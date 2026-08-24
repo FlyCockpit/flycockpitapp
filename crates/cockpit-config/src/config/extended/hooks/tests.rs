@@ -444,3 +444,38 @@ fn hooks_config_rejects_non_native_formats() {
     assert!(registry.hooks.is_empty());
     assert!(registry.warnings.len() >= 10);
 }
+
+#[test]
+fn hooks_config_error_class_matcher_is_a_closed_vocabulary() {
+    // `stopFailure` matches on an exact inference-error-class token (runtime
+    // matching is set membership, never regex). A matcher naming a recognized
+    // class resolves; the values are preserved verbatim.
+    let temp = TempDir::new().unwrap();
+    let ok = temp.path().join("ok/.cockpit/config.json");
+    write_config(
+        &ok,
+        r#"{"hooks":{"stopFailure":[{"matcher":["network","provider_rate_limit"],"command":["notify"]}]}}"#,
+    );
+    let registry = resolve_hooks_from_sources(&[source(ok, ConfigDirKind::Project)]);
+    assert!(registry.warnings.is_empty());
+    assert_eq!(registry.hooks.len(), 1);
+    assert_eq!(registry.hooks[0].event, HookEvent::StopFailure);
+    assert_eq!(
+        registry.hooks[0].matcher,
+        Some(BTreeSet::from([
+            "network".into(),
+            "provider_rate_limit".into(),
+        ]))
+    );
+
+    // A token outside the closed vocabulary is rejected (and warned), not
+    // admitted as a dead hook that could never fire.
+    let bad = temp.path().join("bad/.cockpit/config.json");
+    write_config(
+        &bad,
+        r#"{"hooks":{"stopFailure":[{"matcher":["not_a_real_class"],"command":["notify"]}]}}"#,
+    );
+    let rejected = resolve_hooks_from_sources(&[source(bad, ConfigDirKind::Project)]);
+    assert!(rejected.hooks.is_empty());
+    assert!(!rejected.warnings.is_empty());
+}

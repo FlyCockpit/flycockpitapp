@@ -48,6 +48,7 @@ pub(crate) async fn authorize_monty_native_call(
         GateOutcome::Run { .. } => {}
         GateOutcome::Parked => return Err(crate::engine::interrupt::InterruptParked.into()),
         GateOutcome::Block(block) => {
+            fire_monty_permission_denied_hook(ctx, tool.name(), "authorization_blocked").await;
             return Ok(MontyNativeAuthorization::Denied(serde_json::json!({
                 "denied": true,
                 "kind": "authorization_blocked",
@@ -60,6 +61,7 @@ pub(crate) async fn authorize_monty_native_call(
     if let Some(cage) = ctx.review_cage.as_ref()
         && let Err(error) = cage.allow_dispatch(tool.name())
     {
+        fire_monty_permission_denied_hook(ctx, tool.name(), "review_cage_denied").await;
         return Ok(MontyNativeAuthorization::Denied(serde_json::json!({
             "denied": true,
             "kind": "review_cage_denied",
@@ -80,6 +82,7 @@ pub(crate) async fn authorize_monty_native_call(
                 .is_accept()
             {
                 let available: Vec<&str> = ctx.available_tools.iter().map(String::as_str).collect();
+                fire_monty_permission_denied_hook(ctx, tool.name(), "loop_guard_denied").await;
                 return Ok(MontyNativeAuthorization::Denied(serde_json::json!({
                     "denied": true,
                     "kind": "loop_guard_denied",
@@ -116,6 +119,7 @@ pub(crate) async fn authorize_monty_native_call(
             crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
         ),
     };
+    fire_monty_permission_denied_hook(ctx, tool.name(), denied.0).await;
     Ok(MontyNativeAuthorization::Denied(serde_json::json!({
         "denied": true,
         "kind": denied.0,
@@ -127,6 +131,48 @@ pub(crate) async fn authorize_monty_native_call(
 pub(crate) enum MontyNativeAuthorization {
     Allowed,
     Denied(Value),
+}
+
+/// Fire `permissionDenied` observe hooks for a real denial of a Monty-issued
+/// native tool call. Monty is a transport, not a second authorization authority,
+/// so a host-issued call that the shared safety gate / review cage / loop guard /
+/// approval driver denies must produce the same `permissionDenied` observability
+/// as a model-issued native call — otherwise a matcher configured against that
+/// event would silently miss every Monty denial.
+///
+/// Observe-only and fail-open: a hook failure never alters the deny decision.
+/// `permissionKind` is the exact deny `kind` string the Monty denial payload
+/// already carries, so the hook reports what the host receives. Unlike the
+/// ordinary path there is no turn-pinned registry to reuse here (a host call is
+/// not part of a model turn's pinned hook set), so the registry is resolved from
+/// the current config snapshot — matching `Driver::fire_observe_hook`.
+async fn fire_monty_permission_denied_hook(
+    ctx: &crate::engine::tool::ToolCtx,
+    tool_name: &str,
+    permission_kind: &'static str,
+) {
+    let snapshot = ctx.config.snapshot();
+    super::hooks::run_observe_hooks(
+        &super::hooks::TokioCommandRunner::with_optional_containment(
+            ctx.session.process_containment(),
+        ),
+        &super::hooks::DefaultProcessEnv,
+        snapshot.hooks(),
+        crate::config::extended::hooks::HookEvent::PermissionDenied,
+        tool_name,
+        ctx.session.id,
+        &ctx.cwd,
+        &ctx.session.db,
+        Some(tool_name),
+        ctx.current_tool_call_id.as_deref(),
+        None,
+        None,
+        super::hooks::ObserveFields {
+            permission_kind: Some(permission_kind),
+            ..Default::default()
+        },
+    )
+    .await;
 }
 
 /// Fire `permissionDenied` observe hooks for a real approval / safety-gate /

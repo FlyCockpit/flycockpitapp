@@ -465,7 +465,9 @@ async fn subagent_stop_gate_fires_once_at_interactive_child_completion_not_at_po
 
 #[tokio::test]
 async fn interactive_child_stop_gate_block_continues_against_per_child_frame_latch() {
-    use crate::engine::agent::hooks::{STOP_HOOK_MAX_CONTINUATIONS, StopHookOutcome};
+    use crate::engine::agent::hooks::{
+        ForcedEndCause, STOP_HOOK_MAX_CONTINUATIONS, StopHookOutcome,
+    };
     // A blocking `subagentStop` hook re-runs the CHILD: the gate returns
     // `Continue` and counts the grant against the CHILD FRAME's own latch (an
     // independent per-child budget), up to the 8-cap, then force-ends WITHOUT
@@ -513,7 +515,10 @@ async fn interactive_child_stop_gate_block_continues_against_per_child_frame_lat
     let outcome = driver
         .consult_active_child_stop_gate(&PanicRunner, &env)
         .await;
-    assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+    assert_eq!(
+        outcome,
+        StopHookOutcome::ForcedEnd(ForcedEndCause::ContinuationCap)
+    );
 }
 
 #[tokio::test]
@@ -1022,7 +1027,7 @@ impl crate::engine::agent::hooks::ProcessEnv for ResolveEnv {
 
 #[tokio::test]
 async fn root_stop_gate_per_turn_latch_caps_and_is_independent() {
-    use crate::engine::agent::hooks::{StopGateState, StopHookOutcome};
+    use crate::engine::agent::hooks::{ForcedEndCause, StopGateState, StopHookOutcome};
     let (mut driver, _tmp) = test_driver_without_network(1);
     inject_hooks(
         &mut driver,
@@ -1067,7 +1072,10 @@ async fn root_stop_gate_per_turn_latch_caps_and_is_independent() {
     let outcome = driver
         .consult_root_stop_gate(&PanicRunner, &env, &mut turn_a)
         .await;
-    assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+    assert_eq!(
+        outcome,
+        StopHookOutcome::ForcedEnd(ForcedEndCause::ContinuationCap)
+    );
 
     // A DIFFERENT user turn owns a SEPARATE latch: turn B starts fresh and is
     // granted a continuation even though turn A is capped (independence — the
@@ -1093,7 +1101,10 @@ async fn root_stop_gate_per_turn_latch_caps_and_is_independent() {
     let outcome = driver
         .consult_root_stop_gate(&stop, &env, &mut turn_c)
         .await;
-    assert_eq!(outcome, StopHookOutcome::ForcedEnd);
+    assert_eq!(
+        outcome,
+        StopHookOutcome::ForcedEnd(ForcedEndCause::HookRequested)
+    );
     assert_eq!(
         turn_c.continuation_count, 0,
         "continue:false ends the turn without counting a continuation"

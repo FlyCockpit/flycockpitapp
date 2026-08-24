@@ -48,20 +48,28 @@ impl Driver {
                 failed,
                 requests,
             } => {
-                self.schedule.mark_completed(&job_id);
+                let row_removed = self.schedule.mark_completed(&job_id);
                 // A recursive `Swarm` subagent finished (GOALS §24): free
                 // its concurrency slot and start the next queued spawn, before
                 // anything else, so the global cap accounting stays tight even
                 // if the injected turn below is long-running. Done here on the
                 // main thread — the authority is the single scheduler.
                 if matches!(kind, crate::engine::schedule::ScheduleKind::Swarm) {
-                    self.schedule.swarm_completed();
+                    // Free the slot only when THIS drain removed the live row.
+                    // A swarm job can have two terminal producers (its runner
+                    // and a racing `cancel()`, which frees the slot itself), so
+                    // gating on the one-time row removal keeps the running-swarm
+                    // count decremented exactly once (#108). A duplicate
+                    // `Completed` for an already-reconciled job finds no row and
+                    // must not free the slot a second time.
+                    if row_removed {
+                        self.schedule.swarm_completed();
+                    }
                     // Fire the paired `subagentStop` for a genuine swarm child.
                     // No-op for a goal-supervision worker (never in the map;
                     // guidance L22) — its dedicated completion handling runs
-                    // below. Exactly one `Completed` is drained per job (runner
-                    // on success/failure, authority on cancel), so this fires at
-                    // most once per started child.
+                    // below. Idempotent via the tracking map, so a rare
+                    // duplicate `Completed` fires it at most once per child.
                     self.fire_swarm_subagent_stop_if_tracked(&job_id, failed)
                         .await;
                 }

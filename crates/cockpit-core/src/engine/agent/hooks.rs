@@ -48,6 +48,11 @@ pub(crate) const ENVELOPE_VALUE_MAX_BYTES: usize = 128 * 1024;
 /// Independent cap for stdout and stderr (64 KiB each).
 pub(crate) const OUTPUT_CAP_BYTES: usize = 64 * 1024;
 
+/// Grace window for reaping a deadline-killed hook child before giving up and
+/// deferring to the lease's containment teardown. Bounds the post-`start_kill`
+/// wait so an uninterruptible (D-state) child cannot stall the caller.
+const HOOK_CHILD_REAP_GRACE: Duration = Duration::from_secs(2);
+
 /// Maximum UTF-8-safe character length for a denial reason (1,024 chars).
 pub(crate) const REASON_MAX_CHARS: usize = 1_024;
 
@@ -992,27 +997,27 @@ async fn spawn_real_hook_child(
         }
     };
 
-    // Write stdin.
-    if let Some(mut child_stdin) = child.stdin.take() {
-        if child_stdin.write_all(stdin.as_bytes()).await.is_err() {
-            let _ = child.kill().await;
-            return ChildRunOutcome {
-                stdout: String::new(),
-                exit_code: None,
-                spawn_failed: true,
-                timed_out: false,
-            };
-        }
-        drop(child_stdin);
-    }
+    // Take all three pipes so stdin write, stdout capture, and stderr drain run
+    // CONCURRENTLY. Writing the whole stdin before reading (or never reading
+    // stderr) deadlocks whenever the child fills a kernel pipe buffer — a hook
+    // that emits >64KiB on stderr, or that never consumes its stdin, would wedge.
+    let child_stdin = child.stdin.take();
+    let child_stdout = child.stdout.take();
+    let child_stderr = child.stderr.take();
 
-    // Take stdout before spawning the wait future (avoids double mutable
-    // borrow of `child`).
-    let mut child_stdout = child.stdout.take();
+    // Best-effort stdin writer. A child that exits or is killed mid-write yields
+    // a broken pipe, which is not a hook failure — the deadline path owns the
+    // outcome. Dropping the handle closes stdin so the child observes EOF.
+    let stdin_bytes = stdin.as_bytes().to_vec();
+    let stdin_fut = async move {
+        if let Some(mut sin) = child_stdin {
+            let _ = sin.write_all(&stdin_bytes).await;
+        }
+    };
 
     // Read stdout with independent cap.
-    let stdout_fut = async {
-        if let Some(mut out) = child_stdout.take() {
+    let stdout_fut = async move {
+        if let Some(mut out) = child_stdout {
             let mut temp = vec![0u8; OUTPUT_CAP_BYTES + 1];
             let mut total = Vec::new();
             loop {
@@ -1033,31 +1038,72 @@ async fn spawn_real_hook_child(
         }
     };
 
-    let wait_fut = async {
-        match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => status.code(),
-            Ok(Err(_)) => {
-                let _ = child.kill().await;
-                None
-            }
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                None
+    // Drain stderr to EOF and discard it — only stdout carries the hook
+    // decision. The drain exists solely so a chatty child never blocks on a full
+    // stderr pipe.
+    let stderr_fut = async move {
+        if let Some(mut err) = child_stderr {
+            let mut temp = vec![0u8; 8192];
+            loop {
+                match err.read(&mut temp).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
             }
         }
     };
 
-    let (stdout_result, exit_code) = tokio::join!(stdout_fut, wait_fut);
+    // Bound the ENTIRE interaction — stdin write, both drains, AND wait — under a
+    // single deadline. Bounding only `child.wait()` is not enough: a hook can
+    // fork a background descendant that inherits the pipe fds, so after the
+    // direct child exits or is killed the drains never observe EOF and the join
+    // would hang forever, starving the caller's lease teardown. On elapse we kill
+    // the direct child and return; the caller's `terminate_and_await_empty` then
+    // kills the whole containment group (descendants included), which is the real
+    // authority for closing inherited pipes.
+    let interaction = async {
+        let (_stdin_done, stdout_result, _stderr_drained, wait_res) =
+            tokio::join!(stdin_fut, stdout_fut, stderr_fut, child.wait());
+        (stdout_result, wait_res)
+    };
 
-    let stdout_bytes = stdout_result.unwrap_or_default();
-    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
-    let timed_out = exit_code.is_none();
-    ChildRunOutcome {
-        stdout,
-        exit_code,
-        spawn_failed: false,
-        timed_out,
+    match tokio::time::timeout(timeout, interaction).await {
+        Ok((stdout_result, wait_res)) => {
+            let exit_code = match wait_res {
+                Ok(status) => status.code(),
+                Err(_) => None,
+            };
+            let stdout_bytes = stdout_result.unwrap_or_default();
+            let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+            // A missing exit status (wait error) is reported as a non-completion;
+            // the caller maps both timeout and no-status to a Failed decision.
+            let timed_out = exit_code.is_none();
+            ChildRunOutcome {
+                stdout,
+                exit_code,
+                spawn_failed: false,
+                timed_out,
+            }
+        }
+        Err(_elapsed) => {
+            // Deadline hit. Kill+reap the direct child, but keep the reap itself
+            // BOUNDED: an uninterruptible (D-state) child, or a `start_kill` that
+            // does not immediately take, must not turn this into another
+            // unbounded await that stalls the caller's lease teardown. The
+            // `kill_on_drop(true)` handle plus the caller's
+            // `terminate_and_await_empty` (which kills the whole containment
+            // group) are the ultimate authority. Partial stdout is intentionally
+            // dropped: the caller maps `timeout` to Failed and never parses it.
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(HOOK_CHILD_REAP_GRACE, child.wait()).await;
+            ChildRunOutcome {
+                stdout: String::new(),
+                exit_code: None,
+                spawn_failed: false,
+                timed_out: true,
+            }
+        }
     }
 }
 
@@ -1616,6 +1662,33 @@ async fn record_hook_run(
 /// originating user turn)`.
 pub(crate) const STOP_HOOK_MAX_CONTINUATIONS: u8 = 8;
 
+/// `source` tag on the user-facing Notice emitted when the stop gate forcibly
+/// ends a turn (either cause). Lets a UI attribute the Notice to the stop gate.
+pub(crate) const STOP_HOOK_FORCED_END_SOURCE: &str = "stop_hook_forced_end";
+
+/// Why the stop gate forcibly ended a turn instead of continuing it. Both
+/// causes end the turn; the distinction is audit/notice-only (the caller
+/// ignores the payload — see [`StopHookOutcome::ForcedEnd`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedEndCause {
+    /// The per-frame/job continuation cap ([`STOP_HOOK_MAX_CONTINUATIONS`]) was
+    /// already reached, so this consultation force-ended without reconsulting.
+    ContinuationCap,
+    /// A stop hook returned `{"continue":false,"stopReason":"..."}`, explicitly
+    /// ending the turn.
+    HookRequested,
+}
+
+impl ForcedEndCause {
+    /// Stable camelCase token for the Notice `forcedEndCause` field.
+    const fn wire_tag(self) -> &'static str {
+        match self {
+            Self::ContinuationCap => "continuation_cap",
+            Self::HookRequested => "hook_requested",
+        }
+    }
+}
+
 /// Per-frame/job stop-gate latch tracking continuation count.
 #[derive(Debug, Clone, Default)]
 pub struct StopGateState {
@@ -1669,8 +1742,9 @@ pub enum StopHookOutcome {
         additional_context: Option<String>,
     },
     /// A stop hook produced `{"continue":false,"stopReason":"..."}` which wins
-    /// and ends the turn, or the continuation cap was reached (forced end).
-    ForcedEnd,
+    /// and ends the turn, or the continuation cap was reached (forced end). The
+    /// payload records which cause; the caller ends the turn either way.
+    ForcedEnd(ForcedEndCause),
 }
 
 /// Run all matching stop-gate hooks and aggregate their feedback.
@@ -1718,7 +1792,16 @@ pub(crate) async fn run_stop_hooks(
 ) -> StopHookOutcome {
     // If already at the continuation cap, force end without reconsulting hooks.
     if state.capped() {
-        return StopHookOutcome::ForcedEnd;
+        emit_forced_end_notice(
+            db,
+            session_id,
+            event,
+            ForcedEndCause::ContinuationCap,
+            state.continuation_count,
+            subagent_id,
+        )
+        .await;
+        return StopHookOutcome::ForcedEnd(ForcedEndCause::ContinuationCap);
     }
 
     let hooks = matching_hooks(registry, event, match_value);
@@ -1873,7 +1956,16 @@ pub(crate) async fn run_stop_hooks(
     }
 
     if feedback.forced_end {
-        return StopHookOutcome::ForcedEnd;
+        emit_forced_end_notice(
+            db,
+            session_id,
+            event,
+            ForcedEndCause::HookRequested,
+            state.continuation_count,
+            subagent_id,
+        )
+        .await;
+        return StopHookOutcome::ForcedEnd(ForcedEndCause::HookRequested);
     }
 
     if feedback.should_continue_round() {
@@ -1893,6 +1985,47 @@ pub(crate) async fn run_stop_hooks(
     }
 
     StopHookOutcome::End
+}
+
+/// Emit a fail-open, user-facing Notice recording that the stop gate forcibly
+/// ended a turn. Persistence failures are logged and swallowed — the forced end
+/// stands regardless of whether the Notice was recorded.
+async fn emit_forced_end_notice(
+    db: &crate::db::Db,
+    session_id: Uuid,
+    event: HookEvent,
+    cause: ForcedEndCause,
+    continuations_granted: u8,
+    subagent_id: Option<&str>,
+) {
+    let (text, severity) = match cause {
+        ForcedEndCause::ContinuationCap => (
+            "Stop-hook continuation cap reached; ending without reconsulting hooks.",
+            "warning",
+        ),
+        ForcedEndCause::HookRequested => ("A stop hook explicitly ended the turn.", "info"),
+    };
+    let data = serde_json::json!({
+        "text": text,
+        "severity": severity,
+        "source": STOP_HOOK_FORCED_END_SOURCE,
+        "hookEvent": event.key(),
+        "forcedEndCause": cause.wire_tag(),
+        "continuationsGranted": continuations_granted,
+        "subagentId": subagent_id,
+    });
+    if let Err(error) = db
+        .insert_session_event(
+            session_id,
+            crate::db::session_log::SessionEventKind::Notice,
+            None,
+            None,
+            &data,
+        )
+        .await
+    {
+        tracing::warn!(?error, "failed to persist stop-hook forced-end notice");
+    }
 }
 
 /// Run all matching observe-only lifecycle hooks sequentially.
@@ -2046,21 +2179,25 @@ pub(crate) async fn run_observe_hooks(
 pub(crate) fn error_class_match_value(
     class: &crate::engine::model::InferenceErrorClass,
 ) -> &'static str {
+    use crate::config::extended::hooks as vocabulary;
     use crate::engine::model::InferenceErrorClass as C;
+    // Wire spelling is owned by the config crate's closed `errorClass` matcher
+    // vocabulary ([`HOOK_ERROR_CLASS_MATCH_VALUES`]); returning those constants
+    // keeps the classifier and the matcher validator from drifting apart.
     match class {
-        C::TimeoutTtft => "timeout_ttft",
-        C::TimeoutIdle => "timeout_idle",
-        C::Network => "network",
-        C::Http(_) => "http",
-        C::UtilityTimeout => "utility_timeout",
-        C::MissingToolEntitlement { .. } => "missing_tool_entitlement",
-        C::ClientSideToolsUnsupported => "client_side_tools_unsupported",
-        C::ResponsesToolIdentity => "responses_tool_identity",
-        C::ProviderNotConfigured => "provider_not_configured",
-        C::ProviderRateLimit => "provider_rate_limit",
-        C::BillingOrQuotaExhausted => "billing_or_quota_exhausted",
-        C::UnrenderableWireField => "unrenderable_wire_field",
-        C::Other(_) => "other",
+        C::TimeoutTtft => vocabulary::ERROR_CLASS_TIMEOUT_TTFT,
+        C::TimeoutIdle => vocabulary::ERROR_CLASS_TIMEOUT_IDLE,
+        C::Network => vocabulary::ERROR_CLASS_NETWORK,
+        C::Http(_) => vocabulary::ERROR_CLASS_HTTP,
+        C::UtilityTimeout => vocabulary::ERROR_CLASS_UTILITY_TIMEOUT,
+        C::MissingToolEntitlement { .. } => vocabulary::ERROR_CLASS_MISSING_TOOL_ENTITLEMENT,
+        C::ClientSideToolsUnsupported => vocabulary::ERROR_CLASS_CLIENT_SIDE_TOOLS_UNSUPPORTED,
+        C::ResponsesToolIdentity => vocabulary::ERROR_CLASS_RESPONSES_TOOL_IDENTITY,
+        C::ProviderNotConfigured => vocabulary::ERROR_CLASS_PROVIDER_NOT_CONFIGURED,
+        C::ProviderRateLimit => vocabulary::ERROR_CLASS_PROVIDER_RATE_LIMIT,
+        C::BillingOrQuotaExhausted => vocabulary::ERROR_CLASS_BILLING_OR_QUOTA_EXHAUSTED,
+        C::UnrenderableWireField => vocabulary::ERROR_CLASS_UNRENDERABLE_WIRE_FIELD,
+        C::Other(_) => vocabulary::ERROR_CLASS_OTHER,
     }
 }
 

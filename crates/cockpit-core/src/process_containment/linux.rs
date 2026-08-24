@@ -13,8 +13,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::adapter::{
-    AdapterHandle, AllocatedContainment, ContainerExecRequest, ContainmentAdapter,
-    NativeSpawnRequest, SharedAdapter,
+    AdapterHandle, AllocatedContainment, AllocatedNativeIo, ContainerExecRequest,
+    ContainmentAdapter, NativeIoSpawnRequest, NativeSpawnRequest, SharedAdapter,
 };
 use super::types::{
     ContainmentError, ContainmentGuarantee, EmptyOutcome, PlatformKind, SafeContainmentMetadata,
@@ -28,16 +28,29 @@ pub const DELEGATION_MISSING: &str = "cgroup_delegation_missing";
 pub const MIGRATION_FILE_REACHABLE: &str = "cgroup_migration_file_reachable";
 pub const GUARD_UNVERIFIED: &str = "cgroup_namespace_guard_unverified";
 
+#[cfg(target_os = "linux")]
+use super::linux_broker::{LinuxBrokerClient, LinuxBrokerConfig};
+
 /// Broker that owns exclusive control of the delegated cgroup-v2 subtree.
+#[async_trait]
 pub trait ManagementBroker: Send + Sync + 'static {
     /// Distinct credential/LSM identity — not the workload UID.
     fn distinct_identity(&self) -> bool;
     /// Exclusive delegation: workload UID cannot write cgroup.procs.
     fn exclusive_delegation(&self) -> bool;
     /// Authenticate installation/containment/generation; no raw cgroup FD.
-    fn authenticate(&self, installation: &str, containment: &str, generation: u64) -> bool;
-    fn can_kill(&self, generation: u64) -> bool;
-    fn populated(&self, generation: u64) -> Option<bool>;
+    async fn authenticate(&self, installation: &str, containment: &str, generation: u64) -> bool;
+    async fn spawn_with_io(
+        &self,
+        _request: NativeIoSpawnRequest,
+    ) -> Result<AllocatedNativeIo, ContainmentError> {
+        Err(ContainmentError::DescendantContainmentUnavailable {
+            reason: MANAGEMENT_BOUNDARY_UNAVAILABLE.into(),
+        })
+    }
+    async fn can_kill(&self, key: &str, generation: u64) -> bool;
+    async fn kill(&self, key: &str, generation: u64) -> Result<(), ContainmentError>;
+    async fn populated(&self, key: &str, generation: u64) -> Option<bool>;
 }
 
 /// Default: no broker installed → Unsupported.
@@ -51,13 +64,18 @@ impl ManagementBroker for AbsentBroker {
     fn exclusive_delegation(&self) -> bool {
         false
     }
-    fn authenticate(&self, _: &str, _: &str, _: u64) -> bool {
+    async fn authenticate(&self, _: &str, _: &str, _: u64) -> bool {
         false
     }
-    fn can_kill(&self, _: u64) -> bool {
+    async fn can_kill(&self, _: &str, _: u64) -> bool {
         false
     }
-    fn populated(&self, _: u64) -> Option<bool> {
+    async fn kill(&self, _: &str, _: u64) -> Result<(), ContainmentError> {
+        Err(ContainmentError::DescendantContainmentUnavailable {
+            reason: MANAGEMENT_BOUNDARY_UNAVAILABLE.into(),
+        })
+    }
+    async fn populated(&self, _: &str, _: u64) -> Option<bool> {
         None
     }
 }
@@ -87,13 +105,42 @@ impl ManagementBroker for TestBroker {
     fn exclusive_delegation(&self) -> bool {
         self.exclusive
     }
-    fn authenticate(&self, _: &str, _: &str, generation: u64) -> bool {
+    async fn authenticate(&self, _: &str, _: &str, generation: u64) -> bool {
         self.identity_distinct && self.exclusive && generation > 0
     }
-    fn can_kill(&self, generation: u64) -> bool {
-        self.authenticate("i", "c", generation)
+    async fn spawn_with_io(
+        &self,
+        request: NativeIoSpawnRequest,
+    ) -> Result<AllocatedNativeIo, ContainmentError> {
+        self.set_populated(request.generation, true);
+        let key = format!("linux-cgroup-{}", request.generation);
+        Ok(AllocatedNativeIo {
+            allocation: AllocatedContainment {
+                locator: SafeLocator {
+                    locator_key: Some(key.clone()),
+                    nonce: Some(format!("g{}", request.generation)),
+                    installation_digest: Some("test-linux".into()),
+                    ..Default::default()
+                },
+                guarantee: ContainmentGuarantee::Proven,
+                handle: AdapterHandle { key },
+            },
+            io: super::adapter::NativeChildIo {
+                stdin: Some(Box::pin(tokio::io::sink())),
+                stdout: Some(Box::pin(tokio::io::empty())),
+                stderr: Some(Box::pin(tokio::io::empty())),
+                wait: Box::pin(async { Ok(Some(0)) }),
+            },
+        })
     }
-    fn populated(&self, generation: u64) -> Option<bool> {
+    async fn can_kill(&self, _: &str, generation: u64) -> bool {
+        self.identity_distinct && self.exclusive && generation > 0
+    }
+    async fn kill(&self, _: &str, generation: u64) -> Result<(), ContainmentError> {
+        self.set_populated(generation, false);
+        Ok(())
+    }
+    async fn populated(&self, _: &str, generation: u64) -> Option<bool> {
         self.generations
             .lock()
             .ok()
@@ -211,6 +258,20 @@ impl LinuxCapabilityProbe {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn detect_with_broker(_config: &LinuxBrokerConfig, connected: bool) -> Self {
+        let cgroup_v2 = std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists();
+        let broker_present = connected;
+        Self {
+            cgroup_v2,
+            has_delegation: broker_present,
+            // The client never receives a cgroup fd. The broker owns a
+            // root-owned subtree and verifies it on every request.
+            migration_file_writable_by_workload: !broker_present,
+            broker_present,
+        }
+    }
+
     pub fn unsupported_reason(&self, broker: &dyn ManagementBroker) -> Option<&'static str> {
         if !self.cgroup_v2 {
             return Some(CGROUP_V1_UNSUPPORTED);
@@ -232,17 +293,32 @@ pub struct LinuxCgroupAdapter {
     probe: LinuxCapabilityProbe,
     broker: Arc<dyn ManagementBroker>,
     guard: CgroupNamespaceGuard,
-    /// Live handles: generation → populated (broker-backed when present).
-    live: std::sync::Mutex<std::collections::HashMap<u64, bool>>,
 }
 
 impl LinuxCgroupAdapter {
     pub fn production() -> Self {
+        #[cfg(target_os = "linux")]
+        let config = LinuxBrokerConfig::production();
+        #[cfg(target_os = "linux")]
+        let (broker, connected): (Arc<dyn ManagementBroker>, bool) =
+            match LinuxBrokerClient::connect(config.clone()) {
+                Ok(client) => (Arc::new(client), true),
+                Err(_) => (Arc::new(AbsentBroker), false),
+            };
+        #[cfg(target_os = "linux")]
+        let probe = LinuxCapabilityProbe::detect_with_broker(&config, connected);
+        #[cfg(not(target_os = "linux"))]
+        let probe = LinuxCapabilityProbe::detect();
+        #[cfg(not(target_os = "linux"))]
+        let broker: Arc<dyn ManagementBroker> = Arc::new(AbsentBroker);
+
         Self {
-            probe: LinuxCapabilityProbe::detect(),
-            broker: Arc::new(AbsentBroker),
-            guard: CgroupNamespaceGuard::unverified(),
-            live: std::sync::Mutex::new(std::collections::HashMap::new()),
+            probe,
+            broker,
+            // Production proof is returned by the broker's atomic spawn
+            // response. This flag means the selected protocol requires all
+            // guard attestations; it is not a local host-state assertion.
+            guard: CgroupNamespaceGuard::test_proven(),
         }
     }
 
@@ -255,7 +331,6 @@ impl LinuxCgroupAdapter {
             probe,
             broker,
             guard,
-            live: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -315,29 +390,52 @@ impl ContainmentAdapter for LinuxCgroupAdapter {
         if !self
             .broker
             .authenticate("install", &req.containment_id.to_string(), req.generation)
+            .await
         {
             return Err(ContainmentError::DescendantContainmentUnavailable {
                 reason: MANAGEMENT_BOUNDARY_UNAVAILABLE.into(),
             });
         }
-        // Guard verified membership before releasing launcher — no user code yet.
-        if !self.guard.verification.membership_proven {
+        let spawned = self
+            .broker
+            .spawn_with_io(NativeIoSpawnRequest {
+                containment_id: req.containment_id,
+                session_id: req.session_id,
+                generation: req.generation,
+                operation_id: req.operation_id,
+                program: req.program,
+                args: req.args,
+                cwd: req.cwd,
+                env: Default::default(),
+                require_proven: req.require_proven,
+            })
+            .await?;
+        Ok(spawned.allocation)
+    }
+
+    async fn create_and_spawn_with_io(
+        &self,
+        req: NativeIoSpawnRequest,
+    ) -> Result<AllocatedNativeIo, ContainmentError> {
+        if let Some(reason) = self.reason_if_unsupported() {
             return Err(ContainmentError::DescendantContainmentUnavailable {
-                reason: GUARD_UNVERIFIED.into(),
+                reason: reason.into(),
             });
         }
-        self.live.lock().unwrap().insert(req.generation, true);
-        let key = format!("linux-cgroup-{}", req.generation);
-        Ok(AllocatedContainment {
-            locator: SafeLocator {
-                locator_key: Some(key.clone()),
-                nonce: Some(format!("g{}", req.generation)),
-                installation_digest: Some("linux".into()),
-                ..Default::default()
-            },
-            guarantee: ContainmentGuarantee::Proven,
-            handle: AdapterHandle { key },
-        })
+        if !self
+            .broker
+            .authenticate(
+                "install",
+                &req.containment_id.to_string(),
+                req.generation,
+            )
+            .await
+        {
+            return Err(ContainmentError::DescendantContainmentUnavailable {
+                reason: MANAGEMENT_BOUNDARY_UNAVAILABLE.into(),
+            });
+        }
+        self.broker.spawn_with_io(req).await
     }
 
     async fn create_container_and_exec(
@@ -351,31 +449,24 @@ impl ContainmentAdapter for LinuxCgroupAdapter {
 
     async fn terminate(
         &self,
-        _handle: &AdapterHandle,
+        handle: &AdapterHandle,
         generation: u64,
     ) -> Result<(), ContainmentError> {
-        if !self.broker.can_kill(generation) {
+        if !self.broker.can_kill(&handle.key, generation).await {
             return Err(ContainmentError::Internal(
                 "broker_kill_denied_retryable".into(),
             ));
         }
-        // cgroup.kill semantics via broker authority.
-        self.live.lock().unwrap().insert(generation, false);
-        Ok(())
+        self.broker.kill(&handle.key, generation).await
     }
 
     async fn await_empty(
         &self,
-        _handle: &AdapterHandle,
+        handle: &AdapterHandle,
         generation: u64,
     ) -> Result<EmptyOutcome, ContainmentError> {
         // Sole empty oracle: same-generation cgroup.events populated=0 via actor authority.
-        let populated = self.broker.populated(generation).or_else(|| {
-            self.live
-                .lock()
-                .ok()
-                .and_then(|g| g.get(&generation).copied())
-        });
+        let populated = self.broker.populated(&handle.key, generation).await;
         match populated {
             Some(false) => Ok(EmptyOutcome::ProvenEmpty { generation }),
             Some(true) => Ok(EmptyOutcome::Uncertain {
@@ -394,15 +485,20 @@ impl ContainmentAdapter for LinuxCgroupAdapter {
         locator: &SafeLocator,
         generation: u64,
     ) -> Result<EmptyOutcome, ContainmentError> {
-        let _ = locator;
         if let Some(reason) = self.reason_if_unsupported() {
             return Ok(EmptyOutcome::Unsupported {
                 reason: reason.into(),
             });
         }
+        let Some(key) = locator.locator_key.as_deref() else {
+            return Ok(EmptyOutcome::Uncertain {
+                generation,
+                reason: "linux_locator_key_missing".into(),
+            });
+        };
         self.await_empty(
             &AdapterHandle {
-                key: format!("linux-cgroup-{generation}"),
+                key: key.to_owned(),
             },
             generation,
         )

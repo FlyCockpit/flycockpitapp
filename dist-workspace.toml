@@ -19,7 +19,7 @@ install-path = "CARGO_HOME"
 # Generated release assets are copied into archives/installers alongside the binary.
 # cargo-dist 0.32 `include` only copies pre-existing files, so the release workflow
 # runs `scripts/generate-release-assets.sh` before `dist build`.
-include = ["target/dist/completions", "target/dist/man", "apps/cli/scripts/install-shell-assets.sh", "apps/cli/scripts/runtime-prerequisite-notice.sh", "apps/cli/scripts/runtime-prerequisite-notice.ps1", "apps/cli/generated/runtime-prerequisites.txt"]
+include = ["target/dist/completions", "target/dist/man", "apps/cli/scripts/install-shell-assets.sh", "apps/cli/scripts/install-linux-containment-broker.sh", "apps/cli/scripts/runtime-prerequisite-notice.sh", "apps/cli/scripts/runtime-prerequisite-notice.ps1", "apps/cli/generated/runtime-prerequisites.txt", "infra/systemd/cockpit-containment-broker@.service", "infra/systemd/cockpit-daemon@.service", "infra/tmpfiles.d/flycockpit-containment.conf"]
 # Where to host releases
 hosting = "github"
 # Whether to install an updater program

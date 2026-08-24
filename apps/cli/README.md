@@ -515,11 +515,31 @@ it is not a gate failure. Failed conditions are:
 
 Native hook execution additionally requires the host containment adapter to
 support atomic process placement with retained stdin/stdout/stderr endpoints.
-The current production Linux, macOS, and Windows adapters do not yet implement
-that combined primitive, so they reject before spawn and audit
-`descendant_containment_unsupported`. The fake adapter exercises the lifecycle
-contract in tests; it is not a production fallback. Cockpit never weakens this
-requirement by spawning a hook first and attaching containment afterward.
+On Linux, that primitive is available only to a daemon launched by the shipped
+systemd unit together with the distinct root containment broker. The service
+manager opens the same root-owned `0400` capability file into both services;
+the daemon authenticates each connection by passing that descriptor, and the
+broker compares its root-owned inode before accepting any request. A manually
+or detach-launched daemon intentionally has no capability descriptor and
+rejects hooks before spawn with `descendant_containment_unsupported`.
+
+The broker creates each cgroup and uses `clone3(CLONE_INTO_CGROUP)`. The child
+completes its private mount/cgroup namespace, read-only cgroup view,
+capability-drop, `no_new_privs`, and seccomp setup while held on a broker pipe.
+Only after the daemon validates the broker attestation and received I/O/pidfd
+set does it commit the operation and release `execve`. Disconnects and
+cancelled prepared operations are killed and proven empty. Operation status
+and terminal tombstones live in root-private broker state so restart recovery
+does not turn an ambiguous prepare or commit into a second launch.
+
+Install the managed Linux deployment from an extracted release directory with
+`sudo apps/cli/scripts/install-linux-containment-broker.sh DAEMON_USER`. The
+installer creates the capability, installs the broker and daemon units, and
+enables `cockpit-daemon@UID.service`. Re-running it preserves the existing
+capability. Removing or replacing that file requires stopping both units first.
+macOS and Windows still reject this combined primitive before spawn. The fake
+adapter exercises the lifecycle contract in tests; it is not a production
+fallback. Cockpit never spawns a hook first and attaches containment afterward.
 
 Exit status alone never denies. Post and observe-only hooks never block; they
 run sequentially even if an earlier observer fails.

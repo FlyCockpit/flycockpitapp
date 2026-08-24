@@ -1,0 +1,26 @@
+[Unit]
+Description=FlyCockpit daemon for UID %i
+Documentation=https://docs.flycockpit.com/
+BindsTo=cockpit-containment-broker@%i.service
+After=cockpit-containment-broker@%i.service
+
+[Service]
+Type=simple
+User=%i
+OpenFile=/etc/flycockpit/containment-capability-%i:flycockpit-containment-capability:read-only
+ExecStart=/usr/bin/cockpit daemon start --foreground
+Restart=on-failure
+RestartSec=1s
+NoNewPrivileges=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

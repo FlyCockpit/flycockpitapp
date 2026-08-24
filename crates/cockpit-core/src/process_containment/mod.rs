@@ -11,6 +11,8 @@ mod adapter;
 mod container;
 mod fake;
 mod linux;
+#[cfg(target_os = "linux")]
+mod linux_broker;
 mod macos;
 mod observability;
 mod state_machine;
@@ -33,6 +35,12 @@ pub use fake::{FakeEmptyMode, FakeProvenAdapter, FakeUnsupportedAdapter};
 pub use linux::{
     CgroupNamespaceGuard, LinuxCgroupAdapter, MANAGEMENT_BOUNDARY_UNAVAILABLE, TestBroker,
 };
+#[cfg(target_os = "linux")]
+pub use linux_broker::{LinuxBrokerConfig, LinuxBrokerServerConfig, run_linux_containment_broker};
+#[cfg(target_os = "linux")]
+pub fn inherited_linux_broker_capability_fd() -> Option<std::os::fd::RawFd> {
+    linux_broker::inherited_named_fd("flycockpit-containment-capability")
+}
 pub use macos::{MACOS_UNSUPPORTED_REASON, MacosNativeAdapter};
 pub use observability::{doctor_lines, error_audit_fields, sanitize_reason};
 pub use types::{

@@ -24,6 +24,10 @@ workspace = true
 name = "cockpit"
 path = "src/main.rs"
 
+[[bin]]
+name = "cockpit-containment-broker"
+path = "src/containment_broker_main.rs"
+
 # Single merged e2e/integration test binary: one full-dependency-graph link
 # instead of one per test file. Modules live in tests/e2e/.
 [[test]]

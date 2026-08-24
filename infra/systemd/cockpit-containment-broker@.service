@@ -1,0 +1,39 @@
+[Unit]
+Description=FlyCockpit privileged descendant containment broker for UID %i
+Documentation=https://docs.flycockpit.com/
+After=local-fs.target
+Before=cockpit-daemon.service
+ConditionPathIsMountPoint=/sys/fs/cgroup
+
+[Service]
+Type=simple
+User=root
+Group=root
+OpenFile=/etc/flycockpit/containment-capability-%i:flycockpit-containment-capability:read-only
+ExecStart=/usr/libexec/flycockpit/cockpit-containment-broker --allowed-uid %i --socket /run/flycockpit/containment-broker-%i.sock
+RuntimeDirectory=flycockpit
+RuntimeDirectoryMode=0755
+UMask=0077
+NoNewPrivileges=false
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=no
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/run/flycockpit -/sys/fs/cgroup/flycockpit
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_SETGID CAP_SETPCAP CAP_SETUID CAP_SYS_ADMIN
+AmbientCapabilities=
+Restart=always
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target

@@ -997,9 +997,7 @@ pub(super) async fn authorize_session_row_reader(
 //   fails closed. A read-only ceiling therefore denies every write category.
 
 #[cfg(feature = "remote")]
-use cockpit_proto::capability_ceiling::{
-    RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1,
-};
+use cockpit_proto::capability_ceiling::{RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1};
 
 /// Resolve a raw project-root string to its 16-byte control-plane project id
 /// through the injected deny-closed resolver. A canonicalization failure or a

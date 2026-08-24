@@ -963,6 +963,7 @@ async fn ephemeral_daemon_rejects_new_persistent_mutations() {
         Request::PurgeEndedSessions { before: 0 },
         Request::DeleteAssistant {
             name: "helper-bot".into(),
+            expected_revision: "revision".into(),
         },
         Request::RepairMediaReservation {
             scope: "session".into(),
@@ -16910,6 +16911,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "delete_assistant" => Request::DeleteAssistant {
             name: "helper-bot".into(),
+            expected_revision: "revision".into(),
         },
         "diagnose_media_reservation" => Request::DiagnoseMediaReservation {
             scope: "session".into(),
@@ -23745,7 +23747,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::GetSessionCompactions { session_id }, kind: "get_session_compactions", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::PurgeEndedSessions { before: 0 }, kind: "purge_ended_sessions", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetAssistant { name: "a".into() }, kind: "get_assistant", session_id: None, audit_path: None, mutating: false },
-        CommandMetadataCase { request: Request::DeleteAssistant { name: "a".into() }, kind: "delete_assistant", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::DeleteAssistant { name: "a".into(), expected_revision: "revision".into() }, kind: "delete_assistant", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::DiagnoseMediaReservation { scope: "s".into(), id: "i".into() }, kind: "diagnose_media_reservation", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::RepairMediaReservation { scope: "s".into(), id: "i".into(), expected_block_generation: 0, repair_plan_digest: "d".into(), idempotency_key: "k".into() }, kind: "repair_media_reservation", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetDoctorSnapshot { project_root: None, no_sandbox: false, offline: false }, kind: "get_doctor_snapshot", session_id: None, audit_path: None, mutating: false },

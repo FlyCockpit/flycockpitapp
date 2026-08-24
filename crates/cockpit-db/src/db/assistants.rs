@@ -77,6 +77,30 @@ impl Db {
         .await
     }
 
+    /// Delete exactly the registry generation represented by `expected`.
+    /// Every mutable row field participates so a concurrent update cannot be
+    /// erased after a client confirmed an older snapshot.
+    pub async fn delete_assistant_if_unchanged(&self, expected: AssistantRow) -> Result<bool> {
+        self.write(move |conn| {
+            let changed = conn
+                .execute(
+                    "DELETE FROM assistants
+                     WHERE name = ?1 AND created_at = ?2 AND home_dir = ?3
+                       AND config_json = ?4 AND content_hash = ?5",
+                    params![
+                        expected.name,
+                        expected.created_at,
+                        expected.home_dir,
+                        expected.config_json,
+                        expected.content_hash,
+                    ],
+                )
+                .context("conditionally deleting assistant")?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
     pub async fn update_assistant_config(&self, name: &str, config_json: &str) -> Result<()> {
         let name = name.to_string();
         let config_json = config_json.to_string();

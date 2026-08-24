@@ -314,7 +314,15 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
     }
     let response = daemon
         .client
-        .request(delete_assistant_request(&args.name))
+        .request(delete_assistant_request(
+            &args.name,
+            assistant
+                .definition_revision
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "assistant definition cannot be safely read; refusing delete"
+                ))?,
+        ))
         .await
         .context("requesting assistant delete from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected assistant delete: {error}"))?;
@@ -336,9 +344,10 @@ fn get_assistant_request(name: &str) -> Request {
 }
 
 /// Assemble the owner-remoted `DeleteAssistant` mutation.
-fn delete_assistant_request(name: &str) -> Request {
+fn delete_assistant_request(name: &str, expected_revision: &str) -> Request {
     Request::DeleteAssistant {
         name: name.to_string(),
+        expected_revision: expected_revision.to_string(),
     }
 }
 
@@ -491,10 +500,12 @@ mod tests {
             panic!("show/delete must resolve through GetAssistant");
         };
         assert_eq!(name, "helper-bot");
-        let Request::DeleteAssistant { name } = delete_assistant_request("helper-bot") else {
+        let Request::DeleteAssistant { name, expected_revision } =
+            delete_assistant_request("helper-bot", "rev-1") else {
             panic!("delete must remove through DeleteAssistant");
         };
         assert_eq!(name, "helper-bot");
+        assert_eq!(expected_revision, "rev-1");
     }
 
     #[tokio::test]

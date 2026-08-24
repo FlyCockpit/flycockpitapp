@@ -6410,6 +6410,7 @@ mod tests {
             },
             Request::DeleteAssistant {
                 name: "helper-bot".into(),
+                expected_revision: "revision".into(),
             },
             Request::DiagnoseMediaReservation {
                 scope: "session".into(),

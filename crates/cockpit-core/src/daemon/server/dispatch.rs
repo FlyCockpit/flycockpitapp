@@ -4526,9 +4526,15 @@ async fn handle_serialized_request_impl(
             finish_nonrepeatable_response!(remote_operation, ctx, "purge_ended_sessions", response)
         }
 
-        Request::DeleteAssistant { name } => {
+        Request::DeleteAssistant {
+            name,
+            expected_revision,
+        } => {
             #[cfg(feature = "remote")]
-            let request = Request::DeleteAssistant { name: name.clone() };
+            let request = Request::DeleteAssistant {
+                name: name.clone(),
+                expected_revision: expected_revision.clone(),
+            };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
@@ -4542,9 +4548,27 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let deleted = crate::assistants::delete_registration(&ctx.db, &name)
+            let row = ctx
+                .db
+                .get_assistant(&name)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| conflict("assistant changed or no longer exists"))?;
+            let path = crate::assistants::assistant_definition_path(Path::new(&row.home_dir));
+            let _guard = cockpit_config::config::hold_config_mutation_lock(&path)
+                .map_err(internal)?;
+            let snapshot = assistant_to_proto_with_definition(row.clone());
+            if snapshot.definition_revision.as_deref() != Some(expected_revision.as_str()) {
+                return Err(conflict("assistant changed since delete confirmation"));
+            }
+            let deleted = ctx
+                .db
+                .delete_assistant_if_unchanged(row)
                 .await
                 .map_err(internal)?;
+            if !deleted {
+                return Err(conflict("assistant registry changed during delete"));
+            }
             let response = Response::AssistantDeleted { deleted };
             finish_nonrepeatable_response!(remote_operation, ctx, "delete_assistant", response)
         }
@@ -14022,7 +14046,7 @@ async fn get_assistant_response(
 ) -> std::result::Result<Response, ErrorPayload> {
     let row = ctx.db.get_assistant(&name).await.map_err(internal)?;
     Ok(Response::Assistant {
-        assistant: row.map(assistant_to_proto),
+        assistant: row.map(assistant_to_proto_with_definition),
     })
 }
 

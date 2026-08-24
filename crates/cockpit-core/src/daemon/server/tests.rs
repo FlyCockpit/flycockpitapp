@@ -1796,6 +1796,7 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn authorized_fcor_resources_order_file_modes_and_provider_model() {
     use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
     let ctx = test_ctx();
@@ -1843,6 +1844,7 @@ async fn authorized_fcor_resources_order_file_modes_and_provider_model() {
 }
 
 #[tokio::test]
+#[cfg(feature = "remote")]
 async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dispatch() {
     let ctx = test_ctx();
     let state = MutableClientState::detached_for_test();
@@ -13716,11 +13718,13 @@ fn dispatch_matrix_rows() -> Vec<DispatchMatrixRow> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(feature = "remote")]
 enum CharacterizedDispatchOutcome {
     Applied(Vec<u8>),
     Conflict,
 }
 
+#[cfg(feature = "remote")]
 async fn characterize_operation_dispatch(
     db: &crate::db::Db,
     _request_id: Uuid,
@@ -13771,6 +13775,7 @@ async fn characterize_operation_dispatch(
     }
 }
 
+#[cfg(feature = "remote")]
 fn characterized_operation_id() -> Uuid {
     Uuid::parse_str("01890f3e-4c00-7000-8000-000000000001").unwrap()
 }
@@ -14429,11 +14434,13 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             effect_class: DriverForwarded,
             observation: "SessionWork::Pin delivered to attached worker",
         },
+        #[cfg(feature = "remote")]
         MutatingDispatchCase {
             kind: "store_flycockpit_credential",
             effect_class: Durable,
             observation: "credential file is written",
         },
+        #[cfg(feature = "remote")]
         MutatingDispatchCase {
             kind: "clear_flycockpit_credential",
             effect_class: Durable,
@@ -16417,10 +16424,12 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "pin" => Request::Pin {
             text: "remember".into(),
         },
+        #[cfg(feature = "remote")]
         "store_flycockpit_credential" => Request::StoreFlycockpitCredential {
             credential: flycockpit_credential(),
             force: false,
         },
+        #[cfg(feature = "remote")]
         "clear_flycockpit_credential" => Request::ClearFlycockpitCredential,
         "put_subscription_ack" => Request::PutSubscriptionAck {
             provider_id: "codex-oauth".into(),
@@ -16600,6 +16609,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             cursor: None,
             limit: None,
         },
+        #[cfg(feature = "remote")]
         "get_flycockpit_account" => Request::GetFlycockpitAccount,
         "put_named_secret" => Request::PutNamedSecret {
             name: "matrix-secret".into(),
@@ -16737,12 +16747,15 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             wizard_id: "security".into(),
             answers_json: "{}".into(),
         },
+        #[cfg(feature = "remote")]
         "enroll_flycockpit_org_sync" => Request::EnrollFlycockpitOrgSync {
             org_id: "matrix-org".into(),
         },
+        #[cfg(feature = "remote")]
         "set_flycockpit_connector_enabled" => {
             Request::SetFlycockpitConnectorEnabled { enabled: true }
         }
+        #[cfg(feature = "remote")]
         "sync_flycockpit_org_policy" => Request::SyncFlycockpitOrgPolicy,
         "list_packages" => Request::ListPackages,
         "add_package" => Request::AddPackage {
@@ -16768,7 +16781,9 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "import_kcl_packages" => Request::ImportKclPackages {
             project_root: root.clone(),
         },
+        #[cfg(feature = "remote")]
         "get_connector_state" => Request::GetConnectorState,
+        #[cfg(feature = "remote")]
         "get_org_sync_status" => Request::GetOrgSyncStatus,
         "list_failed_tool_calls" => Request::ListFailedToolCalls {
             since_epoch: 0,
@@ -18127,6 +18142,7 @@ async fn assert_mutating_malformed_socket_case(case: MutatingDispatchCase) {
             let counts = ctx.db.usage_counts("slash", None, 0).await.unwrap();
             assert!(counts.is_empty());
         }
+        #[cfg(feature = "remote")]
         "store_flycockpit_credential" | "clear_flycockpit_credential" => {
             let ctx = test_ctx();
             let request = if case.kind == "store_flycockpit_credential" {
@@ -21329,6 +21345,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
             let counts = ctx.db.usage_counts("slash", None, 0).await.unwrap();
             assert_eq!(counts.get("/help"), Some(&1));
         }
+        #[cfg(feature = "remote")]
         "store_flycockpit_credential" | "clear_flycockpit_credential" => {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("credential.json");
@@ -21365,6 +21382,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
             }
             let _ = path;
         }
+        #[cfg(feature = "remote")]
         "set_flycockpit_connector_enabled" => {
             let ctx = persistent_test_ctx_with_credential_path(
                 tempfile::tempdir().unwrap().path().join("credential.json"),
@@ -21387,6 +21405,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
                 .expect("connector state");
             assert!(state.enabled);
         }
+        #[cfg(feature = "remote")]
         "sync_flycockpit_org_policy" => {
             // The daemon owns this network/policy operation. A test daemon
             // without a credential proves the dispatch path is typed and
@@ -21404,6 +21423,7 @@ async fn assert_in_memory_or_global_mutating_happy(kind: &str) {
                 }
             ));
         }
+        #[cfg(feature = "remote")]
         "enroll_flycockpit_org_sync" => {
             let ctx = persistent_test_ctx_with_credential_path(
                 tempfile::tempdir().unwrap().path().join("credential.json"),
@@ -21793,7 +21813,6 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
     }
 }
 
-#[cfg(feature = "remote")]
 #[tokio::test]
 async fn command_table_metadata_is_exhaustive_and_stable() {
     struct CommandMetadataCase {
@@ -22815,6 +22834,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             audit_path: None,
             mutating: true,
         },
+        #[cfg(feature = "remote")]
         CommandMetadataCase {
             request: Request::StoreFlycockpitCredential {
                 credential: flycockpit_credential(),
@@ -22825,6 +22845,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             audit_path: None,
             mutating: true,
         },
+        #[cfg(feature = "remote")]
         CommandMetadataCase {
             request: Request::ClearFlycockpitCredential,
             kind: "clear_flycockpit_credential",
@@ -22881,6 +22902,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             audit_path: None,
             mutating: true,
         },
+        #[cfg(feature = "remote")]
         CommandMetadataCase {
             request: Request::GetFlycockpitAccount,
             kind: "get_flycockpit_account",
@@ -23555,8 +23577,11 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             audit_path: None,
             mutating: true,
         },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::SetFlycockpitConnectorEnabled { enabled: true }, kind: "set_flycockpit_connector_enabled", session_id: None, audit_path: None, mutating: true },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::SyncFlycockpitOrgPolicy, kind: "sync_flycockpit_org_policy", session_id: None, audit_path: None, mutating: true },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::EnrollFlycockpitOrgSync { org_id: "org-fixture".into() }, kind: "enroll_flycockpit_org_sync", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::PutSubscriptionAck { provider_id: "codex-oauth".into() }, kind: "put_subscription_ack", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::BeginProviderOAuth { provider_id: "example".into() }, kind: "begin_provider_oauth", session_id: None, audit_path: None, mutating: false },
@@ -23600,7 +23625,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::ImportPackage { project_root: project_root.clone(), dir: None, package: None, id: None, as_path: false }, kind: "import_package", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::PrunePackages { project_root: project_root.clone(), days: 30, dry_run: false }, kind: "prune_packages", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ImportKclPackages { project_root: project_root.clone() }, kind: "import_kcl_packages", session_id: None, audit_path: None, mutating: true },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::GetConnectorState, kind: "get_connector_state", session_id: None, audit_path: None, mutating: false },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::GetOrgSyncStatus, kind: "get_org_sync_status", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::ListFailedToolCalls { since_epoch: 0, tool: None, model: None, project_id: None, include_recovered: false, limit: 20 }, kind: "list_failed_tool_calls", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::GetSessionCompactions { session_id }, kind: "get_session_compactions", session_id: None, audit_path: None, mutating: false },
@@ -23624,7 +23651,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
     // expected-coverage set, so there is no hand-bumped count literal to
     // go stale.
     macro_rules! request_variants {
-            ($($variant:ident),* $(,)?) => {
+            ($($(#[$variant_attr:meta])* $variant:ident),* $(,)?) => {
                 fn request_variant_name(request: &Request) -> &'static str {
                     match request {
                         Request::RecoverSecurityBlockedMedia(..) => "RecoverSecurityBlockedMedia",
@@ -23644,7 +23671,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                         Request::AgentInstallationInspect(..) => "AgentInstallationInspect",
                         #[cfg(feature = "remote")]
                         Request::OperationStatus { .. } => "OperationStatus",
-                        $(Request::$variant { .. } => stringify!($variant),)*
+                        $($(#[$variant_attr])* Request::$variant { .. } => stringify!($variant),)*
                         Request::Unknown => "Unknown",
                     }
                 }
@@ -23657,7 +23684,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                     "AgentInstallationList", "AgentInstallationInspect",
                     #[cfg(feature = "remote")]
                     "OperationStatus",
-                    $(stringify!($variant)),*, "Unknown"
+                    $($(#[$variant_attr])* stringify!($variant)),*, "Unknown"
                 ];
             };
         }
@@ -23791,10 +23818,15 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         Prune,
         Compact,
         Pin,
+        #[cfg(feature = "remote")]
         StoreFlycockpitCredential,
+        #[cfg(feature = "remote")]
         ClearFlycockpitCredential,
+        #[cfg(feature = "remote")]
         SetFlycockpitConnectorEnabled,
+        #[cfg(feature = "remote")]
         SyncFlycockpitOrgPolicy,
+        #[cfg(feature = "remote")]
         EnrollFlycockpitOrgSync,
         ListSecretInventory,
         PutNamedSecret,
@@ -23807,6 +23839,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         BeginMcpOAuth,
         CompleteMcpOAuth,
         CancelMcpOAuth,
+        #[cfg(feature = "remote")]
         GetFlycockpitAccount,
         GetProviderCatalogSnapshot,
         FetchProviderModels,
@@ -23856,7 +23889,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ImportPackage,
         PrunePackages,
         ImportKclPackages,
+        #[cfg(feature = "remote")]
         GetConnectorState,
+        #[cfg(feature = "remote")]
         GetOrgSyncStatus,
         ListFailedToolCalls,
         GetSessionCompactions,
@@ -27525,6 +27560,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         upload_accounting: base.upload_accounting.clone(),
         #[cfg(feature = "remote")]
         connector_wake: base.connector_wake.clone(),
+        #[cfg(feature = "remote")]
+        remote_operation_locks: base.remote_operation_locks.clone(),
         scheduler: base.scheduler.clone(),
         image_generation_boot_id: base.image_generation_boot_id,
         _image_generation_worker: None,
@@ -27737,6 +27774,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         upload_accounting: base.upload_accounting.clone(),
         #[cfg(feature = "remote")]
         connector_wake: base.connector_wake.clone(),
+        #[cfg(feature = "remote")]
+        remote_operation_locks: base.remote_operation_locks.clone(),
         scheduler: base.scheduler.clone(),
         image_generation_boot_id: base.image_generation_boot_id,
         _image_generation_worker: None,

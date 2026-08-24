@@ -13039,11 +13039,32 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
     let project = tempfile::tempdir().unwrap();
     let (mut state, session_id, mut work_rx) =
         attached_state_with_worker_receiver(&ctx, project.path()).await;
+    ctx.db
+        .set_session_shared_with_collaborators(session_id, true)
+        .await
+        .unwrap();
     let operation = remote_owner_operation().await;
     let mut remote = remote_principal();
     let ClientPrincipal::Remote(remote_identity) = &mut remote else {
         panic!("remote fixture must remain remote");
     };
+    // The bulk user-message path requires session-writer authorization, so
+    // upgrade the fixture's AgentReadonly scope to Agent for this session's
+    // project root. The actor binding still carries the authenticated device
+    // identity that the FCM2 admission must stamp.
+    remote_identity.authorization = principal::RemoteAuthorization::LegacyRelayScopes(vec![
+        principal::PrincipalGrant {
+            scope: principal::PrincipalScope::Agent,
+            project_root: Some(
+                project
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        },
+    ]);
     remote_identity.actor_binding = Some(crate::daemon::principal::ClientActorBindingV1 {
         schema_version: 1,
         device_id: operation.authenticated_device_id,

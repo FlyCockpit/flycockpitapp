@@ -74,6 +74,36 @@ pub(crate) const REASON_DESCENDANT_CONTAINMENT_UNCERTAIN: &str = "descendant_con
 /// awaiting empty (actor stopped, terminate error). The hook fails open.
 pub(crate) const REASON_DESCENDANT_CONTAINMENT_FAILED: &str = "descendant_containment_failed";
 
+/// Single-sourced, closed failure-reason constants for the ordinary execution
+/// and stdout-parse paths of hook execution (Decision #6). These exact strings
+/// are written to `hook_run.reason`, cited by the README hooks-contract block,
+/// and asserted by `hooks_documentation_matches_typed_contract`; do not spell
+/// them inline elsewhere.
+///
+/// The bare executable could not be resolved before the clean environment was
+/// built (the handler body never runs; fail open).
+pub(crate) const REASON_EXECUTABLE_NOT_FOUND: &str = "executable not found";
+/// The child process could not be launched.
+pub(crate) const REASON_SPAWN_FAILED: &str = "spawn failed";
+/// The child did not finish within `timeoutSecs`.
+pub(crate) const REASON_HOOK_TIMED_OUT: &str = "hook timed out";
+/// stdout was not valid JSON.
+pub(crate) const REASON_MALFORMED_JSON_OUTPUT: &str = "malformed JSON output";
+/// stdout parsed but was not a JSON object.
+pub(crate) const REASON_OUTPUT_NOT_JSON_OBJECT: &str = "output is not a JSON object";
+/// stdout was a JSON object but did not match the closed hook-output shape.
+pub(crate) const REASON_MALFORMED_HOOK_OUTPUT: &str = "malformed hook output";
+/// Prefix for a non-zero exit with no parseable deny; the numeric status is
+/// appended (`hook exited with non-zero status: <code>`).
+pub(crate) const REASON_NONZERO_EXIT_PREFIX: &str = "hook exited with non-zero status";
+/// A pre-tool hook used the stop-gate `block` vocabulary.
+pub(crate) const REASON_UNEXPECTED_PRE_TOOL_BLOCK: &str =
+    "unexpected decision 'block' for pre-tool event";
+/// A stop-gate hook used the pre-tool `deny` vocabulary.
+pub(crate) const REASON_UNEXPECTED_STOP_DENY: &str = "unexpected decision 'deny' for stop event";
+/// A pre-tool hook produced an unknown or missing `decision`.
+pub(crate) const REASON_UNKNOWN_OR_MISSING_DECISION: &str = "unknown or missing decision";
+
 /// Bounded deadline for the post-run empty barrier. A single `terminate` +
 /// single `await_empty` actor round-trip already bounds the common case; this
 /// deadline guarantees that even a stuck platform oracle can never hang the
@@ -81,8 +111,9 @@ pub(crate) const REASON_DESCENDANT_CONTAINMENT_FAILED: &str = "descendant_contai
 /// never as proven-empty settlement.
 pub(crate) const CONTAINMENT_EMPTY_BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Reserved environment keys overwritten after configured env.
-#[allow(dead_code)]
+/// Reserved environment keys overwritten after configured env. Consumed by
+/// [`build_child_env`] (the single source for these key names) and cited by the
+/// documentation contract.
 pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     "COCKPIT_HOOK_EVENT",
     "COCKPIT_HOOK_NAME",
@@ -376,7 +407,6 @@ impl HookDecision {
 
 /// Parsed stdout JSON from a hook command.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct HookOutput {
     #[serde(default)]
     decision: Option<String>,
@@ -391,7 +421,6 @@ struct HookOutput {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct HookSpecificOutput {
     #[serde(default, rename = "additionalContext")]
     additional_context: Option<String>,
@@ -410,7 +439,7 @@ fn parse_pre_tool_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision
             && code != 0
         {
             return HookDecision::Failed {
-                reason: format!("hook exited with non-zero status: {code}"),
+                reason: format!("{REASON_NONZERO_EXIT_PREFIX}: {code}"),
             };
         }
         return HookDecision::Allow;
@@ -418,19 +447,19 @@ fn parse_pre_tool_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision
     let parsed: Result<Value, _> = serde_json::from_str(trimmed);
     let Ok(value) = parsed else {
         return HookDecision::Failed {
-            reason: "malformed JSON output".to_string(),
+            reason: REASON_MALFORMED_JSON_OUTPUT.to_string(),
         };
     };
     if !value.is_object() {
         return HookDecision::Failed {
-            reason: "output is not a JSON object".to_string(),
+            reason: REASON_OUTPUT_NOT_JSON_OBJECT.to_string(),
         };
     }
     let output: HookOutput = match serde_json::from_value(value) {
         Ok(output) => output,
         Err(_) => {
             return HookDecision::Failed {
-                reason: "malformed hook output".to_string(),
+                reason: REASON_MALFORMED_HOOK_OUTPUT.to_string(),
             };
         }
     };
@@ -448,11 +477,11 @@ fn parse_pre_tool_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision
         Some("block") => {
             // block is a stop-gate vocabulary, not valid for pre-tool.
             HookDecision::Failed {
-                reason: "unexpected decision 'block' for pre-tool event".to_string(),
+                reason: REASON_UNEXPECTED_PRE_TOOL_BLOCK.to_string(),
             }
         }
         _ => HookDecision::Failed {
-            reason: "unknown or missing decision".to_string(),
+            reason: REASON_UNKNOWN_OR_MISSING_DECISION.to_string(),
         },
     }
 }
@@ -465,7 +494,7 @@ fn parse_stop_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision {
             && code != 0
         {
             return HookDecision::Failed {
-                reason: format!("hook exited with non-zero status: {code}"),
+                reason: format!("{REASON_NONZERO_EXIT_PREFIX}: {code}"),
             };
         }
         return HookDecision::Allow;
@@ -473,19 +502,19 @@ fn parse_stop_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision {
     let parsed: Result<Value, _> = serde_json::from_str(trimmed);
     let Ok(value) = parsed else {
         return HookDecision::Failed {
-            reason: "malformed JSON output".to_string(),
+            reason: REASON_MALFORMED_JSON_OUTPUT.to_string(),
         };
     };
     if !value.is_object() {
         return HookDecision::Failed {
-            reason: "output is not a JSON object".to_string(),
+            reason: REASON_OUTPUT_NOT_JSON_OBJECT.to_string(),
         };
     }
     let output: HookOutput = match serde_json::from_value(value) {
         Ok(output) => output,
         Err(_) => {
             return HookDecision::Failed {
-                reason: "malformed hook output".to_string(),
+                reason: REASON_MALFORMED_HOOK_OUTPUT.to_string(),
             };
         }
     };
@@ -506,7 +535,7 @@ fn parse_stop_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision {
         Some("deny") => {
             // deny is not a stop-gate vocabulary; treat as fail.
             HookDecision::Failed {
-                reason: "unexpected decision 'deny' for stop event".to_string(),
+                reason: REASON_UNEXPECTED_STOP_DENY.to_string(),
             }
         }
         Some("block") => {
@@ -536,7 +565,7 @@ fn parse_observe_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision 
             && code != 0
         {
             return HookDecision::Failed {
-                reason: format!("hook exited with non-zero status: {code}"),
+                reason: format!("{REASON_NONZERO_EXIT_PREFIX}: {code}"),
             };
         }
         return HookDecision::Allow;
@@ -547,7 +576,7 @@ fn parse_observe_decision(stdout: &str, exit_code: Option<i32>) -> HookDecision 
         HookDecision::Allow
     } else {
         HookDecision::Failed {
-            reason: "malformed JSON output".to_string(),
+            reason: REASON_MALFORMED_JSON_OUTPUT.to_string(),
         }
     }
 }
@@ -610,33 +639,55 @@ pub(crate) fn build_child_env(
 
     #[cfg(windows)]
     {
-        let system_root = process_env.system_root().ok_or_else(|| {
-            "missing SystemRoot: cannot construct clean Windows environment".to_string()
-        })?;
-        env.insert("SystemRoot".to_string(), system_root.clone());
-        env.insert("WINDIR".to_string(), system_root);
         // Deliberately do NOT add ComSpec, PATHEXT, or any other host variable.
+        for (key, value) in windows_clean_env_additions(process_env.system_root())? {
+            env.insert(key.to_string(), value);
+        }
     }
 
-    // Overwrite reserved keys after configured env.
-    env.insert("COCKPIT_HOOK_EVENT".to_string(), event.key().to_string());
+    // Overwrite reserved keys after configured env. The key names are the
+    // single-sourced `RESERVED_ENV_KEYS` (Decision #6) so the runner, the
+    // documentation contract, and tests cannot drift.
+    env.insert(RESERVED_ENV_KEYS[0].to_string(), event.key().to_string());
     env.insert(
-        "COCKPIT_HOOK_NAME".to_string(),
+        RESERVED_ENV_KEYS[1].to_string(),
         hook.origin.as_str().to_string(),
     );
-    env.insert("COCKPIT_SESSION_ID".to_string(), session_id.to_string());
+    env.insert(RESERVED_ENV_KEYS[2].to_string(), session_id.to_string());
     env.insert(
-        "COCKPIT_WORKSPACE_ROOT".to_string(),
+        RESERVED_ENV_KEYS[3].to_string(),
         workspace_root.to_string_lossy().to_string(),
     );
     if let Some(name) = tool_name {
-        env.insert("COCKPIT_TOOL_NAME".to_string(), name.to_string());
+        env.insert(RESERVED_ENV_KEYS[4].to_string(), name.to_string());
     }
     if let Some(id) = tool_call_id {
-        env.insert("COCKPIT_TOOL_CALL_ID".to_string(), id.to_string());
+        env.insert(RESERVED_ENV_KEYS[5].to_string(), id.to_string());
     }
 
     Ok(env)
+}
+
+/// Windows-only clean-environment additions (`SystemRoot` + `WINDIR`), both
+/// derived from the parent `SystemRoot` value obtained through the
+/// [`ProcessEnv`] seam. Returns the missing-`SystemRoot` fail-open error when
+/// the parent process has no `SystemRoot`, so a hook is never launched into an
+/// unbootable Windows environment. `ComSpec`, `PATHEXT`, and every other host
+/// variable are deliberately excluded.
+///
+/// This is a cross-platform pure function — compiled on all hosts, consumed
+/// only under `#[cfg(windows)]` in [`build_child_env`] — so the construction
+/// and its fail-open branch are unit-testable without a Windows host. On
+/// non-Windows builds it is genuinely unused by production; the allow mirrors
+/// the cross-platform [`ProcessEnv::system_root`] seam.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn windows_clean_env_additions(
+    system_root: Option<String>,
+) -> Result<Vec<(&'static str, String)>, String> {
+    let root = system_root.ok_or_else(|| {
+        "missing SystemRoot: cannot construct clean Windows environment".to_string()
+    })?;
+    Ok(vec![("SystemRoot", root.clone()), ("WINDIR", root)])
 }
 
 /// Resolve the hook command's executable to an absolute path.
@@ -1280,7 +1331,7 @@ pub(crate) async fn run_pre_tool_hooks(
                     event,
                     hook,
                     &HookDecision::Failed {
-                        reason: "executable not found".to_string(),
+                        reason: REASON_EXECUTABLE_NOT_FOUND.to_string(),
                     },
                     0,
                     None,
@@ -1340,11 +1391,11 @@ pub(crate) async fn run_pre_tool_hooks(
             }
         } else if raw.spawn_failed {
             HookDecision::Failed {
-                reason: "spawn failed".to_string(),
+                reason: REASON_SPAWN_FAILED.to_string(),
             }
         } else if raw.timeout {
             HookDecision::Failed {
-                reason: "hook timed out".to_string(),
+                reason: REASON_HOOK_TIMED_OUT.to_string(),
             }
         } else {
             parse_pre_tool_decision(&raw.stdout, raw.exit_code)
@@ -1430,7 +1481,7 @@ pub(crate) async fn run_post_tool_hooks(
                     event,
                     hook,
                     &HookDecision::Failed {
-                        reason: "executable not found".to_string(),
+                        reason: REASON_EXECUTABLE_NOT_FOUND.to_string(),
                     },
                     0,
                     None,
@@ -1490,11 +1541,11 @@ pub(crate) async fn run_post_tool_hooks(
             }
         } else if raw.spawn_failed {
             HookDecision::Failed {
-                reason: "spawn failed".to_string(),
+                reason: REASON_SPAWN_FAILED.to_string(),
             }
         } else if raw.timeout {
             HookDecision::Failed {
-                reason: "hook timed out".to_string(),
+                reason: REASON_HOOK_TIMED_OUT.to_string(),
             }
         } else {
             parse_observe_decision(&raw.stdout, raw.exit_code)
@@ -1718,7 +1769,7 @@ pub(crate) async fn run_stop_hooks(
                     event,
                     hook,
                     &HookDecision::Failed {
-                        reason: "executable not found".to_string(),
+                        reason: REASON_EXECUTABLE_NOT_FOUND.to_string(),
                     },
                     0,
                     None,
@@ -1778,11 +1829,11 @@ pub(crate) async fn run_stop_hooks(
             }
         } else if raw.spawn_failed {
             HookDecision::Failed {
-                reason: "spawn failed".to_string(),
+                reason: REASON_SPAWN_FAILED.to_string(),
             }
         } else if raw.timeout {
             HookDecision::Failed {
-                reason: "hook timed out".to_string(),
+                reason: REASON_HOOK_TIMED_OUT.to_string(),
             }
         } else {
             parse_stop_decision(&raw.stdout, raw.exit_code)
@@ -1899,7 +1950,7 @@ pub(crate) async fn run_observe_hooks(
                     event,
                     hook,
                     &HookDecision::Failed {
-                        reason: "executable not found".to_string(),
+                        reason: REASON_EXECUTABLE_NOT_FOUND.to_string(),
                     },
                     0,
                     None,
@@ -1959,11 +2010,11 @@ pub(crate) async fn run_observe_hooks(
             }
         } else if raw.spawn_failed {
             HookDecision::Failed {
-                reason: "spawn failed".to_string(),
+                reason: REASON_SPAWN_FAILED.to_string(),
             }
         } else if raw.timeout {
             HookDecision::Failed {
-                reason: "hook timed out".to_string(),
+                reason: REASON_HOOK_TIMED_OUT.to_string(),
             }
         } else {
             parse_observe_decision(&raw.stdout, raw.exit_code)

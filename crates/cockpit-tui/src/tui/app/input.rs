@@ -977,11 +977,12 @@ impl App {
                         self.start_leaks_rpc_action(action);
                     }
                     crate::tui::leaks_pane::LeaksOutcome::Reveal {
+                        pane_instance_id,
                         report_id,
                         generation,
                     } => {
                         self.overlay = Overlay::Leaks(pane);
-                        self.reveal_leak_into_pane(report_id, generation);
+                        self.reveal_leak_into_pane(pane_instance_id, report_id, generation);
                     }
                 }
                 return false;

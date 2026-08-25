@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct PendingLeakReveal {
     pub(super) operation_id: uuid::Uuid,
+    pub(super) pane_instance_id: uuid::Uuid,
     pub(super) report_id: String,
     pub(super) generation: u64,
     pub(super) active: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -10,6 +11,7 @@ pub(super) struct PendingLeakReveal {
 
 pub(super) struct LeakRevealWorkerResult {
     operation_id: uuid::Uuid,
+    pane_instance_id: uuid::Uuid,
     report_id: String,
     generation: u64,
     result: Result<
@@ -107,7 +109,12 @@ impl App {
     /// sensitive-channel reveal) and handed through a private one-shot channel
     /// into the pane's zeroizing buffer. It never crosses an
     /// `AsyncActionPayload`, the transcript, or any cache.
-    pub(super) fn reveal_leak_into_pane(&mut self, report_id: String, generation: u64) {
+    pub(super) fn reveal_leak_into_pane(
+        &mut self,
+        pane_instance_id: uuid::Uuid,
+        report_id: String,
+        generation: u64,
+    ) {
         if self.pending_leak_reveal.is_some() {
             if let Overlay::Leaks(pane) = &mut self.overlay {
                 pane.set_reveal_error("a reveal is already pending");
@@ -173,6 +180,7 @@ impl App {
             })();
             let _ = sender.send(LeakRevealWorkerResult {
                 operation_id,
+                pane_instance_id,
                 report_id: worker_report_id,
                 generation,
                 result,
@@ -180,6 +188,7 @@ impl App {
         });
         self.pending_leak_reveal = Some(PendingLeakReveal {
             operation_id,
+            pane_instance_id,
             report_id,
             generation,
             active,
@@ -190,7 +199,7 @@ impl App {
     /// Invalidate an in-flight reveal before its sensitive-channel step. The
     /// worker retains and receipt-settles the exact token it minted.
     pub(super) fn cancel_pending_leak_reveal(&mut self) {
-        if let Some(pending) = &self.pending_leak_reveal {
+        if let Some(pending) = self.pending_leak_reveal.take() {
             pending
                 .active
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -206,6 +215,7 @@ impl App {
             Err(std::sync::mpsc::TryRecvError::Empty) => return false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => LeakRevealWorkerResult {
                 operation_id: pending.operation_id,
+                pane_instance_id: pending.pane_instance_id,
                 report_id: pending.report_id.clone(),
                 generation: pending.generation,
                 result: Err(cockpit_core::daemon::leak_reveal::LeakRevealDenied::Internal),
@@ -217,6 +227,7 @@ impl App {
             .expect("leak reveal pending checked");
         tracing::debug!(operation_id = %pending.operation_id, "leak reveal worker settled");
         if worker.operation_id != pending.operation_id
+            || worker.pane_instance_id != pending.pane_instance_id
             || worker.report_id != pending.report_id
             || worker.generation != pending.generation
         {
@@ -225,6 +236,9 @@ impl App {
         let Overlay::Leaks(pane) = &mut self.overlay else {
             return false;
         };
+        if pane.instance_id() != pending.pane_instance_id {
+            return false;
+        }
         match worker.result {
             Ok(secret) => {
                 if secret.report_id == pending.report_id {

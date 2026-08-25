@@ -107,6 +107,14 @@ impl DefaultImageSpendPersistence {
         &self,
         future: impl std::future::Future<Output = Result<T, String>>,
     ) -> Result<T, String> {
+        // This is a hard thread-boundary assertion, not merely documentation:
+        // reducers/event handlers run with an ambient Tokio runtime and must
+        // never drive this synchronous persistence adapter.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(
+                "image spend persistence may run only on its dedicated OS worker".to_string(),
+            );
+        }
         let handle = self
             .runtime
             .as_ref()

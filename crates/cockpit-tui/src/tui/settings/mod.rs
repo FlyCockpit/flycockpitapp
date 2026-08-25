@@ -114,6 +114,7 @@ pub(crate) struct SettingsDaemonEffectRequest {
 pub(crate) enum SettingsDaemonEffectWork {
     Request(Request),
     ProviderMutation(ProviderMutationPlan),
+    TypedDocumentEdit(TypedDocumentEditPlan),
 }
 
 #[derive(Debug)]
@@ -125,6 +126,14 @@ pub(crate) struct ProviderMutationPlan {
         BTreeMap<String, cockpit_config::config::providers::ProviderModelRef>,
         OnUnlistedModelsFetch,
     )>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TypedDocumentEditPlan {
+    project_root: String,
+    requested_path: String,
+    patch: serde_json::Value,
+    snapshot_session_id: String,
 }
 
 pub(crate) async fn execute_settings_daemon_work(
@@ -196,6 +205,97 @@ pub(crate) async fn execute_settings_daemon_work(
             }
             final_response.ok_or_else(|| "provider mutation contained no changes".to_string())
         }
+        SettingsDaemonEffectWork::TypedDocumentEdit(plan) => {
+            let snapshot = client
+                .request(Request::GetExtendedConfigSnapshot {
+                    project_root: plan.project_root.clone(),
+                    snapshot_session_id: plan.snapshot_session_id.clone(),
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            let Response::ExtendedConfigSnapshot { layers, .. } = snapshot else {
+                return Err(format!(
+                    "unexpected typed-edit snapshot response: {snapshot:?}"
+                ));
+            };
+            let layer = layers
+                .into_iter()
+                .find(|layer| layer.display_path == plan.requested_path)
+                .ok_or_else(|| {
+                    "typed settings target is not a daemon-discovered layer".to_string()
+                })?;
+            let mut document =
+                serde_json::to_value(&layer.config).map_err(|error| error.to_string())?;
+            apply_json_merge_patch_local(&mut document, plan.patch);
+            let desired: ExtendedConfig = serde_json::from_value(document)
+                .map_err(|error| format!("invalid typed settings edit: {error}"))?;
+            let base = serde_json::to_value(&layer.config).map_err(|error| error.to_string())?;
+            let desired_value =
+                serde_json::to_value(&desired).map_err(|error| error.to_string())?;
+            let operations = changed_extended_paths(&base, &desired_value)?;
+            let expected_layer_id = layer.layer_id.clone();
+            let expected_layer_kind = layer.kind;
+            let expected_revision = layer.revision.clone();
+            let response = client
+                .request(Request::ApplyExtendedConfigPatch {
+                    project_root: plan.project_root.clone(),
+                    layer_id: expected_layer_id.clone(),
+                    patch: cockpit_core::daemon::proto::ExtendedConfigPatch {
+                        operations,
+                        materialize: true,
+                        denylist: Vec::new(),
+                        redacted_mutations: Vec::new(),
+                    },
+                    expected_revision: expected_revision.clone(),
+                    snapshot_session_id: plan.snapshot_session_id.clone(),
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            let result_revision = match response {
+                Response::ExtendedConfigSaved {
+                    hash,
+                    layer_id,
+                    layer,
+                    consumed_revision,
+                    result_revision,
+                    status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+                    ..
+                } if layer_id == expected_layer_id
+                    && layer == expected_layer_kind
+                    && consumed_revision == expected_revision
+                    && hash == result_revision
+                    && cockpit_proto::is_opaque_authority_token(&result_revision) =>
+                {
+                    result_revision
+                }
+                other => return Err(format!("unexpected typed-edit commit response: {other:?}")),
+            };
+            let refreshed = client
+                .request(Request::GetExtendedConfigSnapshot {
+                    project_root: plan.project_root,
+                    snapshot_session_id: plan.snapshot_session_id,
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            match &refreshed {
+                Response::ExtendedConfigSnapshot { layers, .. }
+                    if layers.iter().any(|layer| {
+                        layer.display_path == plan.requested_path
+                            && layer.layer_id == expected_layer_id
+                            && layer.revision == result_revision
+                    }) =>
+                {
+                    Ok(refreshed)
+                }
+                _ => Err(
+                    "typed settings edit committed, but authoritative refresh did not reconcile"
+                        .into(),
+                ),
+            }
+        }
     }
 }
 
@@ -218,6 +318,7 @@ pub(crate) struct SettingsDaemonEffectCompletion {
 /// beneath the application's multi-thread Tokio runtime. Unit reducers are
 /// intentionally synchronous, so give those tests the same daemon boundary
 /// instead of panicking before the request can be exercised.
+#[cfg(test)]
 fn run_settings_daemon<T>(
     future: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
@@ -247,12 +348,15 @@ fn run_settings_daemon<T>(
 /// client and tests feed responses through the same snapshot/patch/receipt
 /// validation below; a test double may replace only transport, never config
 /// loading or persistence.
+#[cfg(test)]
 trait SettingsDaemonEffect: Send + Sync {
     fn request(&self, request: Request) -> Result<Response, String>;
 }
 
+#[cfg(test)]
 struct ProductionSettingsDaemonEffect;
 
+#[cfg(test)]
 impl SettingsDaemonEffect for ProductionSettingsDaemonEffect {
     fn request(&self, request: Request) -> Result<Response, String> {
         run_settings_daemon(async move {
@@ -274,6 +378,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
 fn settings_daemon_request(request: Request) -> Result<Response, String> {
     #[cfg(test)]
     if let Some(effect) = TEST_SETTINGS_DAEMON_EFFECT.with(|slot| slot.borrow().clone()) {
@@ -333,6 +438,7 @@ fn existing_denylist_draft(entry_id: &str) -> String {
     format!("{DENYLIST_EXISTING_DRAFT_PREFIX}{entry_id}")
 }
 
+#[cfg(test)]
 fn extended_config_layer_snapshot(
     path: &std::path::Path,
     project_root: Option<&std::path::Path>,
@@ -472,6 +578,11 @@ enum PendingSettingsOperation {
     ProviderCatalog {
         project_root: String,
         provider_id: Option<String>,
+        navigation: Option<ProviderNavigation>,
+    },
+    ProjectShadowSnapshot {
+        target: SettingsEffectTarget,
+        prompt: category::ShadowedGlobalPrompt,
     },
     ProviderMutation {
         target: SettingsEffectTarget,
@@ -486,6 +597,27 @@ enum PendingSettingsOperation {
         target: SettingsEffectTarget,
         action: SettingsMutationAction,
     },
+    TypedDocumentEdit {
+        target: SettingsEffectTarget,
+        requested_path: String,
+        action: TypedDocumentEditAction,
+    },
+}
+
+#[derive(Clone)]
+enum ProviderNavigation {
+    Edit {
+        provider_id: String,
+        oauth_expired: bool,
+    },
+    Models {
+        provider_id: String,
+    },
+}
+
+enum TypedDocumentEditAction {
+    Scaffold,
+    RemoveProjectShadow(category::ShadowedGlobalPrompt),
 }
 
 enum SettingsMutationAction {
@@ -514,6 +646,7 @@ enum PendingMcpOAuth {
     },
 }
 
+#[cfg(test)]
 fn apply_settings_patch_via_daemon(
     path: &std::path::Path,
     project_root: Option<&std::path::Path>,
@@ -630,6 +763,7 @@ fn apply_settings_patch_via_daemon(
     }
 }
 
+#[cfg(test)]
 pub(super) fn apply_typed_settings_document_edit(
     path: &std::path::Path,
     project_root: Option<&std::path::Path>,
@@ -1512,6 +1646,9 @@ pub struct SettingsCx {
     daemon_effects: VecDeque<SettingsDaemonEffectRequest>,
     pending_settings: BTreeMap<uuid::Uuid, PendingSettingsOperation>,
     pending_mcp_oauth: Option<PendingMcpOAuth>,
+    completed_shadow_removal: Option<category::ShadowedGlobalPrompt>,
+    pending_shadow_prompt: Option<category::ShadowedGlobalPrompt>,
+    completed_provider_navigation: Option<(ProviderNavigation, ProvidersConfig)>,
     after_extended_commit: Vec<(SettingsEffectTarget, Request, &'static str)>,
     pub config_path: PathBuf,
     /// Path to the cockpit-only config keys. Same `config.json` as
@@ -1657,6 +1794,62 @@ impl SettingsCx {
         operation_id
     }
 
+    fn queue_typed_document_edit(
+        &mut self,
+        path: PathBuf,
+        project_root: PathBuf,
+        patch: serde_json::Value,
+        action: TypedDocumentEditAction,
+    ) {
+        let requested_path = path.display().to_string();
+        let snapshot_session_id = settings_snapshot_session_id().to_owned();
+        let target = SettingsEffectTarget {
+            surface: "settings.typed-document-edit",
+            owner: requested_path.clone(),
+            revision: Some(snapshot_session_id.clone()),
+        };
+        let operation_id = self.enqueue_daemon_work(
+            target.clone(),
+            SettingsDaemonEffectWork::TypedDocumentEdit(TypedDocumentEditPlan {
+                project_root: project_root.display().to_string(),
+                requested_path: requested_path.clone(),
+                patch,
+                snapshot_session_id,
+            }),
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::TypedDocumentEdit {
+                target,
+                requested_path,
+                action,
+            },
+        );
+    }
+
+    fn queue_project_shadow_snapshot(&mut self, prompt: category::ShadowedGlobalPrompt) {
+        let Some(project_root) = self.active_project_root.clone() else {
+            return;
+        };
+        let snapshot_session_id = settings_snapshot_session_id().to_owned();
+        let target = SettingsEffectTarget {
+            surface: "settings.project-shadow-snapshot",
+            owner: prompt.project_config.display().to_string(),
+            revision: Some(snapshot_session_id.clone()),
+        };
+        let operation_id = self.enqueue_daemon_effect(
+            target.clone(),
+            Request::GetExtendedConfigSnapshot {
+                project_root: project_root.display().to_string(),
+                snapshot_session_id,
+            },
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ProjectShadowSnapshot { target, prompt },
+        );
+    }
+
     fn queue_extended_load(&mut self) {
         let project_context = self
             .active_project_root
@@ -1691,6 +1884,14 @@ impl SettingsCx {
     }
 
     fn queue_provider_catalog(&mut self, provider_id: Option<String>) {
+        self.queue_provider_catalog_for(provider_id, None);
+    }
+
+    fn queue_provider_catalog_for(
+        &mut self,
+        provider_id: Option<String>,
+        navigation: Option<ProviderNavigation>,
+    ) {
         let project_root = self
             .active_project_root
             .clone()
@@ -1720,6 +1921,7 @@ impl SettingsCx {
             PendingSettingsOperation::ProviderCatalog {
                 project_root,
                 provider_id,
+                navigation,
             },
         );
     }
@@ -1889,9 +2091,28 @@ impl SettingsCx {
                     }
                 }
             }
+            PendingSettingsOperation::ProjectShadowSnapshot { target, prompt } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                if let Ok(Response::ExtendedConfigSnapshot { layers, .. }) = completion.response
+                    && let Some(layer) = layers.into_iter().find(|layer| {
+                        layer.display_path == prompt.project_config.display().to_string()
+                    })
+                    && layer.authored_paths.iter().any(|authored| {
+                        authored
+                            .iter()
+                            .map(String::as_str)
+                            .eq(prompt.path.iter().copied())
+                    })
+                {
+                    self.pending_shadow_prompt = Some(prompt);
+                }
+            }
             PendingSettingsOperation::ProviderCatalog {
                 project_root,
                 provider_id,
+                navigation,
             } => {
                 let expected = SettingsEffectTarget {
                     surface: "settings.provider-catalog",
@@ -1910,6 +2131,10 @@ impl SettingsCx {
                         let parsed = providers_config_from_view(&config);
                         self.config = parsed.clone();
                         self.original_config = parsed;
+                        if let Some(navigation) = navigation {
+                            self.completed_provider_navigation =
+                                Some((navigation, self.config.clone()));
+                        }
                         if let Some(raw) = config.mcp_config_json
                             && let Ok(mcp) = cockpit_core::mcp::config::McpConfig::parse(&raw)
                         {
@@ -2154,6 +2379,60 @@ impl SettingsCx {
                     Ok(status) => status,
                     Err(error) => format!("settings operation failed: {error}"),
                 }];
+            }
+            PendingSettingsOperation::TypedDocumentEdit {
+                target,
+                requested_path,
+                action,
+            } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                match completion.response {
+                    Ok(Response::ExtendedConfigSnapshot {
+                        layers,
+                        config_generation,
+                    }) => {
+                        let reconciled = layers
+                            .into_iter()
+                            .find(|layer| layer.display_path == requested_path);
+                        match (action, reconciled) {
+                            (TypedDocumentEditAction::Scaffold, Some(layer)) => {
+                                match decode_extended_layer(layer, config_generation) {
+                                    Ok((extended, base, revision)) => {
+                                        self.extended = extended;
+                                        self.extended_base = base;
+                                        self.extended_revision = Some(revision);
+                                        self.extended_warnings =
+                                            vec!["settings layer created".into()];
+                                    }
+                                    Err(error) => {
+                                        self.extended_warnings = vec![format!(
+                                            "settings committed, but refresh was invalid: {error}"
+                                        )]
+                                    }
+                                }
+                            }
+                            (TypedDocumentEditAction::RemoveProjectShadow(prompt), Some(_)) => {
+                                self.completed_shadow_removal = Some(prompt);
+                                self.extended_warnings = vec!["project override removed".into()];
+                            }
+                            (_, None) => {
+                                self.extended_warnings = vec![
+                                    "settings committed, but refreshed layer was absent".into(),
+                                ]
+                            }
+                        }
+                    }
+                    Ok(other) => {
+                        self.extended_warnings =
+                            vec![format!("unexpected typed settings response: {other:?}")]
+                    }
+                    Err(error) => {
+                        self.extended_warnings =
+                            vec![format!("typed settings edit failed: {error}")]
+                    }
+                }
             }
         }
         Ok(())
@@ -2813,6 +3092,7 @@ impl Dialog {
     /// configured. Used by the TUI's
     /// first-run flow to auto-route into the Add wizard after the
     /// daemon prompt resolves.
+    #[cfg(test)]
     pub fn has_no_providers(cwd: &std::path::Path) -> bool {
         daemon_provider_snapshot(cwd, None).is_none_or(|config| config.providers.is_empty())
     }
@@ -2934,67 +3214,43 @@ impl Dialog {
         provider_id: &str,
         oauth_expired: bool,
     ) -> Self {
-        // The daemon is the authority for effective provider state. Its
-        // redacted snapshot is safe to seed into the editor and also lets the
-        // daemon migrate any legacy literal headers during the first save.
-        let Some(config) = daemon_provider_snapshot(cwd, Some(provider_id)) else {
-            return Self::open(cwd);
-        };
-        let Some(entry) = config.providers.get(provider_id).cloned() else {
-            return Self::open(cwd);
-        };
         let Some(path) = config_write_target_for_provider(cwd, provider_id) else {
             return Self::open(cwd);
         };
-        let mut settings = SettingsDialog::open_with_config(path, config);
-        settings.picker_cwd = Some(cwd.to_path_buf());
-        settings.active_project_root = Some(cwd.to_path_buf());
-        let parent = EditState::new(provider_id.to_string(), entry.clone());
-        let oauth_provider = if oauth_expired {
-            match entry.effective_template(provider_id) {
-                Some(cockpit_core::auth::codex_oauth::CREDENTIAL_KEY | "codex") => {
-                    Some(OAuthProvider::Codex)
-                }
-                Some(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY | "grok") => {
-                    Some(OAuthProvider::Grok)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        settings.page = if let Some(provider) = oauth_provider {
-            providers_page(ProvidersPage::OAuthSetup {
-                state: Box::new(providers::OAuthFlowState::new(provider)),
-                parent: Box::new(parent),
-            })
-        } else {
-            providers_page(ProvidersPage::Edit(parent))
-        };
+        let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
+        settings.page = providers_page(ProvidersPage::List {
+            cursor: 0,
+            status: Some(format!("loading `{provider_id}` from the daemon…")),
+            delete_pending: false,
+        });
+        settings.cx.queue_provider_catalog_for(
+            Some(provider_id.to_string()),
+            Some(ProviderNavigation::Edit {
+                provider_id: provider_id.to_string(),
+                oauth_expired,
+            }),
+        );
         Dialog::Settings(Box::new(settings))
     }
 
     /// Open the existing provider-model editor directly for one configured provider.
     /// This is the canonical add-model surface used by scoped model recovery.
     pub fn open_provider_models(cwd: &std::path::Path, provider_id: &str) -> Self {
-        let Some(cfg) = daemon_provider_snapshot(cwd, None) else {
-            return Self::open(cwd);
-        };
-        let Some(entry) = cfg.providers.get(provider_id).cloned() else {
-            return Self::open(cwd);
-        };
         let Some(path) = config_write_target_for_provider(cwd, provider_id) else {
             return Self::open(cwd);
         };
         let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
-        let parent = EditState::new(provider_id.to_string(), entry.clone());
-        settings.page = providers_page(ProvidersPage::Models {
-            editor: Box::new(ModelEditor::new(
-                entry.effective_template(provider_id).map(str::to_owned),
-                entry.models.clone(),
-            )),
-            parent: Box::new(parent),
+        settings.page = providers_page(ProvidersPage::List {
+            cursor: 0,
+            status: Some(format!("loading models for `{provider_id}`…")),
+            delete_pending: false,
         });
+        settings.cx.queue_provider_catalog_for(
+            Some(provider_id.to_string()),
+            Some(ProviderNavigation::Models {
+                provider_id: provider_id.to_string(),
+            }),
+        );
         Dialog::Settings(Box::new(settings))
     }
 
@@ -3157,20 +3413,12 @@ impl Dialog {
                     false
                 }
                 ListAction::Close => true,
-                ListAction::Select(idx) => match scaffold_config_dir_owned(&choices[idx].path) {
-                    Ok(config_path) => {
-                        let cwd = cwd.clone();
-                        *self = Dialog::Settings(Box::new(SettingsDialog::open_from_picker(
-                            config_path,
-                            cwd,
-                        )));
-                        false
-                    }
-                    Err(e) => {
-                        *status = Some(scaffold_error(&choices[idx].path, &e));
-                        false
-                    }
-                },
+                ListAction::Select(idx) => {
+                    let settings =
+                        SettingsDialog::open_for_scaffold(choices[idx].path.clone(), cwd.clone());
+                    *self = Dialog::Settings(Box::new(settings));
+                    false
+                }
             },
             Dialog::CreateScopedConfig {
                 choices,
@@ -3185,19 +3433,9 @@ impl Dialog {
                 ListAction::Stay => false,
                 ListAction::Select(idx) => {
                     let target = &choices[idx];
-                    match scaffold_config_dir_owned(&target.path) {
-                        Ok(config_path) => {
-                            let cwd = cwd.clone();
-                            *self = Dialog::Settings(Box::new(SettingsDialog::open_from_picker(
-                                config_path,
-                                cwd,
-                            )));
-                        }
-                        Err(e) => {
-                            *self =
-                                Dialog::reopen_picker(cwd, Some(scaffold_error(&target.path, &e)));
-                        }
-                    }
+                    let settings =
+                        SettingsDialog::open_for_scaffold(target.path.clone(), cwd.clone());
+                    *self = Dialog::Settings(Box::new(settings));
                     false
                 }
             },
@@ -3453,7 +3691,79 @@ fn dispatch_from_settings_action(
 impl SettingsDialog {
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
         let completion = match self.cx.apply_general_completion(completion) {
-            Ok(()) => return,
+            Ok(()) => {
+                if let Some((navigation, config)) = self.cx.completed_provider_navigation.take() {
+                    let requested_provider_id = match &navigation {
+                        ProviderNavigation::Edit { provider_id, .. }
+                        | ProviderNavigation::Models { provider_id } => provider_id.clone(),
+                    };
+                    if let Some(entry) = config.providers.get(&requested_provider_id).cloned() {
+                        let parent = EditState::new(requested_provider_id.clone(), entry.clone());
+                        self.page = match navigation {
+                            ProviderNavigation::Edit {
+                                provider_id,
+                                oauth_expired,
+                            } => {
+                                let oauth_provider = oauth_expired
+                                    .then(|| match entry.effective_template(&provider_id) {
+                                        Some(
+                                            cockpit_core::auth::codex_oauth::CREDENTIAL_KEY
+                                            | "codex",
+                                        ) => Some(OAuthProvider::Codex),
+                                        Some(
+                                            cockpit_core::auth::xai_oauth::CREDENTIAL_KEY | "grok",
+                                        ) => Some(OAuthProvider::Grok),
+                                        _ => None,
+                                    })
+                                    .flatten();
+                                if let Some(provider) = oauth_provider {
+                                    providers_page(ProvidersPage::OAuthSetup {
+                                        state: Box::new(providers::OAuthFlowState::new(provider)),
+                                        parent: Box::new(parent),
+                                    })
+                                } else {
+                                    providers_page(ProvidersPage::Edit(parent))
+                                }
+                            }
+                            ProviderNavigation::Models { provider_id } => {
+                                providers_page(ProvidersPage::Models {
+                                    editor: Box::new(ModelEditor::new(
+                                        entry.effective_template(&provider_id).map(str::to_owned),
+                                        entry.models.clone(),
+                                    )),
+                                    parent: Box::new(parent),
+                                })
+                            }
+                        };
+                    } else {
+                        self.page = providers_page(ProvidersPage::List {
+                            cursor: 0,
+                            status: Some(format!(
+                                "provider `{requested_provider_id}` is no longer configured"
+                            )),
+                            delete_pending: false,
+                        });
+                    }
+                }
+                if let Some(prompt) = self.cx.pending_shadow_prompt.take()
+                    && let Some(page) = self.page.downcast_mut::<CategoryPage>()
+                {
+                    page.status = Some(format!(
+                        "saved; project config overrides {} here. Remove that project value? y/n",
+                        prompt.setting.descriptor().label
+                    ));
+                    page.shadowed_global = Some(prompt);
+                }
+                if let Some(prompt) = self.cx.completed_shadow_removal.take()
+                    && let Some(page) = self.page.downcast_mut::<CategoryPage>()
+                {
+                    page.status = Some(format!(
+                        "saved; removed project override for {}",
+                        prompt.setting.descriptor().label
+                    ));
+                }
+                return;
+            }
             Err(completion) => completion,
         };
         if let Some(page) = self.page.downcast_mut::<AgentsPage>() {
@@ -3763,6 +4073,9 @@ impl SettingsDialog {
                 daemon_effects: VecDeque::new(),
                 pending_settings: BTreeMap::new(),
                 pending_mcp_oauth: None,
+                completed_shadow_removal: None,
+                pending_shadow_prompt: None,
+                completed_provider_navigation: None,
                 after_extended_commit: Vec::new(),
                 config_path,
                 extended_path,
@@ -3804,6 +4117,22 @@ impl SettingsDialog {
                 dependency_refresh: None,
             },
         }
+    }
+
+    fn open_for_scaffold(directory: PathBuf, cwd: PathBuf) -> Self {
+        let config_path = directory.join(CONFIG_FILE);
+        let mut settings = Self::open_with_config(config_path.clone(), ProvidersConfig::default());
+        settings.picker_cwd = Some(cwd.clone());
+        settings.active_project_root = Some(cwd.clone());
+        settings.cx.queue_provider_catalog(None);
+        settings.cx.queue_typed_document_edit(
+            config_path,
+            cwd,
+            serde_json::json!({ "agents": {}, "tools": {} }),
+            TypedDocumentEditAction::Scaffold,
+        );
+        settings.cx.extended_warnings = vec!["creating settings layer…".into()];
+        settings
     }
 
     /// Same as [`Self::open`] but records the cwd of the picker that
@@ -5192,6 +5521,7 @@ fn providers_config_from_view(
     }
 }
 
+#[cfg(test)]
 fn daemon_provider_snapshot(
     cwd: &std::path::Path,
     provider_id: Option<&str>,
@@ -5202,6 +5532,7 @@ fn daemon_provider_snapshot(
         .map(|config| providers_config_from_view(&config))
 }
 
+#[cfg(test)]
 fn daemon_provider_view_snapshot(
     cwd: &std::path::Path,
     provider_id: Option<&str>,
@@ -5211,6 +5542,7 @@ fn daemon_provider_view_snapshot(
     daemon_provider_view_snapshot_inner(project_root, provider_id)
 }
 
+#[cfg(test)]
 fn daemon_provider_view_snapshot_inner(
     project_root: String,
     provider_id: Option<String>,
@@ -5236,19 +5568,6 @@ fn config_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
         .and_then(std::path::Path::parent)
         .or_else(|| path.parent())
         .map(std::path::Path::to_path_buf)
-}
-
-fn daemon_mcp_snapshot(
-    config_path: &std::path::Path,
-) -> Option<cockpit_core::mcp::config::McpConfig> {
-    let cwd = config_path
-        .parent()
-        .and_then(std::path::Path::parent)
-        .or_else(|| config_path.parent())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    daemon_provider_view_snapshot(cwd, None)
-        .and_then(|config| config.mcp_config_json)
-        .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
 }
 
 fn provider_entries_equal(left: &ProviderEntry, right: &ProviderEntry) -> bool {
@@ -6109,25 +6428,6 @@ fn nearest_project_config_path(cwd: &std::path::Path) -> PathBuf {
     }
     let project = cwd.join(".cockpit");
     project.join(cockpit_config::dirs::CONFIG_FILE)
-}
-
-fn scaffold_config_dir_owned(dir: &std::path::Path) -> Result<PathBuf, String> {
-    let config_path = dir.join(CONFIG_FILE);
-    match apply_typed_settings_document_edit(
-        &config_path,
-        None,
-        serde_json::json!({ "agents": {}, "tools": {} }),
-    )? {
-        SettingsPatchOutcome::Reconciled { .. } => {}
-        SettingsPatchOutcome::CommittedRefreshNeeded { warning, .. } => {
-            return Err(format!("committed; refresh needed: {warning}"));
-        }
-    }
-    Ok(config_path)
-}
-
-fn scaffold_error(path: &std::path::Path, error: &dyn std::fmt::Display) -> String {
-    format!("failed to create {}: {error}", path.display())
 }
 
 fn kind_label(kind: &ConfigDirKind) -> &'static str {

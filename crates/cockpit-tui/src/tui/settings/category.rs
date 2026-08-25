@@ -526,7 +526,7 @@ pub(super) const ALL_SETTING_IDS: &[SettingId] = &[
 ];
 
 impl SettingId {
-    fn descriptor(self) -> SettingDescriptor {
+    pub(super) fn descriptor(self) -> SettingDescriptor {
         SettingDescriptor {
             label: self.label(),
             help: self.help_text(),
@@ -1555,9 +1555,9 @@ fn long_text_setting(id: SettingId) -> bool {
 
 #[derive(Debug, Clone)]
 pub(super) struct ShadowedGlobalPrompt {
-    setting: SettingId,
-    project_config: std::path::PathBuf,
-    path: &'static [&'static str],
+    pub(super) setting: SettingId,
+    pub(super) project_config: std::path::PathBuf,
+    pub(super) path: &'static [&'static str],
 }
 
 /// Directory autosuggest for the packages-dir field: the ranked candidate
@@ -2444,16 +2444,25 @@ impl SettingsCx {
         if let Some(prompt) = p.shadowed_global.clone() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    p.status = Some(
-                        match remove_project_shadow_path(&prompt.project_config, prompt.path) {
-                            Ok(true) => format!(
-                                "saved; removed project override for {}",
-                                prompt.setting.descriptor().label
-                            ),
-                            Ok(false) => "saved; project override was already absent".to_string(),
-                            Err(e) => format!("saved; removing project override failed: {e}"),
-                        },
+                    let project_root = self
+                        .active_project_root
+                        .clone()
+                        .or_else(|| {
+                            prompt
+                                .project_config
+                                .parent()
+                                .and_then(std::path::Path::parent)
+                                .map(std::path::Path::to_path_buf)
+                        })
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let patch = project_shadow_remove_patch(prompt.path);
+                    self.queue_typed_document_edit(
+                        prompt.project_config.clone(),
+                        project_root,
+                        patch,
+                        super::TypedDocumentEditAction::RemoveProjectShadow(prompt),
                     );
+                    p.status = Some("saved; removing project override…".into());
                     p.shadowed_global = None;
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -3175,6 +3184,9 @@ impl SettingsCx {
                         },
                     );
                 }
+                if let Some(prompt) = self.shadowed_global_prompt(id) {
+                    self.queue_project_shadow_snapshot(prompt);
+                }
                 p.status = Some("saving…".into());
             }
             Ok(super::SettingsSaveOutcome::CommittedRefreshNeeded(warning)) => {
@@ -3189,17 +3201,6 @@ impl SettingsCx {
         let project_root = self.active_project_root.as_ref()?;
         let project_config = super::nearest_project_config_path(project_root);
         if self.config_path == project_config {
-            return None;
-        }
-        let (_, snapshot, _) =
-            super::extended_config_layer_snapshot(&project_config, Some(project_root)).ok()?;
-        let authored_paths: Vec<Vec<String>> =
-            serde_json::from_value(snapshot.get("__cockpit_settings_authored_paths")?.clone())
-                .ok()?;
-        if !authored_paths
-            .iter()
-            .any(|authored| authored.iter().map(String::as_str).eq(path.iter().copied()))
-        {
             return None;
         }
         Some(ShadowedGlobalPrompt {
@@ -3515,24 +3516,15 @@ fn parse_min_usize(raw: &str, min: usize) -> Result<usize, String> {
     }
 }
 
-fn remove_project_shadow_path(
-    project_config: &std::path::Path,
-    path: &[&str],
-) -> Result<bool, String> {
+fn project_shadow_remove_patch(path: &[&str]) -> serde_json::Value {
     let Some((last, parents)) = path.split_last() else {
-        return Ok(false);
+        return serde_json::Value::Null;
     };
     let mut patch = serde_json::json!({ (last): null });
     for parent in parents.iter().rev() {
         patch = serde_json::json!({ (parent): patch });
     }
-    match super::apply_typed_settings_document_edit(project_config, None, patch)? {
-        super::SettingsPatchOutcome::Reconciled { .. } => {}
-        super::SettingsPatchOutcome::CommittedRefreshNeeded { warning, .. } => {
-            return Err(format!("committed; refresh needed: {warning}"));
-        }
-    }
-    Ok(true)
+    patch
 }
 
 fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {

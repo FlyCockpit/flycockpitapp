@@ -6667,12 +6667,14 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SaveImageSpendPolicy {
+            client_operation_id,
             project_key,
             settings_json,
             expected_policy_version,
         } => {
             #[cfg(feature = "remote")]
             let request = Request::SaveImageSpendPolicy {
+                client_operation_id: client_operation_id.clone(),
                 project_key: project_key.clone(),
                 settings_json: settings_json.clone(),
                 expected_policy_version,
@@ -6685,31 +6687,138 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let mutation = async {
-                let settings =
-                    serde_json::from_str(&settings_json).map_err(|error| ErrorPayload {
-                        code: ErrorCode::BadRequest,
-                        message: format!("invalid image spend settings: {error}"),
-                    })?;
-                let saved = cockpit_config::config::image_spend::activate_saved_policy(
-                    &ctx.db,
-                    project_key,
-                    settings,
-                    expected_policy_version,
-                    chrono::Utc::now().timestamp_millis(),
-                )
-                .await
-                .map_err(internal)?;
-                Ok(Response::ImageSpendPolicySaved {
-                    policy_version: saved.policy_version,
-                })
-            };
-            finish_provider_mutation_future!(
-                remote_operation,
-                ctx,
+            #[cfg(feature = "remote")]
+            if remote_operation.is_some() {
+                let remote_hash =
+                    local_operation_request_hash(&(
+                        "save_image_spend_policy",
+                        &project_key,
+                        serde_json::from_str::<
+                            cockpit_config::config::image_spend::ImageSpendSettings,
+                        >(&settings_json)
+                        .map_err(|error| ErrorPayload {
+                            code: ErrorCode::BadRequest,
+                            message: format!("invalid image spend settings: {error}"),
+                        })?,
+                        expected_policy_version,
+                    ))?;
+                let operation_id = client_operation_id.clone();
+                let project = project_key.clone();
+                let mutation = async {
+                    let settings =
+                        serde_json::from_str(&settings_json).map_err(|error| ErrorPayload {
+                            code: ErrorCode::BadRequest,
+                            message: format!("invalid image spend settings: {error}"),
+                        })?;
+                    let saved = cockpit_config::config::image_spend::activate_saved_policy(
+                        &ctx.db,
+                        project.clone(),
+                        settings,
+                        expected_policy_version,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .map_err(internal)?;
+                    Ok(Response::ImageSpendPolicySaved {
+                        client_operation_id: operation_id,
+                        project_key: project,
+                        request_hash: local_operation_request_hash_hex(&remote_hash),
+                        consumed_policy_version: expected_policy_version,
+                        result_policy_version: saved.policy_version,
+                    })
+                };
+                return finish_provider_mutation_future!(
+                    remote_operation,
+                    ctx,
+                    "save_image_spend_policy",
+                    mutation
+                );
+            }
+            let settings: cockpit_config::config::image_spend::ImageSpendSettings =
+                serde_json::from_str(&settings_json).map_err(|error| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: format!("invalid image spend settings: {error}"),
+                })?;
+            settings.validate().map_err(|error| ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: format!("invalid image spend settings: {error}"),
+            })?;
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash = local_operation_request_hash(&(
                 "save_image_spend_policy",
-                mutation
+                &project_key,
+                &settings,
+                expected_policy_version,
+            ))?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "save_image_spend_policy",
+                request_hash,
             )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let owner = settlement_owner.clone();
+            let operation_id = client_operation_id.clone();
+            let project = project_key.clone();
+            let hash_hex = local_operation_request_hash_hex(&request_hash);
+            let result = ctx
+                .db
+                .transaction(move |conn| {
+                    let result_policy_version = cockpit_db::Db::save_image_spend_policy_conn(
+                        conn,
+                        &project,
+                        &settings,
+                        expected_policy_version,
+                        chrono::Utc::now().timestamp_millis(),
+                    )?;
+                    let response = Response::ImageSpendPolicySaved {
+                        client_operation_id: operation_id.clone(),
+                        project_key: project,
+                        request_hash: hash_hex,
+                        consumed_policy_version: expected_policy_version,
+                        result_policy_version,
+                    };
+                    let receipt_json = serde_json::to_string(&response)?;
+                    let settled = conn.execute(
+                        "UPDATE local_operation_receipts
+                         SET state='terminal_success',terminal_outcome_json=?5,
+                             execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                         WHERE owner_digest=?1 AND client_operation_id=?2
+                           AND request_hash=?3 AND fencing_generation=?4
+                           AND state='executing'",
+                        rusqlite::params![
+                            owner,
+                            operation_id,
+                            request_hash.as_slice(),
+                            fencing_generation,
+                            receipt_json,
+                            chrono::Utc::now().timestamp_millis()
+                        ],
+                    )?;
+                    if settled != 1 {
+                        anyhow::bail!("image spend policy save lost its receipt fence");
+                    }
+                    Ok(response)
+                })
+                .await
+                .map_err(internal);
+            if let Err(error) = &result {
+                finish_local_operation_error(
+                    ctx,
+                    settlement_owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    error,
+                )
+                .await?;
+            }
+            result
         }
 
         Request::FsCreateDir { project_root, path } => {

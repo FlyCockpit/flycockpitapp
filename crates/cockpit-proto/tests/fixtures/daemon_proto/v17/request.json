@@ -1644,6 +1644,7 @@
   },
   "save_image_spend_policy": {
     "params": {
+      "client_operation_id": "01993cb4-a800-7000-8000-000000000017",
       "project_key": "example",
       "settings_json": "{}",
       "expected_policy_version": 7

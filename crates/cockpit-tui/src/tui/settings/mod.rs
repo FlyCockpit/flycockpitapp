@@ -1141,6 +1141,17 @@ enum PendingSettingsOperation {
         target: SettingsEffectTarget,
         prompt: category::ShadowedGlobalPrompt,
     },
+    ImageSpendLoad {
+        target: SettingsEffectTarget,
+        project_key: String,
+        page_instance_id: uuid::Uuid,
+    },
+    BudgetPolicySavePrepare {
+        target: SettingsEffectTarget,
+        project_key: String,
+        settings: cockpit_config::config::image_spend::ImageSpendSettings,
+        page_instance_id: uuid::Uuid,
+    },
     ProviderMutation {
         target: SettingsEffectTarget,
         client_operation_id: String,
@@ -1214,6 +1225,8 @@ impl PendingSettingsOperation {
             },
             Self::ExtendedRefresh { target, .. }
             | Self::ProjectShadowSnapshot { target, .. }
+            | Self::ImageSpendLoad { target, .. }
+            | Self::BudgetPolicySavePrepare { target, .. }
             | Self::ProviderMutation { target, .. }
             | Self::Followup { target, .. }
             | Self::SimpleMutation { target, .. }
@@ -1311,6 +1324,14 @@ enum SettingsMutationAction {
         client_operation_id: String,
         project_root: String,
     },
+    ImageSpendSave {
+        client_operation_id: String,
+        project_key: String,
+        settings: cockpit_config::config::image_spend::ImageSpendSettings,
+        expected_policy_version: Option<u64>,
+        expected_request_hash: String,
+        page_instance_id: uuid::Uuid,
+    },
 }
 
 impl SettingsMutationAction {
@@ -1325,6 +1346,7 @@ impl SettingsMutationAction {
                 "put_provider_credential"
             }
             Self::CopilotSetup { .. } => "setup_copilot_auth",
+            Self::ImageSpendSave { .. } => "save_image_spend_policy",
         }
     }
 
@@ -1361,12 +1383,39 @@ impl SettingsMutationAction {
             | Self::CopilotSetup {
                 client_operation_id,
                 ..
+            }
+            | Self::ImageSpendSave {
+                client_operation_id,
+                ..
             } => client_operation_id,
         }
     }
 
     fn matches_durable_receipt(&self, response: &Response) -> bool {
         match (self, response) {
+            (
+                Self::ImageSpendSave {
+                    client_operation_id,
+                    project_key,
+                    expected_policy_version,
+                    expected_request_hash,
+                    ..
+                },
+                Response::ImageSpendPolicySaved {
+                    client_operation_id: returned_id,
+                    project_key: returned_project,
+                    request_hash,
+                    consumed_policy_version,
+                    result_policy_version,
+                },
+            ) => {
+                returned_id == client_operation_id
+                    && returned_project == project_key
+                    && request_hash == expected_request_hash
+                    && consumed_policy_version == expected_policy_version
+                    && *result_policy_version
+                        == expected_policy_version.map_or(1, |version| version.saturating_add(1))
+            }
             (
                 Self::McpOAuthBegin {
                     client_operation_id,
@@ -1558,6 +1607,35 @@ fn valid_local_settlement_hash(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn settlement_hash_matches(operation: &PendingSettingsOperation, observed: &str) -> bool {
+    let expected = match operation {
+        PendingSettingsOperation::SimpleMutation { action, .. } => match action {
+            SettingsMutationAction::McpOAuthBegin {
+                expected_request_hash,
+                ..
+            }
+            | SettingsMutationAction::McpOAuthComplete {
+                expected_request_hash,
+                ..
+            }
+            | SettingsMutationAction::McpOAuthCancel {
+                expected_request_hash,
+                ..
+            }
+            | SettingsMutationAction::ImageSpendSave {
+                expected_request_hash,
+                ..
+            } => Some(expected_request_hash.as_str()),
+            _ => None,
+        },
+        _ => None,
+    };
+    expected.map_or_else(
+        || valid_local_settlement_hash(observed),
+        |hash| hash == observed,
+    )
 }
 
 fn valid_vault_freshness(consumed: u64, result: u64, changed: bool) -> bool {
@@ -2615,6 +2693,7 @@ pub struct SettingsCx {
     pending_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_shadow_removal: Option<category::ShadowedGlobalPrompt>,
+    completed_image_spend: Option<ImageSpendCompletion>,
     pending_shadow_prompt: Option<category::ShadowedGlobalPrompt>,
     completed_provider_navigation: Option<(ProviderNavigation, ProvidersConfig)>,
     after_extended_commit: Vec<(SettingsEffectTarget, Request, &'static str)>,
@@ -2720,6 +2799,23 @@ pub struct SettingsCx {
     pub(super) dependency_refresh: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
+enum ImageSpendCompletion {
+    Loaded {
+        page_instance_id: uuid::Uuid,
+        settings: Option<cockpit_config::config::image_spend::ImageSpendSettings>,
+        policy_version: Option<u64>,
+    },
+    Saved {
+        page_instance_id: uuid::Uuid,
+        settings: cockpit_config::config::image_spend::ImageSpendSettings,
+        policy_version: u64,
+    },
+    Failed {
+        page_instance_id: uuid::Uuid,
+        message: String,
+    },
+}
+
 #[derive(Clone)]
 struct ProviderEditAuthority {
     snapshot_session_id: String,
@@ -2749,6 +2845,104 @@ impl SettingsCx {
             work: SettingsDaemonEffectWork::Request(request),
         });
         operation_id
+    }
+
+    pub(super) fn queue_image_spend_load(
+        &mut self,
+        project_key: String,
+        page_instance_id: uuid::Uuid,
+    ) {
+        let target = SettingsEffectTarget {
+            surface: "settings.image-spend-load",
+            owner: format!("{project_key}::{page_instance_id}"),
+            revision: None,
+        };
+        let operation_id = self.enqueue_daemon_effect(
+            target.clone(),
+            Request::GetImageSpendPolicy {
+                project_key: project_key.clone(),
+            },
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ImageSpendLoad {
+                target,
+                project_key,
+                page_instance_id,
+            },
+        );
+    }
+
+    pub(super) fn queue_budget_policy_save(
+        &mut self,
+        project_key: String,
+        settings: cockpit_config::config::image_spend::ImageSpendSettings,
+        page_instance_id: uuid::Uuid,
+    ) {
+        let target = SettingsEffectTarget {
+            surface: "settings.budget-save-prepare",
+            owner: format!("{project_key}::{page_instance_id}"),
+            revision: None,
+        };
+        let operation_id = self.enqueue_daemon_effect(
+            target.clone(),
+            Request::GetImageSpendPolicy {
+                project_key: project_key.clone(),
+            },
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::BudgetPolicySavePrepare {
+                target,
+                project_key,
+                settings,
+                page_instance_id,
+            },
+        );
+    }
+
+    fn queue_image_spend_save(
+        &mut self,
+        project_key: String,
+        settings: cockpit_config::config::image_spend::ImageSpendSettings,
+        expected_policy_version: Option<u64>,
+        page_instance_id: uuid::Uuid,
+    ) -> Result<(), String> {
+        let settings_json = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
+        let client_operation_id = uuid::Uuid::now_v7().to_string();
+        let expected_request_hash = local_receipt_request_hash(&(
+            "save_image_spend_policy",
+            &project_key,
+            &settings,
+            expected_policy_version,
+        ))?;
+        let target = SettingsEffectTarget {
+            surface: "settings.image-spend-save",
+            owner: format!("{project_key}::{page_instance_id}"),
+            revision: expected_policy_version.map(|version| version.to_string()),
+        };
+        let request = Request::SaveImageSpendPolicy {
+            client_operation_id: client_operation_id.clone(),
+            project_key: project_key.clone(),
+            settings_json,
+            expected_policy_version,
+        };
+        let operation_id = self.enqueue_daemon_effect(target.clone(), request);
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::SimpleMutation {
+                target,
+                action: SettingsMutationAction::ImageSpendSave {
+                    client_operation_id,
+                    project_key,
+                    settings,
+                    expected_policy_version,
+                    expected_request_hash,
+                    page_instance_id,
+                },
+            },
+        );
+        Ok(())
     }
 
     fn enqueue_settlement_effect(
@@ -2863,6 +3057,14 @@ impl SettingsCx {
                     });
                 }
                 SettingsMutationAction::ProviderCredentialPut { .. } => {}
+                SettingsMutationAction::ImageSpendSave {
+                    page_instance_id, ..
+                } => {
+                    self.completed_image_spend = Some(ImageSpendCompletion::Failed {
+                        page_instance_id,
+                        message: message.clone(),
+                    });
+                }
             },
             // Extended and typed-document drafts are intentionally untouched:
             // the authoritative rejection proves their base revision was not
@@ -3341,6 +3543,79 @@ impl SettingsCx {
                     self.pending_shadow_prompt = Some(prompt);
                 }
             }
+            PendingSettingsOperation::ImageSpendLoad {
+                target,
+                project_key: _,
+                page_instance_id,
+            } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                self.completed_image_spend = Some(match completion.response {
+                    Ok(Response::ImageSpendPolicy {
+                        settings,
+                        policy_version,
+                    }) if settings.is_some() == policy_version.is_some() => {
+                        ImageSpendCompletion::Loaded {
+                            page_instance_id,
+                            settings,
+                            policy_version,
+                        }
+                    }
+                    Ok(other) => ImageSpendCompletion::Failed {
+                        page_instance_id,
+                        message: format!("unexpected image spend read response: {other:?}"),
+                    },
+                    Err(error) => ImageSpendCompletion::Failed {
+                        page_instance_id,
+                        message: error,
+                    },
+                });
+            }
+            PendingSettingsOperation::BudgetPolicySavePrepare {
+                target,
+                project_key,
+                mut settings,
+                page_instance_id,
+            } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                match completion.response {
+                    Ok(Response::ImageSpendPolicy {
+                        settings: current,
+                        policy_version,
+                    }) if current.is_some() == policy_version.is_some() => {
+                        // The compact budget editor owns only the three budget
+                        // scopes. Preserve the daemon-owned epoch policy from
+                        // the exact version consumed by this mutation.
+                        settings.project_epoch = current.and_then(|value| value.project_epoch);
+                        if let Err(error) = self.queue_image_spend_save(
+                            project_key,
+                            settings,
+                            policy_version,
+                            page_instance_id,
+                        ) {
+                            self.completed_image_spend = Some(ImageSpendCompletion::Failed {
+                                page_instance_id,
+                                message: error,
+                            });
+                        }
+                    }
+                    Ok(other) => {
+                        self.completed_image_spend = Some(ImageSpendCompletion::Failed {
+                            page_instance_id,
+                            message: format!("unexpected image spend read response: {other:?}"),
+                        });
+                    }
+                    Err(error) => {
+                        self.completed_image_spend = Some(ImageSpendCompletion::Failed {
+                            page_instance_id,
+                            message: error,
+                        });
+                    }
+                }
+            }
             PendingSettingsOperation::ProviderCatalog {
                 project_root,
                 provider_id,
@@ -3604,6 +3879,37 @@ impl SettingsCx {
                     return Ok(());
                 }
                 let result = match (action, completion.response) {
+                    (
+                        SettingsMutationAction::ImageSpendSave {
+                            client_operation_id,
+                            project_key,
+                            settings,
+                            expected_policy_version,
+                            expected_request_hash,
+                            page_instance_id,
+                        },
+                        Ok(Response::ImageSpendPolicySaved {
+                            client_operation_id: returned_operation_id,
+                            project_key: returned_project_key,
+                            request_hash,
+                            consumed_policy_version,
+                            result_policy_version,
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && returned_project_key == project_key
+                        && request_hash == expected_request_hash
+                        && consumed_policy_version == expected_policy_version
+                        && result_policy_version
+                            == expected_policy_version
+                                .map_or(1, |version| version.saturating_add(1)) =>
+                    {
+                        self.completed_image_spend = Some(ImageSpendCompletion::Saved {
+                            page_instance_id,
+                            settings,
+                            policy_version: result_policy_version,
+                        });
+                        Ok(format!("saved image spend policy v{result_policy_version}"))
+                    }
                     (
                         SettingsMutationAction::McpSave {
                             config,
@@ -3943,7 +4249,7 @@ impl SettingsCx {
                         terminal_cancelled: false,
                     }) if returned_id == client_operation_id
                         && expected_kind == Some(operation_kind.as_str())
-                        && valid_local_settlement_hash(&request_hash) =>
+                        && settlement_hash_matches(&original, &request_hash) =>
                     {
                         let original = *original;
                         let original_target = original.target();
@@ -3968,7 +4274,7 @@ impl SettingsCx {
                         terminal_cancelled: false,
                     }) if returned_id == client_operation_id
                         && expected_kind == Some(operation_kind.as_str())
-                        && valid_local_settlement_hash(&request_hash) =>
+                        && settlement_hash_matches(&original, &request_hash) =>
                     {
                         self.pending_settings.insert(
                             completion.operation_id,
@@ -3993,7 +4299,7 @@ impl SettingsCx {
                         terminal_cancelled,
                     }) if returned_id == client_operation_id
                         && expected_kind == Some(operation_kind.as_str())
-                        && valid_local_settlement_hash(&request_hash) =>
+                        && settlement_hash_matches(&original, &request_hash) =>
                     {
                         self.apply_terminal_settlement(*original, error, terminal_cancelled);
                     }
@@ -5622,6 +5928,16 @@ impl SettingsDialog {
                         prompt.setting.descriptor().label
                     ));
                 }
+                if let Some(completion) = self.cx.completed_image_spend.take() {
+                    if let Some(page) = self.page.downcast_mut::<image_spend::ImageSpendPage>() {
+                        page.apply_daemon_completion(completion);
+                    } else if let Some(page) = self
+                        .page
+                        .downcast_mut::<image_generation::BudgetEditorPage>()
+                    {
+                        page.apply_daemon_completion(completion);
+                    }
+                }
                 if let Some(McpPage::List(state)) = self.page.downcast_mut::<McpPage>() {
                     self.cx.adopt_pending_mcp_oauth(state);
                 }
@@ -6076,6 +6392,7 @@ impl SettingsDialog {
                 pending_provider_mutation_navigation: None,
                 completed_provider_mutation_navigation: None,
                 completed_shadow_removal: None,
+                completed_image_spend: None,
                 pending_shadow_prompt: None,
                 completed_provider_navigation: None,
                 after_extended_commit: Vec::new(),
@@ -7042,13 +7359,15 @@ impl SettingsPage for RootPage {
                         cx.reload_extended();
                         Some(category_page(CategoryPage::new(Category::Behavior)))
                     }
-                    "Image spend budgets" => Some(image_spend::page(
-                        cx.active_project_root
+                    "Image spend budgets" => {
+                        let project_key = cx
+                            .active_project_root
                             .as_ref()
                             .unwrap_or(&cx.extended_path)
                             .to_string_lossy()
-                            .into_owned(),
-                    )),
+                            .into_owned();
+                        Some(image_spend::page(project_key, cx))
+                    }
                     "Generation" => Some(image_generation::generation_list_page(
                         image_generation::GenerationPrincipal::from_session(
                             &cx.image_generation_session_snapshot(),

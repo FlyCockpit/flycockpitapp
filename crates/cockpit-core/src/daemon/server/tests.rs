@@ -10625,6 +10625,7 @@ async fn remote_owner_save_image_spend_policy_commits_and_replays() {
     // `ImageSpendSettings::validate` passes and the dispatch reaches the DB
     // write rather than a validation rejection.
     let request = Request::SaveImageSpendPolicy {
+        client_operation_id: "remote-image-save".into(),
         project_key: project_key.into(),
         settings_json: r#"{"request":"unlimited","session":"unlimited","project":"unlimited"}"#
             .into(),
@@ -17304,6 +17305,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             expected_config_generation: None,
         },
         "save_image_spend_policy" => Request::SaveImageSpendPolicy {
+            client_operation_id: "authz-image-save".into(),
             project_key: root.clone(),
             settings_json: "not json".into(),
             expected_policy_version: None,
@@ -24203,7 +24205,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::ExportPolicy { project_root: "/tmp/project".into() }, kind: "export_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImportPolicy { project_root: "/tmp/project".into(), bundle_json: "{}".into(), replace: false }, kind: "import_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetImageSpendPolicy { project_key: "proj".into() }, kind: "get_image_spend_policy", session_id: None, audit_path: None, mutating: false },
-        CommandMetadataCase { request: Request::SaveImageSpendPolicy { project_key: "proj".into(), settings_json: "{}".into(), expected_policy_version: None }, kind: "save_image_spend_policy", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::SaveImageSpendPolicy { client_operation_id: "image-save".into(), project_key: "proj".into(), settings_json: "{}".into(), expected_policy_version: None }, kind: "save_image_spend_policy", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ImageEndpointList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_endpoint_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImageEndpointGet { project_root: "/tmp/project".into(), endpoint_id: "ep1".into() }, kind: "image_endpoint_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImageTargetList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_target_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },

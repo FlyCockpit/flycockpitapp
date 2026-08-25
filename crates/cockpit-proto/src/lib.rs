@@ -1041,7 +1041,8 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// Current wire schema version. v17 adds explicit, owner-scoped provider OAuth
 /// cancellation so local frontends can terminally settle timed-out or dismissed
 /// daemon-owned PKCE/device flows. It also adds correlated durable configuration
-/// receipts and operation-bound external-editor settlement/status receipts.
+/// receipts, including atomic image-spend policy receipts, and operation-bound
+/// external-editor settlement/status receipts.
 pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Oldest wire schema version this binary accepts. v17 is current-only: the

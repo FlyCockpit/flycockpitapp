@@ -753,7 +753,12 @@ pub enum Response {
     },
 
     ImageSpendPolicySaved {
-        policy_version: u64,
+        client_operation_id: String,
+        project_key: String,
+        /// Lowercase SHA-256 of the exact non-secret request identity.
+        request_hash: String,
+        consumed_policy_version: Option<u64>,
+        result_policy_version: u64,
     },
 
     /// Redacted LOCAL image-generation control-plane read reply

@@ -3524,8 +3524,13 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "project_key:string|settings_json:string|expected_policy_version:option<u64>",
+      "fcorCanonicalSchema": "client_operation_id:string|project_key:string|settings_json:string|expected_policy_version:option<u64>",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "project_key",
           "role": "param",
@@ -3542,7 +3547,7 @@
           "type": "Option<u64>"
         }
       ],
-      "fcorSchema": "project_key:String|settings_json:String|expected_policy_version:Option<u64>",
+      "fcorSchema": "client_operation_id:String|project_key:String|settings_json:String|expected_policy_version:Option<u64>",
       "strategy": "nonrepeatable_dispatch",
       "tag": "save_image_spend_policy"
     },

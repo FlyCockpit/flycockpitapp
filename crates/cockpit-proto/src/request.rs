@@ -1850,6 +1850,8 @@ pub enum Request {
 
     /// Validate and persist an image spend policy through the daemon owner.
     SaveImageSpendPolicy {
+        /// Stable owner-chosen id used for durable replay and settlement.
+        client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         project_key: String,
         #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
@@ -3026,10 +3028,12 @@ impl Request {
                 validate_owner_identifier("project key", project_key, MAX_OWNER_PROVIDER_ID_BYTES)?;
             }
             Self::SaveImageSpendPolicy {
+                client_operation_id,
                 project_key,
                 settings_json,
                 ..
             } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_identifier("project key", project_key, MAX_OWNER_PROVIDER_ID_BYTES)?;
                 if settings_json.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
                     return Err("image spend settings exceed maximum length".to_string());
@@ -3661,7 +3665,7 @@ macro_rules! command {
             (Request::ImageTargetGet { project_root, target_id }, "image_target_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|target_id:String", [project_root: String => project_root, target_id: String => param]);
             (Request::ImageWorkflowList { project_root, limit, cursor }, "image_workflow_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
             (Request::ImageWorkflowGet { project_root, workflow_id }, "image_workflow_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|workflow_id:String", [project_root: String => project_root, workflow_id: String => param]);
-            (Request::SaveImageSpendPolicy { project_key, settings_json, expected_policy_version }, "save_image_spend_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_key:String|settings_json:String|expected_policy_version:Option<u64>", [project_key: String => param, settings_json: String => param, expected_policy_version: Option<u64> => param]);
+            (Request::SaveImageSpendPolicy { client_operation_id, project_key, settings_json, expected_policy_version }, "save_image_spend_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|project_key:String|settings_json:String|expected_policy_version:Option<u64>", [client_operation_id: String => param, project_key: String => param, settings_json: String => param, expected_policy_version: Option<u64> => param]);
             (Request::ImageEndpointCreate { project_root, endpoint_json, expected_config_generation }, "image_endpoint_create", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|endpoint_json:String|expected_config_generation:Option<u64>", [project_root: String => project_root, endpoint_json: String => param, expected_config_generation: Option<u64> => param]);
             (Request::ImageEndpointUpdate { project_root, endpoint_id, endpoint_json, expected_config_generation }, "image_endpoint_update", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|endpoint_id:String|endpoint_json:String|expected_config_generation:Option<u64>", [project_root: String => project_root, endpoint_id: String => param, endpoint_json: String => param, expected_config_generation: Option<u64> => param]);
             (Request::ImageEndpointDelete { project_root, endpoint_id, expected_config_generation }, "image_endpoint_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|endpoint_id:String|expected_config_generation:Option<u64>", [project_root: String => project_root, endpoint_id: String => param, expected_config_generation: Option<u64> => param]);

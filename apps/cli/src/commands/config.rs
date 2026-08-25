@@ -38,13 +38,18 @@ async fn image_spend(args: ImageSpendArgs) -> Result<()> {
         let saved = daemon
             .client
             .request(crate::daemon::proto::Request::SaveImageSpendPolicy {
+                client_operation_id: uuid::Uuid::now_v7().to_string(),
                 project_key,
                 settings_json: serde_json::to_string(&settings)?,
                 expected_policy_version,
             })
             .await?
             .map_err(|error| anyhow::anyhow!("daemon rejected image spend save: {error}"))?;
-        let crate::daemon::proto::Response::ImageSpendPolicySaved { policy_version } = saved else {
+        let crate::daemon::proto::Response::ImageSpendPolicySaved {
+            result_policy_version: policy_version,
+            ..
+        } = saved
+        else {
             bail!("daemon returned unexpected image spend save response: {saved:?}");
         };
         println!("saved image spend policy version {policy_version}");

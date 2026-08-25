@@ -668,14 +668,13 @@ impl OAuthFlowState {
     }
 
     pub(crate) fn apply_cancel_authoritative_failure(&mut self, error: String) {
-        self.pending = false;
+        // A rejected cancel is proof only that this cancel attempt did not
+        // terminate the original flow. Retain the daemon flow/session and the
+        // authority fence; Escape can issue another correlated cancellation.
+        self.pending = true;
         self.polling = false;
-        self.paste_focused = false;
-        self.focus_paste_after_begin = false;
-        self.manual_input.set("");
-        self.session = OAuthSession::None;
         self.status = Some(Err(format!(
-            "OAuth cancellation was authoritatively rejected: {error}"
+            "OAuth cancellation was authoritatively rejected; the login remains live. Press Esc to retry: {error}"
         )));
     }
 

@@ -2044,7 +2044,11 @@
   },
   "image_spend_policy_saved": {
     "data": {
-      "policy_version": 8
+      "client_operation_id": "01993cb4-a800-7000-8000-000000000017",
+      "project_key": "example",
+      "request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "consumed_policy_version": 7,
+      "result_policy_version": 8
     },
     "response": "image_spend_policy_saved"
   },

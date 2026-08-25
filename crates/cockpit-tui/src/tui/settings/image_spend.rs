@@ -1,11 +1,13 @@
 //! Interactive image-generation spend policy settings page.
 
 use std::any::Any;
+#[cfg(test)]
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use cockpit_config::config::image_spend::{
     BudgetPolicy, ImageSpendSettings, ImageSpendSuggestions, ProjectEpochPolicy,
 };
+#[cfg(test)]
 use cockpit_core::daemon::proto::{Request, Response};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -22,19 +24,23 @@ use super::{Nav, PageBox, SettingsCx, SettingsPage, SettingsPointerSurfaceKind};
 /// never crosses the wire, so it is deliberately absent here rather than
 /// reconstructed with placeholder values.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg(test)]
 struct LoadedImageSpendPolicy {
     settings: ImageSpendSettings,
     policy_version: u64,
 }
 
+#[cfg(test)]
 type LoadResult = Result<Option<LoadedImageSpendPolicy>, String>;
 
+#[cfg(test)]
 #[derive(Default)]
 struct WorkerCompletion {
     complete: Mutex<bool>,
     changed: Condvar,
 }
 
+#[cfg(test)]
 impl WorkerCompletion {
     fn finish(&self) {
         *self.complete.lock().unwrap() = true;
@@ -54,14 +60,17 @@ impl WorkerCompletion {
     }
 }
 
+#[cfg(test)]
 struct WorkerCompletionGuard(Arc<WorkerCompletion>);
 
+#[cfg(test)]
 impl Drop for WorkerCompletionGuard {
     fn drop(&mut self) {
         self.0.finish();
     }
 }
 
+#[cfg(test)]
 trait ImageSpendPersistence: Send + Sync {
     fn load(&self, project_key: String) -> LoadResult;
     fn save(
@@ -86,10 +95,12 @@ trait ImageSpendPersistence: Send + Sync {
 /// reducer runs on that runtime) and drive each request with `Handle::block_on`
 /// from the worker. Routing through the app runtime — rather than a throwaway
 /// per-call runtime — keeps the memoized daemon client and its I/O task alive.
+#[cfg(test)]
 struct DefaultImageSpendPersistence {
     runtime: Option<tokio::runtime::Handle>,
 }
 
+#[cfg(test)]
 impl DefaultImageSpendPersistence {
     /// Capture the ambient application runtime handle. Called from the settings
     /// reducer, which executes on that runtime; absent a runtime the persistence
@@ -123,6 +134,7 @@ impl DefaultImageSpendPersistence {
     }
 }
 
+#[cfg(test)]
 impl ImageSpendPersistence for DefaultImageSpendPersistence {
     fn load(&self, project_key: String) -> LoadResult {
         self.block_on(async move {
@@ -168,6 +180,7 @@ impl ImageSpendPersistence for DefaultImageSpendPersistence {
                 .map_err(|error| error.to_string())?;
             match client
                 .request(Request::SaveImageSpendPolicy {
+                    client_operation_id: uuid::Uuid::now_v7().to_string(),
                     project_key,
                     settings_json,
                     expected_policy_version: expected_version,
@@ -175,12 +188,13 @@ impl ImageSpendPersistence for DefaultImageSpendPersistence {
                 .await
                 .map_err(|error| error.to_string())?
             {
-                Ok(Response::ImageSpendPolicySaved { policy_version }) => {
-                    Ok(LoadedImageSpendPolicy {
-                        settings,
-                        policy_version,
-                    })
-                }
+                Ok(Response::ImageSpendPolicySaved {
+                    result_policy_version: policy_version,
+                    ..
+                }) => Ok(LoadedImageSpendPolicy {
+                    settings,
+                    policy_version,
+                }),
                 Ok(other) => Err(format!("unexpected image spend save response: {other:?}")),
                 Err(error) => Err(error.to_string()),
             }
@@ -199,13 +213,26 @@ fn image_spend_runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|error| error.to_string())
 }
 
-pub(super) fn page(project_key: String) -> PageBox {
-    page_with_persistence(
+pub(super) fn page(project_key: String, cx: &mut SettingsCx) -> PageBox {
+    let page_instance_id = uuid::Uuid::new_v4();
+    cx.queue_image_spend_load(project_key.clone(), page_instance_id);
+    Box::new(ImageSpendPage {
+        page_instance_id,
+        daemon_owned: true,
         project_key,
-        Arc::new(DefaultImageSpendPersistence::capture()),
-    )
+        cursor: 0,
+        editing_time_zone: false,
+        time_zone_before_edit: None,
+        editing_micros: None,
+        micros_buffer: String::new(),
+        draft: ImageSpendSettings::default(),
+        saved: ImageSpendSettings::default(),
+        version: None,
+        status: "Loading saved policy…".into(),
+    })
 }
 
+#[cfg(test)]
 fn page_with_persistence(
     project_key: String,
     persistence: Arc<dyn ImageSpendPersistence>,
@@ -220,6 +247,8 @@ fn page_with_persistence(
         let _ = tx.send(loader.load(key));
     });
     Box::new(ImageSpendPage {
+        page_instance_id: uuid::Uuid::new_v4(),
+        daemon_owned: false,
         project_key,
         cursor: 0,
         editing_time_zone: false,
@@ -239,6 +268,8 @@ fn page_with_persistence(
 }
 
 pub(super) struct ImageSpendPage {
+    page_instance_id: uuid::Uuid,
+    daemon_owned: bool,
     project_key: String,
     cursor: usize,
     editing_time_zone: bool,
@@ -249,14 +280,59 @@ pub(super) struct ImageSpendPage {
     saved: ImageSpendSettings,
     version: Option<u64>,
     status: String,
+    #[cfg(test)]
     load: Mutex<Option<mpsc::Receiver<LoadResult>>>,
+    #[cfg(test)]
     save: Mutex<Option<mpsc::Receiver<Result<LoadedImageSpendPolicy, String>>>>,
+    #[cfg(test)]
     load_completion: Arc<WorkerCompletion>,
+    #[cfg(test)]
     save_completion: Mutex<Option<Arc<WorkerCompletion>>>,
+    #[cfg(test)]
     persistence: Arc<dyn ImageSpendPersistence>,
 }
 
 impl ImageSpendPage {
+    pub(super) fn apply_daemon_completion(&mut self, completion: super::ImageSpendCompletion) {
+        match completion {
+            super::ImageSpendCompletion::Loaded {
+                page_instance_id,
+                settings,
+                policy_version,
+            } if page_instance_id == self.page_instance_id => match (settings, policy_version) {
+                (Some(settings), Some(policy_version)) => {
+                    self.version = Some(policy_version);
+                    self.saved = settings.clone();
+                    self.draft = settings;
+                    self.status = "Saved policy loaded.".into();
+                }
+                (None, None) => {
+                    self.status = "No saved policy; paid dispatch is blocked.".into();
+                }
+                _ => {
+                    self.status = "Could not load policy: inconsistent daemon snapshot".into();
+                }
+            },
+            super::ImageSpendCompletion::Saved {
+                page_instance_id,
+                settings,
+                policy_version,
+            } if page_instance_id == self.page_instance_id => {
+                self.version = Some(policy_version);
+                self.saved = settings.clone();
+                self.draft = settings;
+                self.status = format!("Saved policy version {policy_version}.");
+            }
+            super::ImageSpendCompletion::Failed {
+                page_instance_id,
+                message,
+            } if page_instance_id == self.page_instance_id => {
+                self.status = format!("Policy operation failed: {message}");
+            }
+            _ => {}
+        }
+    }
+
     fn edit_micros(&mut self, code: KeyCode) {
         let Some(scope) = self.editing_micros else {
             return;
@@ -321,6 +397,15 @@ impl ImageSpendPage {
     }
 
     pub(super) fn poll(&mut self) {
+        if self.daemon_owned {
+            return;
+        }
+        #[cfg(test)]
+        self.poll_test_persistence();
+    }
+
+    #[cfg(test)]
+    fn poll_test_persistence(&mut self) {
         let load_result = {
             let load = self.load.lock().unwrap();
             load.as_ref().and_then(|rx| match rx.try_recv() {
@@ -390,25 +475,41 @@ impl ImageSpendPage {
         };
     }
 
-    fn save(&mut self) {
+    fn save(&mut self, cx: &mut SettingsCx) {
         if let Err(reason) = self.draft.validate() {
             self.status = format!("Not saved: {reason:?}. Review every required choice.");
             return;
         }
-        let (tx, rx) = mpsc::sync_channel(1);
-        let project_key = self.project_key.clone();
-        let draft = self.draft.clone();
-        let version = self.version;
-        let persistence = self.persistence.clone();
-        let completion = Arc::new(WorkerCompletion::default());
-        let worker_completion = completion.clone();
-        std::thread::spawn(move || {
-            let _completion = WorkerCompletionGuard(worker_completion);
-            let _ = tx.send(persistence.save(project_key, draft, version));
-        });
-        *self.save.lock().unwrap() = Some(rx);
-        *self.save_completion.lock().unwrap() = Some(completion);
-        self.status = "Saving reviewed policy…".into();
+        if self.daemon_owned {
+            if let Err(error) = cx.queue_image_spend_save(
+                self.project_key.clone(),
+                self.draft.clone(),
+                self.version,
+                self.page_instance_id,
+            ) {
+                self.status = format!("Policy was not saved: {error}");
+            } else {
+                self.status = "Saving reviewed policy…".into();
+            }
+            return;
+        }
+        #[cfg(test)]
+        {
+            let (tx, rx) = mpsc::sync_channel(1);
+            let project_key = self.project_key.clone();
+            let draft = self.draft.clone();
+            let version = self.version;
+            let persistence = self.persistence.clone();
+            let completion = Arc::new(WorkerCompletion::default());
+            let worker_completion = completion.clone();
+            std::thread::spawn(move || {
+                let _completion = WorkerCompletionGuard(worker_completion);
+                let _ = tx.send(persistence.save(project_key, draft, version));
+            });
+            *self.save.lock().unwrap() = Some(rx);
+            *self.save_completion.lock().unwrap() = Some(completion);
+            self.status = "Saving reviewed policy…".into();
+        }
     }
 
     fn adjust_selected(&mut self, increase: bool) {
@@ -458,7 +559,7 @@ impl SettingsPage for ImageSpendPage {
         SettingsPointerSurfaceKind::Category
     }
 
-    fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         self.poll();
         if self.editing_micros.is_some() {
             self.edit_micros(key.code);
@@ -500,7 +601,7 @@ impl SettingsPage for ImageSpendPage {
                             Some(ProjectEpochPolicy::Rolling { .. }) => None,
                         }
                     }
-                    4 => self.save(),
+                    4 => self.save(cx),
                     _ => {}
                 }
                 Nav::Stay
@@ -684,6 +785,8 @@ mod tests {
 
     fn fixture() -> ImageSpendPage {
         ImageSpendPage {
+            page_instance_id: uuid::Uuid::new_v4(),
+            daemon_owned: false,
             project_key: "project".into(),
             cursor: 0,
             editing_time_zone: false,

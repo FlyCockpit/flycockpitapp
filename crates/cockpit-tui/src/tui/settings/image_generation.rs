@@ -747,6 +747,8 @@ pub(super) struct WorkflowEditorPage {
 
 /// Budget editor page.
 pub(super) struct BudgetEditorPage {
+    pub(super) page_instance_id: uuid::Uuid,
+    pub(super) save_pending: bool,
     pub(super) cursor: usize,
     pub(super) principal: GenerationPrincipal,
     pub(super) state: BudgetEditorState,
@@ -835,6 +837,8 @@ pub(super) fn workflow_editor_page(principal: GenerationPrincipal) -> PageBox {
 
 pub(super) fn budget_editor_page(principal: GenerationPrincipal) -> PageBox {
     boxed(BudgetEditorPage {
+        page_instance_id: uuid::Uuid::new_v4(),
+        save_pending: false,
         cursor: 0,
         principal,
         state: BudgetEditorState::unconfigured(),
@@ -1388,6 +1392,28 @@ impl SettingsPage for WorkflowEditorPage {
 }
 
 impl BudgetEditorPage {
+    pub(super) fn apply_daemon_completion(&mut self, completion: super::ImageSpendCompletion) {
+        match completion {
+            super::ImageSpendCompletion::Saved {
+                page_instance_id,
+                policy_version,
+                ..
+            } if page_instance_id == self.page_instance_id => {
+                self.save_pending = false;
+                self.state.blocks_paid_generation = false;
+                self.status = Some(format!("Budget saved (policy v{policy_version})."));
+            }
+            super::ImageSpendCompletion::Failed {
+                page_instance_id,
+                message,
+            } if page_instance_id == self.page_instance_id => {
+                self.save_pending = false;
+                self.status = Some(format!("Save failed: {message}"));
+            }
+            _ => {}
+        }
+    }
+
     /// Resolve the owner-remoted budget project key from the dialog context.
     /// Falls back to the edited config layer path when no active launch project
     /// root is present (the same rule the Image Spend page uses).
@@ -1409,9 +1435,7 @@ impl BudgetEditorPage {
     /// reaches the daemon and is told why with a stable reason.
     fn dispatch_save(&mut self, cx: &mut SettingsCx) {
         if !self.principal.can_mutate_config() {
-            self.status = Some(format!(
-                "Save unavailable: {REASON_FORBIDDEN_IMAGE_ADMIN}"
-            ));
+            self.status = Some(format!("Save unavailable: {REASON_FORBIDDEN_IMAGE_ADMIN}"));
             return;
         }
         let settings = cockpit_config::config::image_spend::ImageSpendSettings {
@@ -1423,35 +1447,10 @@ impl BudgetEditorPage {
             // unchanged here (None = daemon keeps its current epoch policy).
             project_epoch: None,
         };
-        let settings_json = match serde_json::to_string(&settings) {
-            Ok(json) => json,
-            Err(error) => {
-                self.status = Some(format!("Save failed: {error}"));
-                return;
-            }
-        };
         let project_key = Self::budget_project_key(cx);
-        match super::settings_daemon_request(
-            cockpit_core::daemon::proto::Request::SaveImageSpendPolicy {
-                project_key,
-                settings_json,
-                // First-write semantics: no optimistic version fence yet (the
-                // editor does not load a prior policy version). The daemon owner
-                // remains the single authority and rejects an inconsistent set.
-                expected_policy_version: None,
-            },
-        ) {
-            Ok(cockpit_core::daemon::proto::Response::ImageSpendPolicySaved { policy_version }) => {
-                self.state.blocks_paid_generation = false;
-                self.status = Some(format!("Budget saved (policy v{policy_version})."));
-            }
-            Ok(other) => {
-                self.status = Some(format!("Unexpected save response: {other:?}"));
-            }
-            Err(error) => {
-                self.status = Some(format!("Save failed: {error}"));
-            }
-        }
+        self.save_pending = true;
+        self.status = Some("Resolving current policy before save…".into());
+        cx.queue_budget_policy_save(project_key, settings, self.page_instance_id);
     }
 }
 
@@ -1460,6 +1459,9 @@ impl SettingsPage for BudgetEditorPage {
         SettingsPointerSurfaceKind::BudgetEditor
     }
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        if self.save_pending {
+            return Nav::Stay;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => Nav::Back,
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1469,7 +1471,14 @@ impl SettingsPage for BudgetEditorPage {
             _ => Nav::Stay,
         }
     }
-    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, action: SettingsPointerAction) -> Nav {
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        if self.save_pending {
+            return Nav::Stay;
+        }
         match &action {
             SettingsPointerAction::Generation(GenerationAction::SaveBudget) => {
                 self.dispatch_save(cx);
@@ -2409,6 +2418,8 @@ mod tests {
         assert!(state.request.generation.is_none());
 
         let page = BudgetEditorPage {
+            page_instance_id: uuid::Uuid::new_v4(),
+            save_pending: false,
             cursor: 0,
             principal: GenerationPrincipal::local_owner(),
             state: BudgetEditorState::unconfigured(),
@@ -2684,6 +2695,8 @@ mod tests {
             SettingsPointerSurfaceKind::WorkflowEditor
         );
         let budget = BudgetEditorPage {
+            page_instance_id: uuid::Uuid::new_v4(),
+            save_pending: false,
             cursor: 0,
             principal: GenerationPrincipal::local_owner(),
             state: BudgetEditorState::unconfigured(),

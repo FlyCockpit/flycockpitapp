@@ -739,6 +739,11 @@ fn tui_agent_authority_is_daemon_owned() {
         assert!(production.contains(rpc), "missing agent owner RPC: {rpc}");
     }
     assert!(!production.contains("std::fs::write("));
+    assert!(agents.contains("Uuid::new_v4().to_string()"));
+    assert!(
+        !agents.contains("client_operation_id: \"editor-operation\""),
+        "each editor handoff needs a fresh idempotency identity"
+    );
     assert_eq!(
         production
             .matches("cockpit_config::config::write_config_bytes_atomic(&staging.path")

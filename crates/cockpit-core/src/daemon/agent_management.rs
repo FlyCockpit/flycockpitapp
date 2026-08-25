@@ -82,6 +82,13 @@ pub async fn begin_editor_lease(
                 "agent editor client operation was reused for a different request",
             ));
         }
+        if existing.expires_at_unix_ms < chrono::Utc::now().timestamp_millis()
+            && existing.state != "terminal"
+        {
+            return Err(conflict(
+                "agent editor lease acquisition expired before it was acknowledged; start a new editor handoff",
+            ));
+        }
         let snapshot: AgentEditSnapshot =
             serde_json::from_str(&existing.snapshot_json).map_err(internal)?;
         return Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
@@ -128,6 +135,7 @@ pub async fn begin_editor_lease(
             completion_hash: None,
             terminal_result_json: None,
             expires_at_unix_ms,
+            updated_at_unix_ms: chrono::Utc::now().timestamp_millis(),
         })
         .await;
     if let Err(insert_error) = inserted {
@@ -144,6 +152,13 @@ pub async fn begin_editor_lease(
             && existing.agent_name == replay_name
             && existing.consumed_revision == replay_revision
         {
+            if existing.expires_at_unix_ms < chrono::Utc::now().timestamp_millis()
+                && existing.state != "terminal"
+            {
+                return Err(conflict(
+                    "agent editor lease acquisition expired before it was acknowledged; start a new editor handoff",
+                ));
+            }
             let snapshot = serde_json::from_str(&existing.snapshot_json).map_err(internal)?;
             return Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
                 lease_id: existing.lease_id,
@@ -169,11 +184,15 @@ pub async fn complete_editor_lease(
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
     Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
-    let completion_hash: [u8; 32] = Sha256::digest(match markdown.as_deref() {
-        Some(value) => value.as_bytes(),
-        None => b"\0cancel",
-    })
-    .into();
+    let mut completion_hasher = Sha256::new();
+    match markdown.as_deref() {
+        Some(value) => {
+            completion_hasher.update(b"flycockpit.agent-editor.save.v1\0");
+            completion_hasher.update(value.as_bytes());
+        }
+        None => completion_hasher.update(b"flycockpit.agent-editor.cancel.v1\0"),
+    }
+    let completion_hash: [u8; 32] = completion_hasher.finalize().into();
     let known_lease = ctx
         .db
         .agent_editor_lease_by_id(lease_id.clone())
@@ -186,11 +205,10 @@ pub async fn complete_editor_lease(
             message: "agent editor lease belongs to another client principal".into(),
         });
     }
-    if known_lease.expires_at_unix_ms < chrono::Utc::now().timestamp_millis()
-        && known_lease.state != "terminal"
-    {
-        return Err(conflict("editor lease is expired"));
-    }
+    // Expiry prevents an unacknowledged Begin from being replayed as apparent
+    // success forever; it must not make an already-issued capability
+    // impossible to settle. Completion remains exact-hash and owner bound, so
+    // a client can reconcile a commit whose response was lost after the TTL.
     let lease = ctx
         .db
         .reserve_agent_editor_completion(
@@ -200,6 +218,15 @@ pub async fn complete_editor_lease(
         )
         .await
         .map_err(|error| conflict(error.to_string()))?;
+    let lease = match lease {
+        crate::db::agent_editor_leases::AgentEditorCompletionClaim::Execute(lease) => lease,
+        crate::db::agent_editor_leases::AgentEditorCompletionClaim::Pending => {
+            return Err(conflict(
+                "an exact editor completion is already executing; retry to query its durable result",
+            ));
+        }
+        crate::db::agent_editor_leases::AgentEditorCompletionClaim::Terminal(lease) => lease,
+    };
     if lease.project_root != root.to_string_lossy() {
         return Err(bad_request("editor lease belongs to another workspace"));
     }

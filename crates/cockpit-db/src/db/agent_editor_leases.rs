@@ -5,6 +5,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::Db;
 
+const COMPLETION_CLAIM_MS: i64 = 60_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentEditorLeaseRow {
     pub owner_digest: String,
@@ -18,6 +20,13 @@ pub struct AgentEditorLeaseRow {
     pub completion_hash: Option<[u8; 32]>,
     pub terminal_result_json: Option<String>,
     pub expires_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+pub enum AgentEditorCompletionClaim {
+    Execute(AgentEditorLeaseRow),
+    Pending,
+    Terminal(AgentEditorLeaseRow),
 }
 
 impl Db {
@@ -67,16 +76,26 @@ impl Db {
         lease_id: String,
         owner_digest: String,
         completion_hash: [u8; 32],
-    ) -> Result<AgentEditorLeaseRow> {
+    ) -> Result<AgentEditorCompletionClaim> {
         self.transaction(move |conn| {
             let row = by_id(conn, &lease_id)?.context("agent editor lease is absent")?;
             if row.owner_digest != owner_digest { bail!("agent editor lease belongs to another owner"); }
             if let Some(existing) = row.completion_hash
                 && existing != completion_hash { bail!("agent editor lease was settled with different content"); }
-            if row.state == "open" {
-                conn.execute("UPDATE agent_editor_leases SET state='completing',completion_hash=?2,updated_at_unix_ms=?3 WHERE lease_id=?1 AND state='open'", params![lease_id, completion_hash.as_slice(), now_ms()])?;
+            match row.state.as_str() {
+                "terminal" => return Ok(AgentEditorCompletionClaim::Terminal(row)),
+                "completing" if row.updated_at_unix_ms.saturating_add(COMPLETION_CLAIM_MS) > now_ms() => return Ok(AgentEditorCompletionClaim::Pending),
+                "completing" => {
+                    let changed = conn.execute("UPDATE agent_editor_leases SET updated_at_unix_ms=?2 WHERE lease_id=?1 AND state='completing' AND updated_at_unix_ms=?3", params![lease_id, now_ms(), row.updated_at_unix_ms])?;
+                    if changed != 1 { return Ok(AgentEditorCompletionClaim::Pending); }
+                    return Ok(AgentEditorCompletionClaim::Execute(by_id(conn, &lease_id)?.context("agent editor lease disappeared")?));
+                }
+                "open" => {}
+                _ => bail!("agent editor lease has an invalid state"),
             }
-            by_id(conn, &lease_id)?.context("agent editor lease disappeared")
+            let changed = conn.execute("UPDATE agent_editor_leases SET state='completing',completion_hash=?2,updated_at_unix_ms=?3 WHERE lease_id=?1 AND state='open'", params![lease_id, completion_hash.as_slice(), now_ms()])?;
+            if changed != 1 { return Ok(AgentEditorCompletionClaim::Pending); }
+            Ok(AgentEditorCompletionClaim::Execute(by_id(conn, &lease_id)?.context("agent editor lease disappeared")?))
         }).await
     }
 
@@ -127,7 +146,7 @@ fn query<P: rusqlite::Params>(
     params: P,
 ) -> Result<Option<AgentEditorLeaseRow>> {
     let sql = format!(
-        "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_json,state,completion_hash,terminal_result_json,expires_at_unix_ms FROM agent_editor_leases WHERE {predicate}"
+        "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_json,state,completion_hash,terminal_result_json,expires_at_unix_ms,updated_at_unix_ms FROM agent_editor_leases WHERE {predicate}"
     );
     conn.query_row(&sql, params, |row| {
         let hash: Option<Vec<u8>> = row.get(8)?;
@@ -146,6 +165,7 @@ fn query<P: rusqlite::Params>(
             completion_hash: hash,
             terminal_result_json: row.get(9)?,
             expires_at_unix_ms: row.get(10)?,
+            updated_at_unix_ms: row.get(11)?,
         })
     })
     .optional()

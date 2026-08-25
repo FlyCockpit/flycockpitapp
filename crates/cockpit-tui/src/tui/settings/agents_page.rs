@@ -2429,6 +2429,7 @@ impl SettingsCx {
         let cwd = self.agents_cwd();
         let name = editor.name.clone();
         let draft = p.editing.take().expect("editor checked above");
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
         p.stage(
             self,
             super::SettingsEffectTarget {
@@ -2437,13 +2438,13 @@ impl SettingsCx {
                 revision: Some(revision.clone()),
             },
             cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
-                client_operation_id: "editor-operation".into(),
+                client_operation_id: client_operation_id.clone(),
                 project_root: cwd.to_string_lossy().into_owned(),
                 name: name.clone(),
                 expected_revision: revision.clone(),
             },
             PendingAgentOperation::BeginLease {
-                client_operation_id: "editor-operation".into(),
+                client_operation_id,
                 cwd,
                 name,
                 expected_revision: revision,

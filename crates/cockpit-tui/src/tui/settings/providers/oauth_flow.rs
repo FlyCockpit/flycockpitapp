@@ -2,9 +2,6 @@ use super::super::pointer_actions::OAuthFlowId;
 use super::*;
 #[cfg(test)]
 use cockpit_core::auth::{codex_oauth, xai_oauth};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_OAUTH_FLOW_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSetupState) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
@@ -480,7 +477,10 @@ impl OAuthFlowState {
             OAuthProvider::Codex => FlowShape::DeviceCode,
         };
         Self {
-            flow_id: OAuthFlowId(NEXT_OAUTH_FLOW_ID.fetch_add(1, Ordering::Relaxed)),
+            // This identity survives long-lived async work and is included in
+            // retained retry state. A process-reset counter could alias a late
+            // completion from a previous TUI instance after reconnect.
+            flow_id: OAuthFlowId(uuid::Uuid::new_v4().as_u128()),
             provider,
             shape,
             cursor: 0,
@@ -1071,7 +1071,15 @@ pub(super) fn handle_oauth_flow_key_with(
     }
 
     match key.code {
-        KeyCode::Esc => OAuthKeyOutcome::back(Some(s.begin_cancel())),
+        KeyCode::Esc => {
+            if matches!(s.session, OAuthSession::None) {
+                OAuthKeyOutcome::back(None)
+            } else {
+                // The OAuth surface remains the owner until the exact cancel
+                // receipt settles; only apply_cancel may release navigation.
+                OAuthKeyOutcome::stay(Some(s.begin_cancel()))
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             s.cursor = oauth_option_cursor_prev(s.cursor, s.option_count(host));
             OAuthKeyOutcome::stay(None)

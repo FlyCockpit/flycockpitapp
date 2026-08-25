@@ -2958,7 +2958,7 @@
           "type": "Option<String>"
         }
       ],
-      "fcorSchema": "client_operation_id:String|flow_id:String|input:Option<String>",
+      "fcorSchema": "client_operation_id:String|flow_id:String|input:Option<SensitiveWirePayload>",
       "strategy": "none",
       "tag": "complete_provider_oauth"
     },
@@ -3033,7 +3033,7 @@
           "type": "Option<String>"
         }
       ],
-      "fcorSchema": "client_operation_id:String|flow_id:String|input:Option<String>",
+      "fcorSchema": "client_operation_id:String|flow_id:String|input:Option<SensitiveWirePayload>",
       "strategy": "none",
       "tag": "complete_mcp_oauth"
     },

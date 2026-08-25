@@ -695,7 +695,7 @@ async fn complete_provider_oauth_via_daemon(flow_id: String, input: Option<Strin
         .request(Request::CompleteProviderOAuth {
             client_operation_id: uuid::Uuid::new_v4().to_string(),
             flow_id,
-            input,
+            input: input.map(cockpit_proto::SensitiveWirePayload::new),
         })
         .await?
     {

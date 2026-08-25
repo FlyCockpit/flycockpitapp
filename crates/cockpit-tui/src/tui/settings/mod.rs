@@ -422,7 +422,7 @@ pub(crate) async fn execute_settings_daemon_work(
                 .request(Request::CompleteMcpOAuth {
                     client_operation_id,
                     flow_id,
-                    input: Some(input.take()),
+                    input: Some(cockpit_proto::SensitiveWirePayload::new(input.take())),
                 })
                 .await
                 .map_err(|error| error.to_string())?

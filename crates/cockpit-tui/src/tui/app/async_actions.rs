@@ -103,7 +103,7 @@ async fn complete_provider_oauth(
     let request = cockpit_core::daemon::proto::Request::CompleteProviderOAuth {
         client_operation_id: client_operation_id.clone(),
         flow_id: flow_id.clone(),
-        input: input.as_deref().map(ToOwned::to_owned),
+        input: input.map(|value| cockpit_proto::SensitiveWirePayload::new(value.take())),
     };
     let response = tokio::time::timeout(OAUTH_COMPLETE_TIMEOUT, client.request(request)).await;
     let response = match response {

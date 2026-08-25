@@ -11132,8 +11132,8 @@ async fn apply_provider_mutation(
 fn local_operation_request_hash<T: serde::Serialize>(
     request: &T,
 ) -> std::result::Result<[u8; 32], ErrorPayload> {
-    let encoded = serde_json::to_vec(request).map_err(internal)?;
-    Ok(Sha256::digest(encoded).into())
+    let encoded = zeroize::Zeroizing::new(serde_json::to_vec(request).map_err(internal)?);
+    Ok(Sha256::digest(encoded.as_slice()).into())
 }
 
 fn local_operation_request_hash_hex(request_hash: &[u8; 32]) -> String {

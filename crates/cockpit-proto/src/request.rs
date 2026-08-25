@@ -1504,7 +1504,7 @@ pub enum Request {
         client_operation_id: String,
         flow_id: String,
         #[serde(default)]
-        input: Option<String>,
+        input: Option<crate::SensitiveWirePayload>,
     },
 
     /// Cancel an in-progress daemon-owned provider OAuth flow. Cancellation is
@@ -1540,7 +1540,7 @@ pub enum Request {
         client_operation_id: String,
         flow_id: String,
         #[serde(default)]
-        input: Option<String>,
+        input: Option<crate::SensitiveWirePayload>,
     },
 
     /// Cancel an in-progress daemon-owned MCP OAuth flow.
@@ -3566,10 +3566,10 @@ macro_rules! command {
             // completion, and cancellation all carry owner idempotency keys and
             // use the local settlement ledger; none can cross the remote lane.
             (Request::BeginProviderOAuth { client_operation_id, provider_id }, "begin_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|provider_id:String", [client_operation_id: String => param, provider_id: String => param]);
-            (Request::CompleteProviderOAuth { client_operation_id, flow_id, input }, "complete_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|flow_id:String|input:Option<String>", [client_operation_id: String => param, flow_id: String => param, input: Option<String> => param]);
+            (Request::CompleteProviderOAuth { client_operation_id, flow_id, input }, "complete_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|flow_id:String|input:Option<SensitiveWirePayload>", [client_operation_id: String => param, flow_id: String => param, input: Option<SensitiveWirePayload> => param]);
             (Request::CancelProviderOAuth { client_operation_id, begin_client_operation_id, flow_id }, "cancel_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|begin_client_operation_id:String|flow_id:Option<String>", [client_operation_id: String => param, begin_client_operation_id: String => param, flow_id: Option<String> => param]);
             (Request::BeginMcpOAuth { client_operation_id, project_root, server }, "begin_mcp_oauth", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|server:String", [client_operation_id: String => param, project_root: String => project_root, server: String => param]);
-            (Request::CompleteMcpOAuth { client_operation_id, flow_id, input }, "complete_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|flow_id:String|input:Option<String>", [client_operation_id: String => param, flow_id: String => param, input: Option<String> => param]);
+            (Request::CompleteMcpOAuth { client_operation_id, flow_id, input }, "complete_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|flow_id:String|input:Option<SensitiveWirePayload>", [client_operation_id: String => param, flow_id: String => param, input: Option<SensitiveWirePayload> => param]);
             (Request::CancelMcpOAuth { client_operation_id, begin_client_operation_id, flow_id }, "cancel_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|begin_client_operation_id:String|flow_id:Option<String>", [client_operation_id: String => param, begin_client_operation_id: String => param, flow_id: Option<String> => param]);
             (Request::DeleteProviderCredential { client_operation_id, provider_id, project_root }, "delete_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|provider_id:String|project_root:Option<String>", [client_operation_id: String => param, provider_id: String => param, project_root: Option<String> => param]);
             #[cfg(feature = "remote")]

@@ -242,7 +242,7 @@ pub(super) enum WizardControlId {
     EditText,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct OAuthFlowId(pub u64);
+pub(super) struct OAuthFlowId(pub u128);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ConfirmationChoice {

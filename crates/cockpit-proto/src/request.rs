@@ -4073,7 +4073,10 @@ macro_rules! command {
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::AdmitImageIngress { session_id, source, admission_id }, "admit_image_ingress", session_writer, attached, true, local_only, none, serialized, none, "session_id:Uuid|source:ImageIngressSourceV1|admission_id:Uuid", [session_id: Uuid => session, source: ImageIngressSourceV1 => param, admission_id: Uuid => param]);
-            (Request::DiscardImageIngressDraft { session_id, admission_id, local_operation_id }, "discard_image_ingress_draft", owner_only, none, true, local_only, none, serialized, none, "session_id:Uuid|admission_id:Uuid|local_operation_id:Uuid", [session_id: Uuid => session, admission_id: Uuid => param, local_operation_id: Uuid => param]);
+            // Disposal remains available after the frontend has switched its
+            // attached session, but requires the same session-writer authority
+            // that could create the exact admission in the first place.
+            (Request::DiscardImageIngressDraft { session_id, admission_id, local_operation_id }, "discard_image_ingress_draft", session_writer, none, true, local_only, none, serialized, none, "session_id:Uuid|admission_id:Uuid|local_operation_id:Uuid", [session_id: Uuid => session, admission_id: Uuid => param, local_operation_id: Uuid => param]);
             (Request::RetainHttpsMedia(..), "retain_https_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status", public_read, none, false, read_only, none, serialized, none, "-", []);
             (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview", public_read, none, false, read_only, none, serialized, none, "-", []);

@@ -1484,7 +1484,7 @@ fn permanent_publication_bridges_have_closed_typed_signatures() {
             "insert_agent_mutation_journal_under_publication_lock",
             2_usize,
         ),
-        ("prepare_agent_editor_publication_under_publication_lock", 6),
+        ("prepare_agent_editor_publication_under_publication_lock", 8),
         ("record_agent_editor_publication_under_publication_lock", 5),
     ]);
     let expected_types = BTreeMap::from([
@@ -1494,7 +1494,9 @@ fn permanent_publication_bridges_have_closed_typed_signatures() {
         ),
         (
             "prepare_agent_editor_publication_under_publication_lock",
-            vec!["String", "[u8;32]", "String", "String", "String"],
+            vec![
+                "String", "[u8;32]", "String", "String", "String", "u64", "u64",
+            ],
         ),
         (
             "record_agent_editor_publication_under_publication_lock",

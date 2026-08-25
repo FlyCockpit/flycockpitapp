@@ -437,6 +437,7 @@ fn production_uses_cockpit_proto_directly() {
                 if imported == "cockpit_core"
                     || imported == "cockpit_core::self"
                     || imported == "cockpit_core::daemon"
+                    || imported == "cockpit_core::daemon::self"
                     || imported == "cockpit_core::daemon::proto"
                     || imported.starts_with("cockpit_core::daemon::proto::")
                 {

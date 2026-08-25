@@ -47,12 +47,15 @@ fn provider_config_journal_actions_have_strict_payload_shapes() {
         conn.execute(
             "INSERT INTO provider_config_journals
              (journal_id, project_root, provider_id, action, config_path,
-              consumed_revision, intended_revision, entry_json,
+              consumed_revision, intended_revision, consumed_config_generation,
+              intended_config_generation, entry_json,
               cleanup_named_json, cleanup_credential_json, created_at)
              VALUES (lower(hex(randomblob(16))), '/project', ?1, ?2,
                      CASE WHEN ?2 IN ('save', 'batch') THEN '/project/.cockpit/config.json' END,
                      CASE WHEN ?2 IN ('save', 'batch') THEN lower(hex(zeroblob(32))) END,
                      CASE WHEN ?2 IN ('save', 'batch') THEN lower(hex(zeroblob(32))) END,
+                     CASE WHEN ?2 IN ('save', 'batch') THEN 7 END,
+                     CASE WHEN ?2 IN ('save', 'batch') THEN 8 END,
                      ?3, '[]', '[]', 1)",
             rusqlite::params![provider_id, action, entry],
         )
@@ -95,6 +98,28 @@ fn authority_journals_bind_exact_fenced_terminal_receipts() {
             );
         }
     }
+}
+
+#[test]
+fn interrupted_settlement_excludes_provider_journal_owned_receipts() {
+    let source = include_str!("../src/db/local_operation_receipts.rs");
+    let settlement = source
+        .split("pub async fn settle_interrupted_local_operations")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn finish_local_operation").next())
+        .expect("interrupted local-operation settlement source");
+    assert!(settlement.contains("NOT EXISTS ("));
+    assert!(settlement.contains("FROM provider_config_journals journal"));
+    assert!(settlement.contains("journal.owner_digest=local_operation_receipts.owner_digest"));
+    assert!(
+        settlement
+            .contains("journal.client_operation_id=local_operation_receipts.client_operation_id")
+    );
+    assert!(settlement.contains("journal.request_hash=local_operation_receipts.request_hash"));
+    assert!(
+        settlement
+            .contains("journal.fencing_generation=local_operation_receipts.fencing_generation")
+    );
 }
 
 #[test]

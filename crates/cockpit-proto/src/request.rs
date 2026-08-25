@@ -5476,19 +5476,11 @@ mod tests {
                 "local protocol unexpectedly accepts legacy provider mutation `{tag}`"
             );
         }
-        let current = include_str!("../tests/fixtures/daemon_proto/v17/request.json");
-        for tag in [
-            "upsert_provider_config",
-            "save_provider_config",
-            "delete_provider_config",
-            "set_provider_layer_metadata",
-            "apply_setup_wizard",
-        ] {
-            assert!(
-                !current.contains(&format!("\"request\": \"{tag}\"")),
-                "current local fixture still advertises legacy provider mutation `{tag}`"
-            );
-        }
+        // Full-shape daemon fixtures are intentionally remote-profile
+        // archaeology and are exhaustively checked only with `remote`.
+        // This test is the local-profile source of truth: it exercises the
+        // actual default-feature deserializer rather than inspecting that
+        // remote fixture as if it represented a local binary.
     }
 
     #[cfg(feature = "remote")]

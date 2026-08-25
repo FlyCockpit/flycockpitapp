@@ -9092,10 +9092,11 @@ async fn provider_journal_recovery_fails_closed_on_dead_credential_reference() {
                 conn.execute(
                     "INSERT INTO provider_config_journals
                      (journal_id, project_root, provider_id, action, config_path,
-                      consumed_revision, intended_revision, entry_json,
+                      consumed_revision, intended_revision, consumed_config_generation,
+                      intended_config_generation, entry_json,
                       cleanup_named_json, cleanup_credential_json, created_at)
                      VALUES (?1, ?2, 'victim', 'save', '/invalid/dead-reference-test',
-                             ?3, ?3, ?4, '[]', '[]', ?5)",
+                             ?3, ?3, 7, 8, ?4, '[]', '[]', ?5)",
                     rusqlite::params![journal_id, root_owned, "00".repeat(32), entry_json, now],
                 )?;
                 Ok(())

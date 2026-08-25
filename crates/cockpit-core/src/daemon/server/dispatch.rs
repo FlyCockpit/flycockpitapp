@@ -14419,6 +14419,8 @@ async fn apply_provider_mutation(
             &snapshot_session_id,
             &layer_id,
             &expected_revision,
+            capability.config_generation,
+            &mutation_intent_hash,
         )
         .await?;
         {
@@ -15491,6 +15493,7 @@ async fn stage_and_recover_provider_batch(
     snapshot_session_id: &str,
     layer_id: &str,
     consumed_revision: &str,
+    consumed_config_generation: u64,
     mutation_intent_hash: &str,
 ) -> std::result::Result<ProviderMutationJournalCommit, ErrorPayload> {
     recover_provider_config_journals(ctx, project_root, None).await?;
@@ -15646,6 +15649,9 @@ async fn stage_and_recover_provider_batch(
     retain_only_stale_provider_credentials(&desired, &mut cleanup_credentials);
 
     let result_revision = provider_config_revision(&desired)?;
+    let intended_config_generation = consumed_config_generation
+        .checked_add(1)
+        .ok_or_else(|| internal("provider config generation exhausted"))?;
     // This is durable intent, not publication. Recovery replaces this
     // sentinel only after the reference-only file has converged. Publishing a
     // process-local generation before the filesystem commit lets a crash
@@ -15677,6 +15683,10 @@ async fn stage_and_recover_provider_batch(
     let journal_operation_id = receipt_operation_id.clone();
     let consumed_revision_for_tx = consumed_revision.to_owned();
     let intended_revision_for_tx = result_revision.clone();
+    let consumed_config_generation_for_tx = i64::try_from(consumed_config_generation)
+        .map_err(|_| internal("provider config generation exceeds SQLite range"))?;
+    let intended_config_generation_for_tx = i64::try_from(intended_config_generation)
+        .map_err(|_| internal("provider config generation exceeds SQLite range"))?;
     ctx.db
         .transaction(move |conn| {
             let mut inserted_named_claims = std::collections::BTreeSet::new();
@@ -15744,10 +15754,11 @@ async fn stage_and_recover_provider_batch(
                  (journal_id, owner_digest, client_operation_id, request_hash,
                  fencing_generation, terminal_response_json, project_root,
                   provider_id, action, config_path, consumed_revision,
-                  intended_revision, entry_json, cleanup_named_json,
+                  intended_revision, consumed_config_generation,
+                  intended_config_generation, entry_json, cleanup_named_json,
                   cleanup_credential_json, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                         '__provider_batch__', 'batch', ?8, ?9, ?10, ?11, ?12, '[]', ?13)",
+                         '__provider_batch__', 'batch', ?8, ?9, ?10, ?11, ?12, ?13, ?14, '[]', ?15)",
                 rusqlite::params![
                     journal_id_for_tx,
                     journal_owner,
@@ -15759,6 +15770,8 @@ async fn stage_and_recover_provider_batch(
                     config_path,
                     consumed_revision_for_tx,
                     intended_revision_for_tx,
+                    consumed_config_generation_for_tx,
+                    intended_config_generation_for_tx,
                     payload_json,
                     cleanup_named_json,
                     chrono::Utc::now().timestamp_millis()
@@ -16735,6 +16748,8 @@ struct ProviderConfigJournal {
     config_path: Option<String>,
     consumed_revision: Option<String>,
     intended_revision: Option<String>,
+    consumed_config_generation: Option<i64>,
+    intended_config_generation: Option<i64>,
     entry_json: Option<String>,
     cleanup_named_json: String,
     cleanup_credential_json: String,
@@ -17167,6 +17182,7 @@ pub(super) async fn recover_provider_config_journals(
                 "SELECT journal_id, owner_digest, client_operation_id, request_hash,
                         fencing_generation, terminal_response_json, provider_id,
                         action, config_path, consumed_revision, intended_revision,
+                        consumed_config_generation, intended_config_generation,
                         entry_json, cleanup_named_json, cleanup_credential_json
                  FROM provider_config_journals
                  WHERE project_root = ?1
@@ -17188,9 +17204,11 @@ pub(super) async fn recover_provider_config_journals(
                         config_path: row.get(8)?,
                         consumed_revision: row.get(9)?,
                         intended_revision: row.get(10)?,
-                        entry_json: row.get(11)?,
-                        cleanup_named_json: row.get(12)?,
-                        cleanup_credential_json: row.get(13)?,
+                        consumed_config_generation: row.get(11)?,
+                        intended_config_generation: row.get(12)?,
+                        entry_json: row.get(13)?,
+                        cleanup_named_json: row.get(14)?,
+                        cleanup_credential_json: row.get(15)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -17352,10 +17370,28 @@ pub(super) async fn recover_provider_config_journals(
             }
             _ => return Err(bad_request("provider config journal has an invalid action")),
         }
+        let generation = if matches!(journal.action.as_str(), "save" | "batch") {
+            let consumed = journal.consumed_config_generation.ok_or_else(|| {
+                bad_request("provider journal is missing consumed config generation")
+            })?;
+            let intended = journal.intended_config_generation.ok_or_else(|| {
+                bad_request("provider journal is missing intended config generation")
+            })?;
+            if intended != consumed.saturating_add(1) {
+                return Err(bad_request(
+                    "provider journal config-generation transition is invalid",
+                ));
+            }
+            let intended = u64::try_from(intended)
+                .map_err(|_| bad_request("provider journal config generation is invalid"))?;
+            inventory::publish_committed_config_generation_at_least(intended);
+            intended
+        } else {
+            inventory::publish_committed_config_generation()
+        };
         let (_, _, effective) = daemon_provider_config(ctx, project_root.as_str()).await?;
         if let Some(response_json) = journal.terminal_response_json.as_mut() {
             let mut response: Response = serde_json::from_str(response_json).map_err(internal)?;
-            let generation = inventory::publish_committed_config_generation();
             match &mut response {
                 Response::ProviderMutationCommitted {
                     result_revision,
@@ -17363,7 +17399,9 @@ pub(super) async fn recover_provider_config_journals(
                     config,
                     ..
                 } if journal.action == "batch" => {
-                    *result_revision = provider_config_revision(&effective)?;
+                    *result_revision = journal.intended_revision.clone().ok_or_else(|| {
+                        bad_request("provider batch journal is missing intended revision")
+                    })?;
                     *config_generation = generation;
                     *config = crate::secret_ref::redact_provider_view(&effective);
                 }
@@ -17380,10 +17418,8 @@ pub(super) async fn recover_provider_config_journals(
             }
             *response_json = serde_json::to_string(&response).map_err(internal)?;
         } else {
-            // Legacy reference-only save/delete journals have no typed receipt,
-            // but they still changed the effective configuration. Publish only
-            // now, after their filesystem operation completed successfully.
-            inventory::publish_committed_config_generation();
+            // Legacy delete journals have no typed receipt, but still advance
+            // the generation only after their filesystem operation succeeds.
         }
         let mut named: std::collections::BTreeSet<String> =
             serde_json::from_str(&journal.cleanup_named_json).map_err(internal)?;
@@ -17847,6 +17883,14 @@ async fn provider_config_save_under_lock(
         .providers
         .insert(provider_id.to_owned(), entry.clone());
     let intended_revision = provider_config_revision(&intended_layer)?;
+    let consumed_config_generation = inventory::current_config_generation();
+    let intended_config_generation = consumed_config_generation
+        .checked_add(1)
+        .ok_or_else(|| internal("provider config generation exhausted"))?;
+    let consumed_config_generation = i64::try_from(consumed_config_generation)
+        .map_err(|_| internal("provider config generation exceeds SQLite range"))?;
+    let intended_config_generation = i64::try_from(intended_config_generation)
+        .map_err(|_| internal("provider config generation exceeds SQLite range"))?;
     let project_root_owned = project_root.to_string();
     let provider_id_owned = provider_id.to_string();
     let journal_id_owned = journal_id.clone();
@@ -17968,9 +18012,10 @@ async fn provider_config_save_under_lock(
              (journal_id, owner_digest, client_operation_id, request_hash,
               fencing_generation, terminal_response_json, project_root,
               provider_id, action, config_path, consumed_revision,
-              intended_revision, entry_json, cleanup_named_json,
+              intended_revision, consumed_config_generation,
+              intended_config_generation, entry_json, cleanup_named_json,
               cleanup_credential_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'save', ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'save', ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     journal_id_owned,
                     owner_digest,
@@ -17983,6 +18028,8 @@ async fn provider_config_save_under_lock(
                     config_path_for_tx,
                     consumed_revision,
                     intended_revision,
+                    consumed_config_generation,
+                    intended_config_generation,
                     entry_json,
                     named_json,
                     credentials_json,

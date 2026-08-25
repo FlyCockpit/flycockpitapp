@@ -6264,6 +6264,8 @@ CREATE TABLE provider_config_journals (
     config_path      TEXT,
     consumed_revision TEXT CHECK (consumed_revision IS NULL OR length(consumed_revision) = 64),
     intended_revision TEXT CHECK (intended_revision IS NULL OR length(intended_revision) = 64),
+    consumed_config_generation INTEGER CHECK (consumed_config_generation IS NULL OR consumed_config_generation >= 0),
+    intended_config_generation INTEGER CHECK (intended_config_generation IS NULL OR intended_config_generation > 0),
     entry_json       TEXT,
     cleanup_named_json TEXT NOT NULL
         CHECK (json_valid(cleanup_named_json) AND json_type(cleanup_named_json) = 'array'),
@@ -6287,7 +6289,11 @@ CREATE TABLE provider_config_journals (
     ),
     CHECK ((action IN ('save', 'batch')) = (config_path IS NOT NULL)
        AND (action IN ('save', 'batch')) = (consumed_revision IS NOT NULL)
-       AND (action IN ('save', 'batch')) = (intended_revision IS NOT NULL)),
+       AND (action IN ('save', 'batch')) = (intended_revision IS NOT NULL)
+       AND (action IN ('save', 'batch')) = (consumed_config_generation IS NOT NULL)
+       AND (action IN ('save', 'batch')) = (intended_config_generation IS NOT NULL)),
+    CHECK (consumed_config_generation IS NULL
+       OR intended_config_generation = consumed_config_generation + 1),
     CHECK (config_path IS NULL OR length(trim(config_path)) > 0)
 );
 CREATE INDEX provider_config_journals_scope

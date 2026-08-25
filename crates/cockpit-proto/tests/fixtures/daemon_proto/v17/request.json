@@ -1875,10 +1875,13 @@
   },
   "mutate_agent": {
     "params": {
+      "client_operation_id": "11111111-1111-4111-8111-111111111111",
+      "mutation_intent_hash": "e4dcbec33acc09b61bde0e941bc29d1b9206433be5c8050786cef2299398a31b",
       "project_root": "/tmp/project",
       "mutation": {
         "mutation": "reset_all_builtins"
-      }
+      },
+      "expected_revision": "1111111111111111111111111111111111111111111111111111111111111111"
     },
     "request": "mutate_agent"
   },

@@ -45,9 +45,9 @@ pub use agent_management::{
     MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
     MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES, MAX_ASSISTANT_HOME_BYTES,
     agent_edit_projection_digest, agent_inventory_entry_projection_digest,
-    validate_agent_edit_snapshot, validate_agent_editor_completion,
-    validate_agent_mutation_envelope, validate_agent_source_identity,
-    validate_goal_supervision_projection,
+    agent_mutation_intent_hash, agent_mutation_name, validate_agent_edit_snapshot,
+    validate_agent_editor_completion, validate_agent_mutation_envelope,
+    validate_agent_source_identity, validate_goal_supervision_projection,
 };
 pub use config_management::{
     CockpitConfigLayer, CommittedDenylistEntry, ConfigCommitStatus, ConfigPublicationStatus,
@@ -3273,6 +3273,7 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "begin_agent_editor_lease"
                 | "complete_agent_editor_lease"
                 | "get_agent_editor_lease_settlement" => 17,
+                "mutate_agent" => 17,
                 "cancel_leak_reveal" => 16,
                 "get_provider_catalog_snapshot" => 15,
                 "list_secret_inventory"
@@ -3291,7 +3292,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "apply_setup_wizard"
                 | "get_agent_inventory"
                 | "get_agent_edit_snapshot"
-                | "mutate_agent"
                 | "get_extended_config_snapshot"
                 | "save_extended_config"
                 | "export_policy"
@@ -3370,6 +3370,7 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "agent_editor_lease_begun"
                 | "agent_editor_lease_completed"
                 | "extended_config_saved" => 17,
+                "agent_mutated" => 17,
                 "leak_reveal_cancelled" => 16,
                 "flycockpit_org_sync"
                 | "provider_models_fetched"
@@ -6917,6 +6918,17 @@ mod tests {
                 project_root: "/tmp/project".into(),
                 lease_id: Uuid::nil().to_string(),
             },
+            Request::MutateAgent {
+                client_operation_id: "mutate-agent".into(),
+                mutation_intent_hash: agent_mutation_intent_hash(
+                    "/tmp/project",
+                    &AgentMutation::ResetAllBuiltins,
+                    Some(&"00".repeat(32)),
+                ),
+                project_root: "/tmp/project".into(),
+                mutation: AgentMutation::ResetAllBuiltins,
+                expected_revision: Some("00".repeat(32)),
+            },
         ] {
             assert_eq!(
                 body_required_protocol_version(&Body::Request {
@@ -7042,6 +7054,25 @@ mod tests {
                 terminal_error: None,
                 terminal_cancelled: false,
             },
+            Response::AgentMutated(AgentMutationResult {
+                client_operation_id: "mutate-agent".into(),
+                mutation_intent_hash: "98".repeat(32),
+                project_root: "/tmp/project".into(),
+                requested_project_root: "/tmp/project".into(),
+                owner_scope: "project:/tmp/project".into(),
+                agent_name: None,
+                changed: true,
+                affected: 1,
+                snapshot: None,
+                consumed_config_generation: 6,
+                result_config_generation: 7,
+                config_generation: 7,
+                inventory_revision: Some("99".repeat(32)),
+                consumed_revision: Some("00".repeat(32)),
+                result_revision: "99".repeat(32),
+                completed_lease_id: None,
+                outcome: AgentMutationOutcome::Reconciled,
+            }),
         ] {
             assert_eq!(
                 body_required_protocol_version(&Body::Response {
@@ -7565,6 +7596,19 @@ mod tests {
             fixture["agent_mutated"]["data"]["outcome"]["status"],
             "reconciled"
         );
+        let agent = &fixture["agent_mutated"]["data"];
+        assert!(agent["client_operation_id"].is_string());
+        assert_eq!(
+            agent["mutation_intent_hash"].as_str().map(str::len),
+            Some(64)
+        );
+        assert!(agent["project_root"].is_string());
+        assert!(agent["requested_project_root"].is_string());
+        assert_eq!(agent["owner_scope"], "project:/tmp/project");
+        assert!(agent["result_revision"].is_string());
+        assert_eq!(agent["consumed_config_generation"], 7);
+        assert_eq!(agent["result_config_generation"], 8);
+        assert_eq!(agent["config_generation"], 8);
         assert_eq!(
             fixture["agent_editor_lease_completed"]["data"]["status"]["outcome"]["status"],
             "reconciled"

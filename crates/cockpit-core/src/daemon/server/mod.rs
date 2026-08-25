@@ -3725,6 +3725,17 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup typed-settings journal recovery failed")?;
+    let recovered_agent_mutations =
+        crate::daemon::agent_management::recover_agent_mutation_journals(ctx)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))
+            .context("startup agent-mutation journal recovery failed")?;
+    if recovered_agent_mutations > 0 {
+        tracing::info!(
+            count = recovered_agent_mutations,
+            "reconciled committed agent mutations before socket publication"
+        );
+    }
     dispatch::recover_committed_oauth_settlements(ctx)
         .await
         .context("reconciling committed OAuth authority operations")?;

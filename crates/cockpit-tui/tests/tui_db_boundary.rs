@@ -1181,6 +1181,36 @@ fn tui_settings_use_revisioned_typed_mutation() {
 }
 
 #[test]
+fn every_tui_agent_mutation_is_exactly_receipted_and_recoverable() {
+    let agents = read("crates/cockpit-tui/src/tui/settings/agents_page.rs");
+    let goals = read("crates/cockpit-tui/src/tui/goal_settings_pane.rs");
+    let tools = read("crates/cockpit-tui/src/tui/tools_pane.rs");
+    for (surface, source) in [("agents", agents), ("goals", goals), ("tools", tools)] {
+        assert!(
+            source.contains("agent_mutation_intent_hash"),
+            "{surface} must hash the exact public mutation intent"
+        );
+        assert!(
+            source.contains("GetLocalOperationSettlement"),
+            "{surface} must reconcile an ambiguous transport outcome"
+        );
+        assert!(
+            source.contains("bind_agent_mutation_settlement"),
+            "{surface} must bind replayed receipts to the exact operation"
+        );
+        assert!(
+            source.contains("client_operation_id"),
+            "{surface} must retain the owner operation id"
+        );
+        assert!(
+            source.contains("this pane cannot close yet")
+                || source.contains("uncertain_agent_operation"),
+            "{surface} must fence close while settlement is unknown"
+        );
+    }
+}
+
+#[test]
 fn tui_db_boundary_gate_first_has_real_negative_alias_fixtures() {
     for fixture in ["direct_alias.rs", "core_alias.rs"] {
         let source = read(&format!("scripts/fixtures/tui-db-boundary/{fixture}"));

@@ -11476,12 +11476,51 @@ fn authority_recovery_precedes_both_socket_binds() {
         "recover_all_provider_config_journals",
         "recover_all_mcp_config_journals",
         "recover_extended_config_patch_journals",
+        "recover_agent_mutation_journals",
         "recover_committed_oauth_settlements",
         "settle_interrupted_local_operations",
         "recover_editor_leases_before_publish",
         "maintain_editor_leases",
     ] {
         assert!(recovery_body.contains(required), "missing {required}");
+    }
+}
+
+#[test]
+fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
+    let dispatch = include_str!("dispatch.rs");
+    let arm = dispatch
+        .split("Request::MutateAgent")
+        .nth(1)
+        .and_then(|tail| tail.split("Request::BeginAgentEditorLease").next())
+        .expect("mutate-agent dispatch arm must exist");
+    for required in [
+        "agent_mutation_intent_hash",
+        "begin_local_operation",
+        "agent_management::mutate",
+        "terminalize_local_operation",
+    ] {
+        assert!(
+            arm.contains(required),
+            "missing agent receipt fence: {required}"
+        );
+    }
+
+    let management = include_str!("../agent_management.rs");
+    let journal = management
+        .find("INSERT OR IGNORE INTO agent_mutation_journals")
+        .expect("agent mutation must durably journal its intended projection");
+    let publish = management[journal..]
+        .find("mutate_sync(&root, mutation, expected_revision)")
+        .expect("agent publication must follow journal admission");
+    assert!(publish > 0);
+    for required in [
+        "projection_matches_plan",
+        "CommittedRefreshNeeded",
+        "recover_agent_mutation_journals",
+        "SET state='terminal_success'",
+    ] {
+        assert!(management.contains(required), "missing {required}");
     }
 }
 

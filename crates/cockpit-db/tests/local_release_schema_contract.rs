@@ -91,6 +91,38 @@ fn authority_journals_bind_exact_fenced_terminal_receipts() {
     }
 }
 
+#[test]
+fn agent_mutation_recovery_is_hash_only_and_blocks_blind_restart_rejection() {
+    let sql = include_str!("../src/db/migrations/0001_initial.sql");
+    let declaration = sql
+        .split("CREATE TABLE agent_mutation_journals")
+        .nth(1)
+        .and_then(|tail| tail.split(");").next())
+        .expect("agent mutation journal must exist");
+    for field in [
+        "owner_digest",
+        "client_operation_id",
+        "request_hash",
+        "keyed_request_identity",
+        "fencing_generation",
+        "consumed_revision",
+        "mutation_intent_hash",
+        "consumed_projection_hash",
+        "intended_projection_hash",
+        "terminal_response_json",
+    ] {
+        assert!(declaration.contains(field), "missing {field}");
+    }
+    for forbidden in ["markdown", "file_bytes", "payload_json"] {
+        assert!(
+            !declaration.contains(forbidden),
+            "agent recovery must not persist {forbidden}"
+        );
+    }
+    let receipts = include_str!("../src/db/local_operation_receipts.rs");
+    assert!(receipts.contains("SELECT 1 FROM agent_mutation_journals"));
+}
+
 #[derive(Debug)]
 struct Ownership {
     status: String,

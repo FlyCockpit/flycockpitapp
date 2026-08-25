@@ -134,10 +134,30 @@ pub struct GoalSupervisionPatch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentMutationResult {
+    /// Exact owner-generated idempotency key reserved for this mutation.
+    pub client_operation_id: String,
+    /// Lowercase SHA-256 over the public, non-secret mutation identity.
+    pub mutation_intent_hash: String,
+    /// Canonical daemon-authoritative workspace root.
+    pub project_root: String,
+    /// Exact root spelling supplied in the request. This binds the client
+    /// receipt without asking the presentation layer to canonicalize paths.
+    pub requested_project_root: String,
+    /// Canonical owner authority identity for durable settlement lookup.
+    pub owner_scope: String,
+    /// Exact single-agent target, or `None` for inventory-wide mutations.
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub agent_name: Option<String>,
     pub changed: bool,
     pub affected: u32,
     #[serde(deserialize_with = "deserialize_present_option")]
     pub snapshot: Option<AgentEditSnapshot>,
+    /// Configuration generation observed before the mutation reserved its
+    /// authority snapshot.
+    pub consumed_config_generation: u64,
+    /// Configuration generation published for this terminal mutation.
+    pub result_config_generation: u64,
+    /// Backward-compatible alias for `result_config_generation` within v17.
     pub config_generation: u64,
     /// Present for inventory-wide mutations such as reset-all and bound to the
     /// post-commit inventory returned by a subsequent refresh.
@@ -147,6 +167,10 @@ pub struct AgentMutationResult {
     /// is the only mutation that legitimately has no prior revision.
     #[serde(deserialize_with = "deserialize_present_option")]
     pub consumed_revision: Option<String>,
+    /// Exact post-commit document revision, or the inventory revision for an
+    /// inventory-wide mutation. Deletions carry a daemon-minted tombstone
+    /// revision so their durable outcome remains independently bindable.
+    pub result_revision: String,
     /// Present only on the completion response for this exact editor lease.
     #[serde(deserialize_with = "deserialize_present_option")]
     pub completed_lease_id: Option<String>,
@@ -161,6 +185,43 @@ pub struct AgentMutationResult {
 pub enum AgentMutationOutcome {
     Reconciled,
     CommittedRefreshNeeded { warning: String },
+}
+
+/// Return the exact single-agent target, or `None` for an inventory mutation.
+pub fn agent_mutation_name(mutation: &AgentMutation) -> Option<&str> {
+    match mutation {
+        AgentMutation::EjectBuiltin { name }
+        | AgentMutation::SaveDefinition { name, .. }
+        | AgentMutation::CreateDefinition { name, .. }
+        | AgentMutation::DeleteCustom { name }
+        | AgentMutation::ResetBuiltin { name }
+        | AgentMutation::SaveGoalSupervision { name, .. } => Some(name),
+        AgentMutation::ResetAllBuiltins => None,
+    }
+}
+
+/// Public correlation hash for an ordinary agent mutation. Secret material is
+/// never accepted by this protocol family; length framing prevents ambiguous
+/// concatenations and the domain separator permits future formats.
+pub fn agent_mutation_intent_hash(
+    project_root: &str,
+    mutation: &AgentMutation,
+    expected_revision: Option<&str>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cockpit-agent-mutation-intent-v1\0");
+    digest_field(&mut digest, project_root.as_bytes());
+    let encoded =
+        serde_json::to_vec(mutation).expect("serializing an in-memory agent mutation cannot fail");
+    digest_field(&mut digest, &encoded);
+    match expected_revision {
+        Some(revision) => {
+            digest.update([1]);
+            digest_field(&mut digest, revision.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    crate::hex_lower(digest.finalize())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,11 +303,42 @@ pub fn validate_agent_editor_completion(
 
 pub fn validate_agent_mutation_envelope(
     result: &AgentMutationResult,
+    expected_client_operation_id: &str,
+    expected_mutation_intent_hash: &str,
+    expected_project_root: &str,
+    expected_agent_name: Option<&str>,
     expected_consumed_revision: Option<&str>,
     expected_completed_lease_id: Option<&str>,
     inventory_wide: bool,
 ) -> Result<(), &'static str> {
     let token = |value: &str| crate::is_opaque_authority_token(value);
+    if result.client_operation_id != expected_client_operation_id
+        || result.mutation_intent_hash != expected_mutation_intent_hash
+        || result.requested_project_root != expected_project_root
+        || result.agent_name.as_deref() != expected_agent_name
+    {
+        return Err("agent mutation receipt is bound to the wrong operation or target");
+    }
+    if result.project_root.trim().is_empty()
+        || result.project_root.contains('\0')
+        || result.project_root.len() > MAX_ASSISTANT_HOME_BYTES
+        || !std::path::Path::new(&result.project_root).is_absolute()
+    {
+        return Err("agent mutation receipt contains an invalid canonical project root");
+    }
+    if result.owner_scope != format!("project:{}", result.project_root) {
+        return Err("agent mutation receipt contains an invalid owner scope");
+    }
+    if result.result_config_generation != result.config_generation
+        || result.consumed_config_generation > result.result_config_generation
+    {
+        return Err("agent mutation receipt contains an invalid generation transition");
+    }
+    if !crate::is_opaque_authority_token(&result.mutation_intent_hash)
+        || !token(&result.result_revision)
+    {
+        return Err("agent mutation receipt contains a malformed correlation value");
+    }
     if result
         .consumed_revision
         .as_deref()
@@ -264,8 +356,28 @@ pub fn validate_agent_mutation_envelope(
     if result.completed_lease_id.as_deref() != expected_completed_lease_id {
         return Err("agent mutation completion is bound to the wrong editor lease");
     }
-    if inventory_wide != result.inventory_revision.is_some() {
+    if !inventory_wide && result.inventory_revision.is_some() {
         return Err("agent mutation inventory revision has the wrong scope");
+    }
+    if inventory_wide {
+        match (&result.outcome, result.inventory_revision.as_deref()) {
+            (AgentMutationOutcome::Reconciled, Some(revision))
+                if revision == result.result_revision => {}
+            (AgentMutationOutcome::CommittedRefreshNeeded { .. }, None) => {}
+            (AgentMutationOutcome::CommittedRefreshNeeded { .. }, Some(revision))
+                if revision == result.result_revision => {}
+            _ => {
+                return Err("agent inventory mutation returned conflicting result revisions");
+            }
+        }
+    }
+    if !inventory_wide
+        && result
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.revision != result.result_revision)
+    {
+        return Err("agent mutation snapshot disagrees with its result revision");
     }
     if !inventory_wide && result.affected > 1 {
         return Err("single-agent mutation affected multiple definitions");
@@ -274,14 +386,6 @@ pub fn validate_agent_mutation_envelope(
         && (warning.trim().is_empty() || warning.len() > MAX_AGENT_METADATA_BYTES)
     {
         return Err("agent mutation refresh warning is invalid");
-    }
-    if !inventory_wide
-        && matches!(
-            &result.outcome,
-            AgentMutationOutcome::CommittedRefreshNeeded { .. }
-        )
-    {
-        return Err("single-agent mutation cannot require an inventory refresh");
     }
     Ok(())
 }
@@ -440,4 +544,74 @@ pub fn validate_agent_source_identity(
     _project_root: &str,
 ) -> Result<(), &'static str> {
     validate_agent_edit_snapshot(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutation_intent_hash_binds_root_body_and_consumed_revision() {
+        let mutation = AgentMutation::ResetBuiltin {
+            name: "build".into(),
+        };
+        let baseline = agent_mutation_intent_hash("/project", &mutation, Some(&"11".repeat(32)));
+        assert_ne!(
+            baseline,
+            agent_mutation_intent_hash("/other", &mutation, Some(&"11".repeat(32)))
+        );
+        assert_ne!(
+            baseline,
+            agent_mutation_intent_hash("/project", &mutation, Some(&"22".repeat(32)))
+        );
+        assert_ne!(
+            baseline,
+            agent_mutation_intent_hash(
+                "/project",
+                &AgentMutation::ResetBuiltin {
+                    name: "review".into(),
+                },
+                Some(&"11".repeat(32)),
+            )
+        );
+    }
+
+    #[test]
+    fn mutation_envelope_rejects_cross_operation_replay() {
+        let revision = "11".repeat(32);
+        let result_revision = "22".repeat(32);
+        let hash = "33".repeat(32);
+        let result = AgentMutationResult {
+            client_operation_id: "operation-a".into(),
+            mutation_intent_hash: hash.clone(),
+            project_root: "/project".into(),
+            requested_project_root: "/project".into(),
+            owner_scope: "project:/project".into(),
+            agent_name: None,
+            changed: true,
+            affected: 1,
+            snapshot: None,
+            consumed_config_generation: 1,
+            result_config_generation: 2,
+            config_generation: 2,
+            inventory_revision: Some(result_revision.clone()),
+            consumed_revision: Some(revision.clone()),
+            result_revision,
+            completed_lease_id: None,
+            outcome: AgentMutationOutcome::Reconciled,
+        };
+        assert!(
+            validate_agent_mutation_envelope(
+                &result,
+                "operation-b",
+                &hash,
+                "/project",
+                None,
+                Some(&revision),
+                None,
+                true,
+            )
+            .is_err()
+        );
+    }
 }

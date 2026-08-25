@@ -6373,8 +6373,12 @@ CREATE TABLE agent_mutation_journals (
     request_hash          BLOB NOT NULL CHECK (
         typeof(request_hash) = 'blob' AND length(request_hash) = 32
     ),
+    keyed_request_identity BLOB NOT NULL CHECK (
+        typeof(keyed_request_identity) = 'blob' AND length(keyed_request_identity) = 32
+    ),
     fencing_generation    INTEGER NOT NULL CHECK (fencing_generation > 0),
     project_root          TEXT NOT NULL,
+    request_project_root  TEXT NOT NULL,
     agent_name            TEXT,
     action                TEXT NOT NULL CHECK (action IN (
         'eject_builtin', 'save_definition', 'create_definition',
@@ -6382,6 +6386,17 @@ CREATE TABLE agent_mutation_journals (
         'save_goal_supervision'
     )),
     consumed_revision     TEXT,
+    affected_hint         INTEGER NOT NULL CHECK (affected_hint >= 0),
+    changed_hint          INTEGER NOT NULL CHECK (changed_hint IN (0, 1)),
+    consumed_config_generation INTEGER NOT NULL CHECK (consumed_config_generation >= 0),
+    mutation_intent_hash  TEXT NOT NULL CHECK (
+        length(mutation_intent_hash) = 64
+        AND mutation_intent_hash = lower(mutation_intent_hash)
+    ),
+    consumed_projection_hash TEXT NOT NULL CHECK (
+        length(consumed_projection_hash) = 64
+        AND consumed_projection_hash = lower(consumed_projection_hash)
+    ),
     intended_projection_hash TEXT NOT NULL CHECK (
         length(intended_projection_hash) = 64
         AND intended_projection_hash = lower(intended_projection_hash)
@@ -6394,6 +6409,7 @@ CREATE TABLE agent_mutation_journals (
     CHECK (length(trim(owner_digest)) > 0),
     CHECK (length(trim(client_operation_id)) > 0),
     CHECK (length(trim(project_root)) > 0),
+    CHECK (length(trim(request_project_root)) > 0),
     CHECK ((action = 'reset_all_builtins') = (agent_name IS NULL)),
     CHECK (agent_name IS NULL OR length(trim(agent_name)) > 0),
     CHECK (consumed_revision IS NULL OR length(trim(consumed_revision)) > 0)
@@ -6405,11 +6421,18 @@ BEFORE UPDATE ON agent_mutation_journals
 WHEN NEW.owner_digest <> OLD.owner_digest
   OR NEW.client_operation_id <> OLD.client_operation_id
   OR NEW.request_hash <> OLD.request_hash
+  OR NEW.keyed_request_identity <> OLD.keyed_request_identity
   OR NEW.fencing_generation <> OLD.fencing_generation
   OR NEW.project_root <> OLD.project_root
+  OR NEW.request_project_root <> OLD.request_project_root
   OR NEW.agent_name IS NOT OLD.agent_name
   OR NEW.action <> OLD.action
   OR NEW.consumed_revision IS NOT OLD.consumed_revision
+  OR NEW.affected_hint <> OLD.affected_hint
+  OR NEW.changed_hint <> OLD.changed_hint
+  OR NEW.consumed_config_generation <> OLD.consumed_config_generation
+  OR NEW.mutation_intent_hash <> OLD.mutation_intent_hash
+  OR NEW.consumed_projection_hash <> OLD.consumed_projection_hash
   OR NEW.intended_projection_hash <> OLD.intended_projection_hash
   OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
 BEGIN

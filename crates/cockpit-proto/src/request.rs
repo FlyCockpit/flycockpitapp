@@ -1627,6 +1627,7 @@ pub enum Request {
             deserialize_with = "deserialize_lower_hex_sha256",
             skip_serializing_if = "String::is_empty"
         )]
+        #[serde(deserialize_with = "deserialize_lower_hex_sha256")]
         mutation_intent_hash: String,
         mutation: crate::ProviderMutationBatch,
     },
@@ -1749,8 +1750,12 @@ pub enum Request {
     },
 
     /// Apply one typed agent mutation. `expected_revision` is mandatory for
-    /// mutations of one existing document and omitted only for reset-all.
+    /// every mutation except creation; reset-all consumes an inventory
+    /// revision rather than a document revision.
     MutateAgent {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        client_operation_id: String,
+        mutation_intent_hash: String,
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
         mutation: crate::AgentMutation,
@@ -2868,11 +2873,29 @@ impl Request {
                 validate_owner_identifier("agent name", name, crate::MAX_AGENT_NAME_BYTES)?;
             }
             Self::MutateAgent {
+                client_operation_id,
+                mutation_intent_hash,
                 project_root,
                 mutation,
                 expected_revision,
             } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
+                if mutation_intent_hash.len() != 64
+                    || !mutation_intent_hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                {
+                    return Err("agent mutation intent hash must be lowercase SHA-256".to_string());
+                }
+                let expected_hash = crate::agent_mutation_intent_hash(
+                    project_root,
+                    mutation,
+                    expected_revision.as_deref(),
+                );
+                if mutation_intent_hash != &expected_hash {
+                    return Err("agent mutation intent hash does not match its request".to_string());
+                }
                 let name = match mutation {
                     crate::AgentMutation::EjectBuiltin { name }
                     | crate::AgentMutation::SaveDefinition { name, .. }
@@ -2899,6 +2922,18 @@ impl Request {
                     .is_some_and(|value| value.len() > 128)
                 {
                     return Err("agent revision exceeds maximum length".to_string());
+                }
+                match mutation {
+                    crate::AgentMutation::CreateDefinition { .. }
+                        if expected_revision.is_some() =>
+                    {
+                        return Err("agent creation must not carry a consumed revision".into());
+                    }
+                    crate::AgentMutation::CreateDefinition { .. } => {}
+                    _ if expected_revision.is_none() => {
+                        return Err("agent mutation requires a consumed revision".into());
+                    }
+                    _ => {}
                 }
             }
             Self::BeginAgentEditorLease {
@@ -3649,7 +3684,7 @@ macro_rules! command {
             (Request::SaveMcpConfig { client_operation_id, project_root, config_json, secret_values_json, cleanup_names_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|config_json:String|secret_values_json:SensitiveWirePayload|cleanup_names_json:String", [client_operation_id: String => param, project_root: String => project_root, config_json: String => param, secret_values_json: SensitiveWirePayload => param, cleanup_names_json: String => param]);
             (Request::GetAgentInventory { project_root }, "get_agent_inventory", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAgentEditSnapshot { project_root, name }, "get_agent_edit_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|name:String", [project_root: String => project_root, name: String => param]);
-            (Request::MutateAgent { project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [project_root: String => project_root, mutation: crate::AgentMutation => param, expected_revision: Option<String> => param]);
+            (Request::MutateAgent { client_operation_id, mutation_intent_hash, project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, mutation: crate::AgentMutation => param, expected_revision: Option<String> => param]);
             (Request::BeginAgentEditorLease { client_operation_id, project_root, name, expected_revision }, "begin_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|name:String|expected_revision:String", [client_operation_id: String => param, project_root: String => project_root, name: String => param, expected_revision: String => param]);
             (Request::CompleteAgentEditorLease { client_operation_id, project_root, lease_id, markdown }, "complete_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|lease_id:String|markdown:Option<String>", [client_operation_id: String => param, project_root: String => project_root, lease_id: String => param, markdown: Option<String> => param]);
             (Request::GetAgentEditorLeaseSettlement { client_operation_id, project_root, lease_id }, "get_agent_editor_lease_settlement", owner_only, none, false, local_only, none, concurrent, path(project_root), "client_operation_id:String|project_root:String|lease_id:String", [client_operation_id: String => param, project_root: String => project_root, lease_id: String => param]);

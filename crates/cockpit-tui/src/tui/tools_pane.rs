@@ -66,6 +66,8 @@ enum ToolsPending {
     },
     SaveAgent {
         operation_id: uuid::Uuid,
+        client_operation_id: String,
+        mutation_intent_hash: String,
         agent_name: String,
         project_root: String,
         expected_revision: String,
@@ -75,7 +77,18 @@ enum ToolsPending {
         override_json: String,
         cache_break: bool,
         monty_nudge: Option<String>,
+        querying: bool,
     },
+}
+
+enum ToolsMutationResolution {
+    Committed {
+        revision: String,
+        warning: Option<String>,
+    },
+    Pending,
+    Rejected(String),
+    Invalid(String),
 }
 
 #[derive(Debug)]
@@ -135,6 +148,109 @@ impl ToolsPane {
         self.pending_effect.take()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn requeue_settlement(
+        &mut self,
+        operation_id: uuid::Uuid,
+        client_operation_id: String,
+        mutation_intent_hash: String,
+        agent_name: String,
+        project_root: String,
+        expected_revision: String,
+        mutation: cockpit_core::daemon::proto::AgentMutation,
+        def: AgentDef,
+        selection: ToolSurfaceSelection,
+        override_json: String,
+        cache_break: bool,
+        monty_nudge: Option<String>,
+        schedule_query: bool,
+        message: String,
+    ) {
+        let operation_id = if schedule_query {
+            uuid::Uuid::new_v4()
+        } else {
+            operation_id
+        };
+        if schedule_query {
+            self.pending_effect = Some(ToolsEffect {
+                operation_id,
+                agent_name: agent_name.clone(),
+                project_root: project_root.clone(),
+                expected_revision: Some(expected_revision.clone()),
+                request: cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                    client_operation_id: client_operation_id.clone(),
+                },
+            });
+        }
+        self.in_flight = Some(ToolsPending::SaveAgent {
+            operation_id,
+            client_operation_id,
+            mutation_intent_hash,
+            agent_name,
+            project_root,
+            expected_revision,
+            mutation,
+            def,
+            selection,
+            override_json,
+            cache_break,
+            monty_nudge,
+            querying: true,
+        });
+        self.status = Some(format!("{message}; press Enter to query again"));
+    }
+
+    fn retry_settlement(&mut self) {
+        let Some(ToolsPending::SaveAgent {
+            client_operation_id,
+            mutation_intent_hash,
+            agent_name,
+            project_root,
+            expected_revision,
+            mutation,
+            def,
+            selection,
+            override_json,
+            cache_break,
+            monty_nudge,
+            querying: _,
+            ..
+        }) = self.in_flight.take()
+        else {
+            return;
+        };
+        let operation_id = uuid::Uuid::new_v4();
+        self.pending_effect = Some(ToolsEffect {
+            operation_id,
+            agent_name: agent_name.clone(),
+            project_root: project_root.clone(),
+            expected_revision: Some(expected_revision.clone()),
+            request: cockpit_core::daemon::proto::Request::MutateAgent {
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash: mutation_intent_hash.clone(),
+                project_root: project_root.clone(),
+                mutation: mutation.clone(),
+                expected_revision: Some(expected_revision.clone()),
+            },
+        });
+        self.in_flight = Some(ToolsPending::SaveAgent {
+            operation_id,
+            client_operation_id,
+            mutation_intent_hash,
+            agent_name,
+            project_root,
+            expected_revision,
+            mutation,
+            def,
+            selection,
+            override_json,
+            cache_break,
+            monty_nudge,
+            querying: false,
+        });
+        self.status = Some("retrying the exact durable agent-save mutation".into());
+    }
+
     pub(crate) fn apply_completion(&mut self, completion: ToolsCompletion) -> Option<ToolsOutcome> {
         let Some(pending) = self.in_flight.take() else {
             return None;
@@ -169,6 +285,10 @@ impl ToolsPane {
             || completion.expected_revision.as_deref() != expected_revision
         {
             self.in_flight = Some(pending);
+            self.status = Some(
+                "ignored an unbound tool-settings completion; press Enter to query the exact operation"
+                    .into(),
+            );
             return None;
         }
         match pending {
@@ -224,6 +344,9 @@ impl ToolsPane {
                 None
             }
             ToolsPending::SaveAgent {
+                operation_id,
+                client_operation_id,
+                mutation_intent_hash,
                 agent_name,
                 project_root,
                 expected_revision,
@@ -233,6 +356,7 @@ impl ToolsPane {
                 override_json,
                 cache_break,
                 monty_nudge,
+                querying: _,
                 ..
             } => {
                 if self.agent_name != agent_name
@@ -241,29 +365,77 @@ impl ToolsPane {
                 {
                     return None;
                 }
-                let saved = completion.response.and_then(|response| {
-                    let cockpit_core::daemon::proto::Response::AgentMutated(result) = response
-                    else {
-                        return Err("daemon returned an unexpected agent-save response".to_string());
-                    };
-                    crate::tui::settings::agents_page::validate_agent_mutation_result(
-                        &result,
-                        &self.cwd,
-                        &mutation,
-                        Some(&expected_revision),
-                        None,
-                    )?;
-                    let snapshot = result
-                        .snapshot
-                        .ok_or_else(|| "daemon omitted the saved snapshot".to_string())?;
-                    Ok(snapshot.revision)
-                });
+                let response = match completion.response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.requeue_settlement(
+                            operation_id,
+                            client_operation_id,
+                            mutation_intent_hash,
+                            agent_name,
+                            project_root,
+                            expected_revision,
+                            mutation,
+                            def,
+                            selection,
+                            override_json,
+                            cache_break,
+                            monty_nudge,
+                            true,
+                            format!("agent-save outcome is unknown ({error})"),
+                        );
+                        return None;
+                    }
+                };
+                let saved = match crate::tui::settings::agents_page::bind_agent_mutation_settlement(
+                    response,
+                    &client_operation_id,
+                    &mutation_intent_hash,
+                ) {
+                    Ok(crate::tui::settings::agents_page::AgentMutationSettlement::Committed(result)) => (|| {
+                        crate::tui::settings::agents_page::validate_agent_mutation_result(
+                            &result,
+                            &client_operation_id,
+                            &mutation_intent_hash,
+                            &self.cwd,
+                            &mutation,
+                            Some(&expected_revision),
+                            None,
+                        )?;
+                        if let cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded { warning } = result.outcome {
+                            return Ok(ToolsMutationResolution::Committed {
+                                revision: result.result_revision,
+                                warning: Some(warning),
+                            });
+                        }
+                        let snapshot = result.snapshot.ok_or_else(|| {
+                            "daemon omitted the saved snapshot".to_string()
+                        })?;
+                        Ok(ToolsMutationResolution::Committed {
+                            revision: snapshot.revision,
+                            warning: None,
+                        })
+                    })()
+                    .unwrap_or_else(ToolsMutationResolution::Invalid),
+                    Ok(crate::tui::settings::agents_page::AgentMutationSettlement::Pending) => {
+                        ToolsMutationResolution::Pending
+                    }
+                    Ok(crate::tui::settings::agents_page::AgentMutationSettlement::Rejected(error)) => {
+                        ToolsMutationResolution::Rejected(error)
+                    }
+                    Err(error) => ToolsMutationResolution::Invalid(error),
+                };
                 match saved {
-                    Ok(revision) => {
+                    ToolsMutationResolution::Committed { revision, warning } => {
                         self.revision = Some(revision);
                         self.def = Some(def);
                         self.original = selection;
-                        self.status = Some("agent tool settings committed".to_string());
+                        self.status = Some(match warning {
+                            Some(warning) => format!(
+                                "agent tool settings committed but refresh is required: {warning}"
+                            ),
+                            None => "agent tool settings committed".to_string(),
+                        });
                         Some(ToolsOutcome::Apply {
                             override_json,
                             persist_session: false,
@@ -271,8 +443,46 @@ impl ToolsPane {
                             monty_nudge,
                         })
                     }
-                    Err(error) => {
-                        self.status = Some(format!("save failed: {error}"));
+                    ToolsMutationResolution::Pending => {
+                        self.requeue_settlement(
+                            operation_id,
+                            client_operation_id,
+                            mutation_intent_hash,
+                            agent_name,
+                            project_root,
+                            expected_revision,
+                            mutation,
+                            def,
+                            selection,
+                            override_json,
+                            cache_break,
+                            monty_nudge,
+                            false,
+                            "agent-save mutation is still pending".into(),
+                        );
+                        None
+                    }
+                    ToolsMutationResolution::Rejected(error) => {
+                        self.status = Some(format!("save was durably rejected: {error}"));
+                        None
+                    }
+                    ToolsMutationResolution::Invalid(error) => {
+                        self.requeue_settlement(
+                            operation_id,
+                            client_operation_id,
+                            mutation_intent_hash,
+                            agent_name,
+                            project_root,
+                            expected_revision,
+                            mutation,
+                            def,
+                            selection,
+                            override_json,
+                            cache_break,
+                            monty_nudge,
+                            false,
+                            format!("agent-save receipt was malformed or unbound ({error})"),
+                        );
                         None
                     }
                 }
@@ -287,9 +497,14 @@ impl ToolsPane {
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<ToolsOutcome> {
         if self.in_flight.is_some() {
-            self.status = Some(
-                "tool settings operation is still pending; this pane cannot close yet".to_string(),
-            );
+            if key.code == KeyCode::Enter && self.pending_effect.is_none() {
+                self.retry_settlement();
+            } else {
+                self.status = Some(
+                    "tool settings operation is still pending; this pane cannot close yet"
+                        .to_string(),
+                );
+            }
             return None;
         }
         if self.confirm.is_some() {
@@ -455,6 +670,12 @@ impl ToolsPane {
         };
         let operation_id = uuid::Uuid::new_v4();
         let project_root = self.cwd.to_string_lossy().into_owned();
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
+        let mutation_intent_hash = cockpit_proto::agent_mutation_intent_hash(
+            &project_root,
+            &mutation,
+            Some(&prior_revision),
+        );
         let cache_break = self.cache_break_delta();
         let monty_nudge = self.monty_nudge_text();
         self.pending_effect = Some(ToolsEffect {
@@ -463,6 +684,8 @@ impl ToolsPane {
             project_root: project_root.clone(),
             expected_revision: Some(prior_revision.clone()),
             request: cockpit_core::daemon::proto::Request::MutateAgent {
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash: mutation_intent_hash.clone(),
                 project_root: project_root.clone(),
                 mutation: mutation.clone(),
                 expected_revision: Some(prior_revision.clone()),
@@ -470,6 +693,8 @@ impl ToolsPane {
         });
         self.in_flight = Some(ToolsPending::SaveAgent {
             operation_id,
+            client_operation_id,
+            mutation_intent_hash,
             agent_name: self.agent_name.clone(),
             project_root,
             expected_revision: prior_revision,
@@ -479,6 +704,7 @@ impl ToolsPane {
             override_json,
             cache_break,
             monty_nudge,
+            querying: false,
         });
         self.status = Some("saving daemon-owned agent tool settings…".to_string());
         Ok(())

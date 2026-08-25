@@ -6387,12 +6387,58 @@ async fn handle_serialized_request_impl(
         }
 
         Request::MutateAgent {
+            client_operation_id,
+            mutation_intent_hash,
             project_root,
             mutation,
             expected_revision,
         } => {
-            crate::daemon::agent_management::mutate(ctx, project_root, mutation, expected_revision)
-                .await
+            let owner = agent_editor_lease_owner(state);
+            let expected_intent = cockpit_proto::agent_mutation_intent_hash(
+                &project_root,
+                &mutation,
+                expected_revision.as_deref(),
+            );
+            if mutation_intent_hash != expected_intent {
+                return Err(bad_request("agent mutation intent hash is invalid"));
+            }
+            let request_hash: [u8; 32] = hex::decode(&mutation_intent_hash)
+                .map_err(|_| bad_request("agent mutation intent hash is malformed"))?
+                .try_into()
+                .map_err(|_| bad_request("agent mutation intent hash has the wrong length"))?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "mutate_agent",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let result = crate::daemon::agent_management::mutate(
+                ctx,
+                owner.clone(),
+                client_operation_id.clone(),
+                mutation_intent_hash,
+                request_hash,
+                fencing_generation,
+                project_root,
+                mutation,
+                expected_revision,
+            )
+            .await;
+            terminalize_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                async { result },
+            )
+            .await
         }
 
         Request::BeginAgentEditorLease {
@@ -13889,6 +13935,9 @@ async fn finish_local_operation_error(
                     UNION ALL
                     SELECT 1 FROM extended_config_patch_journals
                      WHERE owner_digest=?1 AND client_operation_id=?2
+                    UNION ALL
+                    SELECT 1 FROM agent_mutation_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
                  )",
                 rusqlite::params![linked_owner, linked_operation],
                 |row| row.get::<_, bool>(0),
@@ -14173,7 +14222,11 @@ fn client_operation_id_from_response(
         | Response::McpOAuthCancelled {
             client_operation_id,
             ..
-        } => Ok(client_operation_id.clone()),
+        }
+        | Response::AgentMutated(AgentMutationResult {
+            client_operation_id,
+            ..
+        }) => Ok(client_operation_id.clone()),
         _ => Err(internal(anyhow::anyhow!(
             "local operation produced an unbound receipt"
         ))),

@@ -96,7 +96,7 @@ pub(super) struct AgentsPage {
     /// Exact completion request retained after transport or response
     /// ambiguity. The page cannot close until the daemon replays a matching
     /// terminal receipt.
-    uncertain_editor_settlement: Option<Box<PendingAgentOperation>>,
+    uncertain_agent_operation: Option<Box<PendingAgentOperation>>,
 }
 
 enum PendingAgentOperation {
@@ -114,10 +114,13 @@ enum PendingAgentOperation {
         purpose: SnapshotPurpose,
     },
     Mutation {
+        client_operation_id: String,
+        mutation_intent_hash: String,
         cwd: PathBuf,
         mutation: cockpit_core::daemon::proto::AgentMutation,
         expected_revision: Option<String>,
         purpose: MutationPurpose,
+        querying: bool,
     },
     AssistantSave {
         name: String,
@@ -361,7 +364,7 @@ pub(super) struct AgentDetail {
 impl AgentsPage {
     pub(super) fn has_unsettled_external_edit(&self) -> bool {
         self.pending_external_edit.is_some()
-            || self.uncertain_editor_settlement.is_some()
+            || self.uncertain_agent_operation.is_some()
             || self.pending_daemon.values().any(|pending| {
                 matches!(
                     pending,
@@ -369,6 +372,7 @@ impl AgentsPage {
                         | PendingAgentOperation::PrepareStaging { .. }
                         | PendingAgentOperation::ReadStaging { .. }
                         | PendingAgentOperation::CompleteLease { .. }
+                        | PendingAgentOperation::Mutation { .. }
                 )
             })
     }
@@ -394,12 +398,12 @@ impl AgentsPage {
             agent_rows: Vec::new(),
             assistant_rows: Vec::new(),
             pending_daemon: HashMap::new(),
-            uncertain_editor_settlement: None,
+            uncertain_agent_operation: None,
         }
     }
 
-    fn retry_uncertain_editor_settlement(&mut self, cx: &mut SettingsCx) {
-        let Some(pending) = self.uncertain_editor_settlement.take() else {
+    fn retry_uncertain_agent_operation(&mut self, cx: &mut SettingsCx) {
+        let Some(pending) = self.uncertain_agent_operation.take() else {
             return;
         };
         match *pending {
@@ -474,7 +478,54 @@ impl AgentsPage {
                 );
                 self.status = Some("retrying editor lease settlement…".into());
             }
-            _ => unreachable!("only editor lease operations are retained for settlement"),
+            PendingAgentOperation::Mutation {
+                client_operation_id,
+                mutation_intent_hash,
+                cwd,
+                mutation,
+                expected_revision,
+                purpose,
+                querying,
+            } => {
+                let project_root = cwd.to_string_lossy().into_owned();
+                let request = if querying {
+                    cockpit_core::daemon::proto::Request::MutateAgent {
+                        client_operation_id: client_operation_id.clone(),
+                        mutation_intent_hash: mutation_intent_hash.clone(),
+                        project_root,
+                        mutation: mutation.clone(),
+                        expected_revision: expected_revision.clone(),
+                    }
+                } else {
+                    cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                        client_operation_id: client_operation_id.clone(),
+                    }
+                };
+                self.stage(
+                    cx,
+                    super::SettingsEffectTarget {
+                        surface: "agents.mutation",
+                        owner: format!("{}::{}", cwd.display(), agent_mutation_owner(&mutation)),
+                        revision: expected_revision.clone(),
+                    },
+                    request,
+                    PendingAgentOperation::Mutation {
+                        client_operation_id,
+                        mutation_intent_hash,
+                        cwd,
+                        mutation,
+                        expected_revision,
+                        purpose,
+                        querying: !querying,
+                    },
+                );
+                self.status = Some(if querying {
+                    "retrying the exact durable agent mutation…".into()
+                } else {
+                    "querying durable agent mutation settlement…".into()
+                });
+            }
+            _ => unreachable!("only durable agent operations are retained for settlement"),
         }
     }
 
@@ -848,6 +899,13 @@ impl AgentsPage {
                             name: name.clone(),
                         };
                         let expected_revision = snapshot.revision.clone();
+                        let project_root = cwd.to_string_lossy().into_owned();
+                        let client_operation_id = uuid::Uuid::new_v4().to_string();
+                        let mutation_intent_hash = cockpit_proto::agent_mutation_intent_hash(
+                            &project_root,
+                            &mutation,
+                            Some(&expected_revision),
+                        );
                         self.stage(
                             cx,
                             super::SettingsEffectTarget {
@@ -860,15 +918,20 @@ impl AgentsPage {
                                 revision: Some(expected_revision.clone()),
                             },
                             cockpit_core::daemon::proto::Request::MutateAgent {
-                                project_root: cwd.to_string_lossy().into_owned(),
+                                client_operation_id: client_operation_id.clone(),
+                                mutation_intent_hash: mutation_intent_hash.clone(),
+                                project_root,
                                 mutation: mutation.clone(),
                                 expected_revision: Some(expected_revision.clone()),
                             },
                             PendingAgentOperation::Mutation {
+                                client_operation_id,
+                                mutation_intent_hash,
                                 cwd,
                                 mutation,
                                 expected_revision: Some(expected_revision),
                                 purpose: MutationPurpose::EjectForEdit { external },
+                                querying: false,
                             },
                         );
                     }
@@ -903,31 +966,129 @@ impl AgentsPage {
                 }
             }
             PendingAgentOperation::Mutation {
+                client_operation_id,
+                mutation_intent_hash,
                 cwd,
                 mutation,
                 expected_revision,
                 purpose,
+                querying,
             } => {
-                let result = response.and_then(|response| match response {
-                    cockpit_core::daemon::proto::Response::AgentMutated(result) => {
-                        validate_agent_mutation_result(
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.uncertain_agent_operation =
+                            Some(Box::new(PendingAgentOperation::Mutation {
+                                client_operation_id,
+                                mutation_intent_hash,
+                                cwd,
+                                mutation,
+                                expected_revision,
+                                purpose,
+                                querying,
+                            }));
+                        self.status = Some(format!(
+                            "agent mutation outcome is unknown ({error}); press Enter to reconcile"
+                        ));
+                        return;
+                    }
+                };
+                let result = match bind_agent_mutation_settlement(
+                    response,
+                    &client_operation_id,
+                    &mutation_intent_hash,
+                ) {
+                    Ok(AgentMutationSettlement::Committed(result)) => {
+                        if let Err(error) = validate_agent_mutation_result(
                             &result,
+                            &client_operation_id,
+                            &mutation_intent_hash,
                             &cwd,
                             &mutation,
                             expected_revision.as_deref(),
                             None,
-                        )?;
-                        Ok(result)
+                        ) {
+                            self.uncertain_agent_operation =
+                                Some(Box::new(PendingAgentOperation::Mutation {
+                                    client_operation_id,
+                                    mutation_intent_hash,
+                                    cwd,
+                                    mutation,
+                                    expected_revision,
+                                    purpose,
+                                    querying,
+                                }));
+                            self.status = Some(format!(
+                                "agent mutation returned a malformed receipt ({error}); press Enter to reconcile"
+                            ));
+                            return;
+                        }
+                        result
                     }
-                    other => Err(format!("unexpected agent mutation response: {other:?}")),
-                });
-                let result = match result {
-                    Ok(result) => result,
+                    Ok(AgentMutationSettlement::Pending) => {
+                        self.uncertain_agent_operation =
+                            Some(Box::new(PendingAgentOperation::Mutation {
+                                client_operation_id,
+                                mutation_intent_hash,
+                                cwd,
+                                mutation,
+                                expected_revision,
+                                purpose,
+                                querying: false,
+                            }));
+                        self.status = Some(
+                            "agent mutation is still pending; press Enter to query again".into(),
+                        );
+                        return;
+                    }
+                    Ok(AgentMutationSettlement::Rejected(error)) => {
+                        self.status = Some(format!(
+                            "agent mutation {} was rejected: {error}",
+                            if querying { "settlement" } else { "request" }
+                        ));
+                        return;
+                    }
                     Err(error) => {
-                        self.status = Some(format!("agent mutation failed: {error}"));
+                        self.uncertain_agent_operation =
+                            Some(Box::new(PendingAgentOperation::Mutation {
+                                client_operation_id,
+                                mutation_intent_hash,
+                                cwd,
+                                mutation,
+                                expected_revision,
+                                purpose,
+                                querying,
+                            }));
+                        self.status = Some(format!(
+                            "agent mutation returned an unbound settlement ({error}); press Enter to reconcile"
+                        ));
                         return;
                     }
                 };
+                if let cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                    warning,
+                } = &result.outcome
+                {
+                    match &purpose {
+                        MutationPurpose::SaveEditor { .. } => self.editing = None,
+                        MutationPurpose::SaveDetail { markdown, .. } => {
+                            if let Some(detail) = self.detail.as_mut() {
+                                detail.revision = Some(result.result_revision.clone());
+                                detail.original_text = markdown.clone();
+                            }
+                        }
+                        MutationPurpose::ResetAll => {
+                            self.expected_inventory_after_commit =
+                                result.inventory_revision.clone();
+                        }
+                        _ => {}
+                    }
+                    self.status = Some(format!(
+                        "agent mutation committed but refresh is required: {warning}"
+                    ));
+                    self.queue_load(cx);
+                    return;
+                }
                 match purpose {
                     MutationPurpose::EjectForEdit { external } => match result.snapshot {
                         Some(snapshot) => self.open_workspace_editor(cx, cwd, snapshot, external),
@@ -1158,6 +1319,13 @@ impl AgentsPage {
         expected_revision: String,
         purpose: MutationPurpose,
     ) {
+        let project_root = cwd.to_string_lossy().into_owned();
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
+        let mutation_intent_hash = cockpit_proto::agent_mutation_intent_hash(
+            &project_root,
+            &mutation,
+            Some(&expected_revision),
+        );
         self.stage(
             cx,
             super::SettingsEffectTarget {
@@ -1166,15 +1334,20 @@ impl AgentsPage {
                 revision: Some(expected_revision.clone()),
             },
             cockpit_core::daemon::proto::Request::MutateAgent {
-                project_root: cwd.to_string_lossy().into_owned(),
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash: mutation_intent_hash.clone(),
+                project_root,
                 mutation: mutation.clone(),
                 expected_revision: Some(expected_revision.clone()),
             },
             PendingAgentOperation::Mutation {
+                client_operation_id,
+                mutation_intent_hash,
                 cwd,
                 mutation,
                 expected_revision: Some(expected_revision),
                 purpose,
+                querying: false,
             },
         );
     }
@@ -1247,7 +1420,7 @@ impl AgentsPage {
         let lease = match response {
             Ok(cockpit_core::daemon::proto::Response::AgentEditorLeaseBegun(lease)) => lease,
             Ok(other) => {
-                self.uncertain_editor_settlement =
+                self.uncertain_agent_operation =
                     Some(Box::new(PendingAgentOperation::BeginLease {
                         client_operation_id,
                         cwd,
@@ -1265,7 +1438,7 @@ impl AgentsPage {
                 // The generic protocol error is not proof that the daemon did
                 // not insert the lease. Preserve the exact operation and
                 // replay it until a typed lease receipt arrives.
-                self.uncertain_editor_settlement =
+                self.uncertain_agent_operation =
                     Some(Box::new(PendingAgentOperation::BeginLease {
                         client_operation_id,
                         cwd,
@@ -1283,7 +1456,7 @@ impl AgentsPage {
         if lease.client_operation_id != client_operation_id
             || uuid::Uuid::parse_str(&lease.lease_id).is_err()
         {
-            self.uncertain_editor_settlement = Some(Box::new(PendingAgentOperation::BeginLease {
+            self.uncertain_agent_operation = Some(Box::new(PendingAgentOperation::BeginLease {
                 client_operation_id,
                 cwd,
                 name,
@@ -1409,7 +1582,7 @@ impl AgentsPage {
         querying: bool,
         response: Result<cockpit_core::daemon::proto::Response, String>,
     ) {
-        self.uncertain_editor_settlement = None;
+        self.uncertain_agent_operation = None;
         let expected_saved = matches!(outcome, super::pointer_actions::ExternalEditOutcome::Saved);
         let receipt = match response {
             Ok(cockpit_core::daemon::proto::Response::AgentEditorLeaseCompleted(receipt))
@@ -1431,7 +1604,7 @@ impl AgentsPage {
                 {
                     editor.replace_with_recovery_text(markdown);
                 }
-                self.uncertain_editor_settlement =
+                self.uncertain_agent_operation =
                     Some(Box::new(PendingAgentOperation::CompleteLease {
                         client_operation_id,
                         cwd,
@@ -1482,7 +1655,7 @@ impl AgentsPage {
             }
             cockpit_core::daemon::proto::AgentEditorSettlementStatus::Pending
             | cockpit_core::daemon::proto::AgentEditorSettlementStatus::NotStarted => {
-                self.uncertain_editor_settlement =
+                self.uncertain_agent_operation =
                     Some(Box::new(PendingAgentOperation::CompleteLease {
                         client_operation_id,
                         cwd,
@@ -1539,7 +1712,7 @@ impl AgentsPage {
                 self.queue_load(cx);
             }
             other => {
-                self.uncertain_editor_settlement =
+                self.uncertain_agent_operation =
                     Some(Box::new(PendingAgentOperation::CompleteLease {
                         client_operation_id,
                         cwd,
@@ -2070,6 +2243,8 @@ pub(crate) fn validate_agent_snapshot(
 
 pub(crate) fn validate_agent_mutation_result(
     result: &cockpit_core::daemon::proto::AgentMutationResult,
+    client_operation_id: &str,
+    mutation_intent_hash: &str,
     cwd: &std::path::Path,
     mutation: &cockpit_core::daemon::proto::AgentMutation,
     prior_revision: Option<&str>,
@@ -2080,11 +2255,26 @@ pub(crate) fn validate_agent_mutation_result(
     };
     cockpit_proto::validate_agent_mutation_envelope(
         result,
+        client_operation_id,
+        mutation_intent_hash,
+        cwd.to_string_lossy().as_ref(),
+        cockpit_proto::agent_mutation_name(mutation),
         prior_revision,
         completed_lease_id,
         matches!(mutation, M::ResetAllBuiltins),
     )
     .map_err(str::to_string)?;
+    if matches!(
+        result.outcome,
+        cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded { .. }
+    ) {
+        if let Some(snapshot) = &result.snapshot {
+            let name = cockpit_proto::agent_mutation_name(mutation)
+                .ok_or("inventory mutation returned a single-agent snapshot")?;
+            validate_agent_snapshot(snapshot, cwd, name, None)?;
+        }
+        return Ok(());
+    }
     let coherent_count = result.affected == u32::from(result.changed);
     let require_snapshot = |name: &str, markdown: Option<&str>| {
         let snapshot = result
@@ -2228,6 +2418,87 @@ pub(crate) fn validate_agent_mutation_result(
     Ok(())
 }
 
+pub(crate) enum AgentMutationSettlement {
+    Committed(cockpit_core::daemon::proto::AgentMutationResult),
+    Pending,
+    Rejected(String),
+}
+
+/// Bind a direct or replayed response to one exact owner-generated agent
+/// mutation. A transport error is handled by the caller by querying the local
+/// operation ledger with the same operation id.
+pub(crate) fn bind_agent_mutation_settlement(
+    response: cockpit_core::daemon::proto::Response,
+    client_operation_id: &str,
+    mutation_intent_hash: &str,
+) -> Result<AgentMutationSettlement, String> {
+    use cockpit_core::daemon::proto::Response;
+    match response {
+        Response::AgentMutated(result) => {
+            if result.client_operation_id != client_operation_id
+                || result.mutation_intent_hash != mutation_intent_hash
+            {
+                return Err("daemon returned an unbound agent mutation receipt".into());
+            }
+            Ok(AgentMutationSettlement::Committed(result))
+        }
+        Response::LocalOperationSettlement {
+            client_operation_id: returned_operation_id,
+            operation_kind,
+            request_hash,
+            pending,
+            response,
+            terminal_error,
+            terminal_cancelled,
+        } => {
+            if returned_operation_id != client_operation_id
+                || operation_kind != "mutate_agent"
+                || request_hash != mutation_intent_hash
+            {
+                return Err("daemon returned an unbound agent mutation settlement".into());
+            }
+            if pending {
+                if response.is_some() || terminal_error.is_some() || terminal_cancelled {
+                    return Err(
+                        "pending agent mutation settlement carried a terminal result".into(),
+                    );
+                }
+                return Ok(AgentMutationSettlement::Pending);
+            }
+            if terminal_cancelled {
+                if response.is_some() || terminal_error.is_none() {
+                    return Err("agent mutation cancellation was malformed".into());
+                }
+                return Ok(AgentMutationSettlement::Rejected(
+                    "agent mutation was durably cancelled".into(),
+                ));
+            }
+            if let Some(error) = terminal_error {
+                if response.is_some() {
+                    return Err("agent mutation rejection also carried a response".into());
+                }
+                if error.message.trim().is_empty() {
+                    return Err("agent mutation rejection omitted its error".into());
+                }
+                return Ok(AgentMutationSettlement::Rejected(error.message));
+            }
+            if response.is_none() {
+                return Err("agent mutation settlement was not exactly terminal".into());
+            }
+            match *response.expect("terminal response counted above") {
+                Response::AgentMutated(result)
+                    if result.client_operation_id == client_operation_id
+                        && result.mutation_intent_hash == mutation_intent_hash =>
+                {
+                    Ok(AgentMutationSettlement::Committed(result))
+                }
+                _ => Err("agent mutation settlement carried an unbound terminal receipt".into()),
+            }
+        }
+        other => Err(format!("unexpected agent mutation response: {other:?}")),
+    }
+}
+
 /// Present the effective-model display value in canonical `provider/model`
 /// slash form. A frontmatter `model:` is already authored in that form
 /// (the live convention); we trim and drop blanks so an empty field reads
@@ -2282,12 +2553,12 @@ impl SettingsCx {
     /// `config.json` this settings dialog is editing (the `.cockpit/`
     /// layer the user selected in the picker).
     fn handle_agents_page_key(&mut self, key: KeyEvent, p: &mut AgentsPage) -> Nav {
-        if p.uncertain_editor_settlement.is_some() {
+        if p.uncertain_agent_operation.is_some() {
             if key.code == KeyCode::Enter {
-                p.retry_uncertain_editor_settlement(self);
+                p.retry_uncertain_agent_operation(self);
             } else {
                 p.status = Some(
-                    "editor lease settlement is unresolved; press Enter to query/retry".into(),
+                    "agent operation settlement is unresolved; press Enter to query/retry".into(),
                 );
             }
             return Nav::Stay;

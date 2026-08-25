@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::daemon::proto::{
@@ -325,6 +326,7 @@ pub async fn inventory(
     ctx: &DaemonContext,
     project_root: String,
 ) -> Result<Response, ErrorPayload> {
+    let request_project_root = project_root.clone();
     let root = trusted_root(ctx, &project_root).await?;
     maintain_editor_leases(ctx).await?;
     tokio::task::spawn_blocking(move || {
@@ -356,14 +358,840 @@ pub async fn edit_snapshot(
 
 pub async fn mutate(
     ctx: &DaemonContext,
+    owner_digest: String,
+    client_operation_id: String,
+    mutation_intent_hash: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
     project_root: String,
     mutation: AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
-    tokio::task::spawn_blocking(move || mutate_sync(&root, mutation, expected_revision))
+    let canonical_root = root.to_string_lossy().into_owned();
+    let plan_root = root.clone();
+    let plan_mutation = mutation.clone();
+    let plan_revision = expected_revision.clone();
+    let plan = tokio::task::spawn_blocking(move || {
+        let guard = cockpit_config::config::hold_config_mutation_lock(
+            &plan_root.join(".cockpit/config.json"),
+        )
+        .map_err(internal)?;
+        recover_reset_all_locked(&plan_root, &guard)?;
+        prepare_mutation_plan_sync(&plan_root, &plan_mutation, plan_revision.as_deref())
+    })
+    .await
+    .map_err(join_error)??;
+    let journal_owner = owner_digest.clone();
+    let journal_operation = client_operation_id.clone();
+    let journal_root = canonical_root.clone();
+    let journal_request_root = request_project_root.clone();
+    let journal_action = plan.action.clone();
+    let journal_name = plan.agent_name.clone();
+    let journal_revision = expected_revision.clone();
+    let journal_hash = plan.intended_projection_hash.clone();
+    let journal_intent_hash = mutation_intent_hash.clone();
+    let journal_consumed_hash = plan.consumed_projection_hash.clone();
+    let affected_hint = i64::from(plan.affected_hint);
+    let changed_hint = if plan.changed_hint { 1_i64 } else { 0_i64 };
+    let consumed_config_generation = i64::try_from(plan.consumed_config_generation)
+        .map_err(|_| internal("agent mutation config generation is out of range"))?;
+    let keyed_request_identity = agent_mutation_keyed_identity(
+        ctx,
+        &owner_digest,
+        &client_operation_id,
+        &canonical_root,
+        &request_project_root,
+        &mutation_intent_hash,
+    )?;
+    ctx.db
+        .transaction(move |conn| {
+            let changed = conn.execute(
+                "INSERT OR IGNORE INTO agent_mutation_journals
+                 (owner_digest,client_operation_id,request_hash,keyed_request_identity,fencing_generation,
+                  project_root,request_project_root,agent_name,action,consumed_revision,affected_hint,changed_hint,consumed_config_generation,
+                  mutation_intent_hash,consumed_projection_hash,intended_projection_hash,
+                  terminal_response_json,created_at_unix_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,NULL,?17)",
+                rusqlite::params![
+                    journal_owner,
+                    journal_operation,
+                    request_hash.as_slice(),
+                    keyed_request_identity.as_slice(),
+                    fencing_generation,
+                    journal_root,
+                    journal_request_root,
+                    journal_name,
+                    journal_action,
+                    journal_revision,
+                    affected_hint,
+                    changed_hint,
+                    consumed_config_generation,
+                    journal_intent_hash,
+                    journal_consumed_hash,
+                    journal_hash,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("agent mutation recovery identity already exists");
+            }
+            Ok(())
+        })
         .await
-        .map_err(join_error)?
+        .map_err(|error| conflict(error.to_string()))?;
+    let result = tokio::task::spawn_blocking({
+        let root = root.clone();
+        let mutation = mutation.clone();
+        let expected_revision = expected_revision.clone();
+        move || mutate_sync(&root, mutation, expected_revision)
+    })
+    .await
+    .map_err(join_error)?;
+    let mut response = match result {
+        Ok(Response::AgentMutated(mut result)) => {
+            bind_agent_mutation_receipt(
+                &mut result,
+                &client_operation_id,
+                &mutation_intent_hash,
+                &canonical_root,
+                &request_project_root,
+                &mutation,
+            );
+            Response::AgentMutated(result)
+        }
+        Ok(other) => other,
+        Err(error) => {
+            let reconcile_root = root.clone();
+            let reconcile_plan = plan.clone();
+            let matched = tokio::task::spawn_blocking(move || {
+                projection_matches_plan(&reconcile_root, &reconcile_plan)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
+            if !matched {
+                delete_agent_mutation_journal(ctx, &owner_digest, &client_operation_id).await?;
+                return Err(error);
+            }
+            let projection_root = root.clone();
+            let projection_name = plan.agent_name.clone();
+            let result_is_absent = plan.result_is_absent;
+            let (snapshot, inventory_revision) = tokio::task::spawn_blocking(move || {
+                let snapshot = match projection_name.as_deref() {
+                    Some(name) if !result_is_absent => snapshot_sync(&projection_root, name).ok(),
+                    _ => None,
+                };
+                let inventory = if projection_name.is_none() {
+                    current_inventory_revision(&projection_root).ok()
+                } else {
+                    None
+                };
+                (snapshot, inventory)
+            })
+            .await
+            .map_err(join_error)?;
+            let result_revision = snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.revision.clone())
+                .or_else(|| inventory_revision.clone())
+                .unwrap_or_else(|| {
+                    mutation_tombstone_revision(
+                        &canonical_root,
+                        cockpit_proto::agent_mutation_name(&mutation),
+                        &plan.intended_projection_hash,
+                    )
+                });
+            let result_config_generation = if plan.changed_hint {
+                crate::daemon::server::inventory::publish_committed_config_generation()
+            } else {
+                crate::daemon::server::inventory::current_config_generation()
+            };
+            Response::AgentMutated(AgentMutationResult {
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash: mutation_intent_hash.clone(),
+                project_root: canonical_root.clone(),
+                requested_project_root: request_project_root.clone(),
+                owner_scope: format!("project:{canonical_root}"),
+                agent_name: plan.agent_name.clone(),
+                changed: plan.changed_hint,
+                affected: plan.affected_hint,
+                snapshot,
+                config_generation: result_config_generation,
+                consumed_config_generation: plan.consumed_config_generation,
+                result_config_generation,
+                inventory_revision,
+                consumed_revision: expected_revision.clone(),
+                result_revision,
+                completed_lease_id: None,
+                outcome: cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                    warning: "agent files were committed, but their refreshed projection is unavailable; reload agent settings to reconcile".into(),
+                },
+            })
+        }
+    };
+    if let Response::AgentMutated(result) = &mut response {
+        bind_agent_mutation_receipt(
+            result,
+            &client_operation_id,
+            &mutation_intent_hash,
+            &canonical_root,
+            &request_project_root,
+            &mutation,
+        );
+    }
+    settle_agent_mutation_journal(
+        ctx,
+        owner_digest,
+        client_operation_id,
+        request_hash,
+        fencing_generation,
+        &response,
+    )
+    .await?;
+    Ok(response)
+}
+
+#[derive(Clone)]
+struct AgentMutationPlan {
+    action: String,
+    agent_name: Option<String>,
+    intended_projection_hash: String,
+    consumed_projection_hash: String,
+    affected_hint: u32,
+    changed_hint: bool,
+    consumed_config_generation: u64,
+    result_is_absent: bool,
+}
+
+fn projection_hash(bytes: Option<&[u8]>) -> String {
+    let mut hasher = Sha256::new();
+    match bytes {
+        Some(bytes) => {
+            hasher.update(b"flycockpit.agent-projection.present.v1\0");
+            hasher.update(bytes);
+        }
+        None => hasher.update(b"flycockpit.agent-projection.absent.v1"),
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn agent_mutation_keyed_identity(
+    ctx: &DaemonContext,
+    owner: &str,
+    operation: &str,
+    canonical_root: &str,
+    requested_root: &str,
+    intent_hash: &str,
+) -> Result<[u8; 32], ErrorPayload> {
+    let encoded = zeroize::Zeroizing::new(
+        serde_json::to_vec(&(
+            owner,
+            operation,
+            canonical_root,
+            requested_root,
+            intent_hash,
+        ))
+        .map_err(internal)?,
+    );
+    Ok(ctx
+        .secret_vault
+        .keyed_identity(b"flycockpit.agent-mutation.request.v1", encoded.as_slice()))
+}
+
+fn prepare_mutation_plan_sync(
+    root: &Path,
+    mutation: &AgentMutation,
+    expected_revision: Option<&str>,
+) -> Result<AgentMutationPlan, ErrorPayload> {
+    let (action, name, consumed, intended, affected_hint, absent) = match mutation {
+        AgentMutation::EjectBuiltin { name } => {
+            validate_name(name)?;
+            if !crate::agents::is_builtin_agent(name) {
+                return Err(bad_request("only a built-in agent can be ejected"));
+            }
+            let current = snapshot_sync(root, name)?;
+            ensure_revision(&current.revision, expected_revision)?;
+            ensure_workspace_source_or_embedded(&current)?;
+            (
+                "eject_builtin",
+                Some(name.clone()),
+                target_projection_hash(root, name)?,
+                projection_hash(Some(current.markdown.as_bytes())),
+                1,
+                false,
+            )
+        }
+        AgentMutation::SaveDefinition { name, markdown }
+        | AgentMutation::CreateDefinition { name, markdown } => {
+            validate_name(name)?;
+            let parsed = crate::agents::parse_agent(
+                markdown,
+                name,
+                PathBuf::from("<daemon-agent-mutation-plan>"),
+            )
+            .map_err(bad_config)?;
+            crate::agents::validate_invariants(&parsed).map_err(bad_config)?;
+            if matches!(mutation, AgentMutation::SaveDefinition { .. }) {
+                let current = snapshot_sync(root, name)?;
+                ensure_revision(&current.revision, expected_revision)?;
+                if !matches!(
+                    current.source_layer,
+                    AgentSourceLayer::Workspace | AgentSourceLayer::Embedded
+                ) {
+                    return Err(conflict(
+                        "save refused: another configuration layer owns this agent",
+                    ));
+                }
+            } else if expected_revision.is_some() {
+                return Err(bad_request("create cannot consume a document revision"));
+            } else if crate::agents::resolve(root, name)
+                .map_err(bad_config)?
+                .is_some()
+                || nofollow_read(&project_agent_path(root, name)?)?.is_some()
+            {
+                return Err(conflict(
+                    "agent name already resolves in a configuration layer",
+                ));
+            }
+            let action = if matches!(mutation, AgentMutation::SaveDefinition { .. }) {
+                "save_definition"
+            } else {
+                "create_definition"
+            };
+            (
+                action,
+                Some(name.clone()),
+                target_projection_hash(root, name)?,
+                projection_hash(Some(markdown.as_bytes())),
+                1,
+                false,
+            )
+        }
+        AgentMutation::DeleteCustom { name } => {
+            validate_name(name)?;
+            if crate::agents::is_builtin_agent(name) {
+                return Err(bad_request("built-in agents cannot be deleted"));
+            }
+            let current = snapshot_sync(root, name)?;
+            ensure_revision(&current.revision, expected_revision)?;
+            if current.source_layer != AgentSourceLayer::Workspace
+                || nofollow_read(&project_agent_path(root, name)?)?.is_none()
+            {
+                return Err(conflict("custom agent is not owned by the workspace layer"));
+            }
+            (
+                "delete_custom",
+                Some(name.clone()),
+                target_projection_hash(root, name)?,
+                projection_hash(None),
+                1,
+                true,
+            )
+        }
+        AgentMutation::ResetBuiltin { name } => {
+            validate_name(name)?;
+            if !crate::agents::is_builtin_agent(name) {
+                return Err(bad_request("only a built-in agent can be reset"));
+            }
+            let current = snapshot_sync(root, name)?;
+            ensure_revision(&current.revision, expected_revision)?;
+            if current.source_layer != AgentSourceLayer::Workspace {
+                return Err(conflict(
+                    "built-in override is not owned by the workspace layer",
+                ));
+            }
+            (
+                "reset_builtin",
+                Some(name.clone()),
+                target_projection_hash(root, name)?,
+                projection_hash(None),
+                1,
+                true,
+            )
+        }
+        AgentMutation::ResetAllBuiltins => {
+            let current = current_inventory_revision(root)?;
+            ensure_revision(&current, expected_revision)?;
+            let mut affected = 0_usize;
+            for name in crate::agents::BUILTIN_AGENT_NAMES.iter().copied() {
+                if nofollow_read(&project_agent_path(root, name)?)?.is_some() {
+                    affected = affected.saturating_add(1);
+                }
+            }
+            let affected = affected.try_into().unwrap_or(u32::MAX);
+            (
+                "reset_all_builtins",
+                None,
+                reset_all_target_projection_hash(root)?,
+                reset_all_projection_hash(),
+                affected,
+                true,
+            )
+        }
+        AgentMutation::SaveGoalSupervision { name, patch } => {
+            validate_name(name)?;
+            let current = snapshot_sync(root, name)?;
+            ensure_revision(&current.revision, expected_revision)?;
+            if !matches!(
+                current.source_layer,
+                AgentSourceLayer::Workspace | AgentSourceLayer::Embedded
+            ) {
+                return Err(conflict(
+                    "goal settings cannot shadow an agent owned by another configuration layer",
+                ));
+            }
+            let mut def = crate::agents::parse_agent(
+                &current.markdown,
+                name,
+                PathBuf::from("<daemon-agent-goal-settings-plan>"),
+            )
+            .map_err(bad_config)?;
+            if let Some(value) = &patch.cold_skeptic_count {
+                def.goal_supervision.cold_skeptic_count = *value;
+            }
+            if let Some(value) = &patch.cold_skeptic_model {
+                def.goal_supervision.cold_skeptic_model = value.clone();
+            }
+            if let Some(value) = &patch.max_verification_attempts {
+                def.goal_supervision.max_verification_attempts = *value;
+            }
+            def.goal_supervision.validate().map_err(bad_config)?;
+            crate::agents::validate_invariants(&def).map_err(bad_config)?;
+            let markdown = def.to_markdown().map_err(bad_config)?;
+            (
+                "save_goal_supervision",
+                Some(name.clone()),
+                target_projection_hash(root, name)?,
+                projection_hash(Some(markdown.as_bytes())),
+                1,
+                false,
+            )
+        }
+    };
+    let changed_hint = consumed != intended;
+    let affected_hint = if changed_hint { affected_hint } else { 0 };
+    Ok(AgentMutationPlan {
+        action: action.into(),
+        agent_name: name,
+        intended_projection_hash: intended,
+        consumed_projection_hash: consumed,
+        affected_hint,
+        changed_hint,
+        consumed_config_generation: crate::daemon::server::inventory::current_config_generation(),
+        result_is_absent: absent,
+    })
+}
+
+fn reset_all_projection_hash() -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"flycockpit.agent-reset-all-targets.v1\0");
+    hex::encode(digest.finalize())
+}
+
+fn target_projection_hash(root: &Path, name: &str) -> Result<String, ErrorPayload> {
+    let target = project_agent_path(root, name)?;
+    Ok(projection_hash(nofollow_read(&target)?.as_deref()))
+}
+
+fn reset_all_target_projection_hash(root: &Path) -> Result<String, ErrorPayload> {
+    let mut entries = crate::agents::BUILTIN_AGENT_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    entries.sort();
+    let mut digest = Sha256::new();
+    digest.update(b"flycockpit.agent-reset-all-targets.v1\0");
+    for name in entries {
+        let target = project_agent_path(root, &name)?;
+        if let Some(bytes) = nofollow_read(&target)? {
+            digest.update((name.len() as u64).to_le_bytes());
+            digest.update(name.as_bytes());
+            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update(&bytes);
+        }
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn projection_matches_plan(root: &Path, plan: &AgentMutationPlan) -> Result<bool, ErrorPayload> {
+    if let Some(name) = plan.agent_name.as_deref() {
+        let target = project_agent_path(root, name)?;
+        return Ok(
+            projection_hash(nofollow_read(&target)?.as_deref()) == plan.intended_projection_hash
+        );
+    }
+    Ok(reset_all_target_projection_hash(root)? == plan.intended_projection_hash)
+}
+
+fn projection_matches_consumed(
+    root: &Path,
+    plan: &AgentMutationPlan,
+) -> Result<bool, ErrorPayload> {
+    let current = match plan.agent_name.as_deref() {
+        Some(name) => target_projection_hash(root, name)?,
+        None => reset_all_target_projection_hash(root)?,
+    };
+    Ok(current == plan.consumed_projection_hash)
+}
+
+fn mutation_tombstone_revision(
+    project_root: &str,
+    agent_name: Option<&str>,
+    result_projection_hash: &str,
+) -> String {
+    crate::daemon::authority_token::mint(
+        b"agent-mutation-tombstone/v1",
+        &[
+            project_root.as_bytes(),
+            agent_name.unwrap_or("*").as_bytes(),
+            result_projection_hash.as_bytes(),
+        ],
+    )
+}
+
+fn bind_agent_mutation_receipt(
+    result: &mut AgentMutationResult,
+    client_operation_id: &str,
+    mutation_intent_hash: &str,
+    canonical_project_root: &str,
+    requested_project_root: &str,
+    mutation: &AgentMutation,
+) {
+    result.client_operation_id = client_operation_id.to_owned();
+    result.mutation_intent_hash = mutation_intent_hash.to_owned();
+    result.project_root = canonical_project_root.to_owned();
+    result.requested_project_root = requested_project_root.to_owned();
+    result.owner_scope = format!("project:{canonical_project_root}");
+    result.agent_name = cockpit_proto::agent_mutation_name(mutation).map(str::to_owned);
+    if result.result_revision.is_empty() {
+        result.result_revision = result
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.revision.clone())
+            .or_else(|| result.inventory_revision.clone())
+            .unwrap_or_else(|| {
+                mutation_tombstone_revision(
+                    canonical_project_root,
+                    cockpit_proto::agent_mutation_name(mutation),
+                    &projection_hash(None),
+                )
+            });
+    }
+}
+
+async fn delete_agent_mutation_journal(
+    ctx: &DaemonContext,
+    owner: &str,
+    operation: &str,
+) -> Result<(), ErrorPayload> {
+    let owner = owner.to_owned();
+    let operation = operation.to_owned();
+    ctx.db
+        .write(move |conn| {
+            conn.execute(
+                "DELETE FROM agent_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2",
+                rusqlite::params![owner, operation],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
+async fn settle_agent_mutation_journal(
+    ctx: &DaemonContext,
+    owner: String,
+    operation: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    response: &Response,
+) -> Result<(), ErrorPayload> {
+    let json = serde_json::to_string(response).map_err(internal)?;
+    ctx.db
+        .transaction(move |conn| {
+            let now = chrono::Utc::now().timestamp_millis();
+            let journal = conn.execute(
+                "UPDATE agent_mutation_journals SET terminal_response_json=?5
+                 WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3
+                   AND fencing_generation=?4 AND terminal_response_json IS NULL",
+                rusqlite::params![owner, operation, request_hash.as_slice(), fencing_generation, json],
+            )?;
+            if journal != 1 { anyhow::bail!("agent mutation lost its recovery journal"); }
+            let receipt = conn.execute(
+                "UPDATE local_operation_receipts
+                 SET state='terminal_success',terminal_outcome_json=?5,
+                     execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                 WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3
+                   AND fencing_generation=?4 AND state='executing'",
+                rusqlite::params![owner, operation, request_hash.as_slice(), fencing_generation, json, now],
+            )?;
+            if receipt != 1 { anyhow::bail!("agent mutation lost its receipt fence"); }
+            conn.execute(
+                "DELETE FROM agent_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2",
+                rusqlite::params![owner, operation],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
+/// Reconcile hash-only agent publication intents before the daemon socket is
+/// visible. A matching intended projection proves that atomic publication
+/// crossed its durability boundary; a divergent projection remains pending
+/// for explicit repair rather than fabricating either success or rejection.
+pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64, ErrorPayload> {
+    type Row = (
+        String,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+        bool,
+        i64,
+        String,
+        String,
+        String,
+    );
+    let rows: Vec<Row> = ctx
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT owner_digest,client_operation_id,request_hash,keyed_request_identity,fencing_generation,
+                        project_root,request_project_root,agent_name,action,consumed_revision,affected_hint,changed_hint,consumed_config_generation,
+                        mutation_intent_hash,consumed_projection_hash,intended_projection_hash
+                   FROM agent_mutation_journals ORDER BY created_at_unix_ms",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+        .await
+        .map_err(internal)?;
+    let mut recovered = 0_u64;
+    for (
+        owner,
+        operation,
+        request_hash,
+        keyed_request_identity,
+        fencing_generation,
+        project_root,
+        request_project_root,
+        agent_name,
+        action,
+        consumed_revision,
+        affected_hint,
+        changed_hint,
+        consumed_config_generation,
+        mutation_intent_hash,
+        consumed_projection_hash,
+        intended_projection_hash,
+    ) in rows
+    {
+        let Ok(request_hash): Result<[u8; 32], _> = request_hash.try_into() else {
+            return Err(internal("agent mutation journal request hash is corrupt"));
+        };
+        let Ok(stored_keyed_identity): Result<[u8; 32], _> = keyed_request_identity.try_into()
+        else {
+            return Err(internal(
+                "agent mutation journal keyed request identity is corrupt",
+            ));
+        };
+        let expected_keyed_identity = agent_mutation_keyed_identity(
+            ctx,
+            &owner,
+            &operation,
+            &project_root,
+            &request_project_root,
+            &mutation_intent_hash,
+        )?;
+        if stored_keyed_identity != expected_keyed_identity {
+            return Err(internal(
+                "agent mutation journal keyed request identity does not match its bindings",
+            ));
+        }
+        let affected_hint = u32::try_from(affected_hint)
+            .map_err(|_| internal("agent mutation journal affected count is corrupt"))?;
+        let consumed_config_generation = u64::try_from(consumed_config_generation)
+            .map_err(|_| internal("agent mutation journal config generation is corrupt"))?;
+        let root = PathBuf::from(&project_root);
+        let plan = AgentMutationPlan {
+            result_is_absent: matches!(
+                action.as_str(),
+                "delete_custom" | "reset_builtin" | "reset_all_builtins"
+            ),
+            action,
+            agent_name: agent_name.clone(),
+            consumed_projection_hash,
+            intended_projection_hash,
+            affected_hint,
+            changed_hint,
+            consumed_config_generation,
+        };
+        let check_root = root.clone();
+        let check_plan = plan.clone();
+        let matches =
+            tokio::task::spawn_blocking(move || projection_matches_plan(&check_root, &check_plan))
+                .await
+                .map_err(join_error)??;
+        if !matches {
+            let consumed_root = root.clone();
+            let consumed_plan = plan.clone();
+            let still_consumed = tokio::task::spawn_blocking(move || {
+                projection_matches_consumed(&consumed_root, &consumed_plan)
+            })
+            .await
+            .map_err(join_error)??;
+            if still_consumed {
+                cancel_agent_mutation_journal(
+                    ctx,
+                    owner,
+                    operation,
+                    request_hash,
+                    fencing_generation,
+                )
+                .await?;
+                recovered = recovered.saturating_add(1);
+                continue;
+            }
+            tracing::warn!(
+                client_operation_id = operation,
+                "agent mutation recovery projection is divergent; retaining pending journal"
+            );
+            continue;
+        }
+        let projection_root = root.clone();
+        let projection_name = agent_name.clone();
+        let result_is_absent = plan.result_is_absent;
+        let (snapshot, inventory_revision) = tokio::task::spawn_blocking(move || {
+            let snapshot = match projection_name.as_deref() {
+                Some(name) if !result_is_absent => snapshot_sync(&projection_root, name).ok(),
+                _ => None,
+            };
+            let inventory = if projection_name.is_none() {
+                current_inventory_revision(&projection_root).ok()
+            } else {
+                None
+            };
+            (snapshot, inventory)
+        })
+        .await
+        .map_err(join_error)?;
+        let result_revision = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.revision.clone())
+            .or_else(|| inventory_revision.clone())
+            .unwrap_or_else(|| {
+                mutation_tombstone_revision(
+                    &project_root,
+                    agent_name.as_deref(),
+                    &plan.intended_projection_hash,
+                )
+            });
+        let result_config_generation =
+            consumed_config_generation.saturating_add(if changed_hint { 1 } else { 0 });
+        let response = Response::AgentMutated(AgentMutationResult {
+            client_operation_id: operation.clone(),
+            mutation_intent_hash,
+            project_root: project_root.clone(),
+            requested_project_root: request_project_root,
+            owner_scope: format!("project:{project_root}"),
+            agent_name,
+            changed: changed_hint,
+            affected: affected_hint,
+            snapshot,
+            config_generation: result_config_generation,
+            consumed_config_generation,
+            result_config_generation,
+            inventory_revision,
+            consumed_revision,
+            result_revision,
+            completed_lease_id: None,
+            outcome: cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                warning: "agent files were committed before daemon restart; reload agent settings to reconcile".into(),
+            },
+        });
+        settle_agent_mutation_journal(
+            ctx,
+            owner,
+            operation,
+            request_hash,
+            fencing_generation,
+            &response,
+        )
+        .await?;
+        recovered = recovered.saturating_add(1);
+    }
+    Ok(recovered)
+}
+
+async fn cancel_agent_mutation_journal(
+    ctx: &DaemonContext,
+    owner: String,
+    operation: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+) -> Result<(), ErrorPayload> {
+    let error = ErrorPayload {
+        code: ErrorCode::Shutdown,
+        message: "the daemon restarted before the agent mutation reached file publication".into(),
+    };
+    let json = serde_json::to_string(&error).map_err(internal)?;
+    ctx.db
+        .transaction(move |conn| {
+            let changed = conn.execute(
+                "UPDATE local_operation_receipts
+                 SET state='terminal_cancelled',terminal_outcome_json=?5,
+                     execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                 WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3
+                   AND fencing_generation=?4 AND state='executing'",
+                rusqlite::params![
+                    owner,
+                    operation,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    json,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("agent mutation lost its cancellation receipt fence");
+            }
+            conn.execute(
+                "DELETE FROM agent_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2",
+                rusqlite::params![owner, operation],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
 }
 
 pub async fn begin_editor_lease(
@@ -735,14 +1563,24 @@ async fn complete_editor_lease_inner(
                 }
             };
             if current.markdown == markdown {
+                let result_revision = current.revision.clone();
+                let generation = crate::daemon::server::inventory::current_config_generation();
                 Response::AgentMutated(AgentMutationResult {
+                    client_operation_id: client_operation_id.clone(),
+                    mutation_intent_hash: projection_hash(Some(markdown.as_bytes())),
+                    project_root: root_text.clone(),
+                    requested_project_root: root_text.clone(),
+                    owner_scope: format!("project:{root_text}"),
+                    agent_name: Some(lease.agent_name.clone()),
                     changed: true,
                     affected: 1,
                     snapshot: Some(current),
-                    config_generation: crate::daemon::server::inventory::current_config_generation(
-                    ),
+                    config_generation: generation,
+                    consumed_config_generation: generation,
+                    result_config_generation: generation,
                     inventory_revision: None,
                     consumed_revision: Some(consumed_lease_revision.clone()),
+                    result_revision,
                     completed_lease_id: None,
                     outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
                 })
@@ -776,14 +1614,27 @@ async fn complete_editor_lease_inner(
                         .and_then(Result::ok)
                         .filter(|snapshot| snapshot.markdown == submitted_markdown);
                         if let Some(snapshot) = reconciled {
+                            let result_revision = snapshot.revision.clone();
+                            let generation =
+                                crate::daemon::server::inventory::current_config_generation();
                             Response::AgentMutated(AgentMutationResult {
+                                client_operation_id: client_operation_id.clone(),
+                                mutation_intent_hash: projection_hash(Some(
+                                    submitted_markdown.as_bytes(),
+                                )),
+                                project_root: root_text.clone(),
+                                requested_project_root: root_text.clone(),
+                                owner_scope: format!("project:{root_text}"),
+                                agent_name: Some(lease.agent_name.clone()),
                                 changed: true,
                                 affected: 1,
                                 snapshot: Some(snapshot),
-                                config_generation:
-                                    crate::daemon::server::inventory::current_config_generation(),
+                                config_generation: generation,
+                                consumed_config_generation: generation,
+                                result_config_generation: generation,
                                 inventory_revision: None,
                                 consumed_revision: Some(consumed_lease_revision.clone()),
+                                result_revision,
                                 completed_lease_id: None,
                                 outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
                             })
@@ -802,16 +1653,28 @@ async fn complete_editor_lease_inner(
                 }
             }
         }
-        None => Response::AgentMutated(AgentMutationResult {
-            changed: false,
-            affected: 0,
-            snapshot: None,
-            config_generation: crate::daemon::server::inventory::current_config_generation(),
-            inventory_revision: None,
-            consumed_revision: Some(consumed_lease_revision),
-            completed_lease_id: None,
-            outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
-        }),
+        None => {
+            let generation = crate::daemon::server::inventory::current_config_generation();
+            Response::AgentMutated(AgentMutationResult {
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash: projection_hash(None),
+                project_root: root_text.clone(),
+                requested_project_root: root_text.clone(),
+                owner_scope: format!("project:{root_text}"),
+                agent_name: Some(lease.agent_name.clone()),
+                changed: false,
+                affected: 0,
+                snapshot: None,
+                config_generation: generation,
+                consumed_config_generation: generation,
+                result_config_generation: generation,
+                inventory_revision: None,
+                consumed_revision: Some(consumed_lease_revision),
+                result_revision: lease.consumed_revision.clone(),
+                completed_lease_id: None,
+                outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
+            })
+        }
     };
     let Response::AgentMutated(mut result) = result else {
         unreachable!("agent mutation always returns AgentMutated")
@@ -1237,6 +2100,8 @@ fn mutate_sync(
     mutation: AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<Response, ErrorPayload> {
+    let mutation_name = cockpit_proto::agent_mutation_name(&mutation).map(str::to_owned);
+    let project_root = root.to_string_lossy().into_owned();
     let consumed_revision = expected_revision.clone();
     let lock_target = root.join(".cockpit/config.json");
     let guard =
@@ -1448,13 +2313,33 @@ fn mutate_sync(
     } else {
         (None, cockpit_proto::AgentMutationOutcome::Reconciled)
     };
+    let result_revision = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.revision.clone())
+        .or_else(|| result_inventory_revision.clone())
+        .unwrap_or_else(|| {
+            mutation_tombstone_revision(
+                &project_root,
+                mutation_name.as_deref(),
+                &projection_hash(None),
+            )
+        });
     Ok(Response::AgentMutated(AgentMutationResult {
+        client_operation_id: String::new(),
+        mutation_intent_hash: String::new(),
+        project_root,
+        requested_project_root: root.to_string_lossy().into_owned(),
+        owner_scope: format!("project:{}", root.to_string_lossy()),
+        agent_name: mutation_name,
         changed,
         affected,
         snapshot,
         config_generation: generation,
+        consumed_config_generation: generation_before,
+        result_config_generation: generation,
         inventory_revision: result_inventory_revision,
         consumed_revision,
+        result_revision,
         completed_lease_id: None,
         outcome,
     }))

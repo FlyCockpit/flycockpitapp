@@ -216,6 +216,8 @@ enum GoalSettingsPending {
     },
     SaveAgent {
         operation_id: uuid::Uuid,
+        client_operation_id: String,
+        mutation_intent_hash: String,
         agent_name: String,
         project_root: String,
         expected_revision: String,
@@ -223,7 +225,19 @@ enum GoalSettingsPending {
         patch: cockpit_core::daemon::proto::GoalSupervisionPatch,
         prior_goal_json: Option<String>,
         override_json: Option<String>,
+        querying: bool,
     },
+}
+
+enum GoalMutationResolution {
+    Committed {
+        revision: String,
+        original: serde_json::Map<String, serde_json::Value>,
+        warning: Option<String>,
+    },
+    Pending,
+    Rejected(String),
+    Invalid(String),
 }
 
 #[derive(Debug)]
@@ -277,6 +291,101 @@ impl GoalSettingsPane {
         self.pending_effect.take()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn requeue_settlement(
+        &mut self,
+        operation_id: uuid::Uuid,
+        client_operation_id: String,
+        mutation_intent_hash: String,
+        agent_name: String,
+        project_root: String,
+        expected_revision: String,
+        mutation: cockpit_core::daemon::proto::AgentMutation,
+        patch: cockpit_core::daemon::proto::GoalSupervisionPatch,
+        prior_goal_json: Option<String>,
+        override_json: Option<String>,
+        schedule_query: bool,
+        message: String,
+    ) {
+        let operation_id = if schedule_query {
+            uuid::Uuid::new_v4()
+        } else {
+            operation_id
+        };
+        if schedule_query {
+            self.pending_effect = Some(GoalSettingsEffect {
+                operation_id,
+                agent_name: agent_name.clone(),
+                project_root: project_root.clone(),
+                expected_revision: Some(expected_revision.clone()),
+                request: cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                    client_operation_id: client_operation_id.clone(),
+                },
+            });
+        }
+        self.in_flight = Some(GoalSettingsPending::SaveAgent {
+            operation_id,
+            client_operation_id,
+            mutation_intent_hash,
+            agent_name,
+            project_root,
+            expected_revision,
+            mutation,
+            patch,
+            prior_goal_json,
+            override_json,
+            querying: true,
+        });
+        self.status = Some(format!("{message}; press Enter to query again"));
+    }
+
+    fn retry_settlement(&mut self) {
+        let Some(GoalSettingsPending::SaveAgent {
+            client_operation_id,
+            mutation_intent_hash,
+            agent_name,
+            project_root,
+            expected_revision,
+            mutation,
+            patch,
+            prior_goal_json,
+            override_json,
+            querying: _,
+            ..
+        }) = self.in_flight.take()
+        else {
+            return;
+        };
+        let operation_id = uuid::Uuid::new_v4();
+        self.pending_effect = Some(GoalSettingsEffect {
+            operation_id,
+            agent_name: agent_name.clone(),
+            project_root: project_root.clone(),
+            expected_revision: Some(expected_revision.clone()),
+            request: cockpit_core::daemon::proto::Request::MutateAgent {
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash: mutation_intent_hash.clone(),
+                project_root: project_root.clone(),
+                mutation: mutation.clone(),
+                expected_revision: Some(expected_revision.clone()),
+            },
+        });
+        self.in_flight = Some(GoalSettingsPending::SaveAgent {
+            operation_id,
+            client_operation_id,
+            mutation_intent_hash,
+            agent_name,
+            project_root,
+            expected_revision,
+            mutation,
+            patch,
+            prior_goal_json,
+            override_json,
+            querying: false,
+        });
+        self.status = Some("retrying the exact durable goal-settings mutation".into());
+    }
+
     /// Apply a host-delivered daemon result only when it belongs to the exact
     /// operation and authority snapshot still owned by this pane. Duplicate,
     /// late, and out-of-order completions are presentation no-ops.
@@ -298,6 +407,8 @@ impl GoalSettingsPane {
                 ..
             } => (agent_name.as_str(), project_root.as_str(), None),
             GoalSettingsPending::SaveAgent {
+                client_operation_id,
+                mutation_intent_hash,
                 agent_name,
                 project_root,
                 expected_revision,
@@ -314,6 +425,10 @@ impl GoalSettingsPane {
             || completion.expected_revision.as_deref() != pending_revision
         {
             self.in_flight = Some(pending);
+            self.status = Some(
+                "ignored an unbound goal-settings completion; press Enter to query the exact operation"
+                    .into(),
+            );
             return None;
         }
         match pending {
@@ -359,6 +474,9 @@ impl GoalSettingsPane {
                 None
             }
             GoalSettingsPending::SaveAgent {
+                operation_id,
+                client_operation_id,
+                mutation_intent_hash,
                 agent_name,
                 project_root,
                 expected_revision,
@@ -366,6 +484,7 @@ impl GoalSettingsPane {
                 patch,
                 prior_goal_json,
                 override_json,
+                querying: _,
                 ..
             } => {
                 if self.agent_name != agent_name
@@ -374,47 +493,142 @@ impl GoalSettingsPane {
                 {
                     return None;
                 }
-                let saved = completion.response.and_then(|response| {
-                    let cockpit_core::daemon::proto::Response::AgentMutated(result) = response
-                    else {
-                        return Err("daemon returned an unexpected goal-settings response".into());
-                    };
-                    super::settings::agents_page::validate_agent_mutation_result(
-                        &result,
-                        &self.cwd,
-                        &mutation,
-                        Some(&expected_revision),
-                        None,
-                    )?;
-                    let snapshot = result
-                        .snapshot
-                        .ok_or_else(|| "daemon omitted the goal-settings snapshot".to_string())?;
-                    cockpit_proto::validate_goal_supervision_projection(
-                        prior_goal_json.as_deref(),
-                        &patch,
-                        snapshot.goal_supervision_json.as_deref(),
-                    )?;
-                    let original = snapshot
-                        .goal_supervision_json
-                        .as_deref()
-                        .map(serde_json::from_str)
-                        .transpose()
-                        .map_err(|error| error.to_string())?
-                        .unwrap_or_default();
-                    Ok((snapshot.revision, original))
-                });
+                let response = match completion.response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.requeue_settlement(
+                            operation_id,
+                            client_operation_id,
+                            mutation_intent_hash,
+                            agent_name,
+                            project_root,
+                            expected_revision,
+                            mutation,
+                            patch,
+                            prior_goal_json,
+                            override_json,
+                            true,
+                            format!("goal-settings outcome is unknown ({error})"),
+                        );
+                        return None;
+                    }
+                };
+                let saved = match super::settings::agents_page::bind_agent_mutation_settlement(
+                    response,
+                    &client_operation_id,
+                    &mutation_intent_hash,
+                ) {
+                    Ok(super::settings::agents_page::AgentMutationSettlement::Committed(
+                        result,
+                    )) => (|| {
+                        super::settings::agents_page::validate_agent_mutation_result(
+                            &result,
+                            &client_operation_id,
+                            &mutation_intent_hash,
+                            &self.cwd,
+                            &mutation,
+                            Some(&expected_revision),
+                            None,
+                        )?;
+                        if let cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded { warning } = &result.outcome {
+                            let original = override_json
+                                .as_deref()
+                                .map(serde_json::from_str::<serde_json::Value>)
+                                .transpose()
+                                .map_err(|error| error.to_string())?
+                                .and_then(|value| value.as_object().cloned())
+                                .unwrap_or_default();
+                            return Ok(GoalMutationResolution::Committed {
+                                revision: result.result_revision,
+                                original,
+                                warning: Some(warning.clone()),
+                            });
+                        }
+                        let snapshot = result.snapshot.ok_or_else(|| {
+                            "daemon omitted the goal-settings snapshot".to_string()
+                        })?;
+                        cockpit_proto::validate_goal_supervision_projection(
+                            prior_goal_json.as_deref(),
+                            &patch,
+                            snapshot.goal_supervision_json.as_deref(),
+                        )?;
+                        let original = snapshot
+                            .goal_supervision_json
+                            .as_deref()
+                            .map(serde_json::from_str)
+                            .transpose()
+                            .map_err(|error| error.to_string())?
+                            .unwrap_or_default();
+                        Ok(GoalMutationResolution::Committed {
+                            revision: snapshot.revision,
+                            original,
+                            warning: None,
+                        })
+                    })()
+                    .unwrap_or_else(GoalMutationResolution::Invalid),
+                    Ok(super::settings::agents_page::AgentMutationSettlement::Pending) => {
+                        GoalMutationResolution::Pending
+                    }
+                    Ok(super::settings::agents_page::AgentMutationSettlement::Rejected(error)) => {
+                        GoalMutationResolution::Rejected(error)
+                    }
+                    Err(error) => GoalMutationResolution::Invalid(error),
+                };
                 match saved {
-                    Ok((revision, original)) => {
+                    GoalMutationResolution::Committed {
+                        revision,
+                        original,
+                        warning,
+                    } => {
                         self.revision = Some(revision);
                         self.draft.original = original;
-                        self.status = Some("agent goal settings committed".to_string());
+                        self.status = Some(match warning {
+                            Some(warning) => format!(
+                                "agent goal settings committed but refresh is required: {warning}"
+                            ),
+                            None => "agent goal settings committed".to_string(),
+                        });
                         Some(GoalSettingsOutcome::Apply {
                             override_json,
                             persist_session: false,
                         })
                     }
-                    Err(error) => {
-                        self.status = Some(format!("save failed: {error}"));
+                    GoalMutationResolution::Pending => {
+                        self.requeue_settlement(
+                            operation_id,
+                            client_operation_id,
+                            mutation_intent_hash,
+                            agent_name,
+                            project_root,
+                            expected_revision,
+                            mutation,
+                            patch,
+                            prior_goal_json,
+                            override_json,
+                            false,
+                            "goal-settings mutation is still pending".into(),
+                        );
+                        None
+                    }
+                    GoalMutationResolution::Rejected(error) => {
+                        self.status = Some(format!("save was durably rejected: {error}"));
+                        None
+                    }
+                    GoalMutationResolution::Invalid(error) => {
+                        self.requeue_settlement(
+                            operation_id,
+                            client_operation_id,
+                            mutation_intent_hash,
+                            agent_name,
+                            project_root,
+                            expected_revision,
+                            mutation,
+                            patch,
+                            prior_goal_json,
+                            override_json,
+                            false,
+                            format!("goal-settings receipt was malformed or unbound ({error})"),
+                        );
                         None
                     }
                 }
@@ -429,9 +643,14 @@ impl GoalSettingsPane {
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<GoalSettingsOutcome> {
         if self.in_flight.is_some() {
-            self.status = Some(
-                "goal settings operation is still pending; this pane cannot close yet".to_string(),
-            );
+            if key.code == KeyCode::Enter && self.pending_effect.is_none() {
+                self.retry_settlement();
+            } else {
+                self.status = Some(
+                    "goal settings operation is still pending; this pane cannot close yet"
+                        .to_string(),
+                );
+            }
             return None;
         }
         if self.confirm.is_some() {
@@ -627,12 +846,20 @@ impl GoalSettingsPane {
             })?;
             let operation_id = uuid::Uuid::new_v4();
             let project_root = self.cwd.to_string_lossy().into_owned();
+            let client_operation_id = uuid::Uuid::new_v4().to_string();
+            let mutation_intent_hash = cockpit_proto::agent_mutation_intent_hash(
+                &project_root,
+                &mutation,
+                Some(&expected_revision),
+            );
             self.pending_effect = Some(GoalSettingsEffect {
                 operation_id,
                 agent_name: self.agent_name.clone(),
                 project_root: project_root.clone(),
                 expected_revision: Some(expected_revision.clone()),
                 request: cockpit_core::daemon::proto::Request::MutateAgent {
+                    client_operation_id: client_operation_id.clone(),
+                    mutation_intent_hash: mutation_intent_hash.clone(),
                     project_root: project_root.clone(),
                     mutation: mutation.clone(),
                     expected_revision: Some(expected_revision.clone()),
@@ -640,6 +867,8 @@ impl GoalSettingsPane {
             });
             self.in_flight = Some(GoalSettingsPending::SaveAgent {
                 operation_id,
+                client_operation_id,
+                mutation_intent_hash,
                 agent_name: self.agent_name.clone(),
                 project_root,
                 expected_revision,
@@ -647,6 +876,7 @@ impl GoalSettingsPane {
                 patch: goal_patch,
                 prior_goal_json,
                 override_json,
+                querying: false,
             });
             self.status = Some("saving agent goal settings…".to_string());
             return Ok(GoalSettingsOutcome::Pending);

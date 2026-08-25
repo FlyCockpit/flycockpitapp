@@ -19,6 +19,99 @@ fn settings_input_pages_do_not_wait_on_daemon_rpcs() {
 }
 
 #[test]
+fn agent_editor_staging_is_dispatched_only_through_a_blocking_action() {
+    let agents = include_str!("agents_page.rs");
+    let app = include_str!("../app/async_actions.rs");
+    let begin = agents
+        .split("fn apply_begin_lease")
+        .nth(1)
+        .and_then(|source| source.split("fn settle_unserviced_editor_lease").next())
+        .expect("agent lease reducer source");
+    let completion = agents
+        .split("fn reduce_external_edit_result")
+        .nth(1)
+        .and_then(|source| source.split("fn queue_failed_external_edit_read").next())
+        .expect("agent external-edit completion source");
+    assert!(begin.contains("SettingsBlockingEffectWork::PrepareAgentEditor"));
+    assert!(!begin.contains("agent_external_edit_staging()"));
+    assert!(completion.contains("SettingsBlockingEffectWork::ReadAgentEditor"));
+    assert!(!completion.contains("read_config_leaf_from_retained_directory"));
+    assert!(app.contains("start_blocking("));
+    assert!(app.contains("settings.blocking-effect"));
+}
+
+#[test]
+fn queued_secret_payloads_have_redacted_debug_and_single_owners() {
+    let sentinel = "provider-header-secret-sentinel";
+    let payload = SecretPayload::new(sentinel.to_string());
+    assert!(!format!("{payload:?}").contains(sentinel));
+
+    let save = ProviderSavePlan {
+        provider_id: "example".into(),
+        entry: ProviderEntry::default(),
+        header_secrets: vec![Some(zeroize::Zeroizing::new(sentinel.to_string()))],
+    };
+    let plan = ProviderMutationPlan {
+        project_root: "/workspace".into(),
+        saves: vec![save],
+        deletes: Vec::new(),
+        metadata: None,
+    };
+    assert!(!format!("{plan:?}").contains(sentinel));
+
+    let settings = include_str!("mod.rs");
+    let mcp = include_str!("mcp_page.rs");
+    assert!(settings.contains("Vec<Option<zeroize::Zeroizing<String>>>"));
+    assert!(mcp.contains("SecretPayload::new(secret_values_json)"));
+}
+
+#[test]
+fn settings_cannot_close_or_accept_a_stale_session_completion_while_pending() {
+    let tmp = TempDir::new().unwrap();
+    let mut settings = fresh_dialog(&tmp);
+    let target = SettingsEffectTarget {
+        surface: "settings.test-pending",
+        owner: "owner".into(),
+        revision: Some("revision".into()),
+    };
+    let operation_id = settings.cx.queue_simple_mutation(
+        target.clone(),
+        Request::ListAssistants,
+        SettingsMutationAction::ProviderCredentialDelete {
+            provider_id: "example".into(),
+        },
+    );
+    assert!(!settings.handle_key(press(KeyCode::Char('q'))));
+    assert!(settings.cx.pending_settings.contains_key(&operation_id));
+
+    let current_dialog_id = settings.cx.dialog_id;
+    let mut dialog = Dialog::Settings(Box::new(settings));
+    dialog.apply_settings_daemon_completion(SettingsDaemonEffectCompletion {
+        dialog_id: uuid::Uuid::new_v4(),
+        operation_id,
+        target,
+        response: Ok(Response::Ack),
+        committed_refresh_needed: None,
+    });
+    let Dialog::Settings(settings) = &dialog else {
+        unreachable!();
+    };
+    assert_eq!(settings.cx.dialog_id, current_dialog_id);
+    assert!(settings.cx.pending_settings.contains_key(&operation_id));
+    assert!(settings.cx.completed_provider_auth.is_none());
+}
+
+#[test]
+fn authority_success_is_receipt_driven_and_committed_refresh_is_explicit() {
+    let source = include_str!("mod.rs");
+    assert!(source.contains("if self.authority_operation_pending()"));
+    assert!(source.contains("completed_mcp_navigation"));
+    assert!(source.contains("adopt_pending_mcp_oauth"));
+    assert!(source.contains("committed_refresh_needed"));
+    assert!(source.contains("settings committed at generation"));
+}
+
+#[test]
 fn empty_object_merge_patch_is_derived_as_noop_for_existing_object() {
     let mut authored = serde_json::json!({
         "tui": { "mouse": true },

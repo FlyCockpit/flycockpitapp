@@ -132,6 +132,23 @@ enum PendingAgentOperation {
         authority_id: super::pointer_actions::AgentId,
         draft: AgentEditor,
     },
+    PrepareStaging {
+        cwd: PathBuf,
+        name: String,
+        lease_id: String,
+        consumed_revision: String,
+        authority_id: super::pointer_actions::AgentId,
+        staging_id: uuid::Uuid,
+        draft: AgentEditor,
+    },
+    ReadStaging {
+        pointer_operation_id: PointerOperationId,
+        lease_id: String,
+        consumed_revision: String,
+        staging_id: uuid::Uuid,
+        outcome: super::pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
+    },
     CompleteLease {
         cwd: PathBuf,
         name: String,
@@ -186,6 +203,7 @@ pub(super) struct AgentExternalEdit {
     staging_path: PathBuf,
     lease_id: String,
     consumed_revision: String,
+    staging_id: uuid::Uuid,
     /// Raw draft retained until the effect reaches a terminal outcome. A
     /// failed/cancelled operation restores this exact editor for retry.
     draft: Option<AgentEditor>,
@@ -200,7 +218,7 @@ pub(crate) struct AgentExternalEditEffect {
     pub(crate) path: PathBuf,
 }
 
-struct AgentExternalEditStaging {
+pub(crate) struct AgentExternalEditStaging {
     // Drop order is security/lifecycle relevant on Windows.
     directory_handle: std::fs::File,
     directory: tempfile::TempDir,
@@ -224,6 +242,14 @@ fn agent_external_edit_staging() -> Result<AgentExternalEditStaging, String> {
     })
 }
 
+pub(crate) fn prepare_agent_external_edit_staging(
+    text: &str,
+) -> Result<AgentExternalEditStaging, String> {
+    let staging = agent_external_edit_staging()?;
+    seed_agent_external_edit_staging(&staging, text)?;
+    Ok(staging)
+}
+
 fn seed_agent_external_edit_staging(
     staging: &AgentExternalEditStaging,
     text: &str,
@@ -232,16 +258,12 @@ fn seed_agent_external_edit_staging(
         .map_err(|error| format!("failed to seed external-edit recovery draft: {error:#}"))
 }
 
-fn read_agent_external_edit_staging(pending: &AgentExternalEdit) -> Result<String, String> {
-    if pending.staging_path.parent() != Some(pending.staging_dir.path()) {
-        return Err("external-edit staging path escaped its private directory".into());
-    }
-    let leaf = pending
-        .staging_path
-        .file_name()
-        .ok_or_else(|| "external-edit staging file has no leaf name".to_string())?;
+pub(crate) fn read_agent_external_edit_staging(
+    directory_handle: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+) -> Result<String, String> {
     let bytes = cockpit_config::config::read_config_leaf_from_retained_directory(
-        &pending.staging_dir_handle,
+        directory_handle,
         leaf,
         cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES,
     )
@@ -314,6 +336,15 @@ pub(super) struct AgentDetail {
 impl AgentsPage {
     pub(super) fn has_unsettled_external_edit(&self) -> bool {
         self.pending_external_edit.is_some()
+            || self.pending_daemon.values().any(|pending| {
+                matches!(
+                    pending,
+                    PendingAgentOperation::BeginLease { .. }
+                        | PendingAgentOperation::PrepareStaging { .. }
+                        | PendingAgentOperation::ReadStaging { .. }
+                        | PendingAgentOperation::CompleteLease { .. }
+                )
+            })
             || self.pending_operations.values().any(|pending| {
                 matches!(
                     pending,
@@ -464,6 +495,8 @@ impl AgentsPage {
                     && completion.target.owner == format!("{}::{lease_id}", cwd.display())
                     && completion.target.revision.as_deref() == Some(consumed_revision)
             }
+            PendingAgentOperation::PrepareStaging { .. }
+            | PendingAgentOperation::ReadStaging { .. } => false,
         };
         if !target_matches {
             self.pending_daemon.insert(completion.operation_id, pending);
@@ -523,6 +556,131 @@ impl AgentsPage {
                 }
             }
             other => self.apply_operation_completion(cx, other, completion.response),
+        }
+    }
+
+    pub(super) fn apply_blocking_completion(
+        &mut self,
+        cx: &mut SettingsCx,
+        completion: super::SettingsBlockingEffectCompletion,
+    ) {
+        let Some(pending) = self.pending_daemon.remove(&completion.operation_id) else {
+            return;
+        };
+        match pending {
+            PendingAgentOperation::PrepareStaging {
+                cwd,
+                name,
+                lease_id,
+                consumed_revision,
+                authority_id,
+                staging_id,
+                draft,
+            } => {
+                let expected = super::SettingsEffectTarget {
+                    surface: "agents.editor-staging-prepare",
+                    owner: format!("{}::{lease_id}", cwd.display()),
+                    revision: Some(format!("{consumed_revision}::{staging_id}")),
+                };
+                if completion.target != expected {
+                    self.settle_unserviced_editor_lease(
+                        cx,
+                        cwd,
+                        name,
+                        lease_id,
+                        consumed_revision,
+                        draft,
+                        "external-editor staging receipt identity mismatch".into(),
+                    );
+                    return;
+                }
+                let staging = completion.outcome.and_then(|outcome| match outcome {
+                    super::SettingsBlockingOutcome::AgentEditorPrepared {
+                        staging_id: returned,
+                        staging,
+                    } if returned == staging_id => Ok(staging),
+                    other => Err(format!(
+                        "unexpected external-editor staging result: {other:?}"
+                    )),
+                });
+                match staging {
+                    Ok(staging)
+                        if staging.path.parent() == Some(staging.directory.path())
+                            && staging.path.file_name().is_some() =>
+                    {
+                        let id = self.external_edit_ops.begin();
+                        self.pending_external_edit = Some(AgentExternalEdit {
+                            id,
+                            agent: authority_id,
+                            staging_path: staging.path,
+                            staging_dir: staging.directory,
+                            staging_dir_handle: staging.directory_handle,
+                            lease_id,
+                            consumed_revision,
+                            staging_id,
+                            draft: Some(draft),
+                            servicing: false,
+                        });
+                        self.status = Some("opening $EDITOR…".into());
+                    }
+                    Ok(_) => self.settle_unserviced_editor_lease(
+                        cx,
+                        cwd,
+                        name,
+                        lease_id,
+                        consumed_revision,
+                        draft,
+                        "external-editor staging escaped its private directory".into(),
+                    ),
+                    Err(error) => self.settle_unserviced_editor_lease(
+                        cx,
+                        cwd,
+                        name,
+                        lease_id,
+                        consumed_revision,
+                        draft,
+                        error,
+                    ),
+                }
+            }
+            PendingAgentOperation::ReadStaging {
+                pointer_operation_id,
+                lease_id,
+                consumed_revision,
+                staging_id,
+                outcome,
+                detail,
+            } => {
+                let expected = super::SettingsEffectTarget {
+                    surface: "agents.editor-staging-read",
+                    owner: lease_id.clone(),
+                    revision: Some(format!("{consumed_revision}::{staging_id}")),
+                };
+                let read = if completion.target == expected {
+                    completion.outcome.and_then(|outcome| match outcome {
+                        super::SettingsBlockingOutcome::AgentEditorRead {
+                            staging_id: returned,
+                            text,
+                        } if returned == staging_id => Ok(text),
+                        other => Err(format!("unexpected external-editor read result: {other:?}")),
+                    })
+                } else {
+                    Err("external-editor read receipt identity mismatch".into())
+                };
+                self.settle_external_edit_after_read(
+                    cx,
+                    pointer_operation_id,
+                    lease_id,
+                    consumed_revision,
+                    staging_id,
+                    outcome,
+                    detail,
+                    read,
+                );
+            }
+            other => {
+                self.pending_daemon.insert(completion.operation_id, other);
+            }
         }
     }
 
@@ -1002,46 +1160,32 @@ impl AgentsPage {
                 return;
             }
         };
-        let staging = match agent_external_edit_staging() {
-            Ok(staging) => staging,
-            Err(error) => {
-                self.settle_unserviced_editor_lease(
-                    cx,
-                    cwd,
-                    name,
-                    lease.lease_id,
-                    lease.snapshot.revision,
-                    draft,
-                    error,
-                );
-                return;
-            }
+        let staging_id = uuid::Uuid::new_v4();
+        let target = super::SettingsEffectTarget {
+            surface: "agents.editor-staging-prepare",
+            owner: format!("{}::{}", cwd.display(), lease.lease_id),
+            revision: Some(format!("{}::{staging_id}", lease.snapshot.revision)),
         };
-        if let Err(error) = seed_agent_external_edit_staging(&staging, draft.text()) {
-            self.settle_unserviced_editor_lease(
-                cx,
+        let operation_id = cx.enqueue_blocking_work(
+            target,
+            super::SettingsBlockingEffectWork::PrepareAgentEditor {
+                staging_id,
+                seed: draft.text().to_string(),
+            },
+        );
+        self.pending_daemon.insert(
+            operation_id,
+            PendingAgentOperation::PrepareStaging {
                 cwd,
                 name,
-                lease.lease_id,
-                lease.snapshot.revision,
+                lease_id: lease.lease_id,
+                consumed_revision: lease.snapshot.revision,
+                authority_id,
+                staging_id,
                 draft,
-                error,
-            );
-            return;
-        }
-        let id = self.external_edit_ops.begin();
-        self.pending_external_edit = Some(AgentExternalEdit {
-            id,
-            agent: authority_id,
-            staging_path: staging.path,
-            staging_dir: staging.directory,
-            staging_dir_handle: staging.directory_handle,
-            lease_id: lease.lease_id,
-            consumed_revision: lease.snapshot.revision,
-            draft: Some(draft),
-            servicing: false,
-        });
-        self.status = Some("opening $EDITOR…".into());
+            },
+        );
+        self.status = Some("preparing private external-editor staging…".into());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1300,33 +1444,134 @@ impl AgentsPage {
         else {
             return;
         };
-        if !self.external_edit_ops.complete(id) {
+        let Some(pending) = self.pending_external_edit.as_ref() else {
+            return;
+        };
+        let leaf = match pending.staging_path.file_name() {
+            Some(leaf) if pending.staging_path.parent() == Some(pending.staging_dir.path()) => {
+                leaf.to_os_string()
+            }
+            _ => {
+                self.queue_failed_external_edit_read(
+                    cx,
+                    id,
+                    outcome,
+                    detail,
+                    "external-edit staging path escaped its private directory".into(),
+                );
+                return;
+            }
+        };
+        let directory_handle = match pending.staging_dir_handle.try_clone() {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.queue_failed_external_edit_read(
+                    cx,
+                    id,
+                    outcome,
+                    detail,
+                    format!("failed to retain external-edit staging directory: {error}"),
+                );
+                return;
+            }
+        };
+        let target = super::SettingsEffectTarget {
+            surface: "agents.editor-staging-read",
+            owner: pending.lease_id.clone(),
+            revision: Some(format!(
+                "{}::{}",
+                pending.consumed_revision, pending.staging_id
+            )),
+        };
+        let operation_id = cx.enqueue_blocking_work(
+            target,
+            super::SettingsBlockingEffectWork::ReadAgentEditor {
+                staging_id: pending.staging_id,
+                directory_handle,
+                leaf,
+            },
+        );
+        self.pending_daemon.insert(
+            operation_id,
+            PendingAgentOperation::ReadStaging {
+                pointer_operation_id: id,
+                lease_id: pending.lease_id.clone(),
+                consumed_revision: pending.consumed_revision.clone(),
+                staging_id: pending.staging_id,
+                outcome,
+                detail,
+            },
+        );
+        self.status = Some("reading private external-editor staging…".into());
+    }
+
+    fn queue_failed_external_edit_read(
+        &mut self,
+        cx: &mut SettingsCx,
+        id: PointerOperationId,
+        _outcome: super::pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
+        error: String,
+    ) {
+        let Some(pending) = self.pending_external_edit.as_ref() else {
+            return;
+        };
+        self.settle_external_edit_after_read(
+            cx,
+            id,
+            pending.lease_id.clone(),
+            pending.consumed_revision.clone(),
+            pending.staging_id,
+            super::pointer_actions::ExternalEditOutcome::Failed,
+            detail,
+            Err(error),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn settle_external_edit_after_read(
+        &mut self,
+        cx: &mut SettingsCx,
+        id: PointerOperationId,
+        lease_id: String,
+        consumed_revision: String,
+        staging_id: uuid::Uuid,
+        outcome: super::pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
+        read: Result<String, String>,
+    ) {
+        let matches = self.pending_external_edit.as_ref().is_some_and(|pending| {
+            pending.id == id
+                && pending.lease_id == lease_id
+                && pending.consumed_revision == consumed_revision
+                && pending.staging_id == staging_id
+        });
+        if !matches || !self.external_edit_ops.complete(id) {
             return;
         }
         let Some(mut pending) = self.pending_external_edit.take() else {
             return;
         };
-        let mut settled_outcome = outcome;
-        let mut settled_detail = detail;
-        let markdown = if matches!(outcome, super::pointer_actions::ExternalEditOutcome::Saved) {
-            match read_agent_external_edit_staging(&pending) {
-                Ok(markdown) => Some(markdown),
-                Err(error) => {
-                    settled_outcome = super::pointer_actions::ExternalEditOutcome::Failed;
-                    settled_detail = Some(error);
-                    None
+        let (settled_outcome, settled_detail, markdown) = match (outcome, read) {
+            (super::pointer_actions::ExternalEditOutcome::Saved, Ok(text)) => {
+                (outcome, detail, Some(text))
+            }
+            (non_saved, Ok(recovery)) => {
+                if let Some(editor) = pending.draft.as_mut() {
+                    editor.replace_with_recovery_text(&recovery);
                 }
+                (non_saved, detail, None)
             }
-        } else {
-            let recovery = read_agent_external_edit_staging(&pending).ok();
-            if let (Some(editor), Some(recovery)) = (&mut pending.draft, recovery) {
-                editor.replace_with_recovery_text(&recovery);
-            }
-            None
+            (_, Err(error)) => (
+                super::pointer_actions::ExternalEditOutcome::Failed,
+                Some(match detail {
+                    Some(detail) => format!("{detail}; {error}"),
+                    None => error,
+                }),
+                None,
+            ),
         };
         let cwd = cx.agents_cwd();
-        let lease_id = pending.lease_id.clone();
-        let consumed_revision = pending.consumed_revision.clone();
         self.stage(
             cx,
             super::SettingsEffectTarget {
@@ -1341,7 +1586,7 @@ impl AgentsPage {
             },
             PendingAgentOperation::CompleteLease {
                 cwd,
-                name: agent.name().to_string(),
+                name: pending.agent.name().to_string(),
                 lease_id,
                 consumed_revision,
                 markdown,

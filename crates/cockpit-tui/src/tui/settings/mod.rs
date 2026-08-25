@@ -110,6 +110,94 @@ pub(crate) struct SettingsDaemonEffectRequest {
     pub(crate) work: SettingsDaemonEffectWork,
 }
 
+pub(crate) struct SettingsBlockingEffectRequest {
+    pub(crate) dialog_id: uuid::Uuid,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) target: SettingsEffectTarget,
+    pub(crate) work: SettingsBlockingEffectWork,
+}
+
+pub(crate) enum SettingsBlockingEffectWork {
+    PrepareAgentEditor {
+        staging_id: uuid::Uuid,
+        seed: String,
+    },
+    ReadAgentEditor {
+        staging_id: uuid::Uuid,
+        directory_handle: std::fs::File,
+        leaf: std::ffi::OsString,
+    },
+}
+
+impl std::fmt::Debug for SettingsBlockingEffectWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrepareAgentEditor { staging_id, .. } => f
+                .debug_struct("PrepareAgentEditor")
+                .field("staging_id", staging_id)
+                .field("seed", &"[DRAFT]")
+                .finish(),
+            Self::ReadAgentEditor {
+                staging_id, leaf, ..
+            } => f
+                .debug_struct("ReadAgentEditor")
+                .field("staging_id", staging_id)
+                .field("leaf", leaf)
+                .finish(),
+        }
+    }
+}
+
+pub(crate) enum SettingsBlockingOutcome {
+    AgentEditorPrepared {
+        staging_id: uuid::Uuid,
+        staging: agents_page::AgentExternalEditStaging,
+    },
+    AgentEditorRead {
+        staging_id: uuid::Uuid,
+        text: String,
+    },
+}
+
+impl std::fmt::Debug for SettingsBlockingOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentEditorPrepared { staging_id, .. } => f
+                .debug_struct("AgentEditorPrepared")
+                .field("staging_id", staging_id)
+                .field("staging", &"[PRIVATE STAGING]")
+                .finish(),
+            Self::AgentEditorRead { staging_id, text } => f
+                .debug_struct("AgentEditorRead")
+                .field("staging_id", staging_id)
+                .field("bytes", &text.len())
+                .finish(),
+        }
+    }
+}
+
+pub(crate) fn execute_settings_blocking_work(
+    work: SettingsBlockingEffectWork,
+) -> Result<SettingsBlockingOutcome, String> {
+    match work {
+        SettingsBlockingEffectWork::PrepareAgentEditor { staging_id, seed } => {
+            let staging = agents_page::prepare_agent_external_edit_staging(&seed)?;
+            Ok(SettingsBlockingOutcome::AgentEditorPrepared {
+                staging_id,
+                staging,
+            })
+        }
+        SettingsBlockingEffectWork::ReadAgentEditor {
+            staging_id,
+            directory_handle,
+            leaf,
+        } => Ok(SettingsBlockingOutcome::AgentEditorRead {
+            staging_id,
+            text: agents_page::read_agent_external_edit_staging(&directory_handle, &leaf)?,
+        }),
+    }
+}
+
 pub(crate) enum SettingsDaemonEffectWork {
     Request(Request),
     ProviderCredentialPut {
@@ -119,6 +207,12 @@ pub(crate) enum SettingsDaemonEffectWork {
     McpOAuthComplete {
         flow_id: String,
         input: SecretPayload,
+    },
+    McpConfigSave {
+        project_root: String,
+        config_json: String,
+        secret_values_json: SecretPayload,
+        cleanup_names_json: String,
     },
     ProviderMutation(ProviderMutationPlan),
     TypedDocumentEdit(TypedDocumentEditPlan),
@@ -156,21 +250,52 @@ impl std::fmt::Debug for SettingsDaemonEffectWork {
                 .field("flow_id", flow_id)
                 .field("input", &"[REDACTED]")
                 .finish(),
+            Self::McpConfigSave { project_root, .. } => f
+                .debug_struct("McpConfigSave")
+                .field("project_root", project_root)
+                .field("secret_values_json", &"[REDACTED]")
+                .finish(),
             Self::ProviderMutation(_) => f.write_str("ProviderMutation([REDACTED SECRETS])"),
             Self::TypedDocumentEdit(_) => f.write_str("TypedDocumentEdit([REDACTED PATCH])"),
         }
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct ProviderMutationPlan {
     project_root: String,
-    saves: Vec<(String, ProviderEntry, Vec<Option<String>>)>,
+    saves: Vec<ProviderSavePlan>,
     deletes: Vec<(String, bool)>,
     metadata: Option<(
         BTreeMap<String, cockpit_config::config::providers::ProviderModelRef>,
         OnUnlistedModelsFetch,
     )>,
+}
+
+pub(crate) struct ProviderSavePlan {
+    provider_id: String,
+    entry: ProviderEntry,
+    header_secrets: Vec<Option<zeroize::Zeroizing<String>>>,
+}
+
+impl std::fmt::Debug for ProviderMutationPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderMutationPlan")
+            .field("project_root", &self.project_root)
+            .field("save_count", &self.saves.len())
+            .field("deletes", &self.deletes)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ProviderSavePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSavePlan")
+            .field("provider_id", &self.provider_id)
+            .field("entry", &"[REDACTED HEADERS]")
+            .field("header_secret_count", &self.header_secrets.len())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -236,14 +361,37 @@ pub(crate) async fn execute_settings_daemon_work(
                 committed_refresh_needed: None,
             })
         }
+        SettingsDaemonEffectWork::McpConfigSave {
+            project_root,
+            config_json,
+            secret_values_json,
+            cleanup_names_json,
+        } => Ok(SettingsDaemonWorkOutcome {
+            response: client
+                .request(Request::SaveMcpConfig {
+                    project_root,
+                    config_json,
+                    secret_values_json: secret_values_json.take(),
+                    cleanup_names_json,
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string()),
+            committed_refresh_needed: None,
+        }),
         SettingsDaemonEffectWork::ProviderMutation(plan) => {
             let mut final_response = None;
-            for (provider_id, entry, header_secrets) in plan.saves {
+            for save in plan.saves {
+                let header_secrets = save
+                    .header_secrets
+                    .into_iter()
+                    .map(|secret| secret.map(|mut value| std::mem::take(&mut *value)))
+                    .collect();
                 let response = client
                     .request(Request::SaveProviderConfig {
                         project_root: plan.project_root.clone(),
-                        provider_id,
-                        entry,
+                        provider_id: save.provider_id,
+                        entry: save.entry,
                         header_secrets,
                     })
                     .await
@@ -416,6 +564,14 @@ pub(crate) struct SettingsDaemonEffectCompletion {
     pub(crate) target: SettingsEffectTarget,
     pub(crate) response: Result<Response, String>,
     pub(crate) committed_refresh_needed: Option<CommittedRefreshNeeded>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SettingsBlockingEffectCompletion {
+    pub(crate) dialog_id: uuid::Uuid,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) target: SettingsEffectTarget,
+    pub(crate) outcome: Result<SettingsBlockingOutcome, String>,
 }
 
 /// Run a short daemon RPC from an input reducer. Production reducers execute
@@ -1806,6 +1962,7 @@ impl std::fmt::Debug for TestPageMut<'_> {
 pub struct SettingsCx {
     dialog_id: uuid::Uuid,
     daemon_effects: VecDeque<SettingsDaemonEffectRequest>,
+    blocking_effects: VecDeque<SettingsBlockingEffectRequest>,
     pending_settings: BTreeMap<uuid::Uuid, PendingSettingsOperation>,
     pending_mcp_oauth: Option<PendingMcpOAuth>,
     pending_mcp_navigation: Option<(String, bool)>,
@@ -1916,7 +2073,9 @@ pub struct SettingsCx {
 
 impl SettingsCx {
     fn authority_operation_pending(&self) -> bool {
-        !self.pending_settings.is_empty() || !self.daemon_effects.is_empty()
+        !self.pending_settings.is_empty()
+            || !self.daemon_effects.is_empty()
+            || !self.blocking_effects.is_empty()
     }
 
     fn enqueue_daemon_effect(
@@ -1951,6 +2110,26 @@ impl SettingsCx {
 
     fn take_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
         self.daemon_effects.pop_front()
+    }
+
+    fn enqueue_blocking_work(
+        &mut self,
+        target: SettingsEffectTarget,
+        work: SettingsBlockingEffectWork,
+    ) -> uuid::Uuid {
+        let operation_id = uuid::Uuid::new_v4();
+        self.blocking_effects
+            .push_back(SettingsBlockingEffectRequest {
+                dialog_id: self.dialog_id,
+                operation_id,
+                target,
+                work,
+            });
+        operation_id
+    }
+
+    fn take_blocking_effect(&mut self) -> Option<SettingsBlockingEffectRequest> {
+        self.blocking_effects.pop_front()
     }
 
     fn queue_simple_mutation(
@@ -3812,6 +3991,15 @@ impl Dialog {
         }
     }
 
+    pub(crate) fn take_settings_blocking_effect(
+        &mut self,
+    ) -> Option<SettingsBlockingEffectRequest> {
+        match self {
+            Dialog::Settings(settings) => settings.cx.take_blocking_effect(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn apply_settings_daemon_completion(
         &mut self,
         completion: SettingsDaemonEffectCompletion,
@@ -3823,6 +4011,19 @@ impl Dialog {
             return;
         }
         settings.apply_daemon_completion(completion);
+    }
+
+    pub(crate) fn apply_settings_blocking_completion(
+        &mut self,
+        completion: SettingsBlockingEffectCompletion,
+    ) {
+        let Dialog::Settings(settings) = self else {
+            return;
+        };
+        if completion.dialog_id != settings.cx.dialog_id {
+            return;
+        }
+        settings.apply_blocking_completion(completion);
     }
 
     pub fn apply_host_capabilities(
@@ -4164,6 +4365,12 @@ impl SettingsDialog {
             page.apply_daemon_completion(&mut self.cx, completion);
         }
     }
+
+    fn apply_blocking_completion(&mut self, completion: SettingsBlockingEffectCompletion) {
+        if let Some(page) = self.page.downcast_mut::<AgentsPage>() {
+            page.apply_blocking_completion(&mut self.cx, completion);
+        }
+    }
     #[cfg(test)]
     pub(crate) fn pointer_test_target_rects(&self) -> Vec<Rect> {
         self.cx
@@ -4465,6 +4672,7 @@ impl SettingsDialog {
             cx: SettingsCx {
                 dialog_id: uuid::Uuid::new_v4(),
                 daemon_effects: VecDeque::new(),
+                blocking_effects: VecDeque::new(),
                 pending_settings: BTreeMap::new(),
                 pending_mcp_oauth: None,
                 pending_mcp_navigation: None,
@@ -5773,10 +5981,22 @@ impl SettingsCx {
                                 value,
                             )
                             && !secret_display::is_mask_value(value))
-                        .then(|| header.value.clone())
+                        .then(|| zeroize::Zeroizing::new(header.value.clone()))
                     })
                     .collect();
-                (provider_id.clone(), entry.clone(), header_secrets)
+                let mut queued_entry = entry.clone();
+                for (header, secret) in queued_entry.headers.iter_mut().zip(&header_secrets) {
+                    if secret.is_some() {
+                        // The plaintext has a single owner in `header_secrets`.
+                        // The daemon replaces this placeholder before publish.
+                        header.value.clear();
+                    }
+                }
+                ProviderSavePlan {
+                    provider_id: provider_id.clone(),
+                    entry: queued_entry,
+                    header_secrets,
+                }
             })
             .collect::<Vec<_>>();
         let deletes = self

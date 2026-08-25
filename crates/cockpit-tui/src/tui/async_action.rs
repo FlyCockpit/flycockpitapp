@@ -274,6 +274,7 @@ pub enum AsyncActionPayload {
     WorkspaceTrust(crate::tui::app::WorkspaceTrustCompletion),
     Sealed(crate::tui::app::slash::SealedCompletion),
     SettingsDaemon(crate::tui::settings::SettingsDaemonEffectCompletion),
+    SettingsBlocking(crate::tui::settings::SettingsBlockingEffectCompletion),
     AgentRunnerAttached(Box<crate::tui::agent_runner::AgentRunner>),
     BtwRunnerAttached {
         session_id: uuid::Uuid,

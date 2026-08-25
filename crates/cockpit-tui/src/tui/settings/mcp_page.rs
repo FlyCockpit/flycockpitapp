@@ -338,16 +338,16 @@ impl SettingsCx {
         let secret_values_json = serde_json::to_string(secret_values).map_err(|e| e.to_string())?;
         let cleanup_names_json = serde_json::to_string(cleanup_names).map_err(|e| e.to_string())?;
         let owner = project_root.display().to_string();
-        self.queue_simple_mutation(
+        self.queue_simple_secret_mutation(
             super::SettingsEffectTarget {
                 surface: "settings.mcp-save",
                 owner: owner.clone(),
                 revision: Some(uuid::Uuid::new_v4().to_string()),
             },
-            cockpit_core::daemon::proto::Request::SaveMcpConfig {
+            super::SettingsDaemonEffectWork::McpConfigSave {
                 project_root: owner,
                 config_json,
-                secret_values_json,
+                secret_values_json: super::SecretPayload::new(secret_values_json),
                 cleanup_names_json,
             },
             super::SettingsMutationAction::McpSave(cfg.clone()),
@@ -1634,7 +1634,9 @@ mod tests {
     fn mcp_secret_custody_stays_daemon_owned() {
         let source = include_str!("mcp_page.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-        assert!(production.contains("Request::SaveMcpConfig"));
+        assert!(production.contains("SettingsDaemonEffectWork::McpConfigSave"));
+        assert!(production.contains("SecretPayload::new(secret_values_json)"));
+        assert!(!production.contains("Request::SaveMcpConfig"));
         assert!(production.contains("self.mcp_config.clone()"));
         assert!(!production.contains("read_to_string"));
         assert!(production.contains("Response::McpConfigSaved"));

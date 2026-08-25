@@ -174,6 +174,7 @@ impl App {
         self.start_pending_goal_settings_effect();
         self.start_pending_tools_effect();
         self.start_pending_settings_daemon_effects();
+        self.start_pending_settings_blocking_effects();
         // Cancellation is a terminal runner outcome; most kinds intentionally
         // skip UI mutation. Session switch/resume must still settle provisional
         // buffers, order, and the cleared-view failure contract.
@@ -327,6 +328,30 @@ impl App {
         }
     }
 
+    fn start_pending_settings_blocking_effects(&mut self) {
+        while let Some(effect) = self.dialog.take_settings_blocking_effect() {
+            let dialog_id = effect.dialog_id;
+            let operation_id = effect.operation_id;
+            let target = effect.target;
+            let work = effect.work;
+            self.async_actions.start_blocking(
+                AsyncActionKind::Blocking("settings.blocking-effect"),
+                AsyncActionPolicy::AllowConcurrent,
+                move || {
+                    let outcome = crate::tui::settings::execute_settings_blocking_work(work);
+                    Ok(AsyncActionPayload::SettingsBlocking(
+                        crate::tui::settings::SettingsBlockingEffectCompletion {
+                            dialog_id,
+                            operation_id,
+                            target,
+                            outcome,
+                        },
+                    ))
+                },
+            );
+        }
+    }
+
     pub(super) fn start_sessions_mutation_action(
         &mut self,
         effect: crate::tui::sessions_pane::SessionsMutationEffect,
@@ -387,6 +412,11 @@ impl App {
             AsyncActionKind::DaemonRpc("settings.effect") => {
                 if let Ok(AsyncActionPayload::SettingsDaemon(completion)) = result.payload {
                     self.dialog.apply_settings_daemon_completion(completion);
+                }
+            }
+            AsyncActionKind::Blocking("settings.blocking-effect") => {
+                if let Ok(AsyncActionPayload::SettingsBlocking(completion)) = result.payload {
+                    self.dialog.apply_settings_blocking_completion(completion);
                 }
             }
             AsyncActionKind::DaemonRpc("sessions.mutation") => {

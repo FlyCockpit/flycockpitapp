@@ -409,6 +409,7 @@ impl Approver {
                     "session".to_string(),
                 ],
                 policy_cap: Some("session".to_string()),
+                image_plan_review: None,
             })),
             permission: true,
             approval_class: Some(GrantKind::Path),

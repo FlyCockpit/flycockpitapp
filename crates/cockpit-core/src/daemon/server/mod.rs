@@ -2013,6 +2013,7 @@ fn scrub_command_detail(detail: &mut proto::CommandDetail, redact: &RedactionTab
         native_tool_hints,
         offered_scopes,
         policy_cap,
+        image_plan_review,
     } = detail;
     scrub_string(full_command, redact);
     scrub_option_string(cwd, redact);
@@ -2026,6 +2027,19 @@ fn scrub_command_detail(detail: &mut proto::CommandDetail, redact: &RedactionTab
     scrub_strings(native_tool_hints, redact);
     scrub_strings(offered_scopes, redact);
     scrub_option_string(policy_cap, redact);
+    // The plan review carries only redacted projections by construction, but
+    // pass its user-derivable strings through the same scrubber for defense in
+    // depth.
+    if let Some(review) = image_plan_review {
+        scrub_option_string(&mut review.plan_digest, redact);
+        scrub_strings(&mut review.destination_location_classes, redact);
+        scrub_option_string(&mut review.output_location_class, redact);
+        scrub_option_string(&mut review.reference_egress_summary, redact);
+        for disposition in &mut review.budget_dispositions {
+            scrub_string(&mut disposition.scope, redact);
+            scrub_string(&mut disposition.disposition, redact);
+        }
+    }
 }
 
 fn scrub_write_content_preview(preview: &mut proto::WriteContentPreview, redact: &RedactionTable) {

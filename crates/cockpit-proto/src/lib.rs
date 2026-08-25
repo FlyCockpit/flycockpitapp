@@ -2149,10 +2149,10 @@ pub use cockpit_config::{
 
 #[allow(unused_imports)]
 pub use cockpit_db::wire::{
-    CharSpan, CommandDetail, GrantKind, InterruptDecision, InterruptDecisionLine, InterruptOption,
-    InterruptQuestion, InterruptQuestionSet, MessageRole, ResolveResponse, SandboxDenialConfidence,
-    SandboxDenialEvidence, SandboxDenialReport, SandboxEscalation, SessionActivityState,
-    SessionMessage, SessionSummary, WriteContentPreview,
+    CharSpan, CommandDetail, GrantKind, ImageBudgetDisposition, ImagePlanReview, InterruptDecision,
+    InterruptDecisionLine, InterruptOption, InterruptQuestion, InterruptQuestionSet, MessageRole,
+    ResolveResponse, SandboxDenialConfidence, SandboxDenialEvidence, SandboxDenialReport,
+    SandboxEscalation, SessionActivityState, SessionMessage, SessionSummary, WriteContentPreview,
 };
 
 pub use cockpit_db::db::session_goals::{
@@ -4573,6 +4573,7 @@ COCKPIT_UPDATE_GOLDEN=1 cargo test -p cockpit-proto golden_wire_
             native_tool_hints: vec!["cargo".into()],
             offered_scopes: vec!["session".into()],
             policy_cap: Some("ask".into()),
+            image_plan_review: None,
         }
     }
 
@@ -5748,6 +5749,7 @@ mod tests {
                 native_tool_hints: Vec::new(),
                 offered_scopes: Vec::new(),
                 policy_cap: None,
+                image_plan_review: None,
             })),
         };
         let s = serde_json::to_string(&q).unwrap();

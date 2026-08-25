@@ -910,6 +910,8 @@ fn command_detail(
         native_tool_hints: info.risk.native_tool_hints.clone(),
         offered_scopes: offered_scope_keys,
         policy_cap: Some(policy.max_scope.as_str().to_string()),
+        // Populated only for image-generation approvals (dispatch-inert today).
+        image_plan_review: None,
     })
 }
 
@@ -975,6 +977,7 @@ fn shell_write_command_detail(
             Scope::Global.as_str().to_string(),
         ],
         policy_cap: Some(Scope::Global.as_str().to_string()),
+        image_plan_review: None,
     }
 }
 
@@ -3737,6 +3740,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         };
         let desc = prompt_description("cargo build", false, Some(&detail), None);
         assert!(
@@ -3759,6 +3763,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         };
         let desc = prompt_description("cd", false, Some(&lone), None);
         assert!(desc.contains("cd /tmp"));

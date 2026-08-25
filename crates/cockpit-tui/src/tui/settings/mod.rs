@@ -3879,7 +3879,9 @@ impl SettingsPage for RootPage {
                             .into_owned(),
                     )),
                     "Generation" => Some(image_generation::generation_list_page(
-                        image_generation::GenerationPrincipal::local_owner(),
+                        image_generation::GenerationPrincipal::from_session(
+                            &cx.image_generation_session_snapshot(),
+                        ),
                     )),
                     "Privacy & Safety" => {
                         cx.reload_extended();
@@ -4215,6 +4217,30 @@ fn render_root(frame: &mut Frame, area: Rect, cursor: usize, cx: &SettingsCx) {
 }
 
 impl SettingsCx {
+    /// The image-generation session capability snapshot for the active session,
+    /// from which the Generation node derives its [`GenerationPrincipal`]. The
+    /// TUI settings dialog only runs for the LOCAL owner of this daemon (there
+    /// is no remote settings surface), so `local_owner` is a derived fact of
+    /// the host context rather than a hardcoded capability. The `active_project_id`
+    /// is the launch/session project root this dialog is scoped to; remote grant
+    /// scopes and ceilings are left empty here and MUST be populated from the
+    /// control-plane grant snapshot the day a remote settings surface exists.
+    pub(super) fn image_generation_session_snapshot(
+        &self,
+    ) -> image_generation::SessionCapabilitySnapshot {
+        image_generation::SessionCapabilitySnapshot {
+            local_owner: true,
+            image_admin_grant_project: None,
+            active_project_id: self
+                .active_project_root
+                .as_ref()
+                .map(|root| root.to_string_lossy().into_owned()),
+            project_read: false,
+            session_read: false,
+            session_write: false,
+        }
+    }
+
     /// Safe, non-secret label for the layer that governs the effective
     /// default in this dialog's configuration context. Never a filesystem
     /// path.

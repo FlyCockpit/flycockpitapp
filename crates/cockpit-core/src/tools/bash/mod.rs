@@ -1581,6 +1581,7 @@ async fn defensive_human_escalation_offer(
         native_tool_hints: Vec::new(),
         offered_scopes: vec![crate::approval::store::Scope::Once.as_str().to_string()],
         policy_cap: Some(crate::approval::store::Scope::Once.as_str().to_string()),
+        image_plan_review: None,
     };
     match approver
         .approve_sandbox_escalation(command, confined_exit, confined_stderr, None, Some(detail))

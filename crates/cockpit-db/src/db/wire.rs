@@ -174,6 +174,66 @@ pub struct CommandDetail {
     pub offered_scopes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_cap: Option<String>,
+    /// Typed image-generation authorization-review projection, present only when
+    /// the pending approval is an image-generation plan. Carries redacted plan
+    /// facts (digest, cost, budget disposition, output location) — never a
+    /// credential, provider URL, workflow JSON, or host path. `None` for every
+    /// non-image approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_plan_review: Option<ImagePlanReview>,
+}
+
+/// A redacted budget disposition for one spend scope within an image plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageBudgetDisposition {
+    /// The spend scope this disposition applies to (`request`/`session`/`project`).
+    pub scope: String,
+    /// A stable, non-secret disposition label (e.g. `within_budget`,
+    /// `blocked_unconfigured`, `exceeds_budget`).
+    pub disposition: String,
+}
+
+/// A typed image-generation authorization-review model rendered by the standalone
+/// approval overlay. It replaces the earlier generic `full_command` string with
+/// dedicated, redacted plan fields.
+///
+/// SECURITY / INERT-DISPATCH: several fields (`plan_digest`, `conservative_cost_usd_micros`)
+/// can only be derived from a LIVE dispatch, which is currently inert upstream
+/// (the runtime adapter/destination map ships empty). Those fields fail closed —
+/// `plan_digest` stays `None` and `cost_unknown` stays `true` until a real
+/// dispatch populates them — rather than fabricating a plausible value. Fields
+/// derivable from the plan projection / config (location classes, offered scopes,
+/// budget disposition, fanout/slots) are populated when available.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImagePlanReview {
+    /// The plan digest, when a live dispatch has produced one. `None` = not yet
+    /// available (dispatch inert); the overlay renders a fail-closed placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_digest: Option<String>,
+    /// Destination location classes for this plan (e.g. `local`, `remote_hosted`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destination_location_classes: Vec<String>,
+    /// The conservative maximum cost in USD micros, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conservative_cost_usd_micros: Option<u64>,
+    /// True when the conservative cost cannot be bounded (renders `cost_unknown`).
+    #[serde(default)]
+    pub cost_unknown: bool,
+    /// Per-scope budget dispositions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budget_dispositions: Vec<ImageBudgetDisposition>,
+    /// The output host location class (never a raw path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_location_class: Option<String>,
+    /// A redacted reference-egress summary (counts / classes, never URLs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_egress_summary: Option<String>,
+    /// Plan fanout (number of targets), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout: Option<u32>,
+    /// Plan slot count, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

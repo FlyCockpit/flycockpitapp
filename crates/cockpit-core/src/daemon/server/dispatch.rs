@@ -100,6 +100,34 @@ struct McpOAuthPending {
     flow: crate::mcp::auth::McpOAuthFlow,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct SealedOAuthText(String);
+
+impl SealedOAuthText {
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SealedOAuthText {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl Drop for SealedOAuthText {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl std::fmt::Debug for SealedOAuthText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 #[derive(Clone)]
 enum ProviderOAuthFlow {
     /// A flow that has not started its one-time provider exchange.
@@ -127,8 +155,8 @@ enum DurableOAuthFlow {
         begin_client_operation_id: String,
         begin_request_hash: [u8; 32],
         begin_fencing_generation: i64,
-        authorize_url: String,
-        user_code: Option<String>,
+        authorize_url: SealedOAuthText,
+        user_code: Option<SealedOAuthText>,
         ready: ProviderOAuthReady,
         created_at_unix_ms: i64,
         expires_at_unix_ms: i64,
@@ -147,7 +175,7 @@ enum DurableOAuthFlow {
         begin_client_operation_id: String,
         begin_request_hash: [u8; 32],
         begin_fencing_generation: i64,
-        authorize_url: String,
+        authorize_url: SealedOAuthText,
         pending: McpOAuthPending,
         created_at_unix_ms: i64,
         expires_at_unix_ms: i64,
@@ -197,6 +225,26 @@ enum DurableOAuthFlow {
         terminal_error: ErrorPayload,
         cancelled_at_unix_ms: i64,
     },
+}
+
+impl std::fmt::Debug for DurableOAuthFlow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::Provider { .. } => "Provider",
+            Self::ProviderExchanging { .. } => "ProviderExchanging",
+            Self::Mcp { .. } => "Mcp",
+            Self::McpExchanging { .. } => "McpExchanging",
+            Self::ProviderCommitted { .. } => "ProviderCommitted",
+            Self::McpCommitted { .. } => "McpCommitted",
+            Self::Expired { .. } => "Expired",
+            Self::Cancelled { .. } => "Cancelled",
+        };
+        formatter
+            .debug_struct("DurableOAuthFlow")
+            .field("kind", &kind)
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
 }
 
 fn oauth_wall_ms() -> i64 {
@@ -5750,16 +5798,64 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let consumed_config_generation = inventory::current_config_generation();
-            let row = ctx
-                .db
-                .get_assistant(&name)
-                .await
-                .map_err(internal)?
-                .ok_or_else(|| bad_request(format!("assistant `{name}` was not found")))?;
-            let current = crate::assistants::snapshot(&ctx.db, &name)
-                .await
-                .map_err(internal)?
-                .ok_or_else(|| bad_request(format!("assistant `{name}` was not found")))?;
+            let row = match ctx.db.get_assistant(&name).await {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    let error = bad_request("assistant was not found");
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Err(source) => {
+                    let error = internal(source);
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            let current = match crate::assistants::snapshot(&ctx.db, &name).await {
+                Ok(Some(current)) => current,
+                Ok(None) => {
+                    let error = bad_request("assistant was not found");
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Err(source) => {
+                    let error = internal(source);
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
             if current.definition_revision.as_deref() != Some(expected_revision.as_str()) {
                 let error = conflict("assistant definition changed; reload before saving");
                 finish_local_operation_error(
@@ -5773,7 +5869,7 @@ async fn handle_serialized_request_impl(
                 .await?;
                 return Err(error);
             }
-            begin_assistant_mutation_journal(
+            if let Err(error) = begin_assistant_mutation_journal(
                 ctx,
                 owner.clone(),
                 client_operation_id.clone(),
@@ -5788,7 +5884,19 @@ async fn handle_serialized_request_impl(
                 Some(crate::assistants::markdown_content_hash(&markdown)),
                 consumed_config_generation,
             )
-            .await?;
+            .await
+            {
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
             let updated = match crate::assistants::save_definition_cas(
                 &ctx.db,
                 row,
@@ -5833,16 +5941,7 @@ async fn handle_serialized_request_impl(
                 result_config_generation,
                 outcome,
             };
-            record_assistant_mutation_terminal(
-                ctx,
-                owner.clone(),
-                client_operation_id.clone(),
-                request_hash,
-                fencing_generation,
-                &response,
-            )
-            .await?;
-            finish_local_operation(
+            finish_assistant_mutation(
                 ctx,
                 owner,
                 client_operation_id,
@@ -6139,10 +6238,35 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let consumed_config_generation = inventory::current_config_generation();
-            let current = crate::assistants::snapshot(&ctx.db, &name)
-                .await
-                .map_err(internal)?
-                .ok_or_else(|| conflict("assistant changed or no longer exists"))?;
+            let current = match crate::assistants::snapshot(&ctx.db, &name).await {
+                Ok(Some(current)) => current,
+                Ok(None) => {
+                    let error = conflict("assistant changed or no longer exists");
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Err(source) => {
+                    let error = internal(source);
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
             if crate::assistants::registration_revision(&current.row) != expected_revision {
                 let error = conflict("assistant registration changed; reload before deleting");
                 finish_local_operation_error(
@@ -6156,7 +6280,7 @@ async fn handle_serialized_request_impl(
                 .await?;
                 return Err(error);
             }
-            begin_assistant_mutation_journal(
+            if let Err(error) = begin_assistant_mutation_journal(
                 ctx,
                 owner.clone(),
                 client_operation_id.clone(),
@@ -6171,7 +6295,19 @@ async fn handle_serialized_request_impl(
                 None,
                 consumed_config_generation,
             )
-            .await?;
+            .await
+            {
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
             let deleted =
                 match crate::assistants::delete_registration(&ctx.db, &name, &expected_revision)
                     .await
@@ -6202,16 +6338,7 @@ async fn handle_serialized_request_impl(
                 result_config_generation,
                 outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
             };
-            record_assistant_mutation_terminal(
-                ctx,
-                owner.clone(),
-                client_operation_id.clone(),
-                request_hash,
-                fencing_generation,
-                &response,
-            )
-            .await?;
-            finish_local_operation(
+            finish_assistant_mutation(
                 ctx,
                 owner,
                 client_operation_id,
@@ -9182,10 +9309,22 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
-            let consumed_vault_generation = ctx
-                .secret_vault
-                .current_inventory_generation()
-                .map_err(|error| internal(anyhow::anyhow!(error)))?;
+            let consumed_vault_generation = match ctx.secret_vault.current_inventory_generation() {
+                Ok(generation) => generation,
+                Err(source) => {
+                    let error = internal(anyhow::anyhow!(source));
+                    finish_local_operation_error(
+                        ctx,
+                        settlement_owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
             let changed = ctx
                 .secret_vault
                 .get_item(
@@ -9326,8 +9465,10 @@ async fn handle_serialized_request_impl(
                                     user_code: durable_code,
                                     ..
                                 }) => {
-                                    *authorize_url = durable_url;
-                                    *user_code = durable_code;
+                                    *authorize_url = durable_url.expose().to_owned();
+                                    *user_code = durable_code
+                                        .as_ref()
+                                        .map(|code| code.expose().to_owned());
                                     None
                                 }
                                 Some(DurableOAuthFlow::Expired { terminal_error, .. })
@@ -9349,7 +9490,7 @@ async fn handle_serialized_request_impl(
                                 authorize_url: durable_url,
                                 ..
                             }) => {
-                                *authorize_url = durable_url;
+                                *authorize_url = durable_url.expose().to_owned();
                                 None
                             }
                             Some(DurableOAuthFlow::Expired { terminal_error, .. })
@@ -9495,8 +9636,8 @@ async fn handle_serialized_request_impl(
                         client_operation_id,
                         request_hash,
                         flow_id,
-                        authorize_url,
-                        user_code,
+                        authorize_url: authorize_url.expose().to_owned(),
+                        user_code: user_code.as_ref().map(|code| code.expose().to_owned()),
                     });
                 }
                 LocalOperationStart::Replay(response) => return Ok(response),
@@ -9554,8 +9695,8 @@ async fn handle_serialized_request_impl(
                             flow_id.clone(),
                             owner.clone(),
                             client_operation_id.clone(),
-                            authorize_url.clone(),
-                            user_code.clone(),
+                            authorize_url.expose().to_owned(),
+                            user_code.as_ref().map(|code| code.expose().to_owned()),
                             ProviderOAuthFlow::Ready(ready),
                         )
                         .await;
@@ -9563,8 +9704,8 @@ async fn handle_serialized_request_impl(
                         client_operation_id: client_operation_id.clone(),
                         request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                         flow_id: flow_id.clone(),
-                        authorize_url,
-                        user_code,
+                        authorize_url: authorize_url.expose().to_owned(),
+                        user_code: user_code.as_ref().map(|code| code.expose().to_owned()),
                     };
                     let receipt = Response::ProviderOAuthStarted {
                         client_operation_id: client_operation_id.clone(),
@@ -9640,8 +9781,8 @@ async fn handle_serialized_request_impl(
                         begin_client_operation_id: client_operation_id.clone(),
                         begin_request_hash: request_hash,
                         begin_fencing_generation: fencing_generation,
-                        authorize_url: authorize_url.clone(),
-                        user_code: user_code.clone(),
+                        authorize_url: authorize_url.clone().into(),
+                        user_code: user_code.clone().map(Into::into),
                         ready: durable_ready.clone(),
                         created_at_unix_ms,
                         expires_at_unix_ms: oauth_expiry_ms(created_at_unix_ms),
@@ -9800,8 +9941,8 @@ async fn handle_serialized_request_impl(
                             flow_id.clone(),
                             durable_owner,
                             begin_client_operation_id,
-                            authorize_url,
-                            user_code,
+                            authorize_url.expose().to_owned(),
+                            user_code.as_ref().map(|code| code.expose().to_owned()),
                             ProviderOAuthFlow::Ready(ready),
                         )
                         .await;
@@ -10317,7 +10458,7 @@ async fn handle_serialized_request_impl(
                         client_operation_id,
                         request_hash,
                         flow_id,
-                        authorize_url,
+                        authorize_url: authorize_url.expose().to_owned(),
                     });
                 }
                 LocalOperationStart::Replay(response) => return Ok(response),
@@ -10424,7 +10565,7 @@ async fn handle_serialized_request_impl(
                         flow_id.clone(),
                         owner.clone(),
                         client_operation_id.clone(),
-                        authorize_url.clone(),
+                        authorize_url.expose().to_owned(),
                         pending,
                     )
                     .await;
@@ -10432,7 +10573,7 @@ async fn handle_serialized_request_impl(
                     client_operation_id: client_operation_id.clone(),
                     request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id: flow_id.clone(),
-                    authorize_url,
+                    authorize_url: authorize_url.expose().to_owned(),
                 };
                 let receipt = Response::McpOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
@@ -10531,7 +10672,7 @@ async fn handle_serialized_request_impl(
                     begin_client_operation_id: client_operation_id.clone(),
                     begin_request_hash: request_hash,
                     begin_fencing_generation: fencing_generation,
-                    authorize_url: authorize_url.clone(),
+                    authorize_url: authorize_url.clone().into(),
                     pending: McpOAuthPending {
                         project_root: pending.project_root.clone(),
                         server: pending.server.clone(),
@@ -10678,7 +10819,7 @@ async fn handle_serialized_request_impl(
                             flow_id.clone(),
                             durable_owner,
                             begin_client_operation_id,
-                            authorize_url,
+                            authorize_url.expose().to_owned(),
                             pending,
                         )
                         .await;
@@ -14184,8 +14325,8 @@ async fn begin_assistant_mutation_journal(
                  (owner_digest,client_operation_id,request_hash,fencing_generation,
                   mutation_intent_hash,requested_project_root,project_root,
                   assistant_name,action,consumed_revision,intended_content_hash,
-                  consumed_config_generation,terminal_response_json,created_at_unix_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,?13)",
+                  consumed_config_generation,created_at_unix_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 rusqlite::params![
                     owner,
                     client_operation_id,
@@ -14238,7 +14379,7 @@ async fn begin_assistant_mutation_journal(
         .map_err(internal)
 }
 
-async fn record_assistant_mutation_terminal(
+async fn finish_assistant_mutation(
     ctx: &DaemonContext,
     owner: String,
     client_operation_id: String,
@@ -14248,22 +14389,53 @@ async fn record_assistant_mutation_terminal(
 ) -> std::result::Result<(), ErrorPayload> {
     let response_json = serde_json::to_string(response).map_err(internal)?;
     ctx.db
-        .write(move |conn| {
-            let changed = conn.execute(
-                "UPDATE assistant_mutation_journals SET terminal_response_json=?5
-                 WHERE owner_digest=?1 AND client_operation_id=?2
-                   AND request_hash=?3 AND fencing_generation=?4
-                   AND terminal_response_json IS NULL",
+        .transaction(move |conn| {
+            let journal_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM assistant_mutation_journals
+                  WHERE owner_digest=?1 AND client_operation_id=?2
+                    AND request_hash=?3 AND fencing_generation=?4)",
+                rusqlite::params![
+                    &owner,
+                    &client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                ],
+                |row| row.get(0),
+            )?;
+            if !journal_exists {
+                anyhow::bail!("assistant mutation lost its durable journal fence");
+            }
+            let settled = conn.execute(
+                "UPDATE local_operation_receipts
+                    SET state='terminal_success',terminal_outcome_json=?5,
+                        execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                  WHERE owner_digest=?1 AND client_operation_id=?2
+                    AND request_hash=?3 AND fencing_generation=?4 AND state='executing'",
+                rusqlite::params![
+                    &owner,
+                    &client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    response_json,
+                    chrono::Utc::now().timestamp_millis(),
+                ],
+            )?;
+            if settled != 1 {
+                anyhow::bail!("assistant mutation lost its local receipt fence");
+            }
+            let deleted = conn.execute(
+                "DELETE FROM assistant_mutation_journals
+                  WHERE owner_digest=?1 AND client_operation_id=?2
+                    AND request_hash=?3 AND fencing_generation=?4",
                 rusqlite::params![
                     owner,
                     client_operation_id,
                     request_hash.as_slice(),
                     fencing_generation,
-                    response_json,
                 ],
             )?;
-            if changed != 1 {
-                anyhow::bail!("assistant mutation lost its durable journal fence");
+            if deleted != 1 {
+                anyhow::bail!("assistant mutation journal retirement was not atomic");
             }
             Ok(())
         })
@@ -14309,8 +14481,7 @@ async fn settle_uncommitted_assistant_recovery(
             let deleted = conn.execute(
                 "DELETE FROM assistant_mutation_journals
                  WHERE owner_digest=?1 AND client_operation_id=?2
-                   AND request_hash=?3 AND fencing_generation=?4
-                   AND terminal_response_json IS NULL",
+                   AND request_hash=?3 AND fencing_generation=?4",
                 rusqlite::params![
                     owner,
                     client_operation_id,
@@ -14344,7 +14515,6 @@ pub(super) async fn recover_assistant_mutation_journals(
         consumed_revision: String,
         intended_hash: Option<String>,
         consumed_generation: i64,
-        terminal: Option<String>,
     }
     let rows = ctx
         .db
@@ -14353,7 +14523,7 @@ pub(super) async fn recover_assistant_mutation_journals(
                 "SELECT owner_digest,client_operation_id,request_hash,fencing_generation,
                         mutation_intent_hash,requested_project_root,project_root,
                         assistant_name,action,consumed_revision,intended_content_hash,
-                        consumed_config_generation,terminal_response_json
+                        consumed_config_generation
                    FROM assistant_mutation_journals ORDER BY created_at_unix_ms",
             )?;
             statement
@@ -14371,7 +14541,6 @@ pub(super) async fn recover_assistant_mutation_journals(
                         consumed_revision: row.get(9)?,
                         intended_hash: row.get(10)?,
                         consumed_generation: row.get(11)?,
-                        terminal: row.get(12)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()
@@ -14388,20 +14557,6 @@ pub(super) async fn recover_assistant_mutation_journals(
             .as_slice()
             .try_into()
             .map_err(|_| internal("assistant journal request hash is malformed"))?;
-        if let Some(json) = row.terminal {
-            let response: Response = serde_json::from_str(&json).map_err(internal)?;
-            finish_local_operation(
-                ctx,
-                row.owner,
-                row.operation_id,
-                request_hash,
-                row.fence,
-                &response,
-            )
-            .await?;
-            recovered = recovered.saturating_add(1);
-            continue;
-        }
         let snapshot = crate::assistants::snapshot(&ctx.db, &row.name)
             .await
             .map_err(internal)?;
@@ -14489,16 +14644,7 @@ pub(super) async fn recover_assistant_mutation_journals(
             }
             _ => return Err(internal("assistant mutation journal action is invalid")),
         };
-        record_assistant_mutation_terminal(
-            ctx,
-            row.owner.clone(),
-            row.operation_id.clone(),
-            request_hash,
-            row.fence,
-            &response,
-        )
-        .await?;
-        finish_local_operation(
+        finish_assistant_mutation(
             ctx,
             row.owner,
             row.operation_id,

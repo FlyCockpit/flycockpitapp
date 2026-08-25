@@ -28,6 +28,10 @@ pub struct AgentEditorLeaseRow {
     /// with the terminal receipt.
     pub completion_handle: Option<String>,
     pub completion_operation_id: Option<String>,
+    /// Revision produced by the filesystem publication owned by this exact
+    /// completion claim.  Once present, later edits cannot make the original
+    /// commit ambiguous.
+    pub publication_result_revision: Option<String>,
     pub terminal_result_json: Option<String>,
     pub terminal_error_json: Option<String>,
     pub expires_at_unix_ms: i64,
@@ -63,7 +67,7 @@ impl Db {
     ) -> Result<Vec<AgentEditorLeaseRow>> {
         self.read(move |conn| {
             let mut statement = conn.prepare(
-                "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,completion_handle,completion_operation_id,terminal_result_json,terminal_error_json,expires_at_unix_ms,updated_at_unix_ms
+                "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,completion_handle,completion_operation_id,publication_result_revision,terminal_result_json,terminal_error_json,expires_at_unix_ms,updated_at_unix_ms
                  FROM agent_editor_leases
                  WHERE state='open' AND expires_at_unix_ms < ?1
                  ORDER BY expires_at_unix_ms ASC LIMIT 128",
@@ -82,7 +86,7 @@ impl Db {
     ) -> Result<Vec<AgentEditorLeaseRow>> {
         self.read(move |conn| {
             let mut statement = conn.prepare(
-                "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,completion_handle,completion_operation_id,terminal_result_json,terminal_error_json,expires_at_unix_ms,updated_at_unix_ms
+                "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,completion_handle,completion_operation_id,publication_result_revision,terminal_result_json,terminal_error_json,expires_at_unix_ms,updated_at_unix_ms
                  FROM agent_editor_leases
                  WHERE state='completing' AND updated_at_unix_ms <= ?1
                  ORDER BY updated_at_unix_ms ASC LIMIT 128",
@@ -108,9 +112,9 @@ pub fn insert_agent_editor_lease_conn(conn: &Connection, row: &AgentEditorLeaseR
     conn.execute(
                 "INSERT INTO agent_editor_leases
                  (owner_digest,client_operation_id,lease_id,project_root,agent_name,
-                  consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,completion_handle,completion_operation_id,terminal_result_json,terminal_error_json,
+                  consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,completion_handle,completion_operation_id,publication_result_revision,terminal_result_json,terminal_error_json,
                   expires_at_unix_ms,created_at_unix_ms,updated_at_unix_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'open',NULL,NULL,NULL,NULL,NULL,?9,?10,?10)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'open',NULL,NULL,NULL,NULL,NULL,NULL,?9,?10,?10)",
                 params![
                     &row.owner_digest,
                     &row.client_operation_id,
@@ -124,6 +128,32 @@ pub fn insert_agent_editor_lease_conn(conn: &Connection, row: &AgentEditorLeaseR
                     now_ms()
                 ],
             )?;
+    Ok(())
+}
+
+pub fn record_agent_editor_publication_conn(
+    conn: &Connection,
+    lease_id: &str,
+    completion_identity: [u8; 32],
+    completion_operation_id: &str,
+    result_revision: &str,
+) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE agent_editor_leases
+            SET publication_result_revision=?4,updated_at_unix_ms=?5
+          WHERE lease_id=?1 AND state='completing' AND completion_identity=?2
+            AND completion_operation_id=?3 AND publication_result_revision IS NULL",
+        params![
+            lease_id,
+            completion_identity.as_slice(),
+            completion_operation_id,
+            result_revision,
+            now_ms()
+        ],
+    )?;
+    if changed != 1 {
+        bail!("agent editor publication lost its durable reservation");
+    }
     Ok(())
 }
 
@@ -263,7 +293,7 @@ fn query<P: rusqlite::Params>(
     params: P,
 ) -> Result<Option<AgentEditorLeaseRow>> {
     let sql = format!(
-        "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,completion_handle,completion_operation_id,terminal_result_json,terminal_error_json,expires_at_unix_ms,updated_at_unix_ms FROM agent_editor_leases WHERE {predicate}"
+        "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,completion_handle,completion_operation_id,publication_result_revision,terminal_result_json,terminal_error_json,expires_at_unix_ms,updated_at_unix_ms FROM agent_editor_leases WHERE {predicate}"
     );
     conn.query_row(&sql, params, map_row)
         .optional()
@@ -292,10 +322,11 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentEditorLeaseRow> {
         completion_identity: identity,
         completion_handle: row.get(10)?,
         completion_operation_id: row.get(11)?,
-        terminal_result_json: row.get(12)?,
-        terminal_error_json: row.get(13)?,
-        expires_at_unix_ms: row.get(14)?,
-        updated_at_unix_ms: row.get(15)?,
+        publication_result_revision: row.get(12)?,
+        terminal_result_json: row.get(13)?,
+        terminal_error_json: row.get(14)?,
+        expires_at_unix_ms: row.get(15)?,
+        updated_at_unix_ms: row.get(16)?,
     })
 }
 

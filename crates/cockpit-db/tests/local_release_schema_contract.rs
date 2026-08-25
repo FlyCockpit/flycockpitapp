@@ -70,7 +70,6 @@ fn authority_journals_bind_exact_fenced_terminal_receipts() {
         "mcp_config_journals",
         "extended_config_patch_journals",
         "agent_mutation_journals",
-        "assistant_mutation_journals",
     ] {
         let declaration = sql
             .split(&format!("CREATE TABLE {table}"))
@@ -111,10 +110,13 @@ fn assistant_mutation_recovery_is_hash_only_and_receipt_fenced() {
         "assistant_name",
         "consumed_revision",
         "intended_content_hash",
-        "terminal_response_json",
     ] {
         assert!(declaration.contains(field), "missing {field}");
     }
+    assert!(
+        !declaration.contains("terminal_response_json"),
+        "assistant terminal outcomes belong only in the atomic local receipt"
+    );
     for forbidden in ["markdown", "file_bytes", "secret"] {
         assert!(
             !declaration.contains(forbidden),

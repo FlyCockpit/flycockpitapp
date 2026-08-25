@@ -11224,6 +11224,8 @@ fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
     assert!(lease_table.contains("snapshot_identity"));
     assert!(lease_table.contains("completion_operation_id"));
     assert!(lease_table.contains("completion_handle"));
+    assert!(lease_table.contains("publication_result_revision"));
+    assert!(source.contains("fail_agent_editor_completion_conn"));
     assert!(!lease_table.contains("snapshot_digest"));
     assert!(!lease_table.contains("snapshot_json"));
     assert!(!lease_table.contains("markdown"));
@@ -11633,6 +11635,7 @@ fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
     for required in [
         "projection_matches_plan",
         "CommittedRefreshNeeded",
+        "DELETE FROM assistant_mutation_journals",
         "recover_agent_mutation_journals",
         "conflict_agent_mutation_journal",
         "state='terminal_error'",
@@ -11653,7 +11656,7 @@ fn assistant_mutations_are_owner_receipted_and_crash_recoverable() {
     let dispatch = include_str!("dispatch.rs");
     for required in [
         "begin_assistant_mutation_journal",
-        "record_assistant_mutation_terminal",
+        "finish_assistant_mutation",
         "recover_assistant_mutation_journals",
         "assistant_mutation_journals",
         "save_assistant_definition",

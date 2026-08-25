@@ -3273,7 +3273,7 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "begin_agent_editor_lease"
                 | "complete_agent_editor_lease"
                 | "get_agent_editor_lease_settlement" => 17,
-                "mutate_agent" => 17,
+                "mutate_agent" | "save_assistant_definition" | "delete_assistant" => 17,
                 "cancel_leak_reveal" => 16,
                 "get_provider_catalog_snapshot" => 15,
                 "list_secret_inventory"
@@ -3308,7 +3308,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "get_session_compactions"
                 | "purge_ended_sessions"
                 | "get_assistant"
-                | "delete_assistant"
                 | "diagnose_media_reservation"
                 | "repair_media_reservation"
                 | "get_doctor_snapshot"
@@ -3370,7 +3369,7 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "agent_editor_lease_begun"
                 | "agent_editor_lease_completed"
                 | "extended_config_saved" => 17,
-                "agent_mutated" => 17,
+                "agent_mutated" | "assistant_definition_saved" | "assistant_deleted" => 17,
                 "leak_reveal_cancelled" => 16,
                 "flycockpit_org_sync"
                 | "provider_models_fetched"
@@ -3393,7 +3392,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "session_compactions"
                 | "ended_sessions_purged"
                 | "assistant"
-                | "assistant_deleted"
                 | "media_reservation_diagnosis"
                 | "media_reservation_repaired"
                 | "doctor_snapshot"
@@ -6929,6 +6927,33 @@ mod tests {
                 mutation: AgentMutation::ResetAllBuiltins,
                 expected_revision: Some("00".repeat(32)),
             },
+            Request::SaveAssistantDefinition {
+                client_operation_id: "save-assistant".into(),
+                mutation_intent_hash: assistant_mutation_intent_hash(
+                    "/tmp/project",
+                    "save",
+                    "build",
+                    &"00".repeat(32),
+                    Some("# build"),
+                ),
+                project_root: "/tmp/project".into(),
+                name: "build".into(),
+                markdown: "# build".into(),
+                expected_revision: "00".repeat(32),
+            },
+            Request::DeleteAssistant {
+                client_operation_id: "delete-assistant".into(),
+                mutation_intent_hash: assistant_mutation_intent_hash(
+                    "/tmp/project",
+                    "delete",
+                    "build",
+                    &"00".repeat(32),
+                    None,
+                ),
+                project_root: "/tmp/project".into(),
+                name: "build".into(),
+                expected_revision: "00".repeat(32),
+            },
         ] {
             assert_eq!(
                 body_required_protocol_version(&Body::Request {
@@ -7073,6 +7098,31 @@ mod tests {
                 completed_lease_id: None,
                 outcome: AgentMutationOutcome::Reconciled,
             }),
+            Response::AssistantDefinitionSaved {
+                client_operation_id: "save-assistant".into(),
+                mutation_intent_hash: "aa".repeat(32),
+                project_root: "/tmp/project".into(),
+                requested_project_root: "/tmp/project".into(),
+                name: "build".into(),
+                assistant: None,
+                consumed_revision: "00".repeat(32),
+                result_revision: "11".repeat(32),
+                consumed_config_generation: 6,
+                result_config_generation: 7,
+                outcome: AgentMutationOutcome::Reconciled,
+            },
+            Response::AssistantDeleted {
+                client_operation_id: "delete-assistant".into(),
+                mutation_intent_hash: "bb".repeat(32),
+                project_root: "/tmp/project".into(),
+                requested_project_root: "/tmp/project".into(),
+                name: "build".into(),
+                consumed_revision: "00".repeat(32),
+                result_revision: "22".repeat(32),
+                consumed_config_generation: 6,
+                result_config_generation: 7,
+                outcome: AgentMutationOutcome::Reconciled,
+            },
         ] {
             assert_eq!(
                 body_required_protocol_version(&Body::Response {

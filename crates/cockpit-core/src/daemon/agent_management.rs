@@ -21,6 +21,19 @@ struct SealedEditorReplay {
     snapshot: AgentEditSnapshot,
 }
 
+impl zeroize::Zeroize for SealedEditorReplay {
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.owner_digest);
+        zeroize::Zeroize::zeroize(&mut self.snapshot.name);
+        zeroize::Zeroize::zeroize(&mut self.snapshot.markdown);
+        zeroize::Zeroize::zeroize(&mut self.snapshot.canonical_preview);
+        zeroize::Zeroize::zeroize(&mut self.snapshot.source_identity);
+        zeroize::Zeroize::zeroize(&mut self.snapshot.revision);
+        zeroize::Zeroize::zeroize(&mut self.snapshot.goal_supervision_json);
+        zeroize::Zeroize::zeroize(&mut self.snapshot.projection_digest);
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SealedEditorCompletion {
     owner_digest: String,
@@ -77,8 +90,11 @@ fn load_editor_completion(
             handle,
         )
         .map_err(internal)?;
-    let payload: SealedEditorCompletion =
-        serde_json::from_slice(plaintext.as_slice()).map_err(internal)?;
+    // Wrap immediately so every subsequent binding/identity validation error
+    // zeroizes the recovered completion document before returning.
+    let payload = zeroize::Zeroizing::new(
+        serde_json::from_slice::<SealedEditorCompletion>(plaintext.as_slice()).map_err(internal)?,
+    );
     if payload.owner_digest != row.owner_digest
         || payload.client_operation_id != operation_id
         || payload.project_root != row.project_root
@@ -107,7 +123,7 @@ fn load_editor_completion(
             "editor completion sealed payload identity mismatch",
         ));
     }
-    Ok(zeroize::Zeroizing::new(payload))
+    Ok(payload)
 }
 
 fn load_editor_replay(
@@ -135,12 +151,13 @@ fn load_editor_replay(
     if identity != row.snapshot_identity {
         return Err(internal("editor lease sealed replay identity mismatch"));
     }
-    let replay: SealedEditorReplay =
-        serde_json::from_slice(plaintext.as_slice()).map_err(internal)?;
+    let replay = zeroize::Zeroizing::new(
+        serde_json::from_slice::<SealedEditorReplay>(plaintext.as_slice()).map_err(internal)?,
+    );
     if replay.owner_digest != row.owner_digest {
         return Err(internal("editor lease sealed replay owner mismatch"));
     }
-    Ok(replay.snapshot)
+    Ok(replay.snapshot.clone())
 }
 
 async fn delete_editor_replay_and_row(
@@ -254,13 +271,14 @@ pub(crate) async fn recover_editor_leases_before_publish(
                 ..
             })
         ) {
-            return Err(ErrorPayload {
-                code: ErrorCode::Shutdown,
-                message: format!(
-                    "editor completion {} remains settlement-unknown; refusing daemon publication",
-                    row.lease_id
-                ),
-            });
+            // Genuine ambiguity retains its sealed evidence and remains
+            // queryable through the read-only settlement RPC. It must not
+            // suppress the socket that clients need in order to inspect and
+            // repair that state.
+            tracing::warn!(
+                lease_id = row.lease_id,
+                "editor completion remains settlement-unknown after boot recovery"
+            );
         }
     }
     Ok(())
@@ -1298,6 +1316,7 @@ pub async fn begin_editor_lease(
         completion_identity: None,
         completion_handle: None,
         completion_operation_id: None,
+        publication_result_revision: None,
         terminal_result_json: None,
         terminal_error_json: None,
         expires_at_unix_ms,
@@ -1577,19 +1596,31 @@ async fn complete_editor_lease_inner(
                     )));
                 }
             };
-            if current.markdown == markdown {
-                if current.revision != consumed_lease_revision {
-                    // The durable completion claim predates this observation,
-                    // but it does not prove which filesystem writer published
-                    // identical bytes. Preserve the sealed payload and report
-                    // ambiguity instead of stealing another writer's commit.
-                    return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
-                        &lease,
-                        &client_operation_id,
-                        &root_text,
-                        AgentEditorSettlementStatus::Pending,
-                    )));
-                }
+            if let Some(result_revision) = lease.publication_result_revision.clone() {
+                // This claim durably recorded the revision it published. A
+                // later writer may advance the live projection, but cannot
+                // make the original commit ambiguous again.
+                let generation = crate::daemon::server::inventory::current_config_generation();
+                Response::AgentMutated(AgentMutationResult {
+                    client_operation_id: client_operation_id.clone(),
+                    mutation_intent_hash: projection_hash(Some(markdown.as_bytes())),
+                    project_root: root_text.clone(),
+                    requested_project_root: root_text.clone(),
+                    owner_scope: format!("project:{root_text}"),
+                    agent_name: Some(lease.agent_name.clone()),
+                    changed: true,
+                    affected: 1,
+                    snapshot: None,
+                    config_generation: generation,
+                    consumed_config_generation: generation,
+                    result_config_generation: generation,
+                    inventory_revision: None,
+                    consumed_revision: Some(consumed_lease_revision.clone()),
+                    result_revision,
+                    completed_lease_id: None,
+                    outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
+                })
+            } else if current.markdown == markdown && current.revision == consumed_lease_revision {
                 let result_revision = current.revision.clone();
                 let generation = crate::daemon::server::inventory::current_config_generation();
                 Response::AgentMutated(AgentMutationResult {
@@ -1611,6 +1642,13 @@ async fn complete_editor_lease_inner(
                     completed_lease_id: None,
                     outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
                 })
+            } else if current.markdown == markdown {
+                return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
+                    &lease,
+                    &client_operation_id,
+                    &root_text,
+                    AgentEditorSettlementStatus::Pending,
+                )));
             } else {
                 let agent_name = lease.agent_name.clone();
                 let consumed_revision = lease.consumed_revision.clone();
@@ -1628,8 +1666,78 @@ async fn complete_editor_lease_inner(
                 .map_err(join_error)
                 .and_then(|result| result)
                 {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        if let Response::AgentMutated(mutation) = &result
+                            && mutation.changed
+                        {
+                            let publication_revision = mutation.result_revision.clone();
+                            let lease_id = lease_id.clone();
+                            let operation_id = client_operation_id.clone();
+                            ctx.db
+                                .write(move |conn| {
+                                    crate::db::agent_editor_leases::record_agent_editor_publication_conn(
+                                        conn,
+                                        &lease_id,
+                                        completion_identity,
+                                        &operation_id,
+                                        &publication_revision,
+                                    )
+                                })
+                                .await
+                                .map_err(internal)?;
+                        }
+                        result
+                    }
                     Err(error) => {
+                        if matches!(
+                            error.code,
+                            ErrorCode::BadRequest
+                                | ErrorCode::Conflict
+                                | ErrorCode::HashMismatch
+                                | ErrorCode::LockConflict
+                                | ErrorCode::InvalidConfig
+                                | ErrorCode::WorkspaceTrust
+                        ) {
+                            let receipt = editor_completion(
+                                &lease,
+                                &client_operation_id,
+                                &root_text,
+                                AgentEditorSettlementStatus::Rejected {
+                                    error: ErrorPayload {
+                                        code: error.code,
+                                        message:
+                                            "the editor completion was rejected before publication"
+                                                .into(),
+                                    },
+                                },
+                            );
+                            let json = serde_json::to_string(&receipt).map_err(internal)?;
+                            let vault = ctx.secret_vault.clone();
+                            let handle = completion_handle.clone();
+                            let rejected_lease_id = lease_id.clone();
+                            let operation_id = client_operation_id.clone();
+                            ctx.db
+                                .transaction(move |conn| {
+                                    vault
+                                        .mutate_item_on_conn(
+                                            conn,
+                                            cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                                            &handle,
+                                            None,
+                                        )
+                                        .map_err(|error| anyhow::anyhow!(error))?;
+                                    crate::db::agent_editor_leases::fail_agent_editor_completion_conn(
+                                        conn,
+                                        &rejected_lease_id,
+                                        completion_identity,
+                                        &operation_id,
+                                        &json,
+                                    )
+                                })
+                                .await
+                                .map_err(internal)?;
+                            return Ok(Response::AgentEditorLeaseCompleted(receipt));
+                        }
                         tracing::warn!(
                             error = %error.message,
                             lease_id,
@@ -1673,18 +1781,7 @@ async fn complete_editor_lease_inner(
     };
     result.completed_lease_id = Some(completed_lease_id);
     let status = if is_save {
-        let Some(result_revision) = result
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.revision.clone())
-        else {
-            return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
-                &lease,
-                &client_operation_id,
-                &root_text,
-                AgentEditorSettlementStatus::Pending,
-            )));
-        };
+        let result_revision = result.result_revision.clone();
         AgentEditorSettlementStatus::Saved {
             result_revision,
             outcome: result.outcome.clone(),

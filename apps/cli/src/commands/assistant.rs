@@ -269,7 +269,7 @@ async fn show(name: &str) -> Result<()> {
     println!("home_dir: {}", default_home_dir(&def.name)?.display());
     println!("definition: {}", def.source.display());
     if let Some(hash) = &assistant.definition_presentation_hash {
-        println!("presentation_hash: {hash}");
+        println!("presentation_identity: {hash}");
     }
     println!(
         "agent_id: {}",
@@ -322,7 +322,7 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for assistant delete")?;
-    let assistant = fetch_assistant(&daemon, &args.name)
+    let (assistant, expected_config_generation) = fetch_assistant_inventory(&daemon, &args.name)
         .await?
         .ok_or_else(|| anyhow::anyhow!("assistant `{}` not found", args.name))?;
     if !args.yes {
@@ -354,6 +354,7 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
             &project_root,
             &args.name,
             &expected_revision,
+            expected_config_generation,
         ))
         .await
         .context("requesting assistant delete from daemon")?
@@ -404,6 +405,7 @@ fn delete_assistant_request(
     project_root: &str,
     name: &str,
     expected_revision: &str,
+    expected_config_generation: u64,
 ) -> Request {
     Request::DeleteAssistant {
         client_operation_id: client_operation_id.to_string(),
@@ -417,7 +419,31 @@ fn delete_assistant_request(
         project_root: project_root.to_string(),
         name: name.to_string(),
         expected_revision: expected_revision.to_string(),
+        expected_config_generation,
     }
+}
+
+async fn fetch_assistant_inventory(
+    daemon: &crate::daemon::client::ConnectedDaemon,
+    name: &str,
+) -> Result<Option<(crate::daemon::proto::AssistantSummary, u64)>> {
+    let response = daemon
+        .client
+        .request(Request::ListAssistants)
+        .await
+        .context("requesting assistant inventory from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected assistant inventory: {error}"))?;
+    let Response::Assistants {
+        assistants,
+        config_generation,
+    } = response
+    else {
+        bail!("daemon returned unexpected response to assistant inventory: {response:?}");
+    };
+    Ok(assistants
+        .into_iter()
+        .find(|assistant| assistant.name == name)
+        .map(|assistant| (assistant, config_generation)))
 }
 
 /// Resolve a single assistant registry row through the daemon's owner-remoted
@@ -575,7 +601,8 @@ mod tests {
             project_root,
             name,
             expected_revision,
-        } = delete_assistant_request("op-1", "/project", "helper-bot", "rev-1")
+            expected_config_generation,
+        } = delete_assistant_request("op-1", "/project", "helper-bot", "rev-1", 7)
         else {
             panic!("delete must remove through DeleteAssistant");
         };
@@ -593,6 +620,7 @@ mod tests {
         );
         assert_eq!(name, "helper-bot");
         assert_eq!(expected_revision, "rev-1");
+        assert_eq!(expected_config_generation, 7);
     }
 
     #[tokio::test]

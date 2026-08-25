@@ -90,6 +90,8 @@ pub(super) struct AgentsPage {
     load_generation: uuid::Uuid,
     inventory_revision: Option<String>,
     canonical_project_root: Option<String>,
+    /// Generation of the coherent inventory+assistant pair currently shown.
+    authority_config_generation: Option<u64>,
     expected_inventory_after_commit: Option<String>,
     agent_rows: Vec<AgentRow>,
     assistant_rows: Vec<AgentRow>,
@@ -149,6 +151,7 @@ enum PendingAgentOperation {
         name: String,
         markdown: String,
         expected_revision: String,
+        expected_config_generation: u64,
         purpose: SavePurpose,
         querying: bool,
     },
@@ -159,6 +162,7 @@ enum PendingAgentOperation {
         canonical_project_root: String,
         name: String,
         expected_registration_revision: String,
+        expected_config_generation: u64,
         querying: bool,
     },
     BeginLease {
@@ -393,6 +397,7 @@ pub(super) struct AgentDetail {
 impl AgentsPage {
     fn has_authoritative_pair(&self) -> bool {
         self.canonical_project_root.is_some()
+            && self.authority_config_generation.is_some()
             && self.inventory_load_error.is_none()
             && self.assistant_load_error.is_none()
             && self.staged_inventory.is_none()
@@ -441,6 +446,7 @@ impl AgentsPage {
             load_generation: uuid::Uuid::new_v4(),
             inventory_revision: None,
             canonical_project_root: None,
+            authority_config_generation: None,
             expected_inventory_after_commit: None,
             agent_rows: Vec::new(),
             assistant_rows: Vec::new(),
@@ -584,6 +590,7 @@ impl AgentsPage {
                 name,
                 markdown,
                 expected_revision,
+                expected_config_generation,
                 purpose,
                 querying,
             } => {
@@ -596,6 +603,7 @@ impl AgentsPage {
                         name: name.clone(),
                         markdown: markdown.clone(),
                         expected_revision: expected_revision.clone(),
+                        expected_config_generation,
                     }
                 } else {
                     cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
@@ -618,6 +626,7 @@ impl AgentsPage {
                         name,
                         markdown,
                         expected_revision,
+                        expected_config_generation,
                         purpose,
                         querying: !querying,
                     },
@@ -631,6 +640,7 @@ impl AgentsPage {
                 canonical_project_root,
                 name,
                 expected_registration_revision,
+                expected_config_generation,
                 querying,
             } => {
                 let project_root = cwd.to_string_lossy().into_owned();
@@ -641,6 +651,7 @@ impl AgentsPage {
                         project_root,
                         name: name.clone(),
                         expected_revision: expected_registration_revision.clone(),
+                        expected_config_generation,
                     }
                 } else {
                     cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
@@ -662,6 +673,7 @@ impl AgentsPage {
                         canonical_project_root,
                         name,
                         expected_registration_revision,
+                        expected_config_generation,
                         querying: !querying,
                     },
                 );
@@ -753,6 +765,7 @@ impl AgentsPage {
         self.assistant_rows = assistants.rows;
         self.inventory_revision = Some(inventory.inventory_revision);
         self.canonical_project_root = Some(inventory.canonical_project_root);
+        self.authority_config_generation = Some(inventory.config_generation);
         self.rebuild_rows();
     }
 
@@ -1256,6 +1269,7 @@ impl AgentsPage {
                 cwd,
                 mutation,
                 expected_revision,
+                expected_config_generation,
                 purpose,
                 querying,
             } => {
@@ -1444,6 +1458,7 @@ impl AgentsPage {
                 name,
                 markdown,
                 expected_revision,
+                expected_config_generation,
                 purpose,
                 querying,
             } => {
@@ -1455,6 +1470,7 @@ impl AgentsPage {
                     name: name.clone(),
                     markdown: markdown.clone(),
                     expected_revision: expected_revision.clone(),
+                    expected_config_generation,
                     purpose,
                     querying,
                 };
@@ -1513,7 +1529,11 @@ impl AgentsPage {
                         && canonical_project_root == project_root
                         && returned_name == name
                         && consumed_revision == expected_revision
-                        && result_config_generation > consumed_config_generation =>
+                        && consumed_config_generation == expected_config_generation
+                        && (matches!(
+                            outcome,
+                            cockpit_core::daemon::proto::AgentMutationOutcome::Reconciled
+                        ) || result_config_generation > consumed_config_generation) =>
                     {
                         if let Some(assistant) = assistant {
                                 coherent_assistant_save_revision(
@@ -1583,6 +1603,7 @@ impl AgentsPage {
                 canonical_project_root,
                 name,
                 expected_registration_revision,
+                expected_config_generation,
                 querying,
             } => {
                 let retain_unknown = |this: &mut Self, message: String| {
@@ -1594,6 +1615,7 @@ impl AgentsPage {
                             canonical_project_root: canonical_project_root.clone(),
                             name: name.clone(),
                             expected_registration_revision: expected_registration_revision.clone(),
+                            expected_config_generation,
                             querying,
                         }));
                     this.status = Some(message);
@@ -1649,7 +1671,7 @@ impl AgentsPage {
                         result_revision,
                         consumed_config_generation,
                         result_config_generation,
-                        ..
+                        outcome,
                     } if returned_operation_id == client_operation_id
                         && returned_intent == mutation_intent_hash
                         && requested_project_root == cwd.to_string_lossy().as_ref()
@@ -1657,7 +1679,11 @@ impl AgentsPage {
                         && deleted_name == name
                         && consumed_revision == expected_registration_revision
                         && !result_revision.trim().is_empty()
-                        && result_config_generation > consumed_config_generation =>
+                        && consumed_config_generation == expected_config_generation
+                        && (matches!(
+                            outcome,
+                            cockpit_core::daemon::proto::AgentMutationOutcome::Reconciled
+                        ) || result_config_generation > consumed_config_generation) =>
                     {
                         self.status = Some(format!(
                             "unregistered assistant `{name}`; its home was retained"
@@ -2556,8 +2582,7 @@ fn valid_agent_inventory(
                 && (!entry.overridden || builtin)
                 && cockpit_proto::is_opaque_authority_token(&entry.source_identity)
                 && cockpit_proto::is_opaque_authority_token(&entry.revision)
-                && entry.projection_digest
-                    == cockpit_proto::agent_inventory_entry_projection_digest(entry)
+                && cockpit_proto::is_opaque_authority_token(&entry.projection_digest)
                 && if entry.valid {
                     entry.diagnostic.is_none() && entry.description.is_some()
                 } else {
@@ -2940,7 +2965,7 @@ fn bind_assistant_mutation_settlement(
         } => {
             if returned != client_operation_id
                 || returned_kind != operation_kind
-                || request_hash != mutation_intent_hash
+                || !cockpit_proto::is_opaque_authority_token(&request_hash)
             {
                 return Err("daemon returned an unbound assistant settlement".into());
             }
@@ -3008,7 +3033,7 @@ pub(crate) fn bind_agent_mutation_settlement(
         } => {
             if returned_operation_id != client_operation_id
                 || operation_kind != "mutate_agent"
-                || request_hash != mutation_intent_hash
+                || !cockpit_proto::is_opaque_authority_token(&request_hash)
             {
                 return Err("daemon returned an unbound agent mutation settlement".into());
             }
@@ -3153,6 +3178,9 @@ impl SettingsCx {
                                 .canonical_project_root
                                 .clone()
                                 .expect("authoritative pair has a canonical root");
+                            let expected_config_generation = p
+                                .authority_config_generation
+                                .expect("authoritative pair has a configuration generation");
                             let cwd = self.agents_cwd();
                             let project_root = cwd.to_string_lossy().into_owned();
                             let client_operation_id = uuid::Uuid::new_v4().to_string();
@@ -3178,6 +3206,7 @@ impl SettingsCx {
                                     name: name.clone(),
                                     markdown: text.clone(),
                                     expected_revision: revision.clone(),
+                                    expected_config_generation,
                                 },
                                 PendingAgentOperation::AssistantSave {
                                     client_operation_id,
@@ -3187,6 +3216,7 @@ impl SettingsCx {
                                     name,
                                     markdown: text,
                                     expected_revision: revision,
+                                    expected_config_generation,
                                     purpose: SavePurpose::Editor,
                                     querying: false,
                                 },
@@ -3569,6 +3599,9 @@ impl SettingsCx {
                 .canonical_project_root
                 .clone()
                 .expect("authoritative pair has a canonical root");
+            let expected_config_generation = p
+                .authority_config_generation
+                .expect("authoritative pair has a configuration generation");
             let Some(expected_revision) = detail.revision.clone() else {
                 detail.status = Some("save failed: missing assistant revision".into());
                 return;
@@ -3597,6 +3630,7 @@ impl SettingsCx {
                     name: name.clone(),
                     markdown: markdown.clone(),
                     expected_revision: expected_revision.clone(),
+                    expected_config_generation,
                 },
                 PendingAgentOperation::AssistantSave {
                     client_operation_id,
@@ -3606,6 +3640,7 @@ impl SettingsCx {
                     name,
                     markdown,
                     expected_revision,
+                    expected_config_generation,
                     purpose: SavePurpose::Detail,
                     querying: false,
                 },
@@ -3811,6 +3846,9 @@ impl SettingsCx {
                     .canonical_project_root
                     .clone()
                     .expect("authoritative pair has a canonical root");
+                let expected_config_generation = p
+                    .authority_config_generation
+                    .expect("authoritative pair has a configuration generation");
                 let project_root = cwd.to_string_lossy().into_owned();
                 let client_operation_id = uuid::Uuid::new_v4().to_string();
                 let mutation_intent_hash = cockpit_proto::assistant_mutation_intent_hash(
@@ -3833,6 +3871,7 @@ impl SettingsCx {
                         project_root,
                         name: name.clone(),
                         expected_revision: registration_revision.clone(),
+                        expected_config_generation,
                     },
                     PendingAgentOperation::AssistantDelete {
                         client_operation_id,
@@ -3841,6 +3880,7 @@ impl SettingsCx {
                         canonical_project_root,
                         name,
                         expected_registration_revision: registration_revision.clone(),
+                        expected_config_generation,
                         querying: false,
                     },
                 );

@@ -21,8 +21,8 @@ pub struct AgentMutationJournalFence {
     pub changed_hint: bool,
     pub consumed_config_generation: i64,
     pub mutation_intent_hash: String,
-    pub consumed_projection_hash: String,
-    pub intended_projection_hash: String,
+    pub consumed_projection_identity: String,
+    pub intended_projection_identity: String,
     pub created_at_unix_ms: i64,
 }
 
@@ -38,7 +38,7 @@ impl Db {
                 "INSERT OR IGNORE INTO agent_mutation_journals
                  (owner_digest,client_operation_id,request_hash,keyed_request_identity,fencing_generation,
                   project_root,request_project_root,agent_name,action,consumed_revision,affected_hint,changed_hint,consumed_config_generation,
-                  mutation_intent_hash,consumed_projection_hash,intended_projection_hash,
+                  mutation_intent_hash,consumed_projection_identity,intended_projection_identity,
                   terminal_response_json,created_at_unix_ms)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,NULL,?17)",
                 params![
@@ -56,8 +56,8 @@ impl Db {
                     i64::from(fence.changed_hint),
                     fence.consumed_config_generation,
                     fence.mutation_intent_hash,
-                    fence.consumed_projection_hash,
-                    fence.intended_projection_hash,
+                    fence.consumed_projection_identity,
+                    fence.intended_projection_identity,
                     fence.created_at_unix_ms,
                 ],
             )?;

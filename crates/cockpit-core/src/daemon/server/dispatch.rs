@@ -5750,6 +5750,7 @@ async fn handle_serialized_request_impl(
             name,
             markdown,
             expected_revision,
+            expected_config_generation,
         } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
@@ -5775,10 +5776,15 @@ async fn handle_serialized_request_impl(
             let project_root =
                 crate::daemon::fs_api::canonical_project_root(&requested_project_root)?;
             let owner = stable_authenticated_principal(state);
-            let request_hash: [u8; 32] = hex::decode(&mutation_intent_hash)
-                .map_err(|_| bad_request("assistant mutation intent hash is malformed"))?
-                .try_into()
-                .map_err(|_| bad_request("assistant mutation intent hash has the wrong length"))?;
+            let request_hash = assistant_mutation_request_identity(
+                ctx,
+                &requested_project_root,
+                "save",
+                &name,
+                &expected_revision,
+                Some(&markdown),
+                expected_config_generation,
+            )?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -5791,7 +5797,22 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
+            let _publication = inventory::write_authority_publication().await;
             let consumed_config_generation = inventory::current_config_generation();
+            if consumed_config_generation != expected_config_generation {
+                let error =
+                    conflict("assistant authority generation changed; reload the paired inventory");
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
             let row = match ctx.db.get_assistant(&name).await {
                 Ok(Some(row)) => row,
                 Ok(None) => {
@@ -5875,7 +5896,10 @@ async fn handle_serialized_request_impl(
                 name.clone(),
                 "save",
                 expected_revision.clone(),
-                Some(crate::assistants::markdown_content_hash(&markdown)),
+                Some(ctx.secret_vault.keyed_identity(
+                    b"flycockpit.assistant.intended-markdown.v1",
+                    markdown.as_bytes(),
+                )),
                 consumed_config_generation,
             )
             .await
@@ -6189,6 +6213,7 @@ async fn handle_serialized_request_impl(
             project_root,
             name,
             expected_revision,
+            expected_config_generation,
         } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
@@ -6209,10 +6234,15 @@ async fn handle_serialized_request_impl(
             let project_root =
                 crate::daemon::fs_api::canonical_project_root(&requested_project_root)?;
             let owner = stable_authenticated_principal(state);
-            let request_hash: [u8; 32] = hex::decode(&mutation_intent_hash)
-                .map_err(|_| bad_request("assistant mutation intent hash is malformed"))?
-                .try_into()
-                .map_err(|_| bad_request("assistant mutation intent hash has the wrong length"))?;
+            let request_hash = assistant_mutation_request_identity(
+                ctx,
+                &requested_project_root,
+                "delete",
+                &name,
+                &expected_revision,
+                None,
+                expected_config_generation,
+            )?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -6225,7 +6255,22 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
+            let _publication = inventory::write_authority_publication().await;
             let consumed_config_generation = inventory::current_config_generation();
+            if consumed_config_generation != expected_config_generation {
+                let error =
+                    conflict("assistant authority generation changed; reload the paired inventory");
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
             let current = match crate::assistants::snapshot(&ctx.db, &name).await {
                 Ok(Some(current)) => current,
                 Ok(None) => {
@@ -6310,8 +6355,11 @@ async fn handle_serialized_request_impl(
                 recover_assistant_mutation_journals(ctx).await?;
                 return Err(conflict("assistant changed or no longer exists"));
             }
-            let result_revision = crate::intel::hex_lower(&Sha256::digest(
-                format!("assistant-delete-v1\0{name}\0{expected_revision}").as_bytes(),
+            let tombstone_material =
+                zeroize::Zeroizing::new(format!("{name}\0{expected_revision}").into_bytes());
+            let result_revision = crate::intel::hex_lower(&ctx.secret_vault.keyed_identity(
+                b"flycockpit.assistant.delete-tombstone.v1",
+                tombstone_material.as_slice(),
             ));
             let result_config_generation = inventory::publish_committed_config_generation();
             let response = Response::AssistantDeleted {
@@ -6820,10 +6868,14 @@ async fn handle_serialized_request_impl(
             if mutation_intent_hash != expected_intent {
                 return Err(bad_request("agent mutation intent hash is invalid"));
             }
-            let request_hash: [u8; 32] = hex::decode(&mutation_intent_hash)
-                .map_err(|_| bad_request("agent mutation intent hash is malformed"))?
-                .try_into()
-                .map_err(|_| bad_request("agent mutation intent hash has the wrong length"))?;
+            let request_material = zeroize::Zeroizing::new(
+                serde_json::to_vec(&(&project_root, &mutation, expected_revision.as_deref()))
+                    .map_err(internal)?,
+            );
+            let request_hash = ctx.secret_vault.keyed_identity(
+                b"flycockpit.agent-mutation.request.v2",
+                request_material.as_slice(),
+            );
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -13736,6 +13788,7 @@ async fn handle_concurrent_request_impl(
         }
         Request::GetAssistant { name } => get_assistant_response(&ctx, name).await,
         Request::ListAssistants => {
+            let _publication = inventory::read_authority_publication().await;
             let expected_config_generation = inventory::current_config_generation();
             let snapshots = crate::assistants::snapshots(&ctx.db)
                 .await
@@ -14304,6 +14357,32 @@ enum LocalOperationStart {
     Replay(Response),
 }
 
+fn assistant_mutation_request_identity(
+    ctx: &DaemonContext,
+    requested_project_root: &str,
+    action: &str,
+    name: &str,
+    expected_revision: &str,
+    markdown: Option<&str>,
+    expected_config_generation: u64,
+) -> std::result::Result<[u8; 32], ErrorPayload> {
+    let encoded = zeroize::Zeroizing::new(
+        serde_json::to_vec(&(
+            requested_project_root,
+            action,
+            name,
+            expected_revision,
+            markdown,
+            expected_config_generation,
+        ))
+        .map_err(internal)?,
+    );
+    Ok(ctx.secret_vault.keyed_identity(
+        b"flycockpit.assistant-mutation.request.v2",
+        encoded.as_slice(),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn begin_assistant_mutation_journal(
     ctx: &DaemonContext,
@@ -14317,7 +14396,7 @@ async fn begin_assistant_mutation_journal(
     assistant_name: String,
     action: &'static str,
     consumed_revision: String,
-    intended_content_hash: Option<String>,
+    intended_content_identity: Option<[u8; 32]>,
     consumed_config_generation: u64,
 ) -> std::result::Result<(), ErrorPayload> {
     ctx.db
@@ -14326,7 +14405,7 @@ async fn begin_assistant_mutation_journal(
                 "INSERT OR IGNORE INTO assistant_mutation_journals
                  (owner_digest,client_operation_id,request_hash,fencing_generation,
                   mutation_intent_hash,requested_project_root,project_root,
-                  assistant_name,action,consumed_revision,intended_content_hash,
+                  assistant_name,action,consumed_revision,intended_content_identity,
                   consumed_config_generation,created_at_unix_ms)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 rusqlite::params![
@@ -14340,7 +14419,7 @@ async fn begin_assistant_mutation_journal(
                     assistant_name,
                     action,
                     consumed_revision,
-                    intended_content_hash,
+                    intended_content_identity.as_ref().map(<[u8; 32]>::as_slice),
                     i64::try_from(consumed_config_generation)?,
                     chrono::Utc::now().timestamp_millis(),
                 ],
@@ -14354,7 +14433,7 @@ async fn begin_assistant_mutation_journal(
                    AND request_hash=?3 AND fencing_generation=?4
                    AND mutation_intent_hash=?5 AND requested_project_root=?6
                    AND project_root=?7 AND assistant_name=?8 AND action=?9
-                   AND consumed_revision=?10 AND intended_content_hash IS ?11
+                   AND consumed_revision=?10 AND intended_content_identity IS ?11
                    AND consumed_config_generation=?12)",
                 rusqlite::params![
                     owner,
@@ -14367,7 +14446,7 @@ async fn begin_assistant_mutation_journal(
                     assistant_name,
                     action,
                     consumed_revision,
-                    intended_content_hash,
+                    intended_content_identity.as_ref().map(<[u8; 32]>::as_slice),
                     i64::try_from(consumed_config_generation)?,
                 ],
                 |row| row.get(0),
@@ -14453,10 +14532,9 @@ async fn settle_uncommitted_assistant_recovery(
     fencing_generation: i64,
 ) -> std::result::Result<(), ErrorPayload> {
     let error = ErrorPayload {
-        code: ErrorCode::Internal,
-        message:
-            "the daemon restarted before the assistant mutation committed; no change was published"
-                .into(),
+        code: ErrorCode::Conflict,
+        message: "assistant mutation recovery could not prove the exact committed projection; reload authority before retrying"
+            .into(),
     };
     let error_json = serde_json::to_string(&error).map_err(internal)?;
     ctx.db
@@ -14515,7 +14593,7 @@ pub(super) async fn recover_assistant_mutation_journals(
         name: String,
         action: String,
         consumed_revision: String,
-        intended_hash: Option<String>,
+        intended_hash: Option<Vec<u8>>,
         consumed_generation: i64,
     }
     let rows = ctx
@@ -14524,7 +14602,7 @@ pub(super) async fn recover_assistant_mutation_journals(
             let mut statement = conn.prepare(
                 "SELECT owner_digest,client_operation_id,request_hash,fencing_generation,
                         mutation_intent_hash,requested_project_root,project_root,
-                        assistant_name,action,consumed_revision,intended_content_hash,
+                        assistant_name,action,consumed_revision,intended_content_identity,
                         consumed_config_generation
                    FROM assistant_mutation_journals ORDER BY created_at_unix_ms",
             )?;
@@ -14562,10 +14640,20 @@ pub(super) async fn recover_assistant_mutation_journals(
         let snapshot = crate::assistants::snapshot(&ctx.db, &row.name)
             .await
             .map_err(internal)?;
+        let observed_identity = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.definition_markdown.as_deref())
+            .map(|markdown| {
+                ctx.secret_vault.keyed_identity(
+                    b"flycockpit.assistant.intended-markdown.v1",
+                    markdown.as_bytes(),
+                )
+            });
         let remained_consumed = match (&snapshot, row.action.as_str()) {
             (Some(snapshot), "save") => {
                 snapshot.definition_revision.as_deref() == Some(row.consumed_revision.as_str())
-                    && snapshot.row.content_hash != row.intended_hash.as_deref().unwrap_or_default()
+                    && observed_identity.as_ref().map(<[u8; 32]>::as_slice)
+                        != row.intended_hash.as_deref()
             }
             (Some(snapshot), "delete") => {
                 crate::assistants::registration_revision(&snapshot.row) == row.consumed_revision
@@ -14586,23 +14674,44 @@ pub(super) async fn recover_assistant_mutation_journals(
         }
         let response = match row.action.as_str() {
             "save" => {
-                let snapshot = snapshot.ok_or_else(|| {
-                    internal("assistant save recovery found a missing registration")
-                })?;
-                let committed = snapshot.row.content_hash
-                    == row
-                        .intended_hash
-                        .as_deref()
-                        .ok_or_else(|| internal("assistant save journal omitted intended hash"))?;
-                if !committed {
-                    return Err(internal(
-                        "assistant save journal conflicts with authoritative projection",
-                    ));
+                let Some(snapshot) = snapshot else {
+                    settle_uncommitted_assistant_recovery(
+                        ctx,
+                        row.owner,
+                        row.operation_id,
+                        request_hash,
+                        row.fence,
+                    )
+                    .await?;
+                    recovered = recovered.saturating_add(1);
+                    continue;
+                };
+                if observed_identity.as_ref().map(<[u8; 32]>::as_slice)
+                    != row.intended_hash.as_deref()
+                {
+                    settle_uncommitted_assistant_recovery(
+                        ctx,
+                        row.owner,
+                        row.operation_id,
+                        request_hash,
+                        row.fence,
+                    )
+                    .await?;
+                    recovered = recovered.saturating_add(1);
+                    continue;
                 }
-                let result_revision = snapshot
-                    .definition_revision
-                    .clone()
-                    .ok_or_else(|| internal("recovered assistant save has no revision"))?;
+                let Some(result_revision) = snapshot.definition_revision.clone() else {
+                    settle_uncommitted_assistant_recovery(
+                        ctx,
+                        row.owner,
+                        row.operation_id,
+                        request_hash,
+                        row.fence,
+                    )
+                    .await?;
+                    recovered = recovered.saturating_add(1);
+                    continue;
+                };
                 let result_generation = inventory::publish_committed_config_generation();
                 Response::AssistantDefinitionSaved {
                     client_operation_id: row.operation_id.clone(),
@@ -14620,9 +14729,16 @@ pub(super) async fn recover_assistant_mutation_journals(
             }
             "delete" => {
                 if let Some(_snapshot) = snapshot {
-                    return Err(internal(
-                        "assistant delete journal conflicts with authoritative projection",
-                    ));
+                    settle_uncommitted_assistant_recovery(
+                        ctx,
+                        row.owner,
+                        row.operation_id,
+                        request_hash,
+                        row.fence,
+                    )
+                    .await?;
+                    recovered = recovered.saturating_add(1);
+                    continue;
                 }
                 let result_generation = inventory::publish_committed_config_generation();
                 Response::AssistantDeleted {
@@ -14632,19 +14748,32 @@ pub(super) async fn recover_assistant_mutation_journals(
                     requested_project_root: row.requested_root.clone(),
                     name: row.name.clone(),
                     consumed_revision: row.consumed_revision.clone(),
-                    result_revision: crate::intel::hex_lower(&Sha256::digest(
-                        format!(
-                            "assistant-delete-v1\0{}\0{}",
-                            row.name, row.consumed_revision
-                        )
-                        .as_bytes(),
-                    )),
+                    result_revision: {
+                        let material = zeroize::Zeroizing::new(
+                            format!("{}\0{}", row.name, row.consumed_revision).into_bytes(),
+                        );
+                        crate::intel::hex_lower(&ctx.secret_vault.keyed_identity(
+                            b"flycockpit.assistant.delete-tombstone.v1",
+                            material.as_slice(),
+                        ))
+                    },
                     consumed_config_generation: consumed_generation,
                     result_config_generation: result_generation,
                     outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
                 }
             }
-            _ => return Err(internal("assistant mutation journal action is invalid")),
+            _ => {
+                settle_uncommitted_assistant_recovery(
+                    ctx,
+                    row.owner,
+                    row.operation_id,
+                    request_hash,
+                    row.fence,
+                )
+                .await?;
+                recovered = recovered.saturating_add(1);
+                continue;
+            }
         };
         finish_assistant_mutation(
             ctx,

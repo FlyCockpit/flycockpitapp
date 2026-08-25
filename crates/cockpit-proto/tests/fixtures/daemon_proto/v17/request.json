@@ -1858,11 +1858,12 @@
   "save_assistant_definition": {
     "params": {
       "client_operation_id": "delete-assistant",
-      "mutation_intent_hash": "e81b903c65f09a18b2f28939545add32bfde680cca98b59d1b6a83656aa9d9bd",
+      "mutation_intent_hash": "a8ceffaf0c36a6f6474f100266366a363d0c53e532aba3e8522e511db1471362",
       "project_root": "/tmp/project",
       "name": "helper-bot",
       "markdown": "---\nschemaVersion: 2\n---\nBe helpful.\n",
-      "expected_revision": "revision"
+      "expected_revision": "revision",
+      "expected_config_generation": 7
     },
     "request": "save_assistant_definition"
   },
@@ -1882,7 +1883,7 @@
   "mutate_agent": {
     "params": {
       "client_operation_id": "11111111-1111-4111-8111-111111111111",
-      "mutation_intent_hash": "e4dcbec33acc09b61bde0e941bc29d1b9206433be5c8050786cef2299398a31b",
+      "mutation_intent_hash": "d5acef0939e5d5aaeeb8abadfeb723725fa13022b8e910682a7cb59bc0147603",
       "project_root": "/tmp/project",
       "mutation": {
         "mutation": "reset_all_builtins"
@@ -1950,8 +1951,12 @@
   },
   "delete_assistant": {
     "params": {
+      "client_operation_id": "delete-assistant",
+      "mutation_intent_hash": "a589f568e0d27ddddf1659fbde87fdad36d7759ce533a87abb27a29f155b34f2",
+      "project_root": "/tmp/project",
       "name": "helper-bot",
-      "expected_revision": "revision"
+      "expected_revision": "revision",
+      "expected_config_generation": 7
     },
     "request": "delete_assistant"
   },

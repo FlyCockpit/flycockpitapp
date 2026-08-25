@@ -204,22 +204,31 @@ pub fn agent_mutation_name(mutation: &AgentMutation) -> Option<&str> {
 /// never accepted by this protocol family; length framing prevents ambiguous
 /// concatenations and the domain separator permits future formats.
 pub fn agent_mutation_intent_hash(
-    project_root: &str,
+    _project_root: &str,
     mutation: &AgentMutation,
-    expected_revision: Option<&str>,
+    _expected_revision: Option<&str>,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"cockpit-agent-mutation-intent-v1\0");
-    digest_field(&mut digest, project_root.as_bytes());
-    let encoded =
-        serde_json::to_vec(mutation).expect("serializing an in-memory agent mutation cannot fail");
-    digest_field(&mut digest, &encoded);
-    match expected_revision {
-        Some(revision) => {
-            digest.update([1]);
-            digest_field(&mut digest, revision.as_bytes());
+    digest.update(b"cockpit-agent-mutation-shape-v2\0");
+    let (action, name) = match mutation {
+        AgentMutation::EjectBuiltin { name } => ("eject_builtin", Some(name.as_str())),
+        AgentMutation::SaveDefinition { name, .. } => ("save_definition", Some(name.as_str())),
+        AgentMutation::CreateDefinition { name, .. } => ("create_definition", Some(name.as_str())),
+        AgentMutation::DeleteCustom { name } => ("delete_custom", Some(name.as_str())),
+        AgentMutation::ResetBuiltin { name } => ("reset_builtin", Some(name.as_str())),
+        AgentMutation::ResetAllBuiltins => ("reset_all_builtins", None),
+        AgentMutation::SaveGoalSupervision { name, patch } => {
+            digest.update([
+                u8::from(patch.cold_skeptic_count.is_some()),
+                u8::from(patch.cold_skeptic_model.is_some()),
+                u8::from(patch.max_verification_attempts.is_some()),
+            ]);
+            ("save_goal_supervision", Some(name.as_str()))
         }
-        None => digest.update([0]),
+    };
+    digest_field(&mut digest, action.as_bytes());
+    if let Some(name) = name {
+        digest_field(&mut digest, name.as_bytes());
     }
     crate::hex_lower(digest.finalize())
 }
@@ -228,24 +237,18 @@ pub fn agent_mutation_intent_hash(
 /// The exact bytes are also stored as the owner-scoped durable-operation
 /// request hash so a client can bind pending and terminal settlement replies.
 pub fn assistant_mutation_intent_hash(
-    project_root: &str,
+    _project_root: &str,
     action: &str,
     name: &str,
-    expected_revision: &str,
+    _expected_revision: &str,
     intended_markdown: Option<&str>,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"cockpit-assistant-mutation-intent-v1\0");
-    for field in [project_root, action, name, expected_revision] {
+    digest.update(b"cockpit-assistant-mutation-shape-v2\0");
+    for field in [action, name] {
         digest_field(&mut digest, field.as_bytes());
     }
-    match intended_markdown {
-        Some(markdown) => {
-            digest.update([1]);
-            digest_field(&mut digest, markdown.as_bytes());
-        }
-        None => digest.update([0]),
-    }
+    digest.update([u8::from(intended_markdown.is_some())]);
     crate::hex_lower(digest.finalize())
 }
 
@@ -360,8 +363,10 @@ pub fn validate_agent_mutation_envelope(
     // Generations are process-local publication counters. A boot-recovered
     // committed receipt may legitimately carry a consumed generation from the
     // prior daemon and a smaller generation actually published by this daemon.
-    if matches!(result.outcome, AgentMutationOutcome::Reconciled)
-        && result.consumed_config_generation > result.result_config_generation
+    if matches!(
+        result.outcome,
+        AgentMutationOutcome::CommittedRefreshNeeded { .. }
+    ) && result.result_config_generation <= result.consumed_config_generation
     {
         return Err("agent mutation receipt contains an invalid generation transition");
     }
@@ -493,9 +498,9 @@ pub fn validate_agent_edit_snapshot(snapshot: &AgentEditSnapshot) -> Result<(), 
     {
         return Err("agent snapshot identity is missing");
     }
-    if snapshot.projection_digest != agent_edit_projection_digest(snapshot) {
-        return Err("agent snapshot projection digest is invalid");
-    }
+    // Projection identities are daemon/vault-keyed. A client can validate the
+    // opaque shape and bind it through the authenticated response, but must
+    // not be able to recompute an offline verifier for authored markdown.
     if snapshot
         .goal_supervision_json
         .as_ref()
@@ -511,7 +516,8 @@ pub fn validate_agent_edit_snapshot(snapshot: &AgentEditSnapshot) -> Result<(), 
     Ok(())
 }
 
-pub fn agent_inventory_entry_projection_digest(entry: &AgentInventoryEntry) -> String {
+#[doc(hidden)]
+pub fn agent_inventory_entry_projection_material(entry: &AgentInventoryEntry) -> String {
     let mut digest = Sha256::new();
     digest.update(b"cockpit-agent-inventory-projection-v1\0");
     for value in [
@@ -540,7 +546,8 @@ pub fn agent_inventory_entry_projection_digest(entry: &AgentInventoryEntry) -> S
     crate::hex_lower(digest.finalize())
 }
 
-pub fn agent_edit_projection_digest(snapshot: &AgentEditSnapshot) -> String {
+#[doc(hidden)]
+pub fn agent_edit_projection_material(snapshot: &AgentEditSnapshot) -> String {
     let mut digest = Sha256::new();
     digest.update(b"cockpit-agent-edit-projection-v1\0");
     for value in [
@@ -582,16 +589,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mutation_intent_hash_binds_root_body_and_consumed_revision() {
+    fn mutation_intent_hash_is_body_free_but_binds_public_shape() {
         let mutation = AgentMutation::ResetBuiltin {
             name: "build".into(),
         };
         let baseline = agent_mutation_intent_hash("/project", &mutation, Some(&"11".repeat(32)));
-        assert_ne!(
+        assert_eq!(
             baseline,
             agent_mutation_intent_hash("/other", &mutation, Some(&"11".repeat(32)))
         );
-        assert_ne!(
+        assert_eq!(
             baseline,
             agent_mutation_intent_hash("/project", &mutation, Some(&"22".repeat(32)))
         );
@@ -608,13 +615,11 @@ mod tests {
     }
 
     #[test]
-    fn assistant_mutation_intent_binds_target_action_revision_and_bytes() {
+    fn assistant_mutation_intent_is_body_free_but_binds_public_shape() {
         let baseline =
             assistant_mutation_intent_hash("/project", "save", "helper", "revision", Some("body"));
-        for changed in [
+        for equivalent in [
             assistant_mutation_intent_hash("/other", "save", "helper", "revision", Some("body")),
-            assistant_mutation_intent_hash("/project", "delete", "helper", "revision", None),
-            assistant_mutation_intent_hash("/project", "save", "other", "revision", Some("body")),
             assistant_mutation_intent_hash(
                 "/project",
                 "save",
@@ -629,6 +634,12 @@ mod tests {
                 "revision",
                 Some("other-body"),
             ),
+        ] {
+            assert_eq!(baseline, equivalent);
+        }
+        for changed in [
+            assistant_mutation_intent_hash("/project", "delete", "helper", "revision", None),
+            assistant_mutation_intent_hash("/project", "save", "other", "revision", Some("body")),
         ] {
             assert_ne!(baseline, changed);
         }

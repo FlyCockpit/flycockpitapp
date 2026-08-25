@@ -1640,40 +1640,66 @@ fn scrub_agent_edit_snapshot(snapshot: &mut proto::AgentEditSnapshot, redact: &R
 /// Mint presentation digests only after the final socket-bound redaction
 /// pass. This is infallible and therefore cannot turn a committed mutation
 /// into a post-commit response error.
-fn finalize_response_projections(response: &mut proto::Response) {
-    fn assistant(value: &mut proto::AssistantSummary) {
-        value.definition_presentation_hash = value.definition_markdown.as_ref().map(|markdown| {
-            use sha2::Digest as _;
-            crate::computer::frame::hex::encode(&sha2::Sha256::digest(markdown.as_bytes()))
-        });
-        value.projection_digest = proto::assistant_projection_digest(value);
+fn finalize_response_projections(
+    response: &mut proto::Response,
+    vault: &crate::secure_key::SecretVault,
+) {
+    fn keyed(vault: &crate::secure_key::SecretVault, domain: &[u8], value: &[u8]) -> String {
+        crate::intel::hex_lower(&vault.keyed_identity(domain, value))
     }
-    fn agent(value: &mut proto::AgentEditSnapshot) {
-        value.projection_digest = proto::agent_edit_projection_digest(value);
+    fn assistant(value: &mut proto::AssistantSummary, vault: &crate::secure_key::SecretVault) {
+        value.definition_presentation_hash = value.definition_markdown.as_ref().map(|markdown| {
+            keyed(
+                vault,
+                b"flycockpit.assistant.presentation.v1",
+                markdown.as_bytes(),
+            )
+        });
+        let material = proto::assistant_projection_material(value);
+        value.projection_digest = keyed(
+            vault,
+            b"flycockpit.assistant.projection.v1",
+            material.as_bytes(),
+        );
+    }
+    fn agent(value: &mut proto::AgentEditSnapshot, vault: &crate::secure_key::SecretVault) {
+        let material = proto::agent_edit_projection_material(value);
+        value.projection_digest = keyed(
+            vault,
+            b"flycockpit.agent.edit-projection.v1",
+            material.as_bytes(),
+        );
     }
     match response {
         proto::Response::Assistant {
             assistant: Some(value),
-        } => assistant(value),
-        proto::Response::Assistants { assistants, .. } => assistants.iter_mut().for_each(assistant),
-        proto::Response::AssistantUpserted { assistant: value } => assistant(value),
+        } => assistant(value, vault),
+        proto::Response::Assistants { assistants, .. } => assistants
+            .iter_mut()
+            .for_each(|value| assistant(value, vault)),
+        proto::Response::AssistantUpserted { assistant: value } => assistant(value, vault),
         proto::Response::AssistantDefinitionSaved {
             assistant: Some(value),
             ..
-        } => assistant(value),
+        } => assistant(value, vault),
         proto::Response::AgentInventory { entries, .. } => {
             for entry in entries {
-                entry.projection_digest = proto::agent_inventory_entry_projection_digest(entry);
+                let material = proto::agent_inventory_entry_projection_material(entry);
+                entry.projection_digest = keyed(
+                    vault,
+                    b"flycockpit.agent.inventory-projection.v1",
+                    material.as_bytes(),
+                );
             }
         }
-        proto::Response::AgentEditSnapshot(value) => agent(value),
+        proto::Response::AgentEditSnapshot(value) => agent(value, vault),
         proto::Response::AgentMutated(result) => {
             if let Some(value) = &mut result.snapshot {
-                agent(value);
+                agent(value, vault);
             }
         }
         proto::Response::AgentEditorLeaseCompleted(_) => {}
-        proto::Response::AgentEditorLeaseBegun(lease) => agent(&mut lease.snapshot),
+        proto::Response::AgentEditorLeaseBegun(lease) => agent(&mut lease.snapshot, vault),
         _ => {}
     }
 }
@@ -5586,7 +5612,7 @@ fn response_envelope_for_shared(
             };
             match response {
                 Some(mut response) => {
-                    finalize_response_projections(&mut response);
+                    finalize_response_projections(&mut response, &ctx.secret_vault);
                     bounded_response_envelope(id, response)
                 }
                 None => bounded_error_envelope(
@@ -5645,7 +5671,7 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
             .all(|value| value.len() <= proto::MAX_AGENT_METADATA_BYTES)
             && proto::is_opaque_authority_token(&entry.source_identity)
             && proto::is_opaque_authority_token(&entry.revision)
-            && entry.projection_digest == proto::agent_inventory_entry_projection_digest(entry)
+            && proto::is_opaque_authority_token(&entry.projection_digest)
     };
     let assistant_receipt = |operation: &str,
                              intent: &str,
@@ -5655,7 +5681,8 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
                              consumed: &str,
                              result: &str,
                              consumed_generation: u64,
-                             result_generation: u64| {
+                             result_generation: u64,
+                             outcome: &proto::AgentMutationOutcome| {
         !operation.is_empty()
             && operation.len() <= 128
             && proto::is_opaque_authority_token(intent)
@@ -5668,7 +5695,8 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
             && !consumed.is_empty()
             && consumed.len() <= 128
             && proto::is_opaque_authority_token(result)
-            && result_generation > consumed_generation
+            && (matches!(outcome, proto::AgentMutationOutcome::Reconciled)
+                || result_generation > consumed_generation)
     };
     match response {
         proto::Response::Assistant { assistant: value } => value.as_ref().is_none_or(assistant),
@@ -5687,7 +5715,7 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
             result_revision,
             consumed_config_generation,
             result_config_generation,
-            ..
+            outcome,
         } => {
             value.as_ref().is_none_or(assistant)
                 && assistant_receipt(
@@ -5700,6 +5728,7 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
                     result_revision,
                     *consumed_config_generation,
                     *result_config_generation,
+                    outcome,
                 )
         }
         proto::Response::AssistantDeleted {
@@ -5712,7 +5741,7 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
             result_revision,
             consumed_config_generation,
             result_config_generation,
-            ..
+            outcome,
         } => assistant_receipt(
             client_operation_id,
             mutation_intent_hash,
@@ -5723,6 +5752,7 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
             result_revision,
             *consumed_config_generation,
             *result_config_generation,
+            outcome,
         ),
         proto::Response::ExtendedConfigSnapshot { layers, .. } => {
             layers.len() <= proto::MAX_EXTENDED_CONFIG_LAYERS

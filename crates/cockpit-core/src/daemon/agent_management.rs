@@ -288,6 +288,7 @@ pub async fn inventory(
     ctx: &DaemonContext,
     project_root: String,
 ) -> Result<Response, ErrorPayload> {
+    let _publication = crate::daemon::server::inventory::read_authority_publication().await;
     let requested_project_root = project_root.clone();
     let root = trusted_root(ctx, &project_root).await?;
     maintain_editor_leases(ctx).await?;
@@ -335,6 +336,7 @@ pub async fn mutate(
     mutation: AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<Response, ErrorPayload> {
+    let _publication = crate::daemon::server::inventory::write_authority_publication().await;
     let request_project_root = project_root.clone();
     let root = trusted_root(ctx, &project_root).await?;
     let canonical_root = root.to_string_lossy().into_owned();
@@ -355,6 +357,7 @@ pub async fn mutate(
     let journal_root = canonical_root.clone();
     let journal_request_root = request_project_root.clone();
     let journal_intent_hash = mutation_intent_hash.clone();
+    let publication_vault = ctx.secret_vault.clone();
     let (plan, result, committed_match) = tokio::task::spawn_blocking(move || {
         let guard = cockpit_config::config::hold_config_mutation_lock(
             &authority_root.join(".cockpit/config.json"),
@@ -365,12 +368,13 @@ pub async fn mutate(
             &authority_root,
             &authority_mutation,
             authority_revision.as_deref(),
+            &publication_vault,
         )?;
         let journal_action = plan.action.clone();
         let journal_name = plan.agent_name.clone();
         let journal_revision = authority_revision.clone();
-        let journal_hash = plan.intended_projection_hash.clone();
-        let journal_consumed_hash = plan.consumed_projection_hash.clone();
+        let journal_identity = plan.intended_projection_identity.clone();
+        let journal_consumed_identity = plan.consumed_projection_identity.clone();
         let affected_hint = i64::from(plan.affected_hint);
         let consumed_config_generation = i64::try_from(plan.consumed_config_generation)
             .map_err(|_| internal("agent mutation config generation is out of range"))?;
@@ -391,8 +395,8 @@ pub async fn mutate(
                     changed_hint: plan.changed_hint,
                     consumed_config_generation,
                     mutation_intent_hash: journal_intent_hash,
-                    consumed_projection_hash: journal_consumed_hash,
-                    intended_projection_hash: journal_hash,
+                    consumed_projection_identity: journal_consumed_identity,
+                    intended_projection_identity: journal_identity,
                     created_at_unix_ms: chrono::Utc::now().timestamp_millis(),
                 },
             )
@@ -410,7 +414,7 @@ pub async fn mutate(
         let committed_match = result
             .as_ref()
             .err()
-            .map(|_| projection_matches_plan(&authority_root, &plan));
+            .map(|_| projection_matches_plan(&authority_root, &plan, &publication_vault));
         Ok::<_, ErrorPayload>((plan, result, committed_match))
     })
     .await
@@ -473,7 +477,7 @@ pub async fn mutate(
                     mutation_tombstone_revision(
                         &canonical_root,
                         cockpit_proto::agent_mutation_name(&mutation),
-                        &plan.intended_projection_hash,
+                        &plan.intended_projection_identity,
                     )
                 });
             let result_config_generation = if plan.changed_hint {
@@ -530,15 +534,15 @@ pub async fn mutate(
 struct AgentMutationPlan {
     action: String,
     agent_name: Option<String>,
-    intended_projection_hash: String,
-    consumed_projection_hash: String,
+    intended_projection_identity: String,
+    consumed_projection_identity: String,
     affected_hint: u32,
     changed_hint: bool,
     consumed_config_generation: u64,
     result_is_absent: bool,
 }
 
-fn projection_hash(bytes: Option<&[u8]>) -> String {
+fn projection_identity(vault: &crate::secure_key::SecretVault, bytes: Option<&[u8]>) -> String {
     let mut hasher = Sha256::new();
     match bytes {
         Some(bytes) => {
@@ -547,7 +551,8 @@ fn projection_hash(bytes: Option<&[u8]>) -> String {
         }
         None => hasher.update(b"flycockpit.agent-projection.absent.v1"),
     }
-    hex::encode(hasher.finalize())
+    let material = hasher.finalize();
+    hex::encode(vault.keyed_identity(b"flycockpit.agent.projection.v1", material.as_slice()))
 }
 
 fn agent_mutation_keyed_identity(
@@ -577,6 +582,7 @@ fn prepare_mutation_plan_sync(
     root: &Path,
     mutation: &AgentMutation,
     expected_revision: Option<&str>,
+    vault: &crate::secure_key::SecretVault,
 ) -> Result<AgentMutationPlan, ErrorPayload> {
     let (action, name, consumed, intended, affected_hint, absent) = match mutation {
         AgentMutation::EjectBuiltin { name } => {
@@ -590,8 +596,8 @@ fn prepare_mutation_plan_sync(
             (
                 "eject_builtin",
                 Some(name.clone()),
-                target_projection_hash(root, name)?,
-                projection_hash(Some(current.markdown.as_bytes())),
+                target_projection_identity(root, name, vault)?,
+                projection_identity(vault, Some(current.markdown.as_bytes())),
                 1,
                 false,
             )
@@ -636,8 +642,8 @@ fn prepare_mutation_plan_sync(
             (
                 action,
                 Some(name.clone()),
-                target_projection_hash(root, name)?,
-                projection_hash(Some(markdown.as_bytes())),
+                target_projection_identity(root, name, vault)?,
+                projection_identity(vault, Some(markdown.as_bytes())),
                 1,
                 false,
             )
@@ -657,8 +663,8 @@ fn prepare_mutation_plan_sync(
             (
                 "delete_custom",
                 Some(name.clone()),
-                target_projection_hash(root, name)?,
-                projection_hash(None),
+                target_projection_identity(root, name, vault)?,
+                projection_identity(vault, None),
                 1,
                 true,
             )
@@ -678,8 +684,8 @@ fn prepare_mutation_plan_sync(
             (
                 "reset_builtin",
                 Some(name.clone()),
-                target_projection_hash(root, name)?,
-                projection_hash(None),
+                target_projection_identity(root, name, vault)?,
+                projection_identity(vault, None),
                 1,
                 true,
             )
@@ -697,8 +703,8 @@ fn prepare_mutation_plan_sync(
             (
                 "reset_all_builtins",
                 None,
-                reset_all_target_projection_hash(root)?,
-                reset_all_projection_hash(),
+                reset_all_target_projection_identity(root, vault)?,
+                reset_all_projection_identity(vault),
                 affected,
                 true,
             )
@@ -736,8 +742,8 @@ fn prepare_mutation_plan_sync(
             (
                 "save_goal_supervision",
                 Some(name.clone()),
-                target_projection_hash(root, name)?,
-                projection_hash(Some(markdown.as_bytes())),
+                target_projection_identity(root, name, vault)?,
+                projection_identity(vault, Some(markdown.as_bytes())),
                 1,
                 false,
             )
@@ -748,8 +754,8 @@ fn prepare_mutation_plan_sync(
     Ok(AgentMutationPlan {
         action: action.into(),
         agent_name: name,
-        intended_projection_hash: intended,
-        consumed_projection_hash: consumed,
+        intended_projection_identity: intended,
+        consumed_projection_identity: consumed,
         affected_hint,
         changed_hint,
         consumed_config_generation: crate::daemon::server::inventory::current_config_generation(),
@@ -757,18 +763,31 @@ fn prepare_mutation_plan_sync(
     })
 }
 
-fn reset_all_projection_hash() -> String {
+fn reset_all_projection_identity(vault: &crate::secure_key::SecretVault) -> String {
     let mut digest = Sha256::new();
     digest.update(b"flycockpit.agent-reset-all-targets.v1\0");
-    hex::encode(digest.finalize())
+    hex::encode(vault.keyed_identity(
+        b"flycockpit.agent.reset-all-projection.v1",
+        digest.finalize().as_slice(),
+    ))
 }
 
-fn target_projection_hash(root: &Path, name: &str) -> Result<String, ErrorPayload> {
+fn target_projection_identity(
+    root: &Path,
+    name: &str,
+    vault: &crate::secure_key::SecretVault,
+) -> Result<String, ErrorPayload> {
     let target = project_agent_path(root, name)?;
-    Ok(projection_hash(nofollow_read(&target)?.as_deref()))
+    Ok(projection_identity(
+        vault,
+        nofollow_read(&target)?.as_deref(),
+    ))
 }
 
-fn reset_all_target_projection_hash(root: &Path) -> Result<String, ErrorPayload> {
+fn reset_all_target_projection_identity(
+    root: &Path,
+    vault: &crate::secure_key::SecretVault,
+) -> Result<String, ErrorPayload> {
     let mut entries = crate::agents::BUILTIN_AGENT_NAMES
         .iter()
         .map(|name| (*name).to_owned())
@@ -785,28 +804,37 @@ fn reset_all_target_projection_hash(root: &Path) -> Result<String, ErrorPayload>
             digest.update(&bytes);
         }
     }
-    Ok(hex::encode(digest.finalize()))
+    Ok(hex::encode(vault.keyed_identity(
+        b"flycockpit.agent.reset-all-targets.v1",
+        digest.finalize().as_slice(),
+    )))
 }
 
-fn projection_matches_plan(root: &Path, plan: &AgentMutationPlan) -> Result<bool, ErrorPayload> {
+fn projection_matches_plan(
+    root: &Path,
+    plan: &AgentMutationPlan,
+    vault: &crate::secure_key::SecretVault,
+) -> Result<bool, ErrorPayload> {
     if let Some(name) = plan.agent_name.as_deref() {
         let target = project_agent_path(root, name)?;
         return Ok(
-            projection_hash(nofollow_read(&target)?.as_deref()) == plan.intended_projection_hash
+            projection_identity(vault, nofollow_read(&target)?.as_deref())
+                == plan.intended_projection_identity,
         );
     }
-    Ok(reset_all_target_projection_hash(root)? == plan.intended_projection_hash)
+    Ok(reset_all_target_projection_identity(root, vault)? == plan.intended_projection_identity)
 }
 
 fn projection_matches_consumed(
     root: &Path,
     plan: &AgentMutationPlan,
+    vault: &crate::secure_key::SecretVault,
 ) -> Result<bool, ErrorPayload> {
     let current = match plan.agent_name.as_deref() {
-        Some(name) => target_projection_hash(root, name)?,
-        None => reset_all_target_projection_hash(root)?,
+        Some(name) => target_projection_identity(root, name, vault)?,
+        None => reset_all_target_projection_identity(root, vault)?,
     };
-    Ok(current == plan.consumed_projection_hash)
+    Ok(current == plan.consumed_projection_identity)
 }
 
 fn mutation_tombstone_revision(
@@ -848,7 +876,10 @@ fn bind_agent_mutation_receipt(
                 mutation_tombstone_revision(
                     canonical_project_root,
                     cockpit_proto::agent_mutation_name(mutation),
-                    &projection_hash(None),
+                    &crate::daemon::authority_token::mint(
+                        b"agent-absent-projection/v1",
+                        &[canonical_project_root.as_bytes()],
+                    ),
                 )
             });
     }
@@ -916,6 +947,7 @@ async fn settle_agent_mutation_journal(
 /// crossed its durability boundary; a divergent projection remains pending
 /// for explicit repair rather than fabricating either success or rejection.
 pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64, ErrorPayload> {
+    let _publication = crate::daemon::server::inventory::write_authority_publication().await;
     type Row = (
         String,
         String,
@@ -940,7 +972,7 @@ pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64,
             let mut stmt = conn.prepare(
                 "SELECT owner_digest,client_operation_id,request_hash,keyed_request_identity,fencing_generation,
                         project_root,request_project_root,agent_name,action,consumed_revision,affected_hint,changed_hint,consumed_config_generation,
-                        mutation_intent_hash,consumed_projection_hash,intended_projection_hash
+                        mutation_intent_hash,consumed_projection_identity,intended_projection_identity
                    FROM agent_mutation_journals ORDER BY created_at_unix_ms",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -984,8 +1016,8 @@ pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64,
         changed_hint,
         consumed_config_generation,
         mutation_intent_hash,
-        consumed_projection_hash,
-        intended_projection_hash,
+        consumed_projection_identity,
+        intended_projection_identity,
     ) in rows
     {
         let Ok(request_hash): Result<[u8; 32], _> = request_hash.try_into() else {
@@ -1022,23 +1054,26 @@ pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64,
             ),
             action,
             agent_name: agent_name.clone(),
-            consumed_projection_hash,
-            intended_projection_hash,
+            consumed_projection_identity,
+            intended_projection_identity,
             affected_hint,
             changed_hint,
             consumed_config_generation,
         };
         let check_root = root.clone();
         let check_plan = plan.clone();
-        let matches =
-            tokio::task::spawn_blocking(move || projection_matches_plan(&check_root, &check_plan))
-                .await
-                .map_err(join_error)??;
+        let check_vault = ctx.secret_vault.clone();
+        let matches = tokio::task::spawn_blocking(move || {
+            projection_matches_plan(&check_root, &check_plan, &check_vault)
+        })
+        .await
+        .map_err(join_error)??;
         if !matches {
             let consumed_root = root.clone();
             let consumed_plan = plan.clone();
+            let consumed_vault = ctx.secret_vault.clone();
             let still_consumed = tokio::task::spawn_blocking(move || {
-                projection_matches_consumed(&consumed_root, &consumed_plan)
+                projection_matches_consumed(&consumed_root, &consumed_plan, &consumed_vault)
             })
             .await
             .map_err(join_error)??;
@@ -1094,7 +1129,7 @@ pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64,
                 mutation_tombstone_revision(
                     &project_root,
                     agent_name.as_deref(),
-                    &plan.intended_projection_hash,
+                    &plan.intended_projection_identity,
                 )
             });
         // Recovery runs in a fresh process.  A generation persisted by the
@@ -1618,7 +1653,10 @@ async fn complete_editor_lease_inner(
                 let generation = crate::daemon::server::inventory::current_config_generation();
                 Response::AgentMutated(AgentMutationResult {
                     client_operation_id: client_operation_id.clone(),
-                    mutation_intent_hash: projection_hash(Some(markdown.as_bytes())),
+                    mutation_intent_hash: crate::daemon::authority_token::mint(
+                        b"agent-editor-mutation-intent/v1",
+                        &[lease.lease_id.as_bytes(), lease.agent_name.as_bytes()],
+                    ),
                     project_root: root_text.clone(),
                     requested_project_root: root_text.clone(),
                     owner_scope: format!("project:{root_text}"),
@@ -1640,7 +1678,10 @@ async fn complete_editor_lease_inner(
                 let generation = crate::daemon::server::inventory::current_config_generation();
                 Response::AgentMutated(AgentMutationResult {
                     client_operation_id: client_operation_id.clone(),
-                    mutation_intent_hash: projection_hash(Some(markdown.as_bytes())),
+                    mutation_intent_hash: crate::daemon::authority_token::mint(
+                        b"agent-editor-mutation-intent/v1",
+                        &[lease.lease_id.as_bytes(), lease.agent_name.as_bytes()],
+                    ),
                     project_root: root_text.clone(),
                     requested_project_root: root_text.clone(),
                     owner_scope: format!("project:{root_text}"),
@@ -1772,7 +1813,10 @@ async fn complete_editor_lease_inner(
             let generation = crate::daemon::server::inventory::current_config_generation();
             Response::AgentMutated(AgentMutationResult {
                 client_operation_id: client_operation_id.clone(),
-                mutation_intent_hash: projection_hash(None),
+                mutation_intent_hash: crate::daemon::authority_token::mint(
+                    b"agent-editor-cancel-intent/v1",
+                    &[lease.lease_id.as_bytes(), lease.agent_name.as_bytes()],
+                ),
                 project_root: root_text.clone(),
                 requested_project_root: root_text.clone(),
                 owner_scope: format!("project:{root_text}"),
@@ -2429,7 +2473,10 @@ fn mutate_sync_locked(
             mutation_tombstone_revision(
                 &project_root,
                 mutation_name.as_deref(),
-                &projection_hash(None),
+                &crate::daemon::authority_token::mint(
+                    b"agent-absent-projection/v1",
+                    &[project_root.as_bytes()],
+                ),
             )
         });
     Ok(Response::AgentMutated(AgentMutationResult {

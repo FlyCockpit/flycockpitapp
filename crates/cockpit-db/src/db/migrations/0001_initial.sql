@@ -6381,10 +6381,10 @@ CREATE TABLE assistant_mutation_journals (
     assistant_name        TEXT NOT NULL,
     action                TEXT NOT NULL CHECK (action IN ('save', 'delete')),
     consumed_revision     TEXT NOT NULL,
-    intended_content_hash TEXT CHECK (
-        intended_content_hash IS NULL OR (
-            length(intended_content_hash) = 64
-            AND intended_content_hash = lower(intended_content_hash)
+    intended_content_identity BLOB CHECK (
+        intended_content_identity IS NULL OR (
+            typeof(intended_content_identity) = 'blob'
+            AND length(intended_content_identity) = 32
         )
     ),
     consumed_config_generation INTEGER NOT NULL CHECK (consumed_config_generation >= 0),
@@ -6399,7 +6399,7 @@ CREATE TABLE assistant_mutation_journals (
     CHECK (length(trim(project_root)) > 0),
     CHECK (length(trim(assistant_name)) > 0),
     CHECK (length(trim(consumed_revision)) > 0),
-    CHECK ((action = 'save') = (intended_content_hash IS NOT NULL))
+    CHECK ((action = 'save') = (intended_content_identity IS NOT NULL))
 );
 CREATE INDEX assistant_mutation_journals_created
 ON assistant_mutation_journals(created_at_unix_ms);
@@ -6415,7 +6415,7 @@ WHEN NEW.owner_digest <> OLD.owner_digest
   OR NEW.assistant_name <> OLD.assistant_name
   OR NEW.action <> OLD.action
   OR NEW.consumed_revision <> OLD.consumed_revision
-  OR NEW.intended_content_hash IS NOT OLD.intended_content_hash
+  OR NEW.intended_content_identity IS NOT OLD.intended_content_identity
   OR NEW.consumed_config_generation <> OLD.consumed_config_generation
   OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
 BEGIN
@@ -6454,13 +6454,13 @@ CREATE TABLE agent_mutation_journals (
         length(mutation_intent_hash) = 64
         AND mutation_intent_hash = lower(mutation_intent_hash)
     ),
-    consumed_projection_hash TEXT NOT NULL CHECK (
-        length(consumed_projection_hash) = 64
-        AND consumed_projection_hash = lower(consumed_projection_hash)
+    consumed_projection_identity TEXT NOT NULL CHECK (
+        length(consumed_projection_identity) = 64
+        AND consumed_projection_identity = lower(consumed_projection_identity)
     ),
-    intended_projection_hash TEXT NOT NULL CHECK (
-        length(intended_projection_hash) = 64
-        AND intended_projection_hash = lower(intended_projection_hash)
+    intended_projection_identity TEXT NOT NULL CHECK (
+        length(intended_projection_identity) = 64
+        AND intended_projection_identity = lower(intended_projection_identity)
     ),
     terminal_response_json TEXT CHECK (
         terminal_response_json IS NULL OR json_valid(terminal_response_json)
@@ -6493,8 +6493,8 @@ WHEN NEW.owner_digest <> OLD.owner_digest
   OR NEW.changed_hint <> OLD.changed_hint
   OR NEW.consumed_config_generation <> OLD.consumed_config_generation
   OR NEW.mutation_intent_hash <> OLD.mutation_intent_hash
-  OR NEW.consumed_projection_hash <> OLD.consumed_projection_hash
-  OR NEW.intended_projection_hash <> OLD.intended_projection_hash
+  OR NEW.consumed_projection_identity <> OLD.consumed_projection_identity
+  OR NEW.intended_projection_identity <> OLD.intended_projection_identity
   OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
 BEGIN
     SELECT RAISE(ABORT, 'agent mutation journal identity is immutable');

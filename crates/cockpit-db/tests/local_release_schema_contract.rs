@@ -92,7 +92,7 @@ fn authority_journals_bind_exact_fenced_terminal_receipts() {
 }
 
 #[test]
-fn assistant_mutation_recovery_is_hash_only_and_receipt_fenced() {
+fn assistant_mutation_recovery_is_keyed_identity_only_and_receipt_fenced() {
     let sql = include_str!("../src/db/migrations/0001_initial.sql");
     let declaration = sql
         .split("CREATE TABLE assistant_mutation_journals")
@@ -109,7 +109,7 @@ fn assistant_mutation_recovery_is_hash_only_and_receipt_fenced() {
         "project_root",
         "assistant_name",
         "consumed_revision",
-        "intended_content_hash",
+        "intended_content_identity",
     ] {
         assert!(declaration.contains(field), "missing {field}");
     }
@@ -143,8 +143,8 @@ fn agent_mutation_recovery_is_hash_only_and_blocks_blind_restart_rejection() {
         "fencing_generation",
         "consumed_revision",
         "mutation_intent_hash",
-        "consumed_projection_hash",
-        "intended_projection_hash",
+        "consumed_projection_identity",
+        "intended_projection_identity",
         "terminal_response_json",
     ] {
         assert!(declaration.contains(field), "missing {field}");

@@ -44,7 +44,7 @@ pub use agent_management::{
     AgentMutationOutcome, AgentMutationResult, AgentSourceLayer, GoalSupervisionPatch,
     MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
     MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES, MAX_ASSISTANT_HOME_BYTES,
-    agent_edit_projection_digest, agent_inventory_entry_projection_digest,
+    agent_edit_projection_material, agent_inventory_entry_projection_material,
     agent_mutation_intent_hash, agent_mutation_name, validate_agent_edit_snapshot,
     validate_agent_editor_completion, validate_agent_mutation_envelope,
     validate_agent_source_identity, validate_goal_supervision_projection,
@@ -2235,8 +2235,9 @@ pub struct AssistantSummary {
     pub created_at: i64,
     pub home_dir: String,
     pub config_json: String,
-    /// Digest of the already-redacted definition presentation. This is a UI
-    /// integrity hint only, never the daemon's raw file-integrity hash.
+    /// Vault-keyed identity of the already-redacted definition presentation.
+    /// It is opaque to clients and cannot be used as an offline markdown
+    /// guessing oracle.
     #[serde(deserialize_with = "deserialize_present_option")]
     pub definition_presentation_hash: Option<String>,
     /// Opaque CAS token for the raw registry binding itself. It is request-bound
@@ -2253,8 +2254,7 @@ pub struct AssistantSummary {
     pub definition_revision: Option<String>,
     #[serde(deserialize_with = "deserialize_present_option")]
     pub definition_diagnostic: Option<String>,
-    /// Digest over the exact already-redacted presentation returned to this
-    /// client. Authority revisions above remain opaque CAS tokens.
+    /// Vault-keyed identity over the exact already-redacted presentation.
     pub projection_digest: String,
 }
 
@@ -2308,17 +2308,11 @@ pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'st
             if !diagnostic.trim().is_empty() && summary.definition_presentation_hash.is_none() => {}
         _ => return Err("assistant definition snapshot is incoherent"),
     }
-    if let (Some(markdown), Some(presentation_hash)) = (
-        summary.definition_markdown.as_deref(),
-        summary.definition_presentation_hash.as_deref(),
-    ) {
-        use sha2::Digest as _;
-        if hex_lower(sha2::Sha256::digest(markdown.as_bytes())) != presentation_hash {
-            return Err("assistant definition presentation hash is invalid");
-        }
-    }
-    if summary.projection_digest != assistant_projection_digest(summary) {
-        return Err("assistant projection digest is invalid");
+    // Both identities are vault-keyed and intentionally unrecomputable by a
+    // client. Their opaque shape and response/receipt binding are the public
+    // contract.
+    if !lower_hex_digest(&summary.projection_digest) {
+        return Err("assistant projection identity is invalid");
     }
     Ok(())
 }
@@ -2335,7 +2329,8 @@ pub(crate) fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     out
 }
 
-pub fn assistant_projection_digest(summary: &AssistantSummary) -> String {
+#[doc(hidden)]
+pub fn assistant_projection_material(summary: &AssistantSummary) -> String {
     use sha2::Digest as _;
     let mut digest = sha2::Sha256::new();
     digest.update(b"cockpit-assistant-projection-v1\0");
@@ -6942,6 +6937,7 @@ mod tests {
                 name: "build".into(),
                 markdown: "# build".into(),
                 expected_revision: "00".repeat(32),
+                expected_config_generation: 7,
             },
             Request::DeleteAssistant {
                 client_operation_id: "delete-assistant".into(),
@@ -6955,6 +6951,7 @@ mod tests {
                 project_root: "/tmp/project".into(),
                 name: "build".into(),
                 expected_revision: "00".repeat(32),
+                expected_config_generation: 7,
             },
         ] {
             assert_eq!(
@@ -7192,6 +7189,7 @@ mod tests {
                 project_root: "/tmp/project".into(),
                 name: "helper-bot".into(),
                 expected_revision: "revision".into(),
+                expected_config_generation: 7,
             },
             Request::DiagnoseMediaReservation {
                 scope: "session".into(),

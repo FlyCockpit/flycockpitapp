@@ -130,6 +130,7 @@ enum PendingAgentOperation {
         expected_registration_revision: String,
     },
     BeginLease {
+        client_operation_id: String,
         cwd: PathBuf,
         name: String,
         expected_revision: String,
@@ -406,31 +407,39 @@ impl AgentsPage {
         let Some(pending) = self.uncertain_editor_settlement.take() else {
             return;
         };
-        let PendingAgentOperation::CompleteLease {
-            cwd,
-            name,
-            lease_id,
-            consumed_revision,
-            markdown,
-            draft,
-            detail,
-            outcome,
-        } = *pending
-        else {
-            unreachable!("only completion operations are retained for settlement")
-        };
-        self.stage(
-            cx,
-            super::SettingsEffectTarget {
-                surface: "agents.editor-lease-complete",
-                owner: format!("{}::{lease_id}", cwd.display()),
-                revision: Some(consumed_revision.clone()),
-            },
-            cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
-                project_root: cwd.to_string_lossy().into_owned(),
-                lease_id: lease_id.clone(),
-                markdown: markdown.clone(),
-            },
+        match *pending {
+            PendingAgentOperation::BeginLease {
+                client_operation_id,
+                cwd,
+                name,
+                expected_revision,
+                authority_id,
+                draft,
+            } => {
+                self.stage(
+                    cx,
+                    super::SettingsEffectTarget {
+                        surface: "agents.editor-lease-begin",
+                        owner: format!("{}::{name}", cwd.display()),
+                        revision: Some(expected_revision.clone()),
+                    },
+                    cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
+                        client_operation_id: client_operation_id.clone(),
+                        project_root: cwd.to_string_lossy().into_owned(),
+                        name: name.clone(),
+                        expected_revision: expected_revision.clone(),
+                    },
+                    PendingAgentOperation::BeginLease {
+                        client_operation_id,
+                        cwd,
+                        name,
+                        expected_revision,
+                        authority_id,
+                        draft,
+                    },
+                );
+                self.status = Some("retrying editor lease acquisition…".into());
+            }
             PendingAgentOperation::CompleteLease {
                 cwd,
                 name,
@@ -440,9 +449,34 @@ impl AgentsPage {
                 draft,
                 detail,
                 outcome,
-            },
-        );
-        self.status = Some("retrying editor lease settlement…".into());
+            } => {
+                self.stage(
+                    cx,
+                    super::SettingsEffectTarget {
+                        surface: "agents.editor-lease-complete",
+                        owner: format!("{}::{lease_id}", cwd.display()),
+                        revision: Some(consumed_revision.clone()),
+                    },
+                    cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+                        project_root: cwd.to_string_lossy().into_owned(),
+                        lease_id: lease_id.clone(),
+                        markdown: markdown.clone(),
+                    },
+                    PendingAgentOperation::CompleteLease {
+                        cwd,
+                        name,
+                        lease_id,
+                        consumed_revision,
+                        markdown,
+                        draft,
+                        detail,
+                        outcome,
+                    },
+                );
+                self.status = Some("retrying editor lease settlement…".into());
+            }
+            _ => unreachable!("only editor lease operations are retained for settlement"),
+        }
     }
 
     pub(super) fn queue_load(&mut self, cx: &mut SettingsCx) {
@@ -543,6 +577,7 @@ impl AgentsPage {
                     && completion.target.revision.as_deref() == Some(expected_registration_revision)
             }
             PendingAgentOperation::BeginLease {
+                client_operation_id: _,
                 cwd,
                 name,
                 expected_revision,
@@ -1021,6 +1056,7 @@ impl AgentsPage {
                 Err(error) => self.status = Some(format!("delete failed: {error}")),
             },
             PendingAgentOperation::BeginLease {
+                client_operation_id,
                 cwd,
                 name,
                 expected_revision,
@@ -1028,6 +1064,7 @@ impl AgentsPage {
                 draft,
             } => self.apply_begin_lease(
                 cx,
+                client_operation_id,
                 cwd,
                 name,
                 expected_revision,
@@ -1163,6 +1200,7 @@ impl AgentsPage {
         .with_authority_id(authority_id.clone());
         if external && std::env::var_os("EDITOR").is_some() {
             let expected_revision = snapshot.revision.clone();
+            let client_operation_id = uuid::Uuid::new_v4().to_string();
             self.stage(
                 cx,
                 super::SettingsEffectTarget {
@@ -1171,12 +1209,13 @@ impl AgentsPage {
                     revision: Some(expected_revision.clone()),
                 },
                 cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
-                    client_operation_id: uuid::Uuid::new_v4().to_string(),
+                    client_operation_id: client_operation_id.clone(),
                     project_root: cwd.to_string_lossy().into_owned(),
                     name: name.clone(),
                     expected_revision: expected_revision.clone(),
                 },
                 PendingAgentOperation::BeginLease {
+                    client_operation_id,
                     cwd,
                     name,
                     expected_revision,
@@ -1194,6 +1233,7 @@ impl AgentsPage {
     fn apply_begin_lease(
         &mut self,
         cx: &mut SettingsCx,
+        client_operation_id: String,
         cwd: PathBuf,
         name: String,
         expected_revision: String,
@@ -1204,13 +1244,33 @@ impl AgentsPage {
         let lease = match response {
             Ok(cockpit_core::daemon::proto::Response::AgentEditorLeaseBegun(lease)) => lease,
             Ok(other) => {
-                self.editing = Some(draft);
-                self.status = Some(format!("unexpected editor lease response: {other:?}"));
+                self.uncertain_editor_settlement =
+                    Some(Box::new(PendingAgentOperation::BeginLease {
+                        client_operation_id,
+                        cwd,
+                        name,
+                        expected_revision,
+                        authority_id,
+                        draft,
+                    }));
+                self.status = Some(format!(
+                    "editor lease acquisition is unknown after an unexpected response: {other:?}; press Enter to query/retry"
+                ));
                 return;
             }
             Err(error) => {
-                self.editing = Some(draft);
-                self.status = Some(format!("external edit lease failed: {error}"));
+                self.uncertain_editor_settlement =
+                    Some(Box::new(PendingAgentOperation::BeginLease {
+                        client_operation_id,
+                        cwd,
+                        name,
+                        expected_revision,
+                        authority_id,
+                        draft,
+                    }));
+                self.status = Some(format!(
+                    "editor lease acquisition is unknown: {error}; press Enter to query/retry"
+                ));
                 return;
             }
         };
@@ -2383,6 +2443,7 @@ impl SettingsCx {
                 expected_revision: revision.clone(),
             },
             PendingAgentOperation::BeginLease {
+                client_operation_id: "editor-operation".into(),
                 cwd,
                 name,
                 expected_revision: revision,

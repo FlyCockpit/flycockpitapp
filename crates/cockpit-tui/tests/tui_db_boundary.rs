@@ -274,6 +274,183 @@ fn tui_sources() -> String {
     sources
 }
 
+fn blocking_worker_transport_findings(source: &str) -> Vec<String> {
+    const HELPER: &str = "daemon_request_from_blocking_worker";
+
+    struct WorkerVisitor {
+        worker_depth: usize,
+        findings: Vec<String>,
+    }
+
+    impl WorkerVisitor {
+        fn visit_worker_closure(&mut self, closure: &syn::ExprClosure) {
+            self.worker_depth += 1;
+            syn::visit::visit_expr_closure(self, closure);
+            self.worker_depth -= 1;
+        }
+
+        fn path_is_spawn_blocking(path: &syn::Path) -> bool {
+            let parts = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            matches!(
+                parts.as_slice(),
+                [task, spawn] if task == "task" && spawn == "spawn_blocking"
+            ) || matches!(
+                parts.as_slice(),
+                [tokio, task, spawn]
+                    if tokio == "tokio" && task == "task" && spawn == "spawn_blocking"
+            ) || matches!(
+                parts.as_slice(),
+                [thread, spawn] if thread == "thread" && spawn == "spawn"
+            ) || matches!(
+                parts.as_slice(),
+                [std, thread, spawn]
+                    if std == "std" && thread == "thread" && spawn == "spawn"
+            )
+        }
+    }
+
+    impl<'ast> Visit<'ast> for WorkerVisitor {
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            let receiver = call
+                .receiver
+                .to_token_stream()
+                .to_string()
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>();
+            let approved = call.method == "start_blocking" && receiver == "self.async_actions";
+            self.visit_expr(&call.receiver);
+            for argument in &call.args {
+                if approved {
+                    if let syn::Expr::Closure(closure) = argument {
+                        self.visit_worker_closure(closure);
+                        continue;
+                    }
+                }
+                self.visit_expr(argument);
+            }
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            let approved = matches!(call.func.as_ref(), syn::Expr::Path(path) if Self::path_is_spawn_blocking(&path.path));
+            self.visit_expr(&call.func);
+            for argument in &call.args {
+                if approved {
+                    if let syn::Expr::Closure(closure) = argument {
+                        self.visit_worker_closure(closure);
+                        continue;
+                    }
+                }
+                self.visit_expr(argument);
+            }
+        }
+
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if path
+                .path
+                .segments
+                .last()
+                .is_some_and(|part| part.ident == HELPER)
+                && self.worker_depth == 0
+            {
+                self.findings.push(format!(
+                    "line {}: worker-only daemon transport escapes an approved worker closure",
+                    path.span().start().line
+                ));
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            if item.to_token_stream().to_string().contains(HELPER) {
+                self.findings.push(format!(
+                    "line {}: worker-only daemon transport may not be imported, aliased, or re-exported",
+                    item.span().start().line
+                ));
+            }
+            syn::visit::visit_item_use(self, item);
+        }
+
+        fn visit_macro(&mut self, value: &'ast syn::Macro) {
+            if value.tokens.to_string().contains(HELPER) {
+                self.findings.push(format!(
+                    "line {}: macro obscures worker-only daemon transport",
+                    value.span().start().line
+                ));
+            }
+            syn::visit::visit_macro(self, value);
+        }
+    }
+
+    let source = production_source(source);
+    let file = syn::parse_file(&source).expect("production source remains parseable");
+    let mut visitor = WorkerVisitor {
+        worker_depth: 0,
+        findings: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.findings
+}
+
+#[test]
+fn blocking_daemon_transport_is_structurally_worker_owned() {
+    fn visit_sources(path: &Path, findings: &mut Vec<String>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit_sources(&path, findings);
+            } else if path.extension().and_then(|value| value.to_str()) == Some("rs")
+                && !is_explicit_cfg_test_module(&path)
+            {
+                let source = fs::read_to_string(&path).unwrap();
+                findings.extend(
+                    blocking_worker_transport_findings(&source)
+                        .into_iter()
+                        .map(|finding| format!("{}: {finding}", path.display())),
+                );
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    visit_sources(&repo_root().join("crates/cockpit-tui/src"), &mut findings);
+    assert!(
+        findings.is_empty(),
+        "blocking daemon authority must remain inside an approved worker boundary:\n{}",
+        findings.join("\n")
+    );
+}
+
+#[test]
+fn blocking_daemon_transport_gate_rejects_obscured_and_reducer_calls() {
+    for invalid in [
+        "fn reducer() { agent_runner::daemon_request_from_blocking_worker(req); }",
+        "use agent_runner::daemon_request_from_blocking_worker as rpc; fn reducer() { rpc(req); }",
+        "fn reducer() { let rpc = agent_runner::daemon_request_from_blocking_worker; rpc(req); }",
+        "fn reducer() { fake.start_blocking(move || agent_runner::daemon_request_from_blocking_worker(req)); }",
+        "fn reducer() { macro_rules! hidden { () => { agent_runner::daemon_request_from_blocking_worker(req) } } }",
+    ] {
+        assert!(
+            !blocking_worker_transport_findings(invalid).is_empty(),
+            "negative fixture unexpectedly passed: {invalid}"
+        );
+    }
+    for valid in [
+        "fn effect(&mut self) { self.async_actions.start_blocking(kind, policy, move || agent_runner::daemon_request_from_blocking_worker(req)); }",
+        "fn effect() { tokio::task::spawn_blocking(move || agent_runner::daemon_request_from_blocking_worker(req)); }",
+        "fn effect() { std::thread::spawn(move || agent_runner::daemon_request_from_blocking_worker(req)); }",
+    ] {
+        assert!(
+            blocking_worker_transport_findings(valid).is_empty(),
+            "approved worker fixture rejected: {valid}"
+        );
+    }
+}
+
 #[test]
 fn cockpit_core_db_reexport_removed() {
     let source = read("crates/cockpit-core/src/lib.rs");

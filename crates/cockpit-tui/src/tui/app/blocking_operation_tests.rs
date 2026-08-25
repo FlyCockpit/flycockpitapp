@@ -655,20 +655,9 @@ fn reducers_and_async_loop_do_not_reenter_daemon_runtime_synchronously() {
         }
     }
 
-    // Slash/startup/subagent RPCs that intentionally retain blocking adapters
-    // run only inside AsyncActionRunner::start_blocking closures. The raw helper
-    // spelling is prohibited so a future reducer cannot bypass that ownership
-    // boundary without changing this exact ratchet.
-    for (name, source) in [
-        ("app/slash.rs", include_str!("slash.rs")),
-        ("app/startup_layout.rs", include_str!("startup_layout.rs")),
-        ("app/subagent_view.rs", include_str!("subagent_view.rs")),
-    ] {
-        assert!(
-            !source.contains("daemon_request_blocking("),
-            "{name} must use the explicitly worker-only transport adapter"
-        );
-    }
+    // Worker-only blocking adapters are enforced structurally across every
+    // production source file by `tests/tui_db_boundary.rs`; this reducer gate
+    // deliberately owns only the synchronous event-loop spellings above.
 }
 
 #[test]

@@ -1926,6 +1926,7 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Grok,
             op: OAuthFlowOp::Acknowledge,
+            ..
         })
     ));
     acknowledge.apply_oauth_acknowledgement(Ok(()));
@@ -2998,6 +2999,7 @@ fn pointer_add_codex_login_renders_and_dispatches_from_fresh_state() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Codex,
             op: OAuthFlowOp::Begin,
+            ..
         })
     ));
     assert!(matches!(
@@ -3165,6 +3167,7 @@ fn pointer_add_grok_acknowledge_renders_and_dispatches_from_fresh_state() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Grok,
             op: OAuthFlowOp::Acknowledge,
+            ..
         })
     ));
     fresh.apply_oauth_acknowledgement(Ok(()));
@@ -3235,6 +3238,7 @@ fn pointer_add_codex_acknowledge_renders_and_dispatches_from_fresh_state() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Codex,
             op: OAuthFlowOp::Acknowledge,
+            ..
         })
     ));
     fresh.apply_oauth_acknowledgement(Ok(()));
@@ -6164,6 +6168,7 @@ fn subscription_oauth_acknowledgement_blocks_login_until_chosen() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Codex,
             op: OAuthFlowOp::Acknowledge,
+            ..
         })
     ));
     state.apply_acknowledgement(Ok(()));
@@ -6220,6 +6225,7 @@ fn oauth_grok_manual_paste_starts_session_then_focuses_input() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Grok,
             op: OAuthFlowOp::Begin,
+            ..
         })
     ));
     assert!(state.pending);
@@ -6317,6 +6323,7 @@ fn codex_apply_begin_queues_poll_and_uses_injected_effects() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Codex,
             op: OAuthFlowOp::Poll { .. },
+            ..
         })
     ));
     assert_eq!(
@@ -6563,6 +6570,7 @@ fn oauth_grok_login_option_still_begins() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Grok,
             op: OAuthFlowOp::Begin,
+            ..
         })
     ));
     assert!(state.pending);

@@ -1480,6 +1480,13 @@ pub enum Request {
         input: Option<String>,
     },
 
+    /// Cancel an in-progress daemon-owned provider OAuth flow. Cancellation is
+    /// idempotent so a client can settle a timed-out or already-consumed flow.
+    #[serde(rename = "cancel_provider_oauth")]
+    CancelProviderOAuth {
+        flow_id: String,
+    },
+
     /// Begin daemon-owned MCP OAuth. The daemon retains PKCE and loopback
     /// callback state; the client receives only an opaque flow id and URL.
     #[serde(rename = "begin_mcp_oauth")]
@@ -2524,6 +2531,14 @@ impl Request {
                     return Err("OAuth callback input exceeds maximum length".to_string());
                 }
             }
+            Self::CancelProviderOAuth { flow_id } => {
+                if flow_id.is_empty()
+                    || flow_id.len() > MAX_OWNER_PROVIDER_ID_BYTES
+                    || flow_id.contains('\0')
+                {
+                    return Err("provider OAuth flow id is invalid".to_string());
+                }
+            }
             Self::BeginMcpOAuth {
                 project_root,
                 server,
@@ -3170,6 +3185,7 @@ macro_rules! request_variants {
             (Request::PutProviderCredential { .. }, "put_provider_credential");
             (Request::BeginProviderOAuth { .. }, "begin_provider_oauth");
             (Request::CompleteProviderOAuth { .. }, "complete_provider_oauth");
+            (Request::CancelProviderOAuth { .. }, "cancel_provider_oauth");
             (Request::BeginMcpOAuth { .. }, "begin_mcp_oauth");
             (Request::CompleteMcpOAuth { .. }, "complete_mcp_oauth");
             (Request::CancelMcpOAuth { .. }, "cancel_mcp_oauth");
@@ -3465,6 +3481,7 @@ macro_rules! command {
             // nonrepeatable remote operation and replays its safe response.
             (Request::BeginProviderOAuth { provider_id }, "begin_provider_oauth", owner_only, none, false, read_only, none, serialized, none, "provider_id:String", [provider_id: String => param]);
             (Request::CompleteProviderOAuth { flow_id, input }, "complete_provider_oauth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "flow_id:String|input:Option<String>", [flow_id: String => param, input: Option<String> => param]);
+            (Request::CancelProviderOAuth { flow_id }, "cancel_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "flow_id:String", [flow_id: String => param]);
             (Request::BeginMcpOAuth { project_root, server }, "begin_mcp_oauth", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String|server:String", [project_root: String => project_root, server: String => param]);
             (Request::CompleteMcpOAuth { flow_id, input }, "complete_mcp_oauth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "flow_id:String|input:Option<String>", [flow_id: String => param, input: Option<String> => param]);
             (Request::CancelMcpOAuth { flow_id }, "cancel_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "flow_id:String", [flow_id: String => param]);

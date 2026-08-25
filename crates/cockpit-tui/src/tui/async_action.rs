@@ -231,10 +231,10 @@ pub enum AsyncActionPayload {
     /// Daemon-issued, display-safe OAuth instructions.  No PKCE state,
     /// device authorization id, callback code, or token record crosses this
     /// frontend boundary.
-    OAuthProviderBegin {
-        flow_id: String,
-        authorize_url: String,
-        user_code: Option<String>,
+    OAuth {
+        client_flow_id: crate::tui::settings::pointer_actions::OAuthFlowId,
+        operation_id: crate::tui::settings::shell::PointerOperationId,
+        result: OAuthAsyncResult,
     },
     OAuthAcknowledged,
     OAuthCodexComplete {
@@ -281,6 +281,22 @@ pub enum AsyncActionPayload {
         runner: Box<crate::tui::agent_runner::AgentRunner>,
     },
     MouseCopy(MouseCopyResult),
+}
+
+#[derive(Debug, Clone)]
+pub enum OAuthAsyncResult {
+    Failed(String),
+    Acknowledged,
+    Began {
+        flow_id: String,
+        authorize_url: String,
+        user_code: Option<String>,
+    },
+    Completed {
+        logged_in: bool,
+    },
+    Presented(crate::tui::settings::providers::OAuthPresentationResult),
+    Cancelled,
 }
 
 #[derive(Debug)]

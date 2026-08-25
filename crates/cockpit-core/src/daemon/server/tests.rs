@@ -30,7 +30,9 @@ fn client_teardown_quiesces_dispatch_before_capability_cancellation() {
         .split("async fn select_client_task")
         .next()
         .expect("socket teardown body");
-    let abort = socket.find("executor_task.abort()").expect("executor abort");
+    let abort = socket
+        .find("executor_task.abort()")
+        .expect("executor abort");
     let join = socket[abort..]
         .find("executor_task).await")
         .map(|offset| abort + offset)
@@ -14899,6 +14901,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "put_subscription_ack"
         | "begin_provider_oauth"
         | "complete_provider_oauth"
+        | "cancel_provider_oauth"
         | "begin_mcp_oauth"
         | "complete_mcp_oauth"
         | "upsert_provider_config"
@@ -15248,6 +15251,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("get_flycockpit_account"),
         authz_owner_only("begin_provider_oauth"),
         authz_owner_only("complete_provider_oauth"),
+        authz_owner_only("cancel_provider_oauth"),
         authz_owner_only("begin_mcp_oauth"),
         authz_owner_only("complete_mcp_oauth"),
         authz_owner_only("cancel_mcp_oauth"),
@@ -16622,6 +16626,9 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "complete_provider_oauth" => Request::CompleteProviderOAuth {
             flow_id: "missing-flow".into(),
             input: None,
+        },
+        "cancel_provider_oauth" => Request::CancelProviderOAuth {
+            flow_id: "missing-flow".into(),
         },
         "begin_mcp_oauth" => Request::BeginMcpOAuth {
             project_root: root.clone(),
@@ -23801,6 +23808,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::PutSubscriptionAck { provider_id: "codex-oauth".into() }, kind: "put_subscription_ack", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::BeginProviderOAuth { provider_id: "example".into() }, kind: "begin_provider_oauth", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::CompleteProviderOAuth { flow_id: "flow".into(), input: None }, kind: "complete_provider_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::CancelProviderOAuth { flow_id: "flow".into() }, kind: "cancel_provider_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::BeginMcpOAuth { project_root: "/tmp/project".into(), server: "example".into() }, kind: "begin_mcp_oauth", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::CompleteMcpOAuth { flow_id: "flow".into(), input: None }, kind: "complete_mcp_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::CancelMcpOAuth { flow_id: "flow".into() }, kind: "cancel_mcp_oauth", session_id: None, audit_path: None, mutating: true },
@@ -24053,6 +24061,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         DeleteProviderCredential,
         BeginProviderOAuth,
         CompleteProviderOAuth,
+        CancelProviderOAuth,
         BeginMcpOAuth,
         CompleteMcpOAuth,
         CancelMcpOAuth,

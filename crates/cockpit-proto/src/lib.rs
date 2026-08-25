@@ -1025,14 +1025,14 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v16 adds exact, receipt-bearing cancellation
+/// Current wire schema version. v17 adds explicit provider OAuth cancellation
 /// for leak-reveal capabilities so a local frontend can settle a minted token
 /// on every pre-reveal rejection path without materializing the secret.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
-/// Oldest wire schema version this binary accepts. v16 is current-only: the
+/// Oldest wire schema version this binary accepts. v17 is current-only: the
 /// leak-reveal lifecycle change has no safe compatibility fallback.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 16;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 17;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -3134,6 +3134,7 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
         Body::Request { request, .. } => {
             let tag = request.wire_tag();
             let version = match tag {
+                "cancel_provider_oauth" => 17,
                 "cancel_leak_reveal" => 16,
                 "get_provider_catalog_snapshot" | "apply_provider_mutation" => 15,
                 "list_secret_inventory"
@@ -3598,7 +3599,7 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[16];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[17];
     const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
@@ -6489,7 +6490,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_atomic_catalog_shapes_require_v15_and_leak_cancel_requires_v16() {
+    fn current_protocol_gates_provider_catalog_leak_and_oauth_cancellation() {
         let provider_requests = [
             Request::GetProviderCatalogSnapshot {
                 project_root: "/project".into(),
@@ -6561,6 +6562,18 @@ mod tests {
             })
             .0,
             16
+        );
+        assert_eq!(
+            body_required_protocol_version(&Body::Request {
+                id: Uuid::nil(),
+                #[cfg(feature = "remote")]
+                operation: None,
+                request: Request::CancelProviderOAuth {
+                    flow_id: "flow".into(),
+                },
+            })
+            .0,
+            17
         );
         assert_eq!(
             body_required_protocol_version(&Body::Response {
@@ -7096,7 +7109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v16_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v17_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -7147,13 +7160,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 16);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 16);
+        assert_eq!(PROTOCOL_VERSION, 17);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 17);
         let fixture = proto_fixture_tests::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v16 config_refreshed fixture")
+                .expect("current v17 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -7168,20 +7181,20 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 16);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 16);
+        assert_eq!(PROTOCOL_VERSION, 17);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 17);
         let fixture = proto_fixture_tests::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v16 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v17 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v16 {response_name} must freeze the inclusive verification cap"
+                "current v17 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v16 {response_name} must deserialize: {error}")
+                panic!("current v17 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -7194,13 +7207,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v16 {response_name} assistant identity is invalid: {error}")
+                panic!("current v17 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v16 assistant inventory must carry bounded opaque revisions");
+            .expect("current v17 assistant inventory must carry bounded opaque revisions");
     }
 
     #[test]

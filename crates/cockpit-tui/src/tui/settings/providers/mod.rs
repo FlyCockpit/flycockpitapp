@@ -36,7 +36,7 @@ use oauth_flow::handle_oauth_flow_key_with;
 pub(crate) use oauth_flow::prepare_grok_browser_start;
 pub(crate) use oauth_flow::{
     OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest, OAuthFlowState, OAuthOption,
-    OAuthProvider, OAuthPublicBegin,
+    OAuthPresentationResult, OAuthProvider, OAuthPublicBegin, present_oauth_on_blocking_worker,
 };
 use oauth_flow::{
     OAuthFlowView, OAuthHost, OAuthNav, handle_oauth_flow_key, oauth_help_legend, oauth_options,

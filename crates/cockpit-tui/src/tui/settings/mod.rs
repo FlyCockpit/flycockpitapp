@@ -4223,25 +4223,75 @@ impl Dialog {
         }
     }
 
-    pub(crate) fn apply_oauth_begin(&mut self, provider: OAuthProvider, result: OAuthBeginResult) {
+    pub(crate) fn oauth_provider(&self) -> Option<OAuthProvider> {
+        match self {
+            Dialog::Settings(settings) => settings.oauth_flow_provider(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_oauth_begin(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: OAuthBeginResult,
+    ) {
         if let Dialog::Settings(s) = self {
-            s.apply_oauth_begin(provider, result);
+            s.apply_oauth_begin(provider, client_flow_id, operation_id, result);
         }
     }
 
     pub(crate) fn apply_oauth_complete(
         &mut self,
         provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
         result: Result<bool, String>,
     ) {
         if let Dialog::Settings(s) = self {
-            s.apply_oauth_complete(provider, result);
+            s.apply_oauth_complete(provider, client_flow_id, operation_id, result);
         }
     }
 
-    pub(crate) fn apply_oauth_acknowledgement(&mut self, result: Result<(), String>) {
+    pub(crate) fn apply_oauth_present(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<providers::OAuthPresentationResult, String>,
+    ) {
         if let Dialog::Settings(s) = self {
-            s.apply_oauth_acknowledgement(result);
+            s.apply_oauth_present(provider, client_flow_id, operation_id, result);
+        }
+    }
+
+    pub(crate) fn apply_oauth_cancel(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<(), String>,
+    ) {
+        if let Dialog::Settings(s) = self {
+            s.apply_oauth_cancel(provider, client_flow_id, operation_id, result);
+        }
+    }
+
+    pub(crate) fn apply_oauth_acknowledgement(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<(), String>,
+    ) {
+        if let Dialog::Settings(s) = self {
+            s.apply_oauth_acknowledgement_correlated(
+                provider,
+                client_flow_id,
+                operation_id,
+                result,
+            );
         }
     }
 
@@ -5071,16 +5121,36 @@ impl SettingsDialog {
         }
     }
 
-    fn apply_oauth_begin(&mut self, provider: OAuthProvider, result: OAuthBeginResult) {
+    fn apply_oauth_begin(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: OAuthBeginResult,
+    ) {
         let Some(state) = self.oauth_flow_state_mut(provider) else {
             return;
         };
-        self.pending_oauth_action =
-            state.apply_begin(result, providers::OAuthEffects::production());
+        if !state.accepts_result(client_flow_id, operation_id) {
+            return;
+        }
+        self.pending_oauth_action = state.apply_begin_deferred(result);
     }
 
-    fn apply_oauth_complete(&mut self, provider: OAuthProvider, result: Result<bool, String>) {
-        if result.is_ok() {
+    fn apply_oauth_complete(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<bool, String>,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if !state.accepts_result(client_flow_id, operation_id) {
+            return;
+        }
+        if matches!(result, Ok(true)) {
             self.invalidate_secret_inventory_entry(oauth_credential_inventory_name(provider), None);
         }
         let Some(state) = self.oauth_flow_state_mut(provider) else {
@@ -5089,16 +5159,63 @@ impl SettingsDialog {
         state.apply_complete(result);
     }
 
-    fn apply_oauth_acknowledgement(&mut self, result: Result<(), String>) {
-        let provider = self.oauth_flow_provider();
-        if result.is_ok()
-            && let Some(provider) = provider
-        {
+    fn apply_oauth_present(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<providers::OAuthPresentationResult, String>,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if !state.accepts_result(client_flow_id, operation_id) {
+            return;
+        }
+        self.pending_oauth_action = state.apply_present(result);
+    }
+
+    fn apply_oauth_cancel(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<(), String>,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if state.accepts_result(client_flow_id, operation_id) {
+            state.apply_cancel(result);
+        }
+    }
+
+    fn apply_oauth_acknowledgement_correlated(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<(), String>,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if !state.accepts_result(client_flow_id, operation_id) {
+            return;
+        }
+        if result.is_ok() {
             self.invalidate_secret_inventory_entry(
                 &oauth_acknowledgement_inventory_name(provider),
                 None,
             );
         }
+        if let Some(state) = self.oauth_flow_state_mut(provider) {
+            state.apply_acknowledgement(result);
+        }
+    }
+
+    #[cfg(test)]
+    fn apply_oauth_acknowledgement(&mut self, result: Result<(), String>) {
         if let Some(state) = self.oauth_flow_state_mut_for_any_provider() {
             state.apply_acknowledgement(result);
         }

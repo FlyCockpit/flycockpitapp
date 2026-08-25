@@ -7488,6 +7488,15 @@ async fn handle_serialized_request_impl(
             )
         }
 
+        Request::CancelProviderOAuth { flow_id } => {
+            let owner = oauth_owner(state);
+            // Idempotent terminal settlement: an already-completed, expired,
+            // or previously-cancelled flow is indistinguishable from a
+            // successfully removed one to the owning client.
+            let _ = ctx.oauth_flows.remove_provider(&flow_id, &owner).await;
+            Ok(Response::Ack)
+        }
+
         Request::BeginMcpOAuth {
             project_root,
             server,

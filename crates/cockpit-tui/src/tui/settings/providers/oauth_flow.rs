@@ -54,6 +54,8 @@ pub(crate) enum OAuthProvider {
 #[derive(Debug, Clone)]
 pub(crate) struct OAuthFlowRequest {
     pub(crate) provider: OAuthProvider,
+    pub(crate) client_flow_id: OAuthFlowId,
+    pub(crate) operation_id: super::super::shell::PointerOperationId,
     pub(crate) op: OAuthFlowOp,
 }
 
@@ -61,9 +63,21 @@ pub(crate) struct OAuthFlowRequest {
 pub(crate) enum OAuthFlowOp {
     Acknowledge,
     Begin,
-    Poll { flow_id: String },
-    Complete { flow_id: String, input: String },
-    Cancel,
+    Poll {
+        flow_id: String,
+    },
+    Complete {
+        flow_id: String,
+        input: zeroize::Zeroizing<String>,
+    },
+    Present {
+        authorize_url: String,
+        user_code: Option<String>,
+        open_browser: bool,
+    },
+    Cancel {
+        flow_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +90,60 @@ pub(crate) struct OAuthPublicBegin {
     pub(crate) flow_id: String,
     pub(crate) authorize_url: String,
     pub(crate) user_code: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OAuthPresentationResult {
+    pub(crate) copied: bool,
+    pub(crate) copy_unverified: bool,
+    pub(crate) opened: bool,
+}
+
+impl OAuthPresentationResult {
+    fn status(&self, device_code: bool) -> String {
+        let subject = if device_code {
+            "device code"
+        } else {
+            "OAuth URL"
+        };
+        let copied = if self.copied {
+            if self.copy_unverified {
+                format!("{subject} copied (unverified)")
+            } else {
+                format!("{subject} copied")
+            }
+        } else {
+            format!("{subject} copy failed")
+        };
+        if self.opened {
+            format!("Opened browser; {copied}. Waiting for approval...")
+        } else {
+            format!("{copied}. Open the displayed link manually; waiting for approval...")
+        }
+    }
+}
+
+/// Run justified host-UI integration away from the synchronous input/reducer
+/// path. The caller must bind the returned value to the originating OAuth
+/// flow and operation before displaying it.
+pub(crate) fn present_oauth_on_blocking_worker(
+    authorize_url: String,
+    user_code: Option<String>,
+    open_browser: bool,
+) -> Result<OAuthPresentationResult, String> {
+    let effects = OAuthEffects::production();
+    let copy_value = user_code.as_deref().unwrap_or(&authorize_url);
+    let copy = (effects.copy)(copy_value);
+    let copied = copy.is_ok();
+    let copy_unverified = copy
+        .as_ref()
+        .is_ok_and(|result| crate::clipboard::feedback::classify(result).is_unverified());
+    let opened = open_browser && (effects.open)(&authorize_url).is_ok();
+    Ok(OAuthPresentationResult {
+        copied,
+        copy_unverified,
+        opened,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +407,7 @@ pub(crate) struct OAuthFlowState {
     pub(crate) spinner_tick: usize,
     acknowledgement_required: bool,
     copy_operation: super::super::shell::PointerOperationGate,
+    action_operation: super::super::shell::PointerOperationGate,
     effects: OAuthEffects,
 }
 
@@ -427,6 +496,7 @@ impl OAuthFlowState {
             // Fail closed until the asynchronous inventory answer arrives.
             acknowledgement_required: true,
             copy_operation: super::super::shell::PointerOperationGate::default(),
+            action_operation: super::super::shell::PointerOperationGate::default(),
             effects,
         }
     }
@@ -519,6 +589,51 @@ impl OAuthFlowState {
         self.copy_operation.cancel();
     }
 
+    fn request(&mut self, op: OAuthFlowOp) -> OAuthFlowRequest {
+        OAuthFlowRequest {
+            provider: self.provider,
+            client_flow_id: self.flow_id,
+            operation_id: self.action_operation.begin(),
+            op,
+        }
+    }
+
+    pub(crate) fn accepts_result(
+        &mut self,
+        client_flow_id: OAuthFlowId,
+        operation_id: super::super::shell::PointerOperationId,
+    ) -> bool {
+        self.flow_id == client_flow_id && self.action_operation.complete(operation_id)
+    }
+
+    fn remote_flow_id(&self) -> Option<String> {
+        match &self.session {
+            OAuthSession::Browser { flow_id, .. } | OAuthSession::Device { flow_id, .. } => {
+                Some(flow_id.clone())
+            }
+            OAuthSession::None => None,
+        }
+    }
+
+    fn begin_cancel(&mut self) -> OAuthFlowRequest {
+        self.action_operation.cancel();
+        self.cancel_copy_effect();
+        self.status = Some(Ok("Cancelling OAuth login...".to_string()));
+        self.request(OAuthFlowOp::Cancel {
+            flow_id: self.remote_flow_id(),
+        })
+    }
+
+    pub(crate) fn apply_cancel(&mut self, result: Result<(), String>) {
+        self.pending = false;
+        self.polling = false;
+        self.paste_focused = false;
+        self.focus_paste_after_begin = false;
+        self.manual_input.set("");
+        self.session = OAuthSession::None;
+        self.status = Some(result.map(|()| "OAuth login cancelled".to_string()));
+    }
+
     #[cfg(test)]
     pub(super) fn begin_copy_for_test(
         &mut self,
@@ -565,71 +680,27 @@ impl OAuthFlowState {
         }
     }
 
-    pub(crate) fn apply_begin(
+    pub(crate) fn apply_begin_deferred(
         &mut self,
         result: OAuthBeginResult,
-        effects: OAuthEffects,
     ) -> Option<OAuthFlowRequest> {
         match result {
             OAuthBeginResult::Public(Ok(begin)) if self.provider == OAuthProvider::Codex => {
                 let code = begin.user_code.unwrap_or_default();
-                let copy_result = (effects.copy)(&code);
-                let copied = copy_result.is_ok();
-                // `copied` alone used to collapse Confirmed and Unverified
-                // into the same "Code copied" wording — the same gap
-                // `describe_delivered` exists to close for the toast-based
-                // copy paths elsewhere in the crate. This status line has
-                // no toast/`ToastKind` of its own, so the fix here is a
-                // wording qualifier rather than a shared helper; the code
-                // itself is also always rendered on screen (see the
-                // `Span::styled(login.user_code...)` a few lines below in
-                // the render path), so an unverified copy still leaves the
-                // user able to read and type it, unlike the chat-copy
-                // toast paths where the clipboard is the only way out.
-                let unverified = copy_result
-                    .as_ref()
-                    .is_ok_and(|r| crate::clipboard::feedback::classify(r).is_unverified());
-                let ssh = (effects.is_ssh)();
-                self.ssh = ssh;
-                let opened = ssh || (effects.open)(&begin.authorize_url).is_ok();
-                let copied_suffix = if unverified {
-                    " (unverified — also shown above if the paste doesn't work)"
-                } else {
-                    ""
-                };
-                let status = if ssh {
-                    if copied {
-                        format!(
-                            "Code copied{copied_suffix}. Open the link and enter the code. Waiting for approval..."
-                        )
-                    } else {
-                        "Open the link and enter the code. Waiting for approval (code copy failed)."
-                            .to_string()
-                    }
-                } else if copied && opened {
-                    format!("Opened browser; code copied{copied_suffix}. Waiting for approval...")
-                } else if opened {
-                    "Opened browser. Waiting for approval (code copy failed).".to_string()
-                } else if copied {
-                    format!(
-                        "Code copied{copied_suffix}. Open the link manually. Waiting for approval..."
-                    )
-                } else {
-                    "Open the link manually. Waiting for approval (code copy failed).".to_string()
-                };
                 self.polling = true;
-                self.status = Some(Ok(status));
+                self.status = Some(Ok(
+                    "Device code ready; preparing browser and clipboard...".to_string()
+                ));
                 self.session = OAuthSession::Device {
                     flow_id: begin.flow_id.clone(),
-                    verification_uri: begin.authorize_url,
-                    user_code: code,
+                    verification_uri: begin.authorize_url.clone(),
+                    user_code: code.clone(),
                 };
-                Some(OAuthFlowRequest {
-                    provider: OAuthProvider::Codex,
-                    op: OAuthFlowOp::Poll {
-                        flow_id: begin.flow_id,
-                    },
-                })
+                Some(self.request(OAuthFlowOp::Present {
+                    authorize_url: begin.authorize_url,
+                    user_code: Some(code),
+                    open_browser: !self.ssh,
+                }))
             }
             OAuthBeginResult::Public(Err(e)) if self.provider == OAuthProvider::Codex => {
                 self.polling = false;
@@ -642,16 +713,13 @@ impl OAuthFlowState {
                     flow_id: begin.flow_id,
                     authorize_url: begin.authorize_url.clone(),
                 };
-                self.ssh = (effects.is_ssh)();
-                let opened = self.ssh || (effects.open)(&begin.authorize_url).is_ok();
-                self.paste_focused = focus_paste_after_begin || !opened;
-                self.pending = false;
-                self.status = Some(Ok(if opened {
-                    "Opened browser; paste callback/code here when complete.".into()
-                } else {
-                    "Open the URL manually and paste callback/code here.".into()
-                }));
-                None
+                self.status = Some(Ok("Login URL ready; preparing browser...".into()));
+                self.focus_paste_after_begin = focus_paste_after_begin;
+                Some(self.request(OAuthFlowOp::Present {
+                    authorize_url: begin.authorize_url,
+                    user_code: None,
+                    open_browser: !self.ssh,
+                }))
             }
             OAuthBeginResult::Public(Err(e)) if self.provider == OAuthProvider::Grok => {
                 self.pending = false;
@@ -666,7 +734,84 @@ impl OAuthFlowState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn apply_begin(
+        &mut self,
+        result: OAuthBeginResult,
+        effects: OAuthEffects,
+    ) -> Option<OAuthFlowRequest> {
+        let next = self.apply_begin_deferred(result);
+        let Some(OAuthFlowRequest {
+            client_flow_id,
+            operation_id,
+            op:
+                OAuthFlowOp::Present {
+                    authorize_url,
+                    user_code,
+                    open_browser,
+                },
+            ..
+        }) = next
+        else {
+            return next;
+        };
+        let value = user_code.as_deref().unwrap_or(&authorize_url);
+        let copy = (effects.copy)(value);
+        let presentation = OAuthPresentationResult {
+            copied: copy.is_ok(),
+            copy_unverified: copy
+                .as_ref()
+                .is_ok_and(|result| crate::clipboard::feedback::classify(result).is_unverified()),
+            opened: open_browser && (effects.open)(&authorize_url).is_ok(),
+        };
+        assert!(self.accepts_result(client_flow_id, operation_id));
+        self.apply_present(Ok(presentation))
+    }
+
+    pub(crate) fn apply_present(
+        &mut self,
+        result: Result<OAuthPresentationResult, String>,
+    ) -> Option<OAuthFlowRequest> {
+        match self.provider {
+            OAuthProvider::Codex => {
+                let status = match result {
+                    Ok(result) => result.status(true),
+                    Err(error) => format!(
+                        "Open the link and enter the displayed code. Host integration failed: {error}"
+                    ),
+                };
+                self.status = Some(Ok(status));
+                let Some(flow_id) = self.remote_flow_id() else {
+                    self.polling = false;
+                    self.status = Some(Err("OAuth flow lost its daemon identity".into()));
+                    return None;
+                };
+                Some(self.request(OAuthFlowOp::Poll { flow_id }))
+            }
+            OAuthProvider::Grok => {
+                let opened = result.as_ref().is_ok_and(|value| value.opened);
+                self.pending = false;
+                self.paste_focused = std::mem::take(&mut self.focus_paste_after_begin) || !opened;
+                self.status = Some(match result {
+                    Ok(_) if opened => {
+                        Ok("Opened browser; paste callback/code here when complete.".into())
+                    }
+                    Ok(_) => Ok("Open the URL manually and paste callback/code here.".into()),
+                    Err(error) => Err(format!(
+                        "Could not open the browser; open the displayed URL manually: {error}"
+                    )),
+                });
+                None
+            }
+        }
+    }
+
     pub(crate) fn apply_complete(&mut self, result: Result<bool, String>) {
+        let result = result.and_then(|logged_in| {
+            logged_in
+                .then_some(true)
+                .ok_or_else(|| "provider did not confirm OAuth login".to_string())
+        });
         match self.provider {
             OAuthProvider::Codex => {
                 self.polling = false;
@@ -800,6 +945,17 @@ pub(super) fn handle_oauth_flow_key_with(
     host: OAuthHost,
     effects: OAuthEffects,
 ) -> OAuthKeyOutcome {
+    // A provider flow owns this settings surface until its exact terminal
+    // completion (including cancellation) is applied.  In particular, do not
+    // let navigation, another login, acknowledgement, paste editing, or a
+    // wizard save race a live begin/poll/exchange.
+    if s.pending || s.polling {
+        return if matches!(key.code, KeyCode::Esc) {
+            OAuthKeyOutcome::stay(Some(s.begin_cancel()))
+        } else {
+            OAuthKeyOutcome::stay(None)
+        };
+    }
     if !matches!(key.code, KeyCode::Char('c') | KeyCode::Char('y')) {
         // Any option/focus/navigation change invalidates an outstanding copy
         // completion for this flow generation.
@@ -824,15 +980,13 @@ pub(super) fn handle_oauth_flow_key_with(
                     s.status = Some(Err("paste callback URL or code first".to_string()));
                     return OAuthKeyOutcome::stay(None);
                 }
+                s.manual_input.set("");
                 s.pending = true;
                 s.status = Some(Ok("Completing xAI OAuth login...".to_string()));
-                return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                    provider: OAuthProvider::Grok,
-                    op: OAuthFlowOp::Complete {
-                        flow_id: flow_id.clone(),
-                        input,
-                    },
-                }));
+                return OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Complete {
+                    flow_id: flow_id.clone(),
+                    input: zeroize::Zeroizing::new(input),
+                })));
             }
             _ => {
                 s.manual_input.handle_key(key);
@@ -868,28 +1022,8 @@ pub(super) fn handle_oauth_flow_key_with(
         _ => {}
     }
 
-    if s.provider == OAuthProvider::Grok && s.pending && matches!(key.code, KeyCode::Esc) {
-        s.pending = false;
-        s.status = Some(Ok("OAuth login cancelled".to_string()));
-        return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-            provider: OAuthProvider::Grok,
-            op: OAuthFlowOp::Cancel,
-        }));
-    }
-    if s.provider == OAuthProvider::Codex && s.polling && matches!(key.code, KeyCode::Esc) {
-        s.polling = false;
-        s.status = Some(Ok("Codex OAuth polling cancelled".to_string()));
-        return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-            provider: OAuthProvider::Codex,
-            op: OAuthFlowOp::Cancel,
-        }));
-    }
-
     match key.code {
-        KeyCode::Esc => OAuthKeyOutcome::back(Some(OAuthFlowRequest {
-            provider: s.provider,
-            op: OAuthFlowOp::Cancel,
-        })),
+        KeyCode::Esc => OAuthKeyOutcome::back(Some(s.begin_cancel())),
         KeyCode::Up | KeyCode::Char('k') => {
             s.cursor = oauth_option_cursor_prev(s.cursor, s.option_count(host));
             OAuthKeyOutcome::stay(None)
@@ -917,10 +1051,7 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
             s.status = Some(Ok(
                 "Recording subscription OAuth acknowledgement...".to_string()
             ));
-            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                provider: s.provider,
-                op: OAuthFlowOp::Acknowledge,
-            }))
+            OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Acknowledge)))
         }
         (_, OAuthOption::Continue | OAuthOption::SkipContinue) => OAuthKeyOutcome::confirm(),
         (OAuthProvider::Grok, OAuthOption::ManualPaste) => {
@@ -931,10 +1062,7 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
                 s.pending = true;
                 s.focus_paste_after_begin = true;
                 s.status = Some(Ok("Preparing xAI OAuth login...".to_string()));
-                OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                    provider: OAuthProvider::Grok,
-                    op: OAuthFlowOp::Begin,
-                }))
+                OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Begin)))
             }
         }
         (OAuthProvider::Grok, OAuthOption::Login) => {
@@ -948,44 +1076,29 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
             } else {
                 "Preparing manual xAI OAuth login...".to_string()
             }));
-            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                provider: OAuthProvider::Grok,
-                op: OAuthFlowOp::Begin,
-            }))
+            OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Begin)))
         }
         (OAuthProvider::Grok, OAuthOption::Poll) => {
             s.pending = true;
             s.paste_focused = false;
             s.status = Some(Ok("Checking xAI OAuth callback...".to_string()));
-            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                provider: OAuthProvider::Grok,
-                op: OAuthFlowOp::Begin,
-            }))
+            OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Begin)))
         }
         (OAuthProvider::Codex, OAuthOption::Login) => {
             s.polling = true;
             s.status = Some(Ok("Requesting Codex device code...".to_string()));
-            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                provider: OAuthProvider::Codex,
-                op: OAuthFlowOp::Begin,
-            }))
+            OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Begin)))
         }
         (OAuthProvider::Codex, OAuthOption::Poll) => {
             let Some((flow_id, _, _)) = s.device_login() else {
                 s.polling = true;
                 s.status = Some(Ok("Requesting Codex device code...".to_string()));
-                return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                    provider: OAuthProvider::Codex,
-                    op: OAuthFlowOp::Begin,
-                }));
+                return OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Begin)));
             };
             let flow_id = flow_id.to_string();
             s.polling = true;
             s.status = Some(Ok("Waiting for Codex approval...".to_string()));
-            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                provider: OAuthProvider::Codex,
-                op: OAuthFlowOp::Poll { flow_id },
-            }))
+            OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Poll { flow_id })))
         }
         _ => OAuthKeyOutcome::stay(None),
     }

@@ -1,21 +1,42 @@
 use super::*;
 
-async fn begin_provider_oauth(provider_id: &str) -> Result<AsyncActionPayload, String> {
+const OAUTH_BEGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const OAUTH_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const OAUTH_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const OAUTH_HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn oauth_payload(
+    client_flow_id: crate::tui::settings::pointer_actions::OAuthFlowId,
+    operation_id: crate::tui::settings::shell::PointerOperationId,
+    result: Result<crate::tui::async_action::OAuthAsyncResult, String>,
+) -> AsyncActionPayload {
+    AsyncActionPayload::OAuth {
+        client_flow_id,
+        operation_id,
+        result: result.unwrap_or_else(crate::tui::async_action::OAuthAsyncResult::Failed),
+    }
+}
+
+async fn begin_provider_oauth(
+    provider_id: &str,
+) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
     let client = crate::tui::settings::settings_daemon_client()
         .await
         .map_err(|e| e.to_string())?;
-    match client
-        .request(cockpit_core::daemon::proto::Request::BeginProviderOAuth {
+    let response = tokio::time::timeout(
+        OAUTH_BEGIN_TIMEOUT,
+        client.request(cockpit_core::daemon::proto::Request::BeginProviderOAuth {
             provider_id: provider_id.to_string(),
-        })
-        .await
-        .map_err(|e| e.to_string())?
-    {
+        }),
+    )
+    .await
+    .map_err(|_| "provider OAuth begin timed out".to_string())?;
+    match response.map_err(|e| e.to_string())? {
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
             flow_id,
             authorize_url,
             user_code,
-        }) => Ok(AsyncActionPayload::OAuthProviderBegin {
+        }) => Ok(crate::tui::async_action::OAuthAsyncResult::Began {
             flow_id,
             authorize_url,
             user_code,
@@ -29,21 +50,56 @@ async fn begin_provider_oauth(provider_id: &str) -> Result<AsyncActionPayload, S
 
 async fn complete_provider_oauth(
     flow_id: String,
-    input: Option<String>,
-) -> Result<AsyncActionPayload, String> {
+    input: Option<zeroize::Zeroizing<String>>,
+) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
     let client = crate::tui::settings::settings_daemon_client()
         .await
         .map_err(|e| e.to_string())?;
-    match client
-        .request(cockpit_core::daemon::proto::Request::CompleteProviderOAuth { flow_id, input })
-        .await
-        .map_err(|e| e.to_string())?
-    {
+    let request = cockpit_core::daemon::proto::Request::CompleteProviderOAuth {
+        flow_id: flow_id.clone(),
+        input: input.as_deref().map(ToOwned::to_owned),
+    };
+    let response = tokio::time::timeout(OAUTH_COMPLETE_TIMEOUT, client.request(request)).await;
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => {
+            let _ = cancel_provider_oauth(Some(flow_id)).await;
+            return Err("provider OAuth completion timed out and was cancelled".into());
+        }
+    };
+    match response.map_err(|e| e.to_string())? {
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCompleted { logged_in, .. }) => {
-            Ok(AsyncActionPayload::OAuthCodexComplete { logged_in })
+            Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
         }
         Ok(other) => Err(format!(
             "unexpected provider OAuth completion response: {other:?}"
+        )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+async fn cancel_provider_oauth(
+    flow_id: Option<String>,
+) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
+    let Some(flow_id) = flow_id else {
+        return Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled);
+    };
+    let client = crate::tui::settings::settings_daemon_client()
+        .await
+        .map_err(|e| e.to_string())?;
+    let response = tokio::time::timeout(
+        OAUTH_CANCEL_TIMEOUT,
+        client.request(cockpit_core::daemon::proto::Request::CancelProviderOAuth { flow_id }),
+    )
+    .await
+    .map_err(|_| "provider OAuth cancellation timed out".to_string())?
+    .map_err(|e| e.to_string())?;
+    match response {
+        Ok(cockpit_core::daemon::proto::Response::Ack) => {
+            Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
+        }
+        Ok(other) => Err(format!(
+            "unexpected provider OAuth cancel response: {other:?}"
         )),
         Err(error) => Err(error.to_string()),
     }
@@ -183,7 +239,10 @@ impl App {
         let settings_blocking_cancellations = cancelled
             .iter()
             .filter(|result| {
-                matches!(result.kind, AsyncActionKind::Blocking("settings.blocking-effect"))
+                matches!(
+                    result.kind,
+                    AsyncActionKind::Blocking("settings.blocking-effect")
+                )
             })
             .map(|result| AsyncActionResult {
                 id: result.id,
@@ -223,6 +282,11 @@ impl App {
         for result in results {
             self.apply_async_action_result(result);
         }
+        // Applying a correlated OAuth completion may enqueue its next typed
+        // effect (begin -> host presentation -> poll). Adopt it in this same
+        // event-loop turn; never require an unrelated keypress to advance or
+        // install the state machine.
+        self.drain_oauth_actions();
         // OAuth completion writes credentials asynchronously while its dialog
         // remains open. Fingerprint reconciliation is deliberately performed
         // after applying the result; failed/cancelled flows leave the stored
@@ -355,21 +419,24 @@ impl App {
                 operation_id,
                 target: target.clone(),
             };
-            let action_id = self.async_actions.start_blocking(
-                AsyncActionKind::Blocking("settings.blocking-effect"),
-                AsyncActionPolicy::AllowConcurrent,
-                move || {
-                    let outcome = crate::tui::settings::execute_settings_blocking_work(work);
-                    Ok(AsyncActionPayload::SettingsBlocking(
-                        crate::tui::settings::SettingsBlockingEffectCompletion {
-                            dialog_id,
-                            operation_id,
-                            target,
-                            outcome,
-                        },
-                    ))
-                },
-            ).id();
+            let action_id = self
+                .async_actions
+                .start_blocking(
+                    AsyncActionKind::Blocking("settings.blocking-effect"),
+                    AsyncActionPolicy::AllowConcurrent,
+                    move || {
+                        let outcome = crate::tui::settings::execute_settings_blocking_work(work);
+                        Ok(AsyncActionPayload::SettingsBlocking(
+                            crate::tui::settings::SettingsBlockingEffectCompletion {
+                                dialog_id,
+                                operation_id,
+                                target,
+                                outcome,
+                            },
+                        ))
+                    },
+                )
+                .id();
             self.settings_blocking_actions.insert(action_id, metadata);
         }
     }
@@ -423,7 +490,10 @@ impl App {
                     | AsyncActionKind::DaemonRpc("sealed.effect")
             )
         {
-            if matches!(result.kind, AsyncActionKind::Blocking("settings.blocking-effect")) {
+            if matches!(
+                result.kind,
+                AsyncActionKind::Blocking("settings.blocking-effect")
+            ) {
                 self.settings_blocking_actions.remove(&result.id);
             }
             return;
@@ -1483,64 +1553,177 @@ impl App {
                 }
             },
             AsyncActionKind::Internal("oauth.acknowledge") => {
-                let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthAcknowledged) => Ok(()),
-                    Ok(_) => Err("unexpected OAuth acknowledgement response".to_string()),
-                    Err(e) => Err(e),
-                };
-                self.dialog.apply_oauth_acknowledgement(payload);
+                if let Ok(AsyncActionPayload::OAuth {
+                    client_flow_id,
+                    operation_id,
+                    result,
+                }) = result.payload
+                {
+                    let Some(provider) = self.dialog.oauth_provider() else {
+                        return;
+                    };
+                    let outcome = match result {
+                        crate::tui::async_action::OAuthAsyncResult::Acknowledged => Ok(()),
+                        crate::tui::async_action::OAuthAsyncResult::Failed(error) => Err(error),
+                        _ => Err("unexpected OAuth acknowledgement result".into()),
+                    };
+                    self.dialog.apply_oauth_acknowledgement(
+                        provider,
+                        client_flow_id,
+                        operation_id,
+                        outcome,
+                    );
+                }
             }
             AsyncActionKind::Internal("oauth.codex.begin") => {
-                let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthProviderBegin {
-                        flow_id,
-                        authorize_url,
-                        user_code,
-                    }) => Ok(settings::OAuthPublicBegin {
-                        flow_id,
-                        authorize_url,
-                        user_code,
-                    }),
-                    Ok(_) => Err("unexpected OAuth response".to_string()),
-                    Err(e) => Err(e),
+                let (client_flow_id, operation_id, payload) = match result.payload {
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result:
+                            crate::tui::async_action::OAuthAsyncResult::Began {
+                                flow_id,
+                                authorize_url,
+                                user_code,
+                            },
+                    }) => (
+                        client_flow_id,
+                        operation_id,
+                        Ok(settings::OAuthPublicBegin {
+                            flow_id,
+                            authorize_url,
+                            user_code,
+                        }),
+                    ),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::Failed(error),
+                    }) => (client_flow_id, operation_id, Err(error)),
+                    _ => return,
                 };
-                self.dialog
-                    .apply_oauth_begin(OAuthProvider::Codex, OAuthBeginResult::Public(payload));
+                self.dialog.apply_oauth_begin(
+                    OAuthProvider::Codex,
+                    client_flow_id,
+                    operation_id,
+                    OAuthBeginResult::Public(payload),
+                );
             }
             AsyncActionKind::Internal("oauth.codex.poll") => {
-                let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthCodexComplete { logged_in }) => Ok(logged_in),
-                    Ok(_) => Err("unexpected OAuth response".to_string()),
-                    Err(e) => Err(e),
+                let (client_flow_id, operation_id, payload) = match result.payload {
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::Completed { logged_in },
+                    }) => (client_flow_id, operation_id, Ok(logged_in)),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::Failed(error),
+                    }) => (client_flow_id, operation_id, Err(error)),
+                    _ => return,
                 };
-                self.dialog
-                    .apply_oauth_complete(OAuthProvider::Codex, payload);
+                self.dialog.apply_oauth_complete(
+                    OAuthProvider::Codex,
+                    client_flow_id,
+                    operation_id,
+                    payload,
+                );
             }
             AsyncActionKind::Internal("oauth.grok.begin") => {
-                let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthProviderBegin {
-                        flow_id,
-                        authorize_url,
-                        user_code,
-                    }) => Ok(settings::OAuthPublicBegin {
-                        flow_id,
-                        authorize_url,
-                        user_code,
-                    }),
-                    Ok(_) => Err("unexpected OAuth response".to_string()),
-                    Err(e) => Err(e),
+                let (client_flow_id, operation_id, payload) = match result.payload {
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result:
+                            crate::tui::async_action::OAuthAsyncResult::Began {
+                                flow_id,
+                                authorize_url,
+                                user_code,
+                            },
+                    }) => (
+                        client_flow_id,
+                        operation_id,
+                        Ok(settings::OAuthPublicBegin {
+                            flow_id,
+                            authorize_url,
+                            user_code,
+                        }),
+                    ),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::Failed(error),
+                    }) => (client_flow_id, operation_id, Err(error)),
+                    _ => return,
                 };
-                self.dialog
-                    .apply_oauth_begin(OAuthProvider::Grok, OAuthBeginResult::Public(payload));
+                self.dialog.apply_oauth_begin(
+                    OAuthProvider::Grok,
+                    client_flow_id,
+                    operation_id,
+                    OAuthBeginResult::Public(payload),
+                );
             }
             AsyncActionKind::Internal("oauth.grok.complete") => {
-                let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthGrokComplete { logged_in }) => Ok(logged_in),
-                    Ok(_) => Err("unexpected OAuth response".to_string()),
-                    Err(e) => Err(e),
+                let (client_flow_id, operation_id, payload) = match result.payload {
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::Completed { logged_in },
+                    }) => (client_flow_id, operation_id, Ok(logged_in)),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::Failed(error),
+                    }) => (client_flow_id, operation_id, Err(error)),
+                    _ => return,
                 };
-                self.dialog
-                    .apply_oauth_complete(OAuthProvider::Grok, payload);
+                self.dialog.apply_oauth_complete(
+                    OAuthProvider::Grok,
+                    client_flow_id,
+                    operation_id,
+                    payload,
+                );
+            }
+            AsyncActionKind::Internal("oauth.host.present") => {
+                if let Ok(AsyncActionPayload::OAuth {
+                    client_flow_id,
+                    operation_id,
+                    result,
+                }) = result.payload
+                    && let Some(provider) = self.dialog.oauth_provider()
+                {
+                    let outcome = match result {
+                        crate::tui::async_action::OAuthAsyncResult::Presented(payload) => {
+                            Ok(payload)
+                        }
+                        crate::tui::async_action::OAuthAsyncResult::Failed(error) => Err(error),
+                        _ => Err("unexpected OAuth host result".into()),
+                    };
+                    self.dialog.apply_oauth_present(
+                        provider,
+                        client_flow_id,
+                        operation_id,
+                        outcome,
+                    );
+                }
+            }
+            AsyncActionKind::Internal("oauth.cancel") => {
+                if let Ok(AsyncActionPayload::OAuth {
+                    client_flow_id,
+                    operation_id,
+                    result,
+                }) = result.payload
+                    && let Some(provider) = self.dialog.oauth_provider()
+                {
+                    let outcome = match result {
+                        crate::tui::async_action::OAuthAsyncResult::Cancelled => Ok(()),
+                        crate::tui::async_action::OAuthAsyncResult::Failed(error) => Err(error),
+                        _ => Err("unexpected OAuth cancellation result".into()),
+                    };
+                    self.dialog
+                        .apply_oauth_cancel(provider, client_flow_id, operation_id, outcome);
+                }
             }
             _ => self.completed_async_actions.push(result),
         }
@@ -1810,40 +1993,49 @@ impl App {
 
     pub(super) fn drain_oauth_actions(&mut self) {
         while let Some(action) = self.dialog.take_oauth_action() {
+            let provider = action.provider;
+            let client_flow_id = action.client_flow_id;
+            let operation_id = action.operation_id;
             match (action.provider, action.op) {
                 (provider, OAuthFlowOp::Acknowledge) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.acknowledge"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.acknowledge")),
                         async move {
-                            let provider_id = match provider {
-                                OAuthProvider::Grok => {
-                                    cockpit_core::auth::subscription_ack::GROK_OAUTH_PROVIDER
-                                }
-                                OAuthProvider::Codex => {
-                                    cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER
-                                }
-                            };
-                            let client = crate::tui::settings::settings_daemon_client()
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            match client
-                                .request(cockpit_core::daemon::proto::Request::PutSubscriptionAck {
-                                    provider_id: provider_id.to_string(),
-                                })
-                                .await
-                                .map_err(|e| e.to_string())?
-                            {
-                                Ok(cockpit_core::daemon::proto::Response::Ack) => {
-                                    Ok(AsyncActionPayload::OAuthAcknowledged)
-                                }
-                                Ok(other) => {
-                                    Err(format!("unexpected acknowledgement response: {other:?}"))
-                                }
-                                Err(error) => {
-                                    Err(format!("daemon rejected acknowledgement: {error}"))
+                            let outcome = async {
+                                let provider_id = match provider {
+                                    OAuthProvider::Grok => {
+                                        cockpit_core::auth::subscription_ack::GROK_OAUTH_PROVIDER
+                                    }
+                                    OAuthProvider::Codex => {
+                                        cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER
+                                    }
+                                };
+                                let client = crate::tui::settings::settings_daemon_client()
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                match client
+                                    .request(
+                                        cockpit_core::daemon::proto::Request::PutSubscriptionAck {
+                                            provider_id: provider_id.to_string(),
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|e| e.to_string())?
+                                {
+                                    Ok(cockpit_core::daemon::proto::Response::Ack) => {
+                                        Ok(crate::tui::async_action::OAuthAsyncResult::Acknowledged)
+                                    }
+                                    Ok(other) => Err(format!(
+                                        "unexpected acknowledgement response: {other:?}"
+                                    )),
+                                    Err(error) => {
+                                        Err(format!("daemon rejected acknowledgement: {error}"))
+                                    }
                                 }
                             }
+                            .await;
+                            Ok(oauth_payload(client_flow_id, operation_id, outcome))
                         },
                     );
                 }
@@ -1851,37 +2043,106 @@ impl App {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.codex.begin"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.codex")),
-                        async { begin_provider_oauth("codex-oauth").await },
+                        async move {
+                            Ok(oauth_payload(
+                                client_flow_id,
+                                operation_id,
+                                begin_provider_oauth("codex-oauth").await,
+                            ))
+                        },
                     );
                 }
                 (OAuthProvider::Codex, OAuthFlowOp::Poll { flow_id }) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.codex.poll"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.codex")),
-                        async move { complete_provider_oauth(flow_id, None).await },
+                        async move {
+                            Ok(oauth_payload(
+                                client_flow_id,
+                                operation_id,
+                                complete_provider_oauth(flow_id, None).await,
+                            ))
+                        },
                     );
-                }
-                (OAuthProvider::Codex, OAuthFlowOp::Cancel) => {
-                    self.async_actions
-                        .abort_key(&AsyncActionKey::new("oauth.codex"));
                 }
                 (OAuthProvider::Grok, OAuthFlowOp::Begin) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.grok.begin"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
-                        async move { begin_provider_oauth("grok-oauth").await },
+                        async move {
+                            Ok(oauth_payload(
+                                client_flow_id,
+                                operation_id,
+                                begin_provider_oauth("grok-oauth").await,
+                            ))
+                        },
                     );
                 }
                 (OAuthProvider::Grok, OAuthFlowOp::Complete { flow_id, input }) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.grok.complete"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
-                        async move { complete_provider_oauth(flow_id, Some(input)).await },
+                        async move {
+                            Ok(oauth_payload(
+                                client_flow_id,
+                                operation_id,
+                                complete_provider_oauth(flow_id, Some(input)).await,
+                            ))
+                        },
                     );
                 }
-                (OAuthProvider::Grok, OAuthFlowOp::Cancel) => {
-                    self.async_actions
-                        .abort_key(&AsyncActionKey::new("oauth.grok"));
+                (
+                    _,
+                    OAuthFlowOp::Present {
+                        authorize_url,
+                        user_code,
+                        open_browser,
+                    },
+                ) => {
+                    let key = match provider {
+                        OAuthProvider::Codex => "oauth.codex",
+                        OAuthProvider::Grok => "oauth.grok",
+                    };
+                    self.async_actions.start(
+                        AsyncActionKind::Internal("oauth.host.present"),
+                        AsyncActionPolicy::Replace(AsyncActionKey::new(key)),
+                        async move {
+                            let worker = tokio::task::spawn_blocking(move || {
+                                settings::providers::present_oauth_on_blocking_worker(
+                                    authorize_url,
+                                    user_code,
+                                    open_browser,
+                                )
+                            });
+                            let result = match tokio::time::timeout(OAUTH_HOST_TIMEOUT, worker)
+                                .await
+                            {
+                                Ok(Ok(result)) => result
+                                    .map(crate::tui::async_action::OAuthAsyncResult::Presented),
+                                Ok(Err(error)) => Err(format!("OAuth host worker failed: {error}")),
+                                Err(_) => Err("OAuth browser/clipboard operation timed out".into()),
+                            };
+                            Ok(oauth_payload(client_flow_id, operation_id, result))
+                        },
+                    );
+                }
+                (_, OAuthFlowOp::Cancel { flow_id }) => {
+                    let key = match provider {
+                        OAuthProvider::Codex => AsyncActionKey::new("oauth.codex"),
+                        OAuthProvider::Grok => AsyncActionKey::new("oauth.grok"),
+                    };
+                    self.async_actions.abort_key(&key);
+                    self.async_actions.start(
+                        AsyncActionKind::Internal("oauth.cancel"),
+                        AsyncActionPolicy::Replace(key),
+                        async move {
+                            Ok(oauth_payload(
+                                client_flow_id,
+                                operation_id,
+                                cancel_provider_oauth(flow_id).await,
+                            ))
+                        },
+                    );
                 }
                 (OAuthProvider::Codex, OAuthFlowOp::Complete { .. })
                 | (OAuthProvider::Grok, OAuthFlowOp::Poll { .. }) => {}

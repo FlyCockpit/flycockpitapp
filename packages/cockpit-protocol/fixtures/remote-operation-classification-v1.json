@@ -2933,6 +2933,21 @@
       "tag": "complete_provider_oauth"
     },
     {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "flow_id:string",
+      "fcorRoles": [
+        {
+          "field": "flow_id",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "flow_id:String",
+      "strategy": "none",
+      "tag": "cancel_provider_oauth"
+    },
+    {
       "class": "read_only",
       "evidence": null,
       "fcorCanonicalSchema": "project_root:string|server:string",

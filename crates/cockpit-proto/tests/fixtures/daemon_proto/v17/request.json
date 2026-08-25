@@ -1592,9 +1592,8 @@
       "config_path": "/tmp/project/.cockpit/mcp.json",
       "expected_revision": "0000000000000000000000000000000000000000000000000000000000000000",
       "mutation_intent_hash": "1111111111111111111111111111111111111111111111111111111111111111",
-      "config_json": "{}",
-      "secret_values_json": "{}",
-      "cleanup_names_json": "[]"
+      "patch": "{\"operations\":[{\"operation\":\"delete_authored_server\",\"name\":\"fixture\"}]}",
+      "secret_values_json": "{}"
     },
     "request": "save_mcp_config"
   },

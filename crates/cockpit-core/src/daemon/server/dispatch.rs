@@ -11883,9 +11883,8 @@ async fn handle_serialized_request_impl(
             config_path,
             expected_revision,
             mutation_intent_hash,
-            config_json,
+            patch,
             secret_values_json,
-            cleanup_names_json,
         } => {
             let settlement_owner = settings_capability_owner(state);
             let request_hash = local_operation_secret_request_hash(
@@ -11899,9 +11898,8 @@ async fn handle_serialized_request_impl(
                     &config_path,
                     &expected_revision,
                     &mutation_intent_hash,
-                    &config_json,
+                    &patch,
                     &secret_values_json,
-                    &cleanup_names_json,
                 ),
             )?;
             let fencing_generation = match begin_local_operation(
@@ -11931,9 +11929,8 @@ async fn handle_serialized_request_impl(
                     config_path: config_path.clone(),
                     expected_revision: expected_revision.clone(),
                     mutation_intent_hash: mutation_intent_hash.clone(),
-                    config_json: config_json.clone(),
+                    patch: patch.clone(),
                     secret_values_json: secret_values_json.clone(),
-                    cleanup_names_json: cleanup_names_json.clone(),
                 };
                 #[cfg(feature = "remote")]
                 if let Some(operation) = remote_operation
@@ -11955,9 +11952,8 @@ async fn handle_serialized_request_impl(
                     &config_path,
                     &expected_revision,
                     &mutation_intent_hash,
-                    &config_json,
+                    &patch,
                     &secret_values_json,
-                    &cleanup_names_json,
                 );
                 let response = finish_provider_mutation_future!(
                     remote_operation,
@@ -14289,7 +14285,8 @@ async fn provider_catalog_snapshot(
         );
     }
     let mut view = crate::secret_ref::redact_provider_view(&config);
-    view.mcp_config_json = Some(mcp.config_json);
+    view.mcp_config_json = Some(mcp.effective_config_json);
+    view.mcp_authored_config_json = Some(mcp.authored_config_json);
     view.mcp_owner_root = Some(canonical_root.clone());
     view.mcp_config_path = Some(mcp.config_path);
     view.mcp_edit_capability = Some(snapshot_session_id.to_string());
@@ -15920,7 +15917,8 @@ fn redacted_extended_config_json(
 /// credential-bearing literal. The daemon still reads/parses the config at
 /// this owner boundary; the TUI receives only this sanitized projection.
 struct RedactedMcpConfigSnapshot {
-    config_json: String,
+    effective_config_json: String,
+    authored_config_json: String,
     config_path: String,
     revision: String,
 }
@@ -15951,67 +15949,14 @@ fn redacted_mcp_config_snapshot(
         }
         Err(error) => return Err(internal(error)),
     };
-    for server in config.servers.values_mut() {
-        server.endpoint = server
-            .endpoint
-            .as_deref()
-            .map(cockpit_proto::redact_url_for_owner_view);
-        server.env = server
-            .env
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    if value.trim_start().starts_with('$') {
-                        value.clone()
-                    } else {
-                        "[redacted]".to_string()
-                    },
-                )
-            })
-            .collect();
-        match &mut server.auth {
-            crate::mcp::config::Auth::Header(header) => {
-                if !header.value.trim_start().starts_with('$') {
-                    header.value = "[redacted]".to_string();
-                }
-            }
-            crate::mcp::config::Auth::Env(env) => {
-                env.vars = env
-                    .vars
-                    .iter()
-                    .map(|(name, value)| {
-                        (
-                            name.clone(),
-                            if value.trim_start().starts_with('$') {
-                                value.clone()
-                            } else {
-                                "[redacted]".to_string()
-                            },
-                        )
-                    })
-                    .collect();
-            }
-            crate::mcp::config::Auth::Oauth(oauth) => {
-                oauth.authorize_url = oauth
-                    .authorize_url
-                    .as_deref()
-                    .map(cockpit_proto::redact_url_for_owner_view);
-                oauth.token_url = oauth
-                    .token_url
-                    .as_deref()
-                    .map(cockpit_proto::redact_url_for_owner_view);
-            }
-            crate::mcp::config::Auth::None => {}
-        }
-    }
-    let config_json = serde_json::to_string(&config).map_err(internal)?;
-    let prior_json = serde_json::to_string(&prior).map_err(internal)?;
-    use sha2::Digest as _;
+    crate::mcp::config::redact_config_for_owner_view(&mut config);
+    let mut authored = prior;
+    crate::mcp::config::redact_config_for_owner_view(&mut authored);
     Ok(RedactedMcpConfigSnapshot {
-        config_json,
+        effective_config_json: serde_json::to_string(&config).map_err(internal)?,
+        authored_config_json: serde_json::to_string(&authored).map_err(internal)?,
         config_path: path.to_string_lossy().into_owned(),
-        revision: crate::intel::hex_lower(&Sha256::digest(prior_json.as_bytes())),
+        revision: mcp_target_layer_revision(&path)?,
     })
 }
 
@@ -16037,16 +15982,24 @@ fn canonical_mcp_target_path(
 }
 
 fn mcp_target_layer_revision(path: &std::path::Path) -> std::result::Result<String, ErrorPayload> {
-    let config = match std::fs::read_to_string(path) {
-        Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            crate::mcp::config::McpConfig::default()
+    let value: serde_json::Value = match std::fs::read_to_string(path) {
+        Ok(raw) => {
+            crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?;
+            serde_json::from_str(&raw).map_err(internal)?
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
         Err(error) => return Err(internal(error)),
     };
-    let json = serde_json::to_string(&config).map_err(internal)?;
+    let json = serde_json::to_string(&value).map_err(internal)?;
     use sha2::Digest as _;
     Ok(crate::intel::hex_lower(&Sha256::digest(json.as_bytes())))
+}
+
+fn write_mcp_raw_private(path: &std::path::Path, json: &str) -> anyhow::Result<()> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let body = serde_json::to_string_pretty(&value)?;
+    crate::private_fs::ensure_parent_dir_private(path)?;
+    crate::private_fs::write_private_file(path, format!("{body}\n").as_bytes())
 }
 
 // Model fetch is parameterized by provider/model selectors plus the fetch-mode
@@ -18083,10 +18036,10 @@ async fn provider_config_save_under_lock(
     })
 }
 
-/// Save the complete MCP layer through the daemon. The client supplies only
-/// a reference-bearing JSON projection plus staged named-secret values; the
-/// daemon owns vault staging, config publication, redaction publication, and
-/// cleanup of refs made stale by delete/rename edits.
+/// Apply a typed patch to one raw MCP layer through the daemon. Effective
+/// inherited state is never accepted as a write body: under the publication
+/// lock we re-read the authored JSON document and change only named server
+/// keys, preserving unknown root fields and untouched server objects.
 async fn save_mcp_config(
     ctx: &DaemonContext,
     owner_digest: &str,
@@ -18099,17 +18052,15 @@ async fn save_mcp_config(
     config_path: &str,
     expected_revision: &str,
     supplied_mutation_intent_hash: &str,
-    config_json: &str,
+    patch_json: &str,
     secret_values_json: &str,
-    cleanup_names_json: &str,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     let requested_project_root = project_root.to_owned();
     let mutation_intent_hash = local_operation_request_hash_hex(&local_operation_request_hash(&(
         "save_mcp_config",
         &requested_project_root,
-        &config_json,
-        &cleanup_names_json,
+        patch_json,
     ))?);
     if mutation_intent_hash != supplied_mutation_intent_hash {
         return Err(ErrorPayload {
@@ -18151,9 +18102,12 @@ async fn save_mcp_config(
         });
     }
     recover_mcp_config_journals(ctx, project_root).await?;
-    let mut config: crate::mcp::config::McpConfig =
-        crate::mcp::config::McpConfig::parse(config_json).map_err(internal)?;
-    let secret_values: std::collections::BTreeMap<String, proto::SensitiveWirePayload> =
+    let patch: cockpit_proto::McpConfigPatch = serde_json::from_str(patch_json)
+        .map_err(|error| bad_request(format!("invalid MCP patch: {error}")))?;
+    if patch.operations.is_empty() {
+        return Err(bad_request("MCP patch must contain at least one operation"));
+    }
+    let mut secret_values: std::collections::BTreeMap<String, proto::SensitiveWirePayload> =
         serde_json::from_str(secret_values_json)
             .map_err(|error| bad_request(format!("invalid MCP secret values: {error}")))?;
     let cwd = std::path::PathBuf::from(project_root);
@@ -18161,19 +18115,6 @@ async fn save_mcp_config(
         .await
         .map_err(workspace_trust_error)?;
     let mcp_paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
-    // Clients edit the owner-view projection (`redacted_mcp_config_json`), so
-    // an unedited credential comes back as the redaction sentinel, not the
-    // stored value. Restore the daemon's current values at those positions
-    // before validation — otherwise every save from a redacted view would
-    // either persist the sentinel or fail the literal check. Restored legacy
-    // literals are staged (unless the caller staged that reference itself) so
-    // migration to the vault stays daemon-owned and atomic.
-    let prior_merged = mcp_config_from_paths(&mcp_paths)?;
-    for (reference, value) in
-        crate::mcp::config::restore_owner_view_redactions(&mut config, &prior_merged)
-    {
-        secret_values.entry(reference).or_insert(value);
-    }
     for (name, value) in &secret_values {
         if name.is_empty() || name.len() > cockpit_proto::MAX_OWNER_SECRET_NAME_BYTES {
             return Err(bad_request("MCP secret name exceeds maximum length"));
@@ -18187,7 +18128,6 @@ async fn save_mcp_config(
     // can invoke this production path directly.  Normalize values supplied
     // alongside a staged secret, and reject every other literal before either
     // the vault transaction or config publication starts.
-    validate_and_normalize_mcp_credentials(&mut config, &secret_values)?;
     let target = mcp_paths.last().cloned().or_else(|| {
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             cockpit_config::config::dirs::most_specific_config_write_target(&cwd)
@@ -18220,14 +18160,331 @@ async fn save_mcp_config(
         }
         Err(error) => return Err(internal(error)),
     };
+    let mut raw_document: serde_json::Value = match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).map_err(internal)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(internal(error)),
+    };
+    let root = raw_document
+        .as_object_mut()
+        .ok_or_else(|| bad_request("authored MCP document must be a JSON object"))?;
+    if !root.contains_key("servers") {
+        root.insert("servers".into(), serde_json::json!({}));
+    }
+    let raw_servers = root
+        .get_mut("servers")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| bad_request("authored MCP `servers` must be an object"))?;
+    let prior_effective = mcp_config_from_paths(&mcp_paths)?;
+    let mut changed_config = crate::mcp::config::McpConfig::default();
+    let mut redaction_prior = crate::mcp::config::McpConfig::default();
+    let mut update_candidates = std::collections::BTreeMap::new();
+    let mut touched = std::collections::BTreeSet::new();
+    for operation in &patch.operations {
+        let name = match operation {
+            cockpit_proto::McpConfigPatchOperation::AddServer { name, .. }
+            | cockpit_proto::McpConfigPatchOperation::MaterializeInheritedServer { name, .. }
+            | cockpit_proto::McpConfigPatchOperation::UpdateAuthoredServer { name, .. }
+            | cockpit_proto::McpConfigPatchOperation::DeleteAuthoredServer { name } => name,
+        };
+        if name.trim().is_empty() || !touched.insert(name.clone()) {
+            return Err(bad_request(
+                "MCP patch contains an empty or duplicate server name",
+            ));
+        }
+        match operation {
+            cockpit_proto::McpConfigPatchOperation::AddServer { name, server_json } => {
+                if prior_effective.servers.contains_key(name) {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: format!("MCP server `{name}` already exists in a config layer"),
+                    });
+                }
+                let server = serde_json::from_str(server_json).map_err(|error| {
+                    bad_request(format!("invalid MCP server `{name}`: {error}"))
+                })?;
+                changed_config.servers.insert(name.clone(), server);
+            }
+            cockpit_proto::McpConfigPatchOperation::MaterializeInheritedServer {
+                name,
+                server_json,
+            } => {
+                if prior_config.servers.contains_key(name)
+                    || !prior_effective.servers.contains_key(name)
+                {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: format!("MCP server `{name}` is not an inherited-only server"),
+                    });
+                }
+                if crate::mcp::config::server_has_credential_material(
+                    &prior_effective.servers[name],
+                ) {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: format!(
+                            "MCP server `{name}` uses credentials owned by an ancestor layer; re-enter credentials in this layer before overriding it"
+                        ),
+                    });
+                }
+                let server = serde_json::from_str(server_json).map_err(|error| {
+                    bad_request(format!("invalid MCP server `{name}`: {error}"))
+                })?;
+                changed_config.servers.insert(name.clone(), server);
+                redaction_prior
+                    .servers
+                    .insert(name.clone(), prior_effective.servers[name].clone());
+            }
+            cockpit_proto::McpConfigPatchOperation::UpdateAuthoredServer {
+                name,
+                set_fields_json,
+                unset_fields,
+            } => {
+                if !prior_config.servers.contains_key(name) {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: format!("MCP server `{name}` is not authored in this layer"),
+                    });
+                }
+                let set_fields: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(set_fields_json).map_err(|error| {
+                        bad_request(format!("invalid MCP server patch `{name}`: {error}"))
+                    })?;
+                let mut candidate = raw_servers
+                    .get(name)
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .ok_or_else(|| {
+                        bad_request(format!("authored MCP server `{name}` is invalid"))
+                    })?;
+                // Apply client fields to a redacted typed projection for
+                // validation. The raw candidate above remains the merge
+                // destination, so an unrelated edit neither requires the
+                // client to echo a legacy literal nor loses unknown fields.
+                let mut validation_candidate = serde_json::to_value({
+                    let mut server = prior_config.servers[name].clone();
+                    let mut one = crate::mcp::config::McpConfig::default();
+                    one.servers.insert(name.clone(), server.clone());
+                    crate::mcp::config::redact_config_for_owner_view(&mut one);
+                    server = one.servers.remove(name).ok_or_else(|| {
+                        internal(anyhow::anyhow!("redacted MCP server disappeared"))
+                    })?;
+                    server
+                })
+                .map_err(internal)?;
+                let validation_object = validation_candidate.as_object_mut().ok_or_else(|| {
+                    internal(anyhow::anyhow!("redacted MCP server is not an object"))
+                })?;
+                let known = [
+                    "transport",
+                    "endpoint",
+                    "command",
+                    "args",
+                    "env",
+                    "env_credential_refs",
+                    "auth",
+                    "mode",
+                    "enabled",
+                    "cache_ttl_secs",
+                    "connect_timeout_secs",
+                    "timeout_secs",
+                ];
+                for key in set_fields.keys().chain(unset_fields.iter()) {
+                    if !known.contains(&key.as_str()) {
+                        return Err(bad_request(format!("unknown MCP server field `{key}`")));
+                    }
+                }
+                if unset_fields.iter().any(|key| set_fields.contains_key(key)) {
+                    return Err(bad_request(
+                        "MCP server patch sets and unsets the same field",
+                    ));
+                }
+                for (key, value) in set_fields {
+                    validation_object.insert(key, value);
+                }
+                for key in unset_fields {
+                    validation_object.remove(key);
+                }
+                let server = serde_json::from_value(validation_candidate).map_err(|error| {
+                    bad_request(format!("invalid MCP server `{name}`: {error}"))
+                })?;
+                changed_config.servers.insert(name.clone(), server);
+                redaction_prior
+                    .servers
+                    .insert(name.clone(), prior_config.servers[name].clone());
+                update_candidates.insert(name.clone(), candidate);
+            }
+            cockpit_proto::McpConfigPatchOperation::DeleteAuthoredServer { name } => {
+                if !prior_config.servers.contains_key(name) {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: format!(
+                            "MCP server `{name}` is inherited and cannot be deleted from this layer"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    for (reference, value) in
+        crate::mcp::config::restore_owner_view_redactions(&mut changed_config, &redaction_prior)
+    {
+        secret_values.entry(reference).or_insert(value.into());
+    }
+    validate_and_normalize_mcp_credentials(&mut changed_config, &secret_values)?;
+    // The recovery journal records the typed structural intent and a digest of
+    // each normalized server, never the possibly credential-bearing patch
+    // values. `config_json` remains the exact authored-layer recovery image.
+    let normalized_patch_intent = patch
+        .operations
+        .iter()
+        .map(|operation| {
+            let (kind, name, fields) = match operation {
+                cockpit_proto::McpConfigPatchOperation::AddServer { name, .. } => {
+                    ("add_server", name, Vec::new())
+                }
+                cockpit_proto::McpConfigPatchOperation::MaterializeInheritedServer {
+                    name, ..
+                } => ("materialize_inherited_server", name, Vec::new()),
+                cockpit_proto::McpConfigPatchOperation::UpdateAuthoredServer {
+                    name,
+                    set_fields_json,
+                    unset_fields,
+                } => {
+                    let set: serde_json::Map<String, serde_json::Value> =
+                        serde_json::from_str(set_fields_json).map_err(internal)?;
+                    let mut fields = set.keys().cloned().collect::<Vec<_>>();
+                    fields.extend(unset_fields.iter().map(|field| format!("-{field}")));
+                    fields.sort();
+                    ("update_authored_server", name, fields)
+                }
+                cockpit_proto::McpConfigPatchOperation::DeleteAuthoredServer { name } => {
+                    ("delete_authored_server", name, Vec::new())
+                }
+            };
+            let result_digest = changed_config
+                .servers
+                .get(name)
+                .map(|server| {
+                    serde_json::to_vec(server)
+                        .map(|bytes| crate::intel::hex_lower(&Sha256::digest(bytes)))
+                })
+                .transpose()
+                .map_err(internal)?;
+            Ok(serde_json::json!({
+                "operation": kind,
+                "name": name,
+                "fields": fields,
+                "result_digest": result_digest,
+            }))
+        })
+        .collect::<std::result::Result<Vec<_>, ErrorPayload>>()?;
+    let normalized_patch_intent_json = serde_json::to_string(&serde_json::json!({
+        "operations": normalized_patch_intent,
+    }))
+    .map_err(internal)?;
+    for operation in &patch.operations {
+        match operation {
+            cockpit_proto::McpConfigPatchOperation::AddServer { name, .. }
+            | cockpit_proto::McpConfigPatchOperation::MaterializeInheritedServer { name, .. } => {
+                let server = changed_config.servers.get(name).ok_or_else(|| {
+                    internal(anyhow::anyhow!("normalized MCP server disappeared"))
+                })?;
+                raw_servers.insert(
+                    name.clone(),
+                    serde_json::to_value(server).map_err(internal)?,
+                );
+            }
+            cockpit_proto::McpConfigPatchOperation::UpdateAuthoredServer { name, .. } => {
+                let normalized =
+                    serde_json::to_value(changed_config.servers.get(name).ok_or_else(|| {
+                        internal(anyhow::anyhow!("normalized MCP server disappeared"))
+                    })?)
+                    .map_err(internal)?;
+                let normalized = normalized.as_object().ok_or_else(|| {
+                    internal(anyhow::anyhow!("normalized MCP server is not an object"))
+                })?;
+                let candidate = update_candidates
+                    .get_mut(name)
+                    .ok_or_else(|| internal(anyhow::anyhow!("MCP update candidate disappeared")))?;
+                for key in [
+                    "transport",
+                    "endpoint",
+                    "command",
+                    "args",
+                    "env",
+                    "env_credential_refs",
+                    "auth",
+                    "mode",
+                    "enabled",
+                    "cache_ttl_secs",
+                    "connect_timeout_secs",
+                    "timeout_secs",
+                ] {
+                    if let Some(value) = normalized.get(key) {
+                        if key == "auth" {
+                            let replacement = value.as_object();
+                            let same_kind = candidate
+                                .get(key)
+                                .and_then(serde_json::Value::as_object)
+                                .and_then(|auth| auth.get("kind"))
+                                == replacement.and_then(|auth| auth.get("kind"));
+                            if same_kind {
+                                let existing = candidate
+                                    .get_mut(key)
+                                    .and_then(serde_json::Value::as_object_mut)
+                                    .ok_or_else(|| {
+                                        internal(anyhow::anyhow!("MCP auth object disappeared"))
+                                    })?;
+                                let replacement = replacement.ok_or_else(|| {
+                                    internal(anyhow::anyhow!(
+                                        "normalized MCP auth is not an object"
+                                    ))
+                                })?;
+                                for auth_key in [
+                                    "kind",
+                                    "header",
+                                    "value",
+                                    "credential_ref",
+                                    "vars",
+                                    "credential_refs",
+                                    "authorize_url",
+                                    "token_url",
+                                    "client_id",
+                                    "scopes",
+                                ] {
+                                    if let Some(value) = replacement.get(auth_key) {
+                                        existing.insert(auth_key.into(), value.clone());
+                                    } else {
+                                        existing.remove(auth_key);
+                                    }
+                                }
+                            } else {
+                                candidate.insert(key.into(), value.clone());
+                            }
+                        } else {
+                            candidate.insert(key.into(), value.clone());
+                        }
+                    } else {
+                        candidate.remove(key);
+                    }
+                }
+                raw_servers.insert(name.clone(), serde_json::Value::Object(candidate.clone()));
+            }
+            cockpit_proto::McpConfigPatchOperation::DeleteAuthoredServer { name } => {
+                raw_servers.remove(name);
+            }
+        }
+    }
+    let config_json_owned = serde_json::to_string(&raw_document).map_err(internal)?;
+    let config = crate::mcp::config::McpConfig::parse(&config_json_owned).map_err(internal)?;
     let prior_references = prior_config
         .servers
         .iter()
         .flat_map(|(server_name, server)| mcp_secret_references(server_name, server))
         .collect::<std::collections::BTreeSet<_>>();
     use sha2::Digest as _;
-    let prior_json = serde_json::to_string(&prior_config).map_err(internal)?;
-    let consumed_revision = crate::intel::hex_lower(&Sha256::digest(prior_json.as_bytes()));
+    let consumed_revision = mcp_target_layer_revision(&path)?;
     if consumed_revision != expected_revision {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -18237,7 +18494,6 @@ async fn save_mcp_config(
     }
     let journal_id = Uuid::now_v7().to_string();
     let cleanup_json = serde_json::to_string(&prior_references).map_err(internal)?;
-    let config_json_owned = serde_json::to_string(&config).map_err(internal)?;
     let staged_values = secret_values.into_iter().collect::<Vec<_>>();
     let staged_names = staged_values
         .iter()
@@ -18309,6 +18565,7 @@ async fn save_mcp_config(
             let project_root = project_root.to_string();
             let config_path = path.to_string_lossy().into_owned();
             let config_json = config_json_owned.clone();
+            let patch_intent_json = normalized_patch_intent_json.clone();
             let consumed_revision_for_tx = consumed_revision.clone();
             let result_revision_for_tx = result_revision.clone();
             let cleanup_json = cleanup_json.clone();
@@ -18322,9 +18579,9 @@ async fn save_mcp_config(
                     "INSERT INTO mcp_config_journals
                      (journal_id, owner_digest, client_operation_id, request_hash,
                       fencing_generation, terminal_response_json, project_root,
-                      config_path, config_json, consumed_revision, intended_revision,
+                      config_path, config_json, patch_intent_json, consumed_revision, intended_revision,
                       cleanup_names_json, phase, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'staged', ?13)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'staged', ?14)",
                     rusqlite::params![
                         journal_id,
                         owner_digest,
@@ -18335,6 +18592,7 @@ async fn save_mcp_config(
                         project_root,
                         config_path,
                         config_json,
+                        patch_intent_json,
                         consumed_revision_for_tx,
                         result_revision_for_tx,
                         cleanup_json,
@@ -18412,7 +18670,7 @@ async fn save_mcp_config(
                     .into(),
         });
     }
-    if let Err(error) = config.write_private(&path) {
+    if let Err(error) = write_mcp_raw_private(&path, &config_json_owned) {
         drop(file_lock);
         let error = anyhow::anyhow!(error);
         ctx.poison_redaction_publication(&error);
@@ -19184,9 +19442,9 @@ pub(super) async fn recover_mcp_config_journals(
                     .into(),
             });
         }
-        let config = crate::mcp::config::McpConfig::parse(&config_json).map_err(internal)?;
+        crate::mcp::config::McpConfig::parse(&config_json).map_err(internal)?;
         if actual_revision == consumed_revision {
-            config.write_private(&path).map_err(internal)?;
+            write_mcp_raw_private(&path, &config_json).map_err(internal)?;
         }
         drop(file_lock);
         let cleanup: std::collections::BTreeSet<String> =

@@ -276,6 +276,12 @@ pub struct ProviderConfigView {
     /// contains no header/env literals or credential values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_config_json: Option<String>,
+    /// Daemon-redacted contents of the single authored MCP layer selected by
+    /// `mcp_config_path`. This is deliberately separate from the effective
+    /// projection above: clients may render inherited servers, but mutations
+    /// are computed against and applied only to this document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_authored_config_json: Option<String>,
     /// Daemon-selected canonical MCP authority root and write target for this
     /// snapshot. These bind a later save receipt without making the frontend
     /// rediscover layered config paths.
@@ -297,6 +303,43 @@ pub struct ProviderConfigView {
     /// not load legacy config.json literals locally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extended_config_json: Option<String>,
+}
+
+/// A target-layer MCP edit. The daemon applies these operations to the raw
+/// authored document under its config lock; it never persists a client's
+/// flattened effective projection.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct McpConfigPatch {
+    pub operations: Vec<McpConfigPatchOperation>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum McpConfigPatchOperation {
+    AddServer {
+        name: String,
+        /// A redacted/reference-bearing `ServerConfig` JSON object. Keeping
+        /// the core type out of this crate preserves the protocol boundary.
+        server_json: SensitiveWirePayload,
+    },
+    /// Copy an inherited effective server into this authored layer with an
+    /// intentional override. This is distinct from add so ownership changes
+    /// cannot happen accidentally.
+    MaterializeInheritedServer {
+        name: String,
+        server_json: SensitiveWirePayload,
+    },
+    /// Change known fields on a server already authored in this layer. Values
+    /// are a JSON object keyed by `ServerConfig` field; omitted raw/unknown
+    /// sibling fields are preserved by the daemon.
+    UpdateAuthoredServer {
+        name: String,
+        set_fields_json: SensitiveWirePayload,
+        unset_fields: Vec<String>,
+    },
+    /// Delete an entry authored in the selected layer. The daemon rejects
+    /// deletion of an inherited-only server; MCP has no tombstone syntax.
+    DeleteAuthoredServer { name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6860,9 +6903,8 @@ mod tests {
                 config_path: "/tmp/project/.cockpit/mcp.json".into(),
                 expected_revision: "00".repeat(32),
                 mutation_intent_hash: "11".repeat(32),
-                config_json: "{}".into(),
+                patch: r#"{"operations":[]}"#.into(),
                 secret_values_json: SensitiveWirePayload::new("{}".into()),
-                cleanup_names_json: "[]".into(),
             },
             Request::ApplyExtendedConfigPatch {
                 client_operation_id: "patch-config".into(),
@@ -7755,6 +7797,15 @@ mod tests {
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
         assert_eq!(mcp["mutation_intent_hash"].as_str().map(str::len), Some(64));
+        let patch: McpConfigPatch = serde_json::from_str(
+            mcp["patch"]
+                .as_str()
+                .expect("MCP patch must use the zeroizing wire envelope"),
+        )
+        .expect("current MCP patch fixture must be typed");
+        assert!(!patch.operations.is_empty());
+        assert!(mcp.get("config_json").is_none());
+        assert!(mcp.get("cleanup_names_json").is_none());
         for tag in ["cancel_provider_oauth", "cancel_mcp_oauth"] {
             assert!(requests[tag]["params"]["begin_client_operation_id"].is_string());
         }

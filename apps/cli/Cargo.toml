@@ -225,6 +225,7 @@ monty = { workspace = true }
 # Time / IDs
 chrono = { workspace = true }
 uuid = { workspace = true }
+zeroize = { workspace = true }
 
 # Errors / logging
 anyhow = { workspace = true }

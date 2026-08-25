@@ -328,7 +328,7 @@ impl SettingsCx {
         &mut self,
         cfg: &McpConfig,
         secret_values: &BTreeMap<String, String>,
-        cleanup_names: &BTreeSet<String>,
+        _cleanup_names: &BTreeSet<String>,
     ) -> Result<super::SettingsSaveOutcome, String> {
         let project_root = self
             .active_project_root
@@ -353,19 +353,83 @@ impl SettingsCx {
         let expected_consumed_revision = self.mcp_revision.clone().ok_or_else(|| {
             "MCP authority snapshot has no target-layer revision; reload settings".to_string()
         })?;
-        let config_json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
-        use sha2::{Digest as _, Sha256};
-        let expected_result_revision =
-            super::hex_lower_for_authority(Sha256::digest(config_json.as_bytes()).as_slice());
+        let mut operations = Vec::new();
+        for (name, server) in &cfg.servers {
+            let Some(previous) = self.mcp_config.servers.get(name) else {
+                operations.push(cockpit_proto::McpConfigPatchOperation::AddServer {
+                    name: name.clone(),
+                    server_json: serde_json::to_string(server)
+                        .map_err(|e| e.to_string())?
+                        .into(),
+                });
+                continue;
+            };
+            if previous == server {
+                continue;
+            }
+            if self.mcp_authored_config.servers.contains_key(name) {
+                let previous = serde_json::to_value(previous).map_err(|e| e.to_string())?;
+                let current = serde_json::to_value(server).map_err(|e| e.to_string())?;
+                let previous = previous.as_object().ok_or("invalid prior MCP server")?;
+                let current = current.as_object().ok_or("invalid edited MCP server")?;
+                let set_fields = current
+                    .iter()
+                    .filter(|(key, value)| previous.get(*key) != Some(*value))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<serde_json::Map<_, _>>();
+                let unset_fields = previous
+                    .keys()
+                    .filter(|key| !current.contains_key(*key))
+                    .cloned()
+                    .collect();
+                operations.push(
+                    cockpit_proto::McpConfigPatchOperation::UpdateAuthoredServer {
+                        name: name.clone(),
+                        set_fields_json: serde_json::to_string(&set_fields)
+                            .map_err(|e| e.to_string())?
+                            .into(),
+                        unset_fields,
+                    },
+                );
+            } else {
+                if !credential_refs(name, previous).is_empty() {
+                    return Err(format!(
+                        "MCP server `{name}` inherits credentials; re-enter them in this layer before overriding it"
+                    ));
+                }
+                operations.push(
+                    cockpit_proto::McpConfigPatchOperation::MaterializeInheritedServer {
+                        name: name.clone(),
+                        server_json: serde_json::to_string(server)
+                            .map_err(|e| e.to_string())?
+                            .into(),
+                    },
+                );
+            }
+        }
+        for name in self.mcp_config.servers.keys() {
+            if !cfg.servers.contains_key(name) {
+                if !self.mcp_authored_config.servers.contains_key(name) {
+                    return Err(format!(
+                        "MCP server `{name}` is inherited; edit its owning layer instead of deleting it here"
+                    ));
+                }
+                operations.push(
+                    cockpit_proto::McpConfigPatchOperation::DeleteAuthoredServer {
+                        name: name.clone(),
+                    },
+                );
+            }
+        }
+        if operations.is_empty() {
+            return Err("MCP settings have no changes to save".into());
+        }
+        let patch = cockpit_proto::McpConfigPatch { operations };
+        let patch_wire = serde_json::to_string(&patch).map_err(|e| e.to_string())?;
         let secret_values_json = serde_json::to_string(secret_values).map_err(|e| e.to_string())?;
-        let cleanup_names_json = serde_json::to_string(cleanup_names).map_err(|e| e.to_string())?;
         let owner = project_root.display().to_string();
-        let expected_request_intent_hash = super::local_receipt_request_hash(&(
-            "save_mcp_config",
-            &owner,
-            &config_json,
-            &cleanup_names_json,
-        ))?;
+        let expected_request_intent_hash =
+            super::local_receipt_request_hash(&("save_mcp_config", &owner, &patch_wire))?;
         let client_operation_id = uuid::Uuid::new_v4().to_string();
         self.queue_simple_secret_mutation(
             super::SettingsEffectTarget {
@@ -381,9 +445,8 @@ impl SettingsCx {
                 config_path: expected_config_path.clone(),
                 expected_revision: expected_consumed_revision.clone(),
                 mutation_intent_hash: expected_request_intent_hash.clone(),
-                config_json,
+                patch,
                 secret_values_json: super::SecretPayload::new(secret_values_json),
-                cleanup_names_json,
             },
             super::SettingsMutationAction::McpSave {
                 config: cfg.clone(),
@@ -393,7 +456,6 @@ impl SettingsCx {
                 expected_config_path,
                 snapshot_capability,
                 expected_consumed_revision,
-                expected_result_revision,
                 expected_request_intent_hash,
             },
         );
@@ -1487,6 +1549,11 @@ fn is_env_reference(value: &str) -> bool {
 fn credential_refs(name: &str, server: &ServerConfig) -> BTreeSet<String> {
     let mut refs = BTreeSet::new();
     refs.extend(server.env_credential_refs.values().cloned());
+    for (env_name, value) in &server.env {
+        if !value.trim().is_empty() && !is_env_reference(value) {
+            refs.insert(cockpit_core::mcp::auth::base_env_cred_key(name, env_name));
+        }
+    }
     match &server.auth {
         Auth::Header(h) => {
             if let Some(key) = &h.credential_ref {

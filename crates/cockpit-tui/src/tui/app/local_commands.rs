@@ -1,21 +1,36 @@
 use super::*;
 
-fn mcp_projection_revision(config: &cockpit_core::mcp::config::McpConfig) -> Option<String> {
-    use sha2::Digest as _;
-
-    let json = serde_json::to_string(config).ok()?;
-    Some(
-        sha2::Sha256::digest(json.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-    )
+fn mcp_server_requires_layer_credentials(server: &cockpit_core::mcp::config::ServerConfig) -> bool {
+    !server.env_credential_refs.is_empty()
+        || server
+            .env
+            .values()
+            .any(|value| !value.trim().is_empty() && !value.trim_start().starts_with('$'))
+        || matches!(server.auth, cockpit_core::mcp::config::Auth::Oauth(_))
+        || matches!(
+            &server.auth,
+            cockpit_core::mcp::config::Auth::Header(header)
+                if header.credential_ref.is_some()
+                    || (!header.value.trim().is_empty()
+                        && !header.value.trim_start().starts_with('$'))
+        )
+        || matches!(
+            &server.auth,
+            cockpit_core::mcp::config::Auth::Env(env)
+                if !env.credential_refs.is_empty()
+                    || env.vars.values().any(|value| !value.trim().is_empty()
+                        && !value.trim_start().starts_with('$'))
+        )
 }
 
-fn mcp_mutation_intent_hash(project_root: &str, config_json: &str) -> Option<String> {
+fn mcp_mutation_intent_hash(
+    project_root: &str,
+    patch: &cockpit_proto::McpConfigPatch,
+) -> Option<String> {
     use sha2::Digest as _;
 
-    let encoded = serde_json::to_vec(&("save_mcp_config", project_root, config_json, "[]")).ok()?;
+    let wire = serde_json::to_string(patch).ok()?;
+    let encoded = serde_json::to_vec(&("save_mcp_config", project_root, wire)).ok()?;
     Some(
         sha2::Sha256::digest(&encoded)
             .iter()
@@ -1231,6 +1246,19 @@ impl App {
                     self.push_plain("/mcp: daemon snapshot omitted MCP configuration".to_string());
                     return;
                 };
+                let Some(authored_raw) = config.mcp_authored_config_json else {
+                    self.push_plain(
+                        "/mcp: daemon snapshot omitted authored MCP configuration".to_string(),
+                    );
+                    return;
+                };
+                let Ok(authored) = cockpit_core::mcp::config::McpConfig::parse(&authored_raw)
+                else {
+                    self.push_plain(
+                        "/mcp: daemon returned an invalid authored MCP layer".to_string(),
+                    );
+                    return;
+                };
                 let (
                     Some(owner_root),
                     Some(config_path),
@@ -1263,6 +1291,7 @@ impl App {
                 match pending.intent.clone() {
                     McpLocalIntent::List => self.render_mcp_list(&mcp),
                     McpLocalIntent::SetEnabled { server_id, enabled } => {
+                        let original = mcp.clone();
                         if let Some(server_id) = server_id {
                             let Some(server) = mcp.servers.get_mut(&server_id) else {
                                 self.push_plain(format!("Unknown MCP server `{server_id}`"));
@@ -1277,8 +1306,43 @@ impl App {
                                 server.enabled = target;
                             }
                         }
-                        let config_json = match serde_json::to_string(&mcp) {
-                            Ok(config_json) => config_json,
+                        if let Some((name, _)) = mcp.servers.iter().find(|(name, server)| {
+                            original.servers.get(*name) != Some(*server)
+                                && !authored.servers.contains_key(*name)
+                                && mcp_server_requires_layer_credentials(server)
+                        }) {
+                            self.push_plain(format!(
+                                "/mcp: `{name}` inherits credentials; re-enter them in this layer before overriding it"
+                            ));
+                            return;
+                        }
+                        let operations = mcp
+                            .servers
+                            .iter()
+                            .filter(|(name, server)| original.servers.get(*name) != Some(*server))
+                            .map(|(name, server)| {
+                                if authored.servers.contains_key(name) {
+                                    Ok(cockpit_proto::McpConfigPatchOperation::UpdateAuthoredServer {
+                                        name: name.clone(),
+                                        set_fields_json: serde_json::json!({
+                                            "enabled": server.enabled,
+                                        })
+                                        .to_string()
+                                        .into(),
+                                        unset_fields: Vec::new(),
+                                    })
+                                } else {
+                                    serde_json::to_string(server).map(|server_json| {
+                                        cockpit_proto::McpConfigPatchOperation::MaterializeInheritedServer {
+                                            name: name.clone(),
+                                            server_json: server_json.into(),
+                                        }
+                                    })
+                                }
+                            })
+                            .collect::<std::result::Result<Vec<_>, _>>();
+                        let patch = match operations {
+                            Ok(operations) => cockpit_proto::McpConfigPatch { operations },
                             Err(error) => {
                                 self.push_plain(format!(
                                     "/mcp: failed to serialize daemon projection: {error}"
@@ -1288,12 +1352,21 @@ impl App {
                         };
                         self.push_plain("/mcp: saving configuration…".to_string());
                         let Some(mutation_intent_hash) =
-                            mcp_mutation_intent_hash(&pending.project_root, &config_json)
+                            mcp_mutation_intent_hash(&pending.project_root, &patch)
                         else {
                             self.push_plain(
                                 "/mcp: failed to bind the save mutation intent".to_string(),
                             );
                             return;
+                        };
+                        let patch_wire = match serde_json::to_string(&patch) {
+                            Ok(wire) => wire,
+                            Err(error) => {
+                                self.push_plain(format!(
+                                    "/mcp: failed to encode the typed mutation: {error}"
+                                ));
+                                return;
+                            }
                         };
                         let request = cockpit_core::daemon::proto::Request::SaveMcpConfig {
                             client_operation_id: pending.operation_id.to_string(),
@@ -1303,11 +1376,10 @@ impl App {
                             config_path: authority.config_path.clone(),
                             expected_revision: authority.revision.clone(),
                             mutation_intent_hash: mutation_intent_hash.clone(),
-                            config_json,
+                            patch: cockpit_proto::SensitiveWirePayload::new(patch_wire),
                             secret_values_json: cockpit_proto::SensitiveWirePayload::new(
                                 "{}".to_string(),
                             ),
-                            cleanup_names_json: "[]".to_string(),
                         };
                         self.replace_mcp_local_action(
                             pending.operation_id,
@@ -1539,14 +1611,6 @@ impl App {
                     self.retry_mcp_refresh(pending);
                     return;
                 };
-                if mcp_projection_revision(&mcp).as_deref() != Some(result_revision.as_str()) {
-                    self.push_plain(
-                        "/mcp: saved, but the refreshed MCP projection did not match its receipt"
-                            .to_string(),
-                    );
-                    self.retry_mcp_refresh(pending);
-                    return;
-                }
                 self.mcp_local_snapshot = Some(mcp.clone());
                 self.slash_menu_cache.borrow_mut().take();
                 self.push_plain("/mcp: configuration saved.".to_string());

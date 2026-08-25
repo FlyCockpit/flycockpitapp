@@ -338,9 +338,8 @@ pub(crate) enum SettingsDaemonEffectWork {
         config_path: String,
         expected_revision: String,
         mutation_intent_hash: String,
-        config_json: String,
+        patch: cockpit_proto::McpConfigPatch,
         secret_values_json: SecretPayload,
-        cleanup_names_json: String,
     },
     ProviderMutation(ProviderMutationPlan),
     TypedDocumentEdit(TypedDocumentEditPlan),
@@ -584,9 +583,8 @@ pub(crate) async fn execute_settings_daemon_work(
             config_path,
             expected_revision,
             mutation_intent_hash,
-            config_json,
+            patch,
             secret_values_json,
-            cleanup_names_json,
         } => Ok(SettingsDaemonWorkOutcome {
             response: client
                 .request(Request::SaveMcpConfig {
@@ -597,11 +595,12 @@ pub(crate) async fn execute_settings_daemon_work(
                     config_path,
                     expected_revision,
                     mutation_intent_hash,
-                    config_json,
+                    patch: cockpit_proto::SensitiveWirePayload::new(
+                        serde_json::to_string(&patch).map_err(|error| error.to_string())?,
+                    ),
                     secret_values_json: cockpit_proto::SensitiveWirePayload::new(
                         secret_values_json.take(),
                     ),
-                    cleanup_names_json,
                 })
                 .await
                 .map_err(|error| error.to_string())?
@@ -1356,7 +1355,6 @@ enum SettingsMutationAction {
         expected_config_path: String,
         snapshot_capability: String,
         expected_consumed_revision: String,
-        expected_result_revision: String,
         expected_request_intent_hash: String,
     },
     McpOAuthBegin {
@@ -1546,7 +1544,6 @@ impl SettingsMutationAction {
                     expected_owner_root,
                     expected_config_path,
                     expected_consumed_revision,
-                    expected_result_revision,
                     expected_request_intent_hash,
                     ..
                 },
@@ -1568,7 +1565,7 @@ impl SettingsMutationAction {
                     && owner_root == expected_owner_root
                     && config_path == expected_config_path
                     && consumed_revision == expected_consumed_revision
-                    && result_revision == expected_result_revision
+                    && cockpit_proto::is_opaque_authority_token(result_revision)
                     && mutation_intent_hash == expected_request_intent_hash
                     && cockpit_proto::is_opaque_authority_token(request_hash)
                     && *config_generation > 0
@@ -2834,6 +2831,10 @@ pub struct SettingsCx {
     /// Daemon-redacted MCP snapshot. MCP config is never read from disk by
     /// the TUI; saves replace this cache only after the owner RPC succeeds.
     pub(super) mcp_config: cockpit_core::mcp::config::McpConfig,
+    /// Redacted contents of the daemon-selected authored target layer. Deltas
+    /// are computed against this baseline; inherited effective entries are
+    /// never materialized by an unrelated edit.
+    pub(super) mcp_authored_config: cockpit_core::mcp::config::McpConfig,
     /// Daemon-selected authority metadata for `mcp_config`. A save is not
     /// eligible until all three values came from the same catalog snapshot.
     pub(super) mcp_owner_root: Option<String>,
@@ -3699,21 +3700,27 @@ impl SettingsCx {
                         self.mcp_config_path = None;
                         self.mcp_edit_capability = None;
                         self.mcp_revision = None;
+                        self.mcp_authored_config = cockpit_core::mcp::config::McpConfig::default();
                         if let (
                             Some(raw),
+                            Some(authored_raw),
                             Some(owner_root),
                             Some(config_path),
                             Some(capability),
                             Some(revision),
                         ) = (
                             config.mcp_config_json,
+                            config.mcp_authored_config_json,
                             config.mcp_owner_root,
                             config.mcp_config_path,
                             config.mcp_edit_capability,
                             config.mcp_revision,
-                        ) && let Ok(mcp) = cockpit_core::mcp::config::McpConfig::parse(&raw)
-                        {
+                        ) && let (Ok(mcp), Ok(authored)) = (
+                            cockpit_core::mcp::config::McpConfig::parse(&raw),
+                            cockpit_core::mcp::config::McpConfig::parse(&authored_raw),
+                        ) {
                             self.mcp_config = mcp;
+                            self.mcp_authored_config = authored;
                             self.mcp_owner_root = Some(owner_root);
                             self.mcp_config_path = Some(config_path);
                             self.mcp_edit_capability = Some(capability);
@@ -3966,7 +3973,6 @@ impl SettingsCx {
                             expected_config_path,
                             snapshot_capability,
                             expected_consumed_revision,
-                            expected_result_revision,
                             expected_request_intent_hash,
                         },
                         Ok(Response::McpConfigCommitted {
@@ -3987,7 +3993,7 @@ impl SettingsCx {
                         && config_path == expected_config_path
                         && !snapshot_capability.is_empty()
                         && consumed_revision == expected_consumed_revision
-                        && result_revision == expected_result_revision
+                        && cockpit_proto::is_opaque_authority_token(&result_revision)
                         && mutation_intent_hash == expected_request_intent_hash
                         && cockpit_proto::is_opaque_authority_token(&request_hash)
                         && config_generation > 0 =>
@@ -3999,7 +4005,7 @@ impl SettingsCx {
                         // later edit must refresh and receive a new authority
                         // token instead of reusing this stale snapshot.
                         self.mcp_edit_capability = None;
-                        self.mcp_revision = Some(expected_result_revision);
+                        self.mcp_revision = Some(result_revision);
                         self.invalidate_secret_inventory();
                         if let Some((name, edited)) = self.pending_mcp_navigation.take() {
                             self.completed_mcp_navigation = Some((name, edited, Ok(())));
@@ -6512,6 +6518,7 @@ impl SettingsDialog {
                 extended_revision,
                 extended_warnings,
                 mcp_config,
+                mcp_authored_config: cockpit_core::mcp::config::McpConfig::default(),
                 mcp_owner_root: None,
                 mcp_config_path: None,
                 mcp_edit_capability: None,

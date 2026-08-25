@@ -6302,7 +6302,9 @@ CREATE UNIQUE INDEX provider_config_journals_operation
 ON provider_config_journals(owner_digest, client_operation_id);
 
 -- Recoverable bridge between the owner vault and the MCP configuration file.
--- `config_json` is reference-only; private bytes remain in vault rows.
+-- `config_json` is the exact authored target recovery image, never a flattened
+-- effective projection. Newly touched credential fields are reference-only;
+-- untouched legacy/unknown fields are preserved byte-semantically.
 CREATE TABLE mcp_config_journals (
     journal_id        TEXT PRIMARY KEY,
     owner_digest      TEXT NOT NULL,
@@ -6313,6 +6315,7 @@ CREATE TABLE mcp_config_journals (
     project_root      TEXT NOT NULL,
     config_path       TEXT NOT NULL,
     config_json       TEXT NOT NULL,
+    patch_intent_json TEXT NOT NULL CHECK (json_valid(patch_intent_json)),
     consumed_revision TEXT NOT NULL CHECK (length(consumed_revision) = 64),
     intended_revision TEXT NOT NULL CHECK (length(intended_revision) = 64),
     cleanup_names_json TEXT NOT NULL,

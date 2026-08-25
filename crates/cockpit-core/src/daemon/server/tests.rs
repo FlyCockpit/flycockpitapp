@@ -20,6 +20,75 @@ use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
+fn mcp_patch<T: serde::Serialize>(config: &T) -> cockpit_proto::SensitiveWirePayload {
+    let value = serde_json::to_value(config).unwrap();
+    let operations = value
+        .get("servers")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(
+            |(name, server)| cockpit_proto::McpConfigPatchOperation::AddServer {
+                name: name.clone(),
+                server_json: serde_json::to_string(server).unwrap().into(),
+            },
+        )
+        .collect();
+    serde_json::to_string(&cockpit_proto::McpConfigPatch { operations })
+        .unwrap()
+        .into()
+}
+
+#[test]
+fn mcp_publication_is_a_raw_target_layer_patch() {
+    let source = include_str!("dispatch.rs");
+    let save = source
+        .split("async fn save_mcp_config")
+        .nth(1)
+        .expect("MCP save owner")
+        .split("async fn publish_mcp_journal_generation")
+        .next()
+        .expect("MCP save body");
+    for required in [
+        "McpConfigPatchOperation::AddServer",
+        "McpConfigPatchOperation::MaterializeInheritedServer",
+        "McpConfigPatchOperation::UpdateAuthoredServer",
+        "McpConfigPatchOperation::DeleteAuthoredServer",
+        "raw_document",
+        "patch_intent_json",
+        "mcp_target_layer_revision(&path)",
+    ] {
+        assert!(
+            save.contains(required),
+            "MCP raw-layer owner lost {required}"
+        );
+    }
+    assert!(!save.contains("config.write_private(&path)"));
+    let snapshot = source
+        .split("fn redacted_mcp_config_snapshot")
+        .nth(1)
+        .expect("MCP snapshot owner")
+        .split("fn canonical_mcp_target_path")
+        .next()
+        .expect("MCP snapshot body");
+    assert!(snapshot.contains("effective_config_json"));
+    assert!(snapshot.contains("authored_config_json"));
+}
+
+#[test]
+fn inherited_mcp_materialization_detects_legacy_literal_credentials() {
+    for raw in [
+        r#"{"servers":{"legacy":{"transport":"streamable","endpoint":"https://example.test","auth":{"kind":"header","value":"Bearer legacy"}}}}"#,
+        r#"{"servers":{"legacy":{"transport":"stdio","command":"legacy","env":{"TOKEN":"legacy"}}}}"#,
+        r#"{"servers":{"legacy":{"transport":"stdio","command":"legacy","auth":{"kind":"env","vars":{"TOKEN":"legacy"}}}}}"#,
+    ] {
+        let config = crate::mcp::config::McpConfig::parse(raw).unwrap();
+        assert!(crate::mcp::config::server_has_credential_material(
+            &config.servers["legacy"]
+        ));
+    }
+}
+
 #[test]
 fn client_teardown_quiesces_dispatch_before_capability_cancellation() {
     let source = include_str!("mod.rs");
@@ -8436,9 +8505,8 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
                 config_path: format!("{root}/.cockpit/mcp.json"),
                 expected_revision: "00".repeat(32),
                 mutation_intent_hash: "11".repeat(32),
-                config_json: serde_json::to_string(&config).unwrap(),
+                patch: mcp_patch(&config),
                 secret_values_json: "{}".into(),
-                cleanup_names_json: "[]".into(),
             },
             &mut state,
             &ctx,
@@ -8481,13 +8549,12 @@ async fn mcp_save_stages_literal_and_persists_reference_only_config() {
             config_path: "/tmp/project/.cockpit/mcp.json".into(),
             expected_revision: "00".repeat(32),
             mutation_intent_hash: "11".repeat(32),
-            config_json: serde_json::to_string(&config).unwrap(),
+            patch: mcp_patch(&config),
             secret_values_json: serde_json::json!({
                 "mcp:staged:header": "Bearer staged-value"
             })
             .to_string()
             .into(),
-            cleanup_names_json: "[]".into(),
         },
         &mut state,
         &ctx,
@@ -8563,9 +8630,8 @@ async fn mcp_save_cannot_overwrite_a_provider_claimed_named_secret() {
             config_path: format!("{root}/.cockpit/mcp.json"),
             expected_revision: "00".repeat(32),
             mutation_intent_hash: "11".repeat(32),
-            config_json: serde_json::to_string(&config).unwrap(),
+            patch: mcp_patch(&config),
             secret_values_json: serde_json::Value::Object(secret_values).to_string().into(),
-            cleanup_names_json: "[]".into(),
         },
         &mut state,
         &ctx,
@@ -8999,9 +9065,8 @@ async fn mcp_save_rejects_unstaged_reference_to_provider_claimed_secret() {
             config_path: format!("{root}/.cockpit/mcp.json"),
             expected_revision: "00".repeat(32),
             mutation_intent_hash: "11".repeat(32),
-            config_json: serde_json::to_string(&config).unwrap(),
+            patch: mcp_patch(&config),
             secret_values_json: "{}".into(),
-            cleanup_names_json: "[]".into(),
         },
         &mut state,
         &ctx,
@@ -9187,9 +9252,16 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
                 .into_owned(),
             expected_revision: "00".repeat(32),
             mutation_intent_hash: "11".repeat(32),
-            config_json: serde_json::json!({"servers": {}}).to_string(),
+            patch: serde_json::to_string(&cockpit_proto::McpConfigPatch {
+                operations: vec![
+                    cockpit_proto::McpConfigPatchOperation::DeleteAuthoredServer {
+                        name: "unrelated".into(),
+                    },
+                ],
+            })
+            .unwrap()
+            .into(),
             secret_values_json: "{}".into(),
-            cleanup_names_json: serde_json::json!(["unrelated"]).to_string(),
         },
         &mut state,
         &ctx,
@@ -17751,9 +17823,16 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             config_path: format!("{root}/.cockpit/mcp.json"),
             expected_revision: "00".repeat(32),
             mutation_intent_hash: "11".repeat(32),
-            config_json: "{}".into(),
+            patch: serde_json::to_string(&cockpit_proto::McpConfigPatch {
+                operations: vec![
+                    cockpit_proto::McpConfigPatchOperation::DeleteAuthoredServer {
+                        name: "fixture".into(),
+                    },
+                ],
+            })
+            .unwrap()
+            .into(),
             secret_values_json: "{}".into(),
-            cleanup_names_json: "[]".into(),
         },
         "export_policy" => Request::ExportPolicy {
             project_root: root.clone(),
@@ -24828,7 +24907,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::UpsertProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default() }, kind: "upsert_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::SaveProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }, kind: "save_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::SaveMcpConfig { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), snapshot_capability: "snapshot".into(), owner_root: "/tmp/project".into(), config_path: "/tmp/project/.cockpit/mcp.json".into(), expected_revision: "00".repeat(32), mutation_intent_hash: "11".repeat(32), config_json: "{}".into(), secret_values_json: "{}".into(), cleanup_names_json: "[]".into() }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SaveMcpConfig { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), snapshot_capability: "snapshot".into(), owner_root: "/tmp/project".into(), config_path: "/tmp/project/.cockpit/mcp.json".into(), expected_revision: "00".repeat(32), mutation_intent_hash: "11".repeat(32), patch: r#"{"operations":[{"operation":"delete_authored_server","name":"fixture"}]}"#.into(), secret_values_json: "{}".into() }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SaveAssistantDefinition { client_operation_id: "fixture-operation".into(), mutation_intent_hash: "22".repeat(32), project_root: "/tmp/project".into(), name: "helper".into(), markdown: "---\n---\n".into(), expected_revision: "rev-1".into(), expected_config_generation: 7 }, kind: "save_assistant_definition", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetAgentInventory { project_root: "/tmp/project".into() }, kind: "get_agent_inventory", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::GetAgentEditSnapshot { project_root: "/tmp/project".into(), name: "builder".into() }, kind: "get_agent_edit_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },

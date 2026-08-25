@@ -14438,18 +14438,48 @@ async fn apply_provider_mutation(
     result
 }
 
-fn local_operation_request_hash<T: serde::Serialize>(
+pub(super) fn local_operation_request_hash<T: serde::Serialize>(
     request: &T,
 ) -> std::result::Result<[u8; 32], ErrorPayload> {
     let encoded = zeroize::Zeroizing::new(serde_json::to_vec(request).map_err(internal)?);
     Ok(Sha256::digest(encoded.as_slice()).into())
 }
 
-fn local_operation_request_hash_hex(request_hash: &[u8; 32]) -> String {
+pub(super) fn local_operation_request_hash_hex(request_hash: &[u8; 32]) -> String {
     request_hash
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Test-only helper: register an MCP edit capability so `SaveMcpConfig`
+/// requests can pass the capability gate without first calling
+/// `GetProviderCatalogSnapshot`.
+#[cfg(test)]
+pub(super) fn register_mcp_edit_capability_for_test(
+    snapshot_session_id: &str,
+    owner: &str,
+    project_root: &str,
+    config_path: &str,
+    revision: &str,
+) {
+    let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+        .lock()
+        .expect("provider capability registry poisoned");
+    capabilities.insert(
+        snapshot_session_id.to_string(),
+        ProviderEditCapability {
+            owner: owner.to_string(),
+            project_root: project_root.to_string(),
+            target_path: std::path::PathBuf::new(),
+            layer_id: String::new(),
+            revision: String::new(),
+            config_generation: 0,
+            mcp_target_path: std::path::PathBuf::from(config_path),
+            mcp_revision: revision.to_string(),
+            expires_at: Instant::now() + PROVIDER_EDIT_CAPABILITY_TTL,
+        },
+    );
 }
 
 fn local_operation_stored_hash_hex(

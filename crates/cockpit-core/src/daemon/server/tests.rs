@@ -7545,6 +7545,23 @@ fn persistent_test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<Dae
     )
 }
 
+/// Compute the MCP layer revision the same way the dispatch does: hash the
+/// serialized prior on-disk MCP config (or the default config when the file
+/// is absent). Used by MCP save tests to supply a matching `expected_revision`.
+fn mcp_layer_revision_for_test(config_path: &str) -> String {
+    let config = match std::fs::read_to_string(config_path) {
+        Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).unwrap(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::mcp::config::McpConfig::default()
+        }
+        Err(error) => panic!("failed to read prior MCP config for revision: {error}"),
+    };
+    use sha2::Digest as _;
+    crate::intel::hex_lower(&sha2::Sha256::digest(
+        serde_json::to_string(&config).unwrap().as_bytes(),
+    ))
+}
+
 fn test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
     let db = Db::open_in_memory().expect("in-memory db");
     let locks = Arc::new(LockManager::in_memory(db.clone()));
@@ -8407,6 +8424,17 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
     store.save().unwrap();
     let mut state = owner_state();
     let root = tmp.path().to_string_lossy().into_owned();
+    let owner_digest = super::run_invocation::principal_digest(&state.principal);
+    let canonical_root = crate::secret_ownership::canonical_owner_root(&root);
+    let mcp_config_path = format!("{root}/.cockpit/mcp.json");
+    let expected_revision = mcp_layer_revision_for_test(&mcp_config_path);
+    super::dispatch::register_mcp_edit_capability_for_test(
+        "reject-literal-mcp-save",
+        &owner_digest,
+        &canonical_root,
+        &mcp_config_path,
+        &expected_revision,
+    );
     let cases = [
         serde_json::json!({
             "servers": {"literal-header": {
@@ -8427,17 +8455,27 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
             }}
         }),
     ];
-    for config in cases {
+    for (i, config) in cases.into_iter().enumerate() {
+        let config_json = serde_json::to_string(&config).unwrap();
+        let mutation_intent_hash = super::dispatch::local_operation_request_hash_hex(
+            &super::dispatch::local_operation_request_hash(&(
+                "save_mcp_config",
+                root.as_str(),
+                &config_json,
+                "[]",
+            ))
+            .unwrap(),
+        );
         let result = handle_request(
             Request::SaveMcpConfig {
-                client_operation_id: "reject-literal-mcp-save".into(),
+                client_operation_id: format!("reject-literal-mcp-save-{i}").into(),
                 project_root: root.clone(),
-                snapshot_capability: "snapshot".into(),
-                owner_root: root.clone(),
-                config_path: format!("{root}/.cockpit/mcp.json"),
-                expected_revision: "00".repeat(32),
-                mutation_intent_hash: "11".repeat(32),
-                config_json: serde_json::to_string(&config).unwrap(),
+                snapshot_capability: "reject-literal-mcp-save".into(),
+                owner_root: canonical_root.clone(),
+                config_path: mcp_config_path.clone(),
+                expected_revision: expected_revision.clone(),
+                mutation_intent_hash,
+                config_json,
                 secret_values_json: "{}".into(),
                 cleanup_names_json: "[]".into(),
             },
@@ -8467,22 +8505,43 @@ async fn mcp_save_stages_literal_and_persists_reference_only_config() {
     trust_workspace_root(&ctx, tmp.path()).await;
     let mut state = owner_state();
     let root = tmp.path().to_string_lossy().into_owned();
+    let owner_digest = super::run_invocation::principal_digest(&state.principal);
+    let canonical_root = crate::secret_ownership::canonical_owner_root(&root);
+    let mcp_config_path = format!("{root}/.cockpit/mcp.json");
+    let expected_revision = mcp_layer_revision_for_test(&mcp_config_path);
+    super::dispatch::register_mcp_edit_capability_for_test(
+        "staged-mcp-save",
+        &owner_digest,
+        &canonical_root,
+        &mcp_config_path,
+        &expected_revision,
+    );
     let config = serde_json::json!({
         "servers": {"staged": {
             "transport": "streamable", "endpoint": "https://mcp.example.test",
             "auth": {"kind": "header", "value": "Bearer staged-value"}
         }}
     });
+    let config_json = serde_json::to_string(&config).unwrap();
+    let mutation_intent_hash = super::dispatch::local_operation_request_hash_hex(
+        &super::dispatch::local_operation_request_hash(&(
+            "save_mcp_config",
+            root.as_str(),
+            &config_json,
+            "[]",
+        ))
+        .unwrap(),
+    );
     let response = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "staged-mcp-save".into(),
             project_root: root,
-            snapshot_capability: "snapshot".into(),
-            owner_root: "/tmp/project".into(),
-            config_path: "/tmp/project/.cockpit/mcp.json".into(),
-            expected_revision: "00".repeat(32),
-            mutation_intent_hash: "11".repeat(32),
-            config_json: serde_json::to_string(&config).unwrap(),
+            snapshot_capability: "staged-mcp-save".into(),
+            owner_root: canonical_root,
+            config_path: mcp_config_path,
+            expected_revision,
+            mutation_intent_hash,
+            config_json,
             secret_values_json: serde_json::json!({
                 "mcp:staged:header": "Bearer staged-value"
             })
@@ -8555,16 +8614,37 @@ async fn mcp_save_cannot_overwrite_a_provider_claimed_named_secret() {
         serde_json::Value::String("mcp-attacker-value".into()),
     );
     let mut state = owner_state();
+    let owner_digest = super::run_invocation::principal_digest(&state.principal);
+    let canonical_root = crate::secret_ownership::canonical_owner_root(&root);
+    let mcp_config_path = format!("{root}/.cockpit/mcp.json");
+    let expected_revision = mcp_layer_revision_for_test(&mcp_config_path);
+    super::dispatch::register_mcp_edit_capability_for_test(
+        "ownership-race-mcp-save",
+        &owner_digest,
+        &canonical_root,
+        &mcp_config_path,
+        &expected_revision,
+    );
+    let config_json = serde_json::to_string(&config).unwrap();
+    let mutation_intent_hash = super::dispatch::local_operation_request_hash_hex(
+        &super::dispatch::local_operation_request_hash(&(
+            "save_mcp_config",
+            root.as_str(),
+            &config_json,
+            "[]",
+        ))
+        .unwrap(),
+    );
     let result = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "ownership-race-mcp-save".into(),
             project_root: root.clone(),
-            snapshot_capability: "snapshot".into(),
-            owner_root: root.clone(),
-            config_path: format!("{root}/.cockpit/mcp.json"),
-            expected_revision: "00".repeat(32),
-            mutation_intent_hash: "11".repeat(32),
-            config_json: serde_json::to_string(&config).unwrap(),
+            snapshot_capability: "ownership-race-mcp-save".into(),
+            owner_root: canonical_root.clone(),
+            config_path: mcp_config_path.clone(),
+            expected_revision: expected_revision.clone(),
+            mutation_intent_hash,
+            config_json,
             secret_values_json: serde_json::Value::Object(secret_values).to_string().into(),
             cleanup_names_json: "[]".into(),
         },
@@ -8991,16 +9071,37 @@ async fn mcp_save_rejects_unstaged_reference_to_provider_claimed_secret() {
         }}
     });
     let mut state = owner_state();
+    let owner_digest = super::run_invocation::principal_digest(&state.principal);
+    let canonical_root = crate::secret_ownership::canonical_owner_root(&root);
+    let mcp_config_path = format!("{root}/.cockpit/mcp.json");
+    let expected_revision = mcp_layer_revision_for_test(&mcp_config_path);
+    super::dispatch::register_mcp_edit_capability_for_test(
+        "foreign-reference-mcp-save",
+        &owner_digest,
+        &canonical_root,
+        &mcp_config_path,
+        &expected_revision,
+    );
+    let config_json = serde_json::to_string(&config).unwrap();
+    let mutation_intent_hash = super::dispatch::local_operation_request_hash_hex(
+        &super::dispatch::local_operation_request_hash(&(
+            "save_mcp_config",
+            root.as_str(),
+            &config_json,
+            "[]",
+        ))
+        .unwrap(),
+    );
     let result = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "foreign-reference-mcp-save".into(),
             project_root: root.clone(),
-            snapshot_capability: "snapshot".into(),
-            owner_root: root.clone(),
-            config_path: format!("{root}/.cockpit/mcp.json"),
-            expected_revision: "00".repeat(32),
-            mutation_intent_hash: "11".repeat(32),
-            config_json: serde_json::to_string(&config).unwrap(),
+            snapshot_capability: "foreign-reference-mcp-save".into(),
+            owner_root: canonical_root.clone(),
+            config_path: mcp_config_path.clone(),
+            expected_revision: expected_revision.clone(),
+            mutation_intent_hash,
+            config_json,
             secret_values_json: "{}".into(),
             cleanup_names_json: "[]".into(),
         },
@@ -9171,22 +9272,45 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
     store.set_named_secret("unrelated", "must-survive");
     store.save().unwrap();
     let mut state = owner_state();
+    let root = tmp.path().to_string_lossy().into_owned();
+    let owner_digest = super::run_invocation::principal_digest(&state.principal);
+    let canonical_root = crate::secret_ownership::canonical_owner_root(&root);
+    let mcp_config_path = tmp
+        .path()
+        .join(".cockpit/mcp.json")
+        .to_string_lossy()
+        .into_owned();
+    let expected_revision = mcp_layer_revision_for_test(&mcp_config_path);
+    super::dispatch::register_mcp_edit_capability_for_test(
+        "cleanup-mcp-save",
+        &owner_digest,
+        &canonical_root,
+        &mcp_config_path,
+        &expected_revision,
+    );
+    let config_json = serde_json::json!({"servers": {}}).to_string();
+    let cleanup_names_json = serde_json::json!(["unrelated"]).to_string();
+    let mutation_intent_hash = super::dispatch::local_operation_request_hash_hex(
+        &super::dispatch::local_operation_request_hash(&(
+            "save_mcp_config",
+            &root,
+            &config_json,
+            &cleanup_names_json,
+        ))
+        .unwrap(),
+    );
     let response = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "cleanup-mcp-save".into(),
-            project_root: tmp.path().to_string_lossy().into_owned(),
-            snapshot_capability: "snapshot".into(),
-            owner_root: tmp.path().to_string_lossy().into_owned(),
-            config_path: tmp
-                .path()
-                .join(".cockpit/mcp.json")
-                .to_string_lossy()
-                .into_owned(),
-            expected_revision: "00".repeat(32),
-            mutation_intent_hash: "11".repeat(32),
-            config_json: serde_json::json!({"servers": {}}).to_string(),
+            project_root: root,
+            snapshot_capability: "cleanup-mcp-save".into(),
+            owner_root: canonical_root,
+            config_path: mcp_config_path,
+            expected_revision,
+            mutation_intent_hash,
+            config_json,
             secret_values_json: "{}".into(),
-            cleanup_names_json: serde_json::json!(["unrelated"]).to_string(),
+            cleanup_names_json,
         },
         &mut state,
         &ctx,

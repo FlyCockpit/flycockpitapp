@@ -1792,7 +1792,8 @@ mod tests {
         EnvSnapshot::new(EnvSnapshotSource::DaemonStart, HashMap::new())
     }
 
-    async fn create_helper_assistant(db: &Db, home_dir: std::path::PathBuf) {
+    async fn create_helper_assistant(db: &Db) {
+        let home_dir = crate::assistants::default_home_dir("helper-bot").unwrap();
         create_assistant(
             db,
             CreateAssistantSpec {
@@ -2622,6 +2623,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_unknown_assistant() {
+        let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let scheduler = DaemonScheduler::new(
@@ -2640,7 +2642,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("helper-bot"), "{error:#}");
 
-        create_helper_assistant(&db, tmp.path().join("assistants/helper-bot")).await;
+        create_helper_assistant(&db).await;
         scheduler
             .create_job(run_prompt_job("job-present", "helper-bot", &project_root))
             .await
@@ -2649,6 +2651,7 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_runprompt_creates_owned_session() {
+        let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let project_root = tmp.path().join("project");
@@ -2656,7 +2659,7 @@ mod tests {
         db.set_workspace_trust(&project_root, WorkspaceTrustMode::Trust)
             .await
             .unwrap();
-        create_helper_assistant(&db, tmp.path().join("assistants/helper-bot")).await;
+        create_helper_assistant(&db).await;
         let runner = Arc::new(FakePromptRunner::default());
         let scheduler = DaemonScheduler::new(
             db.clone(),
@@ -2699,6 +2702,7 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_respects_trust() {
+        let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let project_root = tmp.path().join("project");
@@ -2706,7 +2710,7 @@ mod tests {
         db.set_workspace_trust(&project_root, WorkspaceTrustMode::Untrusted)
             .await
             .unwrap();
-        create_helper_assistant(&db, tmp.path().join("assistants/helper-bot")).await;
+        create_helper_assistant(&db).await;
         let registry = production_registry(db.clone());
         let scheduler = DaemonScheduler::new(
             db.clone(),

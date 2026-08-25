@@ -15504,7 +15504,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "fs_list"
         | "fs_write"
         | "fs_create_dir"
-        | "lsp_control"
         | "read_session_messages"
         | "read_client_submission_receipt"
         | "read_history_page"
@@ -15516,7 +15515,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "rename_session"
         | "share_session"
         | "record_session_note"
-        | "get_inventory_bundle"
         | "resource_snapshot"
         | "promote_resource"
         | "set_approval_mode"
@@ -15604,6 +15602,10 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // the same way (no bytes) — a BadRequest, once past the owner gate.
         | "read_bulk_transfer_chunk"
         | "read_redacted_export_chunk" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // `lsp_control` requires an attached session in the dispatch path;
+        // the matrix probe sends it without a prior attach, so the owner-
+        // allowed cell surfaces `NotAttached` after authz.
+        "lsp_control" | "get_inventory_bundle" => AuthzAllowedOutcome::Error(ErrorCode::NotAttached),
         "terminal_ingress_begin"
         | "terminal_ingress_chunk"
         | "terminal_ingress_finish"
@@ -15754,7 +15756,9 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "get_assistant"
         | "get_session_compactions"
         | "diagnose_media_reservation"
-        | "get_doctor_snapshot" => AuthzAllowedOutcome::Response,
+        | "get_doctor_snapshot"
+        | "get_agent_inventory"
+        | "get_extended_config_snapshot" => AuthzAllowedOutcome::Response,
         // Coordinator failures are carried in a typed redacted DTO, so every
         // owner-authorized installation endpoint reaches a response rather
         // than a dispatch-level error.
@@ -15779,7 +15783,15 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "import_kcl_packages"
         | "purge_ended_sessions"
         | "delete_assistant"
-        | "repair_media_reservation" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        | "repair_media_reservation"
+        | "save_assistant_definition"
+        | "begin_agent_editor_lease"
+        | "complete_agent_editor_lease"
+        | "apply_extended_config_patch"
+        | "get_agent_edit_snapshot" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // `mutate_agent` with `ResetAllBuiltins` and no expected_revision fails
+        // with `Conflict` ("agent mutation requires an expected revision").
+        "mutate_agent" => AuthzAllowedOutcome::Error(ErrorCode::Conflict),
         other => panic!("unhandled authz allowed outcome for {other}"),
     }
 }
@@ -15829,6 +15841,12 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("delete_project_note"),
         authz_owner_only("list_assistants"),
         authz_owner_only("upsert_assistant"),
+        authz_owner_only("save_assistant_definition"),
+        authz_owner_only("get_agent_inventory"),
+        authz_owner_only("get_agent_edit_snapshot"),
+        authz_owner_only("mutate_agent"),
+        authz_owner_only("begin_agent_editor_lease"),
+        authz_owner_only("complete_agent_editor_lease"),
         authz_owner_only("resolve_assistant_session"),
         authz_owner_only("create_assistant_session"),
         authz_session_writer("auto_title"),
@@ -15957,6 +15975,8 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("apply_setup_wizard"),
         authz_owner_only("save_mcp_config"),
         authz_owner_only("save_extended_config"),
+        authz_owner_only("apply_extended_config_patch"),
+        authz_owner_only("get_extended_config_snapshot"),
         authz_owner_only("export_policy"),
         authz_owner_only("import_policy"),
         authz_owner_only("get_image_spend_policy"),
@@ -17869,6 +17889,49 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 installation_id: Some(Uuid::new_v4().to_string()),
             })
         }
+        "save_assistant_definition" => Request::SaveAssistantDefinition {
+            name: "authz-matrix-probe".into(),
+            markdown: "---\ndescription: probe\n---\nbody".into(),
+            expected_revision: "rev".into(),
+        },
+        "get_agent_inventory" => Request::GetAgentInventory {
+            project_root: project_root.to_string_lossy().into_owned(),
+        },
+        "get_agent_edit_snapshot" => Request::GetAgentEditSnapshot {
+            project_root: project_root.to_string_lossy().into_owned(),
+            name: "build".into(),
+        },
+        "mutate_agent" => Request::MutateAgent {
+            project_root: project_root.to_string_lossy().into_owned(),
+            mutation: cockpit_proto::AgentMutation::ResetAllBuiltins,
+            expected_revision: None,
+        },
+        "begin_agent_editor_lease" => Request::BeginAgentEditorLease {
+            project_root: project_root.to_string_lossy().into_owned(),
+            name: "build".into(),
+            expected_revision: "rev".into(),
+        },
+        "complete_agent_editor_lease" => Request::CompleteAgentEditorLease {
+            project_root: project_root.to_string_lossy().into_owned(),
+            lease_id: "lease".into(),
+            markdown: None,
+        },
+        "get_extended_config_snapshot" => Request::GetExtendedConfigSnapshot {
+            project_root: project_root.to_string_lossy().into_owned(),
+            snapshot_session_id: "snap".into(),
+        },
+        "apply_extended_config_patch" => Request::ApplyExtendedConfigPatch {
+            project_root: project_root.to_string_lossy().into_owned(),
+            layer_id: "layer".into(),
+            patch: cockpit_proto::ExtendedConfigPatch {
+                operations: Vec::new(),
+                materialize: false,
+                denylist: Vec::new(),
+                redacted_mutations: Vec::new(),
+            },
+            expected_revision: "rev".into(),
+            snapshot_session_id: "snap".into(),
+        },
         other => panic!("unhandled authz matrix request kind {other}"),
     }
 }
@@ -22765,6 +22828,9 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "list_failed_tool_calls",
         "get_session_compactions",
         "get_assistant",
+        "get_agent_edit_snapshot",
+        "get_agent_inventory",
+        "get_extended_config_snapshot",
         "diagnose_media_reservation",
         "get_doctor_snapshot",
         "get_agent_inventory",
@@ -24677,6 +24743,14 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::AgentInstallationSubmitChoice(cockpit_proto::AgentInstallationSubmitChoiceV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, continuation_token: Uuid::new_v4().to_string(), choice_id: Some("choice-a".into()), defer: false }), kind: "agent_installation_submit_choice", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::AgentInstallationList(cockpit_proto::AgentInstallationReadV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, installation_id: None }), kind: "agent_installation_list", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::AgentInstallationInspect(cockpit_proto::AgentInstallationReadV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, installation_id: Some(Uuid::new_v4().to_string()) }), kind: "agent_installation_inspect", session_id: None, audit_path: None, mutating: false },
+        CommandMetadataCase { request: Request::SaveAssistantDefinition { name: "a".into(), markdown: "---\ndescription: test\n---\nbody".into(), expected_revision: "rev".into() }, kind: "save_assistant_definition", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::GetAgentInventory { project_root: project_root.clone() }, kind: "get_agent_inventory", session_id: None, audit_path: Some("/repo"), mutating: false },
+        CommandMetadataCase { request: Request::GetAgentEditSnapshot { project_root: project_root.clone(), name: "build".into() }, kind: "get_agent_edit_snapshot", session_id: None, audit_path: Some("/repo"), mutating: false },
+        CommandMetadataCase { request: Request::MutateAgent { project_root: project_root.clone(), mutation: cockpit_proto::AgentMutation::ResetAllBuiltins, expected_revision: None }, kind: "mutate_agent", session_id: None, audit_path: Some("/repo"), mutating: true },
+        CommandMetadataCase { request: Request::BeginAgentEditorLease { project_root: project_root.clone(), name: "build".into(), expected_revision: "rev".into() }, kind: "begin_agent_editor_lease", session_id: None, audit_path: Some("/repo"), mutating: true },
+        CommandMetadataCase { request: Request::CompleteAgentEditorLease { project_root: project_root.clone(), lease_id: "lease".into(), markdown: None }, kind: "complete_agent_editor_lease", session_id: None, audit_path: Some("/repo"), mutating: true },
+        CommandMetadataCase { request: Request::GetExtendedConfigSnapshot { project_root: project_root.clone(), snapshot_session_id: "snap".into() }, kind: "get_extended_config_snapshot", session_id: None, audit_path: Some("/repo"), mutating: false },
+        CommandMetadataCase { request: Request::ApplyExtendedConfigPatch { project_root: project_root.clone(), layer_id: "layer".into(), patch: cockpit_proto::ExtendedConfigPatch { operations: Vec::new(), materialize: false, denylist: Vec::new(), redacted_mutations: Vec::new() }, expected_revision: "rev".into(), snapshot_session_id: "snap".into() }, kind: "apply_extended_config_patch", session_id: None, audit_path: Some("/repo"), mutating: true },
     ]);
 
     // Drift-proof exhaustiveness (`daemon-trust-test-isolation.md`): the

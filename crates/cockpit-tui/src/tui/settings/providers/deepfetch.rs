@@ -150,6 +150,10 @@ impl DeepFetchState {
             self.spinner_tick = self.spinner_tick.wrapping_add(1);
         }
     }
+
+    pub(super) fn is_running(&self) -> bool {
+        self.phase == DeepFetchPhase::Running
+    }
 }
 
 async fn run_deep_fetch(
@@ -291,10 +295,6 @@ impl DeepFetchState {
 
     pub(super) fn plan_total_requests(&self) -> usize {
         self.plan.total_requests()
-    }
-
-    pub(super) fn is_running(&self) -> bool {
-        self.phase == DeepFetchPhase::Running
     }
 
     pub(super) fn is_done(&self) -> bool {

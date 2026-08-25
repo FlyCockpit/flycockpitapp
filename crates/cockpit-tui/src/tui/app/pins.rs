@@ -878,13 +878,10 @@ impl App {
 mod tests {
     use super::{App, CopyShape, pin_refresh_call_count, reset_pin_refresh_call_count};
     use crate::tui::settings::Dialog;
-    use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use tokio::sync::mpsc;
 
-    use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
+    use crate::tui::agent_runner::{AgentRunner, TestRunnerOverrides};
     use crate::tui::context_menu::{ContextMenu, ContextMenuAction};
     use crate::tui::history::{HistoryEntry, ToolCall, ToolCallState};
 
@@ -900,50 +897,7 @@ mod tests {
     }
 
     fn runner() -> AgentRunner {
-        let (input_tx, _input_rx) = mpsc::channel(1);
-        let (record_tx, _record_rx) = mpsc::channel(1);
-        let (control_tx, _control_rx) = mpsc::channel(1);
-        let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
-        AgentRunner {
-            input_tx,
-            record_tx,
-            control_tx,
-            attached_request_tx,
-            events: Arc::new(Mutex::new(Vec::new())),
-            event_notify: Arc::new(tokio::sync::Notify::new()),
-            active_agent: Arc::new(Mutex::new("Build".to_string())),
-            active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
-            skill_inventory_names: Arc::new(Mutex::new(None)),
-            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
-            active_model_state: None,
-            session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
-            attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            submission_session_tx: tokio::sync::watch::channel(
-                crate::tui::agent_runner::SubmissionSessionBinding::unbound(),
-            )
-            .0,
-            awaiting_durable: Default::default(),
-            short_id: "abc123".to_string(),
-            project_id: "project".to_string(),
-            usage: UsageCounts::default(),
-            owns_daemon: false,
-            socket: PathBuf::from("/tmp/cockpit-test.sock"),
-            history: Vec::new(),
-            paused_work: Vec::new(),
-            repair_required: None,
-            btw_fork: None,
-            daemon_version: "test".to_string(),
-            daemon_compatible: true,
-            current_client: None,
-            attach_context: None,
-            last_applied_seq: None,
-            client_tasks: ClientTasks::default(),
-            #[cfg(test)]
-            test_session_switch_rx: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            test_force_can_switch: false,
-            test_advance_epoch_when_switch_task_created: false,
-        }
+        AgentRunner::test_fixture(TestRunnerOverrides::default())
     }
 
     fn user(seq: Option<i64>) -> HistoryEntry {

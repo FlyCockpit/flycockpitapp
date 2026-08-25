@@ -584,6 +584,98 @@ fn blocking_worker_transport_findings(source: &str) -> Vec<String> {
     blocking_worker_transport_findings_with_authority(source, &authority, false)
 }
 
+const ALLOWED_LINES: &[(&str, &str)] = &[
+    (
+        "crates/cockpit-tui/src/tui/settings/agents_page.rs",
+        "cockpit_config::config::write_config_bytes_atomic(&staging.path, text.as_bytes())",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/async_action.rs",
+        "std::fs::create_dir_all(&dir)?",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/async_action.rs",
+        "std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/async_action.rs",
+        "let mut file = std::fs::OpenOptions::new()",
+    ),
+    ("crates/cockpit-tui/src/tui/async_action.rs", ".write(true)"),
+    (
+        "crates/cockpit-tui/src/tui/async_action.rs",
+        ".create_new(true)",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/image_path_probe.rs",
+        "std::fs::OpenOptions::new() // Unix no-follow read-only handle.",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/image_path_probe.rs",
+        "std::fs::OpenOptions::new() // Windows reparse-point read-only handle.",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/async_action.rs",
+        "file.write_all(format!(\"v1\\n{name}\\n\").as_bytes())?",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/async_action.rs",
+        "match tokio::fs::remove_file(&path).await",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/app/export_actions.rs",
+        "let _ = tokio::fs::remove_file(entry.path()).await",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/app/export_actions.rs",
+        "tokio::fs::create_dir_all(exports_dir)",
+    ),
+    (
+        "crates/cockpit-tui/src/clipboard/recovery/unix.rs",
+        "std::fs::create_dir_all(parent).map_err(|e| io_err(\"creating state directory\", e))?;",
+    ),
+    (
+        "crates/cockpit-tui/src/clipboard/recovery/windows.rs",
+        "std::fs::create_dir_all(parent)?",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/settings/category.rs",
+        "temp.write_all(text.as_bytes())",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/app/panes.rs",
+        "if let Err(e) = temp.write_all(editor_text.as_bytes()) {",
+    ),
+    (
+        "crates/cockpit-tui/src/clipboard/service.rs",
+        "let _ = stdin.write_all(text.as_bytes());",
+    ),
+    (
+        "crates/cockpit-tui/src/clipboard/executable.rs",
+        "let _ = stdin.write_all(bytes);",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/app/mod.rs",
+        "let _ = out.write_all(sequence.as_bytes());",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/app/mod.rs",
+        "let _ = out.write_all(b\"\\x07\");",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/app/mod.rs",
+        "let _ = out.write_all(escapes.as_bytes());",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/pty.rs",
+        "let _ = self.writer.write_all(bytes);",
+    ),
+    (
+        "crates/cockpit-tui/src/tui/links.rs",
+        "lock.write_all(&bytes)?;",
+    ),
+];
+
 #[test]
 fn blocking_daemon_transport_is_structurally_worker_owned() {
     fn visit_sources(path: &Path, sources: &mut Vec<(PathBuf, String)>) {
@@ -1067,97 +1159,6 @@ fn production_filesystem_mutations_have_device_ui_owners() {
     // Every exception is a single reviewed source line, not a whole-file
     // exemption. Adding a second mutation in an allowed host-integration file
     // must therefore update this inventory explicitly.
-    const ALLOWED_LINES: &[(&str, &str)] = &[
-        (
-            "crates/cockpit-tui/src/tui/settings/agents_page.rs",
-            "cockpit_config::config::write_config_bytes_atomic(&staging.path, text.as_bytes())",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/async_action.rs",
-            "std::fs::create_dir_all(&dir)?",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/async_action.rs",
-            "std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/async_action.rs",
-            "let mut file = std::fs::OpenOptions::new()",
-        ),
-        ("crates/cockpit-tui/src/tui/async_action.rs", ".write(true)"),
-        (
-            "crates/cockpit-tui/src/tui/async_action.rs",
-            ".create_new(true)",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/image_path_probe.rs",
-            "std::fs::OpenOptions::new() // Unix no-follow read-only handle.",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/image_path_probe.rs",
-            "std::fs::OpenOptions::new() // Windows reparse-point read-only handle.",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/async_action.rs",
-            "file.write_all(format!(\"v1\\n{name}\\n\").as_bytes())?",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/async_action.rs",
-            "match tokio::fs::remove_file(&path).await",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/app/export_actions.rs",
-            "let _ = tokio::fs::remove_file(entry.path()).await",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/app/export_actions.rs",
-            "tokio::fs::create_dir_all(exports_dir)",
-        ),
-        (
-            "crates/cockpit-tui/src/clipboard/recovery/unix.rs",
-            "std::fs::create_dir_all(parent).map_err(|e| io_err(\"creating state directory\", e))?;",
-        ),
-        (
-            "crates/cockpit-tui/src/clipboard/recovery/windows.rs",
-            "std::fs::create_dir_all(parent)?",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/settings/category.rs",
-            "temp.write_all(text.as_bytes())",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/app/panes.rs",
-            "if let Err(e) = temp.write_all(editor_text.as_bytes()) {",
-        ),
-        (
-            "crates/cockpit-tui/src/clipboard/service.rs",
-            "let _ = stdin.write_all(text.as_bytes());",
-        ),
-        (
-            "crates/cockpit-tui/src/clipboard/executable.rs",
-            "let _ = stdin.write_all(bytes);",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/app/mod.rs",
-            "let _ = out.write_all(sequence.as_bytes());",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/app/mod.rs",
-            "let _ = out.write_all(b\"\\x07\");",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/app/mod.rs",
-            "let _ = out.write_all(escapes.as_bytes());",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/pty.rs",
-            "let _ = self.writer.write_all(bytes);",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/links.rs",
-            "lock.write_all(&bytes)?;",
-        ),
-    ];
     fn visit(
         path: &Path,
         findings: &mut Vec<String>,

@@ -253,7 +253,7 @@ pub(super) enum WizardControlId {
     EditText,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct OAuthFlowId(pub u128);
+pub(crate) struct OAuthFlowId(pub u128);
 
 impl OAuthFlowId {
     /// Stable owner idempotency key for acknowledgement retries in this pane.

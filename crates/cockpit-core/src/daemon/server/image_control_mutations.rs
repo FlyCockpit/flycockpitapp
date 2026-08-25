@@ -1079,8 +1079,9 @@ pub(crate) async fn dispatch_image_control_mutation(
                 "INSERT INTO image_config_mutation_journals
              (owner_digest,client_operation_id,request_hash,fencing_generation,
               mutation_intent_hash,project_root,target_path,consumed_revision,
-              intended_revision,consumed_generation,terminal_response_json,created_at_unix_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+              intended_revision,consumed_generation,publication_phase,
+              terminal_response_json,created_at_unix_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'prepared',?11,?12)",
                 rusqlite::params![
                     journal_owner,
                     journal_operation,
@@ -1105,10 +1106,39 @@ pub(crate) async fn dispatch_image_control_mutation(
         cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
     let precommit = read_document(&target).map_err(internal)?;
     if content_revision(ctx, &precommit) != consumed_revision {
-        return Err(conflict(
-            "image configuration target changed immediately before commit",
-        ));
+        return Err(settle_prepublication_conflict(
+            ctx,
+            owner,
+            client_operation_id,
+            request_hash,
+            fencing_generation,
+        )
+        .await?);
     }
+    let authorize_owner = owner.clone();
+    let authorize_operation = client_operation_id.clone();
+    ctx.db
+        .write(move |conn| {
+            let changed = conn.execute(
+                "UPDATE image_config_mutation_journals
+                    SET publication_phase='publication_authorized'
+                  WHERE owner_digest=?1 AND client_operation_id=?2
+                    AND request_hash=?3 AND fencing_generation=?4
+                    AND publication_phase='prepared'",
+                rusqlite::params![
+                    authorize_owner,
+                    authorize_operation,
+                    request_hash.as_slice(),
+                    fencing_generation
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("image mutation lost its prepared publication journal");
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
     let published_generation = if result_revision != consumed_revision {
         cockpit_config::config::write_config_bytes_atomic(&target, &intended).map_err(internal)?;
         inventory::publish_committed_config_generation()
@@ -1175,20 +1205,97 @@ pub(crate) async fn dispatch_image_control_mutation(
     Ok(response)
 }
 
+fn bounded_prepublication_conflict() -> ErrorPayload {
+    ErrorPayload {
+        code: ErrorCode::Conflict,
+        // This is deliberately the same bounded public error persisted by the
+        // generic local-operation terminalizer. Keeping it path- and
+        // document-free also makes its second, idempotent settlement a no-op.
+        message: "the local operation was rejected; inspect daemon diagnostics for details"
+            .to_owned(),
+    }
+}
+
+async fn settle_prepublication_conflict(
+    ctx: &DaemonContext,
+    owner: String,
+    operation: String,
+    request_hash: [u8; 32],
+    fence: i64,
+) -> std::result::Result<ErrorPayload, ErrorPayload> {
+    let error = bounded_prepublication_conflict();
+    let terminal = serde_json::to_string(&error).map_err(internal)?;
+    ctx.db
+        .transaction(move |conn| {
+            let changed = conn.execute(
+                "UPDATE local_operation_receipts
+                    SET state='terminal_error',terminal_outcome_json=?5,
+                        execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                  WHERE owner_digest=?1 AND client_operation_id=?2
+                    AND request_hash=?3 AND fencing_generation=?4
+                    AND state='executing'
+                    AND EXISTS (
+                        SELECT 1 FROM image_config_mutation_journals journal
+                         WHERE journal.owner_digest=?1
+                           AND journal.client_operation_id=?2
+                           AND journal.request_hash=?3
+                           AND journal.fencing_generation=?4
+                           AND journal.publication_phase='prepared'
+                    )",
+                rusqlite::params![
+                    owner,
+                    operation,
+                    request_hash.as_slice(),
+                    fence,
+                    terminal,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("image mutation lost its exact prepublication receipt");
+            }
+            let retired = conn.execute(
+                "DELETE FROM image_config_mutation_journals
+                  WHERE owner_digest=?1 AND client_operation_id=?2
+                    AND request_hash=?3 AND fencing_generation=?4
+                    AND publication_phase='prepared'",
+                rusqlite::params![owner, operation, request_hash.as_slice(), fence],
+            )?;
+            if retired != 1 {
+                anyhow::bail!("image mutation lost its prepared recovery journal");
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
+    Ok(error)
+}
+
 /// Resolve secret-safe image publication journals before socket publication.
 /// An intended hash proves the atomic file commit; a consumed hash proves no
 /// commit. Any third value is external divergence and fails boot closed.
 pub(crate) async fn recover_image_config_mutation_journals(
     ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<u64, ErrorPayload> {
-    type Row = (String, String, Vec<u8>, i64, String, String, String, String);
+    type Row = (
+        String,
+        String,
+        Vec<u8>,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+    );
     let rows: Vec<Row> = ctx
         .db
         .read(|conn| {
             let mut statement = conn.prepare(
                 "SELECT journal.owner_digest,journal.client_operation_id,journal.request_hash,
                     journal.fencing_generation,journal.target_path,journal.consumed_revision,
-                    journal.intended_revision,journal.terminal_response_json
+                    journal.intended_revision,journal.publication_phase,
+                    journal.terminal_response_json
                FROM image_config_mutation_journals journal
                JOIN local_operation_receipts receipt
                  ON receipt.owner_digest=journal.owner_digest
@@ -1206,6 +1313,7 @@ pub(crate) async fn recover_image_config_mutation_journals(
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1214,7 +1322,18 @@ pub(crate) async fn recover_image_config_mutation_journals(
         .await
         .map_err(internal)?;
     let mut recovered = 0_u64;
-    for (owner, operation, request_hash, fence, target, consumed, intended, response_json) in rows {
+    for (
+        owner,
+        operation,
+        request_hash,
+        fence,
+        target,
+        consumed,
+        intended,
+        publication_phase,
+        response_json,
+    ) in rows
+    {
         let hash: [u8; 32] = request_hash
             .try_into()
             .map_err(|_| internal("image mutation journal request hash is malformed"))?;
@@ -1243,7 +1362,29 @@ pub(crate) async fn recover_image_config_mutation_journals(
                 conn.execute("DELETE FROM image_config_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2", rusqlite::params![owner,operation])?;
                 Ok(())
             }).await.map_err(internal)?;
-        } else if actual == consumed {
+        } else if publication_phase == "prepared" {
+            // No process is allowed to replace the target until the durable
+            // phase transition below the live CAS. Therefore any non-intended
+            // value while still prepared proves this operation did not
+            // publish, even if an external writer changed the file after the
+            // journal was inserted. Retire it instead of poisoning boot.
+            let error = bounded_prepublication_conflict();
+            let terminal = serde_json::to_string(&error).map_err(internal)?;
+            ctx.db.transaction(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE local_operation_receipts SET state='terminal_error',terminal_outcome_json=?5,execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                     WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4",
+                    rusqlite::params![owner,operation,hash.as_slice(),fence,terminal,chrono::Utc::now().timestamp_millis()],
+                )?;
+                if changed != 1 { anyhow::bail!("image mutation recovery lost its exact prepared receipt"); }
+                let retired = conn.execute(
+                    "DELETE FROM image_config_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4 AND publication_phase='prepared'",
+                    rusqlite::params![owner,operation,hash.as_slice(),fence],
+                )?;
+                if retired != 1 { anyhow::bail!("image mutation recovery lost its prepared journal"); }
+                Ok(())
+            }).await.map_err(internal)?;
+        } else if publication_phase == "publication_authorized" && actual == consumed {
             let error = ErrorPayload {
                 code: ErrorCode::Conflict,
                 message:
@@ -1261,9 +1402,13 @@ pub(crate) async fn recover_image_config_mutation_journals(
                 conn.execute("DELETE FROM image_config_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2", rusqlite::params![owner,operation])?;
                 Ok(())
             }).await.map_err(internal)?;
-        } else {
+        } else if publication_phase == "publication_authorized" {
             return Err(conflict(
                 "image configuration diverged from both consumed and intended revisions during recovery",
+            ));
+        } else {
+            return Err(internal(
+                "image mutation journal has an invalid publication phase",
             ));
         }
         recovered = recovered.saturating_add(1);

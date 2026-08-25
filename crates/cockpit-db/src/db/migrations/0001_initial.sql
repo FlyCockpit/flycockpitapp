@@ -6680,6 +6680,7 @@ CREATE TABLE image_config_mutation_journals (
     consumed_revision      TEXT NOT NULL CHECK (length(consumed_revision) = 64 AND consumed_revision = lower(consumed_revision)),
     intended_revision      TEXT NOT NULL CHECK (length(intended_revision) = 64 AND intended_revision = lower(intended_revision)),
     consumed_generation    INTEGER NOT NULL CHECK (consumed_generation >= 0),
+    publication_phase      TEXT NOT NULL CHECK (publication_phase IN ('prepared', 'publication_authorized')),
     terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
     created_at_unix_ms     INTEGER NOT NULL,
     PRIMARY KEY (owner_digest, client_operation_id),
@@ -6703,9 +6704,10 @@ WHEN NEW.owner_digest <> OLD.owner_digest
   OR NEW.consumed_revision <> OLD.consumed_revision
   OR NEW.intended_revision <> OLD.intended_revision
   OR NEW.consumed_generation <> OLD.consumed_generation
+  OR (OLD.publication_phase = 'publication_authorized' AND NEW.publication_phase <> OLD.publication_phase)
   OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
 BEGIN
-    SELECT RAISE(ABORT, 'image config mutation journal is immutable');
+    SELECT RAISE(ABORT, 'image config mutation journal identity is immutable and publication phase is monotonic');
 END;
 
 -- Durable ownership claims for daemon-generated provider/MCP named secrets.

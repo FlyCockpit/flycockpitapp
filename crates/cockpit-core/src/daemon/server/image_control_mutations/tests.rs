@@ -687,6 +687,9 @@ fn durability_source_ratchet_requires_exact_cas_journal_and_post_commit_publicat
         "exact_target_path",
         "registry_from_document(consumed.as_slice())",
         "image_config_mutation_journals",
+        "publication_phase",
+        "publication_authorized",
+        "settle_prepublication_conflict",
         "local_operation_receipts",
         "write_config_bytes_atomic",
         "publish_committed_config_generation",
@@ -724,6 +727,41 @@ fn durability_source_ratchet_requires_exact_cas_journal_and_post_commit_publicat
         "terminal-looking receipts must not retire journals before file reconciliation"
     );
     assert!(recovery.contains("if actual == intended"));
-    assert!(recovery.contains("else if actual == consumed"));
+    assert!(recovery.contains("publication_phase == \"prepared\""));
+    assert!(
+        recovery.contains("publication_phase == \"publication_authorized\" && actual == consumed")
+    );
     assert!(recovery.contains("diverged from both consumed and intended"));
+}
+
+#[test]
+fn durability_source_ratchet_distinguishes_prepublication_conflict_from_ambiguity() {
+    let source = include_str!("../image_control_mutations.rs");
+    let journal_insert = source
+        .find("'prepared'")
+        .expect("journal insert records prepared phase");
+    let live_cas = source
+        .find("let precommit = read_document")
+        .expect("live CAS re-reads target");
+    let authorize = source
+        .find("SET publication_phase='publication_authorized'")
+        .expect("publication authorization is durable");
+    let atomic_write = source
+        .find("write_config_bytes_atomic")
+        .expect("atomic publication exists");
+    assert!(journal_insert < live_cas && live_cas < authorize && authorize < atomic_write);
+
+    let recovery = source
+        .split("pub(crate) async fn recover_image_config_mutation_journals")
+        .nth(1)
+        .expect("image recovery exists");
+    let prepared = recovery
+        .find("publication_phase == \"prepared\"")
+        .expect("prepared recovery branch exists");
+    let authorized = recovery
+        .find("publication_phase == \"publication_authorized\"")
+        .expect("authorized recovery branch exists");
+    assert!(prepared < authorized);
+    assert!(recovery[prepared..authorized].contains("terminal_error"));
+    assert!(recovery[authorized..].contains("diverged from both consumed and intended"));
 }

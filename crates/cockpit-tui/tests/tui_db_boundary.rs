@@ -424,11 +424,19 @@ fn production_uses_cockpit_proto_directly() {
                     path.display()
                 ));
             }
+            if compact.contains("externcratecockpit_core") {
+                findings.push(format!(
+                    "{}: whole-crate cockpit_core extern aliases obscure protocol ownership",
+                    path.display()
+                ));
+            }
             let parsed = syn::parse_file(&source).expect("production TUI source must parse");
             let mut imports = ImportVisitor(Vec::new());
             imports.visit_file(&parsed);
             for imported in imports.0 {
-                if imported == "cockpit_core::daemon"
+                if imported == "cockpit_core"
+                    || imported == "cockpit_core::self"
+                    || imported == "cockpit_core::daemon"
                     || imported == "cockpit_core::daemon::proto"
                     || imported.starts_with("cockpit_core::daemon::proto::")
                 {

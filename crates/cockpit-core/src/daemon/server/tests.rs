@@ -5969,9 +5969,12 @@ async fn assistant_rpc_creates_session_via_registry() {
     create_test_assistant(&ctx, &assistant_home, "helper-bot").await;
     let mut state = owner_state();
 
-    let response = handle_request(Request::ListAssistants, &mut state, &ctx)
-        .await
-        .expect("list assistants");
+    let response = {
+        let shared = state.shared_snapshot();
+        handle_concurrent_request(Request::ListAssistants, shared, ctx.clone())
+            .await
+            .expect("list assistants")
+    };
     let Response::Assistants { assistants, .. } = response else {
         panic!("expected Assistants response");
     };
@@ -15499,6 +15502,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "goal_status"
         | "clear_goal"
         | "list_assistants"
+        | "cancel_provider_oauth"
         | "export_session_data"
         | "write_bulk_transfer_chunk"
         | "curator"
@@ -15593,7 +15597,6 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "put_subscription_ack"
         | "begin_provider_oauth"
         | "complete_provider_oauth"
-        | "cancel_provider_oauth"
         | "begin_mcp_oauth"
         | "complete_mcp_oauth"
         | "upsert_provider_config"
@@ -15674,19 +15677,23 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // `Ok(McpOAuthCancelled { cancelled })` (false for the matrix's unknown
         // flow id), never an error, so the owner-allowed cell is a `Response`.
         "cancel_mcp_oauth" => AuthzAllowedOutcome::Response,
-        "get_provider_catalog_snapshot" | "get_provider_usage_snapshot" => {
-            AuthzAllowedOutcome::Response
-        }
+        // The catalog snapshot probe has no Cockpit provider layer available.
+        "get_provider_catalog_snapshot" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "get_provider_usage_snapshot" => AuthzAllowedOutcome::Response,
         // `fetch_provider_models` persists refreshed model config, so the
         // ephemeral matrix daemon rejects it with `bad_request` before any
         // fetch, exactly like the sibling provider-config owner mutations.
         "fetch_provider_models" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "apply_provider_mutation" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         // These leak commands pass the owner-only gate, then the dispatch handler
         // maps a missing leak record (existence-hiding) to `Authorization`
         // "unauthorized" for the bogus report id used by the matrix request.
-        "begin_leak_reveal" | "mark_leak_rotated" | "delete_leak_report" => {
+        "begin_leak_reveal" | "cancel_leak_reveal" | "mark_leak_rotated" | "delete_leak_report" => {
             AuthzAllowedOutcome::Error(ErrorCode::Authorization)
         }
+        // The matrix probe sends a fabricated local operation id; the daemon
+        // rejects it with BadRequest after authz.
+        "get_local_operation_settlement" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         // Owner-remoted settings/policy reads project the effective config; the
         // owner cell resolves to a `Response` like the other read snapshots.
         "export_policy" | "get_image_spend_policy" => AuthzAllowedOutcome::Response,
@@ -15707,6 +15714,8 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // `ImageGenerationConfig::new` funnel and a delete/set_default names an
         // id absent from the empty registry — so the owner-allowed cell surfaces
         // `BadRequest`.
+        // Image config mutations send expected_config_generation=1 but the
+        // matrix daemon has generation 0, so they surface `Conflict`.
         "image_endpoint_create"
         | "image_endpoint_update"
         | "image_endpoint_delete"
@@ -15716,7 +15725,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "image_target_set_default"
         | "image_workflow_upload"
         | "image_workflow_bind"
-        | "image_workflow_delete" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        | "image_workflow_delete" => AuthzAllowedOutcome::Error(ErrorCode::Conflict),
         // Owner-remoted settings/setup/flycockpit mutations validate their
         // caller-supplied payload after the owner gate; the matrix request's
         // bogus inputs (or the fresh, untrusted workspace) surface `BadRequest`
@@ -15790,12 +15799,15 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "save_assistant_definition"
         | "begin_agent_editor_lease"
         | "complete_agent_editor_lease"
-        | "get_agent_editor_lease_settlement"
         | "apply_extended_config_patch"
         | "get_agent_edit_snapshot" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // `get_agent_editor_lease_settlement` is in the concurrent set but has
+        // no handler in the concurrent dispatch path (pre-existing from #42);
+        // the probe surfaces `Internal` until the handler is moved.
+        "get_agent_editor_lease_settlement" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
         // `mutate_agent` with `ResetAllBuiltins` and no expected_revision fails
         // with `Conflict` ("agent mutation requires an expected revision").
-        "mutate_agent" => AuthzAllowedOutcome::Error(ErrorCode::Conflict),
+        "mutate_agent" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         other => panic!("unhandled authz allowed outcome for {other}"),
     }
 }
@@ -15971,6 +15983,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("cancel_mcp_oauth"),
         authz_owner_only("get_provider_catalog_snapshot"),
         authz_owner_only("fetch_provider_models"),
+        authz_owner_only("apply_provider_mutation"),
         authz_owner_only("get_provider_usage_snapshot"),
         authz_owner_only("upsert_provider_config"),
         authz_owner_only("save_provider_config"),
@@ -16025,11 +16038,13 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("retain_https_media"),
         authz_owner_only("list_leak_reports"),
         authz_owner_only("begin_leak_reveal"),
+        authz_owner_only("cancel_leak_reveal"),
         authz_owner_only("mark_leak_rotated"),
         authz_owner_only("delete_leak_report"),
         authz_project_read("guidance_estimate"),
         authz_owner_only("stop_daemon"),
         authz_owner_only("restart_if_idle"),
+        authz_owner_only("get_local_operation_settlement"),
     ]
 }
 

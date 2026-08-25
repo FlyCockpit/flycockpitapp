@@ -366,6 +366,10 @@ pub struct AgentRunner {
     /// from this. `false` when it attached to a pre-existing (canonical or
     /// auto-promoted persistent) daemon, which it must never stop.
     pub owns_daemon: bool,
+    /// Armed while the runner is still a provisional async attach result.
+    /// Adoption transfers this guard to `App`; dropping a stale/replaced
+    /// result therefore cannot orphan the ephemeral daemon it spawned.
+    owned_daemon_guard: Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard>,
     /// The socket of the daemon this runner is attached to. Carried so an
     /// owned ephemeral daemon can be reaped on exit via the guard.
     pub socket: PathBuf,
@@ -504,6 +508,7 @@ impl AgentRunner {
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
             owns_daemon: false,
+            owned_daemon_guard: None,
             socket: PathBuf::from("/tmp/cockpit-test.sock"),
             history: Vec::new(),
             paused_work: Vec::new(),
@@ -529,6 +534,12 @@ impl AgentRunner {
     /// daemon-owned session.
     pub fn shutdown(&mut self) {
         self.client_tasks.shutdown();
+    }
+
+    pub(crate) fn take_owned_daemon_guard(
+        &mut self,
+    ) -> Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard> {
+        self.owned_daemon_guard.take()
     }
 
     pub fn event_notifier(&self) -> Arc<Notify> {
@@ -2719,6 +2730,8 @@ async fn try_spawn_inner(
         }));
     }
 
+    let owned_daemon_guard = owns_daemon
+        .then(|| cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard::new(socket.clone()));
     Ok(AgentRunner {
         input_tx,
         record_tx,
@@ -2739,6 +2752,7 @@ async fn try_spawn_inner(
         project_id,
         usage,
         owns_daemon,
+        owned_daemon_guard,
         socket,
         history,
         paused_work,
@@ -6128,6 +6142,7 @@ mod tests {
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
             owns_daemon: false,
+            owned_daemon_guard: None,
             socket: PathBuf::from("/tmp/cockpit-test.sock"),
             history: Vec::new(),
             paused_work: Vec::new(),

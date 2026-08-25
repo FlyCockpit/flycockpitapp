@@ -102,12 +102,19 @@ impl App {
     /// exists. The signal handler hands control back to the TUI's own
     /// restore path on SIGINT/SIGTERM rather than `exit`ing outright, so the
     /// alt-screen teardown still runs.
-    pub(super) fn arm_daemon_guard(&mut self, runner: &AgentRunner) {
-        if !runner.owns_daemon || self.daemon_guard.is_some() {
+    pub(super) fn arm_daemon_guard(&mut self, runner: &mut AgentRunner) {
+        if !runner.owns_daemon {
             return;
         }
-        let guard =
-            cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard::new(runner.socket.clone());
+        let Some(guard) = runner.take_owned_daemon_guard() else {
+            return;
+        };
+        if self.daemon_guard.is_some() {
+            // A reconnect to the already-owned daemon must not stop it when
+            // this runner is later dropped.
+            guard.disarm();
+            return;
+        }
         self.daemon_signal_task =
             cockpit_core::daemon::ephemeral_guard::spawn_signal_shutdown(Some(&guard), false);
         self.daemon_guard = Some(guard);
@@ -331,7 +338,8 @@ impl App {
     /// or `Err`) so the caller's latch semantics hold. Shared by the
     /// first-message path and the eager display attach.
     pub(super) fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
-        if let Ok(r) = &runner {
+        let mut runner = runner;
+        if let Ok(r) = &mut runner {
             self.start_model_state_epoch(Some(r.session_id()), r.active_model_state.as_ref());
             let live_btw_fork = r.btw_fork.clone();
             self.reset_display_attach_backoff();

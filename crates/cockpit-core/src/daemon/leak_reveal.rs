@@ -162,7 +162,7 @@ async fn reveal_after_reservation(
 /// [`LeakRevealDenied::UnavailablePlatform`].
 pub async fn reveal_leak_secret(
     control_socket: &Path,
-    capability: &str,
+    capability: &crate::daemon::proto::LeakRevealToken,
 ) -> Result<RevealedLeakSecret, LeakRevealDenied> {
     if crate::daemon::server::in_process_context(control_socket).is_some() {
         return reveal_leak_secret_in_process(control_socket, capability).await;
@@ -191,12 +191,12 @@ pub async fn reveal_leak_secret(
 /// registered for `socket`.
 pub async fn reveal_leak_secret_in_process(
     socket: &Path,
-    capability: &str,
+    capability: &crate::daemon::proto::LeakRevealToken,
 ) -> Result<RevealedLeakSecret, LeakRevealDenied> {
     let ctx = match crate::daemon::server::in_process_context(socket) {
         Some(ctx) => ctx,
         None => return Err(LeakRevealDenied::UnavailablePlatform),
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
-    consume_leak_reveal(&ctx, capability, now_ms).await
+    consume_leak_reveal(&ctx, capability.as_str(), now_ms).await
 }

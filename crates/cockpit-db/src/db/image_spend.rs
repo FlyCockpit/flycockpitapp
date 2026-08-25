@@ -1578,47 +1578,98 @@ impl Db {
     ) -> Result<u64> {
         settings.validate().map_err(anyhow::Error::new)?;
         self.transaction(move |conn| {
-            let current: LatestPolicyRow = conn.query_row("SELECT version,settings_json,epoch_policy_version,rolling_anchor_unix_ms,rolling_anchor_sequence FROM image_spend_policy_versions WHERE project_key=?1 ORDER BY version DESC LIMIT 1", [&project_key], |r| Ok((read_u64(r.get(0)?)?,r.get(1)?,read_u64(r.get(2)?)?,r.get(3)?,r.get(4)?))).optional()?;
-            if current.as_ref().map(|v|v.0) != expected_current_version { return Err(BudgetBlockReason::PolicyVersionChanged.into()); }
-            let version = current.as_ref().map_or(Ok(1), |v| v.0.checked_add(1).ok_or(BudgetBlockReason::ArithmeticOverflow))?;
-            let previous_epoch = current.as_ref().and_then(|v| serde_json::from_str::<ImageSpendSettings>(&v.1).ok()).and_then(|s|s.project_epoch);
-            // The rolling anchor is server-owned; it is persisted in adjacent
-            // columns, never inside the user-constructible settings JSON.
-            let previous_rolling_anchor: Option<(i64, u64)> = match (current.as_ref().and_then(|v| v.3), current.as_ref().and_then(|v| v.4)) {
-                (Some(unix_ms), Some(sequence)) => Some((unix_ms, read_u64(sequence)?)),
-                _ => None,
-            };
-            let same_epoch_policy = match (&previous_epoch, &settings.project_epoch) {
-                (Some(ProjectEpochPolicy::CalendarMonth { time_zone: left }), Some(ProjectEpochPolicy::CalendarMonth { time_zone: right })) => left == right,
-                (Some(ProjectEpochPolicy::Rolling { duration_seconds: left }), Some(ProjectEpochPolicy::Rolling { duration_seconds: right })) => left == right,
-                (None, None) => true,
-                _ => false,
-            };
-            let epoch_policy_version = current.as_ref().map_or(Ok(1), |v| if same_epoch_policy { Ok(v.2) } else { v.2.checked_add(1).ok_or(BudgetBlockReason::ArithmeticOverflow) })?;
-            // Server-stamp (or reuse) the rolling anchor. A same-duration
-            // Rolling->Rolling save keeps the previous anchor, so an anchor is
-            // never a user-visible, independently changeable input.
-            let rolling_anchor: Option<(i64, u64)> = match &settings.project_epoch {
-                Some(ProjectEpochPolicy::Rolling { duration_seconds }) => {
-                    match (&previous_epoch, previous_rolling_anchor) {
-                        (Some(ProjectEpochPolicy::Rolling { duration_seconds: previous_duration }), Some(previous_anchor))
-                            if previous_duration == duration_seconds =>
-                        {
-                            Some(previous_anchor)
-                        }
-                        _ => Some((saved_at_ms, epoch_policy_version)),
-                    }
+            Self::save_image_spend_policy_conn(
+                conn,
+                &project_key,
+                &settings,
+                expected_current_version,
+                saved_at_ms,
+            )
+        })
+        .await
+    }
+
+    /// Persist an image spend policy on an existing writer transaction.
+    ///
+    /// Daemon control-plane callers use this seam to commit the immutable
+    /// policy version and its exactly-once operation receipt atomically.
+    pub fn save_image_spend_policy_conn(
+        conn: &rusqlite::Connection,
+        project_key: &str,
+        settings: &ImageSpendSettings,
+        expected_current_version: Option<u64>,
+        saved_at_ms: i64,
+    ) -> Result<u64> {
+        settings.validate().map_err(anyhow::Error::new)?;
+        let current: LatestPolicyRow = conn.query_row("SELECT version,settings_json,epoch_policy_version,rolling_anchor_unix_ms,rolling_anchor_sequence FROM image_spend_policy_versions WHERE project_key=?1 ORDER BY version DESC LIMIT 1", [&project_key], |r| Ok((read_u64(r.get(0)?)?,r.get(1)?,read_u64(r.get(2)?)?,r.get(3)?,r.get(4)?))).optional()?;
+        if current.as_ref().map(|v| v.0) != expected_current_version {
+            return Err(BudgetBlockReason::PolicyVersionChanged.into());
+        }
+        let version = current.as_ref().map_or(Ok(1), |v| {
+            v.0.checked_add(1)
+                .ok_or(BudgetBlockReason::ArithmeticOverflow)
+        })?;
+        let previous_epoch = current
+            .as_ref()
+            .and_then(|v| serde_json::from_str::<ImageSpendSettings>(&v.1).ok())
+            .and_then(|s| s.project_epoch);
+        // The rolling anchor is server-owned; it is persisted in adjacent
+        // columns, never inside the user-constructible settings JSON.
+        let previous_rolling_anchor: Option<(i64, u64)> = match (
+            current.as_ref().and_then(|v| v.3),
+            current.as_ref().and_then(|v| v.4),
+        ) {
+            (Some(unix_ms), Some(sequence)) => Some((unix_ms, read_u64(sequence)?)),
+            _ => None,
+        };
+        let same_epoch_policy = match (&previous_epoch, &settings.project_epoch) {
+            (
+                Some(ProjectEpochPolicy::CalendarMonth { time_zone: left }),
+                Some(ProjectEpochPolicy::CalendarMonth { time_zone: right }),
+            ) => left == right,
+            (
+                Some(ProjectEpochPolicy::Rolling {
+                    duration_seconds: left,
+                }),
+                Some(ProjectEpochPolicy::Rolling {
+                    duration_seconds: right,
+                }),
+            ) => left == right,
+            (None, None) => true,
+            _ => false,
+        };
+        let epoch_policy_version = current.as_ref().map_or(Ok(1), |v| {
+            if same_epoch_policy {
+                Ok(v.2)
+            } else {
+                v.2.checked_add(1)
+                    .ok_or(BudgetBlockReason::ArithmeticOverflow)
+            }
+        })?;
+        // Server-stamp (or reuse) the rolling anchor. A same-duration
+        // Rolling->Rolling save keeps the previous anchor, so an anchor is
+        // never a user-visible, independently changeable input.
+        let rolling_anchor: Option<(i64, u64)> = match &settings.project_epoch {
+            Some(ProjectEpochPolicy::Rolling { duration_seconds }) => {
+                match (&previous_epoch, previous_rolling_anchor) {
+                    (
+                        Some(ProjectEpochPolicy::Rolling {
+                            duration_seconds: previous_duration,
+                        }),
+                        Some(previous_anchor),
+                    ) if previous_duration == duration_seconds => Some(previous_anchor),
+                    _ => Some((saved_at_ms, epoch_policy_version)),
                 }
-                _ => None,
-            };
-            let (anchor_unix_ms, anchor_sequence): (Option<i64>, Option<i64>) = match rolling_anchor {
-                Some((unix_ms, sequence)) => (Some(unix_ms), Some(sqlite_u64(sequence)?)),
-                None => (None, None),
-            };
-            let json = serde_json::to_string(&settings)?;
-            conn.execute("INSERT INTO image_spend_policy_versions(project_key,version,epoch_policy_version,settings_json,saved_at_ms,rolling_anchor_unix_ms,rolling_anchor_sequence) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![project_key, sqlite_u64(version)?, sqlite_u64(epoch_policy_version)?, json, saved_at_ms, anchor_unix_ms, anchor_sequence])?;
-            Ok(version)
-        }).await
+            }
+            _ => None,
+        };
+        let (anchor_unix_ms, anchor_sequence): (Option<i64>, Option<i64>) = match rolling_anchor {
+            Some((unix_ms, sequence)) => (Some(unix_ms), Some(sqlite_u64(sequence)?)),
+            None => (None, None),
+        };
+        let json = serde_json::to_string(&settings)?;
+        conn.execute("INSERT INTO image_spend_policy_versions(project_key,version,epoch_policy_version,settings_json,saved_at_ms,rolling_anchor_unix_ms,rolling_anchor_sequence) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![project_key, sqlite_u64(version)?, sqlite_u64(epoch_policy_version)?, json, saved_at_ms, anchor_unix_ms, anchor_sequence])?;
+        Ok(version)
     }
 
     /// Atomically reserve the checked conservative sum at request, session,

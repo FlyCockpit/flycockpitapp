@@ -64,26 +64,55 @@ async fn add(args: McpAddArgs) -> Result<()> {
     let auth = build_auth(&args)?;
 
     let cwd = std::env::current_dir()?;
-    let dir = crate::config::dirs::cwd_scoped_creatable_dirs(&cwd)
-        .into_iter()
-        .next()
-        .context("no writable .cockpit/ directory for the current dir")?;
-    let path = dir.path.join("mcp.json");
-
-    // Merge into the nearest project-local config (the daemon's write target for
-    // this cwd) so publishing the full config through `SaveMcpConfig` preserves
-    // existing servers rather than replacing them.
-    let mut cfg = if path.exists() {
-        McpConfig::parse(&std::fs::read_to_string(&path)?)?
-    } else {
-        McpConfig::default()
+    let daemon = ensure_persistent_daemon()
+        .await
+        .context("starting persistent daemon for MCP config save")?;
+    let project_root = cwd.display().to_string();
+    let snapshot_session_id = uuid::Uuid::new_v4().to_string();
+    let snapshot = daemon
+        .client
+        .request(Request::GetProviderCatalogSnapshot {
+            project_root: project_root.clone(),
+            provider_id: None,
+            snapshot_session_id: snapshot_session_id.clone(),
+        })
+        .await?
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+    let Response::ProviderCatalogSnapshot {
+        config,
+        snapshot_session_id: returned_snapshot_id,
+        ..
+    } = snapshot
+    else {
+        bail!("daemon returned unexpected MCP authority snapshot");
     };
+    if returned_snapshot_id != snapshot_session_id {
+        bail!("daemon returned a mismatched MCP authority snapshot");
+    }
+    let mut cfg = McpConfig::parse(
+        config
+            .mcp_config_json
+            .as_deref()
+            .context("daemon MCP snapshot omitted its redacted projection")?,
+    )?;
+    let owner_root = config
+        .mcp_owner_root
+        .context("daemon MCP snapshot omitted its owner root")?;
+    let config_path = config
+        .mcp_config_path
+        .context("daemon MCP snapshot omitted its config path")?;
+    let snapshot_capability = config
+        .mcp_edit_capability
+        .context("daemon MCP snapshot omitted its edit capability")?;
+    let expected_revision = config
+        .mcp_revision
+        .context("daemon MCP snapshot omitted its target revision")?;
 
     if cfg.servers.contains_key(&args.name) {
         bail!(
             "MCP server `{}` already exists in {}",
             args.name,
-            path.display()
+            config_path
         );
     }
 
@@ -133,25 +162,61 @@ async fn add(args: McpAddArgs) -> Result<()> {
     // cannot publish/consume an `mcp:victim` token owned by another kind or
     // workspace. The daemon derives its own write target and cleanup set from
     // `project_root`; `cleanup_names_json` is advisory and ignored server-side.
-    let daemon = ensure_persistent_daemon()
-        .await
-        .context("starting persistent daemon for MCP config save")?;
     let config_json = serde_json::to_string(&cfg).context("serializing MCP config")?;
     let secret_values_json =
         serde_json::to_string(&secret_values).context("serializing MCP secret values")?;
     let cleanup_names_json = serde_json::to_string(&BTreeSet::<String>::new())
         .context("serializing MCP cleanup names")?;
+    let client_operation_id = uuid::Uuid::new_v4().to_string();
+    use sha2::Digest as _;
+    let mutation_intent_hash = sha2::Sha256::digest(
+        serde_json::to_vec(&(
+            "save_mcp_config",
+            &project_root,
+            &config_json,
+            &cleanup_names_json,
+        ))?
+        .as_slice(),
+    )
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
     match daemon
         .client
         .request(Request::SaveMcpConfig {
-            project_root: cwd.display().to_string(),
+            client_operation_id: client_operation_id.clone(),
+            project_root: project_root.clone(),
+            snapshot_capability,
+            owner_root: owner_root.clone(),
+            config_path: config_path.clone(),
+            expected_revision: expected_revision.clone(),
+            mutation_intent_hash: mutation_intent_hash.clone(),
             config_json,
             secret_values_json,
             cleanup_names_json,
         })
         .await?
     {
-        Ok(Response::McpConfigSaved { .. }) => {}
+        Ok(Response::McpConfigCommitted {
+            client_operation_id: returned_operation_id,
+            project_root: returned_root,
+            owner_root: returned_owner_root,
+            config_path: returned_config_path,
+            consumed_revision,
+            result_revision,
+            request_hash,
+            mutation_intent_hash: returned_intent_hash,
+            config_generation,
+            ..
+        }) if returned_operation_id == client_operation_id
+            && returned_root == project_root
+            && returned_owner_root == owner_root
+            && returned_config_path == config_path
+            && consumed_revision == expected_revision
+            && cockpit_proto::is_opaque_authority_token(&request_hash)
+            && returned_intent_hash == mutation_intent_hash
+            && cockpit_proto::is_opaque_authority_token(&result_revision)
+            && config_generation > 0 => {}
         Ok(other) => bail!("daemon returned unexpected response to MCP config save: {other:?}"),
         Err(error) => bail!("daemon rejected MCP config save: {error}"),
     }

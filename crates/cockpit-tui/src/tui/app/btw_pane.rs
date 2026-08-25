@@ -70,6 +70,7 @@ pub(super) struct BtwPaneLayout {
 pub(super) struct BtwPane {
     pub info: proto::BtwForkInfo,
     pub runner: Option<Result<AgentRunner, String>>,
+    runner_attach_action_id: Option<crate::tui::async_action::AsyncActionId>,
     pub composer: Composer,
     pub history: Vec<HistoryEntry>,
     pub pending: Option<PendingMsg>,
@@ -94,6 +95,7 @@ impl BtwPane {
         Self {
             info,
             runner: None,
+            runner_attach_action_id: None,
             composer: Composer::new(vim_enabled),
             history: Vec::new(),
             pending: None,
@@ -171,24 +173,6 @@ impl BtwPane {
             .into_iter()
             .map(|queued| queued.event)
             .collect()
-    }
-
-    pub(super) fn attach_runner(
-        &mut self,
-        cwd: &std::path::Path,
-        no_sandbox: bool,
-        mode: cockpit_core::daemon::client::LifecycleMode,
-    ) {
-        if matches!(self.runner, Some(Ok(_))) {
-            return;
-        }
-        let mut runner =
-            agent_runner::attach_to_session(cwd, self.info.session_id, no_sandbox, mode);
-        if let Ok(runner) = &mut runner {
-            self.history
-                .extend(wire_history_to_entries(std::mem::take(&mut runner.history)));
-        }
-        self.runner = Some(runner);
     }
 
     pub(super) fn apply_event(&mut self, event: TurnEvent, strip_inline_think: bool) {
@@ -931,21 +915,13 @@ impl App {
         let has_test_gate = barrier.is_some();
         #[cfg(not(test))]
         let has_test_gate = false;
-        let mut runner = self
+        let runner = self
             .agent_runner
             .as_ref()
             .and_then(|runner| runner.as_ref().ok());
         if runner.is_none() && !has_test_gate {
-            self.ensure_agent_runner();
-            runner = self
-                .agent_runner
-                .as_ref()
-                .and_then(|runner| runner.as_ref().ok());
-        }
-        if runner.is_none() && !has_test_gate {
-            self.history.push(HistoryEntry::CommandError {
-                line: "/btw: no daemon connection".to_string(),
-            });
+            self.start_runner_attach(true, RunnerAttachContinuation::BtwCommand(args.to_string()));
+            self.push_plain("/btw: connecting".to_string());
             return;
         }
         let parent_session_id = runner
@@ -1016,16 +992,75 @@ impl App {
     pub(super) fn open_btw_pane_from_info(&mut self, info: proto::BtwForkInfo, attach: bool) {
         let mut pane = BtwPane::new(info, self.composer.vim_enabled());
         if attach {
-            pane.attach_runner(&self.launch.cwd, self.no_sandbox, self.lifecycle_mode());
+            pane.runner_attach_action_id = Some(self.start_btw_runner_attach(pane.info.session_id));
         }
         pane.focused = false;
         self.btw_pane = Some(pane);
+    }
+
+    fn start_btw_runner_attach(
+        &mut self,
+        session_id: uuid::Uuid,
+    ) -> crate::tui::async_action::AsyncActionId {
+        let cwd = self.launch.cwd.clone();
+        let no_sandbox = self.no_sandbox;
+        let mode = self.lifecycle_mode();
+        self.async_actions
+            .start(
+                AsyncActionKind::Internal("btw.runner.attach"),
+                AsyncActionPolicy::Replace(AsyncActionKey::new("btw.runner.attach")),
+                async move {
+                    let runner =
+                        agent_runner::attach_to_session(&cwd, session_id, no_sandbox, mode).await?;
+                    Ok(AsyncActionPayload::BtwRunnerAttached {
+                        session_id,
+                        runner: Box::new(runner),
+                    })
+                },
+            )
+            .id()
+    }
+
+    pub(super) fn apply_btw_runner_attach(
+        &mut self,
+        action_id: crate::tui::async_action::AsyncActionId,
+        payload: Result<AsyncActionPayload, String>,
+    ) {
+        let Some(pane) = self
+            .btw_pane
+            .as_mut()
+            .filter(|pane| pane.runner_attach_action_id == Some(action_id))
+        else {
+            return;
+        };
+        pane.runner_attach_action_id = None;
+        match payload {
+            Ok(AsyncActionPayload::BtwRunnerAttached {
+                session_id,
+                mut runner,
+            }) => {
+                if pane.info.session_id != session_id {
+                    return;
+                }
+                pane.history
+                    .extend(wire_history_to_entries(std::mem::take(&mut runner.history)));
+                pane.runner = Some(Ok(*runner));
+            }
+            Err(error) => {
+                pane.runner = Some(Err(error));
+            }
+            Ok(_) => {}
+        }
     }
 
     pub(super) fn close_btw_pane(&mut self) {
         self.async_actions
             .abort_key(&crate::tui::async_action::AsyncActionKey::new(
                 "btw.transition",
+            ));
+        self.async_actions
+            .abort_key(&crate::tui::async_action::AsyncActionKey::new(
+                "btw.runner.attach",
             ));
         self.btw_pane = None;
     }

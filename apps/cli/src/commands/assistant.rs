@@ -264,7 +264,7 @@ async fn show(name: &str) -> Result<()> {
     println!("home_dir: {}", default_home_dir(&def.name)?.display());
     println!("definition: {}", def.source.display());
     if let Some(hash) = &assistant.definition_presentation_hash {
-        println!("presentation_hash: {hash}");
+        println!("presentation_identity: {hash}");
     }
     println!(
         "agent_id: {}",
@@ -317,7 +317,7 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for assistant delete")?;
-    let assistant = fetch_assistant(&daemon, &args.name)
+    let (assistant, expected_config_generation) = fetch_assistant_inventory(&daemon, &args.name)
         .await?
         .ok_or_else(|| anyhow::anyhow!("assistant `{}` not found", args.name))?;
     if !args.yes {
@@ -337,21 +337,47 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
     if expected_revision.is_empty() {
         bail!("assistant registration has no deletion revision");
     }
+    let project_root = std::env::current_dir()
+        .context("resolving assistant deletion workspace")?
+        .to_string_lossy()
+        .into_owned();
+    let client_operation_id = uuid::Uuid::new_v4().to_string();
     let response = daemon
         .client
-        .request(delete_assistant_request(&args.name, &expected_revision))
+        .request(delete_assistant_request(
+            &client_operation_id,
+            &project_root,
+            &args.name,
+            &expected_revision,
+            expected_config_generation,
+        ))
         .await
         .context("requesting assistant delete from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected assistant delete: {error}"))?;
     let Response::AssistantDeleted {
+        client_operation_id: receipt_operation_id,
+        mutation_intent_hash,
+        requested_project_root,
         name,
-        consumed_registration_revision,
-        deleted: true,
+        consumed_revision,
+        ..
     } = response
     else {
         bail!("daemon returned unexpected response to assistant delete: {response:?}");
     };
-    if name != args.name || consumed_registration_revision != expected_revision {
+    let expected_intent = cockpit_proto::assistant_mutation_intent_hash(
+        &project_root,
+        "delete",
+        &args.name,
+        &expected_revision,
+        None,
+    );
+    if receipt_operation_id != client_operation_id
+        || mutation_intent_hash != expected_intent
+        || requested_project_root != project_root
+        || name != args.name
+        || consumed_revision != expected_revision
+    {
         bail!("daemon returned an incoherent assistant deletion receipt");
     }
     println!(
@@ -369,11 +395,50 @@ fn get_assistant_request(name: &str) -> Request {
 }
 
 /// Assemble the owner-remoted `DeleteAssistant` mutation.
-fn delete_assistant_request(name: &str, expected_revision: &str) -> Request {
+fn delete_assistant_request(
+    client_operation_id: &str,
+    project_root: &str,
+    name: &str,
+    expected_revision: &str,
+    expected_config_generation: u64,
+) -> Request {
     Request::DeleteAssistant {
+        client_operation_id: client_operation_id.to_string(),
+        mutation_intent_hash: cockpit_proto::assistant_mutation_intent_hash(
+            project_root,
+            "delete",
+            name,
+            expected_revision,
+            None,
+        ),
+        project_root: project_root.to_string(),
         name: name.to_string(),
         expected_revision: expected_revision.to_string(),
+        expected_config_generation,
     }
+}
+
+async fn fetch_assistant_inventory(
+    daemon: &crate::daemon::client::ConnectedDaemon,
+    name: &str,
+) -> Result<Option<(crate::daemon::proto::AssistantSummary, u64)>> {
+    let response = daemon
+        .client
+        .request(Request::ListAssistants)
+        .await
+        .context("requesting assistant inventory from daemon")?
+        .map_err(|error| anyhow::anyhow!("daemon rejected assistant inventory: {error}"))?;
+    let Response::Assistants {
+        assistants,
+        config_generation,
+    } = response
+    else {
+        bail!("daemon returned unexpected response to assistant inventory: {response:?}");
+    };
+    Ok(assistants
+        .into_iter()
+        .find(|assistant| assistant.name == name)
+        .map(|assistant| (assistant, config_generation)))
 }
 
 /// Resolve a single assistant registry row through the daemon's owner-remoted
@@ -526,27 +591,41 @@ mod tests {
         };
         assert_eq!(name, "helper-bot");
         let Request::DeleteAssistant {
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
             name,
             expected_revision,
-        } = delete_assistant_request("helper-bot", "rev-1")
+            expected_config_generation,
+        } = delete_assistant_request("op-1", "/project", "helper-bot", "rev-1", 7)
         else {
             panic!("delete must remove through DeleteAssistant");
         };
+        assert_eq!(client_operation_id, "op-1");
+        assert_eq!(project_root, "/project");
+        assert_eq!(
+            mutation_intent_hash,
+            cockpit_proto::assistant_mutation_intent_hash(
+                "/project",
+                "delete",
+                "helper-bot",
+                "rev-1",
+                None
+            )
+        );
         assert_eq!(name, "helper-bot");
         assert_eq!(expected_revision, "rev-1");
+        assert_eq!(expected_config_generation, 7);
     }
 
     #[tokio::test]
     async fn cli_write_assistant_home_matches_core_create_assistant() {
-        // Drift guard: `write_assistant_home_with_installation_id` duplicates
-        // the file-writing half of `cockpit_core::assistants::create_assistant`
-        // (cockpit-core is out of scope to refactor). Build a home both ways
-        // from the same spec and assert the on-disk definition BYTES and the
-        // content hash are identical, so a future core change to
-        // fields/ordering/format fails here instead of silently producing
-        // incompatible homes. Core creates only at the daemon-owned canonical
-        // home, so the environment is isolated to the tempdir and
-        // `default_home_dir` resolves under it.
+        // Drift guard: `write_assistant_home` duplicates the file-writing half
+        // of `cockpit_core::assistants::create_assistant` (cockpit-core is out
+        // of scope to refactor). Build a home both ways from the same spec and
+        // assert the on-disk definition BYTES are identical and the registry
+        // identity is the vault-keyed identity of those bytes, so a future
+        // core change cannot silently restore an offline-verifiable digest.
         let temp = tempfile::tempdir().unwrap();
         let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(temp.path()).await;
         let core_home = default_home_dir("helper-bot").unwrap();
@@ -561,7 +640,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (_config_json, cli_hash) = write_assistant_home_with_installation_id(
+        let (_config_json, _legacy_cli_hash) = write_assistant_home_with_installation_id(
             &sample_spec(cli_home.clone()),
             installation_id,
         )
@@ -573,9 +652,16 @@ mod tests {
             core_md, cli_md,
             "assistant.md bytes must match cockpit-core's create_assistant"
         );
+        let markdown = std::str::from_utf8(&cli_md).unwrap();
         assert_eq!(
-            core_row.content_hash, cli_hash,
-            "content hash must match cockpit-core's create_assistant"
+            core_row.content_hash,
+            cockpit_core::assistants::markdown_content_identity(&db, markdown).unwrap(),
+            "persisted content identity must be vault-keyed over the exact assistant bytes"
+        );
+        assert_ne!(
+            core_row.content_hash,
+            markdown_content_hash(markdown),
+            "persisted content identity must not be an offline-verifiable markdown digest"
         );
     }
 

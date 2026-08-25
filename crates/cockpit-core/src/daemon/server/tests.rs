@@ -21,6 +21,51 @@ use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
 #[test]
+fn client_teardown_quiesces_dispatch_before_capability_cancellation() {
+    let source = include_str!("mod.rs");
+    let socket = source
+        .split("async fn handle_client_transport_as")
+        .nth(1)
+        .expect("socket transport")
+        .split("async fn select_client_task")
+        .next()
+        .expect("socket teardown body");
+    let abort = socket
+        .find("executor_task.abort()")
+        .expect("executor abort");
+    let join = socket[abort..]
+        .find("executor_task).await")
+        .map(|offset| abort + offset)
+        .expect("executor join");
+    let cancel = socket
+        .find(".cancel_for_session(client_instance_id)")
+        .expect("socket capability cancellation");
+    assert!(abort < join && join < cancel);
+
+    let in_process = source
+        .split("async fn run_in_process_client")
+        .nth(1)
+        .expect("in-process transport")
+        .split("struct PendingEventLag")
+        .next()
+        .expect("in-process teardown body");
+    let abort_all = in_process
+        .find("concurrent_tasks.abort_all()")
+        .expect("request abort");
+    let join_all = in_process[abort_all..]
+        .find("concurrent_tasks.join_next().await")
+        .map(|offset| abort_all + offset)
+        .expect("request join");
+    let attachments = in_process
+        .find("drain_client_attachment_ownership")
+        .expect("attachment drain");
+    let cancel = in_process
+        .find(".cancel_for_session(client_instance_id)")
+        .expect("in-process capability cancellation");
+    assert!(abort_all < join_all && join_all < attachments && attachments < cancel);
+}
+
+#[test]
 fn oversized_response_is_replaced_before_the_ndjson_writer() {
     let id = Uuid::new_v4();
     let envelope = bounded_response_envelope(
@@ -839,12 +884,14 @@ async fn upsert_assistant_rpc_creates_daemon_owned_definition() {
         panic!("expected assistant")
     };
     assert_eq!(assistant.name, "reviewer");
-    let expected_hash = crate::assistants::markdown_content_hash(
+    let expected_hash = crate::assistants::markdown_content_identity(
+        &ctx.db,
         assistant
             .definition_markdown
             .as_deref()
             .expect("daemon returns the authored assistant markdown"),
-    );
+    )
+    .unwrap();
     assert_eq!(
         ctx.db.list_assistants().await.unwrap()[0].content_hash,
         expected_hash
@@ -985,8 +1032,18 @@ async fn ephemeral_daemon_rejects_new_persistent_mutations() {
         },
         Request::PurgeEndedSessions { before: 0 },
         Request::DeleteAssistant {
+            client_operation_id: "delete-assistant".into(),
+            mutation_intent_hash: cockpit_proto::assistant_mutation_intent_hash(
+                "/repo",
+                "delete",
+                "helper-bot",
+                "revision",
+                None,
+            ),
+            project_root: "/repo".into(),
             name: "helper-bot".into(),
             expected_revision: "revision".into(),
+            expected_config_generation: 7,
         },
         Request::RepairMediaReservation {
             scope: "session".into(),
@@ -5914,7 +5971,7 @@ async fn assistant_rpc_creates_session_via_registry() {
     let response = handle_request(Request::ListAssistants, &mut state, &ctx)
         .await
         .expect("list assistants");
-    let Response::Assistants { assistants } = response else {
+    let Response::Assistants { assistants, .. } = response else {
         panic!("expected Assistants response");
     };
     assert_eq!(assistants.len(), 1);
@@ -7791,6 +7848,7 @@ async fn owner_secret_rpcs_dispatch_vault_persistence_redaction_and_safe_project
     assert!(matches!(
         handle_request(
             Request::PutProviderCredential {
+                client_operation_id: "rpc-provider-put".into(),
                 provider_id: "rpc-provider".into(),
                 record: r#"{"api_key":"rpc-provider-value"}"#.into(),
             },
@@ -7818,6 +7876,7 @@ async fn owner_secret_rpcs_dispatch_vault_persistence_redaction_and_safe_project
     // vault, leaving the existing record untouched.
     let invalid = handle_request(
         Request::PutProviderCredential {
+            client_operation_id: "invalid-provider-put".into(),
             provider_id: "rpc-provider".into(),
             record: "not-json".into(),
         },
@@ -7849,6 +7908,7 @@ async fn owner_secret_rpcs_dispatch_vault_persistence_redaction_and_safe_project
     assert!(matches!(
         handle_request(
             Request::DeleteProviderCredential {
+                client_operation_id: "rpc-provider-delete".into(),
                 provider_id: "rpc-provider".into(),
                 project_root: None,
             },
@@ -8165,6 +8225,7 @@ async fn owner_secret_inventory_accepts_max_subscription_ack_cursor() {
     let mut state = owner_state();
     handle_request(
         Request::PutSubscriptionAck {
+            client_operation_id: "subscription-ack-max-provider".into(),
             provider_id: provider_id.clone(),
         },
         &mut state,
@@ -8359,7 +8420,13 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
     for config in cases {
         let result = handle_request(
             Request::SaveMcpConfig {
+                client_operation_id: "reject-literal-mcp-save".into(),
                 project_root: root.clone(),
+                snapshot_capability: "snapshot".into(),
+                owner_root: root.clone(),
+                config_path: format!("{root}/.cockpit/mcp.json"),
+                expected_revision: "00".repeat(32),
+                mutation_intent_hash: "11".repeat(32),
                 config_json: serde_json::to_string(&config).unwrap(),
                 secret_values_json: "{}".into(),
                 cleanup_names_json: "[]".into(),
@@ -8398,12 +8465,19 @@ async fn mcp_save_stages_literal_and_persists_reference_only_config() {
     });
     let response = handle_request(
         Request::SaveMcpConfig {
+            client_operation_id: "staged-mcp-save".into(),
             project_root: root,
+            snapshot_capability: "snapshot".into(),
+            owner_root: "/tmp/project".into(),
+            config_path: "/tmp/project/.cockpit/mcp.json".into(),
+            expected_revision: "00".repeat(32),
+            mutation_intent_hash: "11".repeat(32),
             config_json: serde_json::to_string(&config).unwrap(),
             secret_values_json: serde_json::json!({
                 "mcp:staged:header": "Bearer staged-value"
             })
-            .to_string(),
+            .to_string()
+            .into(),
             cleanup_names_json: "[]".into(),
         },
         &mut state,
@@ -8411,7 +8485,7 @@ async fn mcp_save_stages_literal_and_persists_reference_only_config() {
     )
     .await
     .expect("staged MCP credential save succeeds");
-    assert!(matches!(response, Response::McpConfigSaved { .. }));
+    assert!(matches!(response, Response::McpConfigCommitted { .. }));
     let wire = std::fs::read_to_string(cockpit_dir.join("mcp.json")).unwrap();
     assert!(!wire.contains("Bearer staged-value"));
     assert!(wire.contains("mcp:staged:header"));
@@ -8473,9 +8547,15 @@ async fn mcp_save_cannot_overwrite_a_provider_claimed_named_secret() {
     let mut state = owner_state();
     let result = handle_request(
         Request::SaveMcpConfig {
+            client_operation_id: "ownership-race-mcp-save".into(),
             project_root: root.clone(),
+            snapshot_capability: "snapshot".into(),
+            owner_root: root.clone(),
+            config_path: format!("{root}/.cockpit/mcp.json"),
+            expected_revision: "00".repeat(32),
+            mutation_intent_hash: "11".repeat(32),
             config_json: serde_json::to_string(&config).unwrap(),
-            secret_values_json: serde_json::Value::Object(secret_values).to_string(),
+            secret_values_json: serde_json::Value::Object(secret_values).to_string().into(),
             cleanup_names_json: "[]".into(),
         },
         &mut state,
@@ -8903,7 +8983,13 @@ async fn mcp_save_rejects_unstaged_reference_to_provider_claimed_secret() {
     let mut state = owner_state();
     let result = handle_request(
         Request::SaveMcpConfig {
+            client_operation_id: "foreign-reference-mcp-save".into(),
             project_root: root.clone(),
+            snapshot_capability: "snapshot".into(),
+            owner_root: root.clone(),
+            config_path: format!("{root}/.cockpit/mcp.json"),
+            expected_revision: "00".repeat(32),
+            mutation_intent_hash: "11".repeat(32),
             config_json: serde_json::to_string(&config).unwrap(),
             secret_values_json: "{}".into(),
             cleanup_names_json: "[]".into(),
@@ -9077,7 +9163,17 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
     let mut state = owner_state();
     let response = handle_request(
         Request::SaveMcpConfig {
+            client_operation_id: "cleanup-mcp-save".into(),
             project_root: tmp.path().to_string_lossy().into_owned(),
+            snapshot_capability: "snapshot".into(),
+            owner_root: tmp.path().to_string_lossy().into_owned(),
+            config_path: tmp
+                .path()
+                .join(".cockpit/mcp.json")
+                .to_string_lossy()
+                .into_owned(),
+            expected_revision: "00".repeat(32),
+            mutation_intent_hash: "11".repeat(32),
             config_json: serde_json::json!({"servers": {}}).to_string(),
             secret_values_json: "{}".into(),
             cleanup_names_json: serde_json::json!(["unrelated"]).to_string(),
@@ -9087,7 +9183,7 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
     )
     .await
     .expect("MCP save succeeds");
-    assert!(matches!(response, Response::McpConfigSaved { .. }));
+    assert!(matches!(response, Response::McpConfigCommitted { .. }));
     let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
     assert_eq!(
         store.named_secret("mcp:old:header"),
@@ -9149,6 +9245,7 @@ async fn owner_provider_rpc_rejects_subscription_ack_namespace_before_failure_in
     ctx.set_force_daemon_redaction_refresh_failure(true);
     let result = handle_request(
         Request::PutProviderCredential {
+            client_operation_id: "reserved-subscription-put".into(),
             provider_id: "subscription-oauth-ack:codex-oauth".into(),
             record: r#"{"api_key":"must-not-store"}"#.into(),
         },
@@ -9246,6 +9343,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
     expect_failed(
         handle_request(
             Request::PutProviderCredential {
+                client_operation_id: "rollback-provider-put".into(),
                 provider_id: "rollback-provider".into(),
                 record: r#"{"api_key":"new-provider"}"#.into(),
             },
@@ -9271,6 +9369,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
     expect_failed(
         handle_request(
             Request::DeleteProviderCredential {
+                client_operation_id: "rollback-provider-delete".into(),
                 provider_id: "rollback-provider".into(),
                 project_root: None,
             },
@@ -10493,6 +10592,7 @@ async fn remote_setup_copilot_auth_refuses_ambient_github_token_read() {
     let build = |remote: bool| {
         (
             Request::SetupCopilotAuth {
+                client_operation_id: "remote-setup-copilot".into(),
                 project_root: project_root.path().to_string_lossy().into_owned(),
                 provider_id: "attacker-controlled-provider".into(),
             },
@@ -10566,6 +10666,7 @@ async fn remote_owner_save_image_spend_policy_commits_and_replays() {
     // `ImageSpendSettings::validate` passes and the dispatch reaches the DB
     // write rather than a validation rejection.
     let request = Request::SaveImageSpendPolicy {
+        client_operation_id: "remote-image-save".into(),
         project_key: project_key.into(),
         settings_json: r#"{"request":"unlimited","session":"unlimited","project":"unlimited"}"#
             .into(),
@@ -10754,31 +10855,83 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
     trust_workspace_root(&ctx, project.path()).await;
     let project_root = project.path().to_string_lossy().into_owned();
 
-    let make_endpoint = |id: &str| {
-        serde_json::to_string(&ImageEndpoint {
-            id: id.to_string(),
-            adapter: ImageAdapterKind::OpenaiImages,
-            origin: "https://api.openai.com/".to_string(),
-            path_prefix: None,
-            credential_ref: Some("openai-key".to_string()),
-            headers: Vec::new(),
-            allow_insecure_transport: false,
-            location: ImageLocationClass::PublicCloud,
-            enabled: true,
-            route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
-            exclusive_server: false,
-        })
-        .unwrap()
+    let make_endpoint = |id: &str| ImageEndpoint {
+        id: id.to_string(),
+        adapter: ImageAdapterKind::OpenaiImages,
+        origin: "https://api.openai.com/".to_string(),
+        path_prefix: None,
+        credential_ref: Some("openai-key".to_string()),
+        headers: Vec::new(),
+        allow_insecure_transport: false,
+        location: ImageLocationClass::PublicCloud,
+        enabled: true,
+        route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+        exclusive_server: false,
     };
+    let make_request =
+        |endpoint: ImageEndpoint,
+         generation: u64,
+         revision: String,
+         capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1| {
+            let change = cockpit_proto::image_control::ImageConfigChangeV1::EndpointUpserted {
+                entity_id: endpoint.id.clone(),
+                entity_generation: "intent".into(),
+                item: cockpit_proto::image_control::ImageEndpointSafeV1::project(
+                    &endpoint,
+                    "intent".into(),
+                ),
+            };
+            let mutation_intent_hash = cockpit_proto::image_control::ImageConfigMutationIntentV1 {
+                project_id: project_root.clone(),
+                expected_config_generation: generation,
+                expected_config_revision: revision.clone(),
+                changes: vec![change],
+            }
+            .sha256()
+            .unwrap();
+            Request::ImageEndpointCreate {
+                client_operation_id: uuid::Uuid::new_v4().to_string(),
+                mutation_intent_hash,
+                project_root: project_root.clone(),
+                endpoint_json: cockpit_proto::SensitiveWirePayload::new(
+                    serde_json::to_string(&endpoint).unwrap(),
+                ),
+                expected_config_generation: generation,
+                expected_config_revision: revision,
+                mutation_capability: capability,
+            }
+        };
 
     // 1) Author a registry through the dedicated RPC.
-    let created = crate::daemon::server::image_control_mutations::dispatch_image_control_mutation(
+    let trust_policy =
+        crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, project.path())
+            .await
+            .unwrap();
+    let layer = crate::daemon::server::image_control_mutations::authoritative_image_layer(
         &ctx,
-        Request::ImageEndpointCreate {
-            project_root: project_root.clone(),
-            endpoint_json: make_endpoint("openai-main"),
-            expected_config_generation: None,
-        },
+        project.path(),
+        &trust_policy,
+    )
+    .unwrap();
+    let generation = inventory::current_config_generation();
+    let capability = crate::daemon::server::image_control_mutations::mint_mutation_capability(
+        &ctx,
+        project.path(),
+        &layer.target,
+        &layer.revision,
+        generation,
+    )
+    .unwrap();
+    let mut state = owner_state();
+    let created = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        make_request(
+            make_endpoint("openai-main"),
+            generation,
+            layer.revision,
+            capability,
+        ),
     )
     .await
     .expect("endpoint create succeeds");
@@ -10814,13 +10967,30 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
     assert!(after_save.contains("Renamed Project"));
 
     // 3) The dedicated RPC still mutates the registry after the settings save.
-    let second = crate::daemon::server::image_control_mutations::dispatch_image_control_mutation(
+    let layer = crate::daemon::server::image_control_mutations::authoritative_image_layer(
         &ctx,
-        Request::ImageEndpointCreate {
-            project_root: project_root.clone(),
-            endpoint_json: make_endpoint("backup-openai"),
-            expected_config_generation: None,
-        },
+        project.path(),
+        &trust_policy,
+    )
+    .unwrap();
+    let generation = inventory::current_config_generation();
+    let capability = crate::daemon::server::image_control_mutations::mint_mutation_capability(
+        &ctx,
+        project.path(),
+        &layer.target,
+        &layer.revision,
+        generation,
+    )
+    .unwrap();
+    let second = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        make_request(
+            make_endpoint("backup-openai"),
+            generation,
+            layer.revision,
+            capability,
+        ),
     )
     .await
     .expect("second endpoint create succeeds after SaveExtendedConfig");
@@ -10915,7 +11085,7 @@ async fn remote_owner_import_policy_rejects_literal_credential_and_closes_ledger
     assert!(replay.is_err(), "a closed operation must not re-run");
 }
 
-/// The three remaining owner-remoted setup/OAuth mutations are reachable by a
+/// The remaining owner-remoted setup mutations are reachable by a
 /// remote owner (they reserve a durable replay record before dispatch) and are
 /// ledger-wired (a domain failure closes the record `outcome_unknown` and a
 /// same-operation retry is refused rather than re-run). Their happy paths need a
@@ -10924,7 +11094,7 @@ async fn remote_owner_import_policy_rejects_literal_credential_and_closes_ledger
 /// outcome — determines.
 #[tokio::test]
 #[cfg(feature = "remote")]
-async fn remote_owner_setup_and_oauth_mutations_reserve_and_close_ledger() {
+async fn remote_owner_setup_mutations_reserve_and_close_ledger() {
     for request in [
         Request::ApplySetupWizard {
             project_root: tempfile::tempdir()
@@ -10937,20 +11107,13 @@ async fn remote_owner_setup_and_oauth_mutations_reserve_and_close_ledger() {
             answers_json: "{}".into(),
         },
         Request::SetupCopilotAuth {
+            client_operation_id: "setup-copilot-failure".into(),
             project_root: tempfile::tempdir()
                 .unwrap()
                 .path()
                 .to_string_lossy()
                 .into_owned(),
             provider_id: "unconfigured-provider".into(),
-        },
-        Request::CompleteProviderOAuth {
-            flow_id: Uuid::new_v4().to_string(),
-            input: Some("https://callback.example/?code=unknown-flow".into()),
-        },
-        Request::CompleteMcpOAuth {
-            flow_id: Uuid::new_v4().to_string(),
-            input: Some("unknown-flow-code".into()),
         },
     ] {
         let ctx = persistent_test_ctx();
@@ -11013,11 +11176,15 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
     // one and assert the projection carries the challenge, never the verifier.
     let started = [
         Response::ProviderOAuthStarted {
+            client_operation_id: "provider-begin".into(),
+            request_hash: "00".repeat(32),
             flow_id: Uuid::new_v4().to_string(),
             authorize_url: "https://auth.example/authorize?state=abc&code_challenge=PUB-CHALLENGE&code_challenge_method=S256".into(),
             user_code: Some("WXYZ-1234".into()),
         },
         Response::McpOAuthStarted {
+            client_operation_id: "mcp-begin".into(),
+            request_hash: "00".repeat(32),
             flow_id: Uuid::new_v4().to_string(),
             authorize_url: "https://mcp.example/authorize?state=def&code_challenge=PUB-CHALLENGE".into(),
         },
@@ -11043,10 +11210,16 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
     }
     let completed = [
         Response::ProviderOAuthCompleted {
+            client_operation_id: "provider-complete".into(),
+            request_hash: "00".repeat(32),
+            flow_id: "provider-flow".into(),
             logged_in: true,
             retry_after_seconds: None,
         },
         Response::McpOAuthCompleted {
+            client_operation_id: "mcp-complete".into(),
+            request_hash: "00".repeat(32),
+            flow_id: "mcp-flow".into(),
             authenticated: true,
         },
     ];
@@ -11069,22 +11242,577 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
             );
         }
     }
-    // The durable `complete_*` request carries only the client-supplied flow id
-    // and callback input — never the server-held verifier — and its canonical
-    // remote-operation params encode exactly those two fields.
+    // The flow is intentionally local-only as one coherent lifecycle; no
+    // canonical remote-operation payload may be produced for completion.
     #[cfg(feature = "remote")]
     {
         let request = Request::CompleteProviderOAuth {
+            client_operation_id: "provider-complete".into(),
             flow_id: "flow-123".into(),
             input: Some("https://callback.example/?code=abc".into()),
         };
-        let params = request.canonical_remote_operation_params_v1().unwrap();
+        assert!(request.canonical_remote_operation_params_v1().is_err());
+    }
+}
+
+#[test]
+fn oauth_completion_receipts_and_cancel_race_are_secret_safe() {
+    let source = include_str!("dispatch.rs");
+    assert!(
+        source.contains("complete_provider_oauth_receipt_v2")
+            && source.contains("complete_mcp_oauth_receipt_v2"),
+        "completion receipts must correlate only non-secret identifiers"
+    );
+    assert!(
+        !source.contains(
+            "local_operation_request_hash(&(\"complete_provider_oauth\", &flow_id, &input))"
+        ) && !source
+            .contains("local_operation_request_hash(&(\"complete_mcp_oauth\", &flow_id, &input))"),
+        "public/durable terminal responses must not retain an unkeyed verifier of OAuth input"
+    );
+    let provider_cancel_branch = source
+        .find("Request::CancelProviderOAuth")
+        .expect("provider cancellation request branch must exist");
+    let provider_source = &source[provider_cancel_branch..];
+    let provider_committed = provider_source
+        .find("Some(DurableOAuthFlow::ProviderCommitted")
+        .expect("provider cancel must inspect the durable committed marker");
+    let provider_terminal_remove = provider_source[provider_committed..]
+        .find("remove_terminal_provider")
+        .expect("provider cancel must clear stale memory without setting cancellation");
+    let provider_cancel = provider_source[provider_committed..]
+        .find("cancel_provider(flow_id")
+        .expect("provider nonterminal state must remain cancellable");
+    assert!(provider_terminal_remove < provider_cancel);
+    let mcp_cancel_branch = source
+        .find("Request::CancelMcpOAuth")
+        .expect("MCP cancellation request branch must exist");
+    let mcp_source = &source[mcp_cancel_branch..];
+    let mcp_committed = mcp_source
+        .find("Some(DurableOAuthFlow::McpCommitted")
+        .expect("MCP cancel must inspect the durable committed marker");
+    let mcp_terminal_remove = mcp_source[mcp_committed..]
+        .find("remove_terminal_mcp")
+        .expect("MCP cancel must clear stale memory without setting cancellation");
+    let mcp_cancel = mcp_source[mcp_committed..]
+        .find("remove_mcp(flow_id")
+        .expect("MCP nonterminal state must remain cancellable");
+    assert!(mcp_terminal_remove < mcp_cancel);
+}
+
+#[test]
+fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
+    let source = include_str!("../agent_management.rs");
+    assert!(source.contains("SealedEditorReplay"));
+    assert!(source.contains("SealedEditorCompletion"));
+    assert!(source.contains("SecretVaultKind::SealedState"));
+    assert!(source.contains("mutate_item_on_conn"));
+    assert!(source.contains("AgentEditorSettlementStatus"));
+    assert!(source.contains("flycockpit.agent-editor.completion.v2"));
+    assert!(source.contains("recoverable_agent_editor_completions"));
+    assert!(source.contains("editor_lease_settlement"));
+    assert!(
+        !source.contains("snapshot_json"),
+        "agent editor plaintext must never be assigned to a SQLite row"
+    );
+    let schema = include_str!("../../../../cockpit-db/src/db/migrations/0001_initial.sql");
+    let lease_table = schema
+        .split("CREATE TABLE agent_editor_leases")
+        .nth(1)
+        .and_then(|tail| tail.split("CREATE INDEX agent_editor_leases_open").next())
+        .expect("agent editor lease schema must exist");
+    assert!(lease_table.contains("snapshot_handle"));
+    assert!(lease_table.contains("snapshot_identity"));
+    assert!(lease_table.contains("completion_operation_id"));
+    assert!(lease_table.contains("completion_handle"));
+    assert!(lease_table.contains("publication_result_revision"));
+    assert!(source.contains("fail_agent_editor_completion_conn"));
+    assert!(!lease_table.contains("snapshot_digest"));
+    assert!(!lease_table.contains("snapshot_json"));
+    assert!(!lease_table.contains("markdown"));
+}
+
+#[test]
+fn reordered_local_operations_terminalize_every_post_admission_preflight_error() {
+    let source = include_str!("dispatch.rs");
+    for (branch, next, required) in [
+        (
+            "Request::BeginMcpOAuth",
+            "Request::CompleteMcpOAuth",
+            [
+                "let server_config = match async",
+                "finish_local_operation_error",
+            ],
+        ),
+        (
+            "Request::DeleteProviderCredential",
+            "Request::GetFlycockpitAccount",
+            ["let preflight = async", "finish_local_operation_error"],
+        ),
+    ] {
+        let body = source
+            .split(branch)
+            .nth(1)
+            .and_then(|tail| tail.split(next).next())
+            .unwrap_or_else(|| panic!("missing {branch} handler body"));
+        let admission = body
+            .find("begin_local_operation(")
+            .unwrap_or_else(|| panic!("{branch} must durably admit before mutable checks"));
+        let body = &body[admission..];
+        for marker in required {
+            assert!(body.contains(marker), "{branch} omitted {marker}");
+        }
+    }
+}
+
+#[test]
+fn oauth_exchange_failure_and_cancellation_have_atomic_receipt_cleanup() {
+    let source = include_str!("dispatch.rs");
+    let failure = source
+        .split("async fn fail_oauth_exchange")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("async fn recover_committed_oauth_settlements")
+                .next()
+        })
+        .expect("OAuth failure settlement helper must exist");
+    assert!(failure.contains("mutate_item_on_conn"));
+    assert!(failure.contains("owns_exact_claim"));
+    assert!(failure.contains("completion_client_operation_id == client_operation_id"));
+    assert!(failure.contains("completion_request_hash == request_hash"));
+    assert!(failure.contains("completion_fencing_generation == fencing_generation"));
+    assert!(failure.contains("UPDATE local_operation_receipts"));
+    assert!(failure.contains("AND state='executing'"));
+    let cancellation = source
+        .split("async fn commit_oauth_cancel")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn fail_oauth_exchange").next())
+        .expect("OAuth cancellation settlement helper must exist");
+    assert!(cancellation.contains("mutate_item_on_conn"));
+    assert!(cancellation.contains("DurableOAuthFlow::Cancelled"));
+    assert!(cancellation.contains("UPDATE local_operation_receipts"));
+    assert!(cancellation.contains("marker_begin_operation_id != begin_client_operation_id"));
+    assert!(cancellation.contains("state='terminal_cancelled'"));
+    assert!(cancellation.contains("exchange_hash.as_slice()"));
+    assert!(cancellation.contains("exchange_fence"));
+    for branch in ["Request::CancelProviderOAuth", "Request::CancelMcpOAuth"] {
+        let body = source
+            .split(branch)
+            .nth(1)
+            .expect("OAuth cancellation handler must exist");
+        assert!(body.contains("terminalize_local_operation("));
+    }
+}
+
+#[test]
+fn oauth_cancel_candidate_validation_loads_once_and_propagates_storage_errors() {
+    let source = include_str!("dispatch.rs");
+    for (branch, next) in [
+        ("Request::CancelProviderOAuth", "Request::BeginMcpOAuth"),
+        (
+            "Request::CancelMcpOAuth",
+            "Request::DeleteProviderCredential",
+        ),
+    ] {
+        let body = source
+            .split(branch)
+            .nth(1)
+            .and_then(|tail| tail.split(next).next())
+            .unwrap_or_else(|| panic!("missing {branch} handler body"));
+        let candidate_validation = body
+            .split("match candidate {")
+            .nth(1)
+            .and_then(|tail| tail.split("let _lock = SECRET_OWNER_RPC_LOCK").next())
+            .unwrap_or_else(|| panic!("missing {branch} durable candidate validation"));
+        assert_eq!(
+            candidate_validation
+                .matches("load_oauth_flow(ctx, &candidate)?")
+                .count(),
+            1,
+            "{branch} must load its durable candidate exactly once and propagate failures"
+        );
         assert!(
-            !params
-                .windows(verifier.len())
-                .any(|w| w == verifier.as_bytes())
+            !candidate_validation.contains("candidate.filter("),
+            "{branch} must not collapse durable load failures into a missing candidate"
+        );
+        assert!(
+            !candidate_validation.contains("Ok(Some(DurableOAuthFlow"),
+            "{branch} must not match away durable load failures"
         );
     }
+}
+
+#[test]
+fn oauth_token_commit_requires_the_exact_durable_exchange_marker() {
+    let source = include_str!("dispatch.rs");
+    for (kind, marker) in [
+        ("provider", "DurableOAuthFlow::ProviderExchanging"),
+        ("MCP", "DurableOAuthFlow::McpExchanging"),
+    ] {
+        let commit_error = format!("{kind} OAuth commit lost its exact durable exchange fence");
+        let body = source
+            .split(&commit_error)
+            .next()
+            .unwrap_or_else(|| panic!("missing {kind} OAuth exact commit fence"));
+        let body = body
+            .rsplit("ctx.db")
+            .next()
+            .expect("OAuth commit transaction must exist");
+        for required in [
+            "get_item_on_conn",
+            marker,
+            "completion_client_operation_id",
+            "completion_request_hash",
+            "completion_fencing_generation",
+        ] {
+            assert!(body.contains(required), "{kind} commit omitted {required}");
+        }
+    }
+}
+
+#[test]
+fn oauth_settlement_hydrates_public_begin_receipts_and_terminalizes_tombstones() {
+    let source = include_str!("dispatch.rs");
+    let settlement = source
+        .split("Request::GetLocalOperationSettlement")
+        .nth(1)
+        .and_then(|tail| tail.split("Request::BeginProviderOAuth").next())
+        .expect("local settlement handler must exist");
+    for required in [
+        "Response::ProviderOAuthStarted",
+        "Response::McpOAuthStarted",
+        "DurableOAuthFlow::Expired",
+        "DurableOAuthFlow::Cancelled",
+        "*authorize_url = durable_url",
+        "response: expired_error.is_none()",
+        "terminal_error: expired_error",
+    ] {
+        assert!(
+            settlement.contains(required),
+            "settlement omitted {required}"
+        );
+    }
+}
+
+#[test]
+fn oauth_ready_expiry_and_exchange_recovery_are_exact_and_capacity_releasing() {
+    let source = include_str!("dispatch.rs");
+    let expiry = source
+        .split("async fn expire_ready_oauth_flow")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn purge_durable_oauth_flows").next())
+        .expect("Ready OAuth expiry helper must exist");
+    for marker in [
+        "begin_request_hash",
+        "begin_fencing_generation",
+        "DurableOAuthFlow::Expired",
+        "SELECT EXISTS",
+        "AND state='terminal_success'",
+        "mutate_item_on_conn",
+    ] {
+        assert!(expiry.contains(marker), "expiry omitted {marker}");
+    }
+    let purge = source
+        .split("async fn purge_durable_oauth_flows")
+        .nth(1)
+        .and_then(|tail| tail.split("fn find_durable_oauth_flow").next())
+        .expect("OAuth capacity maintenance must exist");
+    assert!(purge.contains("if *ready && *expired"));
+    assert!(!purge.contains("*expired && !*receipt_protected"));
+
+    let claim = source
+        .split("async fn claim_oauth_exchange")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn commit_oauth_begin").next())
+        .expect("OAuth exact claim helper must exist");
+    for marker in [
+        "get_item_on_conn",
+        "exact_live_ready",
+        "completion_client_operation_id",
+        "completion_request_hash",
+        "completion_fencing_generation",
+        "state='executing'",
+    ] {
+        assert!(claim.contains(marker), "claim omitted {marker}");
+    }
+
+    let recovery = source
+        .split("async fn recover_committed_oauth_settlements")
+        .nth(1)
+        .and_then(|tail| tail.split("fn load_oauth_flow").next())
+        .expect("OAuth startup recovery must exist");
+    for marker in [
+        "DurableOAuthFlow::ProviderExchanging",
+        "DurableOAuthFlow::McpExchanging",
+        "completion_client_operation_id",
+        "completion_request_hash",
+        "completion_fencing_generation",
+        "state='terminal_cancelled'",
+    ] {
+        assert!(recovery.contains(marker), "recovery omitted {marker}");
+    }
+}
+
+#[test]
+fn editor_replay_precedes_mutable_trust_and_terminal_replay_is_exact() {
+    let source = include_str!("../agent_management.rs");
+    let begin = source
+        .split("pub async fn begin_editor_lease")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn complete_editor_lease").next())
+        .expect("begin editor lease handler must exist");
+    assert!(
+        begin.find("canonical_project_root").unwrap()
+            < begin.find("agent_editor_lease_by_operation").unwrap()
+    );
+    assert!(
+        begin.find("agent_editor_lease_by_operation").unwrap()
+            < begin.find("trusted_canonical_root").unwrap()
+    );
+    let complete = source
+        .split("async fn complete_editor_lease_inner")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn editor_lease_settlement").next())
+        .expect("complete editor lease handler must exist");
+    assert!(complete.contains("known_lease.completion_identity != Some(completion_identity)"));
+    assert!(complete.contains("identical bytes"));
+    assert!(complete.contains("retaining sealed payload"));
+    assert!(!complete.contains("terminalize_editor_failure"));
+    assert!(
+        complete.find("known_lease.state == \"terminal\"").unwrap()
+            < complete.find("trusted_canonical_root").unwrap()
+    );
+    let settlement = source
+        .split("pub async fn editor_lease_settlement")
+        .nth(1)
+        .and_then(|tail| tail.split("fn editor_completion").next())
+        .expect("editor settlement handler must exist");
+    assert!(!settlement.contains("trusted_root("));
+}
+
+#[test]
+fn oauth_stored_token_debug_and_drop_are_secret_safe() {
+    for source in [
+        include_str!("../../auth/xai_oauth.rs"),
+        include_str!("../../auth/codex_oauth.rs"),
+        include_str!("../../mcp/auth.rs"),
+    ] {
+        let tokens = source
+            .split("pub struct StoredTokens")
+            .nth(1)
+            .expect("StoredTokens must exist");
+        assert!(tokens.contains("impl std::fmt::Debug for StoredTokens"));
+        assert!(tokens.contains("[REDACTED]"));
+        assert!(tokens.contains("impl Drop for StoredTokens"));
+        assert!(tokens.contains("access_token.zeroize()"));
+        assert!(tokens.contains("refresh_token.zeroize()"));
+    }
+}
+
+#[test]
+fn authority_recovery_precedes_both_socket_binds() {
+    let daemon = include_str!("../mod.rs");
+    let recovery = daemon
+        .find("server::recover_before_socket_publish(&ctx).await?")
+        .expect("foreground boot must await authority recovery");
+    let control_bind = daemon[recovery..]
+        .find("bind_private_socket(&paths.socket)")
+        .expect("control socket bind must follow recovery");
+    let reveal_bind = daemon[recovery..]
+        .find("leak_reveal_socket::bind_reveal_socket(&ctx)")
+        .expect("reveal socket bind must follow recovery");
+    assert!(control_bind < reveal_bind);
+
+    let server = include_str!("mod.rs");
+    let recovery_body = server
+        .split("pub async fn recover_before_socket_publish")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn run_accept_loop").next())
+        .expect("startup recovery must be structurally separate from accept");
+    for required in [
+        "recover_all_provider_config_journals",
+        "recover_all_mcp_config_journals",
+        "recover_extended_config_patch_journals",
+        "recover_image_config_mutation_journals",
+        "recover_agent_mutation_journals",
+        "recover_committed_oauth_settlements",
+        "recover_assistant_mutation_journals",
+        "settle_interrupted_local_operations",
+        "recover_editor_leases_before_publish",
+        "maintain_editor_leases",
+    ] {
+        assert!(recovery_body.contains(required), "missing {required}");
+    }
+    assert!(
+        recovery_body
+            .find("recover_known_workspace_resets")
+            .unwrap()
+            < recovery_body
+                .find("recover_agent_mutation_journals")
+                .unwrap(),
+        "reset-all filesystem journals must reconcile before dependent agent authority journals"
+    );
+}
+
+#[test]
+fn oauth_expiry_maintenance_runs_without_new_admission() {
+    let server = include_str!("mod.rs");
+    let accept_loop = server
+        .split("pub async fn run_accept_loop")
+        .nth(1)
+        .expect("accept loop must exist");
+    assert!(accept_loop.contains("dispatch::maintain_durable_oauth_flows(&ctx).await"));
+
+    let dispatch = include_str!("dispatch.rs");
+    let maintenance = dispatch
+        .split("pub(super) async fn maintain_durable_oauth_flows")
+        .nth(1)
+        .and_then(|tail| tail.split("fn find_durable_oauth_flow").next())
+        .expect("periodic OAuth maintenance must exist");
+    assert!(maintenance.contains("expire_ready_oauth_flow"));
+    assert!(maintenance.contains("local_operation_settlement"));
+    assert!(maintenance.contains("receipt.is_none()"));
+    assert!(!maintenance.contains("begin_local_operation"));
+    assert!(!maintenance.contains("commit_oauth_begin"));
+}
+
+#[test]
+fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
+    let dispatch = include_str!("dispatch.rs");
+    let arm = dispatch
+        .split("Request::MutateAgent")
+        .nth(1)
+        .and_then(|tail| tail.split("Request::BeginAgentEditorLease").next())
+        .expect("mutate-agent dispatch arm must exist");
+    for required in [
+        "agent_mutation_intent_hash",
+        "begin_local_operation",
+        "agent_management::mutate",
+        "terminalize_local_operation",
+    ] {
+        assert!(
+            arm.contains(required),
+            "missing agent receipt fence: {required}"
+        );
+    }
+
+    let management = include_str!("../agent_management.rs");
+    let journal = management
+        .find("insert_agent_mutation_journal_under_publication_lock")
+        .expect("agent mutation must durably journal its intended projection");
+    let publish = management[journal..]
+        .find("mutate_sync_locked(")
+        .expect("agent publication must follow journal admission");
+    assert!(publish > 0);
+    let mutate = management
+        .split("pub async fn mutate(")
+        .nth(1)
+        .and_then(|tail| tail.split("struct AgentMutationPlan").next())
+        .expect("agent mutation handler must exist");
+    for required in [
+        "hold_config_mutation_lock",
+        "insert_agent_mutation_journal_under_publication_lock",
+        "mutate_sync_locked",
+        "settlement is unknown",
+    ] {
+        assert!(
+            mutate.contains(required),
+            "missing causal authority marker {required}"
+        );
+    }
+    assert!(
+        mutate.find("hold_config_mutation_lock").unwrap()
+            < mutate
+                .find("insert_agent_mutation_journal_under_publication_lock")
+                .unwrap()
+    );
+    assert!(
+        mutate
+            .find("insert_agent_mutation_journal_under_publication_lock")
+            .unwrap()
+            < mutate.find("mutate_sync_locked(").unwrap()
+    );
+    let db_fence = include_str!("../../../../cockpit-db/src/db/agent_mutation_journals.rs");
+    assert!(db_fence.contains("INSERT OR IGNORE INTO agent_mutation_journals"));
+    for required in [
+        "projection_matches_plan",
+        "CommittedRefreshNeeded",
+        "DELETE FROM assistant_mutation_journals",
+        "recover_agent_mutation_journals",
+        "conflict_agent_mutation_journal",
+        "state='terminal_error'",
+        "SET state='terminal_success'",
+    ] {
+        assert!(management.contains(required), "missing {required}");
+    }
+    let reset_recovery = management
+        .split("pub async fn recover_known_workspace_resets")
+        .nth(1)
+        .and_then(|tail| tail.split("fn reset_all_builtins_atomic_locked").next())
+        .expect("reset journal recovery must exist");
+    assert!(reset_recovery.contains("SELECT DISTINCT project_root FROM agent_mutation_journals"));
+
+    let recovery = management
+        .split("pub async fn recover_agent_mutation_journals")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn cancel_agent_mutation_journal").next())
+        .expect("agent mutation recovery must exist");
+    assert!(recovery.contains("publish_committed_config_generation()"));
+    assert!(recovery.contains("current_config_generation()"));
+    assert!(!recovery.contains("consumed_config_generation.saturating_add"));
+    assert!(recovery.contains("settle_agent_mutation_journal("));
+}
+
+#[test]
+fn assistant_mutations_are_owner_receipted_and_crash_recoverable() {
+    let dispatch = include_str!("dispatch.rs");
+    for required in [
+        "begin_assistant_mutation_journal",
+        "finish_assistant_mutation",
+        "recover_assistant_mutation_journals",
+        "assistant_mutation_journals",
+        "save_assistant_definition",
+        "delete_assistant",
+        "hex::decode(&mutation_intent_hash)",
+        "CommittedRefreshNeeded",
+    ] {
+        assert!(
+            dispatch.contains(required),
+            "missing assistant receipt control {required}"
+        );
+    }
+    let server = include_str!("mod.rs");
+    let recovery = server
+        .split("pub async fn recover_before_socket_publish")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn run_accept_loop").next())
+        .expect("boot recovery body");
+    assert!(
+        recovery.find("recover_definition_journals").unwrap()
+            < recovery
+                .find("recover_assistant_mutation_journals")
+                .unwrap()
+    );
+    assert!(
+        recovery
+            .find("recover_assistant_mutation_journals")
+            .unwrap()
+            < recovery
+                .find("settle_interrupted_local_operations")
+                .unwrap()
+    );
+}
+
+#[test]
+fn local_operation_cancelled_settlement_has_one_terminal_shape() {
+    let dispatch = include_str!("dispatch.rs");
+    let cancelled = dispatch
+        .split("LocalOperationSettlement::TerminalCancelled")
+        .nth(1)
+        .and_then(|tail| tail.split("Request::BeginProviderOAuth").next())
+        .expect("cancelled local settlement arm must exist");
+    assert!(cancelled.contains("terminal_error: None"));
+    assert!(cancelled.contains("terminal_cancelled: true"));
 }
 
 #[tokio::test]
@@ -11202,10 +11930,12 @@ async fn ephemeral_daemon_rejects_persistent_secret_writes() {
             name: "ephemeral-name".into(),
         },
         Request::PutProviderCredential {
+            client_operation_id: "ephemeral-provider-put".into(),
             provider_id: "ephemeral-provider".into(),
             record: "{\"api_key\":\"ephemeral-value\"}".into(),
         },
         Request::DeleteProviderCredential {
+            client_operation_id: "ephemeral-provider-delete".into(),
             provider_id: "ephemeral-provider".into(),
             project_root: None,
         },
@@ -11243,10 +11973,12 @@ async fn owner_secret_rpcs_reject_non_owner_principal() {
             name: "name".into(),
         },
         Request::PutProviderCredential {
+            client_operation_id: "unauthorized-provider-put".into(),
             provider_id: "provider".into(),
             record: "{}".into(),
         },
         Request::DeleteProviderCredential {
+            client_operation_id: "unauthorized-provider-delete".into(),
             provider_id: "provider".into(),
             project_root: None,
         },
@@ -14857,6 +15589,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "put_subscription_ack"
         | "begin_provider_oauth"
         | "complete_provider_oauth"
+        | "cancel_provider_oauth"
         | "begin_mcp_oauth"
         | "complete_mcp_oauth"
         | "upsert_provider_config"
@@ -15206,6 +15939,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("get_flycockpit_account"),
         authz_owner_only("begin_provider_oauth"),
         authz_owner_only("complete_provider_oauth"),
+        authz_owner_only("cancel_provider_oauth"),
         authz_owner_only("begin_mcp_oauth"),
         authz_owner_only("complete_mcp_oauth"),
         authz_owner_only("cancel_mcp_oauth"),
@@ -16583,29 +17317,58 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         #[cfg(feature = "remote")]
         "clear_flycockpit_credential" => Request::ClearFlycockpitCredential,
         "put_subscription_ack" => Request::PutSubscriptionAck {
+            client_operation_id: "subscription-ack".into(),
             provider_id: "codex-oauth".into(),
         },
         "begin_provider_oauth" => Request::BeginProviderOAuth {
+            client_operation_id: "provider-begin".into(),
             provider_id: "codex-oauth".into(),
         },
         "complete_provider_oauth" => Request::CompleteProviderOAuth {
+            client_operation_id: "provider-complete".into(),
             flow_id: "missing-flow".into(),
             input: None,
         },
+        "cancel_provider_oauth" => Request::CancelProviderOAuth {
+            client_operation_id: "provider-cancel".into(),
+            begin_client_operation_id: "provider-begin".into(),
+            flow_id: Some("missing-flow".into()),
+        },
         "begin_mcp_oauth" => Request::BeginMcpOAuth {
+            client_operation_id: "mcp-begin".into(),
             project_root: root.clone(),
             server: "missing-server".into(),
         },
         "complete_mcp_oauth" => Request::CompleteMcpOAuth {
+            client_operation_id: "mcp-complete".into(),
             flow_id: "missing-flow".into(),
             input: None,
         },
         "cancel_mcp_oauth" => Request::CancelMcpOAuth {
-            flow_id: "missing-flow".into(),
+            client_operation_id: "mcp-cancel".into(),
+            begin_client_operation_id: "mcp-begin".into(),
+            flow_id: Some("missing-flow".into()),
         },
         "get_provider_catalog_snapshot" => Request::GetProviderCatalogSnapshot {
             project_root: root.clone(),
             provider_id: None,
+            snapshot_session_id: "fixture-snapshot".into(),
+        },
+        "apply_provider_mutation" => Request::ApplyProviderMutation {
+            snapshot_session_id: "fixture-snapshot".into(),
+            layer_id: "fixture-layer".into(),
+            expected_revision: "fixture-revision".into(),
+            client_operation_id: "fixture-operation".into(),
+            mutation_intent_hash: "00".repeat(32),
+            mutation: cockpit_proto::ProviderMutationBatch {
+                upserts: vec![cockpit_proto::ProviderMutationUpsert {
+                    provider_id: "example".into(),
+                    entry: crate::config::providers::ProviderEntry::default(),
+                    header_secrets: Vec::new(),
+                }],
+                deletes: Vec::new(),
+                metadata: None,
+            },
         },
         "fetch_provider_models" => Request::FetchProviderModels {
             project_root: root.clone(),
@@ -16745,6 +17508,9 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "begin_leak_reveal" => Request::BeginLeakReveal {
             report_id: "missing".into(),
         },
+        "cancel_leak_reveal" => Request::CancelLeakReveal {
+            capability: proto::LeakRevealToken::new("00".repeat(32)),
+        },
         "mark_leak_rotated" => Request::MarkLeakRotated {
             report_id: "missing".into(),
             rotation: proto::LeakRotationDisposition::Dismiss,
@@ -16770,15 +17536,26 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             name: "matrix-secret".into(),
         },
         "put_provider_credential" => Request::PutProviderCredential {
+            client_operation_id: "matrix-operation".into(),
             provider_id: "matrix-provider".into(),
             record: "{}".into(),
         },
+        "get_local_operation_settlement" => Request::GetLocalOperationSettlement {
+            client_operation_id: "matrix-operation".into(),
+        },
         "delete_provider_credential" => Request::DeleteProviderCredential {
+            client_operation_id: "matrix-operation".into(),
             provider_id: "matrix-provider".into(),
             project_root: None,
         },
         "save_mcp_config" => Request::SaveMcpConfig {
+            client_operation_id: "matrix-operation".into(),
             project_root: root.clone(),
+            snapshot_capability: "snapshot".into(),
+            owner_root: root.clone(),
+            config_path: format!("{root}/.cockpit/mcp.json"),
+            expected_revision: "00".repeat(32),
+            mutation_intent_hash: "11".repeat(32),
             config_json: "{}".into(),
             secret_values_json: "{}".into(),
             cleanup_names_json: "[]".into(),
@@ -16822,59 +17599,120 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             workflow_id: "wf-authz".into(),
         },
         "image_endpoint_create" => Request::ImageEndpointCreate {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             endpoint_json: "not json".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_endpoint_update" => Request::ImageEndpointUpdate {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             endpoint_id: "ep-authz".into(),
             endpoint_json: "not json".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_endpoint_delete" => Request::ImageEndpointDelete {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             endpoint_id: "ep-authz".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_target_create" => Request::ImageTargetCreate {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             target_json: "not json".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_target_update" => Request::ImageTargetUpdate {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             target_id: "t-authz".into(),
             target_json: "not json".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_target_delete" => Request::ImageTargetDelete {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             target_id: "t-authz".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_target_set_default" => Request::ImageTargetSetDefault {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             target_id: "t-authz".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_workflow_upload" => Request::ImageWorkflowUpload {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             workflow_json: "not json".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_workflow_bind" => Request::ImageWorkflowBind {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             workflow_id: "wf-authz".into(),
             bindings_json: "not json".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_workflow_delete" => Request::ImageWorkflowDelete {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             workflow_id: "wf-authz".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "save_image_spend_policy" => Request::SaveImageSpendPolicy {
+            client_operation_id: "authz-image-save".into(),
             project_key: root.clone(),
             settings_json: "not json".into(),
             expected_policy_version: None,
@@ -16886,6 +17724,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             base_hash: None,
         },
         "setup_copilot_auth" => Request::SetupCopilotAuth {
+            client_operation_id: "matrix-operation".into(),
             project_root: root.clone(),
             provider_id: "matrix-provider".into(),
         },
@@ -16950,8 +17789,18 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             name: "helper-bot".into(),
         },
         "delete_assistant" => Request::DeleteAssistant {
+            client_operation_id: "delete-assistant".into(),
+            mutation_intent_hash: cockpit_proto::assistant_mutation_intent_hash(
+                "/tmp/project",
+                "delete",
+                "helper-bot",
+                "revision",
+                None,
+            ),
+            project_root: "/tmp/project".into(),
             name: "helper-bot".into(),
             expected_revision: "revision".into(),
+            expected_config_generation: 7,
         },
         "diagnose_media_reservation" => Request::DiagnoseMediaReservation {
             scope: "session".into(),
@@ -23126,6 +23975,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
         CommandMetadataCase {
             request: Request::PutProviderCredential {
+                client_operation_id: "metadata-provider-put".into(),
                 provider_id: "example".into(),
                 record: "{}".into(),
             },
@@ -23136,6 +23986,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
         CommandMetadataCase {
             request: Request::DeleteProviderCredential {
+                client_operation_id: "metadata-provider-delete".into(),
                 provider_id: "example".into(),
                 project_root: None,
             },
@@ -23437,6 +24288,15 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             session_id: None,
             audit_path: None,
             mutating: false,
+        },
+        CommandMetadataCase {
+            request: Request::CancelLeakReveal {
+                capability: proto::LeakRevealToken::new("00".repeat(32)),
+            },
+            kind: "cancel_leak_reveal",
+            session_id: None,
+            audit_path: None,
+            mutating: true,
         },
         CommandMetadataCase {
             request: Request::MarkLeakRotated {
@@ -23824,43 +24684,46 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::SyncFlycockpitOrgPolicy, kind: "sync_flycockpit_org_policy", session_id: None, audit_path: None, mutating: true },
         #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::EnrollFlycockpitOrgSync { org_id: "org-fixture".into() }, kind: "enroll_flycockpit_org_sync", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::PutSubscriptionAck { provider_id: "codex-oauth".into() }, kind: "put_subscription_ack", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::BeginProviderOAuth { provider_id: "example".into() }, kind: "begin_provider_oauth", session_id: None, audit_path: None, mutating: false },
-        CommandMetadataCase { request: Request::CompleteProviderOAuth { flow_id: "flow".into(), input: None }, kind: "complete_provider_oauth", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::BeginMcpOAuth { project_root: "/tmp/project".into(), server: "example".into() }, kind: "begin_mcp_oauth", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
-        CommandMetadataCase { request: Request::CompleteMcpOAuth { flow_id: "flow".into(), input: None }, kind: "complete_mcp_oauth", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::CancelMcpOAuth { flow_id: "flow".into() }, kind: "cancel_mcp_oauth", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::GetProviderCatalogSnapshot { project_root: "/tmp/project".into(), provider_id: None }, kind: "get_provider_catalog_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::PutSubscriptionAck { client_operation_id: "subscription-ack".into(), provider_id: "codex-oauth".into() }, kind: "put_subscription_ack", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::BeginProviderOAuth { client_operation_id: "begin-provider".into(), provider_id: "example".into() }, kind: "begin_provider_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::CompleteProviderOAuth { client_operation_id: "complete-provider".into(), flow_id: "flow".into(), input: None }, kind: "complete_provider_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::CancelProviderOAuth { client_operation_id: "cancel-provider".into(), begin_client_operation_id: "begin-provider".into(), flow_id: Some("flow".into()) }, kind: "cancel_provider_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::BeginMcpOAuth { client_operation_id: "begin-mcp".into(), project_root: "/tmp/project".into(), server: "example".into() }, kind: "begin_mcp_oauth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::CompleteMcpOAuth { client_operation_id: "complete-mcp".into(), flow_id: "flow".into(), input: None }, kind: "complete_mcp_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::CancelMcpOAuth { client_operation_id: "cancel-mcp".into(), begin_client_operation_id: "begin-mcp".into(), flow_id: Some("flow".into()) }, kind: "cancel_mcp_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::GetProviderCatalogSnapshot { project_root: "/tmp/project".into(), provider_id: None, snapshot_session_id: "fixture-snapshot".into() }, kind: "get_provider_catalog_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ApplyProviderMutation { snapshot_session_id: "fixture-snapshot".into(), layer_id: "fixture-layer".into(), expected_revision: "fixture-revision".into(), client_operation_id: "fixture-operation".into(), mutation_intent_hash: "00".repeat(32), mutation: cockpit_proto::ProviderMutationBatch { upserts: vec![cockpit_proto::ProviderMutationUpsert { provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }], deletes: Vec::new(), metadata: None } }, kind: "apply_provider_mutation", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::GetLocalOperationSettlement { client_operation_id: "fixture-operation".into() }, kind: "get_local_operation_settlement", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::FetchProviderModels { project_root: "/tmp/project".into(), provider_id: None, model_id: None, deep: false, on_unlisted: None, allow_fallback: false }, kind: "fetch_provider_models", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetProviderUsageSnapshot { project_root: "/tmp/project".into(), provider_id: None }, kind: "get_provider_usage_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::UpsertProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default() }, kind: "upsert_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SaveProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }, kind: "save_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::SaveMcpConfig { project_root: "/tmp/project".into(), config_json: "{}".into(), secret_values_json: "{}".into(), cleanup_names_json: "[]".into() }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SaveMcpConfig { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), snapshot_capability: "snapshot".into(), owner_root: "/tmp/project".into(), config_path: "/tmp/project/.cockpit/mcp.json".into(), expected_revision: "00".repeat(32), mutation_intent_hash: "11".repeat(32), config_json: "{}".into(), secret_values_json: "{}".into(), cleanup_names_json: "[]".into() }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::DeleteProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), delete_stored_secrets: false }, kind: "delete_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SetProviderLayerMetadata { project_root: "/tmp/project".into(), category_defaults_json: "{}".into(), on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch::Keep }, kind: "set_provider_layer_metadata", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::SetupCopilotAuth { project_root: "/tmp/project".into(), provider_id: "example".into() }, kind: "setup_copilot_auth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SetupCopilotAuth { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), provider_id: "example".into() }, kind: "setup_copilot_auth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ApplySetupWizard { project_root: "/tmp/project".into(), wizard_id: "security".into(), answers_json: "{}".into() }, kind: "apply_setup_wizard", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SaveExtendedConfig { project_root: "/tmp/project".into(), path: "AGENTS.md".into(), content: String::new(), base_hash: None }, kind: "save_extended_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ExportPolicy { project_root: "/tmp/project".into() }, kind: "export_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImportPolicy { project_root: "/tmp/project".into(), bundle_json: "{}".into(), replace: false }, kind: "import_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetImageSpendPolicy { project_key: "proj".into() }, kind: "get_image_spend_policy", session_id: None, audit_path: None, mutating: false },
-        CommandMetadataCase { request: Request::SaveImageSpendPolicy { project_key: "proj".into(), settings_json: "{}".into(), expected_policy_version: None }, kind: "save_image_spend_policy", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::SaveImageSpendPolicy { client_operation_id: "image-save".into(), project_key: "proj".into(), settings_json: "{}".into(), expected_policy_version: None }, kind: "save_image_spend_policy", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ImageEndpointList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_endpoint_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImageEndpointGet { project_root: "/tmp/project".into(), endpoint_id: "ep1".into() }, kind: "image_endpoint_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImageTargetList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_target_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImageTargetGet { project_root: "/tmp/project".into(), target_id: "t1".into() }, kind: "image_target_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImageWorkflowList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_workflow_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImageWorkflowGet { project_root: "/tmp/project".into(), workflow_id: "wf1".into() }, kind: "image_workflow_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
-        CommandMetadataCase { request: Request::ImageEndpointCreate { project_root: "/tmp/project".into(), endpoint_json: "{}".into(), expected_config_generation: None }, kind: "image_endpoint_create", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageEndpointUpdate { project_root: "/tmp/project".into(), endpoint_id: "ep1".into(), endpoint_json: "{}".into(), expected_config_generation: None }, kind: "image_endpoint_update", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageEndpointDelete { project_root: "/tmp/project".into(), endpoint_id: "ep1".into(), expected_config_generation: None }, kind: "image_endpoint_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageTargetCreate { project_root: "/tmp/project".into(), target_json: "{}".into(), expected_config_generation: None }, kind: "image_target_create", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageTargetUpdate { project_root: "/tmp/project".into(), target_id: "t1".into(), target_json: "{}".into(), expected_config_generation: None }, kind: "image_target_update", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageTargetDelete { project_root: "/tmp/project".into(), target_id: "t1".into(), expected_config_generation: None }, kind: "image_target_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageTargetSetDefault { project_root: "/tmp/project".into(), target_id: "t1".into(), expected_config_generation: None }, kind: "image_target_set_default", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageWorkflowUpload { project_root: "/tmp/project".into(), workflow_json: "{}".into(), expected_config_generation: None }, kind: "image_workflow_upload", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageWorkflowBind { project_root: "/tmp/project".into(), workflow_id: "wf1".into(), bindings_json: "{}".into(), expected_config_generation: None }, kind: "image_workflow_bind", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageWorkflowDelete { project_root: "/tmp/project".into(), workflow_id: "wf1".into(), expected_config_generation: None }, kind: "image_workflow_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageEndpointCreate { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), endpoint_json: "{}".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_endpoint_create", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageEndpointUpdate { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), endpoint_id: "ep1".into(), endpoint_json: "{}".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_endpoint_update", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageEndpointDelete { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), endpoint_id: "ep1".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_endpoint_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageTargetCreate { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), target_json: "{}".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_target_create", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageTargetUpdate { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), target_id: "t1".into(), target_json: "{}".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_target_update", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageTargetDelete { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), target_id: "t1".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_target_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageTargetSetDefault { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), target_id: "t1".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_target_set_default", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageWorkflowUpload { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), workflow_json: "{}".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_workflow_upload", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageWorkflowBind { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), workflow_id: "wf1".into(), bindings_json: "{}".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_workflow_bind", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageWorkflowDelete { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), workflow_id: "wf1".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_workflow_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ListPackages, kind: "list_packages", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::AddPackage { project_root: project_root.clone(), identifier: "pkg".into(), git: None, branch: None, local_path: None, deep: false }, kind: "add_package", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ImportPackage { project_root: project_root.clone(), dir: None, package: None, id: None, as_path: false }, kind: "import_package", session_id: None, audit_path: None, mutating: true },
@@ -23874,7 +24737,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::GetSessionCompactions { session_id }, kind: "get_session_compactions", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::PurgeEndedSessions { before: 0 }, kind: "purge_ended_sessions", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetAssistant { name: "a".into() }, kind: "get_assistant", session_id: None, audit_path: None, mutating: false },
-        CommandMetadataCase { request: Request::DeleteAssistant { name: "a".into(), expected_revision: "revision".into() }, kind: "delete_assistant", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::DeleteAssistant { client_operation_id: "delete-assistant".into(), mutation_intent_hash: cockpit_proto::assistant_mutation_intent_hash(&project_root, "delete", "a", "revision", None), project_root: project_root.clone(), name: "a".into(), expected_revision: "revision".into(), expected_config_generation: 7 }, kind: "delete_assistant", session_id: None, audit_path: Some(project_root.as_str()), mutating: true },
         CommandMetadataCase { request: Request::DiagnoseMediaReservation { scope: "s".into(), id: "i".into() }, kind: "diagnose_media_reservation", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::RepairMediaReservation { scope: "s".into(), id: "i".into(), expected_block_generation: 0, repair_plan_digest: "d".into(), idempotency_key: "k".into() }, kind: "repair_media_reservation", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetDoctorSnapshot { project_root: None, no_sandbox: false, offline: false }, kind: "get_doctor_snapshot", session_id: None, audit_path: None, mutating: false },
@@ -23973,6 +24836,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         RetireSealedAction,
         ListLeakReports,
         BeginLeakReveal,
+        CancelLeakReveal,
         MarkLeakRotated,
         DeleteLeakReport,
         ListProjectNotes,
@@ -24074,9 +24938,11 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         PutSubscriptionAck,
         DeleteNamedSecret,
         PutProviderCredential,
+        GetLocalOperationSettlement,
         DeleteProviderCredential,
         BeginProviderOAuth,
         CompleteProviderOAuth,
+        CancelProviderOAuth,
         BeginMcpOAuth,
         CompleteMcpOAuth,
         CancelMcpOAuth,

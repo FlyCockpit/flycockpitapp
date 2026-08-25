@@ -87,7 +87,11 @@ fn base() -> ImageGenerationConfig {
 fn endpoint_create_appends_and_upserts() {
     let (cfg, changes) = apply_edit(
         &base(),
-        Edit::EndpointCreate(serde_json::to_string(&endpoint("second", false, None)).unwrap()),
+        Edit::EndpointCreate(
+            serde_json::to_string(&endpoint("second", false, None))
+                .unwrap()
+                .into(),
+        ),
     )
     .expect("create ok");
     assert_eq!(cfg.endpoints().len(), 2);
@@ -102,7 +106,11 @@ fn endpoint_create_duplicate_id_is_rejected() {
     // `::new`'s unique-id invariant fails closed.
     let err = apply_edit(
         &base(),
-        Edit::EndpointCreate(serde_json::to_string(&endpoint(ENDPOINT_ID, false, None)).unwrap()),
+        Edit::EndpointCreate(
+            serde_json::to_string(&endpoint(ENDPOINT_ID, false, None))
+                .unwrap()
+                .into(),
+        ),
     )
     .expect_err("duplicate rejected");
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -115,7 +123,7 @@ fn target_create_referencing_missing_endpoint_fails_closed() {
     let orphan = hosted_target("t-orphan", "ghost-endpoint", true, false);
     let err = apply_edit(
         &base(),
-        Edit::TargetCreate(serde_json::to_string(&orphan).unwrap()),
+        Edit::TargetCreate(serde_json::to_string(&orphan).unwrap().into()),
     )
     .expect_err("dangling target rejected");
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -198,7 +206,7 @@ fn change_set_and_event_carry_no_secret() {
         &base(),
         Edit::EndpointUpdate {
             endpoint_id: ENDPOINT_ID.to_string(),
-            json: endpoint_json,
+            json: endpoint_json.into(),
         },
     )
     .expect("update ok");
@@ -211,6 +219,11 @@ fn change_set_and_event_carry_no_secret() {
     let event = ImageControlEventV1::config_changed(
         "daemon-1".to_string(),
         "/tmp/project".to_string(),
+        "/tmp/project".to_string(),
+        "/tmp/project/.cockpit/config.json".to_string(),
+        "revision".to_string(),
+        cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)),
+        9,
         change_set.clone(),
     );
 
@@ -305,7 +318,11 @@ fn workflow_v2(id: &str) -> RegisteredComfyWorkflow {
 fn base_with_workflow() -> ImageGenerationConfig {
     apply_edit(
         &base(),
-        Edit::WorkflowUpload(serde_json::to_string(&workflow("wf-a", None)).unwrap()),
+        Edit::WorkflowUpload(
+            serde_json::to_string(&workflow("wf-a", None))
+                .unwrap()
+                .into(),
+        ),
     )
     .expect("upload ok")
     .0
@@ -368,7 +385,11 @@ fn comfy_config_referencing_workflow() -> ImageGenerationConfig {
 fn workflow_upload_appends_and_upserts() {
     let (cfg, changes) = apply_edit(
         &base(),
-        Edit::WorkflowUpload(serde_json::to_string(&workflow("wf-new", None)).unwrap()),
+        Edit::WorkflowUpload(
+            serde_json::to_string(&workflow("wf-new", None))
+                .unwrap()
+                .into(),
+        ),
     )
     .expect("upload ok");
     assert_eq!(cfg.workflows().len(), 1);
@@ -391,7 +412,11 @@ fn mutation_preserves_authored_base_tier_threshold() {
     );
     let (cfg, _changes) = apply_edit(
         &authored,
-        Edit::WorkflowUpload(serde_json::to_string(&workflow("wf-new", None)).unwrap()),
+        Edit::WorkflowUpload(
+            serde_json::to_string(&workflow("wf-new", None))
+                .unwrap()
+                .into(),
+        ),
     )
     .expect("upload ok");
     assert_eq!(
@@ -407,7 +432,11 @@ fn workflow_upload_duplicate_id_is_rejected() {
     // `::new`'s unique-id invariant fails closed.
     let err = apply_edit(
         &base_with_workflow(),
-        Edit::WorkflowUpload(serde_json::to_string(&workflow("wf-a", None)).unwrap()),
+        Edit::WorkflowUpload(
+            serde_json::to_string(&workflow("wf-a", None))
+                .unwrap()
+                .into(),
+        ),
     )
     .expect_err("duplicate rejected");
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -425,7 +454,7 @@ fn workflow_upload_lying_graph_digest_is_rejected() {
     assert_ne!(lying.graph_digest, honest_digest);
     let err = apply_edit(
         &base(),
-        Edit::WorkflowUpload(serde_json::to_string(&lying).unwrap()),
+        Edit::WorkflowUpload(serde_json::to_string(&lying).unwrap().into()),
     )
     .expect_err("lying digest rejected");
     assert_eq!(err.code, ErrorCode::BadRequest);
@@ -437,7 +466,7 @@ fn workflow_bind_replaces_definition_and_upserts() {
         &base_with_workflow(),
         Edit::WorkflowBind {
             workflow_id: "wf-a".into(),
-            json: serde_json::to_string(&workflow_v2("wf-a")).unwrap(),
+            json: serde_json::to_string(&workflow_v2("wf-a")).unwrap().into(),
         },
     )
     .expect("bind ok");
@@ -456,7 +485,7 @@ fn workflow_bind_lying_graph_digest_is_rejected() {
         &base_with_workflow(),
         Edit::WorkflowBind {
             workflow_id: "wf-a".into(),
-            json: serde_json::to_string(&lying).unwrap(),
+            json: serde_json::to_string(&lying).unwrap().into(),
         },
     )
     .expect_err("lying digest rejected");
@@ -469,7 +498,9 @@ fn workflow_bind_changing_id_is_rejected() {
         &base_with_workflow(),
         Edit::WorkflowBind {
             workflow_id: "wf-a".into(),
-            json: serde_json::to_string(&workflow("wf-b", None)).unwrap(),
+            json: serde_json::to_string(&workflow("wf-b", None))
+                .unwrap()
+                .into(),
         },
     )
     .expect_err("id change rejected");
@@ -483,7 +514,9 @@ fn workflow_bind_missing_is_not_found() {
         &base(),
         Edit::WorkflowBind {
             workflow_id: "ghost".into(),
-            json: serde_json::to_string(&workflow("ghost", None)).unwrap(),
+            json: serde_json::to_string(&workflow("ghost", None))
+                .unwrap()
+                .into(),
         },
     )
     .expect_err("missing workflow");
@@ -531,7 +564,7 @@ fn workflow_change_set_and_event_carry_no_graph_json() {
     );
 
     let (cfg, pending) =
-        apply_edit(&base(), Edit::WorkflowUpload(workflow_json)).expect("upload ok");
+        apply_edit(&base(), Edit::WorkflowUpload(workflow_json.into())).expect("upload ok");
 
     let generation = "9";
     let change_set = ImageConfigChangeSetSafeV1::new(
@@ -541,6 +574,11 @@ fn workflow_change_set_and_event_carry_no_graph_json() {
     let event = ImageControlEventV1::config_changed(
         "daemon-1".to_string(),
         "/tmp/project".to_string(),
+        "/tmp/project".to_string(),
+        "/tmp/project/.cockpit/config.json".to_string(),
+        "revision".to_string(),
+        cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)),
+        9,
         change_set.clone(),
     );
 
@@ -564,4 +602,128 @@ fn workflow_change_set_and_event_carry_no_graph_json() {
         }
         other => panic!("expected workflow upsert, got {other:?}"),
     }
+}
+
+#[test]
+fn registry_patch_preserves_raw_unknown_and_secret_bearing_siblings() {
+    let raw = br#"{
+      "unknown_future_key": {"opaque": "keep-me"},
+      "providers": {"private": {"api_key": "named-secret-reference"}},
+      "image_generation": {"endpoints": [], "targets": [], "workflows": []}
+    }"#;
+    let rendered = render_registry_patch(raw, &base()).expect("typed image patch renders");
+    let document: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
+    assert_eq!(
+        document.pointer("/unknown_future_key/opaque"),
+        Some(&serde_json::json!("keep-me"))
+    );
+    assert_eq!(
+        document.pointer("/providers/private/api_key"),
+        Some(&serde_json::json!("named-secret-reference"))
+    );
+    assert!(document.get("image_generation").is_some());
+}
+
+#[test]
+fn authoritative_registry_selection_uses_most_specific_authored_layer() {
+    let temp = tempfile::tempdir().unwrap();
+    let least = temp.path().join("least.json");
+    let middle = temp.path().join("middle.json");
+    let most = temp.path().join("most.json");
+    std::fs::write(
+        &least,
+        br#"{"image_generation":{"endpoints":[],"targets":[],"workflows":[]}}"#,
+    )
+    .unwrap();
+    std::fs::write(&middle, br#"{"unrelated":true}"#).unwrap();
+    std::fs::write(
+        &most,
+        br#"{"image_generation":{"endpoints":[],"targets":[],"workflows":[]}}"#,
+    )
+    .unwrap();
+
+    let selected = most_specific_authored_registry(&[least, middle, most.clone()]).unwrap();
+    assert_eq!(selected.as_deref(), Some(most.as_path()));
+}
+
+#[test]
+fn authoritative_registry_selection_does_not_promote_unrelated_layer() {
+    let temp = tempfile::tempdir().unwrap();
+    let authored = temp.path().join("authored.json");
+    let unrelated = temp.path().join("unrelated.json");
+    std::fs::write(
+        &authored,
+        br#"{"sibling":{"keep":true},"image_generation":{"endpoints":[],"targets":[],"workflows":[]}}"#,
+    )
+    .unwrap();
+    std::fs::write(&unrelated, br#"{"other":"preserve-inheritance"}"#).unwrap();
+
+    let selected = most_specific_authored_registry(&[authored.clone(), unrelated]).unwrap();
+    assert_eq!(selected.as_deref(), Some(authored.as_path()));
+    let raw = read_document(&authored).unwrap();
+    assert!(registry_from_document(raw.as_slice()).is_ok());
+}
+
+#[test]
+fn not_yet_created_target_is_bound_to_canonical_existing_ancestor() {
+    let temp = tempfile::tempdir().unwrap();
+    let alias_spelling = temp
+        .path()
+        .join("child")
+        .join("..")
+        .join(".cockpit/config.json");
+    let exact = exact_target_path(&alias_spelling).unwrap();
+    assert_eq!(exact, temp.path().join(".cockpit/config.json"));
+    assert!(exact.is_absolute());
+}
+
+#[test]
+fn durability_source_ratchet_requires_exact_cas_journal_and_post_commit_publication() {
+    let source = include_str!("../image_control_mutations.rs");
+    for required in [
+        "expected_config_revision",
+        "verify_mutation_capability",
+        "most_specific_authored_registry",
+        "exact_target_path",
+        "registry_from_document(consumed.as_slice())",
+        "image_config_mutation_journals",
+        "local_operation_receipts",
+        "write_config_bytes_atomic",
+        "publish_committed_config_generation",
+        "recover_image_config_mutation_journals",
+        "CONFIG_PUBLICATION_RPC_LOCK",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing durability fence {required}"
+        );
+    }
+    let write = source.find("write_config_bytes_atomic").unwrap();
+    let publish = source[write..]
+        .find("publish_committed_config_generation")
+        .map(|offset| write + offset)
+        .unwrap();
+    assert!(
+        write < publish,
+        "generation publication must follow atomic commit"
+    );
+    assert!(
+        !source.contains("let mut cfg = loaded.clone()")
+            && !source.contains("apply_edit(&extended.image_generation"),
+        "dedicated writer must never serialize the effective layered config"
+    );
+    let recovery = source
+        .split("pub(crate) async fn recover_image_config_mutation_journals")
+        .nth(1)
+        .expect("image recovery exists");
+    let actual_read = recovery
+        .find("let actual_bytes = read_document")
+        .expect("recovery must re-read the exact target");
+    assert!(
+        !recovery[..actual_read].contains("receipt_state.starts_with"),
+        "terminal-looking receipts must not retire journals before file reconciliation"
+    );
+    assert!(recovery.contains("if actual == intended"));
+    assert!(recovery.contains("else if actual == consumed"));
+    assert!(recovery.contains("diverged from both consumed and intended"));
 }

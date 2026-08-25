@@ -226,6 +226,24 @@ impl SecretVault {
         fingerprint_key(&self.kek)
     }
 
+    /// Produce an installation- and vault-keyed, domain-separated identity.
+    /// This is suitable for equality/replay fences persisted outside the vault:
+    /// unlike a raw content digest it is not an offline guessing oracle.
+    pub fn keyed_identity(&self, domain: &[u8], value: &[u8]) -> [u8; 32] {
+        let mut derivation =
+            HmacSha256::new_from_slice(self.kek.as_ref()).expect("HMAC accepts any key length");
+        derivation.update(b"flycockpit.vault-identity-key.v1\0");
+        derivation.update(self.installation.as_hex().as_bytes());
+        derivation.update(b"\0");
+        derivation.update(domain);
+        let mut derived = Zeroizing::new([0_u8; 32]);
+        derived.copy_from_slice(&derivation.finalize().into_bytes());
+        let mut identity =
+            HmacSha256::new_from_slice(derived.as_slice()).expect("HMAC accepts any key length");
+        identity.update(value);
+        identity.finalize().into_bytes().into()
+    }
+
     pub fn db(&self) -> &Db {
         &self.db
     }

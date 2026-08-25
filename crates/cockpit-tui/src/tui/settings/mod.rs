@@ -69,7 +69,7 @@ mod tools_page;
 mod ui_page;
 
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -101,10 +101,842 @@ pub(crate) async fn settings_daemon_client()
         .client)
 }
 
+/// A transport captured on the reducer thread and then owned by an async
+/// action. Tests retain their installed fake even when the action is polled on
+/// another runtime worker; production performs the request on the daemon's
+/// asynchronous client.
+pub(crate) struct CapturedSettingsDaemon {
+    #[cfg(test)]
+    effect: Arc<dyn SettingsDaemonEffect>,
+}
+
+pub(crate) fn capture_settings_daemon() -> CapturedSettingsDaemon {
+    #[cfg(test)]
+    {
+        let effect = TEST_SETTINGS_DAEMON_EFFECT
+            .with(|slot| slot.borrow().clone())
+            .unwrap_or_else(disk_daemon_fake::default_effect);
+        return CapturedSettingsDaemon { effect };
+    }
+    #[cfg(not(test))]
+    CapturedSettingsDaemon {}
+}
+
+impl CapturedSettingsDaemon {
+    pub(crate) async fn request(self, request: Request) -> Result<Response, String> {
+        #[cfg(test)]
+        {
+            self.effect.request(request)
+        }
+        #[cfg(not(test))]
+        {
+            let client = settings_daemon_client()
+                .await
+                .map_err(|error| error.to_string())?;
+            tokio::time::timeout(std::time::Duration::from_secs(15), client.request(request))
+                .await
+                .map_err(|_| "local daemon request timed out".to_string())?
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn local_receipt_request_hash<T: serde::Serialize>(request: &T) -> Result<String, String> {
+    use sha2::{Digest as _, Sha256};
+
+    let encoded =
+        zeroize::Zeroizing::new(serde_json::to_vec(request).map_err(|error| error.to_string())?);
+    Ok(Sha256::digest(encoded.as_slice())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn hex_lower_for_authority(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn canonical_project_root(project_root: &std::path::Path) -> String {
+    // Launch/session project roots are daemon-resolved before entering the
+    // settings surface. Preserve that authority identity without performing
+    // filesystem discovery in the synchronous reducer.
+    project_root.to_string_lossy().to_string()
+}
+
+/// A daemon request emitted by a synchronous settings reducer. The target is
+/// explicit authority context rather than display text, allowing the
+/// completion reducer to reject stale results before interpreting the body.
+#[derive(Debug)]
+pub(crate) struct SettingsDaemonEffectRequest {
+    pub(crate) dialog_id: uuid::Uuid,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) target: SettingsEffectTarget,
+    pub(crate) work: SettingsDaemonEffectWork,
+}
+
+pub(crate) struct SettingsBlockingEffectRequest {
+    pub(crate) dialog_id: uuid::Uuid,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) target: SettingsEffectTarget,
+    pub(crate) work: SettingsBlockingEffectWork,
+}
+
+pub(crate) enum SettingsBlockingEffectWork {
+    PrepareAgentEditor {
+        staging_id: uuid::Uuid,
+        seed: String,
+    },
+    ReadAgentEditor {
+        staging_id: uuid::Uuid,
+        directory_handle: std::fs::File,
+        leaf: std::ffi::OsString,
+    },
+    PrepareCategoryEditor {
+        staging_id: uuid::Uuid,
+        seed: String,
+    },
+    ReadCategoryEditor {
+        staging_id: uuid::Uuid,
+        directory_handle: std::fs::File,
+        leaf: std::ffi::OsString,
+    },
+}
+
+impl std::fmt::Debug for SettingsBlockingEffectWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrepareAgentEditor { staging_id, .. } => f
+                .debug_struct("PrepareAgentEditor")
+                .field("staging_id", staging_id)
+                .field("seed", &"[DRAFT]")
+                .finish(),
+            Self::ReadAgentEditor {
+                staging_id, leaf, ..
+            } => f
+                .debug_struct("ReadAgentEditor")
+                .field("staging_id", staging_id)
+                .field("leaf", leaf)
+                .finish(),
+            Self::PrepareCategoryEditor { staging_id, .. } => f
+                .debug_struct("PrepareCategoryEditor")
+                .field("staging_id", staging_id)
+                .field("seed", &"[DRAFT]")
+                .finish(),
+            Self::ReadCategoryEditor {
+                staging_id, leaf, ..
+            } => f
+                .debug_struct("ReadCategoryEditor")
+                .field("staging_id", staging_id)
+                .field("leaf", leaf)
+                .finish(),
+        }
+    }
+}
+
+pub(crate) enum SettingsBlockingOutcome {
+    AgentEditorPrepared {
+        staging_id: uuid::Uuid,
+        staging: agents_page::AgentExternalEditStaging,
+    },
+    AgentEditorRead {
+        staging_id: uuid::Uuid,
+        text: String,
+    },
+    CategoryEditorPrepared {
+        staging_id: uuid::Uuid,
+        staging: agents_page::AgentExternalEditStaging,
+    },
+    CategoryEditorRead {
+        staging_id: uuid::Uuid,
+        text: String,
+    },
+}
+
+impl std::fmt::Debug for SettingsBlockingOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentEditorPrepared { staging_id, .. } => f
+                .debug_struct("AgentEditorPrepared")
+                .field("staging_id", staging_id)
+                .field("staging", &"[PRIVATE STAGING]")
+                .finish(),
+            Self::AgentEditorRead { staging_id, text } => f
+                .debug_struct("AgentEditorRead")
+                .field("staging_id", staging_id)
+                .field("bytes", &text.len())
+                .finish(),
+            Self::CategoryEditorPrepared { staging_id, .. } => f
+                .debug_struct("CategoryEditorPrepared")
+                .field("staging_id", staging_id)
+                .field("staging", &"[PRIVATE STAGING]")
+                .finish(),
+            Self::CategoryEditorRead { staging_id, text } => f
+                .debug_struct("CategoryEditorRead")
+                .field("staging_id", staging_id)
+                .field("bytes", &text.len())
+                .finish(),
+        }
+    }
+}
+
+pub(crate) fn execute_settings_blocking_work(
+    work: SettingsBlockingEffectWork,
+) -> Result<SettingsBlockingOutcome, String> {
+    match work {
+        SettingsBlockingEffectWork::PrepareAgentEditor { staging_id, seed } => {
+            let staging = agents_page::prepare_agent_external_edit_staging(&seed)?;
+            Ok(SettingsBlockingOutcome::AgentEditorPrepared {
+                staging_id,
+                staging,
+            })
+        }
+        SettingsBlockingEffectWork::ReadAgentEditor {
+            staging_id,
+            directory_handle,
+            leaf,
+        } => Ok(SettingsBlockingOutcome::AgentEditorRead {
+            staging_id,
+            text: agents_page::read_agent_external_edit_staging(&directory_handle, &leaf)?,
+        }),
+        SettingsBlockingEffectWork::PrepareCategoryEditor { staging_id, seed } => {
+            let staging = agents_page::prepare_agent_external_edit_staging(&seed)?;
+            Ok(SettingsBlockingOutcome::CategoryEditorPrepared {
+                staging_id,
+                staging,
+            })
+        }
+        SettingsBlockingEffectWork::ReadCategoryEditor {
+            staging_id,
+            directory_handle,
+            leaf,
+        } => Ok(SettingsBlockingOutcome::CategoryEditorRead {
+            staging_id,
+            text: agents_page::read_agent_external_edit_staging(&directory_handle, &leaf)?,
+        }),
+    }
+}
+
+pub(crate) enum SettingsDaemonEffectWork {
+    Request(Request),
+    SettlementQuery(Request),
+    ProviderCredentialPut {
+        client_operation_id: String,
+        provider_id: String,
+        record: SecretPayload,
+    },
+    McpOAuthComplete {
+        client_operation_id: String,
+        flow_id: String,
+        input: SecretPayload,
+    },
+    McpConfigSave {
+        client_operation_id: String,
+        project_root: String,
+        snapshot_capability: String,
+        owner_root: String,
+        config_path: String,
+        expected_revision: String,
+        mutation_intent_hash: String,
+        config_json: String,
+        secret_values_json: SecretPayload,
+        cleanup_names_json: String,
+    },
+    ProviderMutation(ProviderMutationPlan),
+    TypedDocumentEdit(TypedDocumentEditPlan),
+}
+
+pub(crate) struct SecretPayload(zeroize::Zeroizing<String>);
+
+impl SecretPayload {
+    pub(crate) fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    fn take(mut self) -> String {
+        std::mem::take(&mut *self.0)
+    }
+}
+
+impl std::fmt::Debug for SecretPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretPayload([REDACTED])")
+    }
+}
+
+impl std::fmt::Debug for SettingsDaemonEffectWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(_) => f.write_str("Request([REDACTED BODY])"),
+            Self::SettlementQuery(_) => f.write_str("SettlementQuery([REDACTED BODY])"),
+            Self::ProviderCredentialPut { provider_id, .. } => f
+                .debug_struct("ProviderCredentialPut")
+                .field("provider_id", provider_id)
+                .field("record", &"[REDACTED]")
+                .finish(),
+            Self::McpOAuthComplete { flow_id, .. } => f
+                .debug_struct("McpOAuthComplete")
+                .field("flow_id", flow_id)
+                .field("input", &"[REDACTED]")
+                .finish(),
+            Self::McpConfigSave { project_root, .. } => f
+                .debug_struct("McpConfigSave")
+                .field("project_root", project_root)
+                .field("secret_values_json", &"[REDACTED]")
+                .finish(),
+            Self::ProviderMutation(_) => f.write_str("ProviderMutation([REDACTED SECRETS])"),
+            Self::TypedDocumentEdit(_) => f.write_str("TypedDocumentEdit([REDACTED PATCH])"),
+        }
+    }
+}
+
+pub(crate) struct ProviderMutationPlan {
+    snapshot_session_id: String,
+    layer_id: String,
+    owner_root: String,
+    mutation_intent_hash: String,
+    expected_revision: String,
+    client_operation_id: String,
+    saves: Vec<ProviderSavePlan>,
+    deletes: Vec<(String, bool)>,
+    metadata: Option<(
+        BTreeMap<String, cockpit_config::config::providers::ProviderModelRef>,
+        OnUnlistedModelsFetch,
+    )>,
+}
+
+pub(crate) struct ProviderSavePlan {
+    provider_id: String,
+    entry: ProviderEntry,
+    header_secrets: Vec<Option<zeroize::Zeroizing<String>>>,
+}
+
+impl std::fmt::Debug for ProviderMutationPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderMutationPlan")
+            .field("snapshot_session_id", &self.snapshot_session_id)
+            .field("layer_id", &self.layer_id)
+            .field("owner_root", &self.owner_root)
+            .field("mutation_intent_hash", &self.mutation_intent_hash)
+            .field("expected_revision", &self.expected_revision)
+            .field("client_operation_id", &self.client_operation_id)
+            .field("save_count", &self.saves.len())
+            .field("deletes", &self.deletes)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ProviderSavePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSavePlan")
+            .field("provider_id", &self.provider_id)
+            .field("entry", &"[REDACTED HEADERS]")
+            .field("header_secret_count", &self.header_secrets.len())
+            .finish()
+    }
+}
+
+fn provider_plan_intent_hash(
+    saves: &[ProviderSavePlan],
+    deletes: &[(String, bool)],
+    metadata: &Option<(
+        BTreeMap<String, cockpit_config::config::providers::ProviderModelRef>,
+        OnUnlistedModelsFetch,
+    )>,
+) -> Result<String, String> {
+    cockpit_proto::ProviderMutationBatch {
+        upserts: saves
+            .iter()
+            .map(|save| cockpit_proto::ProviderMutationUpsert {
+                provider_id: save.provider_id.clone(),
+                entry: save.entry.clone(),
+                header_secrets: save
+                    .header_secrets
+                    .iter()
+                    .map(|secret| {
+                        secret
+                            .as_ref()
+                            .map(|_| cockpit_proto::ProviderSecretValue::new(String::new()))
+                    })
+                    .collect(),
+            })
+            .collect(),
+        deletes: deletes
+            .iter()
+            .map(
+                |(provider_id, delete_stored_secrets)| cockpit_proto::ProviderMutationDelete {
+                    provider_id: provider_id.clone(),
+                    delete_stored_secrets: *delete_stored_secrets,
+                },
+            )
+            .collect(),
+        metadata: metadata
+            .as_ref()
+            .map(|(category_defaults, on_unlisted_models_fetch)| {
+                cockpit_proto::ProviderLayerMetadataPatch {
+                    category_defaults: category_defaults.clone(),
+                    on_unlisted_models_fetch: *on_unlisted_models_fetch,
+                }
+            }),
+    }
+    .sanitized_intent_hash()
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Debug)]
+pub(crate) struct TypedDocumentEditPlan {
+    client_operation_id: String,
+    project_root: String,
+    requested_path: String,
+    patch: serde_json::Value,
+    snapshot_session_id: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct SettingsDaemonWorkOutcome {
+    pub(crate) response: Result<Response, String>,
+    /// True only when the daemon returned a protocol error. Transport,
+    /// timeout, and response-shape failures remain settlement-ambiguous.
+    pub(crate) authoritative_rejection: bool,
+    pub(crate) committed_refresh_needed: Option<CommittedRefreshNeeded>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CommittedRefreshNeeded {
+    pub(crate) result_revision: String,
+    pub(crate) config_generation: u64,
+    pub(crate) warning: String,
+}
+
+pub(crate) async fn execute_settings_daemon_work(
+    work: SettingsDaemonEffectWork,
+) -> Result<SettingsDaemonWorkOutcome, String> {
+    let client = settings_daemon_client()
+        .await
+        .map_err(|error| error.to_string())?;
+    match work {
+        SettingsDaemonEffectWork::Request(request) => {
+            let response = client
+                .request(request)
+                .await
+                .map_err(|error| error.to_string())?;
+            let authoritative_rejection = response.is_err();
+            Ok(SettingsDaemonWorkOutcome {
+                response: response.map_err(|error| error.to_string()),
+                authoritative_rejection,
+                committed_refresh_needed: None,
+            })
+        }
+        SettingsDaemonEffectWork::SettlementQuery(request) => {
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(15), client.request(request))
+                    .await
+                    .map_err(|_| "local operation settlement query timed out".to_string())?
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string());
+            Ok(SettingsDaemonWorkOutcome {
+                response,
+                authoritative_rejection: false,
+                committed_refresh_needed: None,
+            })
+        }
+        SettingsDaemonEffectWork::ProviderCredentialPut {
+            client_operation_id,
+            provider_id,
+            record,
+        } => Ok(SettingsDaemonWorkOutcome {
+            response: client
+                .request(Request::PutProviderCredential {
+                    client_operation_id,
+                    provider_id,
+                    record: cockpit_proto::SensitiveWirePayload::new(record.take()),
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string()),
+            authoritative_rejection: false,
+            committed_refresh_needed: None,
+        }),
+        SettingsDaemonEffectWork::McpOAuthComplete {
+            client_operation_id,
+            flow_id,
+            input,
+        } => Ok(SettingsDaemonWorkOutcome {
+            response: client
+                .request(Request::CompleteMcpOAuth {
+                    client_operation_id,
+                    flow_id,
+                    input: Some(cockpit_proto::SensitiveWirePayload::new(input.take())),
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string()),
+            authoritative_rejection: false,
+            committed_refresh_needed: None,
+        }),
+        SettingsDaemonEffectWork::McpConfigSave {
+            client_operation_id,
+            project_root,
+            snapshot_capability,
+            owner_root,
+            config_path,
+            expected_revision,
+            mutation_intent_hash,
+            config_json,
+            secret_values_json,
+            cleanup_names_json,
+        } => Ok(SettingsDaemonWorkOutcome {
+            response: client
+                .request(Request::SaveMcpConfig {
+                    client_operation_id,
+                    project_root,
+                    snapshot_capability,
+                    owner_root,
+                    config_path,
+                    expected_revision,
+                    mutation_intent_hash,
+                    config_json,
+                    secret_values_json: cockpit_proto::SensitiveWirePayload::new(
+                        secret_values_json.take(),
+                    ),
+                    cleanup_names_json,
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string()),
+            authoritative_rejection: false,
+            committed_refresh_needed: None,
+        }),
+        SettingsDaemonEffectWork::ProviderMutation(plan) => {
+            let mutation = cockpit_proto::ProviderMutationBatch {
+                upserts: plan
+                    .saves
+                    .into_iter()
+                    .map(|save| cockpit_proto::ProviderMutationUpsert {
+                        provider_id: save.provider_id,
+                        entry: save.entry,
+                        header_secrets: save
+                            .header_secrets
+                            .into_iter()
+                            .map(|secret| {
+                                secret.map(|mut value| {
+                                    cockpit_proto::ProviderSecretValue::new(std::mem::take(
+                                        &mut *value,
+                                    ))
+                                })
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                deletes: plan
+                    .deletes
+                    .into_iter()
+                    .map(|(provider_id, delete_stored_secrets)| {
+                        cockpit_proto::ProviderMutationDelete {
+                            provider_id,
+                            delete_stored_secrets,
+                        }
+                    })
+                    .collect(),
+                metadata: plan
+                    .metadata
+                    .map(|(category_defaults, on_unlisted_models_fetch)| {
+                        cockpit_proto::ProviderLayerMetadataPatch {
+                            category_defaults,
+                            on_unlisted_models_fetch,
+                        }
+                    }),
+            };
+            let observed_intent_hash = mutation
+                .sanitized_intent_hash()
+                .map_err(|error| format!("failed to identify provider mutation: {error}"))?;
+            if observed_intent_hash != plan.mutation_intent_hash {
+                return Err(
+                    "provider mutation changed after its authority gate was installed".into(),
+                );
+            }
+            let expected_intent_hash = plan.mutation_intent_hash.clone();
+            let expected_operation_id = plan.client_operation_id.clone();
+            let expected_session_id = plan.snapshot_session_id.clone();
+            let expected_layer_id = plan.layer_id.clone();
+            let expected_owner_root = plan.owner_root.clone();
+            let expected_revision = plan.expected_revision.clone();
+            let expected_upserts = mutation
+                .upserts
+                .iter()
+                .map(|upsert| (upsert.provider_id.clone(), upsert.entry.clone()))
+                .collect::<Vec<_>>();
+            let expected_deletes = mutation
+                .deletes
+                .iter()
+                .map(|delete| delete.provider_id.clone())
+                .collect::<Vec<_>>();
+            let expected_metadata = mutation.metadata.clone();
+            let response = client
+                .request(Request::ApplyProviderMutation {
+                    snapshot_session_id: expected_session_id.clone(),
+                    layer_id: expected_layer_id.clone(),
+                    expected_revision: expected_revision.clone(),
+                    client_operation_id: expected_operation_id.clone(),
+                    mutation_intent_hash: expected_intent_hash.clone(),
+                    mutation,
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            match &response {
+                Response::ProviderMutationCommitted {
+                    client_operation_id,
+                    snapshot_session_id,
+                    layer_id,
+                    owner_root,
+                    mutation_intent_hash,
+                    consumed_revision,
+                    config,
+                    status: cockpit_proto::ConfigCommitStatus::Committed,
+                    ..
+                } if client_operation_id == &expected_operation_id
+                    && snapshot_session_id == &expected_session_id
+                    && layer_id == &expected_layer_id
+                    && owner_root == &expected_owner_root
+                    && mutation_intent_hash == &expected_intent_hash
+                    && consumed_revision == &expected_revision
+                    && provider_view_matches_mutation(
+                        config,
+                        &expected_upserts,
+                        &expected_deletes,
+                        expected_metadata.as_ref(),
+                    ) => {}
+                other => {
+                    return Err(format!(
+                        "provider mutation returned an unbound or semantically mismatched receipt: {other:?}"
+                    ));
+                }
+            }
+            Ok(SettingsDaemonWorkOutcome {
+                response: Ok(response),
+                authoritative_rejection: false,
+                committed_refresh_needed: None,
+            })
+        }
+        SettingsDaemonEffectWork::TypedDocumentEdit(plan) => {
+            let snapshot = client
+                .request(Request::GetExtendedConfigSnapshot {
+                    project_root: plan.project_root.clone(),
+                    snapshot_session_id: plan.snapshot_session_id.clone(),
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+            let Response::ExtendedConfigSnapshot { layers, .. } = snapshot else {
+                return Err(format!(
+                    "unexpected typed-edit snapshot response: {snapshot:?}"
+                ));
+            };
+            let layer = layers
+                .into_iter()
+                .find(|layer| layer.display_path == plan.requested_path)
+                .ok_or_else(|| {
+                    "typed settings target is not a daemon-discovered layer".to_string()
+                })?;
+            let mut document =
+                serde_json::to_value(&layer.config).map_err(|error| error.to_string())?;
+            apply_json_merge_patch_local(&mut document, plan.patch);
+            let desired: ExtendedConfig = serde_json::from_value(document)
+                .map_err(|error| format!("invalid typed settings edit: {error}"))?;
+            let base = serde_json::to_value(&layer.config).map_err(|error| error.to_string())?;
+            let desired_value =
+                serde_json::to_value(&desired).map_err(|error| error.to_string())?;
+            let operations = changed_extended_paths(&base, &desired_value)?;
+            let expected_layer_id = layer.layer_id.clone();
+            let expected_layer_kind = layer.kind;
+            let expected_revision = layer.revision.clone();
+            let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+                operations,
+                materialize: true,
+                denylist: Vec::new(),
+                redacted_mutations: Vec::new(),
+            };
+            let expected_intent_hash = patch
+                .sanitized_intent_hash()
+                .map_err(|error| error.to_string())?;
+            let response = client
+                .request(Request::ApplyExtendedConfigPatch {
+                    client_operation_id: plan.client_operation_id.clone(),
+                    project_root: plan.project_root.clone(),
+                    layer_id: expected_layer_id.clone(),
+                    patch,
+                    expected_revision: expected_revision.clone(),
+                    snapshot_session_id: plan.snapshot_session_id.clone(),
+                })
+                .await;
+            let response = match response {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) | Err(_) => match client
+                    .request(Request::GetLocalOperationSettlement {
+                        client_operation_id: plan.client_operation_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(_)) | Err(_) => Response::LocalOperationSettlement {
+                        client_operation_id: plan.client_operation_id.clone(),
+                        operation_kind: String::new(),
+                        request_hash: String::new(),
+                        pending: true,
+                        response: None,
+                        terminal_error: None,
+                        terminal_cancelled: false,
+                    },
+                },
+            };
+            let response = match response {
+                Response::LocalOperationSettlement {
+                    client_operation_id,
+                    operation_kind,
+                    request_hash,
+                    pending: false,
+                    response: Some(response),
+                    terminal_error: None,
+                    terminal_cancelled: false,
+                } if client_operation_id == plan.client_operation_id
+                    && operation_kind == "apply_extended_config_patch"
+                    && valid_local_settlement_hash(&request_hash) =>
+                {
+                    *response
+                }
+                Response::LocalOperationSettlement {
+                    client_operation_id,
+                    operation_kind,
+                    request_hash,
+                    pending: false,
+                    response: None,
+                    terminal_error: Some(error),
+                    ..
+                } if client_operation_id == plan.client_operation_id
+                    && operation_kind == "apply_extended_config_patch"
+                    && valid_local_settlement_hash(&request_hash) =>
+                {
+                    return Err(format!(
+                        "typed settings mutation was authoritatively rejected: {error}"
+                    ));
+                }
+                response @ Response::LocalOperationSettlement {
+                    client_operation_id: ref returned_operation_id,
+                    pending: true,
+                    ..
+                } if returned_operation_id == &plan.client_operation_id => {
+                    return Ok(SettingsDaemonWorkOutcome {
+                        response: Ok(response),
+                        authoritative_rejection: false,
+                        committed_refresh_needed: None,
+                    });
+                }
+                other => other,
+            };
+            let (result_revision, result_generation) = match response {
+                Response::ExtendedConfigSaved {
+                    client_operation_id,
+                    request_hash,
+                    mutation_intent_hash,
+                    hash,
+                    layer_id,
+                    layer,
+                    consumed_revision,
+                    result_revision,
+                    status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+                    config_generation,
+                    ..
+                } if client_operation_id == plan.client_operation_id
+                    && cockpit_proto::is_opaque_authority_token(&request_hash)
+                    && mutation_intent_hash == expected_intent_hash
+                    && layer_id == expected_layer_id
+                    && layer == expected_layer_kind
+                    && consumed_revision == expected_revision
+                    && hash == result_revision
+                    && cockpit_proto::is_opaque_authority_token(&result_revision) =>
+                {
+                    (result_revision, config_generation)
+                }
+                other => return Err(format!("unexpected typed-edit commit response: {other:?}")),
+            };
+            let refreshed = client
+                .request(Request::GetExtendedConfigSnapshot {
+                    project_root: plan.project_root,
+                    snapshot_session_id: plan.snapshot_session_id,
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|response| response.map_err(|error| error.to_string()));
+            match &refreshed {
+                Ok(Response::ExtendedConfigSnapshot { layers, .. })
+                    if layers.iter().any(|layer| {
+                        layer.display_path == plan.requested_path
+                            && layer.layer_id == expected_layer_id
+                            && layer.revision == result_revision
+                    }) =>
+                {
+                    Ok(SettingsDaemonWorkOutcome {
+                        response: refreshed,
+                        authoritative_rejection: false,
+                        committed_refresh_needed: None,
+                    })
+                }
+                _ => Ok(SettingsDaemonWorkOutcome {
+                    response: Err(
+                        "typed settings edit committed, but authoritative refresh did not reconcile"
+                            .into(),
+                    ),
+                    authoritative_rejection: false,
+                    committed_refresh_needed: Some(CommittedRefreshNeeded {
+                        result_revision,
+                        config_generation: result_generation,
+                        warning: "settings committed, but the authoritative refresh did not reconcile; reload before editing again".into(),
+                    }),
+                }),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettingsEffectTarget {
+    pub(crate) surface: &'static str,
+    pub(crate) owner: String,
+    pub(crate) revision: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SettingsDaemonEffectCompletion {
+    pub(crate) dialog_id: uuid::Uuid,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) target: SettingsEffectTarget,
+    pub(crate) response: Result<Response, String>,
+    pub(crate) authoritative_rejection: bool,
+    pub(crate) committed_refresh_needed: Option<CommittedRefreshNeeded>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SettingsBlockingEffectCompletion {
+    pub(crate) dialog_id: uuid::Uuid,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) target: SettingsEffectTarget,
+    pub(crate) outcome: Result<SettingsBlockingOutcome, String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SettingsBlockingEffectMetadata {
+    pub(crate) dialog_id: uuid::Uuid,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) target: SettingsEffectTarget,
+}
+
 /// Run a short daemon RPC from an input reducer. Production reducers execute
 /// beneath the application's multi-thread Tokio runtime. Unit reducers are
 /// intentionally synchronous, so give those tests the same daemon boundary
 /// instead of panicking before the request can be exercised.
+#[cfg(test)]
 fn run_settings_daemon<T>(
     future: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
@@ -134,12 +966,15 @@ fn run_settings_daemon<T>(
 /// client and tests feed responses through the same snapshot/patch/receipt
 /// validation below; a test double may replace only transport, never config
 /// loading or persistence.
-pub(crate) trait SettingsDaemonEffect: Send + Sync {
+#[cfg(test)]
+trait SettingsDaemonEffect: Send + Sync {
     fn request(&self, request: Request) -> Result<Response, String>;
 }
 
+#[cfg(test)]
 struct ProductionSettingsDaemonEffect;
 
+#[cfg(test)]
 impl SettingsDaemonEffect for ProductionSettingsDaemonEffect {
     fn request(&self, request: Request) -> Result<Response, String> {
         run_settings_daemon(async move {
@@ -161,12 +996,6 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Single test-mode entry point for every daemon transport the settings and
-/// agent surfaces use.  A thread-installed effect wins so a test can script
-/// exact wire responses; otherwise the shared disk-backed fake answers the
-/// request against the real filesystem, which keeps the production reducers —
-/// snapshot decoding, receipt validation, and refresh reconciliation — on the
-/// path under test.
 #[cfg(test)]
 pub(crate) fn test_daemon_request(request: Request) -> Result<Response, String> {
     if let Some(effect) = TEST_SETTINGS_DAEMON_EFFECT.with(|slot| slot.borrow().clone()) {
@@ -235,6 +1064,7 @@ fn existing_denylist_draft(entry_id: &str) -> String {
     format!("{DENYLIST_EXISTING_DRAFT_PREFIX}{entry_id}")
 }
 
+#[cfg(test)]
 fn extended_config_layer_snapshot(
     path: &std::path::Path,
     project_root: Option<&std::path::Path>,
@@ -341,9 +1171,609 @@ pub(super) enum SettingsPatchOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SettingsSaveOutcome {
     Saved,
+    Queued,
     CommittedRefreshNeeded(String),
 }
 
+enum PendingSettingsOperation {
+    ExtendedLoad {
+        requested_path: String,
+        project_root: String,
+        snapshot_session_id: String,
+    },
+    ExtendedSave {
+        client_operation_id: String,
+        requested_path: String,
+        project_root: String,
+        snapshot_session_id: String,
+        layer_id: String,
+        mutation_intent_hash: String,
+        expected_layer: cockpit_core::daemon::proto::CockpitConfigLayer,
+        expected_revision: String,
+        expected_generation: u64,
+        operations: Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>,
+        denylist_plan: Vec<cockpit_core::daemon::proto::DesiredDenylistEntry>,
+    },
+    ExtendedRefresh {
+        target: SettingsEffectTarget,
+        requested_path: String,
+        expected_layer: cockpit_core::daemon::proto::CockpitConfigLayer,
+        result_revision: String,
+        result_generation: u64,
+        operations: Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>,
+        committed_denylist: Vec<cockpit_core::daemon::proto::CommittedDenylistEntry>,
+        warning: Option<String>,
+    },
+    ProviderCatalog {
+        project_root: String,
+        provider_id: Option<String>,
+        snapshot_session_id: String,
+        navigation: Option<ProviderNavigation>,
+    },
+    ProjectShadowSnapshot {
+        target: SettingsEffectTarget,
+        prompt: category::ShadowedGlobalPrompt,
+    },
+    ImageSpendLoad {
+        target: SettingsEffectTarget,
+        project_key: String,
+        page_instance_id: uuid::Uuid,
+    },
+    ProviderMutation {
+        target: SettingsEffectTarget,
+        client_operation_id: String,
+        snapshot_session_id: String,
+        layer_id: String,
+        owner_root: String,
+        mutation_intent_hash: String,
+        expected_revision: String,
+        expected_generation: u64,
+        staged_default: Option<cockpit_config::config::providers::ActiveModelRef>,
+        notice: Option<String>,
+    },
+    Followup {
+        label: &'static str,
+        target: SettingsEffectTarget,
+    },
+    SimpleMutation {
+        target: SettingsEffectTarget,
+        action: SettingsMutationAction,
+    },
+    SettlementQuery {
+        target: SettingsEffectTarget,
+        client_operation_id: String,
+        original: Box<PendingSettingsOperation>,
+    },
+    SettlementUnknown {
+        target: SettingsEffectTarget,
+        client_operation_id: String,
+        original: Box<PendingSettingsOperation>,
+    },
+    TypedDocumentEdit {
+        target: SettingsEffectTarget,
+        client_operation_id: String,
+        requested_path: String,
+        action: TypedDocumentEditAction,
+    },
+    CategoryExternalPrepare {
+        target: SettingsEffectTarget,
+        pointer_operation_id: shell::PointerOperationId,
+        staging_id: uuid::Uuid,
+    },
+    CategoryExternalRead {
+        target: SettingsEffectTarget,
+        pointer_operation_id: shell::PointerOperationId,
+        staging_id: uuid::Uuid,
+        outcome: pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
+    },
+}
+
+impl PendingSettingsOperation {
+    fn target(&self) -> SettingsEffectTarget {
+        match self {
+            Self::ExtendedLoad {
+                requested_path,
+                snapshot_session_id,
+                ..
+            } => SettingsEffectTarget {
+                surface: "settings.extended-load",
+                owner: requested_path.clone(),
+                revision: Some(snapshot_session_id.clone()),
+            },
+            Self::ExtendedSave {
+                layer_id,
+                expected_revision,
+                ..
+            } => SettingsEffectTarget {
+                surface: "settings.extended-save",
+                owner: layer_id.clone(),
+                revision: Some(expected_revision.clone()),
+            },
+            Self::ExtendedRefresh { target, .. }
+            | Self::ProjectShadowSnapshot { target, .. }
+            | Self::ImageSpendLoad { target, .. }
+            | Self::ProviderMutation { target, .. }
+            | Self::Followup { target, .. }
+            | Self::SimpleMutation { target, .. }
+            | Self::SettlementQuery { target, .. }
+            | Self::SettlementUnknown { target, .. }
+            | Self::TypedDocumentEdit { target, .. }
+            | Self::CategoryExternalPrepare { target, .. }
+            | Self::CategoryExternalRead { target, .. } => target.clone(),
+            Self::ProviderCatalog {
+                project_root,
+                provider_id,
+                snapshot_session_id,
+                ..
+            } => SettingsEffectTarget {
+                surface: "settings.provider-catalog",
+                owner: format!(
+                    "{}::{}",
+                    project_root,
+                    provider_id.as_deref().unwrap_or("*")
+                ),
+                revision: Some(snapshot_session_id.clone()),
+            },
+        }
+    }
+
+    fn target_matches(&self, actual: &SettingsEffectTarget) -> bool {
+        self.target() == *actual
+    }
+}
+
+#[derive(Clone)]
+enum ProviderNavigation {
+    Edit {
+        provider_id: String,
+        oauth_expired: bool,
+    },
+    Models {
+        provider_id: String,
+    },
+}
+
+enum ProviderMutationNavigation {
+    List { status: String },
+    Edit { provider_id: String, status: String },
+}
+
+enum TypedDocumentEditAction {
+    Scaffold,
+    RemoveProjectShadow(category::ShadowedGlobalPrompt),
+}
+
+#[derive(Clone)]
+enum SettingsMutationAction {
+    McpSave {
+        config: cockpit_core::mcp::config::McpConfig,
+        client_operation_id: String,
+        project_root: String,
+        expected_owner_root: String,
+        expected_config_path: String,
+        snapshot_capability: String,
+        expected_consumed_revision: String,
+        expected_result_revision: String,
+        expected_request_intent_hash: String,
+    },
+    McpOAuthBegin {
+        server: String,
+        client_operation_id: String,
+        expected_request_hash: String,
+    },
+    McpOAuthComplete {
+        server: String,
+        flow_id: String,
+        client_operation_id: String,
+        expected_request_hash: String,
+    },
+    McpOAuthCancel {
+        server: String,
+        flow_id: String,
+        client_operation_id: String,
+        expected_request_hash: String,
+    },
+    ProviderCredentialDelete {
+        provider_id: String,
+        client_operation_id: String,
+        project_root: String,
+        expected_request_hash: String,
+    },
+    ProviderCredentialPut {
+        provider_id: String,
+        client_operation_id: String,
+        expected_request_intent_hash: String,
+    },
+    WebCredentialPut {
+        provider_id: String,
+        client_operation_id: String,
+        expected_request_intent_hash: String,
+    },
+    CopilotSetup {
+        provider_id: String,
+        client_operation_id: String,
+        project_root: String,
+        expected_request_hash: String,
+    },
+    ImageSpendSave {
+        client_operation_id: String,
+        project_key: String,
+        settings: cockpit_config::config::image_spend::ImageSpendSettings,
+        expected_policy_version: Option<u64>,
+        expected_request_hash: String,
+        page_instance_id: uuid::Uuid,
+    },
+}
+
+impl SettingsMutationAction {
+    fn operation_kind(&self) -> &'static str {
+        match self {
+            Self::McpSave { .. } => "save_mcp_config",
+            Self::McpOAuthBegin { .. } => "begin_mcp_oauth",
+            Self::McpOAuthComplete { .. } => "complete_mcp_oauth",
+            Self::McpOAuthCancel { .. } => "cancel_mcp_oauth",
+            Self::ProviderCredentialDelete { .. } => "delete_provider_credential",
+            Self::ProviderCredentialPut { .. } | Self::WebCredentialPut { .. } => {
+                "put_provider_credential"
+            }
+            Self::CopilotSetup { .. } => "setup_copilot_auth",
+            Self::ImageSpendSave { .. } => "save_image_spend_policy",
+        }
+    }
+
+    fn settlement_id(&self) -> &str {
+        match self {
+            Self::McpSave {
+                client_operation_id,
+                ..
+            }
+            | Self::McpOAuthBegin {
+                client_operation_id,
+                ..
+            }
+            | Self::McpOAuthComplete {
+                client_operation_id,
+                ..
+            }
+            | Self::McpOAuthCancel {
+                client_operation_id,
+                ..
+            }
+            | Self::ProviderCredentialDelete {
+                client_operation_id,
+                ..
+            }
+            | Self::ProviderCredentialPut {
+                client_operation_id,
+                ..
+            }
+            | Self::WebCredentialPut {
+                client_operation_id,
+                ..
+            }
+            | Self::CopilotSetup {
+                client_operation_id,
+                ..
+            }
+            | Self::ImageSpendSave {
+                client_operation_id,
+                ..
+            } => client_operation_id,
+        }
+    }
+
+    fn matches_durable_receipt(&self, response: &Response) -> bool {
+        match (self, response) {
+            (
+                Self::ImageSpendSave {
+                    client_operation_id,
+                    project_key,
+                    expected_policy_version,
+                    expected_request_hash,
+                    ..
+                },
+                Response::ImageSpendPolicySaved {
+                    client_operation_id: returned_id,
+                    project_key: returned_project,
+                    request_hash,
+                    consumed_policy_version,
+                    result_policy_version,
+                },
+            ) => {
+                returned_id == client_operation_id
+                    && returned_project == project_key
+                    && request_hash == expected_request_hash
+                    && consumed_policy_version == expected_policy_version
+                    && *result_policy_version
+                        == expected_policy_version.map_or(1, |version| version.saturating_add(1))
+            }
+            (
+                Self::McpOAuthBegin {
+                    client_operation_id,
+                    expected_request_hash,
+                    ..
+                },
+                Response::McpOAuthStarted {
+                    client_operation_id: returned_id,
+                    request_hash,
+                    ..
+                },
+            ) => returned_id == client_operation_id && request_hash == expected_request_hash,
+            (
+                Self::McpOAuthComplete {
+                    client_operation_id,
+                    flow_id,
+                    expected_request_hash,
+                    ..
+                },
+                Response::McpOAuthCompleted {
+                    client_operation_id: returned_id,
+                    request_hash,
+                    flow_id: returned_flow,
+                    ..
+                },
+            ) => {
+                returned_id == client_operation_id
+                    && request_hash == expected_request_hash
+                    && returned_flow == flow_id
+            }
+            (
+                Self::McpOAuthCancel {
+                    client_operation_id,
+                    flow_id,
+                    expected_request_hash,
+                    ..
+                },
+                Response::McpOAuthCancelled {
+                    client_operation_id: returned_id,
+                    request_hash,
+                    flow_id: returned_flow,
+                    cancelled,
+                },
+            ) => {
+                returned_id == client_operation_id
+                    && request_hash == expected_request_hash
+                    && (returned_flow.as_deref() == Some(flow_id.as_str())
+                        || (!cancelled && returned_flow.is_none()))
+            }
+            (
+                Self::McpSave {
+                    client_operation_id,
+                    project_root,
+                    expected_owner_root,
+                    expected_config_path,
+                    expected_consumed_revision,
+                    expected_result_revision,
+                    expected_request_intent_hash,
+                    ..
+                },
+                Response::McpConfigCommitted {
+                    client_operation_id: returned_id,
+                    request_hash,
+                    project_root: returned_root,
+                    owner_root,
+                    config_path,
+                    consumed_revision,
+                    result_revision,
+                    mutation_intent_hash,
+                    config_generation,
+                    ..
+                },
+            ) => {
+                returned_id == client_operation_id
+                    && returned_root == project_root
+                    && owner_root == expected_owner_root
+                    && config_path == expected_config_path
+                    && consumed_revision == expected_consumed_revision
+                    && result_revision == expected_result_revision
+                    && mutation_intent_hash == expected_request_intent_hash
+                    && cockpit_proto::is_opaque_authority_token(request_hash)
+                    && *config_generation > 0
+            }
+            (
+                Self::ProviderCredentialDelete {
+                    provider_id,
+                    client_operation_id,
+                    project_root,
+                    expected_request_hash,
+                },
+                Response::ProviderCredentialCommitted {
+                    client_operation_id: returned_id,
+                    mutation_intent_hash,
+                    provider_id: returned_provider,
+                    project_root: Some(returned_root),
+                    owner_root: Some(owner_root),
+                    owner_scope,
+                    stored: false,
+                    changed,
+                    consumed_vault_generation,
+                    result_vault_generation,
+                    config_generation,
+                    ..
+                },
+            ) => {
+                returned_id == client_operation_id
+                    && mutation_intent_hash == expected_request_hash
+                    && returned_provider == provider_id
+                    && returned_root == project_root
+                    && owner_root == project_root
+                    && owner_scope == &format!("project:{owner_root}")
+                    && *config_generation > 0
+                    && valid_vault_freshness(
+                        *consumed_vault_generation,
+                        *result_vault_generation,
+                        *changed,
+                    )
+            }
+            (
+                Self::ProviderCredentialPut {
+                    provider_id,
+                    client_operation_id,
+                    expected_request_intent_hash,
+                }
+                | Self::WebCredentialPut {
+                    provider_id,
+                    client_operation_id,
+                    expected_request_intent_hash,
+                },
+                Response::ProviderCredentialCommitted {
+                    client_operation_id: returned_id,
+                    mutation_intent_hash,
+                    provider_id: returned_provider,
+                    project_root: None,
+                    owner_root: None,
+                    owner_scope,
+                    stored: true,
+                    changed,
+                    consumed_vault_generation,
+                    result_vault_generation,
+                    config_generation,
+                    ..
+                },
+            ) => {
+                returned_id == client_operation_id
+                    && mutation_intent_hash == expected_request_intent_hash
+                    && returned_provider == provider_id
+                    && owner_scope == "global"
+                    && *config_generation > 0
+                    && valid_vault_freshness(
+                        *consumed_vault_generation,
+                        *result_vault_generation,
+                        *changed,
+                    )
+            }
+            (
+                Self::CopilotSetup {
+                    provider_id,
+                    client_operation_id,
+                    project_root,
+                    expected_request_hash,
+                },
+                Response::CopilotAuthCommitted {
+                    client_operation_id: returned_id,
+                    mutation_intent_hash,
+                    provider_id: returned_provider,
+                    project_root: returned_root,
+                    owner_root,
+                    owner_scope,
+                    consumed_vault_generation,
+                    result_vault_generation,
+                    config_generation,
+                    ..
+                },
+            ) => {
+                returned_id == client_operation_id
+                    && mutation_intent_hash == expected_request_hash
+                    && returned_provider == provider_id
+                    && returned_root == project_root
+                    && owner_root == project_root
+                    && owner_scope == &format!("project:{owner_root}")
+                    && *config_generation > 0
+                    && *result_vault_generation > *consumed_vault_generation
+                    && *result_vault_generation > 0
+            }
+            _ => false,
+        }
+    }
+}
+
+fn pending_settlement_kind(operation: &PendingSettingsOperation) -> Option<&'static str> {
+    match operation {
+        PendingSettingsOperation::ProviderMutation { .. } => Some("apply_provider_mutation"),
+        PendingSettingsOperation::ExtendedSave { .. }
+        | PendingSettingsOperation::TypedDocumentEdit { .. } => Some("apply_extended_config_patch"),
+        PendingSettingsOperation::SimpleMutation { action, .. } => Some(action.operation_kind()),
+        _ => None,
+    }
+}
+
+fn valid_local_settlement_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn settlement_hash_matches(operation: &PendingSettingsOperation, observed: &str) -> bool {
+    let expected = match operation {
+        PendingSettingsOperation::SimpleMutation { action, .. } => match action {
+            SettingsMutationAction::McpOAuthBegin {
+                expected_request_hash,
+                ..
+            }
+            | SettingsMutationAction::McpOAuthComplete {
+                expected_request_hash,
+                ..
+            }
+            | SettingsMutationAction::McpOAuthCancel {
+                expected_request_hash,
+                ..
+            }
+            | SettingsMutationAction::ImageSpendSave {
+                expected_request_hash,
+                ..
+            }
+            | SettingsMutationAction::ProviderCredentialDelete {
+                expected_request_hash,
+                ..
+            }
+            | SettingsMutationAction::CopilotSetup {
+                expected_request_hash,
+                ..
+            } => Some(expected_request_hash.as_str()),
+            _ => None,
+        },
+        _ => None,
+    };
+    expected.map_or_else(
+        || valid_local_settlement_hash(observed),
+        |hash| hash == observed,
+    )
+}
+
+fn valid_vault_freshness(consumed: u64, result: u64, changed: bool) -> bool {
+    result > 0
+        && if changed {
+            result > consumed
+        } else {
+            result == consumed
+        }
+}
+
+enum CompletedProviderAuthMutation {
+    Logout {
+        provider_id: String,
+        result: Result<(), String>,
+    },
+    Copilot {
+        provider_id: String,
+        result: Result<(), String>,
+    },
+}
+
+enum PendingMcpOAuth {
+    Started {
+        server: String,
+        begin_client_operation_id: String,
+        flow_id: String,
+        authorize_url: String,
+    },
+    Completed {
+        server: String,
+        flow_id: String,
+    },
+    Cancelled {
+        server: String,
+        flow_id: String,
+    },
+    AlreadyTerminal {
+        server: String,
+        flow_id: String,
+    },
+}
+
+#[cfg(test)]
 fn apply_settings_patch_via_daemon(
     path: &std::path::Path,
     project_root: Option<&std::path::Path>,
@@ -380,6 +1810,7 @@ fn apply_settings_patch_via_daemon(
         .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
     let requested_path = path.display().to_string();
     let response = settings_daemon_request(Request::ApplyExtendedConfigPatch {
+        client_operation_id: uuid::Uuid::new_v4().to_string(),
         project_root: project_root.clone(),
         layer_id: layer_id.clone(),
         patch,
@@ -397,6 +1828,7 @@ fn apply_settings_patch_via_daemon(
             status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
             publication,
             denylist: committed_denylist,
+            ..
         }) if returned_layer_id == layer_id
             && layer == expected_layer
             && consumed_revision == expected_revision
@@ -460,6 +1892,7 @@ fn apply_settings_patch_via_daemon(
     }
 }
 
+#[cfg(test)]
 pub(super) fn apply_typed_settings_document_edit(
     path: &std::path::Path,
     project_root: Option<&std::path::Path>,
@@ -502,6 +1935,7 @@ pub(super) fn apply_typed_settings_document_edit(
         .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
     let requested_path = path.display().to_string();
     let response = settings_daemon_request(Request::ApplyExtendedConfigPatch {
+        client_operation_id: uuid::Uuid::new_v4().to_string(),
         project_root: project_root.clone(),
         layer_id: layer_id.clone(),
         patch,
@@ -519,6 +1953,7 @@ pub(super) fn apply_typed_settings_document_edit(
             status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
             publication,
             denylist: committed_denylist,
+            ..
         }) if returned_layer_id == layer_id
             && layer == expected_layer
             && consumed_revision == revision
@@ -1343,6 +2778,25 @@ impl std::fmt::Debug for TestPageMut<'_> {
 }
 
 pub struct SettingsCx {
+    dialog_id: uuid::Uuid,
+    daemon_effects: VecDeque<SettingsDaemonEffectRequest>,
+    blocking_effects: VecDeque<SettingsBlockingEffectRequest>,
+    pending_settings: BTreeMap<uuid::Uuid, PendingSettingsOperation>,
+    pending_mcp_oauth: Option<PendingMcpOAuth>,
+    pending_mcp_navigation: Option<(String, bool)>,
+    completed_mcp_navigation: Option<(String, bool, Result<(), String>)>,
+    completed_web_credential: Option<(String, Result<(), String>)>,
+    completed_provider_auth: Option<CompletedProviderAuthMutation>,
+    pending_provider_add: Option<(String, ProviderEntry, bool)>,
+    completed_provider_add: Option<Result<(String, ProviderEntry, bool), String>>,
+    completed_provider_mutation: Option<Result<(), String>>,
+    pending_provider_mutation_navigation: Option<ProviderMutationNavigation>,
+    completed_provider_mutation_navigation: Option<ProviderMutationNavigation>,
+    completed_shadow_removal: Option<category::ShadowedGlobalPrompt>,
+    completed_image_spend: Option<ImageSpendCompletion>,
+    pending_shadow_prompt: Option<category::ShadowedGlobalPrompt>,
+    completed_provider_navigation: Option<(ProviderNavigation, ProvidersConfig)>,
+    after_extended_commit: Vec<(SettingsEffectTarget, Request, &'static str)>,
     pub config_path: PathBuf,
     /// Path to the cockpit-only config keys. Same `config.json` as
     /// [`config_path`](Self::config_path) (GOALS §2a) — the provider/model
@@ -1360,6 +2814,8 @@ pub struct SettingsCx {
     /// altered, or unselected removals before merging selected typed fields
     /// into the authoritative raw document.
     original_config: ProvidersConfig,
+    provider_edit_authority: Option<ProviderEditAuthority>,
+    latest_provider_snapshot_session_id: Option<String>,
     /// Cached secret-free cockpit-only settings projection. Read by the UI and
     /// Tools pages; mutations are committed only by the daemon.
     pub(super) extended: ExtendedConfig,
@@ -1376,6 +2832,12 @@ pub struct SettingsCx {
     /// Daemon-redacted MCP snapshot. MCP config is never read from disk by
     /// the TUI; saves replace this cache only after the owner RPC succeeds.
     pub(super) mcp_config: cockpit_core::mcp::config::McpConfig,
+    /// Daemon-selected authority metadata for `mcp_config`. A save is not
+    /// eligible until all three values came from the same catalog snapshot.
+    pub(super) mcp_owner_root: Option<String>,
+    pub(super) mcp_config_path: Option<String>,
+    pub(super) mcp_edit_capability: Option<String>,
+    pub(super) mcp_revision: Option<String>,
     /// The cwd this dialog was opened against. Held so Root's `h`/←
     /// can reopen the picker without losing context. `None` when the
     /// settings dialog was opened from a flow that has no picker to
@@ -1438,7 +2900,1676 @@ pub struct SettingsCx {
     pub(super) dependency_refresh: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
+enum ImageSpendCompletion {
+    Loaded {
+        page_instance_id: uuid::Uuid,
+        settings: Option<cockpit_config::config::image_spend::ImageSpendSettings>,
+        policy_version: Option<u64>,
+    },
+    Saved {
+        page_instance_id: uuid::Uuid,
+        settings: cockpit_config::config::image_spend::ImageSpendSettings,
+        policy_version: u64,
+    },
+    Failed {
+        page_instance_id: uuid::Uuid,
+        message: String,
+    },
+}
+
+#[derive(Clone)]
+struct ProviderEditAuthority {
+    snapshot_session_id: String,
+    layer_id: String,
+    owner_root: String,
+    base_revision: String,
+    config_generation: u64,
+}
+
 impl SettingsCx {
+    fn authority_operation_pending(&self) -> bool {
+        !self.pending_settings.is_empty()
+            || !self.daemon_effects.is_empty()
+            || !self.blocking_effects.is_empty()
+    }
+
+    fn enqueue_daemon_effect(
+        &mut self,
+        target: SettingsEffectTarget,
+        request: Request,
+    ) -> uuid::Uuid {
+        let operation_id = uuid::Uuid::new_v4();
+        self.daemon_effects.push_back(SettingsDaemonEffectRequest {
+            dialog_id: self.dialog_id,
+            operation_id,
+            target,
+            work: SettingsDaemonEffectWork::Request(request),
+        });
+        operation_id
+    }
+
+    pub(super) fn queue_image_spend_load(
+        &mut self,
+        project_key: String,
+        page_instance_id: uuid::Uuid,
+    ) {
+        let target = SettingsEffectTarget {
+            surface: "settings.image-spend-load",
+            owner: format!("{project_key}::{page_instance_id}"),
+            revision: None,
+        };
+        let operation_id = self.enqueue_daemon_effect(
+            target.clone(),
+            Request::GetImageSpendPolicy {
+                project_key: project_key.clone(),
+            },
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ImageSpendLoad {
+                target,
+                project_key,
+                page_instance_id,
+            },
+        );
+    }
+
+    fn queue_image_spend_save(
+        &mut self,
+        project_key: String,
+        settings: cockpit_config::config::image_spend::ImageSpendSettings,
+        expected_policy_version: Option<u64>,
+        page_instance_id: uuid::Uuid,
+    ) -> Result<(), String> {
+        let settings_json = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
+        let client_operation_id = uuid::Uuid::now_v7().to_string();
+        let expected_request_hash = local_receipt_request_hash(&(
+            "save_image_spend_policy",
+            &project_key,
+            &settings,
+            expected_policy_version,
+        ))?;
+        let target = SettingsEffectTarget {
+            surface: "settings.image-spend-save",
+            owner: format!("{project_key}::{page_instance_id}"),
+            revision: expected_policy_version.map(|version| version.to_string()),
+        };
+        let request = Request::SaveImageSpendPolicy {
+            client_operation_id: client_operation_id.clone(),
+            project_key: project_key.clone(),
+            settings_json,
+            expected_policy_version,
+        };
+        let operation_id = self.enqueue_daemon_effect(target.clone(), request);
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::SimpleMutation {
+                target,
+                action: SettingsMutationAction::ImageSpendSave {
+                    client_operation_id,
+                    project_key,
+                    settings,
+                    expected_policy_version,
+                    expected_request_hash,
+                    page_instance_id,
+                },
+            },
+        );
+        Ok(())
+    }
+
+    fn enqueue_settlement_effect(
+        &mut self,
+        target: SettingsEffectTarget,
+        request: Request,
+    ) -> uuid::Uuid {
+        let operation_id = uuid::Uuid::new_v4();
+        self.daemon_effects.push_back(SettingsDaemonEffectRequest {
+            dialog_id: self.dialog_id,
+            operation_id,
+            target,
+            work: SettingsDaemonEffectWork::SettlementQuery(request),
+        });
+        operation_id
+    }
+
+    fn queue_settlement_query(
+        &mut self,
+        client_operation_id: String,
+        original: PendingSettingsOperation,
+    ) {
+        let target = SettingsEffectTarget {
+            surface: "settings.settlement-query",
+            owner: client_operation_id.clone(),
+            revision: Some(client_operation_id.clone()),
+        };
+        let operation_id = self.enqueue_settlement_effect(
+            target.clone(),
+            Request::GetLocalOperationSettlement {
+                client_operation_id: client_operation_id.clone(),
+            },
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::SettlementQuery {
+                target,
+                client_operation_id,
+                original: Box::new(original),
+            },
+        );
+        self.extended_warnings =
+            vec!["operation settlement is unknown; querying the daemon receipt…".into()];
+    }
+
+    fn retry_unknown_settlement(&mut self) {
+        let unknown_id = self.pending_settings.iter().find_map(|(id, pending)| {
+            matches!(pending, PendingSettingsOperation::SettlementUnknown { .. }).then_some(*id)
+        });
+        let Some(unknown_id) = unknown_id else {
+            return;
+        };
+        let Some(PendingSettingsOperation::SettlementUnknown {
+            client_operation_id,
+            original,
+            ..
+        }) = self.pending_settings.remove(&unknown_id)
+        else {
+            return;
+        };
+        self.queue_settlement_query(client_operation_id, *original);
+    }
+
+    /// Apply a daemon-recorded terminal rejection without feeding it back
+    /// through the transport-error path. Transport failures leave authority
+    /// fenced and are queried again; this path is proof that the mutation did
+    /// not commit, so drafts may remain editable and the fence may be released.
+    fn apply_terminal_settlement(
+        &mut self,
+        original: PendingSettingsOperation,
+        error: cockpit_proto::ErrorPayload,
+        cancelled: bool,
+    ) {
+        let disposition = if cancelled { "cancelled" } else { "rejected" };
+        let message = format!("operation was authoritatively {disposition}: {error}");
+        match original {
+            PendingSettingsOperation::ProviderMutation { .. } => {
+                self.completed_provider_mutation = Some(Err(message.clone()));
+                self.completed_provider_mutation_navigation =
+                    self.pending_provider_mutation_navigation.take();
+                if self.pending_provider_add.is_some() {
+                    self.pending_provider_add = None;
+                    self.completed_provider_add = Some(Err(message.clone()));
+                }
+            }
+            PendingSettingsOperation::SimpleMutation { action, .. } => match action {
+                SettingsMutationAction::McpSave { .. } => {
+                    if let Some((name, edited)) = self.pending_mcp_navigation.take() {
+                        self.completed_mcp_navigation = Some((name, edited, Err(message.clone())));
+                    }
+                }
+                SettingsMutationAction::McpOAuthBegin { .. } => {
+                    self.pending_mcp_oauth = None;
+                }
+                // Complete/cancel rejection does not terminate the existing
+                // daemon flow. Keep its full retry identity and URL intact.
+                SettingsMutationAction::McpOAuthComplete { .. }
+                | SettingsMutationAction::McpOAuthCancel { .. } => {}
+                SettingsMutationAction::ProviderCredentialDelete { provider_id, .. } => {
+                    self.completed_provider_auth = Some(CompletedProviderAuthMutation::Logout {
+                        provider_id,
+                        result: Err(message.clone()),
+                    });
+                }
+                SettingsMutationAction::WebCredentialPut { provider_id, .. } => {
+                    self.completed_web_credential = Some((provider_id, Err(message.clone())));
+                }
+                SettingsMutationAction::CopilotSetup { provider_id, .. } => {
+                    self.completed_provider_auth = Some(CompletedProviderAuthMutation::Copilot {
+                        provider_id,
+                        result: Err(message.clone()),
+                    });
+                }
+                SettingsMutationAction::ProviderCredentialPut { .. } => {}
+                SettingsMutationAction::ImageSpendSave {
+                    page_instance_id, ..
+                } => {
+                    self.completed_image_spend = Some(ImageSpendCompletion::Failed {
+                        page_instance_id,
+                        message: message.clone(),
+                    });
+                }
+            },
+            // Extended and typed-document drafts are intentionally untouched:
+            // the authoritative rejection proves their base revision was not
+            // consumed, so the user can correct and submit the same draft.
+            PendingSettingsOperation::ExtendedSave { .. }
+            | PendingSettingsOperation::TypedDocumentEdit { .. } => {}
+            _ => {
+                tracing::warn!("terminal settlement received for a non-settling settings action");
+            }
+        }
+        self.extended_warnings = vec![message];
+    }
+
+    fn enqueue_daemon_work(
+        &mut self,
+        target: SettingsEffectTarget,
+        work: SettingsDaemonEffectWork,
+    ) -> uuid::Uuid {
+        let operation_id = uuid::Uuid::new_v4();
+        self.daemon_effects.push_back(SettingsDaemonEffectRequest {
+            dialog_id: self.dialog_id,
+            operation_id,
+            target,
+            work,
+        });
+        operation_id
+    }
+
+    fn take_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
+        self.daemon_effects.pop_front()
+    }
+
+    fn enqueue_blocking_work(
+        &mut self,
+        target: SettingsEffectTarget,
+        work: SettingsBlockingEffectWork,
+    ) -> uuid::Uuid {
+        let operation_id = uuid::Uuid::new_v4();
+        self.blocking_effects
+            .push_back(SettingsBlockingEffectRequest {
+                dialog_id: self.dialog_id,
+                operation_id,
+                target,
+                work,
+            });
+        operation_id
+    }
+
+    fn take_blocking_effect(&mut self) -> Option<SettingsBlockingEffectRequest> {
+        self.blocking_effects.pop_front()
+    }
+
+    fn queue_simple_mutation(
+        &mut self,
+        target: SettingsEffectTarget,
+        request: Request,
+        action: SettingsMutationAction,
+    ) -> uuid::Uuid {
+        let operation_id = self.enqueue_daemon_effect(target.clone(), request);
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::SimpleMutation { target, action },
+        );
+        operation_id
+    }
+
+    fn queue_simple_secret_mutation(
+        &mut self,
+        target: SettingsEffectTarget,
+        work: SettingsDaemonEffectWork,
+        action: SettingsMutationAction,
+    ) -> uuid::Uuid {
+        let operation_id = self.enqueue_daemon_work(target.clone(), work);
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::SimpleMutation { target, action },
+        );
+        operation_id
+    }
+
+    fn queue_typed_document_edit(
+        &mut self,
+        path: PathBuf,
+        project_root: PathBuf,
+        patch: serde_json::Value,
+        action: TypedDocumentEditAction,
+    ) {
+        let requested_path = path.display().to_string();
+        let snapshot_session_id = settings_snapshot_session_id().to_owned();
+        let target = SettingsEffectTarget {
+            surface: "settings.typed-document-edit",
+            owner: requested_path.clone(),
+            revision: Some(snapshot_session_id.clone()),
+        };
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
+        let operation_id = self.enqueue_daemon_work(
+            target.clone(),
+            SettingsDaemonEffectWork::TypedDocumentEdit(TypedDocumentEditPlan {
+                client_operation_id: client_operation_id.clone(),
+                project_root: project_root.display().to_string(),
+                requested_path: requested_path.clone(),
+                patch,
+                snapshot_session_id,
+            }),
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::TypedDocumentEdit {
+                target,
+                client_operation_id,
+                requested_path,
+                action,
+            },
+        );
+    }
+
+    fn queue_project_shadow_snapshot(&mut self, prompt: category::ShadowedGlobalPrompt) {
+        let Some(project_root) = self.active_project_root.clone() else {
+            return;
+        };
+        let snapshot_session_id = settings_snapshot_session_id().to_owned();
+        let target = SettingsEffectTarget {
+            surface: "settings.project-shadow-snapshot",
+            owner: prompt.project_config.display().to_string(),
+            revision: Some(snapshot_session_id.clone()),
+        };
+        let operation_id = self.enqueue_daemon_effect(
+            target.clone(),
+            Request::GetExtendedConfigSnapshot {
+                project_root: project_root.display().to_string(),
+                snapshot_session_id,
+            },
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ProjectShadowSnapshot { target, prompt },
+        );
+    }
+
+    fn queue_extended_load(&mut self) {
+        let project_context = self
+            .active_project_root
+            .as_deref()
+            .or(self.picker_cwd.as_deref());
+        let Ok(project_root) = config_layer_request(&self.extended_path, project_context) else {
+            self.extended_warnings = vec!["settings request has no workspace root".into()];
+            return;
+        };
+        let requested_path = self.extended_path.display().to_string();
+        let snapshot_session_id = settings_snapshot_session_id().to_owned();
+        let target = SettingsEffectTarget {
+            surface: "settings.extended-load",
+            owner: requested_path.clone(),
+            revision: Some(snapshot_session_id.clone()),
+        };
+        let request = Request::GetExtendedConfigSnapshot {
+            project_root: project_root.clone(),
+            snapshot_session_id: snapshot_session_id.clone(),
+        };
+        let operation_id = self.enqueue_daemon_effect(target, request);
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ExtendedLoad {
+                requested_path,
+                project_root,
+                snapshot_session_id,
+            },
+        );
+        self.extended_revision = None;
+        self.extended_warnings = vec!["loading daemon-owned settings…".into()];
+    }
+
+    fn queue_provider_catalog(&mut self, provider_id: Option<String>) {
+        self.queue_provider_catalog_for(provider_id, None);
+    }
+
+    fn queue_provider_catalog_for(
+        &mut self,
+        provider_id: Option<String>,
+        navigation: Option<ProviderNavigation>,
+    ) {
+        let project_root = self
+            .active_project_root
+            .clone()
+            .or_else(|| self.picker_cwd.clone())
+            .or_else(|| config_cwd(&self.config_path))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .display()
+            .to_string();
+        let owner = format!(
+            "{}::{}",
+            project_root,
+            provider_id.as_deref().unwrap_or("*")
+        );
+        let snapshot_session_id = uuid::Uuid::new_v4().to_string();
+        self.latest_provider_snapshot_session_id = Some(snapshot_session_id.clone());
+        let operation_id = self.enqueue_daemon_effect(
+            SettingsEffectTarget {
+                surface: "settings.provider-catalog",
+                owner,
+                revision: Some(snapshot_session_id.clone()),
+            },
+            Request::GetProviderCatalogSnapshot {
+                project_root: project_root.clone(),
+                provider_id: provider_id.clone(),
+                snapshot_session_id: snapshot_session_id.clone(),
+            },
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ProviderCatalog {
+                project_root,
+                provider_id,
+                snapshot_session_id,
+                navigation,
+            },
+        );
+    }
+
+    fn queue_extended_save(&mut self) -> Result<SettingsSaveOutcome, String> {
+        if self.pending_settings.values().any(|pending| {
+            matches!(
+                pending,
+                PendingSettingsOperation::ExtendedSave { .. }
+                    | PendingSettingsOperation::ExtendedRefresh { .. }
+            )
+        }) {
+            return Err("a settings save is already pending".into());
+        }
+        let expected_revision = self
+            .extended_revision
+            .clone()
+            .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
+        let desired_value =
+            serde_json::to_value(&self.extended).map_err(|error| error.to_string())?;
+        let operations = changed_extended_paths(&self.extended_base, &desired_value)?;
+        let denylist = denylist_mutations(&self.extended_base, &self.extended.redact.denylist)?;
+        let project_root = config_layer_request(
+            &self.extended_path,
+            self.active_project_root
+                .as_deref()
+                .or(self.picker_cwd.as_deref()),
+        )?;
+        let layer_id = self
+            .extended_base
+            .get("__cockpit_settings_layer_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "settings snapshot omitted its layer capability".to_string())?
+            .to_owned();
+        let expected_layer = serde_json::from_value(
+            self.extended_base
+                .get("__cockpit_settings_layer_kind")
+                .cloned()
+                .ok_or_else(|| "settings snapshot omitted its layer kind".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let expected_generation = self
+            .extended_base
+            .get("__cockpit_settings_generation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
+        let requested_path = self.extended_path.display().to_string();
+        let snapshot_session_id = settings_snapshot_session_id().to_owned();
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
+        let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+            operations: operations.clone(),
+            materialize: false,
+            denylist: denylist.clone(),
+            redacted_mutations: Vec::new(),
+        };
+        let mutation_intent_hash = patch
+            .sanitized_intent_hash()
+            .map_err(|error| error.to_string())?;
+        let request = Request::ApplyExtendedConfigPatch {
+            client_operation_id: client_operation_id.clone(),
+            project_root: project_root.clone(),
+            layer_id: layer_id.clone(),
+            patch,
+            expected_revision: expected_revision.clone(),
+            snapshot_session_id: snapshot_session_id.clone(),
+        };
+        let operation_id = self.enqueue_daemon_effect(
+            SettingsEffectTarget {
+                surface: "settings.extended-save",
+                owner: layer_id.clone(),
+                revision: Some(expected_revision.clone()),
+            },
+            request,
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ExtendedSave {
+                client_operation_id,
+                requested_path,
+                project_root,
+                snapshot_session_id,
+                layer_id,
+                mutation_intent_hash,
+                expected_layer,
+                expected_revision,
+                expected_generation,
+                operations,
+                denylist_plan: denylist,
+            },
+        );
+        Ok(SettingsSaveOutcome::Queued)
+    }
+
+    fn queue_after_extended_commit(
+        &mut self,
+        label: &'static str,
+        target: SettingsEffectTarget,
+        request: Request,
+    ) {
+        self.after_extended_commit.push((target, request, label));
+    }
+
+    fn apply_general_completion(
+        &mut self,
+        completion: SettingsDaemonEffectCompletion,
+    ) -> Result<(), SettingsDaemonEffectCompletion> {
+        let Some(pending) = self.pending_settings.remove(&completion.operation_id) else {
+            return Err(completion);
+        };
+        if !pending.target_matches(&completion.target) {
+            self.extended_warnings = vec![format!(
+                "ignored mismatched settings receipt for operation {}",
+                completion.operation_id
+            )];
+            self.pending_settings
+                .insert(completion.operation_id, pending);
+            return Ok(());
+        }
+        match pending {
+            PendingSettingsOperation::ExtendedLoad {
+                requested_path,
+                project_root: _,
+                snapshot_session_id,
+            } => {
+                if completion.target
+                    != (SettingsEffectTarget {
+                        surface: "settings.extended-load",
+                        owner: requested_path.clone(),
+                        revision: Some(snapshot_session_id),
+                    })
+                {
+                    return Ok(());
+                }
+                match completion.response {
+                    Ok(Response::ExtendedConfigSnapshot {
+                        layers,
+                        config_generation,
+                    }) => match layers
+                        .into_iter()
+                        .find(|layer| layer.display_path == requested_path)
+                        .ok_or_else(|| {
+                            "settings target is not a daemon-discovered layer".to_string()
+                        })
+                        .and_then(|layer| decode_extended_layer(layer, config_generation))
+                    {
+                        Ok((extended, base, revision)) => {
+                            self.extended = extended;
+                            self.extended_base = base;
+                            self.extended_revision = Some(revision);
+                            self.extended_warnings.clear();
+                        }
+                        Err(error) => self.extended_warnings = vec![error],
+                    },
+                    Ok(other) => {
+                        self.extended_warnings =
+                            vec![format!("unexpected settings snapshot response: {other:?}")]
+                    }
+                    Err(error) => self.extended_warnings = vec![format!("load failed: {error}")],
+                }
+            }
+            PendingSettingsOperation::ProviderMutation {
+                target,
+                client_operation_id,
+                snapshot_session_id,
+                layer_id,
+                owner_root,
+                mutation_intent_hash,
+                expected_revision,
+                expected_generation,
+                staged_default,
+                notice,
+            } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                let settlement_pending = PendingSettingsOperation::ProviderMutation {
+                    target: target.clone(),
+                    client_operation_id: client_operation_id.clone(),
+                    snapshot_session_id: snapshot_session_id.clone(),
+                    layer_id: layer_id.clone(),
+                    owner_root: owner_root.clone(),
+                    mutation_intent_hash: mutation_intent_hash.clone(),
+                    expected_revision: expected_revision.clone(),
+                    expected_generation,
+                    staged_default: staged_default.clone(),
+                    notice: notice.clone(),
+                };
+                match completion.response {
+                    Ok(Response::ProviderMutationCommitted {
+                        client_operation_id: returned_operation_id,
+                        snapshot_session_id: returned_session_id,
+                        layer_id: returned_layer_id,
+                        owner_root: returned_owner_root,
+                        mutation_intent_hash: returned_intent_hash,
+                        consumed_revision,
+                        result_revision,
+                        config_generation,
+                        config,
+                        status: cockpit_proto::ConfigCommitStatus::Committed,
+                        publication,
+                    }) if returned_operation_id == client_operation_id
+                        && returned_session_id == snapshot_session_id
+                        && returned_layer_id == layer_id
+                        && returned_owner_root == owner_root
+                        && returned_intent_hash == mutation_intent_hash
+                        && consumed_revision == expected_revision
+                        && cockpit_proto::is_opaque_authority_token(&result_revision)
+                        && config_generation == expected_generation.saturating_add(1)
+                        && self.latest_provider_snapshot_session_id.as_deref()
+                            == Some(returned_session_id.as_str()) =>
+                    {
+                        let mut authoritative = providers_config_from_view(&config);
+                        authoritative.set_resolution_generation(config_generation);
+                        authoritative.active_model = staged_default;
+                        self.config = authoritative.clone();
+                        self.original_config = authoritative;
+                        self.provider_edit_authority = Some(ProviderEditAuthority {
+                            snapshot_session_id: returned_session_id,
+                            layer_id: returned_layer_id,
+                            owner_root: returned_owner_root,
+                            base_revision: result_revision,
+                            config_generation,
+                        });
+                        self.last_secret_notice = notice;
+                        self.extended_warnings = vec![if publication
+                            == cockpit_proto::ConfigPublicationStatus::Published
+                        {
+                            "provider settings committed".into()
+                        } else {
+                            "provider settings committed, but publication is degraded; reload before editing again".into()
+                        }];
+                        self.completed_provider_mutation = Some(Ok(()));
+                        self.completed_provider_mutation_navigation =
+                            self.pending_provider_mutation_navigation.take();
+                        if let Some(pending) = self.pending_provider_add.take() {
+                            self.completed_provider_add = Some(Ok(pending));
+                        }
+                    }
+                    Ok(other) => {
+                        tracing::warn!(response = ?other, "provider mutation returned an unbound receipt; resolving durable settlement");
+                        self.queue_settlement_query(client_operation_id, settlement_pending);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "provider mutation transport/daemon outcome is ambiguous; resolving durable settlement");
+                        self.queue_settlement_query(client_operation_id, settlement_pending);
+                    }
+                }
+            }
+            PendingSettingsOperation::ProjectShadowSnapshot { target, prompt } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                if let Ok(Response::ExtendedConfigSnapshot { layers, .. }) = completion.response
+                    && let Some(layer) = layers.into_iter().find(|layer| {
+                        layer.display_path == prompt.project_config.display().to_string()
+                    })
+                    && layer.authored_paths.iter().any(|authored| {
+                        authored
+                            .iter()
+                            .map(String::as_str)
+                            .eq(prompt.path.iter().copied())
+                    })
+                {
+                    self.pending_shadow_prompt = Some(prompt);
+                }
+            }
+            PendingSettingsOperation::ImageSpendLoad {
+                target,
+                project_key: _,
+                page_instance_id,
+            } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                self.completed_image_spend = Some(match completion.response {
+                    Ok(Response::ImageSpendPolicy {
+                        settings,
+                        policy_version,
+                    }) if settings.is_some() == policy_version.is_some() => {
+                        ImageSpendCompletion::Loaded {
+                            page_instance_id,
+                            settings,
+                            policy_version,
+                        }
+                    }
+                    Ok(other) => ImageSpendCompletion::Failed {
+                        page_instance_id,
+                        message: format!("unexpected image spend read response: {other:?}"),
+                    },
+                    Err(error) => ImageSpendCompletion::Failed {
+                        page_instance_id,
+                        message: error,
+                    },
+                });
+            }
+            PendingSettingsOperation::ProviderCatalog {
+                project_root,
+                provider_id,
+                snapshot_session_id,
+                navigation,
+            } => {
+                let expected = SettingsEffectTarget {
+                    surface: "settings.provider-catalog",
+                    owner: format!(
+                        "{}::{}",
+                        project_root,
+                        provider_id.as_deref().unwrap_or("*")
+                    ),
+                    revision: Some(snapshot_session_id.clone()),
+                };
+                if completion.target != expected {
+                    return Ok(());
+                }
+                match completion.response {
+                    Ok(Response::ProviderCatalogSnapshot {
+                        config,
+                        snapshot_session_id: returned_session_id,
+                        layer_id,
+                        owner_root,
+                        base_revision,
+                        config_generation,
+                    }) if returned_session_id == snapshot_session_id
+                        && self.latest_provider_snapshot_session_id.as_deref()
+                            == Some(returned_session_id.as_str()) =>
+                    {
+                        let mut parsed = providers_config_from_view(&config);
+                        parsed.set_resolution_generation(config_generation);
+                        self.config = parsed.clone();
+                        self.original_config = parsed;
+                        self.provider_edit_authority = Some(ProviderEditAuthority {
+                            snapshot_session_id,
+                            layer_id,
+                            owner_root,
+                            base_revision,
+                            config_generation,
+                        });
+                        if let Some(navigation) = navigation {
+                            self.completed_provider_navigation =
+                                Some((navigation, self.config.clone()));
+                        }
+                        self.mcp_owner_root = None;
+                        self.mcp_config_path = None;
+                        self.mcp_edit_capability = None;
+                        self.mcp_revision = None;
+                        if let (
+                            Some(raw),
+                            Some(owner_root),
+                            Some(config_path),
+                            Some(capability),
+                            Some(revision),
+                        ) = (
+                            config.mcp_config_json,
+                            config.mcp_owner_root,
+                            config.mcp_config_path,
+                            config.mcp_edit_capability,
+                            config.mcp_revision,
+                        ) && let Ok(mcp) = cockpit_core::mcp::config::McpConfig::parse(&raw)
+                        {
+                            self.mcp_config = mcp;
+                            self.mcp_owner_root = Some(owner_root);
+                            self.mcp_config_path = Some(config_path);
+                            self.mcp_edit_capability = Some(capability);
+                            self.mcp_revision = Some(revision);
+                        }
+                    }
+                    Ok(other) => {
+                        tracing::warn!(response = ?other, "unexpected async provider catalog response")
+                    }
+                    Err(error) => tracing::warn!(%error, "async provider catalog load failed"),
+                }
+            }
+            PendingSettingsOperation::ExtendedSave {
+                client_operation_id,
+                requested_path,
+                project_root,
+                snapshot_session_id,
+                layer_id,
+                mutation_intent_hash,
+                expected_layer,
+                expected_revision,
+                expected_generation,
+                operations,
+                denylist_plan,
+            } => {
+                let expected_target = SettingsEffectTarget {
+                    surface: "settings.extended-save",
+                    owner: layer_id.clone(),
+                    revision: Some(expected_revision.clone()),
+                };
+                if completion.target != expected_target {
+                    return Ok(());
+                }
+                let receipt = match completion.response {
+                    Ok(Response::ExtendedConfigSaved {
+                        client_operation_id: returned_operation_id,
+                        request_hash,
+                        mutation_intent_hash: returned_intent_hash,
+                        hash,
+                        config_generation,
+                        layer_id: returned_layer_id,
+                        layer,
+                        consumed_revision,
+                        result_revision,
+                        status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+                        publication,
+                        denylist,
+                    }) if returned_operation_id == client_operation_id
+                        && cockpit_proto::is_opaque_authority_token(&request_hash)
+                        && returned_intent_hash == mutation_intent_hash
+                        && returned_layer_id == layer_id
+                        && layer == expected_layer
+                        && consumed_revision == expected_revision
+                        && hash == result_revision
+                        && cockpit_proto::is_opaque_authority_token(&result_revision)
+                        && validate_committed_denylist(&denylist_plan, &denylist).is_ok()
+                        && (config_generation == expected_generation
+                            || config_generation == expected_generation.saturating_add(1)) =>
+                    {
+                        let warning = (publication
+                            == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded)
+                            .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
+                        Ok((result_revision, config_generation, denylist, warning))
+                    }
+                    Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
+                    Err(error) => Err(error),
+                };
+                let (result_revision, result_generation, committed_denylist, warning) =
+                    match receipt {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            self.queue_settlement_query(
+                                client_operation_id.clone(),
+                                PendingSettingsOperation::ExtendedSave {
+                                    client_operation_id,
+                                    requested_path,
+                                    project_root,
+                                    snapshot_session_id,
+                                    layer_id,
+                                    mutation_intent_hash,
+                                    expected_layer,
+                                    expected_revision,
+                                    expected_generation,
+                                    operations,
+                                    denylist_plan,
+                                },
+                            );
+                            self.extended_warnings = vec![format!(
+                                "settings commit settlement is unknown ({error}); querying the exact receipt"
+                            )];
+                            return Ok(());
+                        }
+                    };
+                // Once the commit receipt is valid, local cancellation or a
+                // refresh failure cannot turn it into a reported rejection.
+                self.extended_revision = None;
+                for (target, request, label) in std::mem::take(&mut self.after_extended_commit) {
+                    let followup_id = self.enqueue_daemon_effect(target.clone(), request);
+                    self.pending_settings.insert(
+                        followup_id,
+                        PendingSettingsOperation::Followup { label, target },
+                    );
+                }
+                let refresh_target = SettingsEffectTarget {
+                    surface: "settings.extended-refresh",
+                    owner: layer_id,
+                    revision: Some(result_revision.clone()),
+                };
+                let operation_id = self.enqueue_daemon_effect(
+                    refresh_target.clone(),
+                    Request::GetExtendedConfigSnapshot {
+                        project_root,
+                        snapshot_session_id,
+                    },
+                );
+                self.pending_settings.insert(
+                    operation_id,
+                    PendingSettingsOperation::ExtendedRefresh {
+                        target: refresh_target,
+                        requested_path,
+                        expected_layer,
+                        result_revision,
+                        result_generation,
+                        operations,
+                        committed_denylist,
+                        warning,
+                    },
+                );
+                self.extended_warnings = vec!["settings committed; reconciling…".into()];
+            }
+            PendingSettingsOperation::ExtendedRefresh {
+                target: _,
+                requested_path,
+                expected_layer,
+                result_revision,
+                result_generation,
+                operations,
+                committed_denylist,
+                warning,
+            } => {
+                if completion.target.surface != "settings.extended-refresh"
+                    || completion.target.revision.as_deref() != Some(result_revision.as_str())
+                {
+                    return Ok(());
+                }
+                let reconciled = match completion.response {
+                    Ok(Response::ExtendedConfigSnapshot {
+                        layers,
+                        config_generation,
+                    }) if warning.is_none() && config_generation == result_generation => layers
+                        .into_iter()
+                        .find(|layer| {
+                            layer.display_path == requested_path
+                                && layer.kind == expected_layer
+                                && layer.revision == result_revision
+                                && same_denylist_occurrences(&layer.denylist, &committed_denylist)
+                                && validate_settings_operations(
+                                    &operations,
+                                    &serde_json::to_value(&layer.config)
+                                        .unwrap_or(serde_json::Value::Null),
+                                    &layer.authored_paths,
+                                )
+                                .is_ok()
+                        })
+                        .map(|layer| (layer, config_generation)),
+                    _ => None,
+                };
+                match reconciled {
+                    Some((layer, generation)) => match decode_extended_layer(layer, generation) {
+                        Ok((extended, base, revision)) => {
+                            self.extended = extended;
+                            self.extended_base = base;
+                            self.extended_revision = Some(revision);
+                            self.extended_warnings.clear();
+                        }
+                        Err(error) => self.extended_warnings = vec![format!(
+                            "settings committed, but authoritative refresh was invalid: {error}"
+                        )],
+                    },
+                    None => self.extended_warnings = vec![warning.unwrap_or_else(|| {
+                        format!(
+                            "settings committed at generation {result_generation}, but refresh did not reconcile; reload before editing again"
+                        )
+                    })],
+                }
+            }
+            PendingSettingsOperation::Followup { label, target } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                if let Err(error) = completion.response {
+                    self.extended_warnings
+                        .push(format!("{label} failed after settings committed: {error}"));
+                }
+            }
+            PendingSettingsOperation::SimpleMutation { target, action } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                let client_operation_id = action.settlement_id().to_owned();
+                if completion
+                    .response
+                    .as_ref()
+                    .map_or(true, |response| !action.matches_durable_receipt(response))
+                {
+                    self.queue_settlement_query(
+                        client_operation_id,
+                        PendingSettingsOperation::SimpleMutation { target, action },
+                    );
+                    return Ok(());
+                }
+                let result = match (action, completion.response) {
+                    (
+                        SettingsMutationAction::ImageSpendSave {
+                            client_operation_id,
+                            project_key,
+                            settings,
+                            expected_policy_version,
+                            expected_request_hash,
+                            page_instance_id,
+                        },
+                        Ok(Response::ImageSpendPolicySaved {
+                            client_operation_id: returned_operation_id,
+                            project_key: returned_project_key,
+                            request_hash,
+                            consumed_policy_version,
+                            result_policy_version,
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && returned_project_key == project_key
+                        && request_hash == expected_request_hash
+                        && consumed_policy_version == expected_policy_version
+                        && result_policy_version
+                            == expected_policy_version
+                                .map_or(1, |version| version.saturating_add(1)) =>
+                    {
+                        self.completed_image_spend = Some(ImageSpendCompletion::Saved {
+                            page_instance_id,
+                            settings,
+                            policy_version: result_policy_version,
+                        });
+                        Ok(format!("saved image spend policy v{result_policy_version}"))
+                    }
+                    (
+                        SettingsMutationAction::McpSave {
+                            config,
+                            client_operation_id,
+                            project_root,
+                            expected_owner_root,
+                            expected_config_path,
+                            snapshot_capability,
+                            expected_consumed_revision,
+                            expected_result_revision,
+                            expected_request_intent_hash,
+                        },
+                        Ok(Response::McpConfigCommitted {
+                            client_operation_id: returned_operation_id,
+                            request_hash,
+                            project_root: returned_root,
+                            owner_root,
+                            config_path,
+                            consumed_revision,
+                            result_revision,
+                            mutation_intent_hash,
+                            config_generation,
+                            ..
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && returned_root == project_root
+                        && owner_root == expected_owner_root
+                        && config_path == expected_config_path
+                        && !snapshot_capability.is_empty()
+                        && consumed_revision == expected_consumed_revision
+                        && result_revision == expected_result_revision
+                        && mutation_intent_hash == expected_request_intent_hash
+                        && cockpit_proto::is_opaque_authority_token(&request_hash)
+                        && config_generation > 0 =>
+                    {
+                        self.mcp_config = config;
+                        self.mcp_owner_root = Some(expected_owner_root);
+                        self.mcp_config_path = Some(expected_config_path);
+                        // The capability consumed the pre-commit revision. A
+                        // later edit must refresh and receive a new authority
+                        // token instead of reusing this stale snapshot.
+                        self.mcp_edit_capability = None;
+                        self.mcp_revision = Some(expected_result_revision);
+                        self.invalidate_secret_inventory();
+                        if let Some((name, edited)) = self.pending_mcp_navigation.take() {
+                            self.completed_mcp_navigation = Some((name, edited, Ok(())));
+                        }
+                        Ok("MCP settings committed".to_string())
+                    }
+                    (
+                        SettingsMutationAction::McpOAuthBegin {
+                            server,
+                            client_operation_id,
+                            expected_request_hash,
+                        },
+                        Ok(Response::McpOAuthStarted {
+                            client_operation_id: returned_operation_id,
+                            request_hash,
+                            flow_id,
+                            authorize_url,
+                            ..
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && request_hash == expected_request_hash =>
+                    {
+                        self.pending_mcp_oauth = Some(PendingMcpOAuth::Started {
+                            server,
+                            begin_client_operation_id: client_operation_id,
+                            flow_id,
+                            authorize_url,
+                        });
+                        Ok("MCP OAuth started; open the authorization URL".to_string())
+                    }
+                    (
+                        SettingsMutationAction::McpOAuthComplete {
+                            server,
+                            flow_id,
+                            client_operation_id,
+                            expected_request_hash,
+                        },
+                        Ok(Response::McpOAuthCompleted {
+                            client_operation_id: returned_operation_id,
+                            request_hash,
+                            flow_id: returned_flow_id,
+                            authenticated: true,
+                            ..
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && request_hash == expected_request_hash
+                        && returned_flow_id == flow_id =>
+                    {
+                        self.invalidate_secret_inventory();
+                        self.pending_mcp_oauth =
+                            Some(PendingMcpOAuth::Completed { server, flow_id });
+                        Ok("MCP OAuth authenticated".to_string())
+                    }
+                    (
+                        SettingsMutationAction::McpOAuthCancel {
+                            server,
+                            flow_id,
+                            client_operation_id,
+                            expected_request_hash,
+                        },
+                        Ok(Response::McpOAuthCancelled {
+                            client_operation_id: returned_operation_id,
+                            request_hash,
+                            flow_id: Some(returned_flow_id),
+                            cancelled: true,
+                            ..
+                        }),
+                    ) => {
+                        if returned_operation_id != client_operation_id
+                            || request_hash != expected_request_hash
+                            || returned_flow_id != flow_id
+                        {
+                            return Ok(());
+                        }
+                        self.pending_mcp_oauth =
+                            Some(PendingMcpOAuth::Cancelled { server, flow_id });
+                        Ok("MCP OAuth cancelled".to_string())
+                    }
+                    (
+                        SettingsMutationAction::McpOAuthCancel {
+                            server,
+                            flow_id,
+                            client_operation_id,
+                            expected_request_hash,
+                        },
+                        Ok(Response::McpOAuthCancelled {
+                            client_operation_id: returned_operation_id,
+                            request_hash,
+                            flow_id: returned_flow_id,
+                            cancelled: false,
+                            ..
+                        }),
+                    ) => {
+                        if returned_operation_id != client_operation_id
+                            || request_hash != expected_request_hash
+                            || returned_flow_id
+                                .as_deref()
+                                .is_some_and(|returned| returned != flow_id)
+                        {
+                            return Ok(());
+                        }
+                        // False is an authoritative terminal outcome, not a
+                        // failed cancellation. Drop the stale flow UI and
+                        // reconcile daemon-owned credential inventory.
+                        self.invalidate_secret_inventory();
+                        self.pending_mcp_oauth =
+                            Some(PendingMcpOAuth::AlreadyTerminal { server, flow_id });
+                        Ok("MCP OAuth was already terminal; refreshing inventory".to_string())
+                    }
+                    (
+                        SettingsMutationAction::ProviderCredentialDelete {
+                            provider_id,
+                            client_operation_id,
+                            project_root,
+                            expected_request_hash,
+                        },
+                        Ok(Response::ProviderCredentialCommitted {
+                            client_operation_id: returned_operation_id,
+                            mutation_intent_hash,
+                            provider_id: returned_provider_id,
+                            project_root: Some(returned_root),
+                            owner_root: Some(owner_root),
+                            owner_scope,
+                            stored: false,
+                            changed,
+                            consumed_vault_generation,
+                            result_vault_generation,
+                            config_generation,
+                            ..
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && mutation_intent_hash == expected_request_hash
+                        && returned_provider_id == provider_id
+                        && returned_root == project_root
+                        && owner_root == project_root
+                        && owner_scope == format!("project:{owner_root}")
+                        && config_generation > 0
+                        && valid_vault_freshness(
+                            consumed_vault_generation,
+                            result_vault_generation,
+                            changed,
+                        ) =>
+                    {
+                        self.invalidate_secret_inventory_entry(&provider_id, None);
+                        self.completed_provider_auth =
+                            Some(CompletedProviderAuthMutation::Logout {
+                                provider_id: provider_id.clone(),
+                                result: Ok(()),
+                            });
+                        Ok(format!("signed out of {provider_id}"))
+                    }
+                    (
+                        SettingsMutationAction::ProviderCredentialPut {
+                            provider_id,
+                            client_operation_id,
+                            expected_request_intent_hash,
+                        },
+                        Ok(Response::ProviderCredentialCommitted {
+                            client_operation_id: returned_operation_id,
+                            mutation_intent_hash,
+                            provider_id: returned_provider_id,
+                            project_root: None,
+                            owner_root: None,
+                            owner_scope,
+                            stored: true,
+                            changed,
+                            consumed_vault_generation,
+                            result_vault_generation,
+                            config_generation,
+                            ..
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && mutation_intent_hash == expected_request_intent_hash
+                        && returned_provider_id == provider_id
+                        && owner_scope == "global"
+                        && config_generation > 0
+                        && valid_vault_freshness(
+                            consumed_vault_generation,
+                            result_vault_generation,
+                            changed,
+                        ) =>
+                    {
+                        self.invalidate_secret_inventory_entry(
+                            &provider_id,
+                            Some(
+                                cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord,
+                            ),
+                        );
+                        Ok(format!("stored credential for {provider_id}"))
+                    }
+                    (
+                        SettingsMutationAction::WebCredentialPut {
+                            provider_id,
+                            client_operation_id,
+                            expected_request_intent_hash,
+                        },
+                        Ok(Response::ProviderCredentialCommitted {
+                            client_operation_id: returned_operation_id,
+                            mutation_intent_hash,
+                            provider_id: returned_provider_id,
+                            project_root: None,
+                            owner_root: None,
+                            owner_scope,
+                            stored: true,
+                            changed,
+                            consumed_vault_generation,
+                            result_vault_generation,
+                            config_generation,
+                            ..
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && mutation_intent_hash == expected_request_intent_hash
+                        && returned_provider_id == provider_id
+                        && owner_scope == "global"
+                        && config_generation > 0
+                        && valid_vault_freshness(
+                            consumed_vault_generation,
+                            result_vault_generation,
+                            changed,
+                        ) =>
+                    {
+                        self.invalidate_secret_inventory_entry(
+                            &provider_id,
+                            Some(
+                                cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord,
+                            ),
+                        );
+                        self.completed_web_credential = Some((provider_id.clone(), Ok(())));
+                        Ok(format!("stored credential for {provider_id}"))
+                    }
+                    (SettingsMutationAction::WebCredentialPut { provider_id, .. }, Ok(other)) => {
+                        let error = format!("unexpected web credential response: {other:?}");
+                        self.completed_web_credential = Some((provider_id, Err(error.clone())));
+                        Err(error)
+                    }
+                    (SettingsMutationAction::WebCredentialPut { provider_id, .. }, Err(error)) => {
+                        self.completed_web_credential = Some((provider_id, Err(error.clone())));
+                        Err(error)
+                    }
+                    (
+                        SettingsMutationAction::CopilotSetup {
+                            provider_id,
+                            client_operation_id,
+                            project_root,
+                            expected_request_hash,
+                        },
+                        Ok(Response::CopilotAuthCommitted {
+                            client_operation_id: returned_operation_id,
+                            mutation_intent_hash,
+                            project_root: returned_root,
+                            owner_root,
+                            owner_scope,
+                            provider_id: returned_provider_id,
+                            consumed_vault_generation,
+                            result_vault_generation,
+                            config_generation,
+                            ..
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && mutation_intent_hash == expected_request_hash
+                        && returned_provider_id == provider_id
+                        && returned_root == project_root
+                        && owner_root == project_root
+                        && owner_scope == format!("project:{owner_root}")
+                        && config_generation > 0
+                        && result_vault_generation > consumed_vault_generation
+                        && result_vault_generation > 0 =>
+                    {
+                        self.invalidate_secret_inventory_entry(&provider_id, None);
+                        self.completed_provider_auth =
+                            Some(CompletedProviderAuthMutation::Copilot {
+                                provider_id,
+                                result: Ok(()),
+                            });
+                        Ok("Copilot token configured in the daemon vault".to_string())
+                    }
+                    (
+                        SettingsMutationAction::ProviderCredentialDelete { provider_id, .. },
+                        result,
+                    ) => {
+                        let error = match result {
+                            Ok(other) => format!("unexpected provider logout response: {other:?}"),
+                            Err(error) => error,
+                        };
+                        self.completed_provider_auth =
+                            Some(CompletedProviderAuthMutation::Logout {
+                                provider_id,
+                                result: Err(error.clone()),
+                            });
+                        Err(error)
+                    }
+                    (SettingsMutationAction::CopilotSetup { provider_id, .. }, result) => {
+                        let error = match result {
+                            Ok(other) => format!("unexpected Copilot setup response: {other:?}"),
+                            Err(error) => error,
+                        };
+                        self.completed_provider_auth =
+                            Some(CompletedProviderAuthMutation::Copilot {
+                                provider_id,
+                                result: Err(error.clone()),
+                            });
+                        Err(error)
+                    }
+                    (SettingsMutationAction::McpSave { .. }, Ok(other)) => {
+                        let error = format!("unexpected MCP settings response: {other:?}");
+                        if let Some((name, edited)) = self.pending_mcp_navigation.take() {
+                            self.completed_mcp_navigation =
+                                Some((name, edited, Err(error.clone())));
+                        }
+                        Err(error)
+                    }
+                    (SettingsMutationAction::McpSave { .. }, Err(error)) => {
+                        if let Some((name, edited)) = self.pending_mcp_navigation.take() {
+                            self.completed_mcp_navigation =
+                                Some((name, edited, Err(error.clone())));
+                        }
+                        Err(error)
+                    }
+                    (_, Ok(other)) => {
+                        Err(format!("unexpected settings mutation response: {other:?}"))
+                    }
+                    (_, Err(error)) => Err(error),
+                };
+                self.extended_warnings = vec![match result {
+                    Ok(status) => status,
+                    Err(error) => format!("settings operation failed: {error}"),
+                }];
+            }
+            PendingSettingsOperation::SettlementQuery {
+                target,
+                client_operation_id,
+                original,
+            } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                let expected_kind = pending_settlement_kind(&original);
+                match completion.response {
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id: returned_id,
+                        operation_kind,
+                        request_hash,
+                        pending: false,
+                        response: Some(response),
+                        terminal_error: None,
+                        terminal_cancelled: false,
+                    }) if returned_id == client_operation_id
+                        && expected_kind == Some(operation_kind.as_str())
+                        && settlement_hash_matches(&original, &request_hash) =>
+                    {
+                        let original = *original;
+                        let original_target = original.target();
+                        self.pending_settings
+                            .insert(completion.operation_id, original);
+                        return self.apply_general_completion(SettingsDaemonEffectCompletion {
+                            dialog_id: completion.dialog_id,
+                            operation_id: completion.operation_id,
+                            target: original_target,
+                            response: Ok(*response),
+                            authoritative_rejection: false,
+                            committed_refresh_needed: None,
+                        });
+                    }
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id: returned_id,
+                        operation_kind,
+                        request_hash,
+                        pending: true,
+                        response: None,
+                        terminal_error: None,
+                        terminal_cancelled: false,
+                    }) if returned_id == client_operation_id
+                        && expected_kind == Some(operation_kind.as_str())
+                        && settlement_hash_matches(&original, &request_hash) =>
+                    {
+                        self.pending_settings.insert(
+                            completion.operation_id,
+                            PendingSettingsOperation::SettlementUnknown {
+                                target,
+                                client_operation_id,
+                                original,
+                            },
+                        );
+                        self.extended_warnings = vec![
+                            "operation remains unsettled; press any key to query the durable receipt again"
+                                .into(),
+                        ];
+                    }
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id: returned_id,
+                        operation_kind,
+                        request_hash,
+                        pending: false,
+                        response: None,
+                        terminal_error: Some(error),
+                        terminal_cancelled,
+                    }) if returned_id == client_operation_id
+                        && expected_kind == Some(operation_kind.as_str())
+                        && settlement_hash_matches(&original, &request_hash) =>
+                    {
+                        self.apply_terminal_settlement(*original, error, terminal_cancelled);
+                    }
+                    Ok(other) => {
+                        tracing::warn!(response = ?other, "ignored unbound local settlement query response");
+                        self.pending_settings.insert(
+                            completion.operation_id,
+                            PendingSettingsOperation::SettlementUnknown {
+                                target,
+                                client_operation_id,
+                                original,
+                            },
+                        );
+                        self.extended_warnings = vec![
+                            "settlement receipt was unbound; press any key to query again".into(),
+                        ];
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "local settlement query failed; retaining unknown state");
+                        self.pending_settings.insert(
+                            completion.operation_id,
+                            PendingSettingsOperation::SettlementUnknown {
+                                target,
+                                client_operation_id,
+                                original,
+                            },
+                        );
+                        self.extended_warnings = vec![
+                            "settlement query failed; press any key to retry without leaving this screen"
+                                .into(),
+                        ];
+                    }
+                }
+            }
+            PendingSettingsOperation::SettlementUnknown { .. } => {
+                // No daemon effect is associated with this retained state.
+                // `retry_unknown_settlement` replaces it before enqueueing the
+                // next owner-scoped query.
+                return Err(completion);
+            }
+            PendingSettingsOperation::TypedDocumentEdit {
+                target,
+                client_operation_id,
+                requested_path,
+                action,
+            } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                if let Some(committed) = completion.committed_refresh_needed {
+                    self.extended_revision = None;
+                    self.extended_warnings = vec![format!(
+                        "{} (committed revision {}, generation {}); reload before editing again",
+                        committed.warning, committed.result_revision, committed.config_generation
+                    )];
+                    return Ok(());
+                }
+                match completion.response {
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id: returned_operation_id,
+                        pending: true,
+                        ..
+                    }) if returned_operation_id == client_operation_id => {
+                        self.pending_settings.insert(
+                            completion.operation_id,
+                            PendingSettingsOperation::SettlementUnknown {
+                                target: target.clone(),
+                                client_operation_id: client_operation_id.clone(),
+                                original: Box::new(PendingSettingsOperation::TypedDocumentEdit {
+                                    target,
+                                    client_operation_id,
+                                    requested_path,
+                                    action,
+                                }),
+                            },
+                        );
+                        self.extended_warnings = vec![
+                            "typed settings commit remains unsettled; press any key to query the exact receipt again".into(),
+                        ];
+                    }
+                    Ok(Response::ExtendedConfigSnapshot {
+                        layers,
+                        config_generation,
+                    }) => {
+                        let reconciled = layers
+                            .iter()
+                            .find(|layer| layer.display_path == requested_path)
+                            .cloned();
+                        match (action, reconciled) {
+                            (TypedDocumentEditAction::Scaffold, Some(layer)) => {
+                                match decode_extended_layer(layer, config_generation) {
+                                    Ok((extended, base, revision)) => {
+                                        self.extended = extended;
+                                        self.extended_base = base;
+                                        self.extended_revision = Some(revision);
+                                        self.extended_warnings =
+                                            vec!["settings layer created".into()];
+                                    }
+                                    Err(error) => {
+                                        self.extended_warnings = vec![format!(
+                                            "settings committed, but refresh was invalid: {error}"
+                                        )]
+                                    }
+                                }
+                            }
+                            (
+                                TypedDocumentEditAction::RemoveProjectShadow(prompt),
+                                project_layer,
+                            ) => {
+                                let project_authored =
+                                    project_layer.as_ref().is_some_and(|project_layer| {
+                                        project_layer.authored_paths.iter().any(|authored| {
+                                            authored
+                                                .iter()
+                                                .map(String::as_str)
+                                                .eq(prompt.path.iter().copied())
+                                        })
+                                    });
+                                let source = layers.iter().find(|layer| {
+                                    layer.display_path == prompt.source_config.display().to_string()
+                                });
+                                let source_matches = source.is_some_and(|layer| {
+                                    let value = serde_json::to_value(&layer.config).ok();
+                                    let effective = value.as_ref().and_then(|document| {
+                                        prompt.path.iter().try_fold(document, |value, segment| {
+                                            value.get(*segment)
+                                        })
+                                    });
+                                    !project_authored
+                                        && layer.authored_paths.iter().any(|authored| {
+                                            authored
+                                                .iter()
+                                                .map(String::as_str)
+                                                .eq(prompt.path.iter().copied())
+                                        })
+                                        && effective == Some(&prompt.expected_effective_value)
+                                });
+                                if source_matches {
+                                    self.completed_shadow_removal = Some(prompt);
+                                    self.extended_warnings =
+                                        vec!["project override removed".into()];
+                                } else {
+                                    self.extended_revision = None;
+                                    self.extended_warnings = vec![
+                                        "project override commit returned an unreconciled effective value; reload before editing again".into(),
+                                    ];
+                                }
+                            }
+                            (_, None) => {
+                                self.extended_warnings = vec![
+                                    "settings committed, but refreshed layer was absent".into(),
+                                ]
+                            }
+                        }
+                    }
+                    Ok(other) => {
+                        self.extended_warnings =
+                            vec![format!("unexpected typed settings response: {other:?}")]
+                    }
+                    Err(error) => {
+                        self.extended_warnings =
+                            vec![format!("typed settings edit failed: {error}")]
+                    }
+                }
+            }
+            PendingSettingsOperation::CategoryExternalPrepare { .. }
+            | PendingSettingsOperation::CategoryExternalRead { .. } => {
+                self.extended_warnings =
+                    vec!["category editor work completed on the wrong effect channel".into()];
+            }
+        }
+        Ok(())
+    }
     /// Return a cached metadata-only inventory answer and arrange a background
     /// refresh on a cache miss.  This is deliberately safe to call from a
     /// renderer: it never waits on the daemon or opens a local secret store.
@@ -2094,6 +5225,7 @@ impl Dialog {
     /// configured. Used by the TUI's
     /// first-run flow to auto-route into the Add wizard after the
     /// daemon prompt resolves.
+    #[cfg(test)]
     pub fn has_no_providers(cwd: &std::path::Path) -> bool {
         daemon_provider_snapshot(cwd, None).is_none_or(|config| config.providers.is_empty())
     }
@@ -2215,64 +5347,43 @@ impl Dialog {
         provider_id: &str,
         oauth_expired: bool,
     ) -> Self {
-        let Some(config) = daemon_provider_snapshot(cwd, Some(provider_id)) else {
-            return Self::open(cwd);
-        };
-        let Some(entry) = config.providers.get(provider_id).cloned() else {
-            return Self::open(cwd);
-        };
         let Some(path) = config_write_target_for_provider(cwd, provider_id) else {
             return Self::open(cwd);
         };
-        let mut settings = SettingsDialog::open_with_config(path, config);
-        settings.picker_cwd = Some(cwd.to_path_buf());
-        settings.active_project_root = Some(cwd.to_path_buf());
-        let parent = EditState::new(provider_id.to_string(), entry.clone());
-        let oauth_provider = if oauth_expired {
-            match entry.effective_template(provider_id) {
-                Some(cockpit_core::auth::codex_oauth::CREDENTIAL_KEY | "codex") => {
-                    Some(OAuthProvider::Codex)
-                }
-                Some(cockpit_core::auth::xai_oauth::CREDENTIAL_KEY | "grok") => {
-                    Some(OAuthProvider::Grok)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        settings.page = if let Some(provider) = oauth_provider {
-            providers_page(ProvidersPage::OAuthSetup {
-                state: Box::new(providers::OAuthFlowState::new(provider)),
-                parent: Box::new(parent),
-            })
-        } else {
-            providers_page(ProvidersPage::Edit(parent))
-        };
+        let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
+        settings.page = providers_page(ProvidersPage::List {
+            cursor: 0,
+            status: Some(format!("loading `{provider_id}` from the daemon…")),
+            delete_pending: false,
+        });
+        settings.cx.queue_provider_catalog_for(
+            Some(provider_id.to_string()),
+            Some(ProviderNavigation::Edit {
+                provider_id: provider_id.to_string(),
+                oauth_expired,
+            }),
+        );
         Dialog::Settings(Box::new(settings))
     }
 
     /// Open the existing provider-model editor directly for one configured provider.
     /// This is the canonical add-model surface used by scoped model recovery.
     pub fn open_provider_models(cwd: &std::path::Path, provider_id: &str) -> Self {
-        let Some(cfg) = daemon_provider_snapshot(cwd, None) else {
-            return Self::open(cwd);
-        };
-        let Some(entry) = cfg.providers.get(provider_id).cloned() else {
-            return Self::open(cwd);
-        };
         let Some(path) = config_write_target_for_provider(cwd, provider_id) else {
             return Self::open(cwd);
         };
         let mut settings = SettingsDialog::open_from_picker(path, cwd.to_path_buf());
-        let parent = EditState::new(provider_id.to_string(), entry.clone());
-        settings.page = providers_page(ProvidersPage::Models {
-            editor: Box::new(ModelEditor::new(
-                entry.effective_template(provider_id).map(str::to_owned),
-                entry.models.clone(),
-            )),
-            parent: Box::new(parent),
+        settings.page = providers_page(ProvidersPage::List {
+            cursor: 0,
+            status: Some(format!("loading models for `{provider_id}`…")),
+            delete_pending: false,
         });
+        settings.cx.queue_provider_catalog_for(
+            Some(provider_id.to_string()),
+            Some(ProviderNavigation::Models {
+                provider_id: provider_id.to_string(),
+            }),
+        );
         Dialog::Settings(Box::new(settings))
     }
 
@@ -2435,20 +5546,12 @@ impl Dialog {
                     false
                 }
                 ListAction::Close => true,
-                ListAction::Select(idx) => match scaffold_config_dir_owned(&choices[idx].path) {
-                    Ok(config_path) => {
-                        let cwd = cwd.clone();
-                        *self = Dialog::Settings(Box::new(SettingsDialog::open_from_picker(
-                            config_path,
-                            cwd,
-                        )));
-                        false
-                    }
-                    Err(e) => {
-                        *status = Some(scaffold_error(&choices[idx].path, &e));
-                        false
-                    }
-                },
+                ListAction::Select(idx) => {
+                    let settings =
+                        SettingsDialog::open_for_scaffold(choices[idx].path.clone(), cwd.clone());
+                    *self = Dialog::Settings(Box::new(settings));
+                    false
+                }
             },
             Dialog::CreateScopedConfig {
                 choices,
@@ -2463,19 +5566,9 @@ impl Dialog {
                 ListAction::Stay => false,
                 ListAction::Select(idx) => {
                     let target = &choices[idx];
-                    match scaffold_config_dir_owned(&target.path) {
-                        Ok(config_path) => {
-                            let cwd = cwd.clone();
-                            *self = Dialog::Settings(Box::new(SettingsDialog::open_from_picker(
-                                config_path,
-                                cwd,
-                            )));
-                        }
-                        Err(e) => {
-                            *self =
-                                Dialog::reopen_picker(cwd, Some(scaffold_error(&target.path, &e)));
-                        }
-                    }
+                    let settings =
+                        SettingsDialog::open_for_scaffold(target.path.clone(), cwd.clone());
+                    *self = Dialog::Settings(Box::new(settings));
                     false
                 }
             },
@@ -2552,6 +5645,48 @@ impl Dialog {
         }
     }
 
+    pub(crate) fn take_settings_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
+        match self {
+            Dialog::Settings(settings) => settings.cx.take_daemon_effect(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn take_settings_blocking_effect(
+        &mut self,
+    ) -> Option<SettingsBlockingEffectRequest> {
+        match self {
+            Dialog::Settings(settings) => settings.cx.take_blocking_effect(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_settings_daemon_completion(
+        &mut self,
+        completion: SettingsDaemonEffectCompletion,
+    ) {
+        let Dialog::Settings(settings) = self else {
+            return;
+        };
+        if completion.dialog_id != settings.cx.dialog_id {
+            return;
+        }
+        settings.apply_daemon_completion(completion);
+    }
+
+    pub(crate) fn apply_settings_blocking_completion(
+        &mut self,
+        completion: SettingsBlockingEffectCompletion,
+    ) {
+        let Dialog::Settings(settings) = self else {
+            return;
+        };
+        if completion.dialog_id != settings.cx.dialog_id {
+            return;
+        }
+        settings.apply_blocking_completion(completion);
+    }
+
     pub fn apply_host_capabilities(
         &mut self,
         snapshot: cockpit_proto::HostCapabilitySnapshot,
@@ -2589,25 +5724,121 @@ impl Dialog {
         }
     }
 
-    pub(crate) fn apply_oauth_begin(&mut self, provider: OAuthProvider, result: OAuthBeginResult) {
+    pub(crate) fn oauth_provider(&self) -> Option<OAuthProvider> {
+        match self {
+            Dialog::Settings(settings) => settings.oauth_flow_provider(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_oauth_begin(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: OAuthBeginResult,
+    ) {
         if let Dialog::Settings(s) = self {
-            s.apply_oauth_begin(provider, result);
+            s.apply_oauth_begin(provider, client_flow_id, operation_id, result);
         }
     }
 
     pub(crate) fn apply_oauth_complete(
         &mut self,
         provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
         result: Result<bool, String>,
     ) {
         if let Dialog::Settings(s) = self {
-            s.apply_oauth_complete(provider, result);
+            s.apply_oauth_complete(provider, client_flow_id, operation_id, result);
         }
     }
 
-    pub(crate) fn apply_oauth_acknowledgement(&mut self, result: Result<(), String>) {
+    pub(crate) fn apply_oauth_present(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<providers::OAuthPresentationResult, String>,
+    ) {
         if let Dialog::Settings(s) = self {
-            s.apply_oauth_acknowledgement(result);
+            s.apply_oauth_present(provider, client_flow_id, operation_id, result);
+        }
+    }
+
+    pub(crate) fn apply_oauth_cancel(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<bool, String>,
+    ) {
+        if let Dialog::Settings(s) = self {
+            s.apply_oauth_cancel(provider, client_flow_id, operation_id, result);
+        }
+    }
+
+    pub(crate) fn apply_oauth_cancel_authoritative_failure(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        error: String,
+    ) {
+        if let Dialog::Settings(settings) = self {
+            settings.apply_oauth_cancel_authoritative_failure(
+                provider,
+                client_flow_id,
+                operation_id,
+                error,
+            );
+        }
+    }
+
+    pub(crate) fn apply_oauth_settlement_unknown(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        error: String,
+    ) {
+        if let Dialog::Settings(s) = self {
+            s.apply_oauth_settlement_unknown(provider, client_flow_id, operation_id, error);
+        }
+    }
+
+    pub(crate) fn apply_oauth_acknowledgement_settlement_unknown(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        error: String,
+    ) {
+        if let Dialog::Settings(s) = self {
+            s.apply_oauth_acknowledgement_settlement_unknown(
+                provider,
+                client_flow_id,
+                operation_id,
+                error,
+            );
+        }
+    }
+
+    pub(crate) fn apply_oauth_acknowledgement(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<(), String>,
+    ) {
+        if let Dialog::Settings(s) = self {
+            s.apply_oauth_acknowledgement_correlated(
+                provider,
+                client_flow_id,
+                operation_id,
+                result,
+            );
         }
     }
 
@@ -2709,6 +5940,241 @@ fn dispatch_from_settings_action(
 }
 
 impl SettingsDialog {
+    fn authority_operation_pending(&self) -> bool {
+        self.cx.authority_operation_pending()
+            || self
+                .page
+                .downcast_ref::<AgentsPage>()
+                .is_some_and(AgentsPage::has_unsettled_external_edit)
+            || self
+                .page
+                .downcast_ref::<ProvidersPage>()
+                .is_some_and(ProvidersPage::has_unsettled_authority_operation)
+    }
+
+    fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
+        let completion = match self.cx.apply_general_completion(completion) {
+            Ok(()) => {
+                if let Some((navigation, config)) = self.cx.completed_provider_navigation.take() {
+                    let requested_provider_id = match &navigation {
+                        ProviderNavigation::Edit { provider_id, .. }
+                        | ProviderNavigation::Models { provider_id } => provider_id.clone(),
+                    };
+                    if let Some(entry) = config.providers.get(&requested_provider_id).cloned() {
+                        let parent = EditState::new(requested_provider_id.clone(), entry.clone());
+                        self.page = match navigation {
+                            ProviderNavigation::Edit {
+                                provider_id,
+                                oauth_expired,
+                            } => {
+                                let oauth_provider = oauth_expired
+                                    .then(|| match entry.effective_template(&provider_id) {
+                                        Some(
+                                            cockpit_core::auth::codex_oauth::CREDENTIAL_KEY
+                                            | "codex",
+                                        ) => Some(OAuthProvider::Codex),
+                                        Some(
+                                            cockpit_core::auth::xai_oauth::CREDENTIAL_KEY | "grok",
+                                        ) => Some(OAuthProvider::Grok),
+                                        _ => None,
+                                    })
+                                    .flatten();
+                                if let Some(provider) = oauth_provider {
+                                    providers_page(ProvidersPage::OAuthSetup {
+                                        state: Box::new(providers::OAuthFlowState::new(provider)),
+                                        parent: Box::new(parent),
+                                    })
+                                } else {
+                                    providers_page(ProvidersPage::Edit(parent))
+                                }
+                            }
+                            ProviderNavigation::Models { provider_id } => {
+                                providers_page(ProvidersPage::Models {
+                                    editor: Box::new(ModelEditor::new(
+                                        entry.effective_template(&provider_id).map(str::to_owned),
+                                        entry.models.clone(),
+                                    )),
+                                    parent: Box::new(parent),
+                                })
+                            }
+                        };
+                    } else {
+                        self.page = providers_page(ProvidersPage::List {
+                            cursor: 0,
+                            status: Some(format!(
+                                "provider `{requested_provider_id}` is no longer configured"
+                            )),
+                            delete_pending: false,
+                        });
+                    }
+                }
+                if let Some(prompt) = self.cx.pending_shadow_prompt.take()
+                    && let Some(page) = self.page.downcast_mut::<CategoryPage>()
+                {
+                    page.status = Some(format!(
+                        "saved; project config overrides {} here. Remove that project value? y/n",
+                        prompt.setting.descriptor().label
+                    ));
+                    page.shadowed_global = Some(prompt);
+                }
+                if let Some(prompt) = self.cx.completed_shadow_removal.take()
+                    && let Some(page) = self.page.downcast_mut::<CategoryPage>()
+                {
+                    page.status = Some(format!(
+                        "saved; removed project override for {}",
+                        prompt.setting.descriptor().label
+                    ));
+                }
+                if let Some(completion) = self.cx.completed_image_spend.take() {
+                    if let Some(page) = self.page.downcast_mut::<image_spend::ImageSpendPage>() {
+                        page.apply_daemon_completion(completion);
+                    } else if let Some(page) = self
+                        .page
+                        .downcast_mut::<image_generation::BudgetEditorPage>()
+                    {
+                        page.apply_daemon_completion(completion);
+                    }
+                }
+                if let Some(McpPage::List(state)) = self.page.downcast_mut::<McpPage>() {
+                    self.cx.adopt_pending_mcp_oauth(state);
+                }
+                if let Some((provider_id, result)) = self.cx.completed_web_credential.take()
+                    && let Some(page) = self.page.downcast_mut::<ToolsPage>()
+                    && matches!(
+                        page.editing,
+                        Some(tools_page::ToolField::WebKey(provider))
+                            if tools_page::web_key_provider_id(provider) == provider_id
+                    )
+                {
+                    match result {
+                        Ok(()) => {
+                            page.status = Some(format!("{provider_id} key saved to credentials."));
+                            page.buf = TextField::default();
+                            page.editing = None;
+                        }
+                        Err(error) => {
+                            page.status = Some(format!("Save failed: {error}"));
+                        }
+                    }
+                }
+                if let Some((name, edited, result)) = self.cx.completed_mcp_navigation.take() {
+                    match result {
+                        Ok(()) => {
+                            self.page = mcp_page(McpPage::List(mcp_page::ListState {
+                                cursor: 0,
+                                status: Some(if edited {
+                                    format!("saved `{name}`")
+                                } else {
+                                    format!("added `{name}`")
+                                }),
+                                delete_pending: false,
+                                oauth: None,
+                            }));
+                        }
+                        Err(error) => {
+                            if let Some(McpPage::Add(state)) = self.page.downcast_mut::<McpPage>() {
+                                state.status = Some(format!("save failed: {error}"));
+                            }
+                        }
+                    }
+                }
+                if let Some(completion) = self.cx.completed_provider_auth.take()
+                    && let Some(page) = self.page.downcast_mut::<ProvidersPage>()
+                {
+                    match (completion, page) {
+                        (
+                            CompletedProviderAuthMutation::Logout {
+                                provider_id,
+                                result,
+                            },
+                            ProvidersPage::Edit(state),
+                        ) => {
+                            state.status = Some(match result {
+                                Ok(()) => format!("signed out of {provider_id}"),
+                                Err(error) => format!("sign out failed: {error}"),
+                            });
+                        }
+                        (
+                            CompletedProviderAuthMutation::Copilot {
+                                provider_id,
+                                result,
+                            },
+                            ProvidersPage::CopilotSetup { state, .. },
+                        ) => state.apply_daemon_result(provider_id, result),
+                        _ => {}
+                    }
+                }
+                if let Some(completion) = self.cx.completed_provider_add.take()
+                    && let Some(ProvidersPage::Add(state)) =
+                        self.page.downcast_mut::<ProvidersPage>()
+                {
+                    self.cx.adopt_provider_add_completion(state, completion);
+                }
+                if let Some(result) = self.cx.completed_provider_mutation.take()
+                    && self.cx.completed_provider_add.is_none()
+                    && let Some(page) = self.page.downcast_mut::<ProvidersPage>()
+                {
+                    let status = match result {
+                        Ok(()) => "provider settings committed".to_string(),
+                        Err(error) => format!("provider save failed: {error}"),
+                    };
+                    match page {
+                        ProvidersPage::List { status: slot, .. } => *slot = Some(status),
+                        ProvidersPage::Edit(state) => state.status = Some(status),
+                        _ => {}
+                    }
+                }
+                if let Some(navigation) = self.cx.completed_provider_mutation_navigation.take() {
+                    self.page = match navigation {
+                        ProviderMutationNavigation::List { status } => {
+                            providers_page(ProvidersPage::List {
+                                cursor: initial_list_cursor(&self.cx.config),
+                                status: Some(status),
+                                delete_pending: false,
+                            })
+                        }
+                        ProviderMutationNavigation::Edit {
+                            provider_id,
+                            status,
+                        } => {
+                            let entry = self
+                                .cx
+                                .config
+                                .providers
+                                .get(&provider_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            let mut edit = EditState::new(provider_id, entry);
+                            edit.status = Some(status);
+                            providers_page(ProvidersPage::Edit(edit))
+                        }
+                    };
+                }
+                return;
+            }
+            Err(completion) => completion,
+        };
+        if let Some(page) = self.page.downcast_mut::<AgentsPage>() {
+            page.apply_daemon_completion(&mut self.cx, completion);
+        }
+    }
+
+    fn apply_blocking_completion(&mut self, completion: SettingsBlockingEffectCompletion) {
+        let category_operation = matches!(
+            self.cx.pending_settings.get(&completion.operation_id),
+            Some(
+                PendingSettingsOperation::CategoryExternalPrepare { .. }
+                    | PendingSettingsOperation::CategoryExternalRead { .. }
+            )
+        );
+        if category_operation && let Some(page) = self.page.downcast_mut::<CategoryPage>() {
+            self.cx.apply_category_blocking_completion(page, completion);
+            return;
+        }
+        if let Some(page) = self.page.downcast_mut::<AgentsPage>() {
+            page.apply_blocking_completion(&mut self.cx, completion);
+        }
+    }
     #[cfg(test)]
     pub(crate) fn pointer_test_target_rects(&self) -> Vec<Rect> {
         self.cx
@@ -2982,15 +6448,10 @@ impl SettingsDialog {
 
 impl SettingsDialog {
     pub fn open(config_path: PathBuf) -> Self {
-        let config = {
-            let project_root = config_path
-                .parent()
-                .and_then(std::path::Path::parent)
-                .or_else(|| config_path.parent())
-                .unwrap_or_else(|| std::path::Path::new("."));
-            daemon_provider_snapshot(project_root, None).unwrap_or_default()
-        };
-        Self::open_with_config(config_path, config)
+        let mut settings = Self::open_with_config(config_path, ProvidersConfig::default());
+        settings.cx.queue_provider_catalog(None);
+        settings.cx.queue_extended_load();
+        settings
     }
 
     /// Construct settings from an already-authoritative provider snapshot.
@@ -3000,30 +6461,55 @@ impl SettingsDialog {
         // The cockpit-only keys live in the same `config.json` as the
         // layer-wide provider metadata (GOALS §2a).
         let extended_path = config_path.clone();
-        let (extended, extended_base, extended_revision, extended_warnings) =
-            extended_config_layer_snapshot(&extended_path, None)
-                .map(|(config, value, revision)| (config, value, Some(revision), Vec::new()))
-                .unwrap_or_else(|_| {
-                    let config = ExtendedConfig::default();
-                    let value = serde_json::to_value(&config).unwrap_or_default();
-                    (config, value, None, Vec::new())
-                });
-        let mcp_config = daemon_mcp_snapshot(&config_path).unwrap_or_default();
+        let extended = ExtendedConfig::default();
+        let extended_base = serde_json::to_value(&extended).unwrap_or_default();
+        let extended_revision = None;
+        let extended_warnings = vec!["loading daemon-owned settings…".into()];
+        // Fresh install (no config at this location yet): seed the
+        // skills scan-dir list with the defaults so they show as ordinary
+        // editable rows. Materialization-only — an existing config whose
+        // `scan_dirs` is absent/empty stays empty (clean break).
+        let mcp_config = cockpit_core::mcp::config::McpConfig::default();
         Self {
             page: root_page(0),
             stack: Vec::new(),
             cx: SettingsCx {
+                dialog_id: uuid::Uuid::new_v4(),
+                daemon_effects: VecDeque::new(),
+                blocking_effects: VecDeque::new(),
+                pending_settings: BTreeMap::new(),
+                pending_mcp_oauth: None,
+                pending_mcp_navigation: None,
+                completed_mcp_navigation: None,
+                completed_web_credential: None,
+                completed_provider_auth: None,
+                pending_provider_add: None,
+                completed_provider_add: None,
+                completed_provider_mutation: None,
+                pending_provider_mutation_navigation: None,
+                completed_provider_mutation_navigation: None,
+                completed_shadow_removal: None,
+                completed_image_spend: None,
+                pending_shadow_prompt: None,
+                completed_provider_navigation: None,
+                after_extended_commit: Vec::new(),
                 config_path,
                 extended_path,
                 scroll_states: SettingsScrollStates::default(),
                 pointer_surface: SettingsPointerSurface::default(),
                 original_config: config.clone(),
                 config,
+                provider_edit_authority: None,
+                latest_provider_snapshot_session_id: None,
                 extended,
                 extended_base,
                 extended_revision,
                 extended_warnings,
                 mcp_config,
+                mcp_owner_root: None,
+                mcp_config_path: None,
+                mcp_edit_capability: None,
+                mcp_revision: None,
                 picker_cwd: None,
                 active_project_root: None,
                 sandbox_enabled: true,
@@ -3055,77 +6541,45 @@ impl SettingsDialog {
         }
     }
 
+    fn open_for_scaffold(directory: PathBuf, cwd: PathBuf) -> Self {
+        let config_path = directory.join(CONFIG_FILE);
+        let mut settings = Self::open_with_config(config_path.clone(), ProvidersConfig::default());
+        settings.picker_cwd = Some(cwd.clone());
+        settings.active_project_root = Some(cwd.clone());
+        settings.cx.queue_provider_catalog(None);
+        settings.cx.queue_typed_document_edit(
+            config_path,
+            cwd,
+            serde_json::json!({ "agents": {}, "tools": {} }),
+            TypedDocumentEditAction::Scaffold,
+        );
+        settings.cx.extended_warnings = vec!["creating settings layer…".into()];
+        settings
+    }
+
     /// Same as [`Self::open`] but records the cwd of the picker that
     /// opened this dialog so Root's back keybind can reopen it.
     pub fn open_from_picker(config_path: PathBuf, cwd: PathBuf) -> Self {
-        let config = daemon_provider_snapshot(&cwd, None).unwrap_or_default();
-        let mut s = Self::open_with_config(config_path, config);
+        let mut s = Self::open_with_config(config_path, ProvidersConfig::default());
         s.picker_cwd = Some(cwd.clone());
         s.active_project_root = Some(cwd);
-        if let Some(snapshot) = s
-            .active_project_root
-            .as_deref()
-            .and_then(|root| daemon_provider_view_snapshot(root, None))
-            .and_then(|config| config.mcp_config_json)
-            .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
-        {
-            s.cx.mcp_config = snapshot;
-        }
+        s.cx.queue_provider_catalog(None);
+        s.cx.queue_extended_load();
+        // `open_with_config` already loaded the exact selected layer together
+        // with its opaque revision. Do not replace it with the layered
+        // effective projection here: doing so would materialize inherited
+        // values into this layer and detach `extended_base` from the revision.
         s
     }
 
     /// Reload the authoritative extended-config snapshot after saving.
     fn reload_extended(&mut self) {
-        if let Ok((extended, base, revision)) = extended_config_layer_snapshot(
-            &self.extended_path,
-            self.active_project_root
-                .as_deref()
-                .or(self.picker_cwd.as_deref()),
-        ) {
-            self.extended = extended;
-            self.extended_base = base;
-            self.extended_revision = Some(revision);
-            self.extended_warnings.clear();
-        }
+        self.cx.queue_extended_load();
     }
 
     /// Persist the cached extended-config through daemon authority.
     pub(super) fn save_extended(&mut self) -> Result<SettingsSaveOutcome, String> {
-        let revision = self
-            .extended_revision
-            .as_deref()
-            .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
-        let outcome = apply_settings_patch_via_daemon(
-            &self.extended_path,
-            self.active_project_root
-                .as_deref()
-                .or(self.picker_cwd.as_deref()),
-            &self.extended_base,
-            &self.extended,
-            revision,
-        )?;
-        match outcome {
-            SettingsPatchOutcome::Reconciled {
-                layer,
-                config_generation,
-            } => {
-                let (extended, base, revision) = decode_extended_layer(layer, config_generation)?;
-                self.extended = extended;
-                self.extended_base = base;
-                self.extended_revision = Some(revision);
-                self.extended_warnings.clear();
-                Ok(SettingsSaveOutcome::Saved)
-            }
-            SettingsPatchOutcome::CommittedRefreshNeeded {
-                result_revision: _,
-                config_generation: _,
-                warning,
-            } => {
-                self.extended_revision = None;
-                self.extended_warnings = vec![warning.clone()];
-                Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning))
-            }
-        }
+        self.cx.queue_extended_save()
     }
 
     #[cfg(test)]
@@ -3166,28 +6620,7 @@ impl SettingsDialog {
     }
 
     fn save_config(&mut self) -> Result<(), String> {
-        let mut merged = self.config.clone();
-        for (provider_id, entry) in &merged.providers {
-            cockpit_config::config::providers::validate_provider_headers(
-                provider_id,
-                &entry.headers,
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        let notice = self.protect_provider_literal_headers(&mut merged.providers)?;
-        // The layer-wide default is never part of this file write; it goes to
-        // the daemon's authoritative effective-default operation, and the
-        // dialog only shows the new value once that verified result arrives.
-        self.stage_default_model_change();
-        let authoritative = self.upsert_provider_config_via_daemon(&merged)?;
-        // The daemon response is the only post-save source of truth.  It is
-        // deliberately redacted, so replacing the editor state here also
-        // guarantees that a literal header cannot be retained or rotated on
-        // the next save.
-        self.config = authoritative.clone();
-        self.original_config = authoritative;
-        self.last_secret_notice = notice.map(|notice| notice.render());
-        Ok(())
+        self.cx.save_config()
     }
 
     fn delete_provider_and_stored_secrets(
@@ -3195,39 +6628,8 @@ impl SettingsDialog {
         provider_id: &str,
         delete_stored_secrets: bool,
     ) -> Result<usize, String> {
-        // The daemon performs secret cleanup and config deletion as one
-        // retry-safe composite. Do not remove the local row or issue separate
-        // secret RPCs before this succeeds: a failed cleanup must leave the
-        // config as durable intent for the next attempt.
-        let project_root = self
-            .active_project_root
-            .as_deref()
-            .or(self.picker_cwd.as_deref())
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| "provider delete requires a project context".to_string())?;
-        run_settings_daemon(async {
-            let client = settings_daemon_client()
-                .await
-                .map_err(|error| error.to_string())?;
-            match client
-                .request(Request::DeleteProviderConfig {
-                    project_root: project_root.display().to_string(),
-                    provider_id: provider_id.to_string(),
-                    delete_stored_secrets,
-                })
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                Ok(Response::ProviderConfigUpserted { .. }) => Ok(()),
-                Ok(other) => Err(format!(
-                    "unexpected daemon provider-delete response: {other:?}"
-                )),
-                Err(error) => Err(error.to_string()),
-            }
-        })?;
-        self.config.providers.remove(provider_id);
-        Ok(0)
+        self.cx
+            .delete_provider_and_stored_secrets(provider_id, delete_stored_secrets)
     }
 
     fn tick(&mut self) {
@@ -3281,16 +6683,36 @@ impl SettingsDialog {
         }
     }
 
-    fn apply_oauth_begin(&mut self, provider: OAuthProvider, result: OAuthBeginResult) {
+    fn apply_oauth_begin(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: OAuthBeginResult,
+    ) {
         let Some(state) = self.oauth_flow_state_mut(provider) else {
             return;
         };
-        self.pending_oauth_action =
-            state.apply_begin(result, providers::OAuthEffects::production());
+        if !state.accepts_result(client_flow_id, operation_id) {
+            return;
+        }
+        self.pending_oauth_action = state.apply_begin_deferred(result);
     }
 
-    fn apply_oauth_complete(&mut self, provider: OAuthProvider, result: Result<bool, String>) {
-        if result.is_ok() {
+    fn apply_oauth_complete(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<bool, String>,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if !state.accepts_result(client_flow_id, operation_id) {
+            return;
+        }
+        if matches!(result, Ok(true)) {
             self.invalidate_secret_inventory_entry(oauth_credential_inventory_name(provider), None);
         }
         let Some(state) = self.oauth_flow_state_mut(provider) else {
@@ -3299,16 +6721,108 @@ impl SettingsDialog {
         state.apply_complete(result);
     }
 
-    fn apply_oauth_acknowledgement(&mut self, result: Result<(), String>) {
-        let provider = self.oauth_flow_provider();
-        if result.is_ok()
-            && let Some(provider) = provider
-        {
+    fn apply_oauth_present(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<providers::OAuthPresentationResult, String>,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if !state.accepts_result(client_flow_id, operation_id) {
+            return;
+        }
+        self.pending_oauth_action = state.apply_present(result);
+    }
+
+    fn apply_oauth_cancel(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<bool, String>,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if state.accepts_result(client_flow_id, operation_id) {
+            state.apply_cancel(result);
+        }
+    }
+
+    fn apply_oauth_cancel_authoritative_failure(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        error: String,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if state.accepts_result(client_flow_id, operation_id) {
+            state.apply_cancel_authoritative_failure(error);
+        }
+    }
+
+    fn apply_oauth_settlement_unknown(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        error: String,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if state.accepts_result(client_flow_id, operation_id) {
+            state.apply_settlement_unknown(error);
+        }
+    }
+
+    fn apply_oauth_acknowledgement_settlement_unknown(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        error: String,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if state.accepts_result(client_flow_id, operation_id) {
+            state.apply_acknowledgement_settlement_unknown(error);
+        }
+    }
+
+    fn apply_oauth_acknowledgement_correlated(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        result: Result<(), String>,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if !state.accepts_result(client_flow_id, operation_id) {
+            return;
+        }
+        if result.is_ok() {
             self.invalidate_secret_inventory_entry(
                 &oauth_acknowledgement_inventory_name(provider),
                 None,
             );
         }
+        if let Some(state) = self.oauth_flow_state_mut(provider) {
+            state.apply_acknowledgement(result);
+        }
+    }
+
+    #[cfg(test)]
+    fn apply_oauth_acknowledgement(&mut self, result: Result<(), String>) {
         if let Some(state) = self.oauth_flow_state_mut_for_any_provider() {
             state.apply_acknowledgement(result);
         }
@@ -3484,6 +6998,34 @@ impl SettingsDialog {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        self.cx.retry_unknown_settlement();
+        if self.authority_operation_pending() {
+            // OAuth is the sole authority operation with an interactive
+            // terminal settlement control. Route only plain Escape to the
+            // owning flow reducer so it can mint a correlated cancellation;
+            // every other key remains blocked by this outer dialog gate.
+            let oauth_cancel = matches!(key.code, KeyCode::Esc)
+                && key.modifiers.is_empty()
+                && self
+                    .page
+                    .downcast_ref::<ProvidersPage>()
+                    .is_some_and(ProvidersPage::has_unsettled_oauth_operation);
+            let oauth_ack_retry = matches!(key.code, KeyCode::Enter)
+                && key.modifiers.is_empty()
+                && self
+                    .page
+                    .downcast_ref::<ProvidersPage>()
+                    .is_some_and(ProvidersPage::has_unsettled_oauth_acknowledgement);
+            if oauth_cancel || oauth_ack_retry {
+                let nav = self.page.handle_key(&mut self.cx, key);
+                return self.apply_nav(nav);
+            }
+            self.cx.extended_warnings = vec![
+                "Waiting for the daemon to settle this settings operation; navigation is disabled."
+                    .into(),
+            ];
+            return false;
+        }
         // Tab / Shift+Tab move between fields like ↓/↑ across settings
         // screens. Editors that own Tab themselves opt out through page state.
         let key = if self.in_header_editor() || self.in_pkg_dir_autosuggest() {
@@ -3500,6 +7042,13 @@ impl SettingsDialog {
     }
 
     fn handle_pointer(&mut self, mouse: MouseEvent) -> SettingsPointerOutcome {
+        if self.authority_operation_pending() && !matches!(mouse.kind, MouseEventKind::Moved) {
+            self.cx.extended_warnings = vec![
+                "Waiting for the daemon to settle this settings operation; controls are disabled."
+                    .into(),
+            ];
+            return SettingsPointerOutcome::Consumed;
+        }
         let Some(area) = self.pointer_surface.area.get() else {
             return SettingsPointerOutcome::Consumed;
         };
@@ -3653,6 +7202,13 @@ impl SettingsDialog {
         column: u16,
         row: u16,
     ) -> SettingsPointerOutcome {
+        if self.authority_operation_pending() {
+            self.cx.extended_warnings = vec![
+                "Waiting for the daemon to settle this settings operation; controls are disabled."
+                    .into(),
+            ];
+            return SettingsPointerOutcome::Consumed;
+        }
         match dispatch {
             crate::tui::button::ButtonDispatch::SettingsHeader(SettingsHeaderAction::Close) => {
                 SettingsPointerOutcome::Close
@@ -3708,6 +7264,8 @@ impl SettingsDialog {
     fn take_pending_category_external_edit(
         &mut self,
     ) -> Option<(shell::PointerOperationId, PathBuf)> {
+        #[cfg(test)]
+        self.drive_category_blocking_effects_for_test();
         self.page.downcast_mut::<CategoryPage>().and_then(|p| {
             let pending = p.pending_external_edit.as_mut()?;
             let id = pending.operation_id;
@@ -3726,6 +7284,21 @@ impl SettingsDialog {
         };
         self.cx
             .finish_category_page_external_edit(p, operation_id, outcome, detail);
+        #[cfg(test)]
+        self.drive_category_blocking_effects_for_test();
+    }
+
+    #[cfg(test)]
+    fn drive_category_blocking_effects_for_test(&mut self) {
+        while let Some(effect) = self.cx.take_blocking_effect() {
+            let completion = SettingsBlockingEffectCompletion {
+                dialog_id: effect.dialog_id,
+                operation_id: effect.operation_id,
+                target: effect.target,
+                outcome: execute_settings_blocking_work(effect.work),
+            };
+            self.apply_blocking_completion(completion);
+        }
     }
 
     fn finish_agent_external_edit(
@@ -3734,11 +7307,10 @@ impl SettingsDialog {
         outcome: pointer_actions::ExternalEditOutcome,
         detail: Option<String>,
     ) {
-        let cwd = self.agents_cwd();
         let Some(page) = self.page.downcast_mut::<AgentsPage>() else {
             return;
         };
-        page.finish_external_edit(&cwd, operation_id, outcome, detail);
+        page.finish_external_edit(&mut self.cx, operation_id, outcome, detail);
     }
 
     // ── Rendering ────────────────────────────────────────────────────────
@@ -3872,7 +7444,11 @@ impl SettingsPage for RootPage {
                     "Dependencies" => {
                         Some(dependencies_page::page(cx.agents_cwd(), cx.sandbox_enabled))
                     }
-                    "Agents" => Some(agents_page(AgentsPage::new(&cx.agents_cwd()))),
+                    "Agents" => {
+                        let mut page = AgentsPage::new(&cx.agents_cwd());
+                        page.queue_load(cx);
+                        Some(agents_page(page))
+                    }
                     "Interface" => {
                         cx.reload_extended();
                         Some(category_page(CategoryPage::new(Category::Interface)))
@@ -3881,13 +7457,15 @@ impl SettingsPage for RootPage {
                         cx.reload_extended();
                         Some(category_page(CategoryPage::new(Category::Behavior)))
                     }
-                    "Image spend budgets" => Some(image_spend::page(
-                        cx.active_project_root
+                    "Image spend budgets" => {
+                        let project_key = cx
+                            .active_project_root
                             .as_ref()
                             .unwrap_or(&cx.extended_path)
                             .to_string_lossy()
-                            .into_owned(),
-                    )),
+                            .into_owned();
+                        Some(image_spend::page(project_key, cx))
+                    }
                     "Generation" => Some(image_generation::generation_list_page(
                         image_generation::GenerationPrincipal::from_session(
                             &cx.image_generation_session_snapshot(),
@@ -4140,6 +7718,7 @@ impl SaveStatusValue for SettingsSaveOutcome {
     fn status(self) -> String {
         match self {
             SettingsSaveOutcome::Saved => "saved".into(),
+            SettingsSaveOutcome::Queued => "saving…".into(),
             SettingsSaveOutcome::CommittedRefreshNeeded(warning) => {
                 format!("committed; refresh needed: {warning}")
             }
@@ -4230,8 +7809,9 @@ impl SettingsCx {
     /// The image-generation session capability snapshot for the active session,
     /// from which the Generation node derives its [`GenerationPrincipal`]. The
     /// TUI settings dialog only runs for the LOCAL owner of this daemon (there
-    /// is no remote settings surface), so `local_owner` is a derived fact of
-    /// the host context rather than a hardcoded capability. The `active_project_id`
+    /// is no remote settings surface), but owner affordances are still withheld
+    /// until the app has attached a runner and received a daemon-issued host
+    /// capability generation. The `active_project_id`
     /// is the launch/session project root this dialog is scoped to; remote grant
     /// scopes and ceilings are left empty here and MUST be populated from the
     /// control-plane grant snapshot the day a remote settings surface exists.
@@ -4239,7 +7819,7 @@ impl SettingsCx {
         &self,
     ) -> image_generation::SessionCapabilitySnapshot {
         image_generation::SessionCapabilitySnapshot {
-            local_owner: true,
+            local_owner: self.daemon_attached && self.host_capabilities.generation > 0,
             image_admin_grant_project: None,
             active_project_id: self
                 .active_project_root
@@ -4316,55 +7896,11 @@ impl SettingsCx {
     }
 
     fn reload_extended(&mut self) {
-        if let Ok((extended, base, revision)) = extended_config_layer_snapshot(
-            &self.extended_path,
-            self.active_project_root
-                .as_deref()
-                .or(self.picker_cwd.as_deref()),
-        ) {
-            self.extended = extended;
-            self.extended_base = base;
-            self.extended_revision = Some(revision);
-            self.extended_warnings.clear();
-        }
+        self.queue_extended_load();
     }
 
     pub(super) fn save_extended(&mut self) -> Result<SettingsSaveOutcome, String> {
-        let revision = self
-            .extended_revision
-            .as_deref()
-            .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
-        let outcome = apply_settings_patch_via_daemon(
-            &self.extended_path,
-            self.active_project_root
-                .as_deref()
-                .or(self.picker_cwd.as_deref()),
-            &self.extended_base,
-            &self.extended,
-            revision,
-        )?;
-        match outcome {
-            SettingsPatchOutcome::Reconciled {
-                layer,
-                config_generation,
-            } => {
-                let (extended, base, revision) = decode_extended_layer(layer, config_generation)?;
-                self.extended = extended;
-                self.extended_base = base;
-                self.extended_revision = Some(revision);
-                self.extended_warnings.clear();
-                Ok(SettingsSaveOutcome::Saved)
-            }
-            SettingsPatchOutcome::CommittedRefreshNeeded {
-                result_revision: _,
-                config_generation: _,
-                warning,
-            } => {
-                self.extended_revision = None;
-                self.extended_warnings = vec![warning.clone()];
-                Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning))
-            }
-        }
+        self.queue_extended_save()
     }
 
     fn protect_provider_literal_headers(
@@ -4401,36 +7937,67 @@ impl SettingsCx {
     /// adjacent credentials: the daemon has the trust-aware write target and
     /// can refresh its authoritative snapshot atomically with the mutation.
     fn upsert_provider_config_via_daemon(
-        &self,
-        config: &ProvidersConfig,
-    ) -> Result<ProvidersConfig, String> {
-        let project_root = self
-            .active_project_root
-            .as_deref()
-            .or(self.picker_cwd.as_deref())
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| "provider save requires a project context".to_string())?;
+        &mut self,
+        config: &mut ProvidersConfig,
+        notice: Option<String>,
+    ) -> Result<(), String> {
+        if self
+            .pending_settings
+            .values()
+            .any(|pending| matches!(pending, PendingSettingsOperation::ProviderMutation { .. }))
+        {
+            return Err("a provider settings save is already pending".into());
+        }
+        let authority = self.provider_edit_authority.clone().ok_or_else(|| {
+            "provider snapshot has no edit capability; reload before saving".to_string()
+        })?;
         // `config` is the dialog's effective view in some launch paths. Send
         // only the user's edit intent: unchanged inherited providers must not
         // be re-upserted into the defining layer and shadow the global entry.
-        let providers = config
+        let saves = config
             .providers
-            .iter()
-            .filter(|(provider_id, entry)| {
+            .iter_mut()
+            .filter_map(|(provider_id, entry)| {
+                let changed =
                 self.original_config
                     .providers
-                    .get(*provider_id)
-                    .is_none_or(|original| !provider_entries_equal(original, entry))
+                    .get(provider_id)
+                    .is_none_or(|original| !provider_entries_equal(original, entry));
+                if !changed {
+                    return None;
+                }
+                let header_secrets = entry
+                    .headers
+                    .iter_mut()
+                    .map(|header| {
+                        let value = header.value.trim();
+                        let is_secret = !value.is_empty()
+                            && !value.starts_with('$')
+                            && !cockpit_config::config::providers::is_safe_provider_header_reference(
+                                &header.name.to_ascii_lowercase(),
+                                value,
+                            )
+                            && !secret_display::is_mask_value(value);
+                        is_secret.then(|| {
+                            zeroize::Zeroizing::new(std::mem::take(&mut header.value))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Some(ProviderSavePlan {
+                    provider_id: provider_id.clone(),
+                    // Every staged plaintext was moved, not cloned, before
+                    // this reference-only projection was cloned.
+                    entry: entry.clone(),
+                    header_secrets,
+                })
             })
-            .map(|(provider_id, entry)| (provider_id.clone(), entry.clone()))
             .collect::<Vec<_>>();
-        let deleted = self
+        let deletes = self
             .original_config
             .providers
             .keys()
             .filter(|provider_id| !config.providers.contains_key(*provider_id))
-            .cloned()
+            .map(|provider_id| (provider_id.clone(), false))
             .collect::<Vec<_>>();
         let category_defaults = config.category_defaults.clone();
         let on_unlisted_models_fetch = config
@@ -4438,143 +8005,104 @@ impl SettingsCx {
             .unwrap_or(OnUnlistedModelsFetch::Keep);
         let metadata_changed = config.category_defaults != self.original_config.category_defaults
             || config.on_unlisted_models_fetch != self.original_config.on_unlisted_models_fetch;
-        run_settings_daemon(async move {
-            let client = settings_daemon_client()
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut authoritative = None;
-            for (provider_id, entry) in providers {
-                let header_secrets = entry
-                        .headers
-                        .iter()
-                        .map(|header| {
-                            let value = header.value.trim();
-                            (!value.is_empty()
-                                && !value.starts_with('$')
-                                && !cockpit_config::config::providers::is_safe_provider_header_reference(
-                                    &header.name.to_ascii_lowercase(),
-                                    value,
-                                )
-                                && !secret_display::is_mask_value(value))
-                            .then(|| header.value.clone())
-                        })
-                        .collect();
-                match client
-                    .request(Request::SaveProviderConfig {
-                        project_root: project_root.display().to_string(),
-                        provider_id,
-                        entry,
-                        header_secrets,
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    Ok(cockpit_core::daemon::proto::Response::ProviderConfigUpserted {
-                        config,
-                    }) => authoritative = Some(config),
-                    Ok(other) => {
-                        return Err(format!(
-                            "unexpected daemon provider-config response: {other:?}"
-                        ));
-                    }
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-            for provider_id in deleted {
-                match client
-                    .request(Request::DeleteProviderConfig {
-                        project_root: project_root.display().to_string(),
-                        provider_id,
-                        delete_stored_secrets: false,
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    Ok(cockpit_core::daemon::proto::Response::ProviderConfigUpserted {
-                        config,
-                    }) => authoritative = Some(config),
-                    Ok(other) => {
-                        return Err(format!(
-                            "unexpected daemon provider-delete response: {other:?}"
-                        ));
-                    }
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-            if !metadata_changed {
-                let mut effective = authoritative
-                    .as_ref()
-                    .map(providers_config_from_view)
-                    .unwrap_or_else(|| config.clone());
-                // A provider-config save must never publish the staged
-                // default-model edit. That change is confirmed only by
-                // the separately queued SetDefaultModel request.
-                effective.active_model = self.original_config.active_model.clone();
-                return Ok::<ProvidersConfig, String>(effective);
-            }
-            match client
-                .request(Request::SetProviderLayerMetadata {
-                    project_root: project_root.display().to_string(),
-                    category_defaults_json: serde_json::to_string(&category_defaults)
-                        .map_err(|error| error.to_string())?,
-                    on_unlisted_models_fetch,
-                })
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                Ok(cockpit_core::daemon::proto::Response::ProviderConfigUpserted { config }) => {
-                    authoritative = Some(config)
-                }
-                Ok(other) => {
-                    return Err(format!(
-                        "unexpected daemon provider-metadata response: {other:?}"
-                    ));
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-            let mut effective = authoritative
-                .as_ref()
-                .map(providers_config_from_view)
-                .unwrap_or_else(|| config.clone());
-            // See the early return above: layer metadata persistence is
-            // not confirmation of the pending default-model mutation.
-            effective.active_model = self.original_config.active_model.clone();
-            Ok::<ProvidersConfig, String>(effective)
-        })
+        if saves.is_empty() && deletes.is_empty() && !metadata_changed {
+            return Ok(());
+        }
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
+        let target = SettingsEffectTarget {
+            surface: "settings.provider-mutation",
+            owner: authority.layer_id.clone(),
+            revision: Some(authority.base_revision.clone()),
+        };
+        let metadata = metadata_changed.then_some((category_defaults, on_unlisted_models_fetch));
+        let mutation_intent_hash = provider_plan_intent_hash(&saves, &deletes, &metadata)?;
+        let plan = ProviderMutationPlan {
+            snapshot_session_id: authority.snapshot_session_id.clone(),
+            layer_id: authority.layer_id.clone(),
+            owner_root: authority.owner_root.clone(),
+            mutation_intent_hash: mutation_intent_hash.clone(),
+            expected_revision: authority.base_revision.clone(),
+            client_operation_id: client_operation_id.clone(),
+            saves,
+            deletes,
+            metadata,
+        };
+        let operation_id = self.enqueue_daemon_work(
+            target.clone(),
+            SettingsDaemonEffectWork::ProviderMutation(plan),
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ProviderMutation {
+                target,
+                client_operation_id,
+                snapshot_session_id: authority.snapshot_session_id,
+                layer_id: authority.layer_id,
+                owner_root: authority.owner_root,
+                mutation_intent_hash,
+                expected_revision: authority.base_revision,
+                expected_generation: authority.config_generation,
+                staged_default: self.original_config.active_model.clone(),
+                notice,
+            },
+        );
+        self.extended_warnings = vec!["saving provider settings…".into()];
+        Ok(())
     }
 
     fn delete_provider_config_via_daemon(
-        &self,
+        &mut self,
         provider_id: String,
         delete_stored_secrets: bool,
     ) -> Result<(), String> {
-        let project_root = self
-            .active_project_root
-            .as_deref()
-            .or(self.picker_cwd.as_deref())
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| "provider delete requires a project context".to_string())?;
-        run_settings_daemon(async move {
-            let client = settings_daemon_client()
-                .await
-                .map_err(|error| error.to_string())?;
-            match client
-                .request(Request::DeleteProviderConfig {
-                    project_root: project_root.display().to_string(),
-                    provider_id,
-                    delete_stored_secrets,
-                })
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                Ok(cockpit_core::daemon::proto::Response::ProviderConfigUpserted { .. }) => Ok(()),
-                Ok(other) => Err(format!(
-                    "unexpected daemon provider-delete response: {other:?}"
-                )),
-                Err(error) => Err(error.to_string()),
-            }
-        })
+        if self
+            .pending_settings
+            .values()
+            .any(|pending| matches!(pending, PendingSettingsOperation::ProviderMutation { .. }))
+        {
+            return Err("a provider settings save is already pending".into());
+        }
+        let authority = self.provider_edit_authority.clone().ok_or_else(|| {
+            "provider snapshot has no edit capability; reload before deleting".to_string()
+        })?;
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
+        let target = SettingsEffectTarget {
+            surface: "settings.provider-delete",
+            owner: authority.layer_id.clone(),
+            revision: Some(authority.base_revision.clone()),
+        };
+        let deletes = vec![(provider_id, delete_stored_secrets)];
+        let mutation_intent_hash = provider_plan_intent_hash(&[], &deletes, &None)?;
+        let operation_id = self.enqueue_daemon_work(
+            target.clone(),
+            SettingsDaemonEffectWork::ProviderMutation(ProviderMutationPlan {
+                snapshot_session_id: authority.snapshot_session_id.clone(),
+                layer_id: authority.layer_id.clone(),
+                owner_root: authority.owner_root.clone(),
+                mutation_intent_hash: mutation_intent_hash.clone(),
+                expected_revision: authority.base_revision.clone(),
+                client_operation_id: client_operation_id.clone(),
+                saves: Vec::new(),
+                deletes,
+                metadata: None,
+            }),
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ProviderMutation {
+                target,
+                client_operation_id,
+                snapshot_session_id: authority.snapshot_session_id,
+                layer_id: authority.layer_id,
+                owner_root: authority.owner_root,
+                mutation_intent_hash,
+                expected_revision: authority.base_revision,
+                expected_generation: authority.config_generation,
+                staged_default: self.original_config.active_model.clone(),
+                notice: None,
+            },
+        );
+        Ok(())
     }
 
     fn save_config(&mut self) -> Result<(), String> {
@@ -4584,15 +8112,25 @@ impl SettingsCx {
         // the daemon's authoritative effective-default operation, and the
         // dialog only shows the new value once that verified result arrives.
         self.stage_default_model_change();
-        let authoritative = self.upsert_provider_config_via_daemon(&merged)?;
-        // Provider-layer persistence is not confirmation of the separately
-        // staged default-model mutation. Keep the daemon view, which still
-        // contains the previously verified default, until that operation
-        // completes.
-        self.config = authoritative.clone();
-        self.original_config = authoritative;
-        self.last_secret_notice = notice.map(|notice| notice.render());
-        Ok(())
+        let result = self
+            .upsert_provider_config_via_daemon(&mut merged, notice.map(|notice| notice.render()));
+        // Once queued, leave no second plaintext owner in the live dialog.
+        for entry in self.config.providers.values_mut() {
+            for header in &mut entry.headers {
+                let value = header.value.trim();
+                if !value.is_empty()
+                    && !value.starts_with('$')
+                    && !secret_display::is_mask_value(value)
+                    && !cockpit_config::config::providers::is_safe_provider_header_reference(
+                        &header.name.to_ascii_lowercase(),
+                        value,
+                    )
+                {
+                    header.value = "********".into();
+                }
+            }
+        }
+        result
     }
 
     fn delete_provider_and_stored_secrets(
@@ -4601,7 +8139,6 @@ impl SettingsCx {
         delete_stored_secrets: bool,
     ) -> Result<usize, String> {
         self.delete_provider_config_via_daemon(provider_id.to_string(), delete_stored_secrets)?;
-        self.config.providers.remove(provider_id);
         Ok(0)
     }
 }
@@ -4664,6 +8201,46 @@ fn providers_config_from_view(
     }
 }
 
+fn provider_view_matches_mutation(
+    view: &cockpit_core::daemon::proto::ProviderConfigView,
+    upserts: &[(String, ProviderEntry)],
+    deletes: &[String],
+    metadata: Option<&cockpit_proto::ProviderLayerMetadataPatch>,
+) -> bool {
+    if deletes
+        .iter()
+        .any(|provider_id| view.providers.contains_key(provider_id))
+    {
+        return false;
+    }
+    for (provider_id, expected) in upserts {
+        let Some(observed) = view.providers.get(provider_id) else {
+            return false;
+        };
+        let mut expected_entry = expected.clone();
+        expected_entry.url = cockpit_proto::redact_url_for_owner_view(&expected_entry.url);
+        expected_entry.credential_ref = None;
+        expected_entry.headers.clear();
+        if serde_json::to_value(&expected_entry).ok() != serde_json::to_value(&observed.entry).ok()
+            || observed.headers.len() != expected.headers.len()
+            || !observed
+                .headers
+                .iter()
+                .zip(&expected.headers)
+                .all(|(actual, wanted)| {
+                    actual.redacted && actual.name.eq_ignore_ascii_case(&wanted.name)
+                })
+        {
+            return false;
+        }
+    }
+    metadata.is_none_or(|metadata| {
+        view.category_defaults == metadata.category_defaults
+            && view.on_unlisted_models_fetch == Some(metadata.on_unlisted_models_fetch)
+    })
+}
+
+#[cfg(test)]
 fn daemon_provider_snapshot(
     cwd: &std::path::Path,
     provider_id: Option<&str>,
@@ -4674,6 +8251,7 @@ fn daemon_provider_snapshot(
         .map(|config| providers_config_from_view(&config))
 }
 
+#[cfg(test)]
 fn daemon_provider_view_snapshot(
     cwd: &std::path::Path,
     provider_id: Option<&str>,
@@ -4683,6 +8261,7 @@ fn daemon_provider_view_snapshot(
     daemon_provider_view_snapshot_inner(project_root, provider_id)
 }
 
+#[cfg(test)]
 fn daemon_provider_view_snapshot_inner(
     project_root: String,
     provider_id: Option<String>,
@@ -4690,8 +8269,9 @@ fn daemon_provider_view_snapshot_inner(
     match settings_daemon_request(Request::GetProviderCatalogSnapshot {
         project_root,
         provider_id,
+        snapshot_session_id: uuid::Uuid::new_v4().to_string(),
     }) {
-        Ok(Response::ProviderCatalogSnapshot { config }) => Some(config),
+        Ok(Response::ProviderCatalogSnapshot { config, .. }) => Some(config),
         Ok(other) => {
             tracing::warn!(response = ?other, "unexpected daemon provider snapshot response");
             None
@@ -4708,27 +8288,6 @@ fn config_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
         .and_then(std::path::Path::parent)
         .or_else(|| path.parent())
         .map(std::path::Path::to_path_buf)
-}
-
-/// The daemon-owned MCP projection for a project root. `None` means the
-/// daemon could not answer, which is distinct from "no servers configured".
-pub(crate) fn daemon_mcp_snapshot_for_root(
-    root: &std::path::Path,
-) -> Option<cockpit_core::mcp::config::McpConfig> {
-    daemon_provider_view_snapshot(root, None)
-        .and_then(|config| config.mcp_config_json)
-        .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
-}
-
-fn daemon_mcp_snapshot(
-    config_path: &std::path::Path,
-) -> Option<cockpit_core::mcp::config::McpConfig> {
-    let cwd = config_path
-        .parent()
-        .and_then(std::path::Path::parent)
-        .or_else(|| config_path.parent())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    daemon_mcp_snapshot_for_root(cwd)
 }
 
 fn provider_entries_equal(left: &ProviderEntry, right: &ProviderEntry) -> bool {
@@ -5589,25 +9148,6 @@ fn nearest_project_config_path(cwd: &std::path::Path) -> PathBuf {
     }
     let project = cwd.join(".cockpit");
     project.join(cockpit_config::dirs::CONFIG_FILE)
-}
-
-fn scaffold_config_dir_owned(dir: &std::path::Path) -> Result<PathBuf, String> {
-    let config_path = dir.join(CONFIG_FILE);
-    match apply_typed_settings_document_edit(
-        &config_path,
-        None,
-        serde_json::json!({ "agents": {}, "tools": {} }),
-    )? {
-        SettingsPatchOutcome::Reconciled { .. } => {}
-        SettingsPatchOutcome::CommittedRefreshNeeded { warning, .. } => {
-            return Err(format!("committed; refresh needed: {warning}"));
-        }
-    }
-    Ok(config_path)
-}
-
-fn scaffold_error(path: &std::path::Path, error: &dyn std::fmt::Display) -> String {
-    format!("failed to create {}: {error}", path.display())
 }
 
 fn kind_label(kind: &ConfigDirKind) -> &'static str {

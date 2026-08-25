@@ -670,6 +670,7 @@ async fn begin_provider_oauth_via_daemon(
     match daemon
         .client
         .request(Request::BeginProviderOAuth {
+            client_operation_id: uuid::Uuid::new_v4().to_string(),
             provider_id: provider_id.to_string(),
         })
         .await?
@@ -678,6 +679,7 @@ async fn begin_provider_oauth_via_daemon(
             flow_id,
             authorize_url,
             user_code,
+            ..
         }) => Ok((flow_id, authorize_url, user_code)),
         Ok(other) => bail!("daemon returned unexpected OAuth begin response: {other:?}"),
         Err(error) => bail!("daemon rejected OAuth begin: {error}"),
@@ -690,7 +692,11 @@ async fn complete_provider_oauth_via_daemon(flow_id: String, input: Option<Strin
         .context("starting persistent daemon for OAuth login")?;
     match daemon
         .client
-        .request(Request::CompleteProviderOAuth { flow_id, input })
+        .request(Request::CompleteProviderOAuth {
+            client_operation_id: uuid::Uuid::new_v4().to_string(),
+            flow_id,
+            input: input.map(cockpit_proto::SensitiveWirePayload::new),
+        })
         .await?
     {
         Ok(Response::ProviderOAuthCompleted {
@@ -834,14 +840,25 @@ async fn require_subscription_oauth_acknowledgement(
         .read_line()
         .context("reading subscription OAuth acknowledgement")?;
     if response.trim().eq_ignore_ascii_case("I acknowledge") {
+        // Stable across process restarts so rerunning setup replays the exact
+        // durable acknowledgement after a lost response.
+        let client_operation_id = format!("setup-subscription-ack-{provider}");
         match daemon
             .client
             .request(Request::PutSubscriptionAck {
+                client_operation_id: client_operation_id.clone(),
                 provider_id: provider.to_string(),
             })
             .await?
         {
-            Ok(Response::Ack) => {}
+            Ok(Response::SubscriptionAckCommitted {
+                client_operation_id: returned_id,
+                provider_id,
+                request_hash,
+                ..
+            }) if returned_id == client_operation_id
+                && provider_id == provider
+                && request_hash.len() == 64 => {}
             Ok(other) => {
                 bail!("daemon returned unexpected acknowledgement store response: {other:?}")
             }

@@ -1370,6 +1370,10 @@ async fn run_foreground_inner_with_boot_db(
     if resume_all_sessions {
         resume_all_paused_sessions(&ctx.db).await?;
     }
+    // Recovery is part of the socket-publication barrier. Neither the control
+    // socket nor its reveal sibling may be observable while durable authority
+    // is still being reconciled.
+    server::recover_before_socket_publish(&ctx).await?;
     timer.phase("boot");
 
     // Do not expose a connectable socket until boot has completed. A client

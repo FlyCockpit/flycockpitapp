@@ -620,6 +620,102 @@ fn handler_source_gate_rejects_bypasses() {
 }
 
 #[test]
+fn reducers_and_async_loop_do_not_reenter_daemon_runtime_synchronously() {
+    const RESPONSIVE_SOURCES: &[(&str, &str)] = &[
+        ("app/mod.rs", include_str!("mod.rs")),
+        ("app/input.rs", include_str!("input.rs")),
+        ("app/resume.rs", include_str!("resume.rs")),
+        (
+            "app/attach_lifecycle.rs",
+            include_str!("attach_lifecycle.rs"),
+        ),
+        ("app/model_controls.rs", include_str!("model_controls.rs")),
+        ("app/local_commands.rs", include_str!("local_commands.rs")),
+        ("app/btw_pane.rs", include_str!("btw_pane.rs")),
+        ("app/overlay_actions.rs", include_str!("overlay_actions.rs")),
+        ("tools_pane.rs", include_str!("../tools_pane.rs")),
+        (
+            "goal_settings_pane.rs",
+            include_str!("../goal_settings_pane.rs"),
+        ),
+    ];
+    const FORBIDDEN: &[&str] = &[
+        "daemon_request_blocking",
+        "daemon_request_blocking_classified",
+        "attached_request_tx_blocking",
+        "attached_request_blocking",
+        "block_in_place",
+        ".block_on(",
+    ];
+    for (name, source) in RESPONSIVE_SOURCES {
+        for forbidden in FORBIDDEN {
+            assert!(
+                !source.contains(forbidden),
+                "{name} must enqueue/await typed effects, not call `{forbidden}`"
+            );
+        }
+    }
+
+    // Worker-only blocking adapters are enforced structurally across every
+    // production source file by `tests/tui_db_boundary.rs`; this reducer gate
+    // deliberately owns only the synchronous event-loop spellings above.
+}
+
+#[test]
+fn mcp_local_commands_are_correlated_async_effects() {
+    let source = include_str!("local_commands.rs");
+    for required in [
+        "AsyncActionKind::DaemonRpc(\"mcp.local\")",
+        "McpLocalCompletion",
+        "pending_mcp_local",
+        "snapshot_session_id",
+        "client_operation_id",
+        "commit status is unknown",
+    ] {
+        assert!(
+            source.contains(required),
+            "MCP local command lifecycle must retain `{required}`"
+        );
+    }
+    for forbidden in [
+        "daemon_request_blocking",
+        "settings_daemon_request(",
+        "block_in_place",
+        ".block_on(",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "MCP local command reducers must not use `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn every_production_block_on_is_test_only_or_worker_owned() {
+    let runner = include_str!("../agent_runner.rs");
+    assert_eq!(
+        runner.matches(".block_on(").count(),
+        5,
+        "agent-runner blocking adapters require a fresh call-site audit"
+    );
+    assert!(runner.contains("may be called only from an\n/// `AsyncActionRunner::start_blocking`/`spawn_blocking` worker"));
+
+    let settings = include_str!("../settings/mod.rs");
+    let test_only = settings
+        .split("#[cfg(test)]\nfn run_settings_daemon")
+        .nth(1)
+        .expect("test-only settings adapter remains explicitly gated");
+    assert_eq!(settings.matches(".block_on(").count(), 2);
+    assert_eq!(test_only.matches(".block_on(").count(), 2);
+
+    let image_spend = include_str!("../settings/image_spend.rs");
+    assert_eq!(image_spend.matches("handle.block_on(").count(), 1);
+    assert!(
+        image_spend.contains("image spend persistence may run only on its dedicated OS worker")
+    );
+}
+
+#[test]
 fn sealed_site_catalog_detects_a_deleted_manifest_row() {
     use super::blocking_operations::BLOCKING_OPERATION_MANIFEST;
     let declared = derive_production_sites().unwrap();

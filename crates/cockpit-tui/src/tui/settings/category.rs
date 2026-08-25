@@ -24,7 +24,6 @@
 //! hardcoded list, so roster changes are reflected automatically.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -526,7 +525,7 @@ pub(super) const ALL_SETTING_IDS: &[SettingId] = &[
 ];
 
 impl SettingId {
-    fn descriptor(self) -> SettingDescriptor {
+    pub(super) fn descriptor(self) -> SettingDescriptor {
         SettingDescriptor {
             label: self.label(),
             help: self.help_text(),
@@ -1231,9 +1230,13 @@ pub(super) enum CategoryExternalSource {
 pub(super) struct CategoryExternalEdit {
     pub(super) operation_id: PointerOperationId,
     pub(super) id: SettingId,
-    pub(super) path: tempfile::TempPath,
+    staging_id: uuid::Uuid,
+    source_revision: String,
+    draft: String,
+    staging: Option<super::agents_page::AgentExternalEditStaging>,
     source: CategoryExternalSource,
     servicing: bool,
+    reading: bool,
 }
 
 impl CategoryExternalEdit {
@@ -1251,30 +1254,26 @@ impl CategoryExternalEdit {
         if std::env::var_os("EDITOR").is_none() {
             return Err("No $EDITOR environment variable".into());
         }
-        let mut temp = tempfile::Builder::new()
-            .prefix("cockpit-settings-")
-            .suffix(".txt")
-            .tempfile()
-            .map_err(|e| format!("editor: failed to create temp file: {e}"))?;
-        temp.write_all(text.as_bytes())
-            .map_err(|e| format!("editor: failed to write temp file: {e}"))?;
-        temp.flush()
-            .map_err(|e| format!("editor: failed to flush temp file: {e}"))?;
         Ok(Self {
             operation_id,
             id,
-            path: temp.into_temp_path(),
+            staging_id: uuid::Uuid::new_v4(),
+            source_revision: String::new(),
+            draft: text.to_string(),
+            staging: None,
             source,
             servicing: false,
+            reading: false,
         })
     }
 
     pub(super) fn service_path(&mut self) -> Option<PathBuf> {
-        if self.servicing {
+        if self.servicing || self.reading {
             return None;
         }
+        let path = self.staging.as_ref()?.path().to_path_buf();
         self.servicing = true;
-        Some(self.path.to_path_buf())
+        Some(path)
     }
 }
 
@@ -1555,9 +1554,11 @@ fn long_text_setting(id: SettingId) -> bool {
 
 #[derive(Debug, Clone)]
 pub(super) struct ShadowedGlobalPrompt {
-    setting: SettingId,
-    project_config: std::path::PathBuf,
-    path: &'static [&'static str],
+    pub(super) setting: SettingId,
+    pub(super) source_config: std::path::PathBuf,
+    pub(super) project_config: std::path::PathBuf,
+    pub(super) path: &'static [&'static str],
+    pub(super) expected_effective_value: serde_json::Value,
 }
 
 /// Directory autosuggest for the packages-dir field: the ranked candidate
@@ -1641,14 +1642,19 @@ impl CategoryPage {
                 ));
             }
             CategoryPointerFixtureMode::ExternalEdit => {
+                let staging =
+                    super::agents_page::prepare_agent_external_edit_staging("echo fixture")
+                        .expect("category external-edit fixture");
                 page.pending_external_edit = Some(CategoryExternalEdit {
                     operation_id: PointerOperationId(1),
                     id: SettingId::CompactPrompt,
-                    path: tempfile::NamedTempFile::new()
-                        .expect("category external-edit fixture")
-                        .into_temp_path(),
+                    staging_id: uuid::Uuid::nil(),
+                    source_revision: "fixture".into(),
+                    draft: "echo fixture".into(),
+                    staging: Some(staging),
                     source: CategoryExternalSource::TextEditor,
                     servicing: false,
+                    reading: false,
                 });
             }
             CategoryPointerFixtureMode::PickerList => {
@@ -1877,6 +1883,60 @@ fn category_rows(category: Category) -> Vec<Row> {
 // ── Value formatting ─────────────────────────────────────────────────────
 
 impl SettingsCx {
+    fn begin_category_external_edit(
+        &mut self,
+        p: &mut CategoryPage,
+        id: SettingId,
+        text: &str,
+        source: CategoryExternalSource,
+    ) -> Result<(), String> {
+        let operation_id = p.external_edit_ops.begin();
+        let mut pending = match CategoryExternalEdit::new(operation_id, id, text, source) {
+            Ok(pending) => pending,
+            Err(error) => {
+                p.external_edit_ops.cancel();
+                return Err(error);
+            }
+        };
+        pending.source_revision = self
+            .extended_revision
+            .clone()
+            .unwrap_or_else(|| "unloaded".into());
+        let target = super::SettingsEffectTarget {
+            surface: "settings.category-editor-prepare",
+            owner: format!("{:?}::{:?}", p.category, id),
+            revision: Some(format!(
+                "{}::{}::{}",
+                pending.source_revision, pending.operation_id.0, pending.staging_id
+            )),
+        };
+        let blocking_id = self.enqueue_blocking_work(
+            target,
+            super::SettingsBlockingEffectWork::PrepareCategoryEditor {
+                staging_id: pending.staging_id,
+                seed: pending.draft.clone(),
+            },
+        );
+        self.pending_settings.insert(
+            blocking_id,
+            super::PendingSettingsOperation::CategoryExternalPrepare {
+                target: super::SettingsEffectTarget {
+                    surface: "settings.category-editor-prepare",
+                    owner: format!("{:?}::{:?}", p.category, id),
+                    revision: Some(format!(
+                        "{}::{}::{}",
+                        pending.source_revision, pending.operation_id.0, pending.staging_id
+                    )),
+                },
+                pointer_operation_id: operation_id,
+                staging_id: pending.staging_id,
+            },
+        );
+        p.pending_external_edit = Some(pending);
+        p.status = Some("preparing private external-editor staging…".into());
+        Ok(())
+    }
+
     /// The right-column display value for a setting, reflecting the current
     /// `self.extended` (or `self.config`) state. Enum rows show the active
     /// option spelled out; bool rows show on/off with the default noted.
@@ -2270,84 +2330,196 @@ impl SettingsCx {
         outcome: super::pointer_actions::ExternalEditOutcome,
         detail: Option<String>,
     ) {
-        let Some(setting) = p
-            .pending_external_edit
-            .as_ref()
-            .filter(|pending| pending.operation_id == operation_id)
-            .map(|pending| pending.id)
-        else {
+        let Some(pending) = p.pending_external_edit.as_mut().filter(|pending| {
+            pending.operation_id == operation_id && pending.servicing && !pending.reading
+        }) else {
             return;
         };
-        self.reduce_category_external_edit_result(
-            p,
-            operation_id,
-            super::pointer_actions::CategoryAction::ExternalEditResult(setting, outcome),
-            detail,
+        if outcome != super::pointer_actions::ExternalEditOutcome::Saved {
+            let draft = pending.draft.clone();
+            let source = pending.source;
+            let id = pending.id;
+            let reason = detail.unwrap_or_else(|| match outcome {
+                super::pointer_actions::ExternalEditOutcome::Cancelled => {
+                    "external edit cancelled".into()
+                }
+                _ => "external edit failed".into(),
+            });
+            p.external_edit_ops.complete(operation_id);
+            p.pending_external_edit = None;
+            self.restore_category_external_edit(p, id, draft, source, reason);
+            return;
+        }
+        let Some(staging) = pending.staging.as_ref() else {
+            return;
+        };
+        let Some(leaf) = staging.leaf() else {
+            let id = pending.id;
+            let draft = pending.draft.clone();
+            let source = pending.source;
+            p.external_edit_ops.complete(operation_id);
+            p.pending_external_edit = None;
+            self.restore_category_external_edit(
+                p,
+                id,
+                draft,
+                source,
+                "external-editor staging identity changed".into(),
+            );
+            return;
+        };
+        let directory_handle = match staging.retained_directory() {
+            Ok(handle) => handle,
+            Err(error) => {
+                let id = pending.id;
+                let draft = pending.draft.clone();
+                let source = pending.source;
+                p.external_edit_ops.complete(operation_id);
+                p.pending_external_edit = None;
+                self.restore_category_external_edit(p, id, draft, source, error);
+                return;
+            }
+        };
+        pending.reading = true;
+        let target = super::SettingsEffectTarget {
+            surface: "settings.category-editor-read",
+            owner: format!("{:?}::{:?}", p.category, pending.id),
+            revision: Some(format!(
+                "{}::{}::{}",
+                pending.source_revision, pending.operation_id.0, pending.staging_id
+            )),
+        };
+        let blocking_id = self.enqueue_blocking_work(
+            target.clone(),
+            super::SettingsBlockingEffectWork::ReadCategoryEditor {
+                staging_id: pending.staging_id,
+                directory_handle,
+                leaf,
+            },
         );
+        self.pending_settings.insert(
+            blocking_id,
+            super::PendingSettingsOperation::CategoryExternalRead {
+                target,
+                pointer_operation_id: operation_id,
+                staging_id: pending.staging_id,
+                outcome,
+                detail,
+            },
+        );
+        p.status = Some("reading private external-editor staging…".into());
     }
 
-    fn reduce_category_external_edit_result(
+    pub(super) fn apply_category_blocking_completion(
         &mut self,
         p: &mut CategoryPage,
-        operation_id: PointerOperationId,
-        action: super::pointer_actions::CategoryAction,
-        detail: Option<String>,
+        completion: super::SettingsBlockingEffectCompletion,
     ) {
-        let super::pointer_actions::CategoryAction::ExternalEditResult(setting, outcome) = action
-        else {
+        let Some(operation) = self.pending_settings.remove(&completion.operation_id) else {
             return;
         };
-        if !p
-            .pending_external_edit
-            .as_ref()
-            .is_some_and(|pending| pending.operation_id == operation_id && pending.id == setting)
-        {
-            return;
-        }
-        if p.pending_external_edit
-            .as_ref()
-            .map(|pending| pending.operation_id)
-            != Some(operation_id)
-            || !p.external_edit_ops.complete(operation_id)
-        {
-            return;
-        }
-        let Some(pending) = p.pending_external_edit.take() else {
-            return;
-        };
-        match outcome {
-            super::pointer_actions::ExternalEditOutcome::Cancelled => {
-                p.status = Some(detail.unwrap_or_else(|| "external edit cancelled".into()));
-                return;
-            }
-            super::pointer_actions::ExternalEditOutcome::Failed => {
-                let error = detail.unwrap_or_else(|| "external edit failed".into());
-                match pending.source {
-                    CategoryExternalSource::TextEditor => {
-                        if let Some(editor) = p.text_editor.as_mut() {
-                            editor.error = Some(error);
-                        } else {
-                            p.status = Some(error);
-                        }
+        match operation {
+            super::PendingSettingsOperation::CategoryExternalPrepare {
+                target,
+                pointer_operation_id,
+                staging_id,
+            } => {
+                let valid = completion.target == target
+                    && p.pending_external_edit.as_ref().is_some_and(|pending| {
+                        self.extended_revision.as_deref() == Some(pending.source_revision.as_str())
+                            || self.extended_revision.is_none()
+                                && pending.source_revision == "unloaded"
+                    });
+                let outcome = completion.outcome.and_then(|outcome| match outcome {
+                    super::SettingsBlockingOutcome::CategoryEditorPrepared {
+                        staging_id: returned,
+                        staging,
+                    } if returned == staging_id => Ok(staging),
+                    other => Err(format!("unexpected category staging result: {other:?}")),
+                });
+                let Some(pending) = p.pending_external_edit.as_mut().filter(|pending| {
+                    pending.operation_id == pointer_operation_id
+                        && pending.staging_id == staging_id
+                        && !pending.servicing
+                }) else {
+                    return;
+                };
+                match (valid, outcome) {
+                    (true, Ok(staging)) if staging.leaf().is_some() => {
+                        pending.staging = Some(staging);
+                        p.status = Some("opening $EDITOR…".into());
                     }
-                    CategoryExternalSource::PathEditor
-                    | CategoryExternalSource::Inline
-                    | CategoryExternalSource::Cursor => {
-                        p.status = Some(error);
+                    (_, result) => {
+                        let error = result
+                            .err()
+                            .unwrap_or_else(|| "category staging identity mismatch".into());
+                        let id = pending.id;
+                        let draft = pending.draft.clone();
+                        let source = pending.source;
+                        p.external_edit_ops.complete(pointer_operation_id);
+                        p.pending_external_edit = None;
+                        self.restore_category_external_edit(p, id, draft, source, error);
                     }
                 }
-                return;
             }
-            super::pointer_actions::ExternalEditOutcome::Saved => {}
+            super::PendingSettingsOperation::CategoryExternalRead {
+                target,
+                pointer_operation_id,
+                staging_id,
+                outcome: _,
+                detail,
+            } => {
+                let valid = completion.target == target
+                    && p.pending_external_edit.as_ref().is_some_and(|pending| {
+                        self.extended_revision.as_deref() == Some(pending.source_revision.as_str())
+                            || self.extended_revision.is_none()
+                                && pending.source_revision == "unloaded"
+                    });
+                let result = completion.outcome.and_then(|outcome| match outcome {
+                    super::SettingsBlockingOutcome::CategoryEditorRead {
+                        staging_id: returned,
+                        text,
+                    } if returned == staging_id => Ok(text),
+                    other => Err(format!("unexpected category staging read: {other:?}")),
+                });
+                let Some(pending) = p.pending_external_edit.take().filter(|pending| {
+                    pending.operation_id == pointer_operation_id
+                        && pending.staging_id == staging_id
+                        && pending.reading
+                }) else {
+                    return;
+                };
+                p.external_edit_ops.complete(pointer_operation_id);
+                let raw = match (valid, result) {
+                    (true, Ok(text)) => text,
+                    (_, result) => {
+                        self.restore_category_external_edit(
+                            p,
+                            pending.id,
+                            pending.draft,
+                            pending.source,
+                            result.err().unwrap_or_else(|| {
+                                "category staging read identity mismatch".into()
+                            }),
+                        );
+                        return;
+                    }
+                };
+                self.commit_category_external_text(p, pending, raw, detail);
+            }
+            other => {
+                self.pending_settings.insert(completion.operation_id, other);
+            }
         }
+    }
 
-        let raw = match std::fs::read_to_string(pending.path.as_ref() as &std::path::Path) {
-            Ok(text) => text,
-            Err(e) => {
-                p.status = Some(format!("editor: failed to read temp file back: {e}"));
-                return;
-            }
-        };
+    fn commit_category_external_text(
+        &mut self,
+        p: &mut CategoryPage,
+        pending: CategoryExternalEdit,
+        raw: String,
+        detail: Option<String>,
+    ) {
         let without_lf = raw.strip_suffix('\n').unwrap_or(&raw);
         let text = without_lf
             .strip_suffix('\r')
@@ -2444,16 +2616,25 @@ impl SettingsCx {
         if let Some(prompt) = p.shadowed_global.clone() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    p.status = Some(
-                        match remove_project_shadow_path(&prompt.project_config, prompt.path) {
-                            Ok(true) => format!(
-                                "saved; removed project override for {}",
-                                prompt.setting.descriptor().label
-                            ),
-                            Ok(false) => "saved; project override was already absent".to_string(),
-                            Err(e) => format!("saved; removing project override failed: {e}"),
-                        },
+                    let project_root = self
+                        .active_project_root
+                        .clone()
+                        .or_else(|| {
+                            prompt
+                                .project_config
+                                .parent()
+                                .and_then(std::path::Path::parent)
+                                .map(std::path::Path::to_path_buf)
+                        })
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let patch = project_shadow_remove_patch(prompt.path);
+                    self.queue_typed_document_edit(
+                        prompt.project_config.clone(),
+                        project_root,
+                        patch,
+                        super::TypedDocumentEditAction::RemoveProjectShadow(prompt),
                     );
+                    p.status = Some("saved; removing project override…".into());
                     p.shadowed_global = None;
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -2470,20 +2651,13 @@ impl SettingsCx {
             let cwd = self.agents_cwd();
             match key.code {
                 KeyCode::Char('g') if is_ctrl_g(key) => {
-                    match CategoryExternalEdit::new(
-                        p.external_edit_ops.begin(),
+                    if let Err(reason) = self.begin_category_external_edit(
+                        p,
                         editor.id,
                         editor.text(),
                         CategoryExternalSource::PathEditor,
                     ) {
-                        Ok(request) => {
-                            p.pending_external_edit = Some(request);
-                            p.status = Some("opening $EDITOR...".into());
-                        }
-                        Err(reason) => {
-                            p.external_edit_ops.cancel();
-                            p.status = Some(reason);
-                        }
+                        p.status = Some(reason);
                     }
                     p.path_editor = Some(editor);
                 }
@@ -2571,21 +2745,14 @@ impl SettingsCx {
                     p.status = None;
                 }
                 VimEditorOutcome::ExternalEdit => {
-                    match CategoryExternalEdit::new(
-                        p.external_edit_ops.begin(),
+                    match self.begin_category_external_edit(
+                        p,
                         editor.id,
                         editor.text(),
                         CategoryExternalSource::TextEditor,
                     ) {
-                        Ok(request) => {
-                            p.pending_external_edit = Some(request);
-                            p.status = Some("opening $EDITOR...".into());
-                            editor.error = None;
-                        }
-                        Err(reason) => {
-                            p.external_edit_ops.cancel();
-                            editor.error = Some(reason);
-                        }
+                        Ok(()) => editor.error = None,
+                        Err(reason) => editor.error = Some(reason),
                     }
                     p.text_editor = Some(editor);
                 }
@@ -2608,20 +2775,14 @@ impl SettingsCx {
                 // inline draft on invalid content, so do not apply the
                 // cursor-only long-text/path eligibility filter here.
                 KeyCode::Char('g') if is_ctrl_g(key) => {
-                    match CategoryExternalEdit::new(
-                        p.external_edit_ops.begin(),
+                    let seed = p.buf.text().to_string();
+                    if let Err(reason) = self.begin_category_external_edit(
+                        p,
                         id,
-                        p.buf.text(),
+                        &seed,
                         CategoryExternalSource::Inline,
                     ) {
-                        Ok(request) => {
-                            p.pending_external_edit = Some(request);
-                            p.status = Some("opening $EDITOR...".into());
-                        }
-                        Err(reason) => {
-                            p.external_edit_ops.cancel();
-                            p.status = Some(reason);
-                        }
+                        p.status = Some(reason);
                     }
                 }
                 KeyCode::Enter => {
@@ -2655,20 +2816,13 @@ impl SettingsCx {
                     && category_external_editable(id)
                 {
                     let seed = self.category_edit_seed(id);
-                    match CategoryExternalEdit::new(
-                        p.external_edit_ops.begin(),
+                    if let Err(reason) = self.begin_category_external_edit(
+                        p,
                         id,
                         &seed,
                         CategoryExternalSource::Cursor,
                     ) {
-                        Ok(request) => {
-                            p.pending_external_edit = Some(request);
-                            p.status = Some("opening $EDITOR...".into());
-                        }
-                        Err(reason) => {
-                            p.external_edit_ops.cancel();
-                            p.status = Some(reason);
-                        }
+                        p.status = Some(reason);
                     }
                 }
             }
@@ -3161,6 +3315,25 @@ impl SettingsCx {
                     p.status = Some("saved".into());
                 }
             }
+            Ok(super::SettingsSaveOutcome::Queued) => {
+                if id == SettingId::SandboxEscalationEnabled {
+                    self.queue_after_extended_commit(
+                        "sandbox escalation refresh",
+                        super::SettingsEffectTarget {
+                            surface: "settings.sandbox-escalation",
+                            owner: self.dialog_id.to_string(),
+                            revision: self.extended_revision.clone(),
+                        },
+                        cockpit_core::daemon::proto::Request::SetSandboxEscalation {
+                            enabled: self.extended.sandbox_escalation_enabled,
+                        },
+                    );
+                }
+                if let Some(prompt) = self.shadowed_global_prompt(id) {
+                    self.queue_project_shadow_snapshot(prompt);
+                }
+                p.status = Some("saving…".into());
+            }
             Ok(super::SettingsSaveOutcome::CommittedRefreshNeeded(warning)) => {
                 p.status = Some(format!("committed; refresh needed: {warning}"));
             }
@@ -3175,21 +3348,17 @@ impl SettingsCx {
         if self.config_path == project_config {
             return None;
         }
-        let (_, snapshot, _) =
-            super::extended_config_layer_snapshot(&project_config, Some(project_root)).ok()?;
-        let authored_paths: Vec<Vec<String>> =
-            serde_json::from_value(snapshot.get("__cockpit_settings_authored_paths")?.clone())
-                .ok()?;
-        if !authored_paths
+        let document = serde_json::to_value(&self.extended).ok()?;
+        let expected_effective_value = path
             .iter()
-            .any(|authored| authored.iter().map(String::as_str).eq(path.iter().copied()))
-        {
-            return None;
-        }
+            .try_fold(&document, |value, segment| value.get(*segment))?
+            .clone();
         Some(ShadowedGlobalPrompt {
             setting: id,
+            source_config: self.config_path.clone(),
             project_config,
             path,
+            expected_effective_value,
         })
     }
 
@@ -3499,24 +3668,15 @@ fn parse_min_usize(raw: &str, min: usize) -> Result<usize, String> {
     }
 }
 
-fn remove_project_shadow_path(
-    project_config: &std::path::Path,
-    path: &[&str],
-) -> Result<bool, String> {
+fn project_shadow_remove_patch(path: &[&str]) -> serde_json::Value {
     let Some((last, parents)) = path.split_last() else {
-        return Ok(false);
+        return serde_json::Value::Null;
     };
     let mut patch = serde_json::json!({ (*last): null });
     for parent in parents.iter().rev() {
         patch = serde_json::json!({ (*parent): patch });
     }
-    match super::apply_typed_settings_document_edit(project_config, None, patch)? {
-        super::SettingsPatchOutcome::Reconciled { .. } => {}
-        super::SettingsPatchOutcome::CommittedRefreshNeeded { warning, .. } => {
-            return Err(format!("committed; refresh needed: {warning}"));
-        }
-    }
-    Ok(true)
+    patch
 }
 
 fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {

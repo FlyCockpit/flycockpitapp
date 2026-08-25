@@ -20,6 +20,146 @@ fn schema_inventory(conn: &Connection) -> BTreeMap<String, BTreeSet<String>> {
     inventory
 }
 
+#[test]
+fn local_operation_receipts_have_fenced_terminal_settlement() {
+    let sql = include_str!("../src/db/migrations/0001_initial.sql");
+    for required in [
+        "fencing_generation  INTEGER NOT NULL",
+        "execution_expires_at_unix_ms INTEGER",
+        "'terminal_success', 'terminal_error', 'terminal_cancelled'",
+        "terminal_outcome_json TEXT",
+    ] {
+        assert!(
+            sql.contains(required),
+            "missing receipt invariant: {required}"
+        );
+    }
+    assert!(!sql.contains("state IN ('prepared', 'terminal')"));
+}
+
+#[test]
+fn provider_config_journal_actions_have_strict_payload_shapes() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))
+        .unwrap();
+
+    let insert = |provider_id: &str, action: &str, entry: Option<&str>| {
+        conn.execute(
+            "INSERT INTO provider_config_journals
+             (journal_id, project_root, provider_id, action, entry_json,
+              cleanup_named_json, cleanup_credential_json, created_at)
+             VALUES (lower(hex(randomblob(16))), '/project', ?1, ?2, ?3, '[]', '[]', 1)",
+            rusqlite::params![provider_id, action, entry],
+        )
+    };
+
+    assert!(insert("provider", "save", Some("{}")).is_ok());
+    assert!(insert("provider", "delete", None).is_ok());
+    assert!(insert("__provider_batch__", "batch", Some("{}")).is_ok());
+    assert!(insert("provider", "batch", Some("{}")).is_err());
+    assert!(insert("__provider_batch__", "save", Some("{}")).is_err());
+    assert!(insert("provider", "delete", Some("{}")).is_err());
+    assert!(insert("provider", "save", Some("not-json")).is_err());
+}
+
+#[test]
+fn authority_journals_bind_exact_fenced_terminal_receipts() {
+    let sql = include_str!("../src/db/migrations/0001_initial.sql");
+    for table in [
+        "provider_config_journals",
+        "mcp_config_journals",
+        "extended_config_patch_journals",
+        "image_config_mutation_journals",
+        "agent_mutation_journals",
+    ] {
+        let declaration = sql
+            .split(&format!("CREATE TABLE {table}"))
+            .nth(1)
+            .and_then(|tail| tail.split(");").next())
+            .unwrap_or_else(|| panic!("missing {table}"));
+        for field in [
+            "owner_digest",
+            "client_operation_id",
+            "request_hash",
+            "fencing_generation",
+            "terminal_response_json",
+        ] {
+            assert!(
+                declaration.contains(field),
+                "{table} must bind {field} for exact crash recovery"
+            );
+        }
+    }
+}
+
+#[test]
+fn assistant_mutation_recovery_is_keyed_identity_only_and_receipt_fenced() {
+    let sql = include_str!("../src/db/migrations/0001_initial.sql");
+    let declaration = sql
+        .split("CREATE TABLE assistant_mutation_journals")
+        .nth(1)
+        .and_then(|tail| tail.split(");").next())
+        .expect("assistant mutation journal must exist");
+    for field in [
+        "owner_digest",
+        "client_operation_id",
+        "request_hash",
+        "fencing_generation",
+        "mutation_intent_hash",
+        "requested_project_root",
+        "project_root",
+        "assistant_name",
+        "consumed_revision",
+        "intended_content_identity",
+    ] {
+        assert!(declaration.contains(field), "missing {field}");
+    }
+    assert!(
+        !declaration.contains("terminal_response_json"),
+        "assistant terminal outcomes belong only in the atomic local receipt"
+    );
+    for forbidden in ["markdown", "file_bytes", "secret"] {
+        assert!(
+            !declaration.contains(forbidden),
+            "assistant recovery must not persist {forbidden}"
+        );
+    }
+    let receipts = include_str!("../src/db/local_operation_receipts.rs");
+    assert!(receipts.contains("SELECT 1 FROM assistant_mutation_journals"));
+}
+
+#[test]
+fn agent_mutation_recovery_is_hash_only_and_blocks_blind_restart_rejection() {
+    let sql = include_str!("../src/db/migrations/0001_initial.sql");
+    let declaration = sql
+        .split("CREATE TABLE agent_mutation_journals")
+        .nth(1)
+        .and_then(|tail| tail.split(");").next())
+        .expect("agent mutation journal must exist");
+    for field in [
+        "owner_digest",
+        "client_operation_id",
+        "request_hash",
+        "keyed_request_identity",
+        "fencing_generation",
+        "consumed_revision",
+        "mutation_intent_hash",
+        "consumed_projection_identity",
+        "intended_projection_identity",
+        "terminal_response_json",
+    ] {
+        assert!(declaration.contains(field), "missing {field}");
+    }
+    for forbidden in ["markdown", "file_bytes", "payload_json"] {
+        assert!(
+            !declaration.contains(forbidden),
+            "agent recovery must not persist {forbidden}"
+        );
+    }
+    let receipts = include_str!("../src/db/local_operation_receipts.rs");
+    assert!(receipts.contains("SELECT 1 FROM agent_mutation_journals"));
+}
+
 #[derive(Debug)]
 struct Ownership {
     status: String,

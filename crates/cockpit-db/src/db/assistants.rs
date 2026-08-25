@@ -12,7 +12,7 @@ fn validate_content_hash(content_hash: &str) -> Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        anyhow::bail!("assistant content hash must be 64 lowercase hexadecimal characters");
+        anyhow::bail!("assistant content identity must be 64 lowercase hexadecimal characters");
     }
     Ok(())
 }

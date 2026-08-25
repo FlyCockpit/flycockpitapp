@@ -51,6 +51,7 @@ pub(super) struct ListState {
 
 pub(super) struct McpOAuthState {
     pub(super) server: String,
+    pub(super) begin_client_operation_id: String,
     pub(super) flow_id: String,
     pub(super) authorize_url: String,
     pub(super) callback: TextField,
@@ -328,46 +329,134 @@ impl SettingsCx {
         cfg: &McpConfig,
         secret_values: &BTreeMap<String, String>,
         cleanup_names: &BTreeSet<String>,
-    ) -> Result<(), String> {
+    ) -> Result<super::SettingsSaveOutcome, String> {
         let project_root = self
             .active_project_root
             .clone()
             .or_else(|| self.config_path.parent().map(std::path::Path::to_path_buf))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let canonical_root = super::canonical_project_root(&project_root);
+        let expected_owner_root = self
+            .mcp_owner_root
+            .clone()
+            .filter(|owner| owner == &canonical_root)
+            .ok_or_else(|| {
+                "MCP authority snapshot is missing or belongs to another workspace; reload settings"
+                    .to_string()
+            })?;
+        let expected_config_path = self.mcp_config_path.clone().ok_or_else(|| {
+            "MCP authority snapshot has no daemon-selected config path; reload settings".to_string()
+        })?;
+        let snapshot_capability = self.mcp_edit_capability.clone().ok_or_else(|| {
+            "MCP authority snapshot has no edit capability; reload settings".to_string()
+        })?;
+        let expected_consumed_revision = self.mcp_revision.clone().ok_or_else(|| {
+            "MCP authority snapshot has no target-layer revision; reload settings".to_string()
+        })?;
         let config_json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
+        use sha2::{Digest as _, Sha256};
+        let expected_result_revision =
+            super::hex_lower_for_authority(Sha256::digest(config_json.as_bytes()).as_slice());
         let secret_values_json = serde_json::to_string(secret_values).map_err(|e| e.to_string())?;
         let cleanup_names_json = serde_json::to_string(cleanup_names).map_err(|e| e.to_string())?;
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let client = crate::tui::settings::settings_daemon_client()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                match client
-                    .request(cockpit_core::daemon::proto::Request::SaveMcpConfig {
-                        project_root: project_root.display().to_string(),
-                        config_json,
-                        secret_values_json,
-                        cleanup_names_json,
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?
-                {
-                    Ok(cockpit_core::daemon::proto::Response::McpConfigSaved { .. }) => Ok(()),
-                    Ok(other) => Err(format!(
-                        "daemon returned unexpected MCP save response: {other:?}"
-                    )),
-                    Err(error) => Err(format!("daemon rejected MCP config save: {error}")),
+        let owner = project_root.display().to_string();
+        let expected_request_intent_hash = super::local_receipt_request_hash(&(
+            "save_mcp_config",
+            &owner,
+            &config_json,
+            &cleanup_names_json,
+        ))?;
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
+        self.queue_simple_secret_mutation(
+            super::SettingsEffectTarget {
+                surface: "settings.mcp-save",
+                owner: owner.clone(),
+                revision: Some(client_operation_id.clone()),
+            },
+            super::SettingsDaemonEffectWork::McpConfigSave {
+                client_operation_id: client_operation_id.clone(),
+                project_root: owner.clone(),
+                snapshot_capability: snapshot_capability.clone(),
+                owner_root: expected_owner_root.clone(),
+                config_path: expected_config_path.clone(),
+                expected_revision: expected_consumed_revision.clone(),
+                mutation_intent_hash: expected_request_intent_hash.clone(),
+                config_json,
+                secret_values_json: super::SecretPayload::new(secret_values_json),
+                cleanup_names_json,
+            },
+            super::SettingsMutationAction::McpSave {
+                config: cfg.clone(),
+                client_operation_id,
+                project_root: owner,
+                expected_owner_root,
+                expected_config_path,
+                snapshot_capability,
+                expected_consumed_revision,
+                expected_result_revision,
+                expected_request_intent_hash,
+            },
+        );
+        self.extended_warnings = vec!["saving MCP settings…".into()];
+        Ok(super::SettingsSaveOutcome::Queued)
+    }
+
+    pub(super) fn adopt_pending_mcp_oauth(&mut self, s: &mut ListState) {
+        if let Some(completion) = self.pending_mcp_oauth.take() {
+            match completion {
+                super::PendingMcpOAuth::Started {
+                    server,
+                    begin_client_operation_id,
+                    flow_id,
+                    authorize_url,
+                } => {
+                    s.oauth = Some(McpOAuthState {
+                        server,
+                        begin_client_operation_id,
+                        flow_id,
+                        authorize_url,
+                        callback: TextField::default(),
+                        status: None,
+                    });
+                    s.status = Some(
+                        "open the authorize URL, then paste the callback or code below".into(),
+                    );
                 }
-            })
-        });
-        if result.is_ok() {
-            self.invalidate_secret_inventory();
-            self.mcp_config = cfg.clone();
+                super::PendingMcpOAuth::Completed { server, flow_id } => {
+                    if s.oauth
+                        .as_ref()
+                        .is_some_and(|flow| flow.server == server && flow.flow_id == flow_id)
+                    {
+                        s.oauth = None;
+                    }
+                    s.status = Some(format!("authenticated `{server}`"));
+                }
+                super::PendingMcpOAuth::Cancelled { server, flow_id } => {
+                    if s.oauth
+                        .as_ref()
+                        .is_some_and(|flow| flow.server == server && flow.flow_id == flow_id)
+                    {
+                        s.oauth = None;
+                    }
+                    s.status = Some(format!("cancelled MCP OAuth for `{server}`"));
+                }
+                super::PendingMcpOAuth::AlreadyTerminal { server, flow_id } => {
+                    if s.oauth
+                        .as_ref()
+                        .is_some_and(|flow| flow.server == server && flow.flow_id == flow_id)
+                    {
+                        s.oauth = None;
+                    }
+                    s.status = Some(format!(
+                        "MCP OAuth for `{server}` was already terminal; credential inventory refreshed"
+                    ));
+                }
+            }
         }
-        result
     }
 
     fn handle_mcp_list_key(&mut self, key: KeyEvent, s: &mut ListState) -> Nav {
+        self.adopt_pending_mcp_oauth(s);
         let cfg = self.load_mcp();
         let names: Vec<String> = cfg.servers.keys().cloned().collect();
         let row_count = names.len() + 1; // + [+ add server]
@@ -376,24 +465,40 @@ impl SettingsCx {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     let flow_id = flow.flow_id.clone();
-                    let result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            let client = crate::tui::settings::settings_daemon_client().await?;
-                            client
-                                .request(cockpit_core::daemon::proto::Request::CancelMcpOAuth {
-                                    flow_id,
-                                })
-                                .await?
-                                .map_err(|error| anyhow::anyhow!(error))
-                        })
-                    });
-                    s.status = Some(match result {
-                        Ok(cockpit_core::daemon::proto::Response::McpOAuthCancelled {
-                            cancelled: true,
-                        }) => format!("cancelled MCP OAuth for `{}`", flow.server),
-                        Ok(_) => "MCP OAuth cancelled".into(),
-                        Err(error) => format!("OAuth cancellation failed: {error}"),
-                    });
+                    let client_operation_id = uuid::Uuid::new_v4().to_string();
+                    let expected_request_hash = match super::local_receipt_request_hash(&(
+                        "cancel_mcp_oauth",
+                        &flow.begin_client_operation_id,
+                        &Some(flow_id.clone()),
+                    )) {
+                        Ok(hash) => hash,
+                        Err(error) => {
+                            flow.status =
+                                Some(format!("could not bind OAuth cancellation: {error}"));
+                            s.oauth = Some(flow);
+                            return Nav::Stay;
+                        }
+                    };
+                    self.queue_simple_mutation(
+                        super::SettingsEffectTarget {
+                            surface: "settings.mcp-oauth-cancel",
+                            owner: flow.server.clone(),
+                            revision: Some(flow_id.clone()),
+                        },
+                        cockpit_core::daemon::proto::Request::CancelMcpOAuth {
+                            client_operation_id: client_operation_id.clone(),
+                            begin_client_operation_id: flow.begin_client_operation_id.clone(),
+                            flow_id: Some(flow_id.clone()),
+                        },
+                        super::SettingsMutationAction::McpOAuthCancel {
+                            server: flow.server.clone(),
+                            flow_id,
+                            client_operation_id,
+                            expected_request_hash,
+                        },
+                    );
+                    s.oauth = Some(flow);
+                    s.status = Some("cancelling MCP OAuth…".into());
                 }
                 KeyCode::Enter => {
                     let input = flow.callback.text().trim().to_string();
@@ -405,28 +510,39 @@ impl SettingsCx {
                         return Nav::Stay;
                     }
                     let flow_id = flow.flow_id.clone();
-                    let result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            let client = crate::tui::settings::settings_daemon_client().await?;
-                            client
-                                .request(cockpit_core::daemon::proto::Request::CompleteMcpOAuth {
-                                    flow_id,
-                                    input: Some(input),
-                                })
-                                .await?
-                                .map_err(|error| anyhow::anyhow!(error))
-                        })
-                    });
-                    s.status = Some(match result {
-                        Ok(cockpit_core::daemon::proto::Response::McpOAuthCompleted {
-                            authenticated: true,
-                        }) => {
-                            self.invalidate_secret_inventory();
-                            format!("authenticated `{}`", flow.server)
+                    let client_operation_id = uuid::Uuid::new_v4().to_string();
+                    let expected_request_hash = match super::local_receipt_request_hash(&(
+                        "complete_mcp_oauth_receipt_v2",
+                        &client_operation_id,
+                        &flow_id,
+                    )) {
+                        Ok(hash) => hash,
+                        Err(error) => {
+                            flow.status = Some(format!("could not bind OAuth completion: {error}"));
+                            s.oauth = Some(flow);
+                            return Nav::Stay;
                         }
-                        Ok(other) => format!("unexpected MCP OAuth response: {other:?}"),
-                        Err(error) => format!("auth failed: {error}"),
-                    });
+                    };
+                    self.queue_simple_secret_mutation(
+                        super::SettingsEffectTarget {
+                            surface: "settings.mcp-oauth-complete",
+                            owner: flow.server.clone(),
+                            revision: Some(flow_id.clone()),
+                        },
+                        super::SettingsDaemonEffectWork::McpOAuthComplete {
+                            client_operation_id: client_operation_id.clone(),
+                            flow_id: flow_id.clone(),
+                            input: super::SecretPayload::new(input),
+                        },
+                        super::SettingsMutationAction::McpOAuthComplete {
+                            server: flow.server.clone(),
+                            flow_id,
+                            client_operation_id,
+                            expected_request_hash,
+                        },
+                    );
+                    flow.status = Some("completing authentication…".into());
+                    s.oauth = Some(flow);
                 }
                 _ => {
                     flow.callback.handle_key(key);
@@ -480,49 +596,42 @@ impl SettingsCx {
                 {
                     if matches!(server.auth, Auth::Oauth(_)) {
                         let name = name.clone();
+                        let client_operation_id = uuid::Uuid::new_v4().to_string();
                         let project_root = self
                             .active_project_root
                             .clone()
                             .or_else(|| std::env::current_dir().ok())
                             .unwrap_or_else(|| std::path::PathBuf::from("."));
-                        let res = tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                let client = crate::tui::settings::settings_daemon_client().await?;
-                                let started = client
-                                    .request(cockpit_core::daemon::proto::Request::BeginMcpOAuth {
-                                        project_root: project_root.display().to_string(),
-                                        server: name.clone(),
-                                    })
-                                    .await?
-                                    .map_err(|error| anyhow::anyhow!(error))?;
-                                let cockpit_core::daemon::proto::Response::McpOAuthStarted {
-                                    flow_id,
-                                    authorize_url,
-                                } = started
-                                else {
-                                    anyhow::bail!(
-                                        "daemon returned unexpected MCP OAuth start response"
-                                    );
-                                };
-                                Ok((flow_id, authorize_url))
-                            })
-                        });
-                        match res {
-                            Ok((flow_id, authorize_url)) => {
-                                s.oauth = Some(McpOAuthState {
-                                    server: name,
-                                    flow_id,
-                                    authorize_url,
-                                    callback: TextField::default(),
-                                    status: None,
-                                });
-                                s.status = Some(
-                                    "open the authorize URL, then paste the callback or code below"
-                                        .into(),
-                                );
+                        let project_root = super::canonical_project_root(&project_root);
+                        let expected_request_hash = match super::local_receipt_request_hash(&(
+                            "begin_mcp_oauth",
+                            &project_root,
+                            &name,
+                        )) {
+                            Ok(hash) => hash,
+                            Err(error) => {
+                                s.status = Some(format!("could not bind OAuth start: {error}"));
+                                return Nav::Stay;
                             }
-                            Err(e) => s.status = Some(format!("auth failed: {e}")),
-                        }
+                        };
+                        self.queue_simple_mutation(
+                            super::SettingsEffectTarget {
+                                surface: "settings.mcp-oauth-begin",
+                                owner: name.clone(),
+                                revision: None,
+                            },
+                            cockpit_core::daemon::proto::Request::BeginMcpOAuth {
+                                client_operation_id: client_operation_id.clone(),
+                                project_root,
+                                server: name.clone(),
+                            },
+                            super::SettingsMutationAction::McpOAuthBegin {
+                                server: name,
+                                client_operation_id,
+                                expected_request_hash,
+                            },
+                        );
+                        s.status = Some("starting MCP OAuth…".into());
                     } else {
                         s.status = Some("server uses no OAuth — nothing to authenticate".into());
                     }
@@ -640,16 +749,11 @@ impl SettingsCx {
             .cloned()
             .collect::<BTreeSet<_>>();
         match self.save_mcp(&cfg, &secret_values, &stale_refs) {
-            Ok(()) => Nav::Replace(super::mcp_page(McpPage::List(ListState {
-                cursor: 0,
-                status: Some(if s.original_name.is_some() {
-                    format!("saved `{name}`")
-                } else {
-                    format!("added `{name}`")
-                }),
-                delete_pending: false,
-                oauth: None,
-            }))),
+            Ok(_) => {
+                self.pending_mcp_navigation = Some((name, s.original_name.is_some()));
+                s.status = Some("saving MCP server…".into());
+                Nav::Stay
+            }
             Err(e) => {
                 s.status = Some(format!("save failed: {e}"));
                 Nav::Stay
@@ -1640,10 +1744,16 @@ mod tests {
     fn mcp_secret_custody_stays_daemon_owned() {
         let source = include_str!("mcp_page.rs");
         let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-        assert!(production.contains("Request::SaveMcpConfig"));
+        assert!(production.contains("SettingsDaemonEffectWork::McpConfigSave"));
+        assert!(production.contains("SecretPayload::new(secret_values_json)"));
+        assert!(!production.contains("Request::SaveMcpConfig"));
         assert!(production.contains("self.mcp_config.clone()"));
         assert!(!production.contains("read_to_string"));
-        assert!(production.contains("Response::McpConfigSaved"));
+        assert!(production.contains("Response::McpConfigCommitted"));
+        assert!(production.contains("self.mcp_owner_root"));
+        assert!(production.contains("self.mcp_config_path"));
+        assert!(production.contains("self.mcp_revision"));
+        assert!(!production.contains("serde_json::to_string(&self.config)"));
         assert!(!production.contains("Response::Ack"));
         assert!(!production.contains("write_private"));
         assert!(!production.contains("CredentialStore"));

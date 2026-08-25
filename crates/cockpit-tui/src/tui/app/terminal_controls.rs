@@ -17,7 +17,17 @@ impl App {
         );
         self.ctrl_c_armed_at = new_armed;
         match action {
-            CtrlCAction::Exit => true,
+            CtrlCAction::Exit => {
+                if self.pending_mcp_local.is_some() {
+                    self.push_plain(
+                        "/mcp: exit is fenced until the pending mutation reaches a verified terminal state."
+                            .to_string(),
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
             CtrlCAction::ArmAndInterrupt => {
                 self.interrupt_agent();
                 self.end_working_span();

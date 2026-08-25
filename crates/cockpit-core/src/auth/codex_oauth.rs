@@ -9,6 +9,7 @@ use reqwest::StatusCode;
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use zeroize::Zeroize;
 
 use crate::credentials::CredentialStore;
 
@@ -28,7 +29,9 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OAUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// Clone is intentionally retained for the generic refresh guard, which keeps
+// the previous token set alive until a replacement has been validated.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredTokens {
     pub access_token: String,
     pub refresh_token: String,
@@ -39,18 +42,63 @@ pub struct StoredTokens {
     pub expires_at: i64,
 }
 
+impl std::fmt::Debug for StoredTokens {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredTokens")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("id_token", &self.id_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "account_id",
+                &self.account_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl Drop for StoredTokens {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+        self.id_token.zeroize();
+        self.account_id.zeroize();
+    }
+}
+
 impl StoredTokens {
     fn needs_refresh(&self, now: i64) -> bool {
         self.expires_at.saturating_sub(now) <= REFRESH_SKEW_SECS
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceLogin {
     pub verification_uri: String,
     pub user_code: String,
     device_auth_id: String,
     interval_secs: u64,
+}
+
+impl std::fmt::Debug for DeviceLogin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceLogin")
+            .field("verification_uri", &self.verification_uri)
+            .field("user_code", &"[REDACTED]")
+            .field("device_auth_id", &"[REDACTED]")
+            .field("interval_secs", &self.interval_secs)
+            .finish()
+    }
+}
+
+impl Drop for DeviceLogin {
+    fn drop(&mut self) {
+        self.verification_uri.zeroize();
+        self.user_code.zeroize();
+        self.device_auth_id.zeroize();
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -65,7 +113,7 @@ impl DeviceLogin {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct DeviceCodeResponse {
     #[serde(alias = "usercode")]
     user_code: String,
@@ -74,7 +122,14 @@ struct DeviceCodeResponse {
     interval: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+impl Drop for DeviceCodeResponse {
+    fn drop(&mut self) {
+        self.user_code.zeroize();
+        self.device_auth_id.zeroize();
+    }
+}
+
+#[derive(Deserialize)]
 struct DeviceTokenResponse {
     authorization_code: String,
     code_verifier: String,
@@ -82,7 +137,21 @@ struct DeviceTokenResponse {
     code_challenge: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Serialize)]
+struct DevicePollRequest<'a> {
+    device_auth_id: &'a str,
+    user_code: &'a str,
+}
+
+impl Drop for DeviceTokenResponse {
+    fn drop(&mut self) {
+        self.authorization_code.zeroize();
+        self.code_verifier.zeroize();
+        self.code_challenge.zeroize();
+    }
+}
+
+#[derive(Deserialize)]
 struct TokenResponse {
     #[serde(default)]
     access_token: Option<String>,
@@ -92,6 +161,14 @@ struct TokenResponse {
     id_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
+}
+
+impl Drop for TokenResponse {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+        self.id_token.zeroize();
+    }
 }
 
 #[allow(dead_code)]
@@ -107,18 +184,20 @@ pub async fn run_device_code_login() -> Result<StoredTokens> {
 }
 
 pub async fn begin_device_code_login() -> Result<DeviceLogin> {
-    let body = oauth_http_client()?
-        .post(DEVICE_CODE_URL)
-        .json(&json!({ "client_id": CLIENT_ID }))
-        .send()
-        .await
-        .context("requesting OpenAI Codex device code")?
-        .error_for_status()
-        .context("OpenAI Codex device-code request failed")?
-        .text()
-        .await
-        .context("reading OpenAI Codex device-code response")?;
-    let resp: DeviceCodeResponse = serde_json::from_str(&body).with_context(|| {
+    let body = zeroize::Zeroizing::new(
+        oauth_http_client()?
+            .post(DEVICE_CODE_URL)
+            .json(&json!({ "client_id": CLIENT_ID }))
+            .send()
+            .await
+            .context("requesting OpenAI Codex device code")?
+            .error_for_status()
+            .context("OpenAI Codex device-code request failed")?
+            .text()
+            .await
+            .context("reading OpenAI Codex device-code response")?,
+    );
+    let mut resp: DeviceCodeResponse = serde_json::from_str(&body).with_context(|| {
         format!(
             "parsing OpenAI Codex device-code response: {}",
             response_shape_hint(&body)
@@ -126,8 +205,8 @@ pub async fn begin_device_code_login() -> Result<DeviceLogin> {
     })?;
     Ok(DeviceLogin {
         verification_uri: VERIFY_URL.to_string(),
-        user_code: resp.user_code,
-        device_auth_id: resp.device_auth_id,
+        user_code: std::mem::take(&mut resp.user_code),
+        device_auth_id: std::mem::take(&mut resp.device_auth_id),
         interval_secs: resp
             .interval
             .unwrap_or(DEFAULT_POLL_INTERVAL_SECS)
@@ -173,17 +252,22 @@ async fn complete_device_code_login_tokens(login: DeviceLogin) -> Result<StoredT
         if started.elapsed() > Duration::from_secs(MAX_POLL_SECS) {
             anyhow::bail!("OpenAI Codex device-code login timed out; try again");
         }
+        let request_body = zeroize::Zeroizing::new(
+            serde_json::to_vec(&DevicePollRequest {
+                device_auth_id: &login.device_auth_id,
+                user_code: &login.user_code,
+            })
+            .context("encoding Codex device approval poll")?,
+        );
         let resp = oauth_http_client()?
             .post(DEVICE_TOKEN_URL)
-            .json(&json!({
-                "device_auth_id": login.device_auth_id,
-                "user_code": login.user_code,
-            }))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(request_body.as_slice().to_vec())
             .send()
             .await
             .context("polling OpenAI Codex device-code approval")?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = zeroize::Zeroizing::new(resp.text().await.unwrap_or_default());
         if status.is_success() {
             let approved: DeviceTokenResponse =
                 serde_json::from_str(&body).context("parsing Codex device approval response")?;
@@ -303,40 +387,40 @@ async fn token_request(
     params: &[(&str, &str)],
     previous: Option<&StoredTokens>,
 ) -> Result<StoredTokens> {
+    let request_body = zeroize::Zeroizing::new(form_body(params));
     let resp = oauth_http_client()?
         .post(TOKEN_URL)
         .header(
             reqwest::header::CONTENT_TYPE,
             "application/x-www-form-urlencoded",
         )
-        .body(form_body(params))
+        // reqwest must own its transport buffer; retain no additional
+        // ordinary String copy in this layer.
+        .body(request_body.as_bytes().to_vec())
         .send()
         .await
         .context("POST OpenAI Codex OAuth token endpoint")?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = zeroize::Zeroizing::new(resp.text().await.unwrap_or_default());
     if !status.is_success() {
         return Err(classify_token_error(status, &body));
     }
-    let parsed: TokenResponse = serde_json::from_str(&body).with_context(|| {
+    let mut parsed: TokenResponse = serde_json::from_str(&body).with_context(|| {
         format!(
             "parsing Codex OAuth token response: {}",
             response_shape_hint(&body)
         )
     })?;
-    let access_token = parsed
-        .access_token
+    let access_token = std::mem::take(&mut parsed.access_token)
         .or_else(|| previous.map(|tokens| tokens.access_token.clone()))
         .ok_or_else(|| anyhow!("Codex OAuth token response missing access_token"))?;
-    let refresh_token = parsed
-        .refresh_token
+    let refresh_token = std::mem::take(&mut parsed.refresh_token)
         .or_else(|| previous.map(|tokens| tokens.refresh_token.clone()))
         .ok_or_else(|| anyhow!("Codex OAuth token response missing refresh_token"))?;
     let expires_at = jwt_exp(&access_token)
         .or(parsed.expires_in.map(|secs| unix_now() + secs))
         .unwrap_or_else(|| unix_now() + DEFAULT_EXPIRES_IN_SECS);
-    let id_token = parsed
-        .id_token
+    let id_token = std::mem::take(&mut parsed.id_token)
         .or_else(|| previous.and_then(|tokens| tokens.id_token.clone()));
     let account_id = id_token
         .as_deref()
@@ -369,12 +453,14 @@ fn oauth_timeout_config() -> (Duration, Duration) {
     (OAUTH_CONNECT_TIMEOUT, OAUTH_TOTAL_TIMEOUT)
 }
 
-fn merge_refresh_tokens(previous: &StoredTokens, fresh: StoredTokens) -> StoredTokens {
-    StoredTokens {
-        id_token: fresh.id_token.or_else(|| previous.id_token.clone()),
-        account_id: fresh.account_id.or_else(|| previous.account_id.clone()),
-        ..fresh
+fn merge_refresh_tokens(previous: &StoredTokens, mut fresh: StoredTokens) -> StoredTokens {
+    if fresh.id_token.is_none() {
+        fresh.id_token = previous.id_token.clone();
     }
+    if fresh.account_id.is_none() {
+        fresh.account_id = previous.account_id.clone();
+    }
+    fresh
 }
 
 impl StoredTokens {

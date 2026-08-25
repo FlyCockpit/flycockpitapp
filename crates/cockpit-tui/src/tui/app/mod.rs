@@ -50,7 +50,7 @@ mod scrollback_page_in;
 mod session_services;
 mod side_conversation;
 mod skills_pane_actions;
-mod slash;
+pub(super) mod slash;
 mod startup_layout;
 mod subagent_view;
 mod terminal_controls;
@@ -375,6 +375,58 @@ pub(crate) struct DeliveryUnconfirmedRecord {
     pub probe_exhausted: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum McpLocalIntent {
+    List,
+    SetEnabled {
+        server_id: Option<String>,
+        enabled: Option<bool>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum McpLocalPhase {
+    Snapshot {
+        snapshot_session_id: String,
+    },
+    Save,
+    Settlement,
+    Refresh {
+        snapshot_session_id: String,
+        result_revision: String,
+        config_generation: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct McpLocalCompletion {
+    pub operation_id: uuid::Uuid,
+    pub project_root: String,
+    pub intent: McpLocalIntent,
+    pub phase: McpLocalPhase,
+    pub response: Result<cockpit_core::daemon::proto::Response, String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingMcpLocal {
+    pub action_id: crate::tui::async_action::AsyncActionId,
+    pub operation_id: uuid::Uuid,
+    pub project_root: String,
+    pub intent: McpLocalIntent,
+    pub phase: McpLocalPhase,
+    pub config: Option<cockpit_core::mcp::config::McpConfig>,
+    pub mutation_intent_hash: Option<String>,
+    pub authority: Option<McpLocalAuthority>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct McpLocalAuthority {
+    pub snapshot_capability: String,
+    pub owner_root: String,
+    pub config_path: String,
+    pub revision: String,
+}
+
 pub(crate) struct ModelSelectionRetry {
     /// Durable session attachment that owns this retry. Retry payloads are
     /// never transferable between conversations, even while another session
@@ -662,48 +714,177 @@ impl App {
                 cockpit_core::daemon::proto::WorkspaceTrustMode::Untrusted
             }
         };
+        if self.pending_workspace_trust.is_some() {
+            self.show_toast("workspace trust save is already pending", ToastKind::Info);
+            return false;
+        }
         let project_root = root.root.to_string_lossy().into_owned();
-        let config_generation = match set_workspace_trust_with_retry(
-            &project_root,
+        let operation_id = uuid::Uuid::new_v4();
+        let expected_generation = self.config_snapshot.generation;
+        self.pending_workspace_trust = Some(PendingWorkspaceTrust {
+            operation_id,
+            root,
+            mode,
             rpc_mode,
-            self.config_snapshot.generation,
-            crate::tui::agent_runner::daemon_request_blocking_classified,
-        ) {
+            project_root: project_root.clone(),
+            expected_generation,
+        });
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("workspace-trust.effect"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("workspace-trust.effect")),
+            async move {
+                let result =
+                    set_workspace_trust_async(&project_root, rpc_mode, expected_generation).await;
+                Ok(AsyncActionPayload::WorkspaceTrust(
+                    WorkspaceTrustCompletion {
+                        operation_id,
+                        project_root,
+                        mode: rpc_mode,
+                        expected_generation,
+                        result,
+                    },
+                ))
+            },
+        );
+        self.show_toast("saving workspace trust…", ToastKind::Info);
+        false
+    }
+
+    fn apply_workspace_trust_completion(&mut self, completion: WorkspaceTrustCompletion) {
+        let Some(pending) = self.pending_workspace_trust.take() else {
+            return;
+        };
+        if completion.operation_id != pending.operation_id
+            || completion.project_root != pending.project_root
+            || completion.mode != pending.rpc_mode
+            || completion.expected_generation != pending.expected_generation
+        {
+            self.pending_workspace_trust = Some(pending);
+            return;
+        }
+        let config_generation = match completion.result {
             Ok(generation) => generation,
             Err(error) => {
                 self.show_toast(
                     format!("workspace trust could not be saved: {error}"),
                     ToastKind::Error,
                 );
-                return false;
+                return;
             }
         };
-        self.config_snapshot.generation = config_generation;
+        if config_generation <= pending.expected_generation {
+            self.show_toast(
+                "workspace trust receipt did not advance config generation",
+                ToastKind::Error,
+            );
+            return;
+        }
+        self.config_snapshot.generation = self.config_snapshot.generation.max(config_generation);
         self.config_snapshot
             .providers
-            .set_resolution_generation(config_generation);
-        if mode == cockpit_config::WorkspaceTrustMode::Untrusted {
+            .set_resolution_generation(self.config_snapshot.generation);
+        if pending.mode == cockpit_config::WorkspaceTrustMode::Untrusted {
             self.push_plain(format!(
                 "workspace {} is untrusted and cannot be opened",
-                root.root.display()
+                pending.root.root.display()
             ));
-            return true;
+            self.exit_requested = true;
+            return;
         }
-        if let Err(error) = cockpit_config::trust::apply_trusted_workspace(root, mode) {
+        if let Err(error) =
+            cockpit_config::trust::apply_trusted_workspace(pending.root, pending.mode)
+        {
             self.show_toast(format!("workspace trust failed: {error}"), ToastKind::Error);
-            return false;
+            return;
         }
-        if mode == cockpit_config::WorkspaceTrustMode::Trust {
+        if pending.mode == cockpit_config::WorkspaceTrustMode::Trust {
             self.resync_config_after_local_write();
         }
         self.dialog = Dialog::None;
         if self.daemon_prompt.is_none() {
             self.maybe_open_add_provider_wizard();
         }
-        false
     }
 }
 
+#[derive(Debug)]
+struct PendingWorkspaceTrust {
+    operation_id: uuid::Uuid,
+    root: cockpit_config::trust::TrustRoot,
+    mode: cockpit_config::WorkspaceTrustMode,
+    rpc_mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    project_root: String,
+    expected_generation: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct WorkspaceTrustCompletion {
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) project_root: String,
+    pub(crate) mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    pub(crate) expected_generation: u64,
+    pub(crate) result: Result<u64, String>,
+}
+
+async fn set_workspace_trust_async(
+    project_root: &str,
+    mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    mut expected_generation: u64,
+) -> Result<u64, String> {
+    let client = crate::tui::settings::settings_daemon_client()
+        .await
+        .map_err(|error| error.to_string())?;
+    for attempt in 0..=1 {
+        let response = client
+            .request(cockpit_core::daemon::proto::Request::SetWorkspaceTrust {
+                project_root: project_root.to_string(),
+                mode,
+                expected_config_generation: expected_generation,
+            })
+            .await
+            .map_err(|error| format!("daemon request: {error}"))?;
+        match response {
+            Ok(cockpit_core::daemon::proto::Response::WorkspaceTrustSet { config_generation })
+                if config_generation > expected_generation =>
+            {
+                return Ok(config_generation);
+            }
+            Ok(cockpit_core::daemon::proto::Response::WorkspaceTrustSet { .. }) => {
+                return Err("daemon returned a non-advancing workspace trust generation".into());
+            }
+            Ok(other) => return Err(format!("unexpected workspace trust response: {other:?}")),
+            Err(error)
+                if error.code == cockpit_core::daemon::proto::ErrorCode::Conflict
+                    && attempt == 0 =>
+            {
+                expected_generation = match client
+                    .request(
+                        cockpit_core::daemon::proto::Request::GetStartupDisclosures {
+                            project_root: project_root.to_string(),
+                        },
+                    )
+                    .await
+                    .map_err(|error| format!("daemon request: {error}"))?
+                {
+                    Ok(cockpit_core::daemon::proto::Response::StartupDisclosures {
+                        config_generation,
+                        ..
+                    }) => config_generation,
+                    Ok(other) => {
+                        return Err(format!(
+                            "unexpected config generation refresh response: {other:?}"
+                        ));
+                    }
+                    Err(error) => return Err(format!("daemon request: {error}")),
+                };
+            }
+            Err(error) => return Err(format!("daemon request: {error}")),
+        }
+    }
+    unreachable!("the retry loop returns after its second attempt")
+}
+
+#[cfg(test)]
 fn set_workspace_trust_with_retry(
     project_root: &str,
     mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
@@ -752,6 +933,7 @@ fn set_workspace_trust_with_retry(
     unreachable!("the retry loop returns after its second attempt")
 }
 
+#[cfg(test)]
 fn blocking_request_error(error: crate::tui::agent_runner::BlockingDaemonRequestError) -> String {
     match error {
         crate::tui::agent_runner::BlockingDaemonRequestError::Conflict(message) => {
@@ -1386,6 +1568,31 @@ pub(super) struct RetainedPreDispatchSubmission {
     pub pending: PendingSessionSwitchSubmission,
 }
 
+#[derive(Debug, Clone)]
+pub(super) enum RunnerAttachContinuation {
+    RetryRetainedSubmissions,
+    SelectModel {
+        label: String,
+        active: cockpit_config::providers::ActiveModelRef,
+        persist_as_default: bool,
+        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+    },
+    BtwCommand(String),
+    Compact,
+}
+
+#[derive(Debug)]
+pub(super) struct PendingRunnerAttach {
+    action_id: crate::tui::async_action::AsyncActionId,
+    generation: u64,
+    cwd: PathBuf,
+    requested_session_id: Option<uuid::Uuid>,
+    model_state_generation: u64,
+    config_generation: u64,
+    latch_error: bool,
+    continuations: Vec<RunnerAttachContinuation>,
+}
+
 pub(super) struct RetainedSessionSwitchSubmissions {
     /// `None` is possible only for synthetic/tests that stage without first
     /// claiming a switch. Production entries are always target-bound.
@@ -1724,6 +1931,13 @@ pub struct App {
     pub(super) launch: LaunchInfo,
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
+    pending_workspace_trust: Option<PendingWorkspaceTrust>,
+    pending_sealed_operations: HashMap<uuid::Uuid, slash::PendingSealedOperation>,
+    /// Originating attached binding for every minted, still-live sealed
+    /// capability. Session/epoch replacement must not redirect settlement to
+    /// a newer runner.
+    sealed_capability_bindings: HashMap<String, crate::tui::agent_runner::AttachedRequestBinding>,
+    exit_requested: bool,
     pub(super) active_model_state_generation: u64,
     /// Security disclosures must be fetched from the daemon before a session
     /// attachment can be created. Failures leave this false and user actions
@@ -1940,11 +2154,27 @@ pub struct App {
     /// `Result<AgentRunner, String>` so a failed init keeps the error
     /// around for next-time visibility.
     pub(super) agent_runner: Option<Result<AgentRunner, String>>,
+    pub(super) pending_runner_attach: Option<PendingRunnerAttach>,
+    pub(super) next_runner_attach_generation: u64,
+    pub(super) pending_leak_reveal: Option<overlay_actions::PendingLeakReveal>,
     display_attach_backoff: DisplayAttachBackoff,
     /// Shared client-side runner for TUI background actions. Daemon RPCs and
     /// blocking filesystem/subprocess probes can complete through this tick
     /// drain instead of freezing the event loop.
     pub(super) async_actions: AsyncActionRunner,
+    /// Exact owner and phase of the one active `/mcp` local command. A newer
+    /// command supersedes the old action; late or cancelled results cannot
+    /// mutate the cached projection or print a success line.
+    pub(super) pending_mcp_local: Option<PendingMcpLocal>,
+    /// Last daemon-published owner view. Slash-menu descriptions are purely
+    /// presentational and must never synchronously fetch it during rendering.
+    pub(super) mcp_local_snapshot: Option<cockpit_core::mcp::config::McpConfig>,
+    /// Correlation metadata retained outside blocking workers so runner-level
+    /// timeout/cancellation can still settle the exact settings operation.
+    pub(super) settings_blocking_actions: std::collections::HashMap<
+        crate::tui::async_action::AsyncActionId,
+        crate::tui::settings::SettingsBlockingEffectMetadata,
+    >,
     // Declared after `async_actions`: Rust drops fields in declaration order,
     // so every export owner is released before the process reaper drains.
     pub(super) _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard,
@@ -3370,6 +3600,10 @@ impl App {
             paste_client_instance_id: uuid::Uuid::new_v4(),
             launch,
             config_snapshot,
+            pending_workspace_trust: None,
+            pending_sealed_operations: HashMap::new(),
+            sealed_capability_bindings: HashMap::new(),
+            exit_requested: false,
             active_model_state_generation: 0,
             // Existing unit harnesses construct App without an event loop or
             // daemon fake; gate-focused tests explicitly set this false.
@@ -3432,8 +3666,14 @@ impl App {
             daemon_signal_task: None,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
             agent_runner: None,
+            pending_runner_attach: None,
+            next_runner_attach_generation: 1,
+            pending_leak_reveal: None,
             display_attach_backoff: DisplayAttachBackoff::default(),
             async_actions: AsyncActionRunner::default(),
+            pending_mcp_local: None,
+            mcp_local_snapshot: None,
+            settings_blocking_actions: std::collections::HashMap::new(),
             _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard::new(),
             completed_async_actions: Vec::new(),
             skills_pane_generation: 0,
@@ -3689,9 +3929,20 @@ impl App {
         .await;
         if let Some(notice) = self.startup_daemon_notice.take() {
             let key = cockpit_core::daemon::proto::AppFlagKey::DaemonAutostartNotice;
-            let state = crate::tui::agent_runner::daemon_request_blocking(
-                cockpit_core::daemon::proto::Request::GetAppFlag { key },
-            );
+            // Startup is already async. Await the daemon directly so the runtime
+            // worker remains available to the daemon connection and terminal
+            // event sources instead of synchronously re-entering it.
+            let state = async {
+                let client = crate::tui::settings::settings_daemon_client()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                client
+                    .request(cockpit_core::daemon::proto::Request::GetAppFlag { key })
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())
+            }
+            .await;
             match state {
                 Ok(cockpit_core::daemon::proto::Response::AppFlag { seen: true, .. }) => {}
                 Ok(cockpit_core::daemon::proto::Response::AppFlag {
@@ -3699,12 +3950,20 @@ impl App {
                     version,
                     ..
                 }) => {
-                    let _ = crate::tui::agent_runner::daemon_request_blocking(
-                        cockpit_core::daemon::proto::Request::MarkAppFlagSeen {
-                            key,
-                            expected_version: version,
-                        },
-                    );
+                    let _ = async {
+                        let client = crate::tui::settings::settings_daemon_client()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        client
+                            .request(cockpit_core::daemon::proto::Request::MarkAppFlagSeen {
+                                key,
+                                expected_version: version,
+                            })
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .map_err(|error| error.to_string())
+                    }
+                    .await;
                     self.show_toast(notice, ToastKind::Info);
                 }
                 _ => self.show_toast(notice, ToastKind::Info),
@@ -3781,23 +4040,27 @@ impl App {
         if self.side_conversation.is_some() {
             self.end_side_conversation(false);
         }
-        if run_post_loop_btw_teardown(self.btw_pane.is_some(), || {
+        if self.btw_pane.is_some() {
             if let Some(Ok(runner)) = self.agent_runner.as_ref() {
-                let _ = agent_runner::attached_request_tx_blocking(
-                    runner.attached_request_binding(),
-                    cockpit_core::daemon::proto::Request::EndBtwFork {
+                let binding = runner.attached_request_binding();
+                let _ = binding
+                    .request(cockpit_core::daemon::proto::Request::EndBtwFork {
                         parent_session_id: runner.session_id(),
-                    },
-                );
+                    })
+                    .await;
             }
-        }) {
             self.close_btw_pane();
         }
         // Cancel-on-exit for a pending `/sealed` write: spend and drop any minted
         // capability over the still-live attached binding before the runner/daemon
         // teardown below, so a Ctrl-C×2 (or `/exit`) exit doesn't strand the
         // capability until its server-side expiry.
-        self.teardown_sealed_overlay();
+        self.settle_known_sealed_capabilities_before_shutdown()
+            .await;
+        // Prevent a leak-reveal worker from entering the sensitive channel
+        // after the pane/application has surrendered its operation binding.
+        // The worker owns the exact token and receipt-settles it on this path.
+        self.cancel_pending_leak_reveal();
         self.drop_mouse_copy_ui_ownership();
         let async_shutdown = self.async_actions.shutdown_and_reap().await;
         if async_shutdown.export_cleanup_failed > 0 || async_shutdown.export_cleanup_timed_out > 0 {
@@ -3877,6 +4140,9 @@ impl App {
                 .await?
             {
                 needs_redraw = true;
+            }
+            if self.exit_requested {
+                break;
             }
             if self.tick_attention_interrupt() {
                 needs_redraw = true;
@@ -4044,6 +4310,7 @@ impl App {
         changed |= self.drain_fetch_progress();
         changed |= self.drain_agent_events();
         changed |= self.drain_async_actions();
+        changed |= self.drain_leak_reveal();
         changed |= self.retry_pending_session_switch_submissions();
         changed |= self.retry_retained_pre_dispatch_submissions();
         changed |= self.drain_prediction();
@@ -4357,6 +4624,7 @@ impl App {
     }
 }
 
+#[cfg(test)]
 fn run_post_loop_btw_teardown(open: bool, teardown: impl FnOnce()) -> bool {
     if open {
         teardown();

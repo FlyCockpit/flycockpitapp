@@ -56,6 +56,15 @@ pub(crate) enum ToolSurfaceEditOutcome {
 }
 
 impl ToolSurfaceDraft {
+    pub(crate) fn empty() -> Self {
+        Self {
+            selection: ToolSurfaceSelection {
+                tools: Vec::new(),
+                tool_tiers: BTreeMap::new(),
+            },
+        }
+    }
+
     pub(crate) fn from_def(def: &AgentDef) -> Self {
         Self {
             selection: ToolSurfaceSelection {

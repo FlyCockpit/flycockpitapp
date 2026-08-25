@@ -15,7 +15,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 14 as const;
+export const PROTOCOL_VERSION = 18 as const;
 
 /**
  * JSON form of a bulk transfer reference, mirroring Rust

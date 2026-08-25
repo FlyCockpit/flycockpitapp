@@ -117,7 +117,7 @@ pub struct NotesRpcResult {
 }
 
 impl NotesRpcAction {
-    pub async fn run(self) -> anyhow::Result<NotesRpcResult> {
+    pub fn run_blocking_rpc(self) -> anyhow::Result<NotesRpcResult> {
         let socket = self.daemon_socket;
         let project_root = self.project_root;
         let response_project_root = project_root.clone();

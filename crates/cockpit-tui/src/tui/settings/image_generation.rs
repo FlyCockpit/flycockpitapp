@@ -747,9 +747,17 @@ pub(super) struct WorkflowEditorPage {
 
 /// Budget editor page.
 pub(super) struct BudgetEditorPage {
+    pub(super) page_instance_id: uuid::Uuid,
+    pub(super) load_pending: bool,
+    pub(super) authority_loaded: bool,
+    pub(super) save_pending: bool,
     pub(super) cursor: usize,
     pub(super) principal: GenerationPrincipal,
     pub(super) state: BudgetEditorState,
+    pub(super) policy_version: Option<u64>,
+    pub(super) project_epoch: Option<cockpit_config::config::image_spend::ProjectEpochPolicy>,
+    pub(super) loaded_settings:
+        Option<cockpit_config::config::image_spend::ImageSpendSettings>,
     pub(super) viewport: GenerationViewportMode,
     /// Last save disposition surfaced to the user (owner-RPC result). Never
     /// carries a secret or path — only a stable outcome string.
@@ -833,11 +841,39 @@ pub(super) fn workflow_editor_page(principal: GenerationPrincipal) -> PageBox {
     })
 }
 
+#[cfg(test)]
 pub(super) fn budget_editor_page(principal: GenerationPrincipal) -> PageBox {
     boxed(BudgetEditorPage {
+        page_instance_id: uuid::Uuid::new_v4(),
+        load_pending: false,
+        authority_loaded: true,
+        save_pending: false,
         cursor: 0,
         principal,
         state: BudgetEditorState::unconfigured(),
+        policy_version: None,
+        project_epoch: None,
+        loaded_settings: None,
+        viewport: GenerationViewportMode::Full,
+        status: None,
+    })
+}
+
+fn budget_editor_page_for_context(principal: GenerationPrincipal, cx: &mut SettingsCx) -> PageBox {
+    let page_instance_id = uuid::Uuid::new_v4();
+    let project_key = BudgetEditorPage::budget_project_key(cx);
+    cx.queue_image_spend_load(project_key, page_instance_id);
+    boxed(BudgetEditorPage {
+        page_instance_id,
+        load_pending: true,
+        authority_loaded: false,
+        save_pending: false,
+        cursor: 0,
+        principal,
+        state: BudgetEditorState::unconfigured(),
+        policy_version: None,
+        project_epoch: None,
+        loaded_settings: None,
         viewport: GenerationViewportMode::Full,
         status: None,
     })
@@ -979,13 +1015,14 @@ pub(super) const GENERATION_NODE_TITLES: &[&str] = &[
 pub(super) fn open_generation_node(
     cursor: usize,
     principal: GenerationPrincipal,
+    cx: &mut SettingsCx,
 ) -> Option<PageBox> {
     let idx = cursor.min(GENERATION_NODE_TITLES.len() - 1);
     Some(match idx {
         0 => endpoint_editor_page(principal),
         1 => target_editor_page(principal),
         2 => workflow_editor_page(principal),
-        3 => budget_editor_page(principal),
+        3 => budget_editor_page_for_context(principal, cx),
         4 => grant_list_page(principal),
         5 => job_list_page(principal),
         _ => return None,
@@ -997,7 +1034,7 @@ pub(super) fn open_generation_node(
 // ---------------------------------------------------------------------------
 
 impl GenerationListPage {
-    fn handle_node_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+    fn handle_node_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => Nav::Back,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1011,7 +1048,7 @@ impl GenerationListPage {
                 Nav::Stay
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if let Some(page) = open_generation_node(self.cursor, self.principal) {
+                if let Some(page) = open_generation_node(self.cursor, self.principal, cx) {
                     Nav::Push(page)
                 } else {
                     Nav::Stay
@@ -1028,7 +1065,7 @@ impl SettingsPage for GenerationListPage {
     }
     fn handle_pointer_control(
         &mut self,
-        _cx: &mut SettingsCx,
+        cx: &mut SettingsCx,
         action: super::pointer_actions::SettingsPointerAction,
     ) -> Nav {
         let super::pointer_actions::SettingsPointerAction::Generation(
@@ -1045,7 +1082,7 @@ impl SettingsPage for GenerationListPage {
             super::pointer_actions::GenerationNodeId::Grants => 4,
             super::pointer_actions::GenerationNodeId::Jobs => 5,
         };
-        open_generation_node(self.cursor, self.principal).map_or(Nav::Stay, Nav::Push)
+        open_generation_node(self.cursor, self.principal, cx).map_or(Nav::Stay, Nav::Push)
     }
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         // While the resize blocker is showing, list navigation is inert; only
@@ -1388,6 +1425,71 @@ impl SettingsPage for WorkflowEditorPage {
 }
 
 impl BudgetEditorPage {
+    pub(super) fn apply_daemon_completion(&mut self, completion: super::ImageSpendCompletion) {
+        match completion {
+            super::ImageSpendCompletion::Loaded {
+                page_instance_id,
+                settings,
+                policy_version,
+            } if page_instance_id == self.page_instance_id => {
+                self.load_pending = false;
+                self.authority_loaded = true;
+                let settings = settings.unwrap_or_default();
+                let generation = policy_version.map(|version| version.to_string());
+                self.state.request = BudgetScopeRow {
+                    policy: settings.request.clone(),
+                    generation: generation.clone(),
+                };
+                self.state.session = BudgetScopeRow {
+                    policy: settings.session.clone(),
+                    generation: generation.clone(),
+                };
+                self.state.project = BudgetScopeRow {
+                    policy: settings.project.clone(),
+                    generation,
+                };
+                self.state.blocks_paid_generation =
+                    [&settings.request, &settings.session, &settings.project]
+                        .iter()
+                        .all(|policy| {
+                            matches!(
+                        policy,
+                        cockpit_core::image_generation_control_plane::BudgetPolicy::Unconfigured
+                    )
+                        });
+                self.project_epoch = settings.project_epoch.clone();
+                self.loaded_settings = Some(settings);
+                self.policy_version = policy_version;
+                self.status = Some(match policy_version {
+                    Some(version) => format!("Loaded authoritative budget policy v{version}."),
+                    None => "No saved budget policy; choose values before saving.".into(),
+                });
+            }
+            super::ImageSpendCompletion::Saved {
+                page_instance_id,
+                settings,
+                policy_version,
+            } if page_instance_id == self.page_instance_id => {
+                self.save_pending = false;
+                self.state.blocks_paid_generation = false;
+                self.policy_version = Some(policy_version);
+                self.project_epoch = settings.project_epoch.clone();
+                self.loaded_settings = Some(settings);
+                self.status = Some(format!("Budget saved (policy v{policy_version})."));
+            }
+            super::ImageSpendCompletion::Failed {
+                page_instance_id,
+                message,
+            } if page_instance_id == self.page_instance_id => {
+                self.load_pending = false;
+                self.authority_loaded = false;
+                self.save_pending = false;
+                self.status = Some(format!("Budget policy unavailable: {message}"));
+            }
+            _ => {}
+        }
+    }
+
     /// Resolve the owner-remoted budget project key from the dialog context.
     /// Falls back to the edited config layer path when no active launch project
     /// root is present (the same rule the Image Spend page uses).
@@ -1408,49 +1510,35 @@ impl BudgetEditorPage {
     /// Mutation is gated on `can_mutate_config`; an unauthorized principal never
     /// reaches the daemon and is told why with a stable reason.
     fn dispatch_save(&mut self, cx: &mut SettingsCx) {
+        if !self.authority_loaded {
+            self.status = Some("Save unavailable until the authoritative policy loads.".into());
+            return;
+        }
         if !self.principal.can_mutate_config() {
-            self.status = Some(format!(
-                "Save unavailable: {REASON_FORBIDDEN_IMAGE_ADMIN}"
-            ));
+            self.status = Some(format!("Save unavailable: {REASON_FORBIDDEN_IMAGE_ADMIN}"));
             return;
         }
         let settings = cockpit_config::config::image_spend::ImageSpendSettings {
             request: self.state.request.policy.clone(),
             session: self.state.session.policy.clone(),
             project: self.state.project.policy.clone(),
-            // The budget editor scopes are request/session/project; the project
-            // epoch policy is owned by the Image Spend page and is left
-            // unchanged here (None = daemon keeps its current epoch policy).
-            project_epoch: None,
+            project_epoch: self.project_epoch.clone(),
         };
-        let settings_json = match serde_json::to_string(&settings) {
-            Ok(json) => json,
-            Err(error) => {
-                self.status = Some(format!("Save failed: {error}"));
-                return;
-            }
-        };
+        if self.loaded_settings.as_ref() == Some(&settings) {
+            self.status = Some("No budget changes to save.".into());
+            return;
+        }
         let project_key = Self::budget_project_key(cx);
-        match super::settings_daemon_request(
-            cockpit_core::daemon::proto::Request::SaveImageSpendPolicy {
-                project_key,
-                settings_json,
-                // First-write semantics: no optimistic version fence yet (the
-                // editor does not load a prior policy version). The daemon owner
-                // remains the single authority and rejects an inconsistent set.
-                expected_policy_version: None,
-            },
+        self.save_pending = true;
+        self.status = Some("Saving against the loaded policy revision…".into());
+        if let Err(error) = cx.queue_image_spend_save(
+            project_key,
+            settings,
+            self.policy_version,
+            self.page_instance_id,
         ) {
-            Ok(cockpit_core::daemon::proto::Response::ImageSpendPolicySaved { policy_version }) => {
-                self.state.blocks_paid_generation = false;
-                self.status = Some(format!("Budget saved (policy v{policy_version})."));
-            }
-            Ok(other) => {
-                self.status = Some(format!("Unexpected save response: {other:?}"));
-            }
-            Err(error) => {
-                self.status = Some(format!("Save failed: {error}"));
-            }
+            self.save_pending = false;
+            self.status = Some(format!("Save failed: {error}"));
         }
     }
 }
@@ -1460,6 +1548,9 @@ impl SettingsPage for BudgetEditorPage {
         SettingsPointerSurfaceKind::BudgetEditor
     }
     fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+        if self.load_pending || self.save_pending {
+            return Nav::Stay;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => Nav::Back,
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1469,7 +1560,14 @@ impl SettingsPage for BudgetEditorPage {
             _ => Nav::Stay,
         }
     }
-    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, action: SettingsPointerAction) -> Nav {
+    fn handle_pointer_control(
+        &mut self,
+        cx: &mut SettingsCx,
+        action: SettingsPointerAction,
+    ) -> Nav {
+        if self.load_pending || self.save_pending {
+            return Nav::Stay;
+        }
         match &action {
             SettingsPointerAction::Generation(GenerationAction::SaveBudget) => {
                 self.dispatch_save(cx);
@@ -1485,6 +1583,11 @@ impl SettingsPage for BudgetEditorPage {
             rows.push((format!("Disabled: {reason}"), None));
             rows.push(("No budget data visible.".into(), None));
         } else {
+            if self.load_pending {
+                rows.push(("Loading authoritative budget policy…".into(), None));
+                render_generation_page(cx, frame, area, "generation:budget", "Budget", rows, None);
+                return;
+            }
             let session_label = match self.state.session.policy {
                 cockpit_core::image_generation_control_plane::BudgetPolicy::Unconfigured => {
                     "Unconfigured"
@@ -1531,7 +1634,15 @@ impl SettingsPage for BudgetEditorPage {
             ));
             rows.push((
                 "[Save]".into(),
-                Some((GenerationAction::SaveBudget, true, None)),
+                Some((
+                    GenerationAction::SaveBudget,
+                    self.authority_loaded && !self.save_pending,
+                    if self.authority_loaded {
+                        self.save_pending.then_some("save_pending")
+                    } else {
+                        Some("authoritative_policy_unavailable")
+                    },
+                )),
             ));
             rows.push((
                 "[Cancel]".into(),
@@ -2409,9 +2520,16 @@ mod tests {
         assert!(state.request.generation.is_none());
 
         let page = BudgetEditorPage {
+            page_instance_id: uuid::Uuid::new_v4(),
+            load_pending: false,
+            authority_loaded: true,
+            save_pending: false,
             cursor: 0,
             principal: GenerationPrincipal::local_owner(),
             state: BudgetEditorState::unconfigured(),
+            policy_version: None,
+            project_epoch: None,
+            loaded_settings: None,
             viewport: GenerationViewportMode::Full,
             status: None,
         };
@@ -2684,9 +2802,16 @@ mod tests {
             SettingsPointerSurfaceKind::WorkflowEditor
         );
         let budget = BudgetEditorPage {
+            page_instance_id: uuid::Uuid::new_v4(),
+            load_pending: false,
+            authority_loaded: true,
+            save_pending: false,
             cursor: 0,
             principal: GenerationPrincipal::local_owner(),
             state: BudgetEditorState::unconfigured(),
+            policy_version: None,
+            project_epoch: None,
+            loaded_settings: None,
             viewport: GenerationViewportMode::Full,
             status: None,
         };

@@ -10,7 +10,7 @@ use super::*;
 use crate::daemon::agent_management::conflict;
 
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 // The named-secret ownership guard primitives were factored into the shared
 // `crate::secret_ownership` funnel so policy import, `cockpit mcp add`,
 // credential refresh, and owner-scoped resolution reuse the SAME model. Re-export
@@ -74,12 +74,61 @@ const FLYCOCKPIT_REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// races between clients in one daemon while the file lock covers peers.
 /// Serialize every provider/MCP config publication, reference scan, and
 /// cleanup. They share the named-secret vault namespace.
-static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
+#[derive(Clone)]
+struct ProviderEditCapability {
+    owner: String,
+    project_root: String,
+    target_path: std::path::PathBuf,
+    layer_id: String,
+    revision: String,
+    config_generation: u64,
+    mcp_target_path: std::path::PathBuf,
+    mcp_revision: String,
+    expires_at: Instant,
+}
+
+static PROVIDER_EDIT_CAPABILITIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, ProviderEditCapability>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const PROVIDER_EDIT_CAPABILITY_TTL: Duration = Duration::from_secs(30 * 60);
+const PROVIDER_EDIT_CAPABILITY_CAPACITY: usize = 128;
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct McpOAuthPending {
     project_root: String,
     server: String,
     flow: crate::mcp::auth::McpOAuthFlow,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct SealedOAuthText(String);
+
+impl SealedOAuthText {
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SealedOAuthText {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl Drop for SealedOAuthText {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl std::fmt::Debug for SealedOAuthText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
 }
 
 #[derive(Clone)]
@@ -90,29 +139,1187 @@ enum ProviderOAuthFlow {
     /// Ready value before network I/O. The variant documents the state machine
     /// and makes accidental re-insertion of an in-flight flow conspicuous.
     #[allow(dead_code)]
-    Completing,
+    Completing {
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum ProviderOAuthReady {
     Grok(crate::auth::xai_oauth::ManualLogin),
     Codex(crate::auth::codex_oauth::DeviceLogin),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DurableOAuthFlow {
+    Provider {
+        owner: String,
+        begin_client_operation_id: String,
+        begin_request_hash: [u8; 32],
+        begin_fencing_generation: i64,
+        authorize_url: SealedOAuthText,
+        user_code: Option<SealedOAuthText>,
+        ready: ProviderOAuthReady,
+        created_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    },
+    ProviderExchanging {
+        owner: String,
+        begin_client_operation_id: String,
+        provider_id: String,
+        completion_client_operation_id: String,
+        completion_request_hash: [u8; 32],
+        completion_fencing_generation: i64,
+        claimed_at_unix_ms: i64,
+    },
+    Mcp {
+        owner: String,
+        begin_client_operation_id: String,
+        begin_request_hash: [u8; 32],
+        begin_fencing_generation: i64,
+        authorize_url: SealedOAuthText,
+        pending: McpOAuthPending,
+        created_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    },
+    McpExchanging {
+        owner: String,
+        begin_client_operation_id: String,
+        project_root: String,
+        server: String,
+        completion_client_operation_id: String,
+        completion_request_hash: [u8; 32],
+        completion_fencing_generation: i64,
+        claimed_at_unix_ms: i64,
+    },
+    ProviderCommitted {
+        owner: String,
+        begin_client_operation_id: String,
+        provider_id: String,
+        completion_client_operation_id: String,
+        completion_request_hash: [u8; 32],
+        completion_fencing_generation: i64,
+        terminal_response: Box<Response>,
+        committed_at_unix_ms: i64,
+    },
+    McpCommitted {
+        owner: String,
+        begin_client_operation_id: String,
+        project_root: String,
+        server: String,
+        completion_client_operation_id: String,
+        completion_request_hash: [u8; 32],
+        completion_fencing_generation: i64,
+        terminal_response: Box<Response>,
+        committed_at_unix_ms: i64,
+    },
+    /// Secret-free tombstone retained solely so an exact begin retry receives
+    /// the same terminal expiry instead of replaying stale authorize data.
+    Expired {
+        owner: String,
+        begin_client_operation_id: String,
+        terminal_error: ErrorPayload,
+        expired_at_unix_ms: i64,
+    },
+    Cancelled {
+        owner: String,
+        begin_client_operation_id: String,
+        terminal_error: ErrorPayload,
+        cancelled_at_unix_ms: i64,
+    },
+}
+
+impl std::fmt::Debug for DurableOAuthFlow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::Provider { .. } => "Provider",
+            Self::ProviderExchanging { .. } => "ProviderExchanging",
+            Self::Mcp { .. } => "Mcp",
+            Self::McpExchanging { .. } => "McpExchanging",
+            Self::ProviderCommitted { .. } => "ProviderCommitted",
+            Self::McpCommitted { .. } => "McpCommitted",
+            Self::Expired { .. } => "Expired",
+            Self::Cancelled { .. } => "Cancelled",
+        };
+        formatter
+            .debug_struct("DurableOAuthFlow")
+            .field("kind", &kind)
+            .field("payload", &"[REDACTED]")
+            .finish()
+    }
+}
+
+fn oauth_wall_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn oauth_expiry_ms(created_at_unix_ms: i64) -> i64 {
+    created_at_unix_ms.saturating_add(i64::try_from(OAUTH_FLOW_TTL.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn durable_oauth_expired(flow: &DurableOAuthFlow, now_unix_ms: i64) -> bool {
+    match flow {
+        DurableOAuthFlow::Provider {
+            expires_at_unix_ms, ..
+        }
+        | DurableOAuthFlow::Mcp {
+            expires_at_unix_ms, ..
+        } => now_unix_ms >= *expires_at_unix_ms,
+        DurableOAuthFlow::ProviderExchanging {
+            claimed_at_unix_ms, ..
+        }
+        | DurableOAuthFlow::McpExchanging {
+            claimed_at_unix_ms, ..
+        } => now_unix_ms >= oauth_expiry_ms(*claimed_at_unix_ms),
+        DurableOAuthFlow::ProviderCommitted {
+            committed_at_unix_ms,
+            ..
+        }
+        | DurableOAuthFlow::McpCommitted {
+            committed_at_unix_ms,
+            ..
+        } => now_unix_ms >= oauth_expiry_ms(*committed_at_unix_ms),
+        DurableOAuthFlow::Expired { .. } | DurableOAuthFlow::Cancelled { .. } => true,
+    }
+}
+
+fn durable_oauth_owner_and_created(flow: &DurableOAuthFlow) -> (&str, i64) {
+    match flow {
+        DurableOAuthFlow::Provider {
+            owner,
+            created_at_unix_ms,
+            ..
+        }
+        | DurableOAuthFlow::Mcp {
+            owner,
+            created_at_unix_ms,
+            ..
+        } => (owner, *created_at_unix_ms),
+        DurableOAuthFlow::ProviderExchanging {
+            owner,
+            claimed_at_unix_ms,
+            ..
+        }
+        | DurableOAuthFlow::McpExchanging {
+            owner,
+            claimed_at_unix_ms,
+            ..
+        } => (owner, *claimed_at_unix_ms),
+        DurableOAuthFlow::ProviderCommitted {
+            owner,
+            committed_at_unix_ms,
+            ..
+        }
+        | DurableOAuthFlow::McpCommitted {
+            owner,
+            committed_at_unix_ms,
+            ..
+        } => (owner, *committed_at_unix_ms),
+        DurableOAuthFlow::Expired {
+            owner,
+            expired_at_unix_ms,
+            ..
+        } => (owner, *expired_at_unix_ms),
+        DurableOAuthFlow::Cancelled {
+            owner,
+            cancelled_at_unix_ms,
+            ..
+        } => (owner, *cancelled_at_unix_ms),
+    }
+}
+
+async fn expire_ready_oauth_flow(
+    ctx: &DaemonContext,
+    flow_id: String,
+    owner: String,
+    begin_client_operation_id: String,
+    begin_request_hash: [u8; 32],
+    begin_fencing_generation: i64,
+) -> std::result::Result<(), ErrorPayload> {
+    let terminal_error = ErrorPayload {
+        code: ErrorCode::Conflict,
+        message: "the OAuth flow expired before completion; start a new login".to_owned(),
+    };
+    let expired_at_unix_ms = oauth_wall_ms();
+    let tombstone = zeroize::Zeroizing::new(
+        serde_json::to_vec(&DurableOAuthFlow::Expired {
+            owner: owner.clone(),
+            begin_client_operation_id: begin_client_operation_id.clone(),
+            terminal_error,
+            expired_at_unix_ms,
+        })
+        .map_err(internal)?,
+    );
+    let vault = ctx.secret_vault.clone();
+    let vault_id = oauth_flow_vault_id(&flow_id);
+    ctx.db
+        .transaction(move |conn| {
+            // Re-read under the writer transaction so a concurrently claimed
+            // flow cannot be erased by an expiry decision made from a stale
+            // snapshot.
+            let bytes = vault
+                .get_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                    &vault_id,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let marker: DurableOAuthFlow = serde_json::from_slice(bytes.as_slice())?;
+            let still_exact_expired_ready = match marker {
+                DurableOAuthFlow::Provider {
+                    owner: marker_owner,
+                    begin_client_operation_id: marker_operation_id,
+                    begin_request_hash: marker_hash,
+                    begin_fencing_generation: marker_fence,
+                    expires_at_unix_ms,
+                    ..
+                }
+                | DurableOAuthFlow::Mcp {
+                    owner: marker_owner,
+                    begin_client_operation_id: marker_operation_id,
+                    begin_request_hash: marker_hash,
+                    begin_fencing_generation: marker_fence,
+                    expires_at_unix_ms,
+                    ..
+                } => {
+                    marker_owner == owner
+                        && marker_operation_id == begin_client_operation_id
+                        && marker_hash == begin_request_hash
+                        && marker_fence == begin_fencing_generation
+                        && oauth_wall_ms() >= expires_at_unix_ms
+                }
+                _ => false,
+            };
+            if !still_exact_expired_ready {
+                return Ok(());
+            }
+            // Begin receipts are already terminal-success and terminal rows
+            // are immutable by schema. Verify that exact receipt, then replace
+            // the secret-bearing Ready payload with a secret-free expiry
+            // tombstone that makes future begin retries deterministic.
+            let receipt_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_operation_receipts
+                 WHERE owner_digest=?1 AND client_operation_id=?2
+                   AND request_hash=?3 AND fencing_generation=?4
+                   AND state='terminal_success')",
+                rusqlite::params![
+                    owner,
+                    begin_client_operation_id,
+                    begin_request_hash.as_slice(),
+                    begin_fencing_generation
+                ],
+                |row| row.get(0),
+            )?;
+            if !receipt_exists {
+                anyhow::bail!("expired OAuth flow has no exact replay receipt");
+            }
+            vault
+                .mutate_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                    &vault_id,
+                    Some(tombstone.as_slice()),
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
+async fn purge_durable_oauth_flows(
+    ctx: &DaemonContext,
+    admitting_owner: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    let mut flows = Vec::new();
+    for item_id in ctx
+        .secret_vault
+        .list_item_ids(cockpit_db::secret_vault::SecretVaultKind::SealedState)
+        .map_err(|error| internal(anyhow::anyhow!(error)))?
+        .into_iter()
+        .filter(|id| id.starts_with("oauth-flow:"))
+    {
+        let flow_id = item_id.trim_start_matches("oauth-flow:").to_owned();
+        if let Some(flow) = load_oauth_flow(ctx, &flow_id)? {
+            if let DurableOAuthFlow::Expired {
+                owner,
+                begin_client_operation_id,
+                ..
+            }
+            | DurableOAuthFlow::Cancelled {
+                owner,
+                begin_client_operation_id,
+                ..
+            } = &flow
+            {
+                // Secret-free terminal tombstones do not consume live-flow
+                // capacity. Once the owning receipt reaches normal retention,
+                // the tombstone no longer has a retry identity and can go too.
+                if ctx
+                    .db
+                    .local_operation_settlement(owner.clone(), begin_client_operation_id.clone())
+                    .await
+                    .map_err(internal)?
+                    .is_none()
+                {
+                    delete_oauth_flow(ctx, &flow_id)?;
+                }
+                continue;
+            }
+            let (owner, created) = durable_oauth_owner_and_created(&flow);
+            let begin_identity = match &flow {
+                DurableOAuthFlow::Provider {
+                    begin_client_operation_id,
+                    begin_request_hash,
+                    begin_fencing_generation,
+                    ..
+                }
+                | DurableOAuthFlow::Mcp {
+                    begin_client_operation_id,
+                    begin_request_hash,
+                    begin_fencing_generation,
+                    ..
+                } => Some((
+                    begin_client_operation_id.clone(),
+                    *begin_request_hash,
+                    *begin_fencing_generation,
+                )),
+                DurableOAuthFlow::ProviderExchanging { .. }
+                | DurableOAuthFlow::McpExchanging { .. }
+                | DurableOAuthFlow::ProviderCommitted { .. }
+                | DurableOAuthFlow::McpCommitted { .. }
+                | DurableOAuthFlow::Expired { .. }
+                | DurableOAuthFlow::Cancelled { .. } => None,
+            };
+            let receipt_protected = if let Some((operation_id, _, _)) = &begin_identity {
+                ctx.db
+                    .local_operation_settlement(owner.to_owned(), operation_id.clone())
+                    .await
+                    .map_err(internal)?
+                    .is_some()
+            } else {
+                true
+            };
+            let ready = matches!(
+                &flow,
+                DurableOAuthFlow::Provider { .. } | DurableOAuthFlow::Mcp { .. }
+            );
+            flows.push((
+                flow_id,
+                owner.to_owned(),
+                created,
+                ready,
+                receipt_protected,
+                durable_oauth_expired(&flow, oauth_wall_ms()),
+                begin_identity,
+            ));
+        }
+    }
+    flows.sort_by_key(|(_, _, created, _, _, _, _)| *created);
+
+    // A Ready flow has a hard ten-minute lifetime. Its begin receipt is
+    // rewritten to the exact terminal expiry outcome in the same transaction
+    // that removes the sealed verifier, so an abandoned receipt cannot protect
+    // capacity forever or replay a dead authorize instruction.
+    for (flow_id, owner, _, ready, _, expired, begin_identity) in &flows {
+        if *ready && *expired {
+            let (operation_id, request_hash, fence) = begin_identity
+                .clone()
+                .ok_or_else(|| internal(anyhow::anyhow!("Ready OAuth flow lost begin identity")))?;
+            expire_ready_oauth_flow(
+                ctx,
+                flow_id.clone(),
+                owner.clone(),
+                operation_id,
+                request_hash,
+                fence,
+            )
+            .await?;
+        }
+    }
+    flows.retain(|(_, _, _, ready, _, expired, _)| !(*ready && *expired));
+    let owner_excess = flows
+        .iter()
+        .filter(|(_, owner, _, _, _, _, _)| owner == admitting_owner)
+        .count()
+        .saturating_sub(OAUTH_FLOW_OWNER_CAPACITY.saturating_sub(1));
+    let global_excess = flows
+        .len()
+        .saturating_sub(OAUTH_FLOW_GLOBAL_CAPACITY.saturating_sub(1));
+    let mut owner_removed = 0usize;
+    let mut global_removed = 0usize;
+    for (flow_id, owner, _, ready, receipt_protected, _, _) in flows {
+        let remove_for_owner = owner == admitting_owner && owner_removed < owner_excess;
+        let remove_for_global = global_removed < global_excess;
+        if (remove_for_owner || remove_for_global) && ready && !receipt_protected {
+            delete_oauth_flow(ctx, &flow_id)?;
+            owner_removed += usize::from(remove_for_owner);
+            global_removed += 1;
+        }
+    }
+    if owner_removed < owner_excess || global_removed < global_excess {
+        return Err(conflict(
+            "OAuth flow capacity is occupied by unsettled or replay-protected operations",
+        ));
+    }
+    Ok(())
+}
+
+/// Periodic expiry for daemon-owned OAuth authority.
+///
+/// This path never admits a new flow and never time-takes over an exchange.
+/// It only (a) converts an exact expired Ready marker to its receipt-bound,
+/// secret-free tombstone and (b) deletes terminal tombstones after their
+/// owning begin receipt has itself been retired. Thus an abandoned PKCE
+/// verifier/device state cannot live until the next Begin request, while an
+/// exact retry retains deterministic settlement for as long as its receipt.
+pub(super) async fn maintain_durable_oauth_flows(
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    ctx.oauth_flows.maintain().await;
+    for item_id in ctx
+        .secret_vault
+        .list_item_ids(cockpit_db::secret_vault::SecretVaultKind::SealedState)
+        .map_err(|error| internal(anyhow::anyhow!(error)))?
+        .into_iter()
+        .filter(|id| id.starts_with("oauth-flow:"))
+    {
+        let flow_id = item_id.trim_start_matches("oauth-flow:").to_owned();
+        let Some(flow) = load_oauth_flow(ctx, &flow_id)? else {
+            continue;
+        };
+        match flow {
+            DurableOAuthFlow::Provider {
+                owner,
+                begin_client_operation_id,
+                begin_request_hash,
+                begin_fencing_generation,
+                expires_at_unix_ms,
+                ..
+            }
+            | DurableOAuthFlow::Mcp {
+                owner,
+                begin_client_operation_id,
+                begin_request_hash,
+                begin_fencing_generation,
+                expires_at_unix_ms,
+                ..
+            } if oauth_wall_ms() >= expires_at_unix_ms => {
+                expire_ready_oauth_flow(
+                    ctx,
+                    flow_id,
+                    owner,
+                    begin_client_operation_id,
+                    begin_request_hash,
+                    begin_fencing_generation,
+                )
+                .await?;
+            }
+            DurableOAuthFlow::Expired {
+                owner,
+                begin_client_operation_id,
+                ..
+            }
+            | DurableOAuthFlow::Cancelled {
+                owner,
+                begin_client_operation_id,
+                ..
+            } => {
+                let receipt = ctx
+                    .db
+                    .local_operation_settlement(owner, begin_client_operation_id)
+                    .await
+                    .map_err(internal)?;
+                if receipt.is_none() {
+                    delete_oauth_flow(ctx, &flow_id)?;
+                }
+            }
+            // Exchanging and committed markers are recovery evidence. Their
+            // exact receipt transition, not elapsed wall time, owns cleanup.
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn find_durable_oauth_flow(
+    ctx: &DaemonContext,
+    owner: &str,
+    begin_client_operation_id: &str,
+) -> std::result::Result<Option<(String, DurableOAuthFlow)>, ErrorPayload> {
+    for item_id in ctx
+        .secret_vault
+        .list_item_ids(cockpit_db::secret_vault::SecretVaultKind::SealedState)
+        .map_err(|error| internal(anyhow::anyhow!(error)))?
+        .into_iter()
+        .filter(|id| id.starts_with("oauth-flow:"))
+    {
+        let flow_id = item_id.trim_start_matches("oauth-flow:").to_owned();
+        let Some(flow) = load_oauth_flow(ctx, &flow_id)? else {
+            continue;
+        };
+        let matches_begin = match &flow {
+            DurableOAuthFlow::Provider {
+                owner: durable_owner,
+                begin_client_operation_id: durable_begin,
+                ..
+            }
+            | DurableOAuthFlow::Mcp {
+                owner: durable_owner,
+                begin_client_operation_id: durable_begin,
+                ..
+            } => durable_owner == owner && durable_begin == begin_client_operation_id,
+            _ => false,
+        };
+        if matches_begin {
+            return Ok(Some((flow_id, flow)));
+        }
+    }
+    Ok(None)
+}
+
+fn oauth_flow_vault_id(flow_id: &str) -> String {
+    format!("oauth-flow:{flow_id}")
+}
+
+async fn claim_oauth_exchange(
+    ctx: &DaemonContext,
+    flow_id: String,
+    owner: String,
+    begin_client_operation_id: String,
+    completion_client_operation_id: String,
+    completion_request_hash: [u8; 32],
+    completion_fencing_generation: i64,
+    exchanging: DurableOAuthFlow,
+) -> std::result::Result<(), ErrorPayload> {
+    let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&exchanging).map_err(internal)?);
+    let vault = ctx.secret_vault.clone();
+    let vault_id = oauth_flow_vault_id(&flow_id);
+    ctx.db
+        .transaction(move |conn| {
+            let current = vault
+                .get_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                    &vault_id,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let current: DurableOAuthFlow = serde_json::from_slice(current.as_slice())?;
+            let exact_live_ready = match (&current, &exchanging) {
+                (
+                    DurableOAuthFlow::Provider {
+                        owner: current_owner,
+                        begin_client_operation_id: current_begin,
+                        expires_at_unix_ms,
+                        ..
+                    },
+                    DurableOAuthFlow::ProviderExchanging { .. },
+                )
+                | (
+                    DurableOAuthFlow::Mcp {
+                        owner: current_owner,
+                        begin_client_operation_id: current_begin,
+                        expires_at_unix_ms,
+                        ..
+                    },
+                    DurableOAuthFlow::McpExchanging { .. },
+                ) => {
+                    current_owner == &owner
+                        && current_begin == &begin_client_operation_id
+                        && oauth_wall_ms() < *expires_at_unix_ms
+                }
+                _ => false,
+            };
+            if !exact_live_ready {
+                anyhow::bail!("OAuth flow is not an exact live Ready claim");
+            }
+            let receipt_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_operation_receipts
+                 WHERE owner_digest=?1 AND client_operation_id=?2
+                   AND request_hash=?3 AND fencing_generation=?4
+                   AND state='executing')",
+                rusqlite::params![
+                    owner,
+                    completion_client_operation_id,
+                    completion_request_hash.as_slice(),
+                    completion_fencing_generation
+                ],
+                |row| row.get(0),
+            )?;
+            if !receipt_exists {
+                anyhow::bail!("OAuth exchange lost its exact completion receipt");
+            }
+            vault
+                .mutate_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                    &vault_id,
+                    Some(bytes.as_slice()),
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
+/// Publish a Ready OAuth flow and its exact begin receipt under one SQLite
+/// fence. A crash can therefore observe neither, or both; startup never has to
+/// guess whether a returned authorize instruction had durable authority.
+async fn commit_oauth_begin(
+    ctx: &DaemonContext,
+    flow_id: String,
+    flow: DurableOAuthFlow,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    receipt: Response,
+) -> std::result::Result<(), ErrorPayload> {
+    let flow_bytes = zeroize::Zeroizing::new(serde_json::to_vec(&flow).map_err(internal)?);
+    let receipt_json = serde_json::to_string(&receipt).map_err(internal)?;
+    let vault = ctx.secret_vault.clone();
+    let vault_id = oauth_flow_vault_id(&flow_id);
+    ctx.db
+        .transaction(move |conn| {
+            vault
+                .mutate_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                    &vault_id,
+                    Some(flow_bytes.as_slice()),
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let settled = conn.execute(
+                "UPDATE local_operation_receipts
+                 SET state='terminal_success',terminal_outcome_json=?5,
+                     execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                 WHERE owner_digest=?1 AND client_operation_id=?2
+                   AND request_hash=?3 AND fencing_generation=?4
+                   AND state='executing'",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    receipt_json,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            if settled != 1 {
+                anyhow::bail!("OAuth begin lost its receipt fence");
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
+    if let Err(error) = ctx.publish_owner_redaction_table() {
+        ctx.poison_redaction_publication(&error);
+        tracing::error!(%error, "OAuth begin committed but redaction publication failed; daemon poisoned");
+    }
+    Ok(())
+}
+
+async fn commit_oauth_cancel(
+    ctx: &DaemonContext,
+    flow_id: Option<String>,
+    delete_ready_flow: bool,
+    begin_client_operation_id: String,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    response: &Response,
+) -> std::result::Result<(), ErrorPayload> {
+    let receipt_json = serde_json::to_string(response).map_err(internal)?;
+    let vault = ctx.secret_vault.clone();
+    ctx.db
+        .transaction(move |conn| {
+            if delete_ready_flow {
+                let flow_id = flow_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("cancelled OAuth flow lost its identity"))?;
+                let vault_id = oauth_flow_vault_id(flow_id);
+                let current = vault
+                    .get_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                        &vault_id,
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                let current: DurableOAuthFlow = serde_json::from_slice(current.as_slice())?;
+                let (marker_owner, marker_begin_operation_id, exchanging_identity) = match current {
+                    DurableOAuthFlow::Provider {
+                        owner,
+                        begin_client_operation_id,
+                        ..
+                    }
+                    | DurableOAuthFlow::Mcp {
+                        owner,
+                        begin_client_operation_id,
+                        ..
+                    } => (owner, begin_client_operation_id, None),
+                    DurableOAuthFlow::ProviderExchanging {
+                        owner,
+                        begin_client_operation_id,
+                        completion_client_operation_id,
+                        completion_request_hash,
+                        completion_fencing_generation,
+                        ..
+                    }
+                    | DurableOAuthFlow::McpExchanging {
+                        owner,
+                        begin_client_operation_id,
+                        completion_client_operation_id,
+                        completion_request_hash,
+                        completion_fencing_generation,
+                        ..
+                    } => (
+                        owner,
+                        begin_client_operation_id,
+                        Some((
+                            completion_client_operation_id,
+                            completion_request_hash,
+                            completion_fencing_generation,
+                        )),
+                    ),
+                    _ => anyhow::bail!("OAuth cancellation target is not live"),
+                };
+                if marker_owner != owner || marker_begin_operation_id != begin_client_operation_id {
+                    anyhow::bail!("OAuth cancellation target identity does not match");
+                }
+                let terminal_error = ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "the OAuth flow was cancelled; start a new login".to_owned(),
+                };
+                let tombstone =
+                    zeroize::Zeroizing::new(serde_json::to_vec(&DurableOAuthFlow::Cancelled {
+                        owner: marker_owner,
+                        begin_client_operation_id: marker_begin_operation_id,
+                        terminal_error: terminal_error.clone(),
+                        cancelled_at_unix_ms: oauth_wall_ms(),
+                    })?);
+                vault
+                    .mutate_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                        &vault_id,
+                        Some(tombstone.as_slice()),
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                if let Some((operation_id, exchange_hash, exchange_fence)) = exchanging_identity {
+                    let exchange_error_json = serde_json::to_string(&terminal_error)?;
+                    let settled_exchange = conn.execute(
+                        "UPDATE local_operation_receipts
+                         SET state='terminal_cancelled',terminal_outcome_json=?5,
+                             execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                         WHERE owner_digest=?1 AND client_operation_id=?2
+                           AND request_hash=?3 AND fencing_generation=?4
+                           AND state='executing'",
+                        rusqlite::params![
+                            owner,
+                            operation_id,
+                            exchange_hash.as_slice(),
+                            exchange_fence,
+                            exchange_error_json,
+                            oauth_wall_ms()
+                        ],
+                    )?;
+                    if settled_exchange != 1 {
+                        anyhow::bail!("OAuth cancellation lost the exact exchange receipt fence");
+                    }
+                }
+            }
+            let settled = conn.execute(
+                "UPDATE local_operation_receipts
+                 SET state='terminal_success',terminal_outcome_json=?5,
+                     execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                 WHERE owner_digest=?1 AND client_operation_id=?2
+                   AND request_hash=?3 AND fencing_generation=?4
+                   AND state='executing'",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    receipt_json,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            if settled != 1 {
+                anyhow::bail!("OAuth cancellation lost its receipt fence");
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
+    if delete_ready_flow && let Err(error) = ctx.publish_owner_redaction_table() {
+        ctx.poison_redaction_publication(&error);
+        tracing::error!(%error, "OAuth cancellation committed but redaction publication failed; daemon poisoned");
+    }
+    Ok(())
+}
+
+async fn settle_failed_oauth_begin(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    error: &ErrorPayload,
+) -> std::result::Result<ErrorPayload, ErrorPayload> {
+    tracing::warn!(
+        error_code = %error.code,
+        error = %error.message,
+        operation_id = %client_operation_id,
+        "OAuth begin failed after receipt admission"
+    );
+    let terminal_error = ErrorPayload {
+        code: error.code.clone(),
+        message: "OAuth could not be started; inspect daemon diagnostics for details".to_owned(),
+    };
+    finish_local_operation_error(
+        ctx,
+        owner,
+        client_operation_id,
+        request_hash,
+        fencing_generation,
+        &terminal_error,
+    )
+    .await?;
+    Ok(terminal_error)
+}
+
+/// Settle a failed one-shot exchange and remove its sealed claim atomically.
+/// An Exchanging marker without an executing receipt is neither replayable nor
+/// capacity-evictable, so the two pieces must never be torn across a crash.
+async fn fail_oauth_exchange(
+    ctx: &DaemonContext,
+    flow_id: String,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    error: &ErrorPayload,
+) -> std::result::Result<ErrorPayload, ErrorPayload> {
+    tracing::warn!(
+        error_code = %error.code,
+        error = %error.message,
+        operation_id = %client_operation_id,
+        "OAuth exchange failed"
+    );
+    let terminal_error = ErrorPayload {
+        code: error.code.clone(),
+        message: if error.code == ErrorCode::Shutdown {
+            "the daemon stopped before the OAuth exchange completed"
+        } else {
+            "the OAuth exchange was rejected; inspect daemon diagnostics for details"
+        }
+        .to_owned(),
+    };
+    let error_json = serde_json::to_string(&terminal_error).map_err(internal)?;
+    let terminal_state = if error.code == ErrorCode::Shutdown {
+        "terminal_cancelled"
+    } else {
+        "terminal_error"
+    };
+    let vault = ctx.secret_vault.clone();
+    let terminal_error_for_return = terminal_error.clone();
+    ctx.db
+        .transaction(move |conn| {
+            // A failed request is allowed to erase only the one-shot marker it
+            // installed itself. In particular, an unknown or cross-owner flow
+            // id must never become deletion authority over another principal's
+            // live OAuth exchange.
+            let vault_id = oauth_flow_vault_id(&flow_id);
+            let owns_exact_claim = match vault.get_item_on_conn(
+                conn,
+                cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                &vault_id,
+            ) {
+                Ok(bytes) => {
+                    let marker: DurableOAuthFlow = serde_json::from_slice(bytes.as_slice())?;
+                    match marker {
+                        DurableOAuthFlow::ProviderExchanging {
+                            owner: marker_owner,
+                            completion_client_operation_id,
+                            completion_request_hash,
+                            completion_fencing_generation,
+                            ..
+                        }
+                        | DurableOAuthFlow::McpExchanging {
+                            owner: marker_owner,
+                            completion_client_operation_id,
+                            completion_request_hash,
+                            completion_fencing_generation,
+                            ..
+                        } => {
+                            marker_owner == owner
+                                && completion_client_operation_id == client_operation_id
+                                && completion_request_hash == request_hash
+                                && completion_fencing_generation == fencing_generation
+                        }
+                        _ => false,
+                    }
+                }
+                Err(crate::secure_key::SecureKeyError::NotFound(_)) => false,
+                Err(error) => return Err(anyhow::anyhow!(error)),
+            };
+            if owns_exact_claim {
+                vault
+                    .mutate_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                        &vault_id,
+                        None,
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            let changed = conn.execute(
+                "UPDATE local_operation_receipts
+                 SET state=?5,terminal_outcome_json=?6,
+                     execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?7
+                 WHERE owner_digest=?1 AND client_operation_id=?2
+                   AND request_hash=?3 AND fencing_generation=?4
+                   AND state='executing'",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    terminal_state,
+                    error_json,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("OAuth exchange failure lost its receipt fence");
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
+    Ok(terminal_error_for_return)
+}
+
+/// Reconcile token commits that became durable before their owner receipt was
+/// acknowledged. The encrypted marker contains the exact admitted operation,
+/// keyed request identity, fence, and secret-free terminal response, so this
+/// runs before the generic interrupted-operation fail-closed sweep.
+pub(super) async fn recover_committed_oauth_settlements(
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let item_ids = ctx
+        .secret_vault
+        .list_item_ids(cockpit_db::secret_vault::SecretVaultKind::SealedState)
+        .map_err(|error| internal(anyhow::anyhow!(error)))?;
+    for item_id in item_ids
+        .into_iter()
+        .filter(|id| id.starts_with("oauth-flow:"))
+    {
+        let flow_id = item_id.trim_start_matches("oauth-flow:");
+        let Some(flow) = load_oauth_flow(ctx, flow_id)? else {
+            continue;
+        };
+        let settlement = match flow {
+            DurableOAuthFlow::Provider {
+                owner,
+                begin_client_operation_id,
+                begin_request_hash,
+                begin_fencing_generation,
+                expires_at_unix_ms,
+                ..
+            }
+            | DurableOAuthFlow::Mcp {
+                owner,
+                begin_client_operation_id,
+                begin_request_hash,
+                begin_fencing_generation,
+                expires_at_unix_ms,
+                ..
+            } if oauth_wall_ms() >= expires_at_unix_ms => {
+                expire_ready_oauth_flow(
+                    ctx,
+                    flow_id.to_owned(),
+                    owner,
+                    begin_client_operation_id,
+                    begin_request_hash,
+                    begin_fencing_generation,
+                )
+                .await?;
+                None
+            }
+            DurableOAuthFlow::ProviderCommitted {
+                owner,
+                completion_client_operation_id,
+                completion_request_hash,
+                completion_fencing_generation,
+                terminal_response,
+                ..
+            }
+            | DurableOAuthFlow::McpCommitted {
+                owner,
+                completion_client_operation_id,
+                completion_request_hash,
+                completion_fencing_generation,
+                terminal_response,
+                ..
+            } => Some((
+                owner,
+                completion_client_operation_id,
+                completion_request_hash,
+                completion_fencing_generation,
+                terminal_response,
+            )),
+            DurableOAuthFlow::ProviderExchanging {
+                owner,
+                completion_client_operation_id,
+                completion_request_hash,
+                completion_fencing_generation,
+                ..
+            }
+            | DurableOAuthFlow::McpExchanging {
+                owner,
+                completion_client_operation_id,
+                completion_request_hash,
+                completion_fencing_generation,
+                ..
+            } => {
+                let interruption = ErrorPayload {
+                    code: ErrorCode::Internal,
+                    message: "the daemon restarted before the OAuth exchange completed; the one-time flow was cancelled"
+                        .to_owned(),
+                };
+                let outcome_json = serde_json::to_string(&interruption).map_err(internal)?;
+                let vault = ctx.secret_vault.clone();
+                let vault_id = oauth_flow_vault_id(flow_id);
+                ctx.db
+                    .transaction(move |conn| {
+                        let changed = conn.execute(
+                            "UPDATE local_operation_receipts
+                             SET state='terminal_cancelled',terminal_outcome_json=?5,
+                                 execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                             WHERE owner_digest=?1 AND client_operation_id=?2
+                               AND request_hash=?3 AND fencing_generation=?4
+                               AND state='executing'",
+                            rusqlite::params![
+                                owner,
+                                completion_client_operation_id,
+                                completion_request_hash.as_slice(),
+                                completion_fencing_generation,
+                                outcome_json,
+                                oauth_wall_ms()
+                            ],
+                        )?;
+                        if changed != 1 {
+                            anyhow::bail!(
+                                "orphan OAuth exchange has no exact executing completion receipt"
+                            );
+                        }
+                        vault
+                            .mutate_item_on_conn(
+                                conn,
+                                cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                                &vault_id,
+                                None,
+                            )
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(internal)?;
+                None
+            }
+            _ => None,
+        };
+        let Some((owner, operation_id, request_hash, fence, response)) = settlement else {
+            continue;
+        };
+        finish_local_operation(
+            ctx,
+            owner,
+            operation_id,
+            request_hash,
+            fence,
+            response.as_ref(),
+        )
+        .await?;
+        delete_oauth_flow(ctx, flow_id)?;
+    }
+    Ok(())
+}
+
+fn load_oauth_flow(
+    ctx: &DaemonContext,
+    flow_id: &str,
+) -> std::result::Result<Option<DurableOAuthFlow>, ErrorPayload> {
+    match ctx.secret_vault.get_item(
+        cockpit_db::secret_vault::SecretVaultKind::SealedState,
+        &oauth_flow_vault_id(flow_id),
+    ) {
+        Ok(bytes) => {
+            let flow: DurableOAuthFlow =
+                serde_json::from_slice(bytes.as_slice()).map_err(internal)?;
+            // Expiry alone is not authority to destroy recovery evidence.
+            // Admission maintenance removes only unreferenced Ready flows;
+            // Exchanging/Committed and receipt-targeted rows remain
+            // reconcilable across restart.
+            Ok(Some(flow))
+        }
+        Err(crate::secure_key::SecureKeyError::NotFound(_)) => Ok(None),
+        Err(error) => Err(internal(anyhow::anyhow!(error))),
+    }
+}
+
+fn delete_oauth_flow(ctx: &DaemonContext, flow_id: &str) -> std::result::Result<(), ErrorPayload> {
+    ctx.secret_vault
+        .mutate_item(
+            cockpit_db::secret_vault::SecretVaultKind::SealedState,
+            &oauth_flow_vault_id(flow_id),
+            None,
+        )
+        .map_err(|error| internal(anyhow::anyhow!(error)))?;
+    Ok(())
 }
 
 const OAUTH_FLOW_TTL: Duration = Duration::from_secs(10 * 60);
 const OAUTH_FLOW_GLOBAL_CAPACITY: usize = 64;
 const OAUTH_FLOW_OWNER_CAPACITY: usize = 8;
 
+fn local_operation_secret_request_hash<T: serde::Serialize>(
+    ctx: &DaemonContext,
+    domain: &'static [u8],
+    request: &T,
+) -> std::result::Result<[u8; 32], ErrorPayload> {
+    let encoded = zeroize::Zeroizing::new(serde_json::to_vec(request).map_err(internal)?);
+    Ok(ctx
+        .secret_vault
+        .keyed_request_identity(domain, encoded.as_slice()))
+}
+
 struct StoredProviderOAuthFlow {
     owner: String,
+    begin_client_operation_id: String,
+    authorize_url: String,
+    user_code: Option<String>,
     created_at: Instant,
     flow: ProviderOAuthFlow,
 }
 
 struct StoredMcpOAuthFlow {
     owner: String,
+    begin_client_operation_id: String,
+    authorize_url: String,
     created_at: Instant,
-    flow: McpOAuthPending,
+    flow: McpOAuthFlow,
+}
+
+enum McpOAuthFlow {
+    Ready(McpOAuthPending),
+    Completing {
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
 }
 
 /// Daemon-owned OAuth state. Keeping this on the context prevents one daemon
@@ -139,6 +1346,14 @@ impl OAuthFlowStore {
     fn purge_mcp(flows: &mut std::collections::HashMap<String, StoredMcpOAuthFlow>) {
         let now = Instant::now();
         flows.retain(|_, flow| now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL);
+    }
+
+    /// Drop expired process-local mirrors without creating or replaying a
+    /// flow. The durable sealed marker remains authoritative and is settled
+    /// separately by [`maintain_durable_oauth_flows`].
+    async fn maintain(&self) {
+        Self::purge_provider(&mut self.provider.lock().await);
+        Self::purge_mcp(&mut self.mcp.lock().await);
     }
 
     fn evict_oldest_provider(
@@ -169,7 +1384,15 @@ impl OAuthFlowStore {
         }
     }
 
-    async fn insert_provider(&self, id: String, owner: String, flow: ProviderOAuthFlow) {
+    async fn insert_provider(
+        &self,
+        id: String,
+        owner: String,
+        begin_client_operation_id: String,
+        authorize_url: String,
+        user_code: Option<String>,
+        flow: ProviderOAuthFlow,
+    ) {
         let mut flows = self.provider.lock().await;
         Self::purge_provider(&mut flows);
         if flows.values().filter(|flow| flow.owner == owner).count() >= OAUTH_FLOW_OWNER_CAPACITY {
@@ -187,30 +1410,122 @@ impl OAuthFlowStore {
             id,
             StoredProviderOAuthFlow {
                 owner,
+                begin_client_operation_id,
+                authorize_url,
+                user_code,
                 created_at: Instant::now(),
                 flow,
             },
         );
     }
 
-    async fn take_provider(&self, id: &str, owner: &str) -> Option<ProviderOAuthFlow> {
+    async fn provider_started(
+        &self,
+        owner: &str,
+        begin_id: &str,
+    ) -> Option<(String, String, Option<String>)> {
         let mut flows = self.provider.lock().await;
         Self::purge_provider(&mut flows);
-        (flows.get(id).is_some_and(|flow| flow.owner == owner))
-            .then(|| flows.remove(id).expect("flow checked above").flow)
+        flows
+            .iter()
+            .find(|(_, flow)| flow.owner == owner && flow.begin_client_operation_id == begin_id)
+            .map(|(id, flow)| {
+                (
+                    id.clone(),
+                    flow.authorize_url.clone(),
+                    flow.user_code.clone(),
+                )
+            })
     }
 
-    async fn restore_provider(&self, id: String, owner: String, flow: ProviderOAuthFlow) {
-        self.insert_provider(id, owner, flow).await;
+    async fn claim_provider(
+        &self,
+        id: &str,
+        owner: &str,
+    ) -> Option<(
+        ProviderOAuthReady,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )> {
+        let mut flows = self.provider.lock().await;
+        Self::purge_provider(&mut flows);
+        let stored = flows.get_mut(id).filter(|flow| flow.owner == owner)?;
+        let ProviderOAuthFlow::Ready(ready) = &stored.flow else {
+            return None;
+        };
+        let ready = ready.clone();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        stored.flow = ProviderOAuthFlow::Completing {
+            cancelled: cancelled.clone(),
+        };
+        Some((ready, cancelled))
+    }
+
+    async fn restore_provider(&self, id: &str, owner: &str, flow: ProviderOAuthReady) {
+        let mut flows = self.provider.lock().await;
+        if let Some(stored) = flows.get_mut(id).filter(|flow| flow.owner == owner) {
+            stored.flow = ProviderOAuthFlow::Ready(flow);
+        }
+    }
+
+    async fn resolve_provider_id(
+        &self,
+        id: Option<&str>,
+        begin_id: &str,
+        owner: &str,
+    ) -> Option<String> {
+        let mut flows = self.provider.lock().await;
+        Self::purge_provider(&mut flows);
+        id.filter(|id| {
+            flows.get(*id).is_some_and(|flow| {
+                flow.owner == owner && flow.begin_client_operation_id == begin_id
+            })
+        })
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            flows
+                .iter()
+                .find(|(_, flow)| flow.owner == owner && flow.begin_client_operation_id == begin_id)
+                .map(|(id, _)| id.clone())
+        })
+    }
+
+    async fn cancel_provider(&self, id: &str, owner: &str) -> bool {
+        let mut flows = self.provider.lock().await;
+        Self::purge_provider(&mut flows);
+        let Some(stored) = flows.get(id).filter(|flow| flow.owner == owner) else {
+            return false;
+        };
+        if let ProviderOAuthFlow::Completing { cancelled } = &stored.flow {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        flows.remove(id).is_some()
     }
 
     async fn remove_provider(&self, id: &str, owner: &str) -> bool {
-        let mut flows = self.provider.lock().await;
-        Self::purge_provider(&mut flows);
-        flows.get(id).is_some_and(|flow| flow.owner == owner) && flows.remove(id).is_some()
+        self.cancel_provider(id, owner).await
     }
 
-    async fn insert_mcp(&self, id: String, owner: String, flow: McpOAuthPending) {
+    /// Remove an already-terminal flow without tripping its cancellation
+    /// fence. Callers must hold the owner commit lock and must have observed a
+    /// matching durable committed marker first.
+    async fn remove_terminal_provider(&self, id: &str, owner: &str) -> bool {
+        let mut flows = self.provider.lock().await;
+        flows
+            .get(id)
+            .is_some_and(|flow| flow.owner == owner)
+            .then(|| flows.remove(id))
+            .flatten()
+            .is_some()
+    }
+
+    async fn insert_mcp(
+        &self,
+        id: String,
+        owner: String,
+        begin_client_operation_id: String,
+        authorize_url: String,
+        flow: McpOAuthPending,
+    ) {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
         if flows.values().filter(|flow| flow.owner == owner).count() >= OAUTH_FLOW_OWNER_CAPACITY {
@@ -228,31 +1543,100 @@ impl OAuthFlowStore {
             id,
             StoredMcpOAuthFlow {
                 owner,
+                begin_client_operation_id,
+                authorize_url,
                 created_at: Instant::now(),
-                flow,
+                flow: McpOAuthFlow::Ready(flow),
             },
         );
     }
 
-    async fn take_mcp(&self, id: &str, owner: &str) -> Option<McpOAuthPending> {
+    async fn mcp_started(&self, owner: &str, begin_id: &str) -> Option<(String, String)> {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
-        (flows.get(id).is_some_and(|flow| flow.owner == owner))
-            .then(|| flows.remove(id).expect("flow checked above").flow)
+        flows
+            .iter()
+            .find(|(_, flow)| flow.owner == owner && flow.begin_client_operation_id == begin_id)
+            .map(|(id, flow)| (id.clone(), flow.authorize_url.clone()))
+    }
+
+    async fn claim_mcp(
+        &self,
+        id: &str,
+        owner: &str,
+    ) -> Option<(
+        McpOAuthPending,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )> {
+        let mut flows = self.mcp.lock().await;
+        Self::purge_mcp(&mut flows);
+        let stored = flows.get_mut(id).filter(|flow| flow.owner == owner)?;
+        let flow = std::mem::replace(
+            &mut stored.flow,
+            McpOAuthFlow::Completing {
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        let McpOAuthFlow::Ready(pending) = flow else {
+            return None;
+        };
+        let McpOAuthFlow::Completing { cancelled } = &stored.flow else {
+            unreachable!()
+        };
+        Some((pending, cancelled.clone()))
+    }
+
+    async fn resolve_mcp_id(
+        &self,
+        id: Option<&str>,
+        begin_id: &str,
+        owner: &str,
+    ) -> Option<String> {
+        let mut flows = self.mcp.lock().await;
+        Self::purge_mcp(&mut flows);
+        id.filter(|id| {
+            flows.get(*id).is_some_and(|flow| {
+                flow.owner == owner && flow.begin_client_operation_id == begin_id
+            })
+        })
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            flows
+                .iter()
+                .find(|(_, flow)| flow.owner == owner && flow.begin_client_operation_id == begin_id)
+                .map(|(id, _)| id.clone())
+        })
     }
 
     async fn remove_mcp(&self, id: &str, owner: &str) -> bool {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
-        flows.get(id).is_some_and(|flow| flow.owner == owner) && flows.remove(id).is_some()
+        let Some(stored) = flows.get(id).filter(|flow| flow.owner == owner) else {
+            return false;
+        };
+        if let McpOAuthFlow::Completing { cancelled } = &stored.flow {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        flows.remove(id).is_some()
+    }
+
+    async fn remove_terminal_mcp(&self, id: &str, owner: &str) -> bool {
+        let mut flows = self.mcp.lock().await;
+        flows
+            .get(id)
+            .is_some_and(|flow| flow.owner == owner)
+            .then(|| flows.remove(id))
+            .flatten()
+            .is_some()
     }
 }
 
 fn oauth_owner(state: &MutableClientState) -> String {
-    state
-        .principal
-        .tag()
-        .unwrap_or_else(|| "local-owner".to_string())
+    // OAuth and the rest of owner-scoped settings must share one durable
+    // settlement namespace.  A connection-local/tag spelling made a lost
+    // OAuth response unqueryable after reconnect even though the authenticated
+    // principal was unchanged.
+    stable_authenticated_principal(state)
 }
 
 /// Authentic "this request may perform LOCAL-HOST actions" signal for handlers
@@ -313,14 +1697,79 @@ mod oauth_store_tests {
                 .insert_provider(
                     format!("flow-{index}"),
                     "owner-a".to_string(),
-                    ProviderOAuthFlow::Completing,
+                    format!("begin-{index}"),
+                    "https://example.test".into(),
+                    None,
+                    ProviderOAuthFlow::Completing {
+                        cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    },
                 )
                 .await;
         }
 
-        assert!(store.take_provider("flow-0", "owner-a").await.is_none());
-        assert!(store.take_provider("flow-1", "owner-b").await.is_none());
-        assert!(store.take_provider("flow-8", "owner-a").await.is_some());
+        assert!(
+            store
+                .resolve_provider_id(Some("flow-0"), "begin-0", "owner-a")
+                .await
+                .is_none()
+        );
+        assert!(
+            store
+                .resolve_provider_id(Some("flow-1"), "begin-1", "owner-b")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .resolve_provider_id(Some("flow-8"), "begin-8", "owner-a")
+                .await
+                .as_deref(),
+            Some("flow-8")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_fences_an_inflight_provider_completion() {
+        let store = OAuthFlowStore::new();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        store
+            .insert_provider(
+                "flow".into(),
+                "owner".into(),
+                "begin".into(),
+                "https://example.test".into(),
+                None,
+                ProviderOAuthFlow::Completing {
+                    cancelled: cancelled.clone(),
+                },
+            )
+            .await;
+        assert!(store.cancel_provider("flow", "owner").await);
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn durable_oauth_contract_is_expiring_fenced_and_secret_safe() {
+        let source = include_str!("dispatch.rs");
+        for required in [
+            "created_at_unix_ms",
+            "expires_at_unix_ms",
+            "ProviderExchanging",
+            "McpExchanging",
+            "purge_durable_oauth_flows",
+            "local_operation_secret_request_hash",
+            "keyed_request_identity",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing OAuth durability guard: {required}"
+            );
+        }
+        assert!(source.contains("authorize_url: String::new()"));
+        assert!(source.contains("user_code: None"));
+        assert!(source.contains("provider-oauth/complete/v1\\0"));
+        assert!(source.contains("mcp-oauth/complete/v1\\0"));
+        assert!(source.contains("finish_local_operation_error("));
     }
 }
 
@@ -1562,12 +3011,27 @@ async fn mutate_owner_vault_item_with_remote_ledger(
         .db
         .transaction(move |conn| {
             match plaintext.as_deref() {
-                Some(value) => vault
-                    .put_item_on_conn(conn, kind, &item_id, value)
-                    .map_err(|error| anyhow::anyhow!(error))?,
-                None => vault
-                    .delete_item_on_conn(conn, kind, &item_id)
-                    .map_err(|error| anyhow::anyhow!(error))?,
+                Some(value) => {
+                    let unchanged = match vault.get_item_on_conn(conn, kind, &item_id) {
+                        Ok(current) => current.as_slice() == value,
+                        Err(crate::secure_key::SecureKeyError::NotFound(_)) => false,
+                        Err(error) => return Err(anyhow::anyhow!(error)),
+                    };
+                    if !unchanged {
+                        vault
+                            .put_item_on_conn(conn, kind, &item_id, value)
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                    }
+                }
+                None => {
+                    match vault.get_item_on_conn(conn, kind, &item_id) {
+                        Ok(_) => vault
+                            .delete_item_on_conn(conn, kind, &item_id)
+                            .map_err(|error| anyhow::anyhow!(error))?,
+                        Err(crate::secure_key::SecureKeyError::NotFound(_)) => {}
+                        Err(error) => return Err(anyhow::anyhow!(error)),
+                    }
+                }
             }
             if let Some(server_url) = disable_org_sync_for.as_deref() {
                 cockpit_db::Db::mark_org_sync_disabled_on_conn(conn, server_url, now_ms)?;
@@ -2250,76 +3714,74 @@ async fn dispatch_image_control_read(
     if project_root.trim().is_empty() {
         return Err(bad_request("project_root must not be empty"));
     }
-    let cwd = std::path::PathBuf::from(&project_root);
+    let _publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    let cwd = std::fs::canonicalize(&project_root)
+        .map_err(|_| bad_request("project_root must identify an existing canonical workspace"))?;
     let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
         .await
         .map_err(internal)?;
-    let (_, extended) = ctx
-        .config_source
-        .load_effective_for_daemon(&cwd, &trust_policy)
+    let layer = image_control_mutations::authoritative_image_layer(ctx, &cwd, &trust_policy)
         .map_err(internal)?;
-    let cfg = &extended.image_generation;
-    let generation = inventory::current_config_generation().to_string();
+    let cfg = &layer.registry;
+    let config_generation = inventory::current_config_generation();
+    let generation = config_generation.to_string();
     let daemon_instance_id = inventory::daemon_instance_id().to_string();
-    match request {
+    let canonical_project_root = cwd.to_string_lossy().into_owned();
+    let target_path = layer.target.to_string_lossy().into_owned();
+    let mutation_capability = image_control_mutations::mint_mutation_capability(
+        ctx,
+        &cwd,
+        &layer.target,
+        &layer.revision,
+        config_generation,
+    )
+    .map_err(internal)?;
+    let authority = image_control_reads::ImageControlReadAuthority {
+        daemon_instance_id,
+        requested_project_root: project_root.clone(),
+        canonical_project_root,
+        target_path,
+        target_revision: layer.revision.clone(),
+        mutation_capability,
+        config_generation,
+    };
+    let response = match request {
         Request::ImageEndpointList { limit, cursor, .. } => image_control_reads::endpoint_list(
             cfg,
             &generation,
-            daemon_instance_id,
-            project_root,
+            &authority,
             limit,
             cursor.as_deref(),
-        )
-        .map(Response::ImageControlRead),
-        Request::ImageEndpointGet { endpoint_id, .. } => image_control_reads::endpoint_get(
-            cfg,
-            &generation,
-            daemon_instance_id,
-            project_root,
-            &endpoint_id,
-        )
-        .map(Response::ImageControlRead),
-        Request::ImageTargetList { limit, cursor, .. } => image_control_reads::target_list(
-            cfg,
-            &generation,
-            daemon_instance_id,
-            project_root,
-            limit,
-            cursor.as_deref(),
-        )
-        .map(Response::ImageControlRead),
-        Request::ImageTargetGet { target_id, .. } => image_control_reads::target_get(
-            cfg,
-            &generation,
-            daemon_instance_id,
-            project_root,
-            &target_id,
-        )
-        .map(Response::ImageControlRead),
+        ),
+        Request::ImageEndpointGet { endpoint_id, .. } => {
+            image_control_reads::endpoint_get(cfg, &generation, &authority, &endpoint_id)
+        }
+        Request::ImageTargetList { limit, cursor, .. } => {
+            image_control_reads::target_list(cfg, &generation, &authority, limit, cursor.as_deref())
+        }
+        Request::ImageTargetGet { target_id, .. } => {
+            image_control_reads::target_get(cfg, &generation, &authority, &target_id)
+        }
         Request::ImageWorkflowList { limit, cursor, .. } => image_control_reads::workflow_list(
             cfg,
             &generation,
-            daemon_instance_id,
-            project_root,
+            &authority,
             limit,
             cursor.as_deref(),
-        )
-        .map(Response::ImageControlRead),
-        Request::ImageWorkflowGet { workflow_id, .. } => image_control_reads::workflow_get(
-            cfg,
-            &generation,
-            daemon_instance_id,
-            project_root,
-            &workflow_id,
-        )
-        .map(Response::ImageControlRead),
+        ),
+        Request::ImageWorkflowGet { workflow_id, .. } => {
+            image_control_reads::workflow_get(cfg, &generation, &authority, &workflow_id)
+        }
         // The project_root pre-match already rejected any non-image-control
         // variant, so this arm is unreachable.
-        other => Err(internal(format!(
-            "dispatch_image_control_read called with non-image-control request `{}`",
-            principal::request_kind(&other)
-        ))),
-    }
+        other => {
+            return Err(internal(format!(
+                "dispatch_image_control_read called with non-image-control request `{}`",
+                principal::request_kind(&other)
+            )));
+        }
+    }?;
+    Ok(Response::ImageControlRead(response))
 }
 
 async fn handle_serialized_request_impl(
@@ -4283,9 +5745,13 @@ async fn handle_serialized_request_impl(
             finish_nonrepeatable_response!(remote_operation, ctx, "upsert_assistant", response)
         }
         Request::SaveAssistantDefinition {
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
             name,
             markdown,
             expected_revision,
+            expected_config_generation,
         } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
@@ -4297,26 +5763,213 @@ async fn handle_serialized_request_impl(
             if markdown.len() > proto::MAX_AGENT_MARKDOWN_BYTES {
                 return Err(bad_request("assistant markdown exceeds maximum length"));
             }
-            let row = ctx
-                .db
-                .get_assistant(&name)
-                .await
-                .map_err(internal)?
-                .ok_or_else(|| bad_request(format!("assistant `{name}` was not found")))?;
-            crate::assistants::save_definition_cas(&ctx.db, row, markdown, &expected_revision)
-                .await
-                .map_err(|error| ErrorPayload {
-                    code: ErrorCode::Conflict,
-                    message: format!("assistant definition save rejected: {error:#}"),
-                })?;
-            let assistant = crate::assistants::snapshot(&ctx.db, &name)
-                .await
-                .map_err(internal)?
-                .ok_or_else(|| internal("assistant disappeared after definition save"))?;
-            Ok(Response::AssistantDefinitionSaved {
-                assistant: assistant_snapshot_to_proto(assistant),
-                consumed_definition_revision: expected_revision,
-            })
+            let expected_intent = cockpit_proto::assistant_mutation_intent_hash(
+                &project_root,
+                "save",
+                &name,
+                &expected_revision,
+                Some(&markdown),
+            );
+            if mutation_intent_hash != expected_intent {
+                return Err(bad_request("assistant mutation intent hash is invalid"));
+            }
+            let requested_project_root = project_root;
+            let project_root =
+                crate::daemon::fs_api::canonical_project_root(&requested_project_root)?;
+            let owner = stable_authenticated_principal(state);
+            let request_hash = assistant_mutation_request_identity(
+                ctx,
+                &requested_project_root,
+                "save",
+                &name,
+                &expected_revision,
+                Some(&markdown),
+                expected_config_generation,
+            )?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "save_assistant_definition",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let _publication = inventory::write_authority_publication().await;
+            let consumed_config_generation = inventory::current_config_generation();
+            if consumed_config_generation != expected_config_generation {
+                let error =
+                    conflict("assistant authority generation changed; reload the paired inventory");
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            let row = match ctx.db.get_assistant(&name).await {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    let error = bad_request("assistant was not found");
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Err(source) => {
+                    let error = internal(source);
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            let current = match crate::assistants::snapshot(&ctx.db, &name).await {
+                Ok(Some(current)) => current,
+                Ok(None) => {
+                    let error = bad_request("assistant was not found");
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Err(source) => {
+                    let error = internal(source);
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            if current.definition_revision.as_deref() != Some(expected_revision.as_str()) {
+                let error = conflict("assistant definition changed; reload before saving");
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            if let Err(error) = begin_assistant_mutation_journal(
+                ctx,
+                owner.clone(),
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
+                mutation_intent_hash.clone(),
+                requested_project_root.clone(),
+                project_root.clone(),
+                name.clone(),
+                "save",
+                expected_revision.clone(),
+                Some(ctx.secret_vault.keyed_request_identity(
+                    b"flycockpit.assistant.intended-markdown.v1",
+                    markdown.as_bytes(),
+                )),
+                consumed_config_generation,
+            )
+            .await
+            {
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            let updated = match crate::assistants::save_definition_cas(
+                &ctx.db,
+                row,
+                markdown.clone(),
+                &expected_revision,
+            )
+            .await
+            {
+                Ok(updated) => updated,
+                Err(error) => {
+                    recover_assistant_mutation_journals(ctx).await?;
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: format!("assistant definition save rejected: {error:#}"),
+                    });
+                }
+            };
+            let result_revision = crate::assistants::definition_revision(&updated, &markdown);
+            let (assistant, outcome) = match crate::assistants::snapshot(&ctx.db, &name).await {
+                Ok(Some(snapshot)) => (
+                    Some(assistant_snapshot_to_proto(snapshot)),
+                    cockpit_proto::AgentMutationOutcome::Reconciled,
+                ),
+                Ok(None) | Err(_) => (
+                    None,
+                    cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                        warning: "assistant definition committed; refresh is required".into(),
+                    },
+                ),
+            };
+            let result_config_generation = inventory::publish_committed_config_generation();
+            let response = Response::AssistantDefinitionSaved {
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash,
+                project_root,
+                requested_project_root,
+                name,
+                assistant,
+                consumed_revision: expected_revision,
+                result_revision,
+                consumed_config_generation,
+                result_config_generation,
+                outcome,
+            };
+            finish_assistant_mutation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
+            Ok(response)
         }
 
         Request::AddPackage {
@@ -4556,40 +6209,183 @@ async fn handle_serialized_request_impl(
         }
 
         Request::DeleteAssistant {
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
             name,
             expected_revision,
+            expected_config_generation,
         } => {
-            #[cfg(feature = "remote")]
-            let request = Request::DeleteAssistant {
-                name: name.clone(),
-                expected_revision: expected_revision.clone(),
-            };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
                 ));
             }
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) =
-                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
-                        .await?
+            let expected_intent = cockpit_proto::assistant_mutation_intent_hash(
+                &project_root,
+                "delete",
+                &name,
+                &expected_revision,
+                None,
+            );
+            if mutation_intent_hash != expected_intent {
+                return Err(bad_request("assistant mutation intent hash is invalid"));
+            }
+            let requested_project_root = project_root;
+            let project_root =
+                crate::daemon::fs_api::canonical_project_root(&requested_project_root)?;
+            let owner = stable_authenticated_principal(state);
+            let request_hash = assistant_mutation_request_identity(
+                ctx,
+                &requested_project_root,
+                "delete",
+                &name,
+                &expected_revision,
+                None,
+                expected_config_generation,
+            )?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "delete_assistant",
+                request_hash,
+            )
+            .await?
             {
-                return Ok(response);
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let _publication = inventory::write_authority_publication().await;
+            let consumed_config_generation = inventory::current_config_generation();
+            if consumed_config_generation != expected_config_generation {
+                let error =
+                    conflict("assistant authority generation changed; reload the paired inventory");
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            let current = match crate::assistants::snapshot(&ctx.db, &name).await {
+                Ok(Some(current)) => current,
+                Ok(None) => {
+                    let error = conflict("assistant changed or no longer exists");
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Err(source) => {
+                    let error = internal(source);
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            if crate::assistants::registration_revision(&current.row) != expected_revision {
+                let error = conflict("assistant registration changed; reload before deleting");
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            if let Err(error) = begin_assistant_mutation_journal(
+                ctx,
+                owner.clone(),
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
+                mutation_intent_hash.clone(),
+                requested_project_root.clone(),
+                project_root.clone(),
+                name.clone(),
+                "delete",
+                expected_revision.clone(),
+                None,
+                consumed_config_generation,
+            )
+            .await
+            {
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
             }
             let deleted =
-                crate::assistants::delete_registration(&ctx.db, &name, &expected_revision)
+                match crate::assistants::delete_registration(&ctx.db, &name, &expected_revision)
                     .await
-                    .map_err(|error| conflict(format!("assistant deletion rejected: {error:#}")))?;
+                {
+                    Ok(deleted) => deleted,
+                    Err(error) => {
+                        recover_assistant_mutation_journals(ctx).await?;
+                        return Err(conflict(format!("assistant deletion rejected: {error:#}")));
+                    }
+                };
             if !deleted {
+                recover_assistant_mutation_journals(ctx).await?;
                 return Err(conflict("assistant changed or no longer exists"));
             }
+            let tombstone_material =
+                zeroize::Zeroizing::new(format!("{name}\0{expected_revision}").into_bytes());
+            let result_revision =
+                crate::intel::hex_lower(&ctx.secret_vault.keyed_request_identity(
+                    b"flycockpit.assistant.delete-tombstone.v1",
+                    tombstone_material.as_slice(),
+                ));
+            let result_config_generation = inventory::publish_committed_config_generation();
             let response = Response::AssistantDeleted {
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash,
+                project_root,
+                requested_project_root,
                 name,
-                consumed_registration_revision: expected_revision,
-                deleted,
+                consumed_revision: expected_revision,
+                result_revision,
+                consumed_config_generation,
+                result_config_generation,
+                outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
             };
-            finish_nonrepeatable_response!(remote_operation, ctx, "delete_assistant", response)
+            finish_assistant_mutation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
+            Ok(response)
         }
 
         Request::RepairMediaReservation {
@@ -5059,21 +6855,73 @@ async fn handle_serialized_request_impl(
         }
 
         Request::MutateAgent {
+            client_operation_id,
+            mutation_intent_hash,
             project_root,
             mutation,
             expected_revision,
         } => {
-            crate::daemon::agent_management::mutate(ctx, project_root, mutation, expected_revision)
-                .await
+            let owner = agent_editor_lease_owner(state);
+            let expected_intent = cockpit_proto::agent_mutation_intent_hash(
+                &project_root,
+                &mutation,
+                expected_revision.as_deref(),
+            );
+            if mutation_intent_hash != expected_intent {
+                return Err(bad_request("agent mutation intent hash is invalid"));
+            }
+            let request_material = zeroize::Zeroizing::new(
+                serde_json::to_vec(&(&project_root, &mutation, expected_revision.as_deref()))
+                    .map_err(internal)?,
+            );
+            let request_hash = ctx.secret_vault.keyed_request_identity(
+                b"flycockpit.agent-mutation.request.v2",
+                request_material.as_slice(),
+            );
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "mutate_agent",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let result = crate::daemon::agent_management::mutate(
+                ctx,
+                owner.clone(),
+                client_operation_id.clone(),
+                mutation_intent_hash,
+                request_hash,
+                fencing_generation,
+                project_root,
+                mutation,
+                expected_revision,
+            )
+            .await;
+            terminalize_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                async { result },
+            )
+            .await
         }
 
         Request::BeginAgentEditorLease {
+            client_operation_id,
             project_root,
             name,
             expected_revision,
         } => {
             crate::daemon::agent_management::begin_editor_lease(
                 ctx,
+                client_operation_id.clone(),
                 project_root,
                 name,
                 expected_revision,
@@ -5083,15 +6931,32 @@ async fn handle_serialized_request_impl(
         }
 
         Request::CompleteAgentEditorLease {
+            client_operation_id,
             project_root,
             lease_id,
             markdown,
         } => {
             crate::daemon::agent_management::complete_editor_lease(
                 ctx,
+                client_operation_id,
                 project_root,
                 lease_id,
                 markdown,
+                agent_editor_lease_owner(state),
+            )
+            .await
+        }
+
+        Request::GetAgentEditorLeaseSettlement {
+            client_operation_id,
+            project_root,
+            lease_id,
+        } => {
+            crate::daemon::agent_management::editor_lease_settlement(
+                ctx,
+                client_operation_id,
+                project_root,
+                lease_id,
                 agent_editor_lease_owner(state),
             )
             .await
@@ -5111,20 +6976,57 @@ async fn handle_serialized_request_impl(
         }
 
         Request::ApplyExtendedConfigPatch {
+            client_operation_id,
             project_root,
             layer_id,
             patch,
             expected_revision,
             snapshot_session_id,
         } => {
-            crate::daemon::fs_api::apply_extended_config_patch(
+            let owner = settings_capability_owner(state);
+            let request_hash = local_operation_secret_request_hash(
                 ctx,
+                b"flycockpit/local-operation/extended-config-patch/v1\0",
+                &(
+                    "apply_extended_config_patch",
+                    &project_root,
+                    &layer_id,
+                    &patch,
+                    &expected_revision,
+                    &snapshot_session_id,
+                ),
+            )?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "apply_extended_config_patch",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let operation = crate::daemon::fs_api::apply_extended_config_patch(
+                ctx,
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
                 project_root,
                 layer_id,
                 patch,
                 expected_revision,
-                settings_capability_owner(state),
+                owner.clone(),
                 snapshot_session_id,
+            );
+            terminalize_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                operation,
             )
             .await
         }
@@ -5279,16 +7181,104 @@ async fn handle_serialized_request_impl(
         | Request::ImageWorkflowUpload { .. }
         | Request::ImageWorkflowBind { .. }
         | Request::ImageWorkflowDelete { .. } => {
-            image_control_mutations::dispatch_image_control_mutation(ctx, request).await
+            let client_operation_id = match &request {
+                Request::ImageEndpointCreate {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageEndpointUpdate {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageEndpointDelete {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageTargetCreate {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageTargetUpdate {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageTargetDelete {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageTargetSetDefault {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageWorkflowUpload {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageWorkflowBind {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageWorkflowDelete {
+                    client_operation_id,
+                    ..
+                } => client_operation_id.clone(),
+                _ => unreachable!(),
+            };
+            let owner = settings_capability_owner(state);
+            let request_hash = local_operation_secret_request_hash(
+                ctx,
+                b"flycockpit/local-operation/image-config-mutation/v1\0",
+                &request,
+            )?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "image_config_mutation",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let operation = image_control_mutations::dispatch_image_control_mutation(
+                ctx,
+                request,
+                owner.clone(),
+                request_hash,
+                fencing_generation,
+            );
+            let result = terminalize_local_operation(
+                ctx,
+                owner.clone(),
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
+                operation,
+            )
+            .await;
+            if result.is_ok() {
+                ctx.db.write(move |conn| {
+                    conn.execute(
+                        "DELETE FROM image_config_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2",
+                        rusqlite::params![owner, client_operation_id],
+                    )?;
+                    Ok(())
+                }).await.map_err(internal)?;
+            }
+            result
         }
 
         Request::SaveImageSpendPolicy {
+            client_operation_id,
             project_key,
             settings_json,
             expected_policy_version,
         } => {
             #[cfg(feature = "remote")]
             let request = Request::SaveImageSpendPolicy {
+                client_operation_id: client_operation_id.clone(),
                 project_key: project_key.clone(),
                 settings_json: settings_json.clone(),
                 expected_policy_version,
@@ -5301,31 +7291,138 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let mutation = async {
-                let settings =
-                    serde_json::from_str(&settings_json).map_err(|error| ErrorPayload {
-                        code: ErrorCode::BadRequest,
-                        message: format!("invalid image spend settings: {error}"),
-                    })?;
-                let saved = cockpit_config::config::image_spend::activate_saved_policy(
-                    &ctx.db,
-                    project_key,
-                    settings,
-                    expected_policy_version,
-                    chrono::Utc::now().timestamp_millis(),
-                )
-                .await
-                .map_err(internal)?;
-                Ok(Response::ImageSpendPolicySaved {
-                    policy_version: saved.policy_version,
-                })
-            };
-            finish_provider_mutation_future!(
-                remote_operation,
-                ctx,
+            #[cfg(feature = "remote")]
+            if remote_operation.is_some() {
+                let remote_hash =
+                    local_operation_request_hash(&(
+                        "save_image_spend_policy",
+                        &project_key,
+                        serde_json::from_str::<
+                            cockpit_config::config::image_spend::ImageSpendSettings,
+                        >(&settings_json)
+                        .map_err(|error| ErrorPayload {
+                            code: ErrorCode::BadRequest,
+                            message: format!("invalid image spend settings: {error}"),
+                        })?,
+                        expected_policy_version,
+                    ))?;
+                let operation_id = client_operation_id.clone();
+                let project = project_key.clone();
+                let mutation = async {
+                    let settings =
+                        serde_json::from_str(&settings_json).map_err(|error| ErrorPayload {
+                            code: ErrorCode::BadRequest,
+                            message: format!("invalid image spend settings: {error}"),
+                        })?;
+                    let saved = cockpit_config::config::image_spend::activate_saved_policy(
+                        &ctx.db,
+                        project.clone(),
+                        settings,
+                        expected_policy_version,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .map_err(internal)?;
+                    Ok(Response::ImageSpendPolicySaved {
+                        client_operation_id: operation_id,
+                        project_key: project,
+                        request_hash: local_operation_request_hash_hex(&remote_hash),
+                        consumed_policy_version: expected_policy_version,
+                        result_policy_version: saved.policy_version,
+                    })
+                };
+                return finish_provider_mutation_future!(
+                    remote_operation,
+                    ctx,
+                    "save_image_spend_policy",
+                    mutation
+                );
+            }
+            let settings: cockpit_config::config::image_spend::ImageSpendSettings =
+                serde_json::from_str(&settings_json).map_err(|error| ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: format!("invalid image spend settings: {error}"),
+                })?;
+            settings.validate().map_err(|error| ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: format!("invalid image spend settings: {error}"),
+            })?;
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash = local_operation_request_hash(&(
                 "save_image_spend_policy",
-                mutation
+                &project_key,
+                &settings,
+                expected_policy_version,
+            ))?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "save_image_spend_policy",
+                request_hash,
             )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let owner = settlement_owner.clone();
+            let operation_id = client_operation_id.clone();
+            let project = project_key.clone();
+            let hash_hex = local_operation_request_hash_hex(&request_hash);
+            let result = ctx
+                .db
+                .transaction(move |conn| {
+                    let result_policy_version = cockpit_db::Db::save_image_spend_policy_conn(
+                        conn,
+                        &project,
+                        &settings,
+                        expected_policy_version,
+                        chrono::Utc::now().timestamp_millis(),
+                    )?;
+                    let response = Response::ImageSpendPolicySaved {
+                        client_operation_id: operation_id.clone(),
+                        project_key: project,
+                        request_hash: hash_hex,
+                        consumed_policy_version: expected_policy_version,
+                        result_policy_version,
+                    };
+                    let receipt_json = serde_json::to_string(&response)?;
+                    let settled = conn.execute(
+                        "UPDATE local_operation_receipts
+                         SET state='terminal_success',terminal_outcome_json=?5,
+                             execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                         WHERE owner_digest=?1 AND client_operation_id=?2
+                           AND request_hash=?3 AND fencing_generation=?4
+                           AND state='executing'",
+                        rusqlite::params![
+                            owner,
+                            operation_id,
+                            request_hash.as_slice(),
+                            fencing_generation,
+                            receipt_json,
+                            chrono::Utc::now().timestamp_millis()
+                        ],
+                    )?;
+                    if settled != 1 {
+                        anyhow::bail!("image spend policy save lost its receipt fence");
+                    }
+                    Ok(response)
+                })
+                .await
+                .map_err(internal);
+            if let Err(error) = &result {
+                finish_local_operation_error(
+                    ctx,
+                    settlement_owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    error,
+                )
+                .await?;
+            }
+            result
         }
 
         Request::FsCreateDir { project_root, path } => {
@@ -7200,64 +9297,119 @@ async fn handle_serialized_request_impl(
             }
         }
 
-        Request::PutSubscriptionAck { provider_id } => {
-            #[cfg(feature = "remote")]
-            let request = Request::PutSubscriptionAck {
-                provider_id: provider_id.clone(),
-            };
+        Request::PutSubscriptionAck {
+            client_operation_id,
+            provider_id,
+        } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent subscription acknowledgement writes",
                 ));
             }
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) =
-                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
-                        .await?
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash =
+                local_operation_request_hash(&("put_subscription_ack", &provider_id))?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "put_subscription_ack",
+                request_hash,
+            )
+            .await?
             {
-                return Ok(response);
-            }
-            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
-            let item_id = format!("{}{}", crate::auth::subscription_ack::PREFIX, provider_id);
-            let payload = serde_json::to_vec(&serde_json::Value::Bool(true)).map_err(internal)?;
-            #[cfg(feature = "remote")]
-            {
-                match remote_operation {
-                    Some(operation) => {
-                        mutate_owner_vault_item_with_remote_ledger(
-                            ctx,
-                            operation,
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let result = async {
+                let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+                let item_id = format!("{}{}", crate::auth::subscription_ack::PREFIX, provider_id);
+                let payload =
+                    serde_json::to_vec(&serde_json::Value::Bool(true)).map_err(internal)?;
+                let vault = ctx.secret_vault.clone();
+                let owner = settlement_owner.clone();
+                let operation_id = client_operation_id.clone();
+                let provider = provider_id.clone();
+                let item_id_for_tx = item_id.clone();
+                let payload_for_tx = payload.clone();
+                let response = ctx
+                    .db
+                    .transaction(move |conn| {
+                        cockpit_db::secret_vault::ensure_inventory_generation_conn(conn)?;
+                        let consumed_vault_generation =
+                            cockpit_db::secret_vault::inventory_generation_conn(conn)?;
+                        let changed = match vault.get_item_on_conn(
+                            conn,
                             cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
-                            &item_id,
-                            Some(&payload),
-                            "put_subscription_ack",
-                            Response::Ack,
-                            None,
-                        )
-                        .await
-                    }
-                    None => {
-                        ctx.mutate_owner_vault_item(
-                            cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
-                            &item_id,
-                            Some(&payload),
-                        )
-                        .map_err(internal)?;
-                        Ok(Response::Ack)
-                    }
+                            &item_id_for_tx,
+                        ) {
+                            Ok(current) => current.as_slice() != payload_for_tx.as_slice(),
+                            Err(crate::secure_key::SecureKeyError::NotFound(_)) => true,
+                            Err(error) => return Err(anyhow::anyhow!(error)),
+                        };
+                        if changed {
+                            vault
+                                .mutate_item_on_conn(
+                                    conn,
+                                    cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
+                                    &item_id_for_tx,
+                                    Some(payload_for_tx.as_slice()),
+                                )
+                                .map_err(|error| anyhow::anyhow!(error))?;
+                        }
+                        let result_vault_generation =
+                            cockpit_db::secret_vault::inventory_generation_conn(conn)?;
+                        let response = Response::SubscriptionAckCommitted {
+                            client_operation_id: operation_id.clone(),
+                            provider_id: provider,
+                            request_hash: local_operation_request_hash_hex(&request_hash),
+                            changed,
+                            consumed_vault_generation,
+                            result_vault_generation,
+                        };
+                        let receipt_json = serde_json::to_string(&response)?;
+                        let settled = conn.execute(
+                            "UPDATE local_operation_receipts
+                             SET state='terminal_success',terminal_outcome_json=?5,
+                                 execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                             WHERE owner_digest=?1 AND client_operation_id=?2
+                               AND request_hash=?3 AND fencing_generation=?4
+                               AND state='executing'",
+                            rusqlite::params![
+                                owner,
+                                operation_id,
+                                request_hash.as_slice(),
+                                fencing_generation,
+                                receipt_json,
+                                chrono::Utc::now().timestamp_millis()
+                            ],
+                        )?;
+                        if settled != 1 {
+                            anyhow::bail!("subscription acknowledgement lost its receipt fence");
+                        }
+                        Ok(response)
+                    })
+                    .await
+                    .map_err(internal)?;
+                if let Err(error) = ctx.publish_owner_redaction_table() {
+                    ctx.poison_redaction_publication(&error);
+                    tracing::error!(%error, "subscription acknowledgement committed but redaction publication failed; daemon poisoned");
                 }
+                Ok(response)
             }
-            #[cfg(not(feature = "remote"))]
-            {
-                ctx.mutate_owner_vault_item(
-                    cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
-                    &item_id,
-                    Some(&payload),
+            .await;
+            if let Err(error) = &result {
+                finish_local_operation_error(
+                    ctx,
+                    settlement_owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    error,
                 )
-                .map_err(internal)?;
-                Ok(Response::Ack)
+                .await?;
             }
+            result
         }
 
         Request::DeleteNamedSecret { name } => {
@@ -7318,11 +9470,22 @@ async fn handle_serialized_request_impl(
         }
 
         Request::PutProviderCredential {
+            client_operation_id,
             provider_id,
             record,
         } => {
+            let settlement_owner = settings_capability_owner(state);
+            let mutation_intent_hash = local_operation_request_hash_hex(
+                &local_operation_request_hash(&("put_provider_credential", &provider_id))?,
+            );
+            let request_hash = local_operation_secret_request_hash(
+                ctx,
+                b"flycockpit/local-operation/provider-credential/put/v1\0",
+                &("put_provider_credential", &provider_id, &record),
+            )?;
             #[cfg(feature = "remote")]
             let request = Request::PutProviderCredential {
+                client_operation_id: client_operation_id.clone(),
                 provider_id: provider_id.clone(),
                 record: record.clone(),
             };
@@ -7339,16 +9502,71 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let record_value: serde_json::Value = serde_json::from_str(&record).map_err(|_| {
-                // Malformed caller-supplied JSON is a client error, not an
-                // internal fault. Keep the message field-only so a partially
-                // parsed record cannot leak secret bytes through the error.
-                bad_request("provider credential record is not valid JSON")
-            })?;
-            let record_bytes = serde_json::to_vec(&record_value).map_err(internal)?;
-            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
-            #[cfg(feature = "remote")]
+            let mut record_value: serde_json::Value = serde_json::from_str(record.as_str())
+                .map_err(|_| {
+                    // Malformed caller-supplied JSON is a client error, not an
+                    // internal fault. Keep the message field-only so a partially
+                    // parsed record cannot leak secret bytes through the error.
+                    bad_request("provider credential record is not valid JSON")
+                })?;
+            let encoded_record = serde_json::to_vec(&record_value);
+            zeroize_json_strings(&mut record_value);
+            let record_bytes = zeroize::Zeroizing::new(encoded_record.map_err(internal)?);
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "put_provider_credential",
+                request_hash,
+            )
+            .await?
             {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            let consumed_vault_generation = match ctx.secret_vault.current_inventory_generation() {
+                Ok(generation) => generation,
+                Err(source) => {
+                    let error = internal(anyhow::anyhow!(source));
+                    finish_local_operation_error(
+                        ctx,
+                        settlement_owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            let changed = ctx
+                .secret_vault
+                .get_item(
+                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                    &provider_id,
+                )
+                .map(|current| current.as_slice() != record_bytes.as_slice())
+                .unwrap_or(true);
+            let receipt = Response::ProviderCredentialCommitted {
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash,
+                provider_id: provider_id.clone(),
+                project_root: None,
+                owner_root: None,
+                owner_scope: "global".into(),
+                stored: true,
+                changed,
+                consumed_vault_generation,
+                result_vault_generation: consumed_vault_generation
+                    .saturating_add(u64::from(changed)),
+                config_generation: inventory::current_config_generation(),
+            };
+            #[cfg(not(feature = "remote"))]
+            let _ = &receipt;
+            let result = match {
+                #[cfg(feature = "remote")]
                 match remote_operation {
                     Some(operation) => {
                         mutate_owner_vault_item_with_remote_ledger(
@@ -7358,134 +9576,633 @@ async fn handle_serialized_request_impl(
                             &provider_id,
                             Some(&record_bytes),
                             "put_provider_credential",
-                            Response::Ack,
+                            receipt,
                             None,
                         )
                         .await
                     }
                     None => {
-                        ctx.mutate_owner_vault_item(
-                            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                            &provider_id,
-                            Some(&record_bytes),
+                        commit_local_provider_credential(
+                            ctx,
+                            settlement_owner.clone(),
+                            client_operation_id.clone(),
+                            request_hash,
+                            fencing_generation,
+                            provider_id.clone(),
+                            None,
+                            provider_id.clone(),
+                            Some(record_bytes),
                         )
-                        .map_err(internal)?;
-                        Ok(Response::Ack)
+                        .await
                     }
                 }
-            }
-            #[cfg(not(feature = "remote"))]
-            {
-                ctx.mutate_owner_vault_item(
-                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                    &provider_id,
-                    Some(&record_bytes),
+                #[cfg(not(feature = "remote"))]
+                {
+                    commit_local_provider_credential(
+                        ctx,
+                        settlement_owner.clone(),
+                        client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        provider_id.clone(),
+                        None,
+                        provider_id.clone(),
+                        Some(record_bytes),
+                    )
+                    .await
+                }
+            } {
+                Ok(result) => result,
+                Err(error) => {
+                    finish_local_operation_error(
+                        ctx,
+                        settlement_owner.clone(),
+                        client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            // The local helper commits the mutation and receipt together. A
+            // remote operation has its own atomic replay ledger but still
+            // closes this owner-scoped local receipt here.
+            #[cfg(feature = "remote")]
+            if remote_operation.is_some() {
+                finish_local_operation(
+                    ctx,
+                    settlement_owner,
+                    client_operation_id_from_response(&result)?,
+                    request_hash,
+                    fencing_generation,
+                    &result,
                 )
-                .map_err(internal)?;
-                Ok(Response::Ack)
+                .await?;
+            }
+            Ok(result)
+        }
+
+        Request::GetLocalOperationSettlement {
+            client_operation_id,
+        } => {
+            let owner = settings_capability_owner(state);
+            let settlement = ctx
+                .db
+                .local_operation_settlement(owner, client_operation_id.clone())
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| bad_request("local operation settlement is unknown"))?;
+            match settlement {
+                crate::db::local_operation_receipts::LocalOperationSettlement::Pending(identity) => {
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id,
+                        operation_kind: identity.operation_kind,
+                        request_hash: local_operation_stored_hash_hex(&identity.request_hash)?,
+                        pending: true,
+                        response: None,
+                        terminal_error: None,
+                        terminal_cancelled: false,
+                    })
+                }
+                crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(identity, json) => {
+                    let mut response: Response = serde_json::from_str(&json).map_err(internal)?;
+                    let expired_error = match &mut response {
+                        Response::ProviderOAuthStarted {
+                            flow_id,
+                            authorize_url,
+                            user_code,
+                            ..
+                        } => {
+                            match load_oauth_flow(ctx, flow_id)? {
+                                Some(DurableOAuthFlow::Provider {
+                                    authorize_url: durable_url,
+                                    user_code: durable_code,
+                                    ..
+                                }) => {
+                                    *authorize_url = durable_url.expose().to_owned();
+                                    *user_code = durable_code
+                                        .as_ref()
+                                        .map(|code| code.expose().to_owned());
+                                    None
+                                }
+                                Some(DurableOAuthFlow::Expired { terminal_error, .. })
+                                | Some(DurableOAuthFlow::Cancelled { terminal_error, .. }) => {
+                                    Some(terminal_error)
+                                }
+                                _ => Some(ErrorPayload {
+                                    code: ErrorCode::Conflict,
+                                    message: "provider OAuth begin no longer has a live flow; start a new login".to_owned(),
+                                }),
+                            }
+                        }
+                        Response::McpOAuthStarted {
+                            flow_id,
+                            authorize_url,
+                            ..
+                        } => match load_oauth_flow(ctx, flow_id)? {
+                            Some(DurableOAuthFlow::Mcp {
+                                authorize_url: durable_url,
+                                ..
+                            }) => {
+                                *authorize_url = durable_url.expose().to_owned();
+                                None
+                            }
+                            Some(DurableOAuthFlow::Expired { terminal_error, .. })
+                            | Some(DurableOAuthFlow::Cancelled { terminal_error, .. }) => {
+                                Some(terminal_error)
+                            }
+                            _ => Some(ErrorPayload {
+                                code: ErrorCode::Conflict,
+                                message: "MCP OAuth begin no longer has a live flow; start a new login".to_owned(),
+                            }),
+                        },
+                        _ => None,
+                    };
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id,
+                        operation_kind: identity.operation_kind,
+                        request_hash: local_operation_stored_hash_hex(&identity.request_hash)?,
+                        pending: false,
+                        response: expired_error.is_none().then(|| Box::new(response)),
+                        terminal_cancelled: matches!(
+                            expired_error.as_ref(),
+                            Some(ErrorPayload { code: ErrorCode::Conflict, message })
+                                if message.contains("cancelled")
+                        ),
+                        terminal_error: expired_error,
+                    })
+                }
+                crate::db::local_operation_receipts::LocalOperationSettlement::TerminalError(identity, json) => {
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id,
+                        operation_kind: identity.operation_kind,
+                        request_hash: local_operation_stored_hash_hex(&identity.request_hash)?,
+                        pending: false,
+                        response: None,
+                        terminal_error: Some(serde_json::from_str(&json).map_err(internal)?),
+                        terminal_cancelled: false,
+                    })
+                }
+                crate::db::local_operation_receipts::LocalOperationSettlement::TerminalCancelled(identity, json) => {
+                    // Validate the durable payload before returning the typed
+                    // cancellation shape, but do not also populate the error
+                    // arm: settlement terminal alternatives are exclusive.
+                    let _: ErrorPayload = serde_json::from_str(&json).map_err(internal)?;
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id,
+                        operation_kind: identity.operation_kind,
+                        request_hash: local_operation_stored_hash_hex(&identity.request_hash)?,
+                        pending: false,
+                        response: None,
+                        terminal_error: None,
+                        terminal_cancelled: true,
+                    })
+                }
             }
         }
 
-        Request::BeginProviderOAuth { provider_id } => {
+        Request::BeginProviderOAuth {
+            client_operation_id,
+            provider_id,
+        } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
             }
-            let flow_id = uuid::Uuid::new_v4().to_string();
+            if provider_id != crate::auth::xai_oauth::CREDENTIAL_KEY
+                && provider_id != crate::auth::codex_oauth::CREDENTIAL_KEY
+            {
+                return Err(bad_request("unsupported provider OAuth flow"));
+            }
             let owner = oauth_owner(state);
-            let (flow, authorize_url, user_code) = match provider_id.as_str() {
-                crate::auth::xai_oauth::CREDENTIAL_KEY => {
-                    let login = crate::auth::xai_oauth::begin_manual_login()
-                        .await
-                        .map_err(internal)?;
-                    let authorize_url = login.authorize_url.clone();
-                    (
-                        ProviderOAuthFlow::Ready(ProviderOAuthReady::Grok(login)),
-                        authorize_url,
-                        None,
-                    )
-                }
-                crate::auth::codex_oauth::CREDENTIAL_KEY => {
-                    let login = crate::auth::codex_oauth::begin_device_code_login()
-                        .await
-                        .map_err(internal)?;
-                    let authorize_url = login.verification_uri.clone();
-                    let user_code = Some(login.user_code.clone());
-                    (
-                        ProviderOAuthFlow::Ready(ProviderOAuthReady::Codex(login)),
+            let request_hash = local_operation_secret_request_hash(
+                ctx,
+                b"flycockpit/local-operation/provider-oauth/begin/v1\0",
+                &("begin_provider_oauth", &provider_id),
+            )?;
+            // The durable idempotency key remains daemon-keyed, but the wire
+            // receipt must be independently predictable by the owner client.
+            // This lets a direct response and a later settlement be checked
+            // against the exact submitted request instead of merely against
+            // each other.
+            let receipt_request_hash =
+                local_operation_request_hash(&("begin_provider_oauth", &provider_id))?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "begin_provider_oauth",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(Response::ProviderOAuthStarted {
+                    client_operation_id,
+                    request_hash,
+                    flow_id,
+                    ..
+                }) => {
+                    let durable = load_oauth_flow(ctx, &flow_id)?;
+                    if let Some(
+                        DurableOAuthFlow::Expired {
+                            owner: durable_owner,
+                            begin_client_operation_id: durable_begin,
+                            terminal_error,
+                            ..
+                        }
+                        | DurableOAuthFlow::Cancelled {
+                            owner: durable_owner,
+                            begin_client_operation_id: durable_begin,
+                            terminal_error,
+                            ..
+                        },
+                    ) = &durable
+                        && durable_owner == &owner
+                        && durable_begin == &client_operation_id
+                    {
+                        return Err(terminal_error.clone());
+                    }
+                    let Some(DurableOAuthFlow::Provider {
+                        owner,
+                        begin_client_operation_id,
+                        begin_request_hash,
+                        begin_fencing_generation,
                         authorize_url,
                         user_code,
-                    )
+                        expires_at_unix_ms,
+                        ..
+                    }) = durable
+                    else {
+                        return Err(conflict("provider OAuth begin receipt has no live flow"));
+                    };
+                    if oauth_wall_ms() >= expires_at_unix_ms {
+                        expire_ready_oauth_flow(
+                            ctx,
+                            flow_id,
+                            owner,
+                            begin_client_operation_id,
+                            begin_request_hash,
+                            begin_fencing_generation,
+                        )
+                        .await?;
+                        return Err(conflict(
+                            "the OAuth flow expired before completion; start a new login",
+                        ));
+                    }
+                    return Ok(Response::ProviderOAuthStarted {
+                        client_operation_id,
+                        request_hash,
+                        flow_id,
+                        authorize_url: authorize_url.expose().to_owned(),
+                        user_code: user_code.as_ref().map(|code| code.expose().to_owned()),
+                    });
                 }
-                _ => return Err(bad_request("unsupported provider OAuth flow")),
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
             };
-            ctx.oauth_flows
-                .insert_provider(flow_id.clone(), owner, flow)
-                .await;
-            Ok(Response::ProviderOAuthStarted {
-                flow_id,
-                authorize_url,
-                user_code,
-            })
+            let begin_result = async {
+                // Never let capacity/expiry maintenance erase the durable target
+                // needed to replay an exact begin receipt.
+                purge_durable_oauth_flows(ctx, &owner).await?;
+                if let Some((flow_id, authorize_url, user_code)) = ctx
+                    .oauth_flows
+                    .provider_started(&owner, &client_operation_id)
+                    .await
+                {
+                    let response = Response::ProviderOAuthStarted {
+                        client_operation_id: client_operation_id.clone(),
+                        request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                        flow_id,
+                        authorize_url,
+                        user_code,
+                    };
+                    let receipt = Response::ProviderOAuthStarted {
+                        client_operation_id: client_operation_id.clone(),
+                        request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                        flow_id: match &response {
+                            Response::ProviderOAuthStarted { flow_id, .. } => flow_id.clone(),
+                            _ => unreachable!(),
+                        },
+                        authorize_url: String::new(),
+                        user_code: None,
+                    };
+                    finish_local_operation(
+                        ctx,
+                        owner.clone(),
+                        client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        &receipt,
+                    )
+                    .await?;
+                    return Ok(response);
+                }
+                if let Some((
+                    flow_id,
+                    DurableOAuthFlow::Provider {
+                        authorize_url,
+                        user_code,
+                        ready,
+                        ..
+                    },
+                )) = find_durable_oauth_flow(ctx, &owner, &client_operation_id)?
+                {
+                    ctx.oauth_flows
+                        .insert_provider(
+                            flow_id.clone(),
+                            owner.clone(),
+                            client_operation_id.clone(),
+                            authorize_url.expose().to_owned(),
+                            user_code.as_ref().map(|code| code.expose().to_owned()),
+                            ProviderOAuthFlow::Ready(ready),
+                        )
+                        .await;
+                    let response = Response::ProviderOAuthStarted {
+                        client_operation_id: client_operation_id.clone(),
+                        request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                        flow_id: flow_id.clone(),
+                        authorize_url: authorize_url.expose().to_owned(),
+                        user_code: user_code.as_ref().map(|code| code.expose().to_owned()),
+                    };
+                    let receipt = Response::ProviderOAuthStarted {
+                        client_operation_id: client_operation_id.clone(),
+                        request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                        flow_id,
+                        authorize_url: String::new(),
+                        user_code: None,
+                    };
+                    finish_local_operation(
+                        ctx,
+                        owner.clone(),
+                        client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        &receipt,
+                    )
+                    .await?;
+                    return Ok(response);
+                }
+                let flow_id = uuid::Uuid::new_v4().to_string();
+                let (flow, authorize_url, user_code) = match provider_id.as_str() {
+                    crate::auth::xai_oauth::CREDENTIAL_KEY => {
+                        let login = match crate::auth::xai_oauth::begin_manual_login().await {
+                            Ok(login) => login,
+                            Err(cause) => return Err(internal(cause)),
+                        };
+                        let authorize_url = login.authorize_url.clone();
+                        (
+                            ProviderOAuthFlow::Ready(ProviderOAuthReady::Grok(login)),
+                            authorize_url,
+                            None,
+                        )
+                    }
+                    crate::auth::codex_oauth::CREDENTIAL_KEY => {
+                        let login = match crate::auth::codex_oauth::begin_device_code_login().await
+                        {
+                            Ok(login) => login,
+                            Err(cause) => return Err(internal(cause)),
+                        };
+                        let authorize_url = login.verification_uri.clone();
+                        let user_code = Some(login.user_code.clone());
+                        (
+                            ProviderOAuthFlow::Ready(ProviderOAuthReady::Codex(login)),
+                            authorize_url,
+                            user_code,
+                        )
+                    }
+                    _ => unreachable!("provider OAuth kind was validated before ledger admission"),
+                };
+                let ProviderOAuthFlow::Ready(durable_ready) = &flow else {
+                    unreachable!("new provider OAuth flow must be ready")
+                };
+                let created_at_unix_ms = oauth_wall_ms();
+                let response = Response::ProviderOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id: flow_id.clone(),
+                    authorize_url: authorize_url.clone(),
+                    user_code: user_code.clone(),
+                };
+                let receipt = Response::ProviderOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id: flow_id.clone(),
+                    authorize_url: String::new(),
+                    user_code: None,
+                };
+                commit_oauth_begin(
+                    ctx,
+                    flow_id.clone(),
+                    DurableOAuthFlow::Provider {
+                        owner: owner.clone(),
+                        begin_client_operation_id: client_operation_id.clone(),
+                        begin_request_hash: request_hash,
+                        begin_fencing_generation: fencing_generation,
+                        authorize_url: authorize_url.clone().into(),
+                        user_code: user_code.clone().map(Into::into),
+                        ready: durable_ready.clone(),
+                        created_at_unix_ms,
+                        expires_at_unix_ms: oauth_expiry_ms(created_at_unix_ms),
+                    },
+                    owner.clone(),
+                    client_operation_id.clone(),
+                    request_hash,
+                    fencing_generation,
+                    receipt,
+                )
+                .await?;
+                ctx.oauth_flows
+                    .insert_provider(
+                        flow_id.clone(),
+                        owner.clone(),
+                        client_operation_id.clone(),
+                        authorize_url.clone(),
+                        user_code.clone(),
+                        flow,
+                    )
+                    .await;
+                Ok(response)
+            }
+            .await;
+            match begin_result {
+                Ok(response) => Ok(response),
+                Err(error) => {
+                    let terminal_error = settle_failed_oauth_begin(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    Err(terminal_error)
+                }
+            }
         }
 
-        Request::CompleteProviderOAuth { flow_id, input } => {
+        Request::CompleteProviderOAuth {
+            client_operation_id,
+            flow_id,
+            input,
+        } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
             }
-            #[cfg(feature = "remote")]
-            let request = Request::CompleteProviderOAuth {
-                flow_id: flow_id.clone(),
-                input: input.clone(),
-            };
-            // The durable completion reserves a nonrepeatable remote operation
-            // before the one-shot exchange so an authenticated remote owner can
-            // retry it idempotently: a replay returns the cached safe response
-            // (which carries no token) without re-running the exchange. The PKCE
-            // verifier and the exchanged tokens stay server-side / in the vault
-            // and never enter the ledger's safe response or any log.
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) =
-                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
-                        .await?
+            let owner = oauth_owner(state);
+            let request_hash = local_operation_secret_request_hash(
+                ctx,
+                b"flycockpit/local-operation/provider-oauth/complete/v1\0",
+                &("complete_provider_oauth", &flow_id, &input),
+            )?;
+            // The public receipt correlation contains no callback/code-derived
+            // verifier. Secret-bearing request identity stays daemon-keyed in
+            // `request_hash`; the wire receipt is bound by the caller nonce and
+            // exact flow while owner binding is enforced by the receipt row.
+            let receipt_request_hash = local_operation_request_hash(&(
+                "complete_provider_oauth_receipt_v2",
+                &client_operation_id,
+                &flow_id,
+            ))?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "complete_provider_oauth",
+                request_hash,
+            )
+            .await?
             {
-                return Ok(response);
-            }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             let mutation = async {
+                let durable_flow = load_oauth_flow(ctx, &flow_id)?;
+                if let Some(DurableOAuthFlow::Provider {
+                    owner: durable_owner,
+                    begin_client_operation_id,
+                    begin_request_hash,
+                    begin_fencing_generation,
+                    expires_at_unix_ms,
+                    ..
+                }) = &durable_flow
+                    && durable_owner == &owner
+                    && oauth_wall_ms() >= *expires_at_unix_ms
+                {
+                    expire_ready_oauth_flow(
+                        ctx,
+                        flow_id.clone(),
+                        durable_owner.clone(),
+                        begin_client_operation_id.clone(),
+                        *begin_request_hash,
+                        *begin_fencing_generation,
+                    )
+                    .await?;
+                    return Err(conflict(
+                        "the OAuth flow expired before completion; start a new login",
+                    ));
+                }
+                if let Some(DurableOAuthFlow::ProviderCommitted {
+                    owner: durable_owner,
+                    completion_client_operation_id,
+                    completion_request_hash,
+                    completion_fencing_generation,
+                    terminal_response,
+                    ..
+                }) = &durable_flow
+                    && durable_owner == &owner
+                {
+                    if completion_client_operation_id != &client_operation_id
+                        || completion_request_hash != &request_hash
+                        || completion_fencing_generation != &fencing_generation
+                    {
+                        return Err(conflict(
+                            "provider OAuth flow was committed by a different completion operation",
+                        ));
+                    }
+                    return Ok(terminal_response.as_ref().clone());
+                }
+                let durable_begin_client_operation_id = match &durable_flow {
+                    Some(DurableOAuthFlow::Provider {
+                        owner: durable_owner,
+                        begin_client_operation_id,
+                        ..
+                    }) if durable_owner == &owner => begin_client_operation_id.clone(),
+                    _ => {
+                        return Err(bad_request(
+                            "provider OAuth flow is unknown or belongs to another owner",
+                        ));
+                    }
+                };
                 // Atomically claim the one-shot flow before any provider network
                 // exchange. A second concurrent completion therefore fails at
                 // lookup instead of issuing another token set. Restore only when
                 // validation or the pre-persistence exchange fails; once the
                 // provider has exchanged the code, replay must remain rejected.
-                let owner = oauth_owner(state);
-                let flow = ctx
-                    .oauth_flows
-                    .take_provider(&flow_id, &owner)
-                    .await
-                    .ok_or_else(|| {
-                        bad_request("provider OAuth flow is unknown or already completed")
-                    })?;
-                let ready = match flow {
-                    ProviderOAuthFlow::Ready(ready) => ready,
-                    ProviderOAuthFlow::Completing => {
-                        return Err(bad_request("provider OAuth flow is already completing"));
-                    }
+                let claimed = ctx.oauth_flows.claim_provider(&flow_id, &owner).await;
+                if claimed.is_none()
+                    && let Some(DurableOAuthFlow::Provider {
+                        owner: durable_owner,
+                        begin_client_operation_id,
+                        authorize_url,
+                        user_code,
+                        ready,
+                        ..
+                    }) = load_oauth_flow(ctx, &flow_id)?
+                    && durable_owner == owner
+                {
+                    ctx.oauth_flows
+                        .insert_provider(
+                            flow_id.clone(),
+                            durable_owner,
+                            begin_client_operation_id,
+                            authorize_url.expose().to_owned(),
+                            user_code.as_ref().map(|code| code.expose().to_owned()),
+                            ProviderOAuthFlow::Ready(ready),
+                        )
+                        .await;
+                }
+                let (ready, cancellation_fence) = match claimed {
+                    Some(claimed) => claimed,
+                    None => ctx
+                        .oauth_flows
+                        .claim_provider(&flow_id, &owner)
+                        .await
+                        .ok_or_else(|| {
+                            bad_request("provider OAuth flow is unknown or already completed")
+                        })?,
                 };
-                let exchange_ready = ready.clone();
-                let exchange = match exchange_ready {
+                let provider_id = match &ready {
+                    ProviderOAuthReady::Grok(_) => crate::auth::xai_oauth::CREDENTIAL_KEY,
+                    ProviderOAuthReady::Codex(_) => crate::auth::codex_oauth::CREDENTIAL_KEY,
+                };
+                claim_oauth_exchange(
+                    ctx,
+                    flow_id.clone(),
+                    owner.clone(),
+                    durable_begin_client_operation_id.clone(),
+                    client_operation_id.clone(),
+                    request_hash,
+                    fencing_generation,
+                    DurableOAuthFlow::ProviderExchanging {
+                        owner: owner.clone(),
+                        begin_client_operation_id: durable_begin_client_operation_id.clone(),
+                        provider_id: provider_id.to_owned(),
+                        completion_client_operation_id: client_operation_id.clone(),
+                        completion_request_hash: request_hash,
+                        completion_fencing_generation: fencing_generation,
+                        claimed_at_unix_ms: oauth_wall_ms(),
+                    },
+                )
+                .await?;
+                let exchange = match ready {
                     ProviderOAuthReady::Grok(login) => {
                         let Some(callback) = input.as_deref() else {
-                            ctx.oauth_flows
-                                .restore_provider(
-                                    flow_id,
-                                    owner.clone(),
-                                    ProviderOAuthFlow::Ready(ProviderOAuthReady::Grok(login)),
-                                )
-                                .await;
                             return Err(bad_request(
                                 "Grok OAuth completion requires a callback URL or code",
                             ));
@@ -7501,13 +10218,6 @@ async fn handle_serialized_request_impl(
                     }
                     ProviderOAuthReady::Codex(login) => {
                         if input.is_some() {
-                            ctx.oauth_flows
-                                .restore_provider(
-                                    flow_id,
-                                    owner.clone(),
-                                    ProviderOAuthFlow::Ready(ProviderOAuthReady::Codex(login)),
-                                )
-                                .await;
                             return Err(bad_request(
                                 "Codex device OAuth does not accept callback input",
                             ));
@@ -7524,43 +10234,361 @@ async fn handle_serialized_request_impl(
                             })
                     }
                 };
-                let (provider_id, record) = match exchange {
-                    Ok(value) => value,
-                    Err(error) => {
-                        ctx.oauth_flows
-                            .restore_provider(
-                                flow_id,
-                                owner.clone(),
-                                ProviderOAuthFlow::Ready(ready),
-                            )
-                            .await;
-                        return Err(error);
-                    }
-                };
+                let (provider_id, record) = exchange?;
+                let record = zeroize::Zeroizing::new(record);
                 let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
-                ctx.mutate_owner_vault_item(
-                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                    provider_id,
-                    Some(&record),
-                )
-                .map_err(internal)?;
+                if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(conflict("provider OAuth completion was cancelled"));
+                }
+                let terminal_response = Response::ProviderOAuthCompleted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id: flow_id.clone(),
+                    logged_in: true,
+                    retry_after_seconds: None,
+                };
+                let committed_marker = zeroize::Zeroizing::new(
+                    serde_json::to_vec(&DurableOAuthFlow::ProviderCommitted {
+                        owner: owner.clone(),
+                        begin_client_operation_id: durable_begin_client_operation_id,
+                        provider_id: provider_id.to_owned(),
+                        completion_client_operation_id: client_operation_id.clone(),
+                        completion_request_hash: request_hash,
+                        completion_fencing_generation: fencing_generation,
+                        terminal_response: Box::new(terminal_response.clone()),
+                        committed_at_unix_ms: oauth_wall_ms(),
+                    })
+                    .map_err(internal)?,
+                );
+                let vault = ctx.secret_vault.clone();
+                let flow_vault_id = oauth_flow_vault_id(&flow_id);
+                let provider_id_owned = provider_id.to_owned();
+                let receipt_owner = owner.clone();
+                let receipt_operation_id = client_operation_id.clone();
+                let receipt_json = serde_json::to_string(&terminal_response).map_err(internal)?;
+                ctx.db
+                    .transaction(move |conn| {
+                        let marker = vault
+                            .get_item_on_conn(
+                                conn,
+                                cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                                &flow_vault_id,
+                            )
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        let marker: DurableOAuthFlow = serde_json::from_slice(marker.as_slice())?;
+                        let owns_exact_exchange = matches!(
+                            marker,
+                            DurableOAuthFlow::ProviderExchanging {
+                                owner: marker_owner,
+                                provider_id: marker_provider,
+                                completion_client_operation_id: marker_operation,
+                                completion_request_hash: marker_hash,
+                                completion_fencing_generation: marker_fence,
+                                ..
+                            } if marker_owner == receipt_owner
+                                && marker_provider == provider_id_owned
+                                && marker_operation == receipt_operation_id
+                                && marker_hash == request_hash
+                                && marker_fence == fencing_generation
+                        );
+                        if !owns_exact_exchange {
+                            anyhow::bail!(
+                                "provider OAuth commit lost its exact durable exchange fence"
+                            );
+                        }
+                        vault
+                            .mutate_item_on_conn(
+                                conn,
+                                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                                &provider_id_owned,
+                                Some(&record),
+                            )
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        vault
+                            .mutate_item_on_conn(
+                                conn,
+                                cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                                &flow_vault_id,
+                                Some(committed_marker.as_slice()),
+                            )
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        let settled = conn.execute(
+                            "UPDATE local_operation_receipts
+                             SET state='terminal_success',terminal_outcome_json=?5,
+                                 execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                             WHERE owner_digest=?1 AND client_operation_id=?2
+                               AND request_hash=?3 AND fencing_generation=?4
+                               AND state='executing'",
+                            rusqlite::params![
+                                receipt_owner,
+                                receipt_operation_id,
+                                request_hash.as_slice(),
+                                fencing_generation,
+                                receipt_json,
+                                chrono::Utc::now().timestamp_millis()
+                            ],
+                        )?;
+                        if settled != 1 {
+                            anyhow::bail!("provider OAuth completion lost its receipt fence");
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .map_err(internal)?;
+                if let Err(error) = ctx.publish_owner_redaction_table() {
+                    ctx.poison_redaction_publication(&error);
+                    tracing::error!(%error, "provider OAuth committed but redaction publication failed; daemon poisoned");
+                }
                 // The token record is now durable; consuming the one-time flow
                 // prevents a duplicate exchange after a successful completion.
                 ctx.oauth_flows.remove_provider(&flow_id, &owner).await;
-                Ok(Response::ProviderOAuthCompleted {
-                    logged_in: true,
-                    retry_after_seconds: None,
-                })
+                Ok(terminal_response)
             };
-            finish_provider_mutation_future!(
-                remote_operation,
+            let response = match mutation.await {
+                Ok(response) => response,
+                Err(error) => {
+                    ctx.oauth_flows.remove_provider(&flow_id, &owner).await;
+                    let terminal_error = fail_oauth_exchange(
+                        ctx,
+                        flow_id,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(terminal_error);
+                }
+            };
+            finish_local_operation(
                 ctx,
-                "complete_provider_oauth",
-                mutation
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
             )
+            .await?;
+            delete_oauth_flow(ctx, &flow_id)?;
+            Ok(response)
+        }
+
+        Request::CancelProviderOAuth {
+            client_operation_id,
+            begin_client_operation_id,
+            flow_id,
+        } => {
+            let owner = oauth_owner(state);
+            let request_hash = local_operation_request_hash(&(
+                "cancel_provider_oauth",
+                &begin_client_operation_id,
+                &flow_id,
+            ))?;
+            let receipt_request_hash = request_hash;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "cancel_provider_oauth",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            return terminalize_local_operation(
+                ctx,
+                owner.clone(),
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
+                async {
+            let resolved_flow_id = ctx
+                .oauth_flows
+                .resolve_provider_id(flow_id.as_deref(), &begin_client_operation_id, &owner)
+                .await;
+            let resolved_flow_id = if resolved_flow_id.is_some() {
+                resolved_flow_id
+            } else {
+                let candidate = if let Some(flow_id) = flow_id {
+                    Some(flow_id)
+                } else {
+                    let settlement = match ctx
+                        .db
+                        .local_operation_settlement(
+                            owner.clone(),
+                            begin_client_operation_id.clone(),
+                        )
+                        .await
+                        .map_err(internal)
+                    {
+                        Ok(settlement) => settlement,
+                        Err(error) => {
+                            finish_local_operation_error(
+                                ctx,
+                                owner,
+                                client_operation_id,
+                                request_hash,
+                                fencing_generation,
+                                &error,
+                            )
+                            .await?;
+                            return Err(error);
+                        }
+                    };
+                    match settlement {
+                        Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(_, json)) => {
+                            let begin_response = match serde_json::from_str::<Response>(&json)
+                                .map_err(internal)
+                            {
+                                Ok(response) => response,
+                                Err(error) => {
+                                    finish_local_operation_error(
+                                        ctx,
+                                        owner,
+                                        client_operation_id,
+                                        request_hash,
+                                        fencing_generation,
+                                        &error,
+                                    )
+                                    .await?;
+                                    return Err(error);
+                                }
+                            };
+                            match begin_response {
+                                Response::ProviderOAuthStarted { flow_id, .. } => Some(flow_id),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                match candidate {
+                    Some(candidate) => {
+                        let durable_candidate = load_oauth_flow(ctx, &candidate)?;
+                        match durable_candidate {
+                            Some(DurableOAuthFlow::Provider {
+                                owner: durable_owner,
+                                begin_client_operation_id: durable_begin,
+                                ..
+                            })
+                            | Some(DurableOAuthFlow::ProviderExchanging {
+                                owner: durable_owner,
+                                begin_client_operation_id: durable_begin,
+                                ..
+                            })
+                            | Some(DurableOAuthFlow::ProviderCommitted {
+                                owner: durable_owner,
+                                begin_client_operation_id: durable_begin,
+                                ..
+                            }) if durable_owner == owner
+                                && durable_begin == begin_client_operation_id =>
+                            {
+                                Some(candidate)
+                            }
+                            _ => None,
+                        }
+                    }
+                    None => None,
+                }
+            };
+            // Serialize with the persistence fence. An acknowledged cancellation
+            // therefore either wins before the vault commit or reports that the
+            // exact flow had already reached another terminal state.
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            let (cancelled, committed) = if let Some(flow_id) = resolved_flow_id.as_deref() {
+                let durable = match load_oauth_flow(ctx, flow_id) {
+                    Ok(flow) => flow,
+                    Err(error) => {
+                        finish_local_operation_error(
+                            ctx,
+                            owner,
+                            client_operation_id,
+                            request_hash,
+                            fencing_generation,
+                            &error,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
+                match durable {
+                    Some(DurableOAuthFlow::ProviderCommitted {
+                        owner: durable_owner,
+                        begin_client_operation_id: durable_begin,
+                        ..
+                    }) if durable_owner == owner && durable_begin == begin_client_operation_id => {
+                        // A stale in-memory Completing entry cannot overturn a
+                        // commit. Clear it without setting the cancellation bit
+                        // while the same lock still fences the committer.
+                        (false, true)
+                    }
+                    Some(DurableOAuthFlow::Provider {
+                        owner: durable_owner,
+                        begin_client_operation_id: durable_begin,
+                        ..
+                    })
+                    | Some(DurableOAuthFlow::ProviderExchanging {
+                        owner: durable_owner,
+                        begin_client_operation_id: durable_begin,
+                        ..
+                    }) if durable_owner == owner && durable_begin == begin_client_operation_id => {
+                        (true, false)
+                    }
+                    _ => (false, false),
+                }
+            } else {
+                (false, false)
+            };
+            let response = Response::ProviderOAuthCancelled {
+                client_operation_id: client_operation_id.clone(),
+                request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                flow_id: resolved_flow_id.clone(),
+                cancelled,
+            };
+            if let Err(error) = commit_oauth_cancel(
+                ctx,
+                resolved_flow_id.clone(),
+                cancelled,
+                begin_client_operation_id.clone(),
+                owner.clone(),
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await
+            {
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            if let Some(flow_id) = resolved_flow_id.as_deref() {
+                if cancelled {
+                    ctx.oauth_flows.cancel_provider(flow_id, &owner).await;
+                } else if committed {
+                    ctx.oauth_flows
+                        .remove_terminal_provider(flow_id, &owner)
+                        .await;
+                }
+            }
+                    Ok(response)
+                },
+            )
+            .await;
         }
 
         Request::BeginMcpOAuth {
+            client_operation_id,
             project_root,
             server,
         } => {
@@ -7573,28 +10601,217 @@ async fn handle_serialized_request_impl(
             // stored root, and the in-transaction guard at `CompleteMcpOAuth` must
             // all key on the same canonical workspace root as later resolution.
             let project_root = crate::secret_ownership::canonical_owner_root(&project_root);
-            let cwd = std::path::PathBuf::from(&project_root);
-            let trust_policy =
-                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-                    .await
-                    .map_err(workspace_trust_error)?;
-            let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
-            let config = mcp_config_from_paths(&paths)?;
-            let server_config = config
-                .servers
-                .get(&server)
-                .ok_or_else(|| bad_request(format!("MCP server `{server}` is not configured")))?;
-            if !matches!(server_config.auth, crate::mcp::config::Auth::Oauth(_)) {
-                return Err(bad_request(format!(
-                    "MCP server `{server}` is not configured for OAuth"
-                )));
-            }
-            ensure_mcp_ownership_available(
+            let owner = oauth_owner(state);
+            let request_hash = local_operation_secret_request_hash(
                 ctx,
-                &project_root,
-                [crate::mcp::auth::cred_key(&server)],
+                b"flycockpit/local-operation/mcp-oauth/begin/v1\0",
+                &("begin_mcp_oauth", &project_root, &server),
+            )?;
+            let receipt_request_hash =
+                local_operation_request_hash(&("begin_mcp_oauth", &project_root, &server))?;
+            // Admission and exact replay precede every mutable trust/config/
+            // ownership check and capacity sweep. Otherwise an already-settled
+            // begin can become unreplayable merely because its workspace was
+            // edited after the original request.
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "begin_mcp_oauth",
+                request_hash,
             )
-            .await?;
+            .await?
+            {
+                LocalOperationStart::Replay(Response::McpOAuthStarted {
+                    client_operation_id,
+                    request_hash,
+                    flow_id,
+                    ..
+                }) => {
+                    let durable = load_oauth_flow(ctx, &flow_id)?;
+                    if let Some(
+                        DurableOAuthFlow::Expired {
+                            owner: durable_owner,
+                            begin_client_operation_id: durable_begin,
+                            terminal_error,
+                            ..
+                        }
+                        | DurableOAuthFlow::Cancelled {
+                            owner: durable_owner,
+                            begin_client_operation_id: durable_begin,
+                            terminal_error,
+                            ..
+                        },
+                    ) = &durable
+                        && durable_owner == &owner
+                        && durable_begin == &client_operation_id
+                    {
+                        return Err(terminal_error.clone());
+                    }
+                    let Some(DurableOAuthFlow::Mcp {
+                        owner,
+                        begin_client_operation_id,
+                        begin_request_hash,
+                        begin_fencing_generation,
+                        authorize_url,
+                        expires_at_unix_ms,
+                        ..
+                    }) = durable
+                    else {
+                        return Err(conflict("MCP OAuth begin receipt has no live flow"));
+                    };
+                    if oauth_wall_ms() >= expires_at_unix_ms {
+                        expire_ready_oauth_flow(
+                            ctx,
+                            flow_id,
+                            owner,
+                            begin_client_operation_id,
+                            begin_request_hash,
+                            begin_fencing_generation,
+                        )
+                        .await?;
+                        return Err(conflict(
+                            "the OAuth flow expired before completion; start a new login",
+                        ));
+                    }
+                    return Ok(Response::McpOAuthStarted {
+                        client_operation_id,
+                        request_hash,
+                        flow_id,
+                        authorize_url: authorize_url.expose().to_owned(),
+                    });
+                }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let server_config = match async {
+                purge_durable_oauth_flows(ctx, &owner).await?;
+                let cwd = std::path::PathBuf::from(&project_root);
+                let trust_policy =
+                    crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+                        .await
+                        .map_err(workspace_trust_error)?;
+                let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
+                let config = mcp_config_from_paths(&paths)?;
+                let server_config = config.servers.get(&server).cloned().ok_or_else(|| {
+                    bad_request(format!("MCP server `{server}` is not configured"))
+                })?;
+                if !matches!(server_config.auth, crate::mcp::config::Auth::Oauth(_)) {
+                    return Err(bad_request(format!(
+                        "MCP server `{server}` is not configured for OAuth"
+                    )));
+                }
+                ensure_mcp_ownership_available(
+                    ctx,
+                    &project_root,
+                    [crate::mcp::auth::cred_key(&server)],
+                )
+                .await?;
+                Ok::<_, ErrorPayload>(server_config)
+            }
+            .await
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    let terminal_error = settle_failed_oauth_begin(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(terminal_error);
+                }
+            };
+            if let Some((flow_id, authorize_url)) = ctx
+                .oauth_flows
+                .mcp_started(&owner, &client_operation_id)
+                .await
+            {
+                let response = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id,
+                    authorize_url,
+                };
+                let receipt = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id: match &response {
+                        Response::McpOAuthStarted { flow_id, .. } => flow_id.clone(),
+                        _ => unreachable!(),
+                    },
+                    authorize_url: String::new(),
+                };
+                finish_local_operation(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &receipt,
+                )
+                .await?;
+                return Ok(response);
+            }
+            let durable_replay = match find_durable_oauth_flow(ctx, &owner, &client_operation_id) {
+                Ok(replay) => replay,
+                Err(error) => {
+                    let terminal_error = settle_failed_oauth_begin(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(terminal_error);
+                }
+            };
+            if let Some((
+                flow_id,
+                DurableOAuthFlow::Mcp {
+                    authorize_url,
+                    pending,
+                    ..
+                },
+            )) = durable_replay
+            {
+                ctx.oauth_flows
+                    .insert_mcp(
+                        flow_id.clone(),
+                        owner.clone(),
+                        client_operation_id.clone(),
+                        authorize_url.expose().to_owned(),
+                        pending,
+                    )
+                    .await;
+                let response = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id: flow_id.clone(),
+                    authorize_url: authorize_url.expose().to_owned(),
+                };
+                let receipt = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id,
+                    authorize_url: String::new(),
+                };
+                finish_local_operation(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &receipt,
+                )
+                .await?;
+                return Ok(response);
+            }
             // Only a LOCAL owner may have the daemon open a host browser and
             // bind a host loopback listener for the callback. For a remote
             // caller the daemon returns the authorize URL only (no browser, no
@@ -7607,72 +10824,325 @@ async fn handle_serialized_request_impl(
                 remote_operation,
             );
             let (flow, authorize_url) =
-                crate::mcp::auth::begin_oauth_flow(&server, server_config, local_display)
+                match crate::mcp::auth::begin_oauth_flow(&server, &server_config, local_display)
                     .await
-                    .map_err(internal)?;
+                {
+                    Ok(started) => started,
+                    Err(cause) => {
+                        let error = internal(cause);
+                        let terminal_error = settle_failed_oauth_begin(
+                            ctx,
+                            owner,
+                            client_operation_id,
+                            request_hash,
+                            fencing_generation,
+                            &error,
+                        )
+                        .await?;
+                        return Err(terminal_error);
+                    }
+                };
             let flow_id = uuid::Uuid::new_v4().to_string();
+            let pending = McpOAuthPending {
+                project_root,
+                server,
+                flow,
+            };
+            let created_at_unix_ms = oauth_wall_ms();
+            let response = Response::McpOAuthStarted {
+                client_operation_id: client_operation_id.clone(),
+                request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                flow_id: flow_id.clone(),
+                authorize_url: authorize_url.clone(),
+            };
+            let receipt = Response::McpOAuthStarted {
+                client_operation_id: client_operation_id.clone(),
+                request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                flow_id: flow_id.clone(),
+                authorize_url: String::new(),
+            };
+            let durable_flow_copy_result = match serde_json::to_vec(&pending.flow).map_err(internal)
+            {
+                Ok(bytes) => {
+                    let bytes = zeroize::Zeroizing::new(bytes);
+                    serde_json::from_slice(bytes.as_slice()).map_err(internal)
+                }
+                Err(error) => Err(error),
+            };
+            let durable_flow_copy = match durable_flow_copy_result {
+                Ok(flow) => flow,
+                Err(error) => {
+                    let terminal_error = settle_failed_oauth_begin(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(terminal_error);
+                }
+            };
+            if let Err(error) = commit_oauth_begin(
+                ctx,
+                flow_id.clone(),
+                DurableOAuthFlow::Mcp {
+                    owner: owner.clone(),
+                    begin_client_operation_id: client_operation_id.clone(),
+                    begin_request_hash: request_hash,
+                    begin_fencing_generation: fencing_generation,
+                    authorize_url: authorize_url.clone().into(),
+                    pending: McpOAuthPending {
+                        project_root: pending.project_root.clone(),
+                        server: pending.server.clone(),
+                        flow: durable_flow_copy,
+                    },
+                    created_at_unix_ms,
+                    expires_at_unix_ms: oauth_expiry_ms(created_at_unix_ms),
+                },
+                owner.clone(),
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
+                receipt,
+            )
+            .await
+            {
+                let terminal_error = settle_failed_oauth_begin(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(terminal_error);
+            }
             ctx.oauth_flows
                 .insert_mcp(
                     flow_id.clone(),
-                    oauth_owner(state),
-                    McpOAuthPending {
-                        project_root,
-                        server,
-                        flow,
-                    },
+                    owner.clone(),
+                    client_operation_id.clone(),
+                    authorize_url.clone(),
+                    pending,
                 )
                 .await;
-            Ok(Response::McpOAuthStarted {
-                flow_id,
-                authorize_url,
-            })
+            Ok(response)
         }
 
-        Request::CompleteMcpOAuth { flow_id, input } => {
+        Request::CompleteMcpOAuth {
+            client_operation_id,
+            flow_id,
+            input,
+        } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
                 ));
             }
-            #[cfg(feature = "remote")]
-            let request = Request::CompleteMcpOAuth {
-                flow_id: flow_id.clone(),
-                input: input.clone(),
-            };
-            // Durable MCP OAuth completion: reserve a nonrepeatable remote
-            // operation before the one-shot exchange so a remote owner can retry
-            // idempotently (a replay returns the cached, token-free safe
-            // response). The exchanged tokens are staged into the vault inside
-            // the BEGIN IMMEDIATE transaction below and never enter the ledger
-            // safe response or any log.
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) =
-                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
-                        .await?
+            let owner = oauth_owner(state);
+            let request_hash = local_operation_secret_request_hash(
+                ctx,
+                b"flycockpit/local-operation/mcp-oauth/complete/v1\0",
+                &("complete_mcp_oauth", &flow_id, &input),
+            )?;
+            let receipt_request_hash = local_operation_request_hash(&(
+                "complete_mcp_oauth_receipt_v2",
+                &client_operation_id,
+                &flow_id,
+            ))?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "complete_mcp_oauth",
+                request_hash,
+            )
+            .await?
             {
-                return Ok(response);
-            }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             let mutation = async {
-                let owner = oauth_owner(state);
-                let pending = ctx
-                    .oauth_flows
-                    .take_mcp(&flow_id, &owner)
-                    .await
-                    .ok_or_else(|| bad_request("MCP OAuth flow is unknown or already completed"))?;
+                let durable_flow = load_oauth_flow(ctx, &flow_id)?;
+                if let Some(DurableOAuthFlow::Mcp {
+                    owner: durable_owner,
+                    begin_client_operation_id,
+                    begin_request_hash,
+                    begin_fencing_generation,
+                    expires_at_unix_ms,
+                    ..
+                }) = &durable_flow
+                    && durable_owner == &owner
+                    && oauth_wall_ms() >= *expires_at_unix_ms
+                {
+                    expire_ready_oauth_flow(
+                        ctx,
+                        flow_id.clone(),
+                        durable_owner.clone(),
+                        begin_client_operation_id.clone(),
+                        *begin_request_hash,
+                        *begin_fencing_generation,
+                    )
+                    .await?;
+                    return Err(conflict(
+                        "the OAuth flow expired before completion; start a new login",
+                    ));
+                }
+                if let Some(DurableOAuthFlow::McpCommitted {
+                    owner: durable_owner,
+                    completion_client_operation_id,
+                    completion_request_hash,
+                    completion_fencing_generation,
+                    terminal_response,
+                    ..
+                }) = &durable_flow
+                    && durable_owner == &owner
+                {
+                    if completion_client_operation_id != &client_operation_id
+                        || completion_request_hash != &request_hash
+                        || completion_fencing_generation != &fencing_generation
+                    {
+                        return Err(conflict(
+                            "MCP OAuth flow was committed by a different completion operation",
+                        ));
+                    }
+                    return Ok(terminal_response.as_ref().clone());
+                }
+                let durable_begin_client_operation_id = match &durable_flow {
+                    Some(DurableOAuthFlow::Mcp {
+                        owner: durable_owner,
+                        begin_client_operation_id,
+                        ..
+                    }) if durable_owner == &owner => begin_client_operation_id.clone(),
+                    _ => {
+                        return Err(bad_request(
+                            "MCP OAuth flow is unknown or belongs to another owner",
+                        ));
+                    }
+                };
+                let claimed = ctx.oauth_flows.claim_mcp(&flow_id, &owner).await;
+                if claimed.is_none()
+                    && let Some(DurableOAuthFlow::Mcp {
+                        owner: durable_owner,
+                        begin_client_operation_id,
+                        authorize_url,
+                        pending,
+                        ..
+                    }) = load_oauth_flow(ctx, &flow_id)?
+                    && durable_owner == owner
+                {
+                    ctx.oauth_flows
+                        .insert_mcp(
+                            flow_id.clone(),
+                            durable_owner,
+                            begin_client_operation_id,
+                            authorize_url.expose().to_owned(),
+                            pending,
+                        )
+                        .await;
+                }
+                let (pending, cancellation_fence) = match claimed {
+                    Some(claimed) => claimed,
+                    None => ctx
+                        .oauth_flows
+                        .claim_mcp(&flow_id, &owner)
+                        .await
+                        .ok_or_else(|| {
+                            bad_request("MCP OAuth flow is unknown or already completed")
+                        })?,
+                };
+                claim_oauth_exchange(
+                    ctx,
+                    flow_id.clone(),
+                    owner.clone(),
+                    durable_begin_client_operation_id.clone(),
+                    client_operation_id.clone(),
+                    request_hash,
+                    fencing_generation,
+                    DurableOAuthFlow::McpExchanging {
+                        owner: owner.clone(),
+                        begin_client_operation_id: durable_begin_client_operation_id.clone(),
+                        project_root: pending.project_root.clone(),
+                        server: pending.server.clone(),
+                        completion_client_operation_id: client_operation_id.clone(),
+                        completion_request_hash: request_hash,
+                        completion_fencing_generation: fencing_generation,
+                        claimed_at_unix_ms: oauth_wall_ms(),
+                    },
+                )
+                .await?;
                 // Once claimed, this flow is one-shot. A provider exchange may have
                 // consumed its authorization code even if vault persistence fails,
                 // so it must not be reinserted for a second exchange.
                 let tokens = crate::mcp::auth::complete_oauth_flow(pending.flow, input.as_deref())
                     .await
                     .map_err(internal)?;
-                let record = serde_json::to_vec(&tokens).map_err(internal)?;
+                let record =
+                    zeroize::Zeroizing::new(serde_json::to_vec(&tokens).map_err(internal)?);
                 let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+                if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(conflict("MCP OAuth completion was cancelled"));
+                }
                 let credential_key = crate::mcp::auth::cred_key(&pending.server);
                 let owner_root = pending.project_root.clone();
+                let terminal_response = Response::McpOAuthCompleted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id: flow_id.clone(),
+                    authenticated: true,
+                };
+                let committed_marker = zeroize::Zeroizing::new(
+                    serde_json::to_vec(&DurableOAuthFlow::McpCommitted {
+                        owner: owner.clone(),
+                        begin_client_operation_id: durable_begin_client_operation_id,
+                        project_root: owner_root.clone(),
+                        server: pending.server.clone(),
+                        completion_client_operation_id: client_operation_id.clone(),
+                        completion_request_hash: request_hash,
+                        completion_fencing_generation: fencing_generation,
+                        terminal_response: Box::new(terminal_response.clone()),
+                        committed_at_unix_ms: oauth_wall_ms(),
+                    })
+                    .map_err(internal)?,
+                );
+                let flow_vault_id = oauth_flow_vault_id(&flow_id);
                 let vault = ctx.secret_vault.clone();
+                let receipt_owner = owner.clone();
+                let receipt_operation_id = client_operation_id.clone();
+                let receipt_json = serde_json::to_string(&terminal_response).map_err(internal)?;
                 ctx.db
                     .transaction(move |conn| {
+                        let marker = vault
+                            .get_item_on_conn(
+                                conn,
+                                cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                                &flow_vault_id,
+                            )
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        let marker: DurableOAuthFlow = serde_json::from_slice(marker.as_slice())?;
+                        let owns_exact_exchange = matches!(
+                            marker,
+                            DurableOAuthFlow::McpExchanging {
+                                owner: marker_owner,
+                                project_root: marker_root,
+                                server: marker_server,
+                                completion_client_operation_id: marker_operation,
+                                completion_request_hash: marker_hash,
+                                completion_fencing_generation: marker_fence,
+                                ..
+                            } if marker_owner == receipt_owner
+                                && marker_root == owner_root
+                                && marker_server == pending.server
+                                && marker_operation == receipt_operation_id
+                                && marker_hash == request_hash
+                                && marker_fence == fencing_generation
+                        );
+                        if !owns_exact_exchange {
+                            anyhow::bail!("MCP OAuth commit lost its exact durable exchange fence");
+                        }
                         // ATOMIC cross-kind admission for the flow-managed OAuth
                         // token key. The `ensure_mcp_ownership_available` check ran
                         // back at `StartMcpOAuth`; a provider (or another workspace)
@@ -7695,6 +11165,14 @@ async fn handle_serialized_request_impl(
                                 Some(&record),
                             )
                             .map_err(|error| anyhow::anyhow!(error))?;
+                        vault
+                            .mutate_item_on_conn(
+                                conn,
+                                cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                                &flow_vault_id,
+                                Some(committed_marker.as_slice()),
+                            )
+                            .map_err(|error| anyhow::anyhow!(error))?;
                         conn.execute(
                             "INSERT OR IGNORE INTO secret_named_ownership
                          (item_id, owner_kind, project_root, created_at)
@@ -7705,6 +11183,25 @@ async fn handle_serialized_request_impl(
                                 chrono::Utc::now().timestamp_millis()
                             ],
                         )?;
+                        let settled = conn.execute(
+                            "UPDATE local_operation_receipts
+                             SET state='terminal_success',terminal_outcome_json=?5,
+                                 execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                             WHERE owner_digest=?1 AND client_operation_id=?2
+                               AND request_hash=?3 AND fencing_generation=?4
+                               AND state='executing'",
+                            rusqlite::params![
+                                receipt_owner,
+                                receipt_operation_id,
+                                request_hash.as_slice(),
+                                fencing_generation,
+                                receipt_json,
+                                chrono::Utc::now().timestamp_millis()
+                            ],
+                        )?;
+                        if settled != 1 {
+                            anyhow::bail!("MCP OAuth completion lost its receipt fence");
+                        }
                         Ok(())
                     })
                     .await
@@ -7714,27 +11211,202 @@ async fn handle_serialized_request_impl(
                     // so rollback could orphan the already-authorized token;
                     // poison and fail closed until the daemon is restarted.
                     ctx.poison_redaction_publication(&error);
-                    return Err(internal(error));
+                    tracing::error!(%error, "MCP OAuth committed but redaction publication failed; daemon poisoned");
                 }
-                Ok(Response::McpOAuthCompleted {
-                    authenticated: true,
-                })
+                Ok(terminal_response)
             };
-            finish_provider_mutation_future!(remote_operation, ctx, "complete_mcp_oauth", mutation)
+            let response = match mutation.await {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
+                    let terminal_error = fail_oauth_exchange(
+                        ctx,
+                        flow_id,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(terminal_error);
+                }
+            };
+            let _ = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
+            finish_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
+            delete_oauth_flow(ctx, &flow_id)?;
+            Ok(response)
         }
 
-        Request::CancelMcpOAuth { flow_id } => {
+        Request::CancelMcpOAuth {
+            client_operation_id,
+            begin_client_operation_id,
+            flow_id,
+        } => {
             let owner = oauth_owner(state);
-            let cancelled = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
-            Ok(Response::McpOAuthCancelled { cancelled })
+            let request_hash = local_operation_request_hash(&(
+                "cancel_mcp_oauth",
+                &begin_client_operation_id,
+                &flow_id,
+            ))?;
+            let receipt_request_hash = request_hash;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "cancel_mcp_oauth",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            return terminalize_local_operation(
+                ctx,
+                owner.clone(),
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
+                async {
+            let resolved_flow_id = ctx
+                .oauth_flows
+                .resolve_mcp_id(flow_id.as_deref(), &begin_client_operation_id, &owner)
+                .await;
+            let resolved_flow_id = if resolved_flow_id.is_some() {
+                resolved_flow_id
+            } else {
+                let candidate = if let Some(flow_id) = flow_id {
+                    Some(flow_id)
+                } else {
+                    match ctx
+                        .db
+                        .local_operation_settlement(
+                            owner.clone(),
+                            begin_client_operation_id.clone(),
+                        )
+                        .await
+                        .map_err(internal)?
+                    {
+                        Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(_, json)) => {
+                            match serde_json::from_str::<Response>(&json).map_err(internal)? {
+                                Response::McpOAuthStarted { flow_id, .. } => Some(flow_id),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                match candidate {
+                    Some(candidate) => {
+                        let durable_candidate = load_oauth_flow(ctx, &candidate)?;
+                        match durable_candidate {
+                            Some(DurableOAuthFlow::Mcp {
+                                owner: durable_owner,
+                                begin_client_operation_id: durable_begin,
+                                ..
+                            })
+                            | Some(DurableOAuthFlow::McpExchanging {
+                                owner: durable_owner,
+                                begin_client_operation_id: durable_begin,
+                                ..
+                            })
+                            | Some(DurableOAuthFlow::McpCommitted {
+                                owner: durable_owner,
+                                begin_client_operation_id: durable_begin,
+                                ..
+                            }) if durable_owner == owner
+                                && durable_begin == begin_client_operation_id =>
+                            {
+                                Some(candidate)
+                            }
+                            _ => None,
+                        }
+                    }
+                    None => None,
+                }
+            };
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            let (cancelled, committed) = if let Some(flow_id) = resolved_flow_id.as_deref() {
+                match load_oauth_flow(ctx, flow_id)? {
+                    Some(DurableOAuthFlow::McpCommitted {
+                        owner: durable_owner,
+                        begin_client_operation_id: durable_begin,
+                        ..
+                    }) if durable_owner == owner && durable_begin == begin_client_operation_id => {
+                        (false, true)
+                    }
+                    Some(DurableOAuthFlow::Mcp {
+                        owner: durable_owner,
+                        begin_client_operation_id: durable_begin,
+                        ..
+                    })
+                    | Some(DurableOAuthFlow::McpExchanging {
+                        owner: durable_owner,
+                        begin_client_operation_id: durable_begin,
+                        ..
+                    }) if durable_owner == owner && durable_begin == begin_client_operation_id => {
+                        (true, false)
+                    }
+                    _ => (false, false),
+                }
+            } else {
+                (false, false)
+            };
+            let response = Response::McpOAuthCancelled {
+                client_operation_id: client_operation_id.clone(),
+                request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                flow_id: resolved_flow_id.clone(),
+                cancelled,
+            };
+            commit_oauth_cancel(
+                ctx,
+                resolved_flow_id.clone(),
+                cancelled,
+                begin_client_operation_id.clone(),
+                owner.clone(),
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
+            if let Some(flow_id) = resolved_flow_id.as_deref() {
+                if cancelled {
+                    let _ = ctx.oauth_flows.remove_mcp(flow_id, &owner).await;
+                } else if committed {
+                    ctx.oauth_flows.remove_terminal_mcp(flow_id, &owner).await;
+                }
+            }
+                    Ok(response)
+                },
+            )
+            .await;
         }
 
         Request::DeleteProviderCredential {
+            client_operation_id,
             provider_id,
             project_root,
         } => {
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash = local_operation_request_hash(&(
+                "delete_provider_credential",
+                &provider_id,
+                &project_root,
+            ))?;
+            let mutation_intent_hash = local_operation_request_hash_hex(&request_hash);
             #[cfg(feature = "remote")]
             let request = Request::DeleteProviderCredential {
+                client_operation_id: client_operation_id.clone(),
                 provider_id: provider_id.clone(),
                 project_root: project_root.clone(),
             };
@@ -7751,10 +11423,23 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
+            // Bind/replay the authenticated operation identity before reading
+            // mutable config or vault state. A retry must resolve the original
+            // receipt even if the provider was renamed, its config was removed,
+            // or workspace trust changed after the first execution.
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "delete_provider_credential",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
-            if let Some(root) = project_root.as_deref() {
-                recover_provider_config_journals(ctx, root, Some(&provider_id)).await?;
-            }
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             // A CLI identifies a configured provider, never a hidden vault
             // record name. Resolve that reference only inside the daemon so a
@@ -7762,40 +11447,99 @@ async fn handle_serialized_request_impl(
             // direct (`project_root: None`) path is the owner-settings mirror
             // of `PutProviderCredential`: the owner supplies the raw vault
             // record id and receives a plain `Ack`.
-            let (credential_record_id, response) = if let Some(project_root) =
-                project_root.as_deref()
-            {
-                let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
-                let provider = config.providers.get(&provider_id).ok_or_else(|| {
-                    bad_request(format!("provider `{provider_id}` is not configured"))
-                })?;
-                if provider.auth != Some(crate::config::providers::AuthKind::OAuth) {
-                    return Err(bad_request(
-                        "provider credential logout is only available for OAuth providers",
-                    ));
+            let preflight = async {
+                if let Some(root) = project_root.as_deref() {
+                    recover_provider_config_journals(ctx, root, Some(&provider_id)).await?;
                 }
-                let credential_record_id = provider.credential_ref.clone().ok_or_else(|| {
-                    bad_request(format!("provider `{provider_id}` has no credential_ref"))
-                })?;
-                let credential_present = ctx
-                    .secret_vault
-                    .get_item(
+                let canonical_project_root = project_root
+                    .as_deref()
+                    .map(crate::secret_ownership::canonical_owner_root);
+                let (credential_record_id, changed) = if let Some(project_root) =
+                    project_root.as_deref()
+                {
+                    let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
+                    let provider = config.providers.get(&provider_id).ok_or_else(|| {
+                        bad_request(format!("provider `{provider_id}` is not configured"))
+                    })?;
+                    if provider.auth != Some(crate::config::providers::AuthKind::OAuth) {
+                        return Err(bad_request(
+                            "provider credential logout is only available for OAuth providers",
+                        ));
+                    }
+                    let credential_record_id =
+                        provider.credential_ref.clone().ok_or_else(|| {
+                            bad_request(format!("provider `{provider_id}` has no credential_ref"))
+                        })?;
+                    let credential_present = match ctx.secret_vault.get_item(
                         cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
                         &credential_record_id,
-                    )
-                    .is_ok();
-                (
+                    ) {
+                        Ok(_) => true,
+                        Err(crate::secure_key::SecureKeyError::NotFound(_)) => false,
+                        Err(error) => return Err(internal(anyhow::anyhow!(error))),
+                    };
+                    (credential_record_id, credential_present)
+                } else {
+                    let credential_present = match ctx.secret_vault.get_item(
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &provider_id,
+                    ) {
+                        Ok(_) => true,
+                        Err(crate::secure_key::SecureKeyError::NotFound(_)) => false,
+                        Err(error) => return Err(internal(anyhow::anyhow!(error))),
+                    };
+                    (provider_id.clone(), credential_present)
+                };
+                let consumed_vault_generation = ctx
+                    .secret_vault
+                    .current_inventory_generation()
+                    .map_err(|error| internal(anyhow::anyhow!(error)))?;
+                Ok::<_, ErrorPayload>((
+                    canonical_project_root,
                     credential_record_id,
-                    Response::ProviderCredentialDeleted {
-                        found: credential_present,
-                        deleted: credential_present,
-                    },
-                )
-            } else {
-                (provider_id.clone(), Response::Ack)
+                    changed,
+                    consumed_vault_generation,
+                ))
+            }
+            .await;
+            let (canonical_project_root, credential_record_id, changed, consumed_vault_generation) =
+                match preflight {
+                    Ok(preflight) => preflight,
+                    Err(error) => {
+                        finish_local_operation_error(
+                            ctx,
+                            settlement_owner,
+                            client_operation_id,
+                            request_hash,
+                            fencing_generation,
+                            &error,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
+            let owner_scope = canonical_project_root
+                .as_ref()
+                .map(|root| format!("project:{root}"))
+                .unwrap_or_else(|| "global".into());
+            let response = Response::ProviderCredentialCommitted {
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash,
+                provider_id: provider_id.clone(),
+                project_root: project_root.clone(),
+                owner_root: canonical_project_root,
+                owner_scope,
+                stored: false,
+                changed,
+                consumed_vault_generation,
+                result_vault_generation: consumed_vault_generation
+                    .saturating_add(u64::from(changed)),
+                config_generation: inventory::current_config_generation(),
             };
-            #[cfg(feature = "remote")]
-            {
+            #[cfg(not(feature = "remote"))]
+            let _ = (&response, changed, consumed_vault_generation);
+            let result = match {
+                #[cfg(feature = "remote")]
                 match remote_operation {
                     Some(operation) => {
                         mutate_owner_vault_item_with_remote_ledger(
@@ -7811,26 +11555,63 @@ async fn handle_serialized_request_impl(
                         .await
                     }
                     None => {
-                        ctx.mutate_owner_vault_item(
-                            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                            &credential_record_id,
+                        commit_local_provider_credential(
+                            ctx,
+                            settlement_owner.clone(),
+                            client_operation_id.clone(),
+                            request_hash,
+                            fencing_generation,
+                            provider_id.clone(),
+                            project_root.clone(),
+                            credential_record_id.clone(),
                             None,
                         )
-                        .map_err(internal)?;
-                        Ok(response)
+                        .await
                     }
                 }
-            }
-            #[cfg(not(feature = "remote"))]
-            {
-                ctx.mutate_owner_vault_item(
-                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                    &credential_record_id,
-                    None,
+                #[cfg(not(feature = "remote"))]
+                {
+                    commit_local_provider_credential(
+                        ctx,
+                        settlement_owner.clone(),
+                        client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        provider_id.clone(),
+                        project_root.clone(),
+                        credential_record_id.clone(),
+                        None,
+                    )
+                    .await
+                }
+            } {
+                Ok(result) => result,
+                Err(error) => {
+                    finish_local_operation_error(
+                        ctx,
+                        settlement_owner.clone(),
+                        client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            #[cfg(feature = "remote")]
+            if remote_operation.is_some() {
+                finish_local_operation(
+                    ctx,
+                    settlement_owner,
+                    client_operation_id_from_response(&result)?,
+                    request_hash,
+                    fencing_generation,
+                    &result,
                 )
-                .map_err(internal)?;
-                Ok(response)
+                .await?;
             }
+            Ok(result)
         }
 
         #[cfg(feature = "remote")]
@@ -7842,7 +11623,43 @@ async fn handle_serialized_request_impl(
         Request::GetProviderCatalogSnapshot {
             project_root,
             provider_id,
-        } => provider_catalog_snapshot(ctx, &project_root, provider_id.as_deref()).await,
+            snapshot_session_id,
+        } => {
+            provider_catalog_snapshot(
+                ctx,
+                &project_root,
+                provider_id.as_deref(),
+                &snapshot_session_id,
+                settings_capability_owner(state),
+            )
+            .await
+        }
+
+        Request::ApplyProviderMutation {
+            snapshot_session_id,
+            layer_id,
+            expected_revision,
+            client_operation_id,
+            mutation_intent_hash,
+            mutation,
+        } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept provider config writes",
+                ));
+            }
+            apply_provider_mutation(
+                ctx,
+                snapshot_session_id,
+                layer_id,
+                expected_revision,
+                client_operation_id,
+                mutation_intent_hash,
+                mutation,
+                settings_capability_owner(state),
+            )
+            .await
+        }
 
         Request::FetchProviderModels {
             project_root,
@@ -8011,49 +11828,94 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SetupCopilotAuth {
+            client_operation_id,
             project_root,
             provider_id,
         } => {
-            if ctx.paths.ephemeral {
-                return Err(bad_request(
-                    "ephemeral daemons do not accept Copilot auth setup",
-                ));
-            }
-            #[cfg(feature = "remote")]
-            let request = Request::SetupCopilotAuth {
-                project_root: project_root.clone(),
-                provider_id: provider_id.clone(),
-            };
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) =
-                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
-                        .await?
-            {
-                return Ok(response);
-            }
-            // A local unix-socket owner (`ClientPrincipal::Owner`, no
-            // remote-operation ledger context) may adopt the host's ambient
-            // GitHub token; any remote caller is failed closed inside
-            // `setup_copilot_auth`. `is_local_owner` is derived only from
-            // daemon-assigned signals — see `is_local_owner_action`.
-            let is_local_owner = is_local_owner_action(
-                state,
-                #[cfg(feature = "remote")]
-                remote_operation,
-            );
-            let operation_result = setup_copilot_auth(
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash =
+                local_operation_request_hash(&("setup_copilot_auth", &project_root, &provider_id))?;
+            let mutation_intent_hash = local_operation_request_hash_hex(&request_hash);
+            let fencing_generation = match begin_local_operation(
                 ctx,
-                &project_root,
-                &provider_id,
-                provider_env_snapshot(ctx, state),
-                is_local_owner,
+                &settlement_owner,
+                &client_operation_id,
+                "setup_copilot_auth",
+                request_hash,
             )
-            .await;
-            let operation_result = operation_result.map(|_| Response::Ack);
-            finish_provider_mutation_future!(remote_operation, ctx, "setup_copilot_auth", async {
-                operation_result
-            })
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let operation = async {
+                if ctx.paths.ephemeral {
+                    return Err(bad_request(
+                        "ephemeral daemons do not accept Copilot auth setup",
+                    ));
+                }
+                #[cfg(feature = "remote")]
+                let request = Request::SetupCopilotAuth {
+                    client_operation_id: client_operation_id.clone(),
+                    project_root: project_root.clone(),
+                    provider_id: provider_id.clone(),
+                };
+                #[cfg(feature = "remote")]
+                if let Some(operation) = remote_operation
+                    && let Some(response) =
+                        begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                            .await?
+                {
+                    return Ok(response);
+                }
+                // A local unix-socket owner (`ClientPrincipal::Owner`, no
+                // remote-operation ledger context) may adopt the host's ambient
+                // GitHub token; any remote caller is failed closed inside
+                // `setup_copilot_auth`. `is_local_owner` is derived only from
+                // daemon-assigned signals — see `is_local_owner_action`.
+                let is_local_owner = is_local_owner_action(
+                    state,
+                    #[cfg(feature = "remote")]
+                    remote_operation,
+                );
+                // Provider config publication owns the complete vault/file
+                // journal. The SQLite writer transaction captures both vault
+                // generations; taking the standalone secret lock here would
+                // self-deadlock when recovery performs journal cleanup.
+                let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+                let operation_result = setup_copilot_auth(
+                    ctx,
+                    &project_root,
+                    &provider_id,
+                    provider_env_snapshot(ctx, state),
+                    is_local_owner,
+                    CopilotJournalBinding {
+                        owner_digest: settlement_owner.clone(),
+                        client_operation_id: client_operation_id.clone(),
+                        request_hash,
+                        mutation_intent_hash,
+                        fencing_generation,
+                        requested_project_root: project_root.clone(),
+                    },
+                )
+                .await;
+                let response = finish_provider_mutation_future!(
+                    remote_operation,
+                    ctx,
+                    "setup_copilot_auth",
+                    async { operation_result }
+                )?;
+                Ok(response)
+            };
+            terminalize_local_operation(
+                ctx,
+                settlement_owner.clone(),
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
+                operation,
+            )
+            .await
         }
 
         Request::ApplySetupWizard {
@@ -8093,44 +11955,106 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SaveMcpConfig {
+            client_operation_id,
             project_root,
+            snapshot_capability,
+            owner_root,
+            config_path,
+            expected_revision,
+            mutation_intent_hash,
             config_json,
             secret_values_json,
             cleanup_names_json,
         } => {
-            if ctx.paths.ephemeral {
-                return Err(bad_request(
-                    "ephemeral daemons do not accept MCP config writes",
-                ));
-            }
-            #[cfg(feature = "remote")]
-            let request = Request::SaveMcpConfig {
-                project_root: project_root.clone(),
-                config_json: config_json.clone(),
-                secret_values_json: secret_values_json.clone(),
-                cleanup_names_json: cleanup_names_json.clone(),
-            };
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) =
-                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
-                        .await?
-            {
-                return Ok(response);
-            }
-            let operation_result = save_mcp_config(
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash = local_operation_secret_request_hash(
                 ctx,
-                &project_root,
-                &config_json,
-                &secret_values_json,
-                &cleanup_names_json,
-            );
-            finish_provider_mutation_future!(
-                remote_operation,
+                b"flycockpit/local-operation/mcp-config-save/v1\0",
+                &(
+                    "save_mcp_config",
+                    &project_root,
+                    &snapshot_capability,
+                    &owner_root,
+                    &config_path,
+                    &expected_revision,
+                    &mutation_intent_hash,
+                    &config_json,
+                    &secret_values_json,
+                    &cleanup_names_json,
+                ),
+            )?;
+            let fencing_generation = match begin_local_operation(
                 ctx,
+                &settlement_owner,
+                &client_operation_id,
                 "save_mcp_config",
-                operation_result
+                request_hash,
             )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let operation = async {
+                if ctx.paths.ephemeral {
+                    return Err(bad_request(
+                        "ephemeral daemons do not accept MCP config writes",
+                    ));
+                }
+                #[cfg(feature = "remote")]
+                let request = Request::SaveMcpConfig {
+                    client_operation_id: client_operation_id.clone(),
+                    project_root: project_root.clone(),
+                    snapshot_capability: snapshot_capability.clone(),
+                    owner_root: owner_root.clone(),
+                    config_path: config_path.clone(),
+                    expected_revision: expected_revision.clone(),
+                    mutation_intent_hash: mutation_intent_hash.clone(),
+                    config_json: config_json.clone(),
+                    secret_values_json: secret_values_json.clone(),
+                    cleanup_names_json: cleanup_names_json.clone(),
+                };
+                #[cfg(feature = "remote")]
+                if let Some(operation) = remote_operation
+                    && let Some(response) =
+                        begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                            .await?
+                {
+                    return Ok(response);
+                }
+                let operation_result = save_mcp_config(
+                    ctx,
+                    &settlement_owner,
+                    &client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &project_root,
+                    &snapshot_capability,
+                    &owner_root,
+                    &config_path,
+                    &expected_revision,
+                    &mutation_intent_hash,
+                    &config_json,
+                    &secret_values_json,
+                    &cleanup_names_json,
+                );
+                let response = finish_provider_mutation_future!(
+                    remote_operation,
+                    ctx,
+                    "save_mcp_config",
+                    operation_result
+                )?;
+                Ok(response)
+            };
+            terminalize_local_operation(
+                ctx,
+                settlement_owner.clone(),
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
+                operation,
+            )
+            .await
         }
 
         Request::DeleteProviderConfig {
@@ -9108,6 +13032,9 @@ async fn handle_serialized_request_impl(
         Request::BeginLeakReveal { report_id } => {
             begin_leak_reveal(ctx, &state.principal, report_id).await
         }
+        Request::CancelLeakReveal { capability } => {
+            cancel_leak_reveal(ctx, &state.principal, capability)
+        }
         Request::MarkLeakRotated {
             report_id,
             rotation,
@@ -9323,11 +13250,33 @@ pub(super) async fn begin_leak_reveal(
         .mint(token, report_id.clone(), expires_at_ms);
     Ok(Response::LeakRevealCapability {
         capability: proto::LeakRevealCapability {
-            capability: hex,
+            capability: proto::LeakRevealToken::new(hex),
             report_id,
             expires_at_ms,
         },
     })
+}
+
+fn cancel_leak_reveal(
+    ctx: &Arc<DaemonContext>,
+    principal: &ClientPrincipal,
+    capability: proto::LeakRevealToken,
+) -> std::result::Result<Response, ErrorPayload> {
+    if !principal.is_owner() {
+        return Err(authorization_error(
+            "leak reveal cancel requires local owner",
+        ));
+    }
+    let report_id = ctx
+        .leak_reveal_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .cancel_exact(capability.as_str(), chrono::Utc::now().timestamp_millis())
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "unauthorized".to_string(),
+        })?;
+    Ok(Response::LeakRevealCancelled { report_id })
 }
 
 /// Dispatch `MarkLeakRotated`: update the rotation disposition of a leak
@@ -10087,7 +14036,17 @@ async fn handle_concurrent_request_impl(
         Request::GetProviderCatalogSnapshot {
             project_root,
             provider_id,
-        } => provider_catalog_snapshot(&ctx, &project_root, provider_id.as_deref()).await,
+            snapshot_session_id,
+        } => {
+            provider_catalog_snapshot(
+                &ctx,
+                &project_root,
+                provider_id.as_deref(),
+                &snapshot_session_id,
+                shared.capability_owner.clone(),
+            )
+            .await
+        }
         Request::ListPackages => list_packages_response(&ctx).await,
         #[cfg(feature = "remote")]
         Request::GetConnectorState => get_connector_state_response(&ctx).await,
@@ -10117,6 +14076,8 @@ async fn handle_concurrent_request_impl(
         }
         Request::GetAssistant { name } => get_assistant_response(&ctx, name).await,
         Request::ListAssistants => {
+            let _publication = inventory::read_authority_publication().await;
+            let expected_config_generation = inventory::current_config_generation();
             let snapshots = crate::assistants::snapshots(&ctx.db)
                 .await
                 .map_err(internal)?;
@@ -10147,7 +14108,16 @@ async fn handle_concurrent_request_impl(
                 .into_iter()
                 .map(assistant_snapshot_to_proto)
                 .collect();
-            Ok(Response::Assistants { assistants })
+            let config_generation = inventory::current_config_generation();
+            if config_generation != expected_config_generation {
+                return Err(conflict(
+                    "configuration changed while reading assistants; retry the paired read",
+                ));
+            }
+            Ok(Response::Assistants {
+                assistants,
+                config_generation,
+            })
         }
         Request::DiagnoseMediaReservation { scope, id } => {
             diagnose_media_reservation_response(&ctx, scope, id).await
@@ -10366,6 +14336,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
         Request::PutProviderCredential {
             provider_id,
             record,
+            ..
         } => {
             if provider_id.trim().is_empty() {
                 Some("provider id must not be empty")
@@ -10375,7 +14346,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
                 || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
             {
                 Some("provider id is reserved")
-            } else if serde_json::from_str::<serde_json::Value>(record).is_err() {
+            } else if serde_json::from_str::<serde_json::Value>(record.as_str()).is_err() {
                 Some("provider credential record must be valid JSON")
             } else {
                 None
@@ -10458,10 +14429,17 @@ async fn provider_catalog_snapshot(
     ctx: &DaemonContext,
     project_root: &str,
     provider_id: Option<&str>,
+    snapshot_session_id: &str,
+    capability_owner: String,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (cwd, trust_policy, mut config) = daemon_provider_config(ctx, project_root).await?;
+    // The CAS covers the complete effective provider projection even when the
+    // caller asks to render only one row. A sibling provider edit therefore
+    // invalidates this capability instead of being overwritten by a partial
+    // snapshot save.
+    let revision = provider_config_revision(&config)?;
     if let Some(provider_id) = provider_id {
         let Some(entry) = config.providers.remove(provider_id) else {
             return Err(bad_request(format!(
@@ -10471,10 +14449,1489 @@ async fn provider_catalog_snapshot(
         config.providers.clear();
         config.providers.insert(provider_id.to_string(), entry);
     }
+    let config_generation = inventory::current_config_generation();
+    let canonical_root = crate::secret_ownership::canonical_owner_root(project_root);
+    let target_path =
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            ctx.config_source()
+                .config_write_target_for_provider(&cwd, "default")
+        })
+        .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+    let layer_material = format!(
+        "provider-layer\0{canonical_root}\0{}\0{snapshot_session_id}",
+        target_path.display()
+    );
+    let layer_id =
+        crate::intel::hex_lower(&<Sha256 as sha2::Digest>::digest(layer_material.as_bytes()));
+    let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
+    {
+        let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+            .lock()
+            .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
+        let now = Instant::now();
+        capabilities.retain(|_, capability| capability.expires_at > now);
+        if capabilities.len() >= PROVIDER_EDIT_CAPABILITY_CAPACITY
+            && !capabilities.contains_key(snapshot_session_id)
+        {
+            return Err(bad_request(
+                "provider edit capability capacity reached; retry after an edit expires",
+            ));
+        }
+        capabilities.insert(
+            snapshot_session_id.to_string(),
+            ProviderEditCapability {
+                owner: capability_owner,
+                project_root: canonical_root.clone(),
+                target_path,
+                layer_id: layer_id.clone(),
+                revision: revision.clone(),
+                config_generation,
+                mcp_target_path: std::path::PathBuf::from(&mcp.config_path),
+                mcp_revision: mcp.revision.clone(),
+                expires_at: now + PROVIDER_EDIT_CAPABILITY_TTL,
+            },
+        );
+    }
     let mut view = crate::secret_ref::redact_provider_view(&config);
-    view.mcp_config_json = Some(redacted_mcp_config_json(ctx, &cwd, &trust_policy)?);
+    view.mcp_config_json = Some(mcp.config_json);
+    view.mcp_owner_root = Some(canonical_root.clone());
+    view.mcp_config_path = Some(mcp.config_path);
+    view.mcp_edit_capability = Some(snapshot_session_id.to_string());
+    view.mcp_revision = Some(mcp.revision);
     view.extended_config_json = Some(redacted_extended_config_json(ctx, &cwd, &trust_policy)?);
-    bounded_provider_response(Response::ProviderCatalogSnapshot { config: view })
+    bounded_provider_response(Response::ProviderCatalogSnapshot {
+        config: view,
+        snapshot_session_id: snapshot_session_id.to_string(),
+        layer_id,
+        owner_root: canonical_root,
+        base_revision: revision,
+        config_generation,
+    })
+}
+
+fn provider_config_revision(
+    config: &crate::config::providers::ProvidersConfig,
+) -> std::result::Result<String, ErrorPayload> {
+    let bytes = serde_json::to_vec(config).map_err(internal)?;
+    Ok(crate::intel::hex_lower(&<Sha256 as sha2::Digest>::digest(
+        &bytes,
+    )))
+}
+
+async fn apply_provider_mutation(
+    ctx: &DaemonContext,
+    snapshot_session_id: String,
+    layer_id: String,
+    expected_revision: String,
+    client_operation_id: String,
+    mutation_intent_hash: String,
+    mutation: cockpit_proto::ProviderMutationBatch,
+    capability_owner: String,
+) -> std::result::Result<Response, ErrorPayload> {
+    let observed_intent_hash = mutation.sanitized_intent_hash().map_err(internal)?;
+    if observed_intent_hash != mutation_intent_hash {
+        return Err(bad_request(
+            "provider mutation intent digest does not match its body",
+        ));
+    }
+    let request_hash = local_operation_secret_request_hash(
+        ctx,
+        b"flycockpit/local-operation/provider-mutation/v1\0",
+        &(
+            "apply_provider_mutation",
+            &snapshot_session_id,
+            &layer_id,
+            &expected_revision,
+            &mutation_intent_hash,
+            &mutation_intent_hash,
+            &mutation,
+        ),
+    )?;
+    let fencing_generation = match begin_local_operation(
+        ctx,
+        &capability_owner,
+        &client_operation_id,
+        "apply_provider_mutation",
+        request_hash,
+    )
+    .await?
+    {
+        LocalOperationStart::Replay(response) => return Ok(response),
+        LocalOperationStart::Execute(generation) => generation,
+    };
+    let result = async {
+        let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+        let capability = {
+            let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+                .lock()
+                .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
+            let now = Instant::now();
+            capabilities.retain(|_, capability| capability.expires_at > now);
+            capabilities
+                .get(&snapshot_session_id)
+                .cloned()
+                .ok_or_else(|| bad_request("provider edit capability is absent or expired"))?
+        };
+        recover_provider_config_journals(ctx, &capability.project_root, None).await?;
+        let (_, _, current) = daemon_provider_config(ctx, &capability.project_root).await?;
+        let observed_revision = provider_config_revision(&current)?;
+        validate_provider_edit_capability(
+            &capability,
+            &capability_owner,
+            &layer_id,
+            &expected_revision,
+            inventory::current_config_generation(),
+            &observed_revision,
+        )?;
+
+        // Validate the entire intent before the first durable side effect. This is
+        // also defense in depth for typed in-process callers that bypass decoding.
+        let mut ids = std::collections::BTreeSet::new();
+        for upsert in &mutation.upserts {
+            if !ids.insert(upsert.provider_id.as_str()) {
+                return Err(bad_request("provider mutation contains duplicate ids"));
+            }
+            validate_daemon_provider_url(&upsert.entry.url)?;
+            validate_unique_provider_header_names(&upsert.entry.headers)?;
+            if upsert.header_secrets.len() != upsert.entry.headers.len() {
+                return Err(bad_request(
+                    "provider header secret count does not match headers",
+                ));
+            }
+        }
+        for delete in &mutation.deletes {
+            if !ids.insert(delete.provider_id.as_str()) {
+                return Err(bad_request("provider mutation contains duplicate ids"));
+            }
+        }
+
+        let commit = stage_and_recover_provider_batch(
+            ctx,
+            &capability.project_root,
+            &capability.target_path,
+            mutation,
+            &capability_owner,
+            &client_operation_id,
+            request_hash,
+            fencing_generation,
+            &snapshot_session_id,
+            &layer_id,
+            &expected_revision,
+        )
+        .await?;
+        {
+            let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+                .lock()
+                .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
+            capabilities.insert(
+                snapshot_session_id.clone(),
+                ProviderEditCapability {
+                    owner: capability.owner,
+                    project_root: capability.project_root,
+                    target_path: capability.target_path,
+                    layer_id: layer_id.clone(),
+                    revision: commit.result_revision.clone(),
+                    config_generation: commit.config_generation,
+                    mcp_target_path: capability.mcp_target_path,
+                    mcp_revision: capability.mcp_revision,
+                    expires_at: Instant::now() + PROVIDER_EDIT_CAPABILITY_TTL,
+                },
+            );
+        }
+        let response = commit.response;
+        finish_local_operation(
+            ctx,
+            capability_owner.clone(),
+            client_operation_id.clone(),
+            request_hash,
+            fencing_generation,
+            &response,
+        )
+        .await?;
+        Ok(response)
+    }
+    .await;
+    if let Err(error) = &result {
+        finish_local_operation_error(
+            ctx,
+            capability_owner,
+            client_operation_id,
+            request_hash,
+            fencing_generation,
+            error,
+        )
+        .await?;
+    }
+    result
+}
+
+fn local_operation_request_hash<T: serde::Serialize>(
+    request: &T,
+) -> std::result::Result<[u8; 32], ErrorPayload> {
+    let encoded = zeroize::Zeroizing::new(serde_json::to_vec(request).map_err(internal)?);
+    Ok(Sha256::digest(encoded.as_slice()).into())
+}
+
+fn local_operation_request_hash_hex(request_hash: &[u8; 32]) -> String {
+    request_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn local_operation_stored_hash_hex(
+    request_hash: &[u8],
+) -> std::result::Result<String, ErrorPayload> {
+    if request_hash.len() != 32 {
+        return Err(internal(anyhow::anyhow!(
+            "local operation receipt contains an invalid request hash"
+        )));
+    }
+    Ok(request_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+enum LocalOperationStart {
+    Execute(i64),
+    Replay(Response),
+}
+
+fn assistant_mutation_request_identity(
+    ctx: &DaemonContext,
+    requested_project_root: &str,
+    action: &str,
+    name: &str,
+    expected_revision: &str,
+    markdown: Option<&str>,
+    expected_config_generation: u64,
+) -> std::result::Result<[u8; 32], ErrorPayload> {
+    let encoded = zeroize::Zeroizing::new(
+        serde_json::to_vec(&(
+            requested_project_root,
+            action,
+            name,
+            expected_revision,
+            markdown,
+            expected_config_generation,
+        ))
+        .map_err(internal)?,
+    );
+    Ok(ctx.secret_vault.keyed_request_identity(
+        b"flycockpit.assistant-mutation.request.v2",
+        encoded.as_slice(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn begin_assistant_mutation_journal(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    mutation_intent_hash: String,
+    requested_project_root: String,
+    project_root: String,
+    assistant_name: String,
+    action: &'static str,
+    consumed_revision: String,
+    intended_content_identity: Option<[u8; 32]>,
+    consumed_config_generation: u64,
+) -> std::result::Result<(), ErrorPayload> {
+    ctx.db
+        .transaction(move |conn| {
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO assistant_mutation_journals
+                 (owner_digest,client_operation_id,request_hash,fencing_generation,
+                  mutation_intent_hash,requested_project_root,project_root,
+                  assistant_name,action,consumed_revision,intended_content_identity,
+                  consumed_config_generation,created_at_unix_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    mutation_intent_hash,
+                    requested_project_root,
+                    project_root,
+                    assistant_name,
+                    action,
+                    consumed_revision,
+                    intended_content_identity.as_ref().map(<[u8; 32]>::as_slice),
+                    i64::try_from(consumed_config_generation)?,
+                    chrono::Utc::now().timestamp_millis(),
+                ],
+            )?;
+            if inserted == 1 {
+                return Ok(());
+            }
+            let exact: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM assistant_mutation_journals
+                 WHERE owner_digest=?1 AND client_operation_id=?2
+                   AND request_hash=?3 AND fencing_generation=?4
+                   AND mutation_intent_hash=?5 AND requested_project_root=?6
+                   AND project_root=?7 AND assistant_name=?8 AND action=?9
+                   AND consumed_revision=?10 AND intended_content_identity IS ?11
+                   AND consumed_config_generation=?12)",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    mutation_intent_hash,
+                    requested_project_root,
+                    project_root,
+                    assistant_name,
+                    action,
+                    consumed_revision,
+                    intended_content_identity.as_ref().map(<[u8; 32]>::as_slice),
+                    i64::try_from(consumed_config_generation)?,
+                ],
+                |row| row.get(0),
+            )?;
+            if !exact {
+                anyhow::bail!("assistant mutation journal identity conflicts with receipt");
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
+async fn finish_assistant_mutation(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    response: &Response,
+) -> std::result::Result<(), ErrorPayload> {
+    let response_json = serde_json::to_string(response).map_err(internal)?;
+    ctx.db
+        .transaction(move |conn| {
+            let journal_exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM assistant_mutation_journals
+                  WHERE owner_digest=?1 AND client_operation_id=?2
+                    AND request_hash=?3 AND fencing_generation=?4)",
+                rusqlite::params![
+                    &owner,
+                    &client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                ],
+                |row| row.get(0),
+            )?;
+            if !journal_exists {
+                anyhow::bail!("assistant mutation lost its durable journal fence");
+            }
+            let settled = conn.execute(
+                "UPDATE local_operation_receipts
+                    SET state='terminal_success',terminal_outcome_json=?5,
+                        execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                  WHERE owner_digest=?1 AND client_operation_id=?2
+                    AND request_hash=?3 AND fencing_generation=?4 AND state='executing'",
+                rusqlite::params![
+                    &owner,
+                    &client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    response_json,
+                    chrono::Utc::now().timestamp_millis(),
+                ],
+            )?;
+            if settled != 1 {
+                anyhow::bail!("assistant mutation lost its local receipt fence");
+            }
+            let deleted = conn.execute(
+                "DELETE FROM assistant_mutation_journals
+                  WHERE owner_digest=?1 AND client_operation_id=?2
+                    AND request_hash=?3 AND fencing_generation=?4",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                ],
+            )?;
+            if deleted != 1 {
+                anyhow::bail!("assistant mutation journal retirement was not atomic");
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
+async fn settle_uncommitted_assistant_recovery(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+) -> std::result::Result<(), ErrorPayload> {
+    let error = ErrorPayload {
+        code: ErrorCode::Conflict,
+        message: "assistant mutation recovery could not prove the exact committed projection; reload authority before retrying"
+            .into(),
+    };
+    let error_json = serde_json::to_string(&error).map_err(internal)?;
+    ctx.db
+        .transaction(move |conn| {
+            let settled = conn.execute(
+                "UPDATE local_operation_receipts
+                 SET state='terminal_error',terminal_outcome_json=?5,
+                     execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                 WHERE owner_digest=?1 AND client_operation_id=?2
+                   AND request_hash=?3 AND fencing_generation=?4
+                   AND state='executing'",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    error_json,
+                    chrono::Utc::now().timestamp_millis(),
+                ],
+            )?;
+            if settled != 1 {
+                anyhow::bail!("uncommitted assistant recovery lost its receipt fence");
+            }
+            let deleted = conn.execute(
+                "DELETE FROM assistant_mutation_journals
+                 WHERE owner_digest=?1 AND client_operation_id=?2
+                   AND request_hash=?3 AND fencing_generation=?4",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                ],
+            )?;
+            if deleted != 1 {
+                anyhow::bail!("uncommitted assistant recovery lost its journal fence");
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
+pub(super) async fn recover_assistant_mutation_journals(
+    ctx: &DaemonContext,
+) -> std::result::Result<u64, ErrorPayload> {
+    #[derive(Debug)]
+    struct Row {
+        owner: String,
+        operation_id: String,
+        request_hash: Vec<u8>,
+        fence: i64,
+        intent_hash: String,
+        requested_root: String,
+        root: String,
+        name: String,
+        action: String,
+        consumed_revision: String,
+        intended_hash: Option<Vec<u8>>,
+        consumed_generation: i64,
+    }
+    let rows = ctx
+        .db
+        .read(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT owner_digest,client_operation_id,request_hash,fencing_generation,
+                        mutation_intent_hash,requested_project_root,project_root,
+                        assistant_name,action,consumed_revision,intended_content_identity,
+                        consumed_config_generation
+                   FROM assistant_mutation_journals ORDER BY created_at_unix_ms",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok(Row {
+                        owner: row.get(0)?,
+                        operation_id: row.get(1)?,
+                        request_hash: row.get(2)?,
+                        fence: row.get(3)?,
+                        intent_hash: row.get(4)?,
+                        requested_root: row.get(5)?,
+                        root: row.get(6)?,
+                        name: row.get(7)?,
+                        action: row.get(8)?,
+                        consumed_revision: row.get(9)?,
+                        intended_hash: row.get(10)?,
+                        consumed_generation: row.get(11)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .map_err(internal)?;
+    let mut recovered = 0u64;
+    for row in rows {
+        let consumed_generation = u64::try_from(row.consumed_generation)
+            .map_err(|_| internal("assistant journal generation is negative"))?;
+        let request_hash: [u8; 32] = row
+            .request_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| internal("assistant journal request hash is malformed"))?;
+        let snapshot = crate::assistants::snapshot(&ctx.db, &row.name)
+            .await
+            .map_err(internal)?;
+        let observed_identity = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.definition_markdown.as_deref())
+            .map(|markdown| {
+                ctx.secret_vault.keyed_request_identity(
+                    b"flycockpit.assistant.intended-markdown.v1",
+                    markdown.as_bytes(),
+                )
+            });
+        let remained_consumed = match (&snapshot, row.action.as_str()) {
+            (Some(snapshot), "save") => {
+                snapshot.definition_revision.as_deref() == Some(row.consumed_revision.as_str())
+                    && observed_identity.as_ref().map(<[u8; 32]>::as_slice)
+                        != row.intended_hash.as_deref()
+            }
+            (Some(snapshot), "delete") => {
+                crate::assistants::registration_revision(&snapshot.row) == row.consumed_revision
+            }
+            _ => false,
+        };
+        if remained_consumed {
+            settle_uncommitted_assistant_recovery(
+                ctx,
+                row.owner,
+                row.operation_id,
+                request_hash,
+                row.fence,
+            )
+            .await?;
+            recovered = recovered.saturating_add(1);
+            continue;
+        }
+        let response = match row.action.as_str() {
+            "save" => {
+                let Some(snapshot) = snapshot else {
+                    settle_uncommitted_assistant_recovery(
+                        ctx,
+                        row.owner,
+                        row.operation_id,
+                        request_hash,
+                        row.fence,
+                    )
+                    .await?;
+                    recovered = recovered.saturating_add(1);
+                    continue;
+                };
+                if observed_identity.as_ref().map(<[u8; 32]>::as_slice)
+                    != row.intended_hash.as_deref()
+                {
+                    settle_uncommitted_assistant_recovery(
+                        ctx,
+                        row.owner,
+                        row.operation_id,
+                        request_hash,
+                        row.fence,
+                    )
+                    .await?;
+                    recovered = recovered.saturating_add(1);
+                    continue;
+                }
+                let Some(result_revision) = snapshot.definition_revision.clone() else {
+                    settle_uncommitted_assistant_recovery(
+                        ctx,
+                        row.owner,
+                        row.operation_id,
+                        request_hash,
+                        row.fence,
+                    )
+                    .await?;
+                    recovered = recovered.saturating_add(1);
+                    continue;
+                };
+                let result_generation = inventory::publish_committed_config_generation();
+                Response::AssistantDefinitionSaved {
+                    client_operation_id: row.operation_id.clone(),
+                    mutation_intent_hash: row.intent_hash.clone(),
+                    project_root: row.root.clone(),
+                    requested_project_root: row.requested_root.clone(),
+                    name: row.name.clone(),
+                    assistant: Some(assistant_snapshot_to_proto(snapshot)),
+                    consumed_revision: row.consumed_revision.clone(),
+                    result_revision,
+                    consumed_config_generation: consumed_generation,
+                    result_config_generation: result_generation,
+                    outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
+                }
+            }
+            "delete" => {
+                if let Some(_snapshot) = snapshot {
+                    settle_uncommitted_assistant_recovery(
+                        ctx,
+                        row.owner,
+                        row.operation_id,
+                        request_hash,
+                        row.fence,
+                    )
+                    .await?;
+                    recovered = recovered.saturating_add(1);
+                    continue;
+                }
+                let result_generation = inventory::publish_committed_config_generation();
+                Response::AssistantDeleted {
+                    client_operation_id: row.operation_id.clone(),
+                    mutation_intent_hash: row.intent_hash.clone(),
+                    project_root: row.root.clone(),
+                    requested_project_root: row.requested_root.clone(),
+                    name: row.name.clone(),
+                    consumed_revision: row.consumed_revision.clone(),
+                    result_revision: {
+                        let material = zeroize::Zeroizing::new(
+                            format!("{}\0{}", row.name, row.consumed_revision).into_bytes(),
+                        );
+                        crate::intel::hex_lower(&ctx.secret_vault.keyed_request_identity(
+                            b"flycockpit.assistant.delete-tombstone.v1",
+                            material.as_slice(),
+                        ))
+                    },
+                    consumed_config_generation: consumed_generation,
+                    result_config_generation: result_generation,
+                    outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
+                }
+            }
+            _ => {
+                settle_uncommitted_assistant_recovery(
+                    ctx,
+                    row.owner,
+                    row.operation_id,
+                    request_hash,
+                    row.fence,
+                )
+                .await?;
+                recovered = recovered.saturating_add(1);
+                continue;
+            }
+        };
+        finish_assistant_mutation(
+            ctx,
+            row.owner,
+            row.operation_id,
+            request_hash,
+            row.fence,
+            &response,
+        )
+        .await?;
+        recovered = recovered.saturating_add(1);
+    }
+    Ok(recovered)
+}
+
+async fn begin_local_operation(
+    ctx: &DaemonContext,
+    owner: &str,
+    client_operation_id: &str,
+    kind: &str,
+    request_hash: [u8; 32],
+) -> std::result::Result<LocalOperationStart, ErrorPayload> {
+    match ctx
+        .db
+        .begin_local_operation(
+            owner.to_owned(),
+            client_operation_id.to_owned(),
+            kind.to_owned(),
+            request_hash,
+        )
+        .await
+        .map_err(|error| conflict(error.to_string()))?
+    {
+        crate::db::local_operation_receipts::LocalOperationBegin::Dispatch {
+            fencing_generation,
+        } => Ok(LocalOperationStart::Execute(fencing_generation)),
+        crate::db::local_operation_receipts::LocalOperationBegin::TerminalSuccess(json) => {
+            serde_json::from_str(&json)
+                .map(LocalOperationStart::Replay)
+                .map_err(internal)
+        }
+        crate::db::local_operation_receipts::LocalOperationBegin::TerminalError(json) => {
+            let error: ErrorPayload = serde_json::from_str(&json).map_err(internal)?;
+            Err(error)
+        }
+        crate::db::local_operation_receipts::LocalOperationBegin::TerminalCancelled(json) => {
+            let error: ErrorPayload = serde_json::from_str(&json).map_err(internal)?;
+            Err(error)
+        }
+        crate::db::local_operation_receipts::LocalOperationBegin::Pending => Err(conflict(
+            "an exact duplicate local operation is already executing; query its settlement",
+        )),
+    }
+}
+
+async fn finish_local_operation(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    response: &Response,
+) -> std::result::Result<(), ErrorPayload> {
+    let response_json = serde_json::to_string(response).map_err(internal)?;
+    ctx.db
+        .finish_local_operation(
+            owner,
+            client_operation_id,
+            request_hash,
+            fencing_generation,
+            "terminal_success".into(),
+            response_json,
+        )
+        .await
+        .map_err(internal)
+}
+
+async fn finish_local_operation_error(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    error: &ErrorPayload,
+) -> std::result::Result<(), ErrorPayload> {
+    let linked_owner = owner.clone();
+    let linked_operation = client_operation_id.clone();
+    let has_recovery_intent = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM provider_config_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                    UNION ALL
+                    SELECT 1 FROM mcp_config_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                    UNION ALL
+                    SELECT 1 FROM extended_config_patch_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                    UNION ALL
+                    SELECT 1 FROM image_config_mutation_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                    UNION ALL
+                    SELECT 1 FROM agent_mutation_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                    UNION ALL
+                    SELECT 1 FROM assistant_mutation_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                 )",
+                rusqlite::params![linked_owner, linked_operation],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .map_err(internal)?;
+    if has_recovery_intent {
+        tracing::warn!(
+            client_operation_id,
+            "local operation remains settlement-unknown behind a durable recovery intent"
+        );
+        return Ok(());
+    }
+    // Local receipts survive daemon restarts and are queryable independently
+    // of the request that produced them. Never persist an anyhow/provider/
+    // filesystem-derived message here: those strings can contain paths,
+    // response bodies, or secret-adjacent diagnostics. The typed code remains
+    // authoritative while the public message is deliberately fixed and
+    // bounded. Detailed diagnostics stay in process-local logs only.
+    let terminal_error = ErrorPayload {
+        code: error.code.clone(),
+        message: if error.code == ErrorCode::Shutdown {
+            "the daemon stopped before the local operation completed"
+        } else {
+            "the local operation was rejected; inspect daemon diagnostics for details"
+        }
+        .to_owned(),
+    };
+    let error_json = serde_json::to_string(&terminal_error).map_err(internal)?;
+    ctx.db
+        .finish_local_operation(
+            owner,
+            client_operation_id,
+            request_hash,
+            fencing_generation,
+            if error.code == ErrorCode::Shutdown {
+                "terminal_cancelled".into()
+            } else {
+                "terminal_error".into()
+            },
+            error_json,
+        )
+        .await
+        .map_err(internal)
+}
+
+/// Close every admitted local operation in the current process.  Handler
+/// bodies intentionally live inside this future so validation, remote-ledger
+/// admission, publication, and response construction cannot escape through a
+/// `?` while leaving an executing receipt behind.
+async fn terminalize_local_operation<F>(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    operation: F,
+) -> std::result::Result<Response, ErrorPayload>
+where
+    F: std::future::Future<Output = std::result::Result<Response, ErrorPayload>>,
+{
+    match operation.await {
+        Ok(response) => {
+            let response_operation_id = client_operation_id_from_response(&response)?;
+            if response_operation_id != client_operation_id {
+                let error = internal(anyhow::anyhow!(
+                    "local operation produced a receipt for a different operation"
+                ));
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            finish_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(error) => {
+            finish_local_operation_error(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &error,
+            )
+            .await?;
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_local_provider_credential(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    provider_id: String,
+    project_root: Option<String>,
+    credential_record_id: String,
+    record: Option<zeroize::Zeroizing<Vec<u8>>>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let mutation_intent_hash = if record.is_some() {
+        local_operation_request_hash_hex(&local_operation_request_hash(&(
+            "put_provider_credential",
+            &provider_id,
+        ))?)
+    } else {
+        local_operation_request_hash_hex(&local_operation_request_hash(&(
+            "delete_provider_credential",
+            &provider_id,
+            &project_root,
+        ))?)
+    };
+    let vault = ctx.secret_vault.clone();
+    let response = ctx
+        .db
+        .transaction(move |conn| {
+            // The receipt fence, before/after inventory generations, exact
+            // target mutation, and terminal response share one SQLite commit.
+            // A crash can therefore expose either the old state + executing
+            // receipt or the new state + exact terminal receipt, never the
+            // changed=false fabrication that a later baseline read permits.
+            let fence_is_live: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_operation_receipts
+                 WHERE owner_digest=?1 AND client_operation_id=?2
+                   AND request_hash=?3 AND fencing_generation=?4 AND state='executing')",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation
+                ],
+                |row| row.get(0),
+            )?;
+            if !fence_is_live {
+                anyhow::bail!("local credential operation lost its execution fence");
+            }
+            let consumed_vault_generation =
+                cockpit_db::secret_vault::inventory_generation_conn(conn)?;
+            let current = match vault.get_item_on_conn(
+                conn,
+                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                &credential_record_id,
+            ) {
+                Ok(value) => Some(value),
+                Err(crate::secure_key::SecureKeyError::NotFound(_)) => None,
+                Err(error) => return Err(anyhow::anyhow!(error)),
+            };
+            let changed = match (&current, record.as_deref()) {
+                (Some(current), Some(desired)) => current.as_slice() != desired,
+                (None, None) => false,
+                _ => true,
+            };
+            if changed {
+                vault
+                    .mutate_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &credential_record_id,
+                        record.as_deref(),
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            let result_vault_generation =
+                cockpit_db::secret_vault::inventory_generation_conn(conn)?;
+            let owner_root = project_root
+                .as_deref()
+                .map(crate::secret_ownership::canonical_owner_root);
+            let owner_scope = owner_root
+                .as_ref()
+                .map(|root| format!("project:{root}"))
+                .unwrap_or_else(|| "global".into());
+            let response = Response::ProviderCredentialCommitted {
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash,
+                provider_id,
+                project_root,
+                owner_root,
+                owner_scope,
+                stored: record.is_some(),
+                changed,
+                consumed_vault_generation,
+                result_vault_generation,
+                config_generation: inventory::current_config_generation(),
+            };
+            let response_json = serde_json::to_string(&response)?;
+            let updated = conn.execute(
+                "UPDATE local_operation_receipts
+                 SET state='terminal_success',terminal_outcome_json=?5,
+                     execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                 WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3
+                   AND fencing_generation=?4 AND state='executing'",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    response_json,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            if updated != 1 {
+                anyhow::bail!("local credential operation lost its execution fence");
+            }
+            Ok(response)
+        })
+        .await
+        .map_err(internal)?;
+    if matches!(
+        &response,
+        Response::ProviderCredentialCommitted { changed: true, .. }
+    ) && let Err(error) = ctx.publish_owner_redaction_table()
+    {
+        ctx.poison_redaction_publication(&error);
+        return Err(internal(error));
+    }
+    Ok(response)
+}
+
+fn client_operation_id_from_response(
+    response: &Response,
+) -> std::result::Result<String, ErrorPayload> {
+    match response {
+        Response::ProviderMutationCommitted {
+            client_operation_id,
+            ..
+        }
+        | Response::ProviderCredentialCommitted {
+            client_operation_id,
+            ..
+        }
+        | Response::McpConfigCommitted {
+            client_operation_id,
+            ..
+        }
+        | Response::ExtendedConfigSaved {
+            client_operation_id,
+            ..
+        }
+        | Response::CopilotAuthCommitted {
+            client_operation_id,
+            ..
+        }
+        | Response::ProviderOAuthStarted {
+            client_operation_id,
+            ..
+        }
+        | Response::ProviderOAuthCompleted {
+            client_operation_id,
+            ..
+        }
+        | Response::ProviderOAuthCancelled {
+            client_operation_id,
+            ..
+        }
+        | Response::McpOAuthStarted {
+            client_operation_id,
+            ..
+        }
+        | Response::McpOAuthCompleted {
+            client_operation_id,
+            ..
+        }
+        | Response::McpOAuthCancelled {
+            client_operation_id,
+            ..
+        }
+        | Response::ImageControlMutated(
+            cockpit_proto::image_control::ImageControlMutationResponseV1 {
+                client_operation_id,
+                ..
+            },
+        )
+        | Response::AgentMutated(AgentMutationResult {
+            client_operation_id,
+            ..
+        }) => Ok(client_operation_id.clone()),
+        _ => Err(internal(anyhow::anyhow!(
+            "local operation produced an unbound receipt"
+        ))),
+    }
+}
+
+fn validate_provider_edit_capability(
+    capability: &ProviderEditCapability,
+    owner: &str,
+    layer_id: &str,
+    expected_revision: &str,
+    current_generation: u64,
+    observed_revision: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    if capability.layer_id != layer_id || capability.revision != expected_revision {
+        return Err(bad_request(
+            "provider edit capability does not match the submitted base revision",
+        ));
+    }
+    if capability.owner != owner {
+        return Err(bad_request(
+            "provider edit capability belongs to another authenticated owner",
+        ));
+    }
+    if current_generation != capability.config_generation {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "configuration generation changed; reload before saving".into(),
+        });
+    }
+    if observed_revision != expected_revision {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "provider configuration changed; reload before saving".into(),
+        });
+    }
+    Ok(())
+}
+
+async fn stage_and_recover_provider_batch(
+    ctx: &DaemonContext,
+    project_root: &str,
+    capability_target: &std::path::Path,
+    mutation: cockpit_proto::ProviderMutationBatch,
+    owner_digest: &str,
+    client_operation_id: &str,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    snapshot_session_id: &str,
+    layer_id: &str,
+    consumed_revision: &str,
+    mutation_intent_hash: &str,
+) -> std::result::Result<ProviderMutationJournalCommit, ErrorPayload> {
+    recover_provider_config_journals(ctx, project_root, None).await?;
+    let (cwd, trust_policy, effective) = daemon_provider_config(ctx, project_root).await?;
+    let target = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        ctx.config_source()
+            .config_write_target_for_provider(&cwd, "default")
+    })
+    .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+    if target != capability_target {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "provider authority layer changed; reload before saving".into(),
+        });
+    }
+    for provider_id in mutation
+        .upserts
+        .iter()
+        .map(|upsert| upsert.provider_id.as_str())
+        .chain(
+            mutation
+                .deletes
+                .iter()
+                .map(|delete| delete.provider_id.as_str()),
+        )
+    {
+        let provider_target =
+            crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+                ctx.config_source()
+                    .config_write_target_for_provider(&cwd, provider_id)
+            })
+            .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+        if provider_target != target {
+            return Err(bad_request(
+                "provider batch spans multiple authority layers; reload the defining layer",
+            ));
+        }
+    }
+    let doc = crate::config::providers::ConfigDoc::load(&target).map_err(internal)?;
+    let mut desired = doc.providers();
+    let mut staged: Vec<(String, zeroize::Zeroizing<String>)> = Vec::new();
+    let mut static_refs = std::collections::BTreeSet::new();
+    let mut cleanup_named = std::collections::BTreeSet::new();
+    let mut cleanup_credentials =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    let mut credential_claims = Vec::<(String, String)>::new();
+    let batch_id = Uuid::now_v7().to_string();
+
+    for mut upsert in mutation.upserts {
+        let prior = desired
+            .providers
+            .get(&upsert.provider_id)
+            .or_else(|| effective.providers.get(&upsert.provider_id));
+        if let Some(prior) = prior {
+            let refs = provider_owned_secret_references(prior);
+            cleanup_named.extend(refs.0);
+            cleanup_credentials
+                .entry(upsert.provider_id.clone())
+                .or_default()
+                .extend(refs.1);
+            for (index, header) in upsert.entry.headers.iter_mut().enumerate() {
+                if header.value.trim() == "********"
+                    && let Some(old_header) = prior
+                        .headers
+                        .iter()
+                        .find(|candidate| candidate.name.eq_ignore_ascii_case(&header.name))
+                {
+                    header.value.clone_from(&old_header.value);
+                }
+                if upsert.header_secrets[index].is_none()
+                    && !header.value.trim().is_empty()
+                    && !crate::config::providers::is_safe_provider_header_reference(
+                        &header.name.to_ascii_lowercase(),
+                        &header.value,
+                    )
+                {
+                    return Err(bad_request(
+                        "a redacted provider header could not be restored authoritatively",
+                    ));
+                }
+            }
+        }
+        for (index, (header, secret)) in upsert
+            .entry
+            .headers
+            .iter_mut()
+            .zip(upsert.header_secrets)
+            .enumerate()
+        {
+            if let Some(secret) = secret {
+                let slug = upsert
+                    .provider_id
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphanumeric())
+                    .take(48)
+                    .collect::<String>();
+                let name = format!("provider-{slug}-{batch_id}-{index}");
+                header.value = format!("$secret:{name}");
+                staged.push((name, secret.into_zeroizing()));
+            }
+        }
+        validate_daemon_provider_url(&upsert.entry.url)?;
+        validate_unique_provider_header_names(&upsert.entry.headers)?;
+        ensure_provider_credential_reference_available(ctx, &upsert.entry).await?;
+        let staged_names = staged
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        static_refs.extend(
+            provider_owned_secret_references(&upsert.entry)
+                .0
+                .into_iter()
+                .filter(|name| !staged_names.contains(name.as_str())),
+        );
+        if let Some(reference) = &upsert.entry.credential_ref {
+            credential_claims.push((upsert.provider_id.clone(), reference.clone()));
+        }
+        desired.providers.insert(upsert.provider_id, upsert.entry);
+    }
+    for delete in mutation.deletes {
+        if let Some(prior) = desired.providers.remove(&delete.provider_id)
+            && delete.delete_stored_secrets
+        {
+            let refs = provider_owned_secret_references(&prior);
+            cleanup_named.extend(refs.0);
+            cleanup_credentials
+                .entry(delete.provider_id)
+                .or_default()
+                .extend(refs.1);
+        }
+    }
+    if let Some(metadata) = mutation.metadata {
+        desired.category_defaults = metadata.category_defaults;
+        desired.on_unlisted_models_fetch = Some(metadata.on_unlisted_models_fetch);
+    }
+
+    // Cleanup is pair-scoped. A reference retained by the same provider in
+    // the final layer must keep both its vault row and its exact ownership
+    // claim; a global "reference is live somewhere" check is too late because
+    // retiring this provider's claim would still break its next resolution.
+    retain_only_stale_provider_credentials(&desired, &mut cleanup_credentials);
+
+    let result_revision = provider_config_revision(&desired)?;
+    // This is durable intent, not publication. Recovery replaces this
+    // sentinel only after the reference-only file has converged. Publishing a
+    // process-local generation before the filesystem commit lets a crash
+    // leave both a lying receipt and a generation from the wrong daemon boot.
+    let config_generation = 0;
+    let response = Response::ProviderMutationCommitted {
+        client_operation_id: client_operation_id.to_owned(),
+        snapshot_session_id: snapshot_session_id.to_owned(),
+        layer_id: layer_id.to_owned(),
+        owner_root: project_root.to_owned(),
+        mutation_intent_hash: mutation_intent_hash.to_owned(),
+        consumed_revision: consumed_revision.to_owned(),
+        result_revision: result_revision.clone(),
+        config_generation,
+        config: crate::secret_ref::redact_provider_view(&desired),
+        status: cockpit_proto::ConfigCommitStatus::Committed,
+        publication: cockpit_proto::ConfigPublicationStatus::Published,
+    };
+    let terminal_response_json = serde_json::to_string(&response).map_err(internal)?;
+    let journal_id = format!("provider-batch-{batch_id}");
+    let cleanup_named_json = serde_json::to_string(&cleanup_named).map_err(internal)?;
+    let project_root_owned = project_root.to_string();
+    let vault = ctx.secret_vault.clone();
+    let journal_id_for_tx = journal_id.clone();
+    let config_path = target.to_string_lossy().into_owned();
+    let receipt_owner = owner_digest.to_owned();
+    let receipt_operation_id = client_operation_id.to_owned();
+    let journal_owner = receipt_owner.clone();
+    let journal_operation_id = receipt_operation_id.clone();
+    ctx.db
+        .transaction(move |conn| {
+            let mut inserted_named_claims = std::collections::BTreeSet::new();
+            let mut inserted_credential_claims =
+                std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+            for reference in &static_refs {
+                ensure_static_named_reference_owned_on_conn(
+                    conn,
+                    &vault,
+                    reference,
+                    "provider",
+                    &project_root_owned,
+                )?;
+            }
+            for (name, secret) in &staged {
+                reject_conflicting_named_ownership_on_conn(
+                    conn,
+                    name,
+                    "provider",
+                    &project_root_owned,
+                )?;
+                vault.put_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                    name,
+                    secret.as_bytes(),
+                )?;
+                let inserted = conn.execute(
+                    "INSERT INTO secret_named_ownership
+                     (item_id, owner_kind, project_root, created_at)
+                     VALUES (?1, 'provider', ?2, ?3)",
+                    rusqlite::params![
+                        name,
+                        project_root_owned,
+                        chrono::Utc::now().timestamp_millis()
+                    ],
+                )?;
+                if inserted != 1 {
+                    anyhow::bail!("new provider secret claim was not inserted");
+                }
+                inserted_named_claims.insert(name.clone());
+            }
+            for (provider_id, reference) in &credential_claims {
+                let inserted = claim_provider_credential_on_conn(
+                    conn,
+                    reference,
+                    provider_id,
+                    &project_root_owned,
+                )?;
+                if inserted == 1 {
+                    inserted_credential_claims
+                        .entry(provider_id.clone())
+                        .or_default()
+                        .insert(reference.clone());
+                }
+            }
+            let payload_json = serde_json::to_string(&ProviderBatchJournalPayload {
+                config_path,
+                config: desired,
+                cleanup_credentials,
+                inserted_named_claims,
+                inserted_credential_claims,
+            })?;
+            conn.execute(
+                "INSERT INTO provider_config_journals
+                 (journal_id, owner_digest, client_operation_id, request_hash,
+                  fencing_generation, terminal_response_json, project_root,
+                  provider_id, action, entry_json, cleanup_named_json,
+                  cleanup_credential_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                         '__provider_batch__', 'batch', ?8, ?9, '[]', ?10)",
+                rusqlite::params![
+                    journal_id_for_tx,
+                    journal_owner,
+                    journal_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    terminal_response_json,
+                    project_root_owned,
+                    payload_json,
+                    cleanup_named_json,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(map_named_secret_tx_error)?;
+    if let Err(error) = ctx.publish_owner_redaction_table() {
+        let compensation = compensate_provider_batch_staging(ctx, &journal_id).await;
+        ctx.poison_redaction_publication(&error);
+        return match compensation {
+            Ok(()) => Err(internal(error)),
+            Err(compensation_error) => Err(internal(anyhow::anyhow!(
+                "provider redaction publication failed: {error}; staging compensation failed: {}",
+                compensation_error.message
+            ))),
+        };
+    }
+    // The single durable batch intent is visible before any file changes.
+    // Recovery writes the complete desired layer and retires cleanup only
+    // after every provider file and metadata field converges.
+    recover_provider_config_journals(ctx, project_root, None).await?;
+    let response = match ctx
+        .db
+        .local_operation_settlement(receipt_owner, receipt_operation_id)
+        .await
+        .map_err(internal)?
+    {
+        Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
+            _,
+            json,
+        )) => serde_json::from_str::<Response>(&json).map_err(internal)?,
+        _ => {
+            return Err(internal(anyhow::anyhow!(
+                "provider journal retired without an exact terminal receipt"
+            )));
+        }
+    };
+    let (result_revision, config_generation) = match &response {
+        Response::ProviderMutationCommitted {
+            result_revision,
+            config_generation,
+            ..
+        } => (result_revision.clone(), *config_generation),
+        _ => {
+            return Err(internal(anyhow::anyhow!(
+                "provider journal produced the wrong terminal response"
+            )));
+        }
+    };
+    Ok(ProviderMutationJournalCommit {
+        response,
+        result_revision,
+        config_generation,
+    })
+}
+
+struct ProviderMutationJournalCommit {
+    response: Response,
+    result_revision: String,
+    config_generation: u64,
+}
+
+async fn compensate_provider_batch_staging(
+    ctx: &DaemonContext,
+    journal_id: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    let journal_id = journal_id.to_string();
+    let vault = ctx.secret_vault.clone();
+    ctx.db
+        .transaction(move |conn| {
+            let payload_json: String = conn.query_row(
+                "SELECT entry_json FROM provider_config_journals
+                 WHERE journal_id = ?1 AND action = 'batch'",
+                [&journal_id],
+                |row| row.get(0),
+            )?;
+            let payload: ProviderBatchJournalPayload = serde_json::from_str(&payload_json)?;
+            for name in &payload.inserted_named_claims {
+                vault.delete_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                    name,
+                )?;
+                conn.execute(
+                    "DELETE FROM secret_named_ownership
+                     WHERE item_id = ?1 AND owner_kind = 'provider'
+                       AND project_root = (SELECT project_root FROM provider_config_journals WHERE journal_id = ?2)",
+                    rusqlite::params![name, journal_id],
+                )?;
+            }
+            for (provider_id, references) in &payload.inserted_credential_claims {
+                for reference in references {
+                    conn.execute(
+                        "DELETE FROM secret_credential_ownership
+                         WHERE item_id = ?1 AND provider_id = ?2
+                           AND project_root = (SELECT project_root FROM provider_config_journals WHERE journal_id = ?3)",
+                        rusqlite::params![reference, provider_id, journal_id],
+                    )?;
+                }
+            }
+            conn.execute(
+                "DELETE FROM provider_config_journals WHERE journal_id = ?1",
+                rusqlite::params![journal_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
 }
 
 fn redacted_extended_config_json(
@@ -10503,15 +15960,134 @@ fn redacted_extended_config_json(
 /// Project the layered MCP config for settings clients without returning any
 /// credential-bearing literal. The daemon still reads/parses the config at
 /// this owner boundary; the TUI receives only this sanitized projection.
-fn redacted_mcp_config_json(
+struct RedactedMcpConfigSnapshot {
+    config_json: String,
+    config_path: String,
+    revision: String,
+}
+
+fn redacted_mcp_config_snapshot(
     ctx: &DaemonContext,
     cwd: &std::path::Path,
     trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
-) -> std::result::Result<String, ErrorPayload> {
+) -> std::result::Result<RedactedMcpConfigSnapshot, ErrorPayload> {
     let paths = daemon_mcp_paths(ctx, cwd, trust_policy)?;
     let mut config = mcp_config_from_paths(&paths)?;
-    crate::mcp::config::redact_config_for_owner_view(&mut config);
-    serde_json::to_string(&config).map_err(internal)
+    let target = paths.last().cloned().or_else(|| {
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            cockpit_config::config::dirs::most_specific_config_write_target(cwd)
+                .map(|path| path.with_file_name(cockpit_config::config::dirs::MCP_FILE))
+        })
+    });
+    let path = target
+        .ok_or_else(|| bad_request("no Cockpit config layer is available for MCP snapshot"))?
+        .parent()
+        .ok_or_else(|| bad_request("MCP config target has no parent"))?
+        .join(cockpit_config::config::dirs::MCP_FILE);
+    let path = canonical_mcp_target_path(&path)?;
+    let prior = match std::fs::read_to_string(&path) {
+        Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::mcp::config::McpConfig::default()
+        }
+        Err(error) => return Err(internal(error)),
+    };
+    for server in config.servers.values_mut() {
+        server.endpoint = server
+            .endpoint
+            .as_deref()
+            .map(cockpit_proto::redact_url_for_owner_view);
+        server.env = server
+            .env
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    if value.trim_start().starts_with('$') {
+                        value.clone()
+                    } else {
+                        "[redacted]".to_string()
+                    },
+                )
+            })
+            .collect();
+        match &mut server.auth {
+            crate::mcp::config::Auth::Header(header) => {
+                if !header.value.trim_start().starts_with('$') {
+                    header.value = "[redacted]".to_string();
+                }
+            }
+            crate::mcp::config::Auth::Env(env) => {
+                env.vars = env
+                    .vars
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.clone(),
+                            if value.trim_start().starts_with('$') {
+                                value.clone()
+                            } else {
+                                "[redacted]".to_string()
+                            },
+                        )
+                    })
+                    .collect();
+            }
+            crate::mcp::config::Auth::Oauth(oauth) => {
+                oauth.authorize_url = oauth
+                    .authorize_url
+                    .as_deref()
+                    .map(cockpit_proto::redact_url_for_owner_view);
+                oauth.token_url = oauth
+                    .token_url
+                    .as_deref()
+                    .map(cockpit_proto::redact_url_for_owner_view);
+            }
+            crate::mcp::config::Auth::None => {}
+        }
+    }
+    let config_json = serde_json::to_string(&config).map_err(internal)?;
+    let prior_json = serde_json::to_string(&prior).map_err(internal)?;
+    use sha2::Digest as _;
+    Ok(RedactedMcpConfigSnapshot {
+        config_json,
+        config_path: path.to_string_lossy().into_owned(),
+        revision: crate::intel::hex_lower(&Sha256::digest(prior_json.as_bytes())),
+    })
+}
+
+fn canonical_mcp_target_path(
+    path: &std::path::Path,
+) -> std::result::Result<std::path::PathBuf, ErrorPayload> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let absolute = std::path::absolute(path).map_err(internal)?;
+            let mut ancestor = absolute.as_path();
+            while !ancestor.exists() {
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| bad_request("MCP config target has no existing ancestor"))?;
+            }
+            let canonical_ancestor = std::fs::canonicalize(ancestor).map_err(internal)?;
+            let suffix = absolute.strip_prefix(ancestor).map_err(internal)?;
+            Ok(canonical_ancestor.join(suffix))
+        }
+        Err(error) => Err(internal(error)),
+    }
+}
+
+fn mcp_target_layer_revision(path: &std::path::Path) -> std::result::Result<String, ErrorPayload> {
+    let config = match std::fs::read_to_string(path) {
+        Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::mcp::config::McpConfig::default()
+        }
+        Err(error) => return Err(internal(error)),
+    };
+    let json = serde_json::to_string(&config).map_err(internal)?;
+    use sha2::Digest as _;
+    Ok(crate::intel::hex_lower(&Sha256::digest(json.as_bytes())))
 }
 
 // Model fetch is parameterized by provider/model selectors plus the fetch-mode
@@ -10753,6 +16329,8 @@ async fn provider_models_fetch(
     };
     let response =
         bounded_provider_response(scrub_provider_response(response, &config, &store, &env)?)?;
+    let config_changed =
+        !changed_provider_ids.is_empty() || on_unlisted.is_some_and(|_| !aggregate_fetch_failed);
     for provider_id in changed_provider_ids {
         let entry = config
             .providers
@@ -10769,6 +16347,9 @@ async fn provider_models_fetch(
             config.category_defaults.clone(),
             on_unlisted,
         )?;
+    }
+    if config_changed {
+        inventory::publish_committed_config_generation();
     }
     Ok(response)
 }
@@ -11112,14 +16693,6 @@ async fn provider_config_upsert(
     if provider_id.trim().is_empty() {
         return Err(bad_request("provider_id must not be empty"));
     }
-    // Upsert is also used by redacted settings projections. A missing
-    // credential_ref means “unchanged” in that projection, never removal.
-    if entry.credential_ref.is_none() {
-        let (_, _, current) = daemon_provider_config(ctx, project_root).await?;
-        if let Some(existing) = current.providers.get(provider_id) {
-            entry.credential_ref = existing.credential_ref.clone();
-        }
-    }
     let header_secrets = vec![None; entry.headers.len()];
     provider_config_save(ctx, project_root, provider_id, entry, header_secrets).await
 }
@@ -11133,7 +16706,8 @@ async fn setup_copilot_auth(
     provider_id: &str,
     env: std::collections::HashMap<String, String>,
     is_local_owner: bool,
-) -> std::result::Result<(), ErrorPayload> {
+    journal_binding: CopilotJournalBinding,
+) -> std::result::Result<Response, ErrorPayload> {
     // Adopting the daemon HOST's ambient GitHub token (`COPILOT_GITHUB_TOKEN` /
     // `GH_TOKEN` / `GITHUB_TOKEN`) and injecting it into a caller-selected
     // provider's `Authorization` header is a local-host action: the chosen
@@ -11179,18 +16753,264 @@ async fn setup_copilot_auth(
         entry.headers.len() - 1
     };
     header_secrets[index] = Some(token);
-    provider_config_save(ctx, project_root, provider_id, entry, header_secrets).await?;
-    Ok(())
+    let owner = journal_binding.owner_digest.clone();
+    let operation_id = journal_binding.client_operation_id.clone();
+    provider_config_save_under_lock(
+        ctx,
+        project_root,
+        provider_id,
+        entry,
+        header_secrets,
+        Some(journal_binding),
+    )
+    .await?;
+    match ctx
+        .db
+        .local_operation_settlement(owner, operation_id)
+        .await
+        .map_err(internal)?
+    {
+        Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
+            _,
+            json,
+        )) => serde_json::from_str(&json).map_err(internal),
+        _ => Err(internal(anyhow::anyhow!(
+            "Copilot provider journal retired without its exact terminal receipt"
+        ))),
+    }
 }
 
 #[derive(serde::Deserialize)]
 struct ProviderConfigJournal {
     journal_id: String,
+    owner_digest: Option<String>,
+    client_operation_id: Option<String>,
+    request_hash: Option<Vec<u8>>,
+    fencing_generation: Option<i64>,
+    terminal_response_json: Option<String>,
     provider_id: String,
     action: String,
     entry_json: Option<String>,
     cleanup_named_json: String,
     cleanup_credential_json: String,
+}
+
+#[cfg(test)]
+mod provider_atomic_authority_tests {
+    use super::*;
+
+    fn capability() -> ProviderEditCapability {
+        ProviderEditCapability {
+            owner: "owner".into(),
+            project_root: "/project".into(),
+            target_path: "/project/.cockpit/config.json".into(),
+            layer_id: "layer".into(),
+            revision: "revision".into(),
+            config_generation: 7,
+            mcp_target_path: "/project/.cockpit/mcp.json".into(),
+            mcp_revision: "mcp-revision".into(),
+            expires_at: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn provider_cas_rejects_stale_revision_and_concurrent_generation() {
+        let stale = validate_provider_edit_capability(
+            &capability(),
+            "owner",
+            "layer",
+            "revision",
+            7,
+            "other-revision",
+        )
+        .unwrap_err();
+        assert_eq!(stale.code, ErrorCode::Conflict);
+
+        let concurrent = validate_provider_edit_capability(
+            &capability(),
+            "owner",
+            "layer",
+            "revision",
+            8,
+            "revision",
+        )
+        .unwrap_err();
+        assert_eq!(concurrent.code, ErrorCode::Conflict);
+    }
+
+    #[test]
+    fn provider_batch_journal_is_the_only_prepublication_durable_intent() {
+        let source = include_str!("dispatch.rs");
+        let batch = source
+            .split("async fn stage_and_recover_provider_batch")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("async fn compensate_provider_batch_staging")
+                    .next()
+            })
+            .expect("provider batch coordinator source");
+        assert!(batch.contains("'__provider_batch__', 'batch'"));
+        assert!(batch.contains("recover_provider_config_journals(ctx, project_root, None)"));
+        assert!(batch.contains("publish_owner_redaction_table"));
+        assert!(!batch.contains("provider_config_save_under_lock("));
+        assert!(!batch.contains("provider_config_delete_under_lock("));
+    }
+
+    #[test]
+    fn provider_batch_recovery_preserves_unknown_document_keys() {
+        let source = include_str!("dispatch.rs");
+        let recovery = source
+            .split("\"batch\" =>")
+            .nth(1)
+            .and_then(|tail| tail.split("_ => return Err").next())
+            .expect("provider batch recovery source");
+        assert!(recovery.contains("ConfigDoc::load(&path)"));
+        assert!(recovery.contains("doc.write(&payload.config)"));
+    }
+
+    #[test]
+    fn retained_provider_credential_pair_is_not_cleanup_work() {
+        let mut desired = crate::config::providers::ProvidersConfig::default();
+        desired.providers.insert(
+            "provider".into(),
+            crate::config::providers::ProviderEntry {
+                credential_ref: Some("credential".into()),
+                ..Default::default()
+            },
+        );
+        let mut cleanup = std::collections::BTreeMap::from([(
+            "provider".into(),
+            std::collections::BTreeSet::from(["credential".into(), "stale".into()]),
+        )]);
+        retain_only_stale_provider_credentials(&desired, &mut cleanup);
+        assert_eq!(
+            cleanup.get("provider"),
+            Some(&std::collections::BTreeSet::from(["stale".into()]))
+        );
+    }
+
+    #[test]
+    fn foreign_provider_credential_claim_is_rejected_transactionally() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE secret_vault_items (kind TEXT, item_id TEXT);
+             CREATE TABLE secret_credential_ownership (
+                 item_id TEXT, provider_id TEXT, project_root TEXT, created_at INTEGER,
+                 PRIMARY KEY (item_id, provider_id, project_root)
+             );
+             INSERT INTO secret_vault_items VALUES ('credential_record', 'credential');
+             INSERT INTO secret_credential_ownership
+             VALUES ('credential', 'foreign-provider', '/foreign', 1);",
+        )
+        .unwrap();
+        let error = claim_provider_credential_on_conn(&conn, "credential", "provider", "/project")
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<ProviderCredentialClaimConflict>()
+                .is_some()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM secret_credential_ownership",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn filtered_legacy_recovery_includes_whole_layer_batch_first() {
+        let source = include_str!("dispatch.rs");
+        let recovery = source
+            .split("pub(super) async fn recover_provider_config_journals")
+            .nth(1)
+            .and_then(|tail| tail.split("for journal in journals").next())
+            .expect("provider recovery query source");
+        assert!(recovery.contains("action = 'batch' OR provider_id = ?2"));
+        assert!(recovery.contains("CASE WHEN action = 'batch' THEN 0 ELSE 1 END"));
+    }
+
+    #[test]
+    fn batch_compensation_uses_only_journaled_exact_claims() {
+        let source = include_str!("dispatch.rs");
+        let compensation = source
+            .split("async fn compensate_provider_batch_staging")
+            .nth(1)
+            .and_then(|tail| tail.split("fn redacted_extended_config_json").next())
+            .expect("provider batch compensation source");
+        assert!(compensation.contains("payload.inserted_named_claims"));
+        assert!(compensation.contains("payload.inserted_credential_claims"));
+        assert!(!compensation.contains("created_at >="));
+    }
+
+    #[test]
+    fn config_generation_is_published_only_after_file_convergence() {
+        let source = include_str!("dispatch.rs");
+        let batch_stage = source
+            .split("async fn stage_and_recover_provider_batch")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("async fn compensate_provider_batch_staging")
+                    .next()
+            })
+            .expect("provider batch staging source");
+        assert!(!batch_stage.contains("publish_committed_config_generation()"));
+        assert!(batch_stage.contains("let config_generation = 0"));
+
+        let provider_recovery = source
+            .split("pub(super) async fn recover_provider_config_journals")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn settle_journaled_local_success_on_conn")
+                    .next()
+            })
+            .expect("provider recovery source");
+        let file_commit = provider_recovery
+            .find("doc.write(&payload.config)")
+            .expect("batch file commit");
+        let generation = provider_recovery
+            .find("publish_committed_config_generation()")
+            .expect("post-commit generation publication");
+        assert!(generation > file_commit);
+
+        let mcp_save = source
+            .split("async fn save_mcp_config")
+            .nth(1)
+            .and_then(|tail| tail.split("fn mcp_live_secret_references").next())
+            .expect("MCP save source");
+        let file_commit = mcp_save
+            .find("config.write_private(&path)")
+            .expect("MCP file commit");
+        let generation = mcp_save
+            .find("publish_mcp_journal_generation(ctx, &journal_id)")
+            .expect("MCP generation publication");
+        assert!(generation > file_commit);
+    }
+
+    #[test]
+    fn copilot_auth_is_bound_to_provider_journal_and_exact_receipt() {
+        let source = include_str!("dispatch.rs");
+        let setup = source
+            .split("async fn setup_copilot_auth")
+            .nth(1)
+            .and_then(|tail| tail.split("struct ProviderConfigJournal").next())
+            .expect("Copilot setup source");
+        assert!(setup.contains("Some(journal_binding)"));
+        assert!(setup.contains("local_operation_settlement(owner, operation_id)"));
+
+        let provider_save = source
+            .split("async fn provider_config_save_under_lock")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn save_mcp_config").next())
+            .expect("provider journal source");
+        assert!(provider_save.contains("Response::CopilotAuthCommitted"));
+        assert!(provider_save.contains("inventory_generation_conn(conn)"));
+        assert!(provider_save.contains("fencing_generation"));
+        assert!(provider_save.contains("terminal_response_json"));
+    }
 }
 
 fn provider_owned_secret_references(
@@ -11372,19 +17192,29 @@ pub(super) async fn recover_provider_config_journals(
         .db
         .read(move |conn| {
             let mut statement = conn.prepare(
-                "SELECT journal_id, provider_id, action, entry_json, cleanup_named_json, cleanup_credential_json
-                 FROM provider_config_journals WHERE project_root = ?1 AND (?2 IS NULL OR provider_id = ?2)
-                 ORDER BY created_at, journal_id",
+                "SELECT journal_id, owner_digest, client_operation_id, request_hash,
+                        fencing_generation, terminal_response_json, provider_id,
+                        action, entry_json, cleanup_named_json, cleanup_credential_json
+                 FROM provider_config_journals
+                 WHERE project_root = ?1
+                   AND (?2 IS NULL OR action = 'batch' OR provider_id = ?2)
+                 ORDER BY CASE WHEN action = 'batch' THEN 0 ELSE 1 END,
+                          created_at, journal_id",
             )?;
             statement
                 .query_map(rusqlite::params![project_root_query, provider_id], |row| {
                     Ok(ProviderConfigJournal {
                         journal_id: row.get(0)?,
-                        provider_id: row.get(1)?,
-                        action: row.get(2)?,
-                        entry_json: row.get(3)?,
-                        cleanup_named_json: row.get(4)?,
-                        cleanup_credential_json: row.get(5)?,
+                        owner_digest: row.get(1)?,
+                        client_operation_id: row.get(2)?,
+                        request_hash: row.get(3)?,
+                        fencing_generation: row.get(4)?,
+                        terminal_response_json: row.get(5)?,
+                        provider_id: row.get(6)?,
+                        action: row.get(7)?,
+                        entry_json: row.get(8)?,
+                        cleanup_named_json: row.get(9)?,
+                        cleanup_credential_json: row.get(10)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -11430,9 +17260,74 @@ pub(super) async fn recover_provider_config_journals(
                     doc.write(&layer).map_err(internal)?;
                 }
             }
+            "batch" => {
+                let payload: ProviderBatchJournalPayload = serde_json::from_str(
+                    journal
+                        .entry_json
+                        .as_deref()
+                        .ok_or_else(|| bad_request("provider batch journal is missing payload"))?,
+                )
+                .map_err(internal)?;
+                for (provider_id, entry) in &payload.config.providers {
+                    validate_daemon_provider_url(&entry.url)?;
+                    validate_unique_provider_header_names(&entry.headers)?;
+                    ensure_provider_named_references_claimed(ctx, project_root.as_str(), entry)
+                        .await?;
+                    ensure_provider_credential_reference_available(ctx, entry).await?;
+                    if provider_id.trim().is_empty() {
+                        return Err(bad_request("provider batch journal contains an empty id"));
+                    }
+                }
+                let path = std::path::PathBuf::from(&payload.config_path);
+                let expected_path =
+                    crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+                        ctx.config_source()
+                            .config_write_target_for_provider(&cwd, "default")
+                    })
+                    .ok_or_else(|| bad_request("no cockpit config found"))?;
+                if path != expected_path {
+                    return Err(bad_request(
+                        "provider batch journal target no longer matches its authority layer",
+                    ));
+                }
+                let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+                doc.write(&payload.config).map_err(internal)?;
+            }
             _ => return Err(bad_request("provider config journal has an invalid action")),
         }
         let (_, _, effective) = daemon_provider_config(ctx, project_root.as_str()).await?;
+        if let Some(response_json) = journal.terminal_response_json.as_mut() {
+            let mut response: Response = serde_json::from_str(response_json).map_err(internal)?;
+            let generation = inventory::publish_committed_config_generation();
+            match &mut response {
+                Response::ProviderMutationCommitted {
+                    result_revision,
+                    config_generation,
+                    config,
+                    ..
+                } if journal.action == "batch" => {
+                    *result_revision = provider_config_revision(&effective)?;
+                    *config_generation = generation;
+                    *config = crate::secret_ref::redact_provider_view(&effective);
+                }
+                Response::CopilotAuthCommitted {
+                    config_generation, ..
+                } if journal.action == "save" => {
+                    *config_generation = generation;
+                }
+                _ => {
+                    return Err(internal(anyhow::anyhow!(
+                        "provider journal has the wrong terminal response"
+                    )));
+                }
+            }
+            *response_json = serde_json::to_string(&response).map_err(internal)?;
+        } else {
+            // Legacy reference-only save/delete journals have no typed receipt,
+            // but they still changed the effective configuration. Publish only
+            // now, after their filesystem operation completed successfully.
+            inventory::publish_committed_config_generation();
+        }
         let mut named: std::collections::BTreeSet<String> =
             serde_json::from_str(&journal.cleanup_named_json).map_err(internal)?;
         let mut credentials: std::collections::BTreeSet<String> =
@@ -11479,9 +17374,77 @@ pub(super) async fn recover_provider_config_journals(
                 .map_err(internal)?;
             }
         }
+        if journal.action == "batch" {
+            let payload: ProviderBatchJournalPayload = serde_json::from_str(
+                journal
+                    .entry_json
+                    .as_deref()
+                    .ok_or_else(|| bad_request("provider batch journal is missing payload"))?,
+            )
+            .map_err(internal)?;
+            for (provider_id, references) in payload.cleanup_credentials {
+                let retained_by_same_pair = effective
+                    .providers
+                    .get(&provider_id)
+                    .map(|entry| provider_owned_secret_references(entry).1)
+                    .unwrap_or_default();
+                for reference in references {
+                    if retained_by_same_pair.contains(&reference) {
+                        continue;
+                    }
+                    let sole_claim =
+                        release_credential_ownership(ctx, &reference, &provider_id, &project_root)
+                            .await?;
+                    retire_credential_ownership(ctx, &reference, &provider_id, &project_root)
+                        .await?;
+                    if !live_credentials.contains(&reference) && sole_claim.is_none_or(|sole| sole)
+                    {
+                        ctx.mutate_owner_vault_item(
+                            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                            &reference,
+                            None,
+                        )
+                        .map_err(internal)?;
+                    }
+                }
+            }
+        }
         let journal_id = journal.journal_id;
+        let settlement = match (
+            journal.owner_digest,
+            journal.client_operation_id,
+            journal.request_hash,
+            journal.fencing_generation,
+            journal.terminal_response_json,
+        ) {
+            (Some(owner), Some(operation_id), Some(hash), Some(fence), Some(response)) => {
+                Some((owner, operation_id, hash, fence, response))
+            }
+            (None, None, None, None, None) => None,
+            _ => {
+                return Err(internal(anyhow::anyhow!(
+                    "provider journal has partial receipt binding"
+                )));
+            }
+        };
         ctx.db
             .write(move |conn| {
+                if let Some((owner, operation_id, request_hash, fence, response)) = settlement {
+                    let operation_kind = match serde_json::from_str::<Response>(&response)? {
+                        Response::ProviderMutationCommitted { .. } => "apply_provider_mutation",
+                        Response::CopilotAuthCommitted { .. } => "setup_copilot_auth",
+                        _ => anyhow::bail!("provider journal has an unsupported receipt"),
+                    };
+                    settle_journaled_local_success_on_conn(
+                        conn,
+                        operation_kind,
+                        &owner,
+                        &operation_id,
+                        &request_hash,
+                        fence,
+                        &response,
+                    )?;
+                }
                 conn.execute(
                     "DELETE FROM provider_config_journals WHERE journal_id = ?1",
                     rusqlite::params![journal_id],
@@ -11492,6 +17455,92 @@ pub(super) async fn recover_provider_config_journals(
             .map_err(internal)?;
     }
     Ok(())
+}
+
+fn settle_journaled_local_success_on_conn(
+    conn: &rusqlite::Connection,
+    expected_operation_kind: &str,
+    owner: &str,
+    operation_id: &str,
+    request_hash: &[u8],
+    fencing_generation: i64,
+    response_json: &str,
+) -> anyhow::Result<()> {
+    let existing: (String, Vec<u8>, String, i64, Option<String>) = conn.query_row(
+        "SELECT operation_kind,request_hash,state,fencing_generation,terminal_outcome_json
+         FROM local_operation_receipts
+         WHERE owner_digest=?1 AND client_operation_id=?2",
+        rusqlite::params![owner, operation_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    if existing.0 != expected_operation_kind
+        || existing.1 != request_hash
+        || existing.3 != fencing_generation
+    {
+        anyhow::bail!("journal receipt binding does not match its authenticated execution fence");
+    }
+    if existing.2 == "terminal_success" && existing.4.as_deref() == Some(response_json) {
+        return Ok(());
+    }
+    if existing.2 != "executing" {
+        anyhow::bail!("journal commit conflicts with an existing terminal settlement");
+    }
+    let changed = conn.execute(
+        "UPDATE local_operation_receipts
+         SET state='terminal_success',terminal_outcome_json=?5,
+             execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+         WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3
+           AND fencing_generation=?4 AND state='executing'",
+        rusqlite::params![
+            owner,
+            operation_id,
+            request_hash,
+            fencing_generation,
+            response_json,
+            chrono::Utc::now().timestamp_millis()
+        ],
+    )?;
+    if changed != 1 {
+        anyhow::bail!("journal commit lost its durable execution fence");
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProviderBatchJournalPayload {
+    config_path: String,
+    config: crate::config::providers::ProvidersConfig,
+    #[serde(default)]
+    cleanup_credentials: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Exact claims inserted by this batch. Compensation must never infer
+    /// ownership from timestamps because two transactions can share a clock
+    /// tick and pre-existing claims must survive a failed publication.
+    #[serde(default)]
+    inserted_named_claims: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    inserted_credential_claims:
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+fn retain_only_stale_provider_credentials(
+    desired: &crate::config::providers::ProvidersConfig,
+    cleanup: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) {
+    for (provider_id, references) in cleanup.iter_mut() {
+        if let Some(final_entry) = desired.providers.get(provider_id) {
+            let retained = provider_owned_secret_references(final_entry).1;
+            references.retain(|reference| !retained.contains(reference));
+        }
+    }
+    cleanup.retain(|_, references| !references.is_empty());
 }
 
 #[cfg(any(unix, test))]
@@ -11556,8 +17605,7 @@ async fn compensate_provider_config_save(
                     "DELETE FROM secret_credential_ownership
                      WHERE item_id = ?1
                        AND provider_id = (SELECT provider_id FROM provider_config_journals WHERE journal_id = ?2)
-                       AND project_root = (SELECT project_root FROM provider_config_journals WHERE journal_id = ?2)
-                       AND created_at >= (SELECT created_at FROM provider_config_journals WHERE journal_id = ?2)",
+                       AND project_root = (SELECT project_root FROM provider_config_journals WHERE journal_id = ?2)",
                     rusqlite::params![reference, journal_id],
                 )?;
             }
@@ -11575,10 +17623,31 @@ async fn provider_config_save(
     ctx: &DaemonContext,
     project_root: &str,
     provider_id: &str,
-    mut entry: crate::config::providers::ProviderEntry,
-    mut header_secrets: Vec<Option<String>>,
+    entry: crate::config::providers::ProviderEntry,
+    header_secrets: Vec<Option<String>>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    provider_config_save_under_lock(ctx, project_root, provider_id, entry, header_secrets, None)
+        .await
+}
+
+struct CopilotJournalBinding {
+    owner_digest: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    mutation_intent_hash: String,
+    fencing_generation: i64,
+    requested_project_root: String,
+}
+
+async fn provider_config_save_under_lock(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: &str,
+    mut entry: crate::config::providers::ProviderEntry,
+    mut header_secrets: Vec<Option<String>>,
+    copilot_binding: Option<CopilotJournalBinding>,
+) -> std::result::Result<Response, ErrorPayload> {
     // Canonicalize the workspace root once, at this daemon boundary, so every
     // ownership claim, journal, recovery, and owner-scoped read below keys on the
     // same symlink-resolved form the authz layer and resolution paths use — a
@@ -11596,6 +17665,15 @@ async fn provider_config_save(
         ));
     }
     let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
+    // Reference-only legacy upserts use absence as "unchanged". Resolve that
+    // meaning only after whole-layer journal recovery and under the publication
+    // lock; doing it in the outer dispatcher can resurrect the credential from
+    // a snapshot that predates an outstanding atomic batch.
+    if entry.credential_ref.is_none()
+        && let Some(existing) = config.providers.get(provider_id)
+    {
+        entry.credential_ref = existing.credential_ref.clone();
+    }
     let old_references = config
         .providers
         .get(provider_id)
@@ -11687,56 +17765,140 @@ async fn provider_config_save(
     let staged_for_tx = staged.clone();
     let credential_ref_for_tx = entry.credential_ref.clone();
     let static_named_refs_for_tx = static_named_refs.clone();
-    ctx.db.transaction(move |conn| {
-        // Atomic backstop for the non-staged static header references: each must
-        // still be owned by this exact provider/root with a live vault row,
-        // verified on THIS connection under the writer lock (fails closed on a
-        // conflict, rolling the whole save back).
-        for reference in &static_named_refs_for_tx {
-            ensure_static_named_reference_owned_on_conn(
-                conn,
-                &vault,
-                reference,
-                "provider",
-                &project_root_owned,
-            )?;
-        }
-        for (name, secret) in &staged_for_tx {
-            // ATOMIC cross-kind admission, symmetric with the MCP writer:
-            // re-check ownership INSIDE the same `BEGIN IMMEDIATE` transaction
-            // that writes the vault value and inserts the provider claim. These
-            // are freshly minted per-save names, but an atomic guard here (not
-            // just `INSERT OR IGNORE`) fails closed rather than silently
-            // coexisting should any name ever collide with a foreign owner.
-            reject_conflicting_named_ownership_on_conn(conn, name, "provider", &project_root_owned)?;
-            vault.put_item_on_conn(conn, cockpit_db::secret_vault::SecretVaultKind::NamedSecret, name, secret.as_bytes())?;
-            conn.execute(
-                "INSERT OR IGNORE INTO secret_named_ownership
+    let copilot_provider_id = provider_id.to_owned();
+    let copilot_owner_root = project_root.to_owned();
+    let inserted_credential_claim = ctx
+        .db
+        .transaction(move |conn| {
+            let consumed_vault_generation =
+                cockpit_db::secret_vault::inventory_generation_conn(conn)?;
+            if let Some(binding) = copilot_binding.as_ref() {
+                let fence_is_live: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM local_operation_receipts
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                       AND request_hash=?3 AND fencing_generation=?4
+                       AND state='executing')",
+                    rusqlite::params![
+                        &binding.owner_digest,
+                        &binding.client_operation_id,
+                        binding.request_hash.as_slice(),
+                        binding.fencing_generation
+                    ],
+                    |row| row.get(0),
+                )?;
+                if !fence_is_live {
+                    anyhow::bail!("Copilot auth lost its durable execution fence");
+                }
+            }
+            // Atomic backstop for the non-staged static header references: each must
+            // still be owned by this exact provider/root with a live vault row,
+            // verified on THIS connection under the writer lock (fails closed on a
+            // conflict, rolling the whole save back).
+            for reference in &static_named_refs_for_tx {
+                ensure_static_named_reference_owned_on_conn(
+                    conn,
+                    &vault,
+                    reference,
+                    "provider",
+                    &project_root_owned,
+                )?;
+            }
+            for (name, secret) in &staged_for_tx {
+                // ATOMIC cross-kind admission, symmetric with the MCP writer:
+                // re-check ownership INSIDE the same `BEGIN IMMEDIATE` transaction
+                // that writes the vault value and inserts the provider claim. These
+                // are freshly minted per-save names, but an atomic guard here (not
+                // just `INSERT OR IGNORE`) fails closed rather than silently
+                // coexisting should any name ever collide with a foreign owner.
+                reject_conflicting_named_ownership_on_conn(
+                    conn,
+                    name,
+                    "provider",
+                    &project_root_owned,
+                )?;
+                vault.put_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                    name,
+                    secret.as_bytes(),
+                )?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO secret_named_ownership
                  (item_id, owner_kind, project_root, created_at)
                  VALUES (?1, 'provider', ?2, ?3)",
-                rusqlite::params![name, project_root_owned, chrono::Utc::now().timestamp_millis()],
-            )?;
-        }
-        if let Some(reference) = credential_ref_for_tx {
+                    rusqlite::params![
+                        name,
+                        project_root_owned,
+                        chrono::Utc::now().timestamp_millis()
+                    ],
+                )?;
+            }
+            let inserted_credential_claim = credential_ref_for_tx
+                .as_deref()
+                .map(|reference| {
+                    claim_provider_credential_on_conn(
+                        conn,
+                        reference,
+                        &provider_id_owned,
+                        &project_root_owned,
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false);
+            let (owner_digest, client_operation_id, request_hash, fence, terminal_response) =
+                if let Some(binding) = copilot_binding {
+                    let result_vault_generation =
+                        cockpit_db::secret_vault::inventory_generation_conn(conn)?;
+                    if result_vault_generation <= consumed_vault_generation {
+                        anyhow::bail!("Copilot auth did not advance the durable vault generation");
+                    }
+                    let response = Response::CopilotAuthCommitted {
+                        client_operation_id: binding.client_operation_id.clone(),
+                        mutation_intent_hash: binding.mutation_intent_hash,
+                        project_root: binding.requested_project_root,
+                        owner_root: copilot_owner_root.clone(),
+                        owner_scope: format!("project:{copilot_owner_root}"),
+                        provider_id: copilot_provider_id,
+                        consumed_vault_generation,
+                        result_vault_generation,
+                        config_generation: 0,
+                    };
+                    (
+                        Some(binding.owner_digest),
+                        Some(binding.client_operation_id),
+                        Some(binding.request_hash.to_vec()),
+                        Some(binding.fencing_generation),
+                        Some(serde_json::to_string(&response)?),
+                    )
+                } else {
+                    (None, None, None, None, None)
+                };
             conn.execute(
-                "INSERT OR IGNORE INTO secret_credential_ownership
-                 (item_id, provider_id, project_root, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO provider_config_journals
+             (journal_id, owner_digest, client_operation_id, request_hash,
+              fencing_generation, terminal_response_json, project_root,
+              provider_id, action, entry_json, cleanup_named_json,
+              cleanup_credential_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'save', ?9, ?10, ?11, ?12)",
                 rusqlite::params![
-                    reference,
-                    provider_id_owned.clone(),
-                    project_root_owned.clone(),
+                    journal_id_owned,
+                    owner_digest,
+                    client_operation_id,
+                    request_hash,
+                    fence,
+                    terminal_response,
+                    project_root_owned,
+                    provider_id_owned,
+                    entry_json,
+                    named_json,
+                    credentials_json,
                     chrono::Utc::now().timestamp_millis()
                 ],
             )?;
-        }
-        conn.execute(
-            "INSERT INTO provider_config_journals (journal_id, project_root, provider_id, action, entry_json, cleanup_named_json, cleanup_credential_json, created_at)
-             VALUES (?1, ?2, ?3, 'save', ?4, ?5, ?6, ?7)",
-            rusqlite::params![journal_id_owned, project_root_owned, provider_id_owned, entry_json, named_json, credentials_json, chrono::Utc::now().timestamp_millis()],
-        )?;
-        Ok(())
-    }).await.map_err(map_named_secret_tx_error)?;
+            Ok(inserted_credential_claim)
+        })
+        .await
+        .map_err(map_named_secret_tx_error)?;
     // The staged writes above intentionally bypass `mutate_owner_vault_item`
     // so they can share one SQLite transaction with the recovery journal. Do
     // not acknowledge (or persist the config) until the live redaction table
@@ -11752,7 +17914,10 @@ async fn provider_config_save(
             ctx,
             &journal_id,
             &staged_names,
-            entry.credential_ref.as_deref(),
+            entry
+                .credential_ref
+                .as_deref()
+                .filter(|_| inserted_credential_claim),
         )
         .await
         .err()
@@ -11780,22 +17945,71 @@ async fn provider_config_save(
 /// cleanup of refs made stale by delete/rename edits.
 async fn save_mcp_config(
     ctx: &DaemonContext,
+    owner_digest: &str,
+    client_operation_id: &str,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
     project_root: &str,
+    snapshot_capability: &str,
+    owner_root: &str,
+    config_path: &str,
+    expected_revision: &str,
+    supplied_mutation_intent_hash: &str,
     config_json: &str,
     secret_values_json: &str,
-    _cleanup_names_json: &str,
+    cleanup_names_json: &str,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    let requested_project_root = project_root.to_owned();
+    let mutation_intent_hash = local_operation_request_hash_hex(&local_operation_request_hash(&(
+        "save_mcp_config",
+        &requested_project_root,
+        &config_json,
+        &cleanup_names_json,
+    ))?);
+    if mutation_intent_hash != supplied_mutation_intent_hash {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message:
+                "MCP mutation intent does not match the submitted body; reload before retrying"
+                    .into(),
+        });
+    }
     // Canonicalize the workspace root once at this daemon boundary so every
     // ownership claim/guard/journal below (and later resolution) keys on the
     // same symlink-resolved form. The CLI (`cockpit mcp add`) sends a raw cwd;
     // canonicalizing here is what makes that raw wire spelling consistent.
     let project_root_canon = crate::secret_ownership::canonical_owner_root(project_root);
     let project_root = project_root_canon.as_str();
+    let capability = {
+        let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+            .lock()
+            .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
+        let now = Instant::now();
+        capabilities.retain(|_, capability| capability.expires_at > now);
+        capabilities.get(snapshot_capability).cloned()
+    }
+    .ok_or_else(|| ErrorPayload {
+        code: ErrorCode::Conflict,
+        message: "MCP edit capability is missing or expired; reload before retrying".into(),
+    })?;
+    if capability.owner != owner_digest
+        || capability.project_root != project_root
+        || owner_root != project_root
+        || capability.mcp_target_path != std::path::Path::new(config_path)
+        || capability.mcp_revision != expected_revision
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message:
+                "MCP edit authority does not match the daemon snapshot; reload before retrying"
+                    .into(),
+        });
+    }
     recover_mcp_config_journals(ctx, project_root).await?;
     let mut config: crate::mcp::config::McpConfig =
         crate::mcp::config::McpConfig::parse(config_json).map_err(internal)?;
-    let mut secret_values: std::collections::BTreeMap<String, String> =
+    let secret_values: std::collections::BTreeMap<String, proto::SensitiveWirePayload> =
         serde_json::from_str(secret_values_json)
             .map_err(|error| bad_request(format!("invalid MCP secret values: {error}")))?;
     let cwd = std::path::PathBuf::from(project_root);
@@ -11842,6 +18056,15 @@ async fn save_mcp_config(
         .parent()
         .ok_or_else(|| bad_request("MCP config target has no parent"))?
         .join(cockpit_config::config::dirs::MCP_FILE);
+    let path = canonical_mcp_target_path(&path)?;
+    if path != capability.mcp_target_path || path != std::path::Path::new(config_path) {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message:
+                "MCP config target changed since the authority snapshot; reload before retrying"
+                    .into(),
+        });
+    }
     // Cleanup authority comes from the daemon's prior on-disk layer, never
     // from a caller-supplied list of arbitrary vault names. A malformed prior
     // layer is a hard failure: treating it as empty could delete credentials
@@ -11858,6 +18081,16 @@ async fn save_mcp_config(
         .iter()
         .flat_map(|(server_name, server)| mcp_secret_references(server_name, server))
         .collect::<std::collections::BTreeSet<_>>();
+    use sha2::Digest as _;
+    let prior_json = serde_json::to_string(&prior_config).map_err(internal)?;
+    let consumed_revision = crate::intel::hex_lower(&Sha256::digest(prior_json.as_bytes()));
+    if consumed_revision != expected_revision {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "MCP config changed since the authority snapshot; reload before retrying"
+                .into(),
+        });
+    }
     let journal_id = Uuid::now_v7().to_string();
     let cleanup_json = serde_json::to_string(&prior_references).map_err(internal)?;
     let config_json_owned = serde_json::to_string(&config).map_err(internal)?;
@@ -11894,6 +18127,35 @@ async fn save_mcp_config(
         .filter(|reference| !oauth_keys.contains(*reference) && !staged_names.contains(*reference))
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
+    let result_revision = crate::intel::hex_lower(&Sha256::digest(config_json_owned.as_bytes()));
+    if mcp_target_layer_revision(&path)? != consumed_revision {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message:
+                "MCP config changed before its durable journal was created; reload before retrying"
+                    .into(),
+        });
+    }
+    let credential_count = config
+        .servers
+        .iter()
+        .flat_map(|(name, server)| mcp_secret_references(name, server))
+        .count();
+    let terminal_response = Response::McpConfigCommitted {
+        client_operation_id: client_operation_id.to_owned(),
+        request_hash: crate::intel::hex_lower(&request_hash),
+        mutation_intent_hash,
+        project_root: requested_project_root,
+        owner_root: project_root.to_owned(),
+        config_path: path.to_string_lossy().into_owned(),
+        consumed_revision,
+        result_revision,
+        // Recovery assigns the current boot's committed generation only after
+        // the reference-only file has durably converged.
+        config_generation: 0,
+        credential_count: u32::try_from(credential_count).unwrap_or(u32::MAX),
+    };
+    let terminal_response_json = serde_json::to_string(&terminal_response).map_err(internal)?;
     let staged_for_tx = staged_values.clone();
     let staged_mutations = ctx
         .db
@@ -11903,21 +18165,36 @@ async fn save_mcp_config(
             let project_root = project_root.to_string();
             let config_path = path.to_string_lossy().into_owned();
             let config_json = config_json_owned.clone();
+            let consumed_revision_for_tx = consumed_revision.clone();
+            let result_revision_for_tx = result_revision.clone();
             let cleanup_json = cleanup_json.clone();
+            let owner_digest = owner_digest.to_owned();
+            let client_operation_id = client_operation_id.to_owned();
+            let terminal_response_json = terminal_response_json.clone();
             let all_refs = all_refs.clone();
             let static_nonstaged_refs = static_nonstaged_refs.clone();
             move |conn| {
                 conn.execute(
                     "INSERT INTO mcp_config_journals
-                     (journal_id, project_root, config_path, config_json, cleanup_names_json, phase, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'staged', ?6)",
+                     (journal_id, owner_digest, client_operation_id, request_hash,
+                      fencing_generation, terminal_response_json, project_root,
+                      config_path, config_json, consumed_revision, intended_revision,
+                      cleanup_names_json, phase, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'staged', ?13)",
                     rusqlite::params![
                         journal_id,
+                        owner_digest,
+                        client_operation_id,
+                        request_hash.as_slice(),
+                        fencing_generation,
+                        terminal_response_json,
                         project_root,
                         config_path,
                         config_json,
+                        consumed_revision_for_tx,
+                        result_revision_for_tx,
                         cleanup_json,
-                        chrono::Utc::now().timestamp_millis(),
+                        chrono::Utc::now().timestamp_millis()
                     ],
                 )?;
                 // ATOMIC full-reference admission: re-check EVERY normalized
@@ -11948,12 +18225,7 @@ async fn save_mcp_config(
                     // and the enclosing transaction rolls back. Do NOT rely on
                     // `INSERT OR IGNORE` to let cross-kind claims silently
                     // coexist.
-                    reject_conflicting_named_ownership_on_conn(
-                        conn,
-                        name,
-                        "mcp",
-                        &project_root,
-                    )?;
+                    reject_conflicting_named_ownership_on_conn(conn, name, "mcp", &project_root)?;
                     let mutation = vault.mutate_item_on_conn(
                         conn,
                         cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
@@ -11982,7 +18254,22 @@ async fn save_mcp_config(
         ctx.poison_redaction_publication(&error);
         return Err(internal(error));
     }
+    crate::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
+    let file_lock = cockpit_config::config::hold_config_mutation_lock(&path).map_err(internal)?;
+    if canonical_mcp_target_path(&path)? != path
+        || mcp_target_layer_revision(&path)? != consumed_revision
+    {
+        drop(file_lock);
+        compensate_mcp_staged_and_retire(ctx, &journal_id, &staged_mutations).await?;
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message:
+                "MCP config target or revision changed before publication; staged credentials were rolled back"
+                    .into(),
+        });
+    }
     if let Err(error) = config.write_private(&path) {
+        drop(file_lock);
         let error = anyhow::anyhow!(error);
         ctx.poison_redaction_publication(&error);
         // The atomic write may have succeeded before reporting an error. Keep
@@ -11990,6 +18277,7 @@ async fn save_mcp_config(
         // vault value that the file may now reference.
         return Err(internal(error));
     }
+    drop(file_lock);
     if let Err(error) = ctx
         .db
         .write({
@@ -12021,15 +18309,48 @@ async fn save_mcp_config(
         }
         delete_owned_named_secret(ctx, &name, "mcp", project_root).await?;
     }
+    let terminal_response = publish_mcp_journal_generation(ctx, &journal_id).await?;
     delete_mcp_journal(ctx, &journal_id).await?;
-    let credential_count = config
-        .servers
-        .iter()
-        .flat_map(|(name, server)| mcp_secret_references(name, server))
-        .count();
-    Ok(Response::McpConfigSaved {
-        credential_count: u32::try_from(credential_count).unwrap_or(u32::MAX),
-    })
+    Ok(terminal_response)
+}
+
+/// Replace the MCP journal's pre-publication sentinel with a generation from
+/// this daemon boot. The file write must have completed before this is called;
+/// the amended response is then settled atomically with journal retirement.
+async fn publish_mcp_journal_generation(
+    ctx: &DaemonContext,
+    journal_id: &str,
+) -> std::result::Result<Response, ErrorPayload> {
+    let journal_id = journal_id.to_owned();
+    let generation = inventory::publish_committed_config_generation();
+    ctx.db
+        .write(move |conn| {
+            let response_json: String = conn.query_row(
+                "SELECT terminal_response_json FROM mcp_config_journals WHERE journal_id = ?1",
+                rusqlite::params![journal_id],
+                |row| row.get(0),
+            )?;
+            let mut response: Response = serde_json::from_str(&response_json)?;
+            let Response::McpConfigCommitted {
+                config_generation, ..
+            } = &mut response
+            else {
+                anyhow::bail!("MCP config journal has the wrong terminal response");
+            };
+            *config_generation = generation;
+            let amended = serde_json::to_string(&response)?;
+            let changed = conn.execute(
+                "UPDATE mcp_config_journals SET terminal_response_json = ?2
+                 WHERE journal_id = ?1",
+                rusqlite::params![journal_id, amended],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("MCP config journal disappeared before publication");
+            }
+            Ok(response)
+        })
+        .await
+        .map_err(internal)
 }
 
 async fn delete_mcp_journal(
@@ -12039,6 +18360,36 @@ async fn delete_mcp_journal(
     let journal_id = journal_id.to_owned();
     ctx.db
         .write(move |conn| {
+            let (owner, operation_id, request_hash, fence, response): (
+                String,
+                String,
+                Vec<u8>,
+                i64,
+                String,
+            ) = conn.query_row(
+                "SELECT owner_digest,client_operation_id,request_hash,
+                        fencing_generation,terminal_response_json
+                 FROM mcp_config_journals WHERE journal_id = ?1",
+                rusqlite::params![journal_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+            settle_journaled_local_success_on_conn(
+                conn,
+                "save_mcp_config",
+                &owner,
+                &operation_id,
+                &request_hash,
+                fence,
+                &response,
+            )?;
             conn.execute(
                 "DELETE FROM mcp_config_journals WHERE journal_id = ?1",
                 rusqlite::params![journal_id],
@@ -12394,10 +18745,72 @@ async fn ensure_mcp_ownership_available(
 /// [`NamedSecretClaimConflict`] becomes a `BadRequest` (fail-closed ownership
 /// rejection), everything else an `internal` fault.
 fn map_named_secret_tx_error(error: anyhow::Error) -> ErrorPayload {
+    if let Some(conflict) = error.downcast_ref::<ProviderCredentialClaimConflict>() {
+        return bad_request(conflict.to_string());
+    }
     match error.downcast::<NamedSecretClaimConflict>() {
         Ok(conflict) => bad_request(conflict.to_string()),
         Err(error) => internal(error),
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("provider credential reference `{reference}` {reason}")]
+struct ProviderCredentialClaimConflict {
+    reference: String,
+    reason: &'static str,
+}
+
+/// Admit an exact provider/root credential claim under the same SQLite writer
+/// transaction that journals the config mutation. Existing ownership by the
+/// exact pair is idempotent; any other pair is foreign authority and cannot be
+/// acquired implicitly.
+fn claim_provider_credential_on_conn(
+    conn: &rusqlite::Connection,
+    reference: &str,
+    provider_id: &str,
+    project_root: &str,
+) -> anyhow::Result<bool> {
+    let vault_item_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM secret_vault_items
+                        WHERE kind = 'credential_record' AND item_id = ?1)",
+        [reference],
+        |row| row.get(0),
+    )?;
+    if !vault_item_exists {
+        return Err(ProviderCredentialClaimConflict {
+            reference: reference.to_string(),
+            reason: "is absent from the daemon vault",
+        }
+        .into());
+    }
+    let foreign_owner: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM secret_credential_ownership
+             WHERE item_id = ?1
+               AND NOT (provider_id = ?2 AND project_root = ?3)
+         )",
+        rusqlite::params![reference, provider_id, project_root],
+        |row| row.get(0),
+    )?;
+    if foreign_owner {
+        return Err(ProviderCredentialClaimConflict {
+            reference: reference.to_string(),
+            reason: "is owned by another provider or workspace",
+        }
+        .into());
+    }
+    Ok(conn.execute(
+        "INSERT OR IGNORE INTO secret_credential_ownership
+         (item_id, provider_id, project_root, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            reference,
+            provider_id,
+            project_root,
+            chrono::Utc::now().timestamp_millis()
+        ],
+    )? == 1)
 }
 
 /// Validate that every named-secret reference in a normalized MCP config is
@@ -12581,27 +18994,57 @@ pub(super) async fn recover_mcp_config_journals(
     project_root: &str,
 ) -> std::result::Result<(), ErrorPayload> {
     let root = project_root.to_owned();
-    let journals: Vec<(String, String, String, String)> = ctx
+    let journals: Vec<(String, String, String, String, String, String)> = ctx
         .db
         .read(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT journal_id, config_path, config_json, cleanup_names_json
+                "SELECT journal_id, config_path, config_json, cleanup_names_json,
+                        consumed_revision, intended_revision
                  FROM mcp_config_journals WHERE project_root = ?1
                  ORDER BY created_at, journal_id",
             )?;
             stmt.query_map(rusqlite::params![root], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
         })
         .await
         .map_err(internal)?;
-    for (journal_id, path, config_json, cleanup_json) in journals {
+    for (journal_id, path, config_json, cleanup_json, consumed_revision, intended_revision) in
+        journals
+    {
+        let path = std::path::PathBuf::from(path);
+        crate::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
+        let file_lock =
+            cockpit_config::config::hold_config_mutation_lock(&path).map_err(internal)?;
+        if canonical_mcp_target_path(&path)? != path {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "MCP journal target was retargeted; durable settlement remains unknown"
+                    .into(),
+            });
+        }
+        let actual_revision = mcp_target_layer_revision(&path)?;
+        if actual_revision != intended_revision && actual_revision != consumed_revision {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "MCP journal found a third-party config revision; durable settlement remains unknown"
+                    .into(),
+            });
+        }
         let config = crate::mcp::config::McpConfig::parse(&config_json).map_err(internal)?;
-        config
-            .write_private(std::path::Path::new(&path))
-            .map_err(internal)?;
+        if actual_revision == consumed_revision {
+            config.write_private(&path).map_err(internal)?;
+        }
+        drop(file_lock);
         let cleanup: std::collections::BTreeSet<String> =
             serde_json::from_str(&cleanup_json).map_err(internal)?;
         let live = mcp_global_live_secret_references(ctx, project_root).await?;
@@ -12613,6 +19056,7 @@ pub(super) async fn recover_mcp_config_journals(
             }
             delete_owned_named_secret(ctx, name, "mcp", project_root).await?;
         }
+        publish_mcp_journal_generation(ctx, &journal_id).await?;
         delete_mcp_journal(ctx, &journal_id).await?;
     }
     Ok(())
@@ -12647,7 +19091,7 @@ pub(super) async fn recover_all_mcp_config_journals(
 /// before any vault transaction or filesystem write.
 fn validate_and_normalize_mcp_credentials(
     config: &mut crate::mcp::config::McpConfig,
-    staged: &std::collections::BTreeMap<String, String>,
+    staged: &std::collections::BTreeMap<String, proto::SensitiveWirePayload>,
 ) -> std::result::Result<(), ErrorPayload> {
     let mut consumed = std::collections::BTreeSet::new();
 
@@ -12675,12 +19119,12 @@ fn validate_and_normalize_mcp_credentials(
                                 "MCP server `{server_name}` header must use a staged secret or reference"
                             ))
                         })?;
-                        if value != header.value.trim() {
+                        if value.as_str() != header.value.trim() {
                             return Err(bad_request(format!(
                                 "MCP server `{server_name}` header literal does not match its staged secret"
                             )));
                         }
-                        header.value.clear();
+                        zeroize::Zeroize::zeroize(&mut header.value);
                     } else if !header.value.trim().is_empty() {
                         return Err(bad_request(format!(
                             "MCP server `{server_name}` header cannot combine an environment reference with a credential reference"
@@ -12693,12 +19137,12 @@ fn validate_and_normalize_mcp_credentials(
                             "MCP server `{server_name}` header value must be a reference or staged secret"
                         ))
                     })?;
-                    if value != header.value.trim() {
+                    if value.as_str() != header.value.trim() {
                         return Err(bad_request(format!(
                             "MCP server `{server_name}` header literal does not match its staged secret"
                         )));
                     }
-                    header.value.clear();
+                    zeroize::Zeroize::zeroize(&mut header.value);
                     header.credential_ref = Some(reference.clone());
                     consumed.insert(reference);
                 }
@@ -12746,7 +19190,7 @@ fn normalize_mcp_env_map(
     values: &mut std::collections::BTreeMap<String, String>,
     refs: &mut std::collections::BTreeMap<String, String>,
     key_fn: fn(&str, &str) -> String,
-    staged: &std::collections::BTreeMap<String, String>,
+    staged: &std::collections::BTreeMap<String, proto::SensitiveWirePayload>,
     consumed: &mut std::collections::BTreeSet<String>,
     field: &str,
 ) -> std::result::Result<(), ErrorPayload> {
@@ -12773,7 +19217,7 @@ fn normalize_mcp_env_map(
                 "MCP server `{server_name}` {field} `{name}` must use a reference or staged secret"
             ))
         })?;
-        if staged_value != value {
+        if staged_value.as_str() != value {
             return Err(bad_request(format!(
                 "MCP server `{server_name}` {field} `{name}` literal does not match its staged secret"
             )));
@@ -12783,9 +19227,31 @@ fn normalize_mcp_env_map(
         remove.push(name.clone());
     }
     for name in remove {
-        values.remove(&name);
+        if let Some(mut literal) = values.remove(&name) {
+            zeroize::Zeroize::zeroize(&mut literal);
+        }
     }
     Ok(())
+}
+
+/// Scrub strings materialized by `serde_json::Value` before its ordinary
+/// allocations are released. The encoded vault handoff is separately held in
+/// a `Zeroizing<Vec<u8>>`.
+fn zeroize_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => zeroize::Zeroize::zeroize(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                zeroize_json_strings(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                zeroize_json_strings(value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
 }
 
 fn validate_mcp_secret_ref(reference: &str) -> std::result::Result<(), ErrorPayload> {
@@ -12954,6 +19420,15 @@ async fn provider_config_delete(
     delete_stored_secrets: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    provider_config_delete_under_lock(ctx, project_root, provider_id, delete_stored_secrets).await
+}
+
+async fn provider_config_delete_under_lock(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: &str,
+    delete_stored_secrets: bool,
+) -> std::result::Result<Response, ErrorPayload> {
     // Converge a matching prior intent before deciding that the provider is
     // absent; otherwise a crash between journal/file publication can turn a
     // requested no-op into a skipped cleanup.
@@ -13006,6 +19481,21 @@ async fn provider_layer_metadata_set(
     on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    provider_layer_metadata_set_under_lock(
+        ctx,
+        project_root,
+        category_defaults_json,
+        on_unlisted_models_fetch,
+    )
+    .await
+}
+
+async fn provider_layer_metadata_set_under_lock(
+    ctx: &DaemonContext,
+    project_root: &str,
+    category_defaults_json: String,
+    on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch,
+) -> std::result::Result<Response, ErrorPayload> {
     let category_defaults: std::collections::BTreeMap<
         String,
         crate::config::providers::ProviderModelRef,

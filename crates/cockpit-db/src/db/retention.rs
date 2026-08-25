@@ -58,10 +58,83 @@ pub struct RetentionOutcome {
     pub sessions_expired: u64,
     pub payload_rows_deleted: u64,
     pub goal_tombstones_purged: u64,
+    pub local_authority_rows_purged: u64,
     pub vacuumed: bool,
 }
 
 impl Db {
+    /// Bound secret-free local authority receipts while retaining a generous
+    /// replay/reconciliation window. Executing operations and completing
+    /// editor leases are deliberately excluded: ambiguous side effects remain
+    /// inspectable until their owning recovery path reaches a terminal state.
+    pub async fn prune_local_authority_receipts(&self, cutoff_unix_ms: i64) -> Result<u64> {
+        self.transaction(move |conn| {
+            let receipts = conn.execute(
+                "DELETE FROM local_operation_receipts
+                 WHERE state LIKE 'terminal_%' AND updated_at_unix_ms < ?1",
+                params![cutoff_unix_ms],
+            )? as u64;
+            let editor = conn.execute(
+                "DELETE FROM agent_editor_leases
+                 WHERE state = 'terminal' AND updated_at_unix_ms < ?1",
+                params![cutoff_unix_ms],
+            )? as u64;
+            // Recovery-owned ambiguous intents stay inspectable. Only dead or
+            // already-terminal marker residue is eligible for bounded cleanup.
+            let patch_journals = conn.execute(
+                "DELETE FROM extended_config_patch_journals
+                  WHERE created_at_unix_ms < ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM local_operation_receipts receipt
+                         WHERE receipt.owner_digest=extended_config_patch_journals.owner_digest
+                           AND receipt.client_operation_id=extended_config_patch_journals.client_operation_id
+                           AND receipt.state IN ('prepared','executing')
+                    )",
+                params![cutoff_unix_ms],
+            )? as u64;
+            let agent_journals = conn.execute(
+                "DELETE FROM agent_mutation_journals
+                  WHERE created_at_unix_ms < ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM local_operation_receipts receipt
+                         WHERE receipt.owner_digest=agent_mutation_journals.owner_digest
+                           AND receipt.client_operation_id=agent_mutation_journals.client_operation_id
+                           AND receipt.state IN ('prepared','executing')
+                    )",
+                params![cutoff_unix_ms],
+            )? as u64;
+            let image_journals = conn.execute(
+                "DELETE FROM image_config_mutation_journals
+                  WHERE created_at_unix_ms < ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM local_operation_receipts receipt
+                         WHERE receipt.owner_digest=image_config_mutation_journals.owner_digest
+                           AND receipt.client_operation_id=image_config_mutation_journals.client_operation_id
+                           AND receipt.state IN ('prepared','executing')
+                    )",
+                params![cutoff_unix_ms],
+            )? as u64;
+            let assistant_journals = conn.execute(
+                "DELETE FROM assistant_mutation_journals
+                  WHERE created_at_unix_ms < ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM local_operation_receipts receipt
+                         WHERE receipt.owner_digest=assistant_mutation_journals.owner_digest
+                           AND receipt.client_operation_id=assistant_mutation_journals.client_operation_id
+                           AND receipt.state IN ('prepared','executing')
+                    )",
+                params![cutoff_unix_ms],
+            )? as u64;
+            Ok(receipts
+                .saturating_add(editor)
+                .saturating_add(patch_journals)
+                .saturating_add(agent_journals)
+                .saturating_add(image_journals)
+                .saturating_add(assistant_journals))
+        })
+        .await
+    }
+
     /// Delete old payload rows for closed sessions, preserving session rows.
     pub async fn prune_session_payloads(&self, payload_cutoff_secs: i64) -> Result<u64> {
         if payload_cutoff_secs <= 0 {
@@ -138,11 +211,20 @@ impl Db {
             .await?
             .try_into()
             .unwrap_or(u64::MAX);
+        // Local mutation receipts contain no request bodies or secret values,
+        // but they still disclose operation metadata and workspace targets.
+        // Keep ninety days for lost-response replay, then prune only terminal
+        // receipts and long-expired, never-consumed editor capabilities.
+        let authority_cutoff_ms = now_secs.saturating_sub(90 * 86_400).saturating_mul(1000);
+        outcome.local_authority_rows_purged = self
+            .prune_local_authority_receipts(authority_cutoff_ms)
+            .await?;
 
         let deleted = outcome
             .sessions_expired
             .saturating_add(outcome.payload_rows_deleted)
             .saturating_add(outcome.goal_tombstones_purged);
+        let deleted = deleted.saturating_add(outcome.local_authority_rows_purged);
         if self.path.is_some()
             && self.should_vacuum(deleted, now_secs, cfg).await
             && self.vacuum_retention_database().await?

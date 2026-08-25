@@ -38,7 +38,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use uuid::Uuid;
 
-use crate::tui::agent_runner;
 use crate::tui::message_block::{MessageBlock, MessageBlockRole, render_markdown_message_block};
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::pane_shared::{boxed_row, resolve_project_id, short_id};
@@ -245,6 +244,37 @@ pub enum SessionsOutcome {
         session_id: Uuid,
         before_seq: Option<i64>,
     },
+    /// Execute a daemon-owned archive/delete/unarchive mutation without
+    /// waiting in the input reducer, then reload this browser level.
+    Mutate(SessionsMutationEffect),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionsMutationTarget {
+    pub(crate) session_id: Uuid,
+    pub(crate) kind: &'static str,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionsMutationEffect {
+    pub(crate) pane_id: Uuid,
+    pub(crate) operation_id: Uuid,
+    pub(crate) target: SessionsMutationTarget,
+    pub(crate) request: cockpit_core::daemon::proto::Request,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionsMutationCompletion {
+    pub(crate) pane_id: Uuid,
+    pub(crate) operation_id: Uuid,
+    pub(crate) target: SessionsMutationTarget,
+    pub(crate) response: Result<cockpit_core::daemon::proto::Response, String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingSessionsMutation {
+    operation_id: Uuid,
+    target: SessionsMutationTarget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +362,7 @@ struct CardHit {
 }
 
 pub struct SessionsPane {
+    pane_id: Uuid,
     /// Resolved current-project id, or `None` when the cwd couldn't be
     /// resolved. When `None` the scope is pinned to `All`.
     project_id: Option<String>,
@@ -375,6 +406,7 @@ pub struct SessionsPane {
     last_card_click: Option<(usize, std::time::Instant)>,
     confirm_buttons: crate::tui::button::ButtonRegistry,
     pointer_capture: bool,
+    pending_mutation: Option<PendingSessionsMutation>,
 }
 
 impl SessionsPane {
@@ -443,6 +475,7 @@ impl SessionsPane {
             Scope::All
         };
         let mut pane = Self {
+            pane_id: Uuid::new_v4(),
             project_id,
             scope,
             show_archived: false,
@@ -469,6 +502,7 @@ impl SessionsPane {
             last_card_click: None,
             confirm_buttons: crate::tui::button::ButtonRegistry::default(),
             pointer_capture: false,
+            pending_mutation: None,
         };
         if daemon_connected {
             pane.loading = Some("Loading sessions...");
@@ -491,10 +525,6 @@ impl SessionsPane {
     /// (Re)load the root level for the active scope, discarding any fork
     /// drill-in. Called at open and on a scope / archived-toggle change.
     fn load_root(&mut self) {
-        let pid = match self.scope {
-            Scope::Project => self.project_id.clone(),
-            Scope::All => None,
-        };
         if self.daemon_connected {
             self.loading = Some("Loading sessions...");
             self.levels = vec![Level {
@@ -504,10 +534,10 @@ impl SessionsPane {
             }];
             return;
         }
-        let cards = self.fetch_level(pid, None);
+        self.mark_disconnected_unavailable();
         self.levels = vec![Level {
             parent: None,
-            cards,
+            cards: Vec::new(),
             list: ScrollList::new(),
         }];
     }
@@ -578,59 +608,8 @@ impl SessionsPane {
         }
     }
 
-    /// Fetch + tier-sort one level: root sessions (`parent = None`) or the
-    /// direct forks of `parent`. Filters archived per the toggle and
-    /// attaches live status. Records (clears) the error on success.
-    ///
-    /// Data path: daemon-connected → the RPC list + per-session live
-    /// status; daemonless → a read-only direct DB read with live status
-    /// uniformly absent (every session degrades to its DB-derived tier).
-    fn fetch_level(
-        &mut self,
-        project_id: Option<String>,
-        parent: Option<Uuid>,
-    ) -> Vec<(SessionSummary, Tier)> {
-        let listed = if self.daemon_connected {
-            match self.daemon_socket.as_deref() {
-                Some(socket) => agent_runner::list_sessions_blocking(socket, project_id, parent),
-                None => Err("daemon socket unavailable for sessions.list".to_string()),
-            }
-        } else {
-            Err("Unavailable — reconnect to the daemon, then Retry".to_string())
-        };
-        match listed {
-            Ok(mut sessions) => {
-                self.error = None;
-                // Archive filter (GOALS §17h): hidden by default.
-                if !self.show_archived {
-                    sessions.retain(|s| s.archived_at.is_none());
-                }
-                // Live status only exists with a daemon. Daemonless, every
-                // session falls to its DB-derived tier (`None` live), which
-                // `classify` handles without error.
-                let live = if self.daemon_connected {
-                    let ids: Vec<Uuid> = sessions.iter().map(|s| s.session_id).collect();
-                    self.daemon_socket
-                        .as_deref()
-                        .map(|socket| agent_runner::session_live_status_blocking(socket, ids))
-                        .unwrap_or_default()
-                } else {
-                    std::collections::HashMap::new()
-                };
-                let pairs: Vec<_> = sessions
-                    .into_iter()
-                    .map(|s| {
-                        let l = live.get(&s.session_id).copied();
-                        (s, l)
-                    })
-                    .collect();
-                tier_sort(pairs)
-            }
-            Err(e) => {
-                self.error = Some(e);
-                Vec::new()
-            }
-        }
+    fn mark_disconnected_unavailable(&mut self) {
+        self.error = Some("Unavailable — reconnect to the daemon, then Retry".to_string());
     }
 
     /// Reload the current level in place, preserving scope/breadcrumb and
@@ -640,23 +619,9 @@ impl SessionsPane {
             self.mark_current_level_loading();
             return;
         }
-        let (pid, parent) = {
-            let depth = self.levels.len();
-            let level = self.levels.last().expect("at least the root level");
-            match (depth, &level.parent) {
-                (_, Some(p)) => (None, Some(p.session_id)),
-                _ => (
-                    match self.scope {
-                        Scope::Project => self.project_id.clone(),
-                        Scope::All => None,
-                    },
-                    None,
-                ),
-            }
-        };
-        let cards = self.fetch_level(pid, parent);
+        self.mark_disconnected_unavailable();
         if let Some(level) = self.levels.last_mut() {
-            level.cards = cards;
+            level.cards.clear();
             level.list.clamp_cursor(level.cards.len());
             level.list.set_scroll(0);
         }
@@ -804,6 +769,13 @@ impl SessionsPane {
     /// otherwise (the pane stays open). Always consumed by `App` so
     /// nothing leaks to the composer (the modal rule).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<SessionsOutcome> {
+        if self.pending_mutation.is_some() {
+            self.notice = Some(
+                "Waiting for the daemon to settle the session change; this browser cannot close yet."
+                    .to_string(),
+            );
+            return None;
+        }
         // The confirm sub-dialog owns input while open.
         if matches!(self.step, Step::Confirm { .. }) {
             return self.handle_confirm_key(key);
@@ -959,10 +931,10 @@ impl SessionsPane {
             });
             return true;
         }
-        let cards = self.fetch_level(None, Some(parent.session_id));
+        self.mark_disconnected_unavailable();
         self.levels.push(Level {
             parent: Some(parent),
-            cards,
+            cards: Vec::new(),
             list: ScrollList::new(),
         });
         false
@@ -987,6 +959,12 @@ impl SessionsPane {
             self.notice = Some(DAEMONLESS_HINT.to_string());
             return;
         }
+        let live = self
+            .current()
+            .cards
+            .get(self.current().list.cursor())
+            .and_then(|(_, status)| *status)
+            .is_some_and(|(jobs, processing)| jobs || processing);
         let Some(s) = self.selected().cloned() else {
             return;
         };
@@ -994,16 +972,8 @@ impl SessionsPane {
         // archive/delete (GOALS §17h) — carried on the summary, accurate
         // without an extra round-trip.
         let descendants = s.descendant_count;
-        // Live status drives the interrupt-first warning.
-        let live_map = self
-            .daemon_socket
-            .as_deref()
-            .map(|socket| agent_runner::session_live_status_blocking(socket, vec![s.session_id]))
-            .unwrap_or_default();
-        let live = live_map
-            .get(&s.session_id)
-            .map(|(j, p)| *j || *p)
-            .unwrap_or(false);
+        // Live status was fetched by the typed async list effect. Confirmation
+        // consumes that snapshot and never blocks the key reducer.
         let label = card_description(&s);
         self.step = Step::Confirm {
             session_id: s.session_id,
@@ -1070,21 +1040,16 @@ impl SessionsPane {
             },
             ConfirmChoice::Delete => Request::DeleteSession { session_id },
         };
-        match agent_runner::daemon_request_blocking(req) {
-            Ok(_) => {
-                self.error = None;
-            }
-            Err(e) => {
-                self.error = Some(e);
-            }
-        }
         self.step = Step::Browse;
-        self.reload_current_level();
-        if self.daemon_connected {
-            Some(SessionsOutcome::LoadList)
-        } else {
-            None
-        }
+        self.error = None;
+        let kind = match choice {
+            ConfirmChoice::Archive => "archive",
+            ConfirmChoice::Delete => "delete",
+            ConfirmChoice::Cancel => unreachable!("cancel returned before request construction"),
+        };
+        Some(SessionsOutcome::Mutate(
+            self.begin_mutation(session_id, kind, req),
+        ))
     }
 
     fn unarchive_selected(&mut self) -> Option<SessionsOutcome> {
@@ -1095,16 +1060,71 @@ impl SessionsPane {
         }
         let s = self.selected().cloned()?;
         s.archived_at?;
-        match agent_runner::daemon_request_blocking(
+        self.error = None;
+        Some(SessionsOutcome::Mutate(self.begin_mutation(
+            s.session_id,
+            "unarchive",
             cockpit_core::daemon::proto::Request::UnarchiveSession {
                 session_id: s.session_id,
             },
-        ) {
-            Ok(_) => self.error = None,
-            Err(e) => self.error = Some(e),
+        )))
+    }
+
+    fn begin_mutation(
+        &mut self,
+        session_id: Uuid,
+        kind: &'static str,
+        request: cockpit_core::daemon::proto::Request,
+    ) -> SessionsMutationEffect {
+        let operation_id = Uuid::new_v4();
+        let target = SessionsMutationTarget { session_id, kind };
+        self.pending_mutation = Some(PendingSessionsMutation {
+            operation_id,
+            target: target.clone(),
+        });
+        self.notice = Some(format!("{kind} pending…"));
+        SessionsMutationEffect {
+            pane_id: self.pane_id,
+            operation_id,
+            target,
+            request,
         }
-        self.reload_current_level();
-        Some(SessionsOutcome::LoadList)
+    }
+
+    pub(crate) fn apply_mutation_completion(
+        &mut self,
+        completion: SessionsMutationCompletion,
+    ) -> bool {
+        let Some(pending) = self.pending_mutation.as_ref() else {
+            return false;
+        };
+        if completion.pane_id != self.pane_id
+            || completion.operation_id != pending.operation_id
+            || completion.target != pending.target
+        {
+            self.error = Some("ignored a mismatched session mutation receipt".to_string());
+            return false;
+        }
+        self.pending_mutation = None;
+        match completion.response {
+            Ok(cockpit_core::daemon::proto::Response::Ack) => {
+                self.error = None;
+                self.notice = Some(format!("{} committed", completion.target.kind));
+                self.reload_current_level();
+                true
+            }
+            Ok(other) => {
+                self.error = Some(format!(
+                    "unexpected {} receipt: {other:?}",
+                    completion.target.kind
+                ));
+                false
+            }
+            Err(error) => {
+                self.error = Some(format!("{} failed: {error}", completion.target.kind));
+                false
+            }
+        }
     }
 
     /// Mouse-wheel scroll (one row).
@@ -1184,6 +1204,13 @@ impl SessionsPane {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<SessionsOutcome> {
+        if self.pending_mutation.is_some() {
+            self.notice = Some(
+                "Waiting for the daemon to settle the session change; controls are disabled."
+                    .to_string(),
+            );
+            return None;
+        }
         if matches!(self.step, Step::Confirm { .. })
             && matches!(
                 mouse.kind,
@@ -3197,6 +3224,7 @@ mod tests {
     /// mode. No daemon/DB interaction either way (the level is seeded).
     fn test_pane_mode(cards: Vec<(SessionSummary, Tier)>, daemon_connected: bool) -> SessionsPane {
         SessionsPane {
+            pane_id: Uuid::new_v4(),
             project_id: Some("pid".into()),
             scope: Scope::Project,
             show_archived: false,
@@ -3228,6 +3256,7 @@ mod tests {
             last_card_click: None,
             confirm_buttons: crate::tui::button::ButtonRegistry::default(),
             pointer_capture: false,
+            pending_mutation: None,
         }
     }
 
@@ -3287,8 +3316,8 @@ mod tests {
     #[test]
     fn disconnected_list_is_typed_unavailable() {
         let mut pane = test_pane_mode(vec![], false);
-        let cards = pane.fetch_level(Some("pid".into()), None);
-        assert!(cards.is_empty());
+        pane.mark_disconnected_unavailable();
+        assert!(pane.current().cards.is_empty());
         assert!(
             pane.error
                 .as_deref()

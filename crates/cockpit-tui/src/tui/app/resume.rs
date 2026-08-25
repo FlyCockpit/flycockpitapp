@@ -26,9 +26,20 @@ impl App {
         let was_btw_dialog = self.question_dialog_btw;
         if was_btw_dialog {
             if let Some(Ok(runner)) = self.btw_pane.as_ref().and_then(|pane| pane.runner.as_ref()) {
-                let _ = agent_runner::attached_request_tx_blocking(
-                    runner.attached_request_binding(),
-                    request,
+                let binding = runner.attached_request_binding();
+                self.async_actions.start(
+                    AsyncActionKind::DaemonRpc("btw.resolve-interrupt"),
+                    AsyncActionPolicy::AllowConcurrent,
+                    async move {
+                        match binding.request(request).await? {
+                            cockpit_core::daemon::proto::Response::Ack => {
+                                Ok(AsyncActionPayload::Unit)
+                            }
+                            other => {
+                                Err(format!("unexpected resolve-interrupt response: {other:?}"))
+                            }
+                        }
+                    },
                 );
             }
         } else {
@@ -92,7 +103,11 @@ impl App {
     /// `/compact`: enqueue an in-place compaction turn on the active session.
     pub(super) fn start_compact(&mut self) {
         let submission = cockpit_core::engine::message::UserSubmission::compact_notice();
-        self.ensure_agent_runner();
+        if !matches!(self.agent_runner, Some(Ok(_))) {
+            self.start_runner_attach(true, RunnerAttachContinuation::Compact);
+            self.push_plain("/compact: connecting".to_string());
+            return;
+        }
         let span_orphaned = match self.agent_runner.as_ref() {
             Some(Ok(runner)) => match runner.try_send_input(submission) {
                 Ok(_) => {

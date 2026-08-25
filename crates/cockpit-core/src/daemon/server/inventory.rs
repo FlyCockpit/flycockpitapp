@@ -28,6 +28,20 @@ pub const MAX_INVENTORY_ENCODED_BYTES: usize = 4 * 1024 * 1024;
 /// inventory source changes. Combined with the skills catalog generation.
 static INVENTORY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// A generation is meaningful only together with the authority projection it
+/// labels. Readers hold the shared side while collecting rows and the
+/// generation; agent/assistant writers hold the exclusive side from their CAS
+/// read through durable publication and the generation bump. This closes the
+/// commit-before-bump window that an atomic counter alone cannot close.
+static AUTHORITY_PUBLICATION_FENCE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+pub async fn read_authority_publication() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    AUTHORITY_PUBLICATION_FENCE.read().await
+}
+
+pub async fn write_authority_publication() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    AUTHORITY_PUBLICATION_FENCE.write().await
+}
 
 type InventoryBarrierCb = Box<dyn Fn() + Send + Sync>;
 

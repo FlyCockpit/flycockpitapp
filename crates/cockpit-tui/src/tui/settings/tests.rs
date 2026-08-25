@@ -3,6 +3,247 @@ use super::*;
 use cockpit_config::extended::ExtendedConfigDoc;
 
 #[test]
+fn settings_input_pages_do_not_wait_on_daemon_rpcs() {
+    for (name, source) in [
+        ("providers", include_str!("providers/mod.rs")),
+        ("mcp", include_str!("mcp_page.rs")),
+        ("tools", include_str!("tools_page.rs")),
+        ("category", include_str!("category.rs")),
+    ] {
+        assert!(
+            !source.contains("block_in_place")
+                && !source.contains("Handle::current().block_on")
+                && !source.contains("settings_daemon_request("),
+            "{name} settings input path contains a synchronous daemon wait"
+        );
+    }
+}
+
+#[test]
+fn agent_editor_staging_is_dispatched_only_through_a_blocking_action() {
+    let agents = include_str!("agents_page.rs");
+    let app = include_str!("../app/async_actions.rs");
+    let begin = agents
+        .split("fn apply_begin_lease")
+        .nth(1)
+        .and_then(|source| source.split("fn settle_unserviced_editor_lease").next())
+        .expect("agent lease reducer source");
+    let completion = agents
+        .split("fn reduce_external_edit_result")
+        .nth(1)
+        .and_then(|source| source.split("fn queue_failed_external_edit_read").next())
+        .expect("agent external-edit completion source");
+    assert!(begin.contains("SettingsBlockingEffectWork::PrepareAgentEditor"));
+    assert!(!begin.contains("agent_external_edit_staging()"));
+    assert!(completion.contains("SettingsBlockingEffectWork::ReadAgentEditor"));
+    assert!(!completion.contains("read_config_leaf_from_retained_directory"));
+    assert!(app.contains("start_blocking("));
+    assert!(app.contains("settings.blocking-effect"));
+}
+
+#[test]
+fn category_editor_staging_is_dispatched_only_through_blocking_actions() {
+    let category = include_str!("category.rs");
+    assert!(category.contains("PrepareCategoryEditor"));
+    assert!(category.contains("ReadCategoryEditor"));
+    assert!(!category.contains("std::fs::read_to_string(pending"));
+    assert!(!category.contains("tempfile::Builder::new()"));
+}
+
+#[test]
+fn settings_blocking_timeout_retains_operation_metadata() {
+    let app = include_str!("../app/async_actions.rs");
+    let state = include_str!("../app/mod.rs");
+    assert!(app.contains("settings_blocking_actions.insert"));
+    assert!(app.contains("outcome: Err(error)"));
+    assert!(state.contains("SettingsBlockingEffectMetadata"));
+}
+
+#[test]
+fn queued_secret_payloads_have_redacted_debug_and_single_owners() {
+    let sentinel = "provider-header-secret-sentinel";
+    let payload = SecretPayload::new(sentinel.to_string());
+    assert!(!format!("{payload:?}").contains(sentinel));
+
+    let save = ProviderSavePlan {
+        provider_id: "example".into(),
+        entry: ProviderEntry::default(),
+        header_secrets: vec![Some(zeroize::Zeroizing::new(sentinel.to_string()))],
+    };
+    let plan = ProviderMutationPlan {
+        snapshot_session_id: "snapshot".into(),
+        layer_id: "layer".into(),
+        owner_root: "/project".into(),
+        mutation_intent_hash: "00".repeat(32),
+        expected_revision: "revision".into(),
+        client_operation_id: "operation".into(),
+        saves: vec![save],
+        deletes: Vec::new(),
+        metadata: None,
+    };
+    assert!(!format!("{plan:?}").contains(sentinel));
+
+    let settings = include_str!("mod.rs");
+    let mcp = include_str!("mcp_page.rs");
+    assert!(settings.contains("Vec<Option<zeroize::Zeroizing<String>>>"));
+    assert!(mcp.contains("SecretPayload::new(secret_values_json)"));
+}
+
+#[test]
+fn provider_settings_use_one_exact_atomic_receipt_and_no_legacy_sequence() {
+    let settings = include_str!("mod.rs");
+    let executor = settings
+        .split("SettingsDaemonEffectWork::ProviderMutation(plan) =>")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("SettingsDaemonEffectWork::TypedDocumentEdit")
+                .next()
+        })
+        .expect("provider mutation executor");
+    assert_eq!(executor.matches(".request(").count(), 1);
+    assert!(executor.contains("Request::ApplyProviderMutation"));
+    assert!(!executor.contains("Request::SaveProviderConfig"));
+    assert!(!executor.contains("Request::DeleteProviderConfig"));
+    assert!(!executor.contains("Request::SetProviderLayerMetadata"));
+
+    let completion = settings
+        .split("Ok(Response::ProviderMutationCommitted")
+        .nth(1)
+        .expect("provider committed receipt handling");
+    for exact_field in [
+        "returned_operation_id == client_operation_id",
+        "returned_session_id == snapshot_session_id",
+        "returned_layer_id == layer_id",
+        "consumed_revision == expected_revision",
+        "config_generation == expected_generation.saturating_add(1)",
+    ] {
+        assert!(completion.contains(exact_field), "missing {exact_field}");
+    }
+    assert!(completion.contains("ConfigPublicationStatus::Published"));
+}
+
+#[test]
+fn settings_cannot_close_or_accept_a_stale_session_completion_while_pending() {
+    let tmp = TempDir::new().unwrap();
+    let mut settings = fresh_dialog(&tmp);
+    let target = SettingsEffectTarget {
+        surface: "settings.test-pending",
+        owner: "owner".into(),
+        revision: Some("revision".into()),
+    };
+    let operation_id = settings.cx.queue_simple_mutation(
+        target.clone(),
+        Request::ListAssistants,
+        SettingsMutationAction::ProviderCredentialDelete {
+            provider_id: "example".into(),
+            client_operation_id: "test-operation".into(),
+            project_root: "/workspace".into(),
+            expected_request_hash: "00".repeat(32),
+        },
+    );
+    assert!(!settings.handle_key(press(KeyCode::Char('q'))));
+    assert!(settings.cx.pending_settings.contains_key(&operation_id));
+
+    let current_dialog_id = settings.cx.dialog_id;
+    let mut dialog = Dialog::Settings(Box::new(settings));
+    dialog.apply_settings_daemon_completion(SettingsDaemonEffectCompletion {
+        dialog_id: uuid::Uuid::new_v4(),
+        operation_id,
+        target,
+        response: Ok(Response::Ack),
+        authoritative_rejection: false,
+        committed_refresh_needed: None,
+    });
+    let Dialog::Settings(settings) = &dialog else {
+        unreachable!();
+    };
+    assert_eq!(settings.cx.dialog_id, current_dialog_id);
+    assert!(settings.cx.pending_settings.contains_key(&operation_id));
+    assert!(settings.cx.completed_provider_auth.is_none());
+}
+
+#[test]
+fn authority_success_is_receipt_driven_and_committed_refresh_is_explicit() {
+    let source = include_str!("mod.rs");
+    let providers = include_str!("providers/mod.rs");
+    let fetch = include_str!("providers/fetch.rs");
+    assert!(source.contains("if self.authority_operation_pending()"));
+    assert!(source.contains("completed_mcp_navigation"));
+    assert!(source.contains("adopt_pending_mcp_oauth"));
+    assert!(source.contains("committed_refresh_needed"));
+    assert!(source.contains("settings committed at generation"));
+    assert!(source.contains("pending_provider_mutation_navigation.take()"));
+    assert!(source.contains("completed_provider_mutation_navigation"));
+    assert!(providers.contains("has_unsettled_authority_operation"));
+    assert!(providers.contains("Self::FetchAll(state) => state.is_fetching()"));
+    assert!(providers.contains("ProviderMutationNavigation::Edit"));
+    assert!(fetch.contains("ProviderMutationNavigation::List"));
+    assert!(fetch.contains("return Nav::Stay"));
+    let mcp = include_str!("mcp_page.rs");
+    assert!(mcp.contains("Result<super::SettingsSaveOutcome, String>"));
+    assert!(mcp.contains("Ok(super::SettingsSaveOutcome::Queued)"));
+}
+
+#[test]
+fn oauth_acknowledgement_keeps_explicit_authority_until_typed_settlement() {
+    let flow = include_str!("providers/oauth_flow.rs");
+    let providers = include_str!("providers/mod.rs");
+    let app = include_str!("../app/async_actions.rs");
+    let dialog = include_str!("mod.rs");
+
+    assert!(flow.contains("acknowledgement_authority_pending: bool"));
+    assert!(flow.contains("self.acknowledgement_authority_pending = true"));
+    assert!(flow.contains("apply_acknowledgement_settlement_unknown"));
+    assert!(flow.contains("self.acknowledgement_authority_pending = false"));
+    assert!(providers.contains("has_unsettled_oauth_acknowledgement"));
+    assert!(dialog.contains("oauth_ack_retry"));
+    assert!(app.contains("Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_)"));
+    assert!(!app.contains("daemon rejected acknowledgement: {error}"));
+}
+
+#[test]
+fn external_editor_generic_errors_never_release_daemon_authority() {
+    let agents = include_str!("agents_page.rs");
+    let begin = agents
+        .split("fn apply_begin_lease")
+        .nth(1)
+        .and_then(|source| source.split("fn settle_unserviced_editor_lease").next())
+        .expect("editor begin reducer");
+    let completion = agents
+        .split("fn apply_complete_lease")
+        .nth(1)
+        .and_then(|source| source.split("/// Help line for the footer").next())
+        .expect("editor completion reducer");
+
+    assert!(begin.contains("PendingAgentOperation::BeginLease"));
+    assert!(!begin.contains("if authoritative_rejection"));
+    assert!(completion.contains("validate_agent_editor_completion"));
+    assert!(completion.contains("PendingAgentOperation::CompleteLease"));
+    assert!(completion.contains("AgentEditorSettlementStatus::Pending"));
+    assert!(completion.contains("AgentEditorSettlementStatus::Rejected"));
+    assert!(completion.contains("AgentEditorSettlementStatus::Cancelled"));
+    assert!(completion.contains("AgentEditorSettlementStatus::Saved"));
+    assert!(!completion.contains("if authoritative_rejection"));
+}
+
+#[test]
+fn provider_auth_completions_carry_unit_success_results() {
+    let settings = include_str!("mod.rs");
+    let auth_completion = settings
+        .split("enum CompletedProviderAuthMutation")
+        .nth(1)
+        .and_then(|source| source.split("enum PendingMcpOAuth").next())
+        .expect("provider auth completion enum");
+    assert_eq!(
+        auth_completion
+            .matches("result: Result<(), String>")
+            .count(),
+        2
+    );
+    assert!(!auth_completion.contains("Result<bool, String>"));
+}
+
+#[test]
 fn empty_object_merge_patch_is_derived_as_noop_for_existing_object() {
     let mut authored = serde_json::json!({
         "tui": { "mouse": true },
@@ -69,6 +310,9 @@ fn injected_settings_transport_uses_production_receipt_and_reconciliation_path()
     let effect = Arc::new(QueuedSettingsDaemon {
         responses: Mutex::new(std::collections::VecDeque::from([
             Ok(Response::ExtendedConfigSaved {
+                client_operation_id: "fixture-operation".into(),
+                request_hash: "aa".repeat(32),
+                mutation_intent_hash: "bb".repeat(32),
                 hash: "revision-2".into(),
                 config_generation: 8,
                 layer_id: layer_id.into(),
@@ -122,6 +366,9 @@ fn injected_settings_transport_rejects_wrong_consumed_revision() {
     let effect = Arc::new(QueuedSettingsDaemon {
         responses: Mutex::new(std::collections::VecDeque::from([Ok(
             Response::ExtendedConfigSaved {
+                client_operation_id: "fixture-operation".into(),
+                request_hash: "aa".repeat(32),
+                mutation_intent_hash: "bb".repeat(32),
                 hash: "revision-2".into(),
                 config_generation: 8,
                 layer_id: "layer-capability".into(),
@@ -2501,13 +2748,11 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
       }
     }"#;
 
-    // MCP list edits (toggle/delete/save) are owner-remoted through the daemon
-    // (`Request::SaveMcpConfig`), which blocks on the ambient runtime and fails
-    // closed on an untrusted workspace. Promote an isolated in-process daemon,
-    // trust one shared project root, and drive every click that can persist
-    // under a multi-thread runtime so `block_in_place(Handle::current())` has a
-    // reactor. The environment is isolated so the owner write never touches this
-    // developer box.
+    // MCP list edits (toggle/delete/save) enqueue typed owner RPC effects and
+    // fail closed on an untrusted workspace. Promote an isolated in-process
+    // daemon and trust one shared project root so the helper can service each
+    // queued effect and feed its correlated receipt back through the reducer.
+    // The environment is isolated so the owner write never touches this box.
     let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
     let _daemon = cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -6119,6 +6364,7 @@ fn mcp_oauth_ui_retains_public_url_and_accepts_manual_callback() {
     callback.set("http://127.0.0.1:43123/callback?code=opaque");
     let state = mcp_page::McpOAuthState {
         server: "docs".into(),
+        begin_client_operation_id: "begin".into(),
         flow_id: "flow-id".into(),
         authorize_url: "https://auth.example.test/authorize".into(),
         callback,
@@ -8768,4 +9014,42 @@ fn runtime_sandbox_policy_reaches_settings_dependency_context() {
         unreachable!()
     };
     assert!(!settings.cx.sandbox_enabled);
+}
+
+#[test]
+fn durable_settings_mutations_retain_unknown_settlement_until_receipt() {
+    let source = include_str!("mod.rs");
+    assert!(source.contains("PendingSettingsOperation::SettlementQuery"));
+    assert!(source.contains("Request::GetLocalOperationSettlement"));
+    assert!(source.contains("SettingsDaemonEffectWork::SettlementQuery"));
+    assert!(source.contains("local operation settlement query timed out"));
+    assert!(source.contains("operation settlement is unknown"));
+    assert!(source.contains("authority_operation_pending"));
+    assert!(source.contains("pending_settlement_kind"));
+    assert!(source.contains("valid_local_settlement_hash"));
+    assert!(source.contains("operation was authoritatively rejected"));
+    assert!(source.contains("operation was authoritatively cancelled"));
+}
+
+#[test]
+fn oauth_and_project_receipts_are_bound_to_exact_authority_targets() {
+    let source = include_str!("mod.rs");
+    let mcp = include_str!("mcp_page.rs");
+    let providers = include_str!("providers/mod.rs");
+
+    assert!(source.contains("expected_request_hash"));
+    assert!(source.contains("request_hash == expected_request_hash"));
+    assert!(source.contains("owner_root == project_root"));
+    assert!(mcp.contains("local_receipt_request_hash"));
+    assert!(providers.contains("canonical_project_root"));
+    assert!(source.contains("client_operation_id: client_operation_id.clone()"));
+    assert!(source.contains("settings commit settlement is unknown"));
+    assert!(source.contains("typed settings commit remains unsettled"));
+    assert!(mcp.contains("expected_consumed_revision"));
+    assert!(mcp.contains("expected_result_revision"));
+    assert!(source.contains("sanitized_intent_hash"));
+    assert!(source.contains("returned_intent_hash == mutation_intent_hash"));
+    assert!(source.contains("mutation_intent_hash == expected_request_hash"));
+    assert!(mcp.contains("expected_request_intent_hash"));
+    assert!(source.contains("provider_view_matches_mutation"));
 }

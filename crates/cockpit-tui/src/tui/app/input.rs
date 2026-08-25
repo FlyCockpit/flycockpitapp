@@ -630,6 +630,9 @@ impl App {
         //   2. if it requested close: drain its result, close it
         //   3. unconditionally `return false`
         if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
+            if self.pending_workspace_trust.is_some() {
+                return false;
+            }
             let should_close = self.dialog.handle_key(key);
             if should_close && let Some((root, mode)) = self.dialog.take_workspace_trust_choice() {
                 return self.apply_workspace_trust_choice(root, mode);
@@ -862,6 +865,10 @@ impl App {
                         self.overlay = Overlay::Sessions(pane);
                         self.start_sessions_preview_action(session_id, before_seq);
                     }
+                    Some(crate::tui::sessions_pane::SessionsOutcome::Mutate(request)) => {
+                        self.overlay = Overlay::Sessions(pane);
+                        self.start_sessions_mutation_action(request);
+                    }
                     None => {
                         self.overlay = Overlay::Sessions(pane);
                     }
@@ -876,7 +883,11 @@ impl App {
             }
             Overlay::Tools(mut pane) => {
                 if let Some(outcome) = pane.handle_key(key) {
-                    self.handle_tools_outcome(outcome);
+                    if matches!(outcome, crate::tui::tools_pane::ToolsOutcome::Pending) {
+                        self.overlay = Overlay::Tools(pane);
+                    } else {
+                        self.handle_tools_outcome(outcome);
+                    }
                 } else {
                     self.overlay = Overlay::Tools(pane);
                 }
@@ -884,7 +895,14 @@ impl App {
             }
             Overlay::GoalSettings(mut pane) => {
                 if let Some(outcome) = pane.handle_key(key) {
-                    self.handle_goal_settings_outcome(outcome);
+                    if matches!(
+                        outcome,
+                        crate::tui::goal_settings_pane::GoalSettingsOutcome::Pending
+                    ) {
+                        self.overlay = Overlay::GoalSettings(pane);
+                    } else {
+                        self.handle_goal_settings_outcome(outcome);
+                    }
                 } else {
                     self.overlay = Overlay::GoalSettings(pane);
                 }
@@ -940,6 +958,7 @@ impl App {
             Overlay::Leaks(mut pane) => {
                 match pane.handle_key(key) {
                     crate::tui::leaks_pane::LeaksOutcome::Close => {
+                        self.cancel_pending_leak_reveal();
                         // Zeroize the reveal buffer and request a full alt-screen
                         // clear so no stale plaintext cells survive the close
                         // (serviced with the terminal handle in the event loop).
@@ -958,11 +977,12 @@ impl App {
                         self.start_leaks_rpc_action(action);
                     }
                     crate::tui::leaks_pane::LeaksOutcome::Reveal {
+                        pane_instance_id,
                         report_id,
                         generation,
                     } => {
                         self.overlay = Overlay::Leaks(pane);
-                        self.reveal_leak_into_pane(report_id, generation);
+                        self.reveal_leak_into_pane(pane_instance_id, report_id, generation);
                     }
                 }
                 return false;
@@ -981,9 +1001,9 @@ impl App {
                         capability_id,
                         literal,
                     } => {
-                        // Overlay closes (self.overlay is already None); send the
-                        // apply. The literal rides only the apply frame — never
-                        // the transcript, history, or an async payload.
+                        // Overlay closes (self.overlay is already None); move the
+                        // literal into the attached-binding effect. It remains
+                        // zeroizing and never enters transcript or history.
                         self.apply_sealed_write(&capability_id, literal, summary);
                     }
                     SealedOverlayOutcome::Cancel { capability_id } => {
@@ -1322,6 +1342,7 @@ impl App {
             && !self.pending_prune_confirm
             && self.pending_stop_confirm.is_none()
             && self.pending_compact.is_none()
+            && self.pending_mcp_local.is_none()
             && !self.pending_external_edit
             && self.context_menu.is_none()
             && self.pane.is_none()

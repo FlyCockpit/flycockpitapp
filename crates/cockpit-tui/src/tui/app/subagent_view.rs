@@ -376,7 +376,7 @@ impl App {
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("subagent.steer"),
             AsyncActionPolicy::AllowConcurrent,
-            move || match agent_runner::daemon_request_blocking(req)? {
+            move || match agent_runner::daemon_request_from_blocking_worker(req)? {
                 cockpit_core::daemon::proto::Response::DelegationSteer { result } => {
                     Ok(AsyncActionPayload::DelegationSteer(result))
                 }

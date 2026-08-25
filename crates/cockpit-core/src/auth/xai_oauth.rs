@@ -12,6 +12,7 @@ use rand::Rng;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use crate::credentials::CredentialStore;
 
@@ -39,11 +40,31 @@ pub enum CallbackSource {
     ManualPaste,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// Clone is intentionally retained for the generic refresh guard, which keeps
+// the previous token set alive until a replacement has been validated.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredTokens {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: i64,
+}
+
+impl std::fmt::Debug for StoredTokens {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredTokens")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl Drop for StoredTokens {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
 }
 
 impl StoredTokens {
@@ -58,12 +79,33 @@ struct Discovery {
     token_endpoint: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ManualLogin {
     pub authorize_url: String,
     state: String,
     verifier: String,
     token_endpoint: String,
+}
+
+impl std::fmt::Debug for ManualLogin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManualLogin")
+            .field("authorize_url", &"[REDACTED]")
+            .field("state", &"[REDACTED]")
+            .field("verifier", &"[REDACTED]")
+            .field("token_endpoint", &self.token_endpoint)
+            .finish()
+    }
+}
+
+impl Drop for ManualLogin {
+    fn drop(&mut self) {
+        self.authorize_url.zeroize();
+        self.state.zeroize();
+        self.verifier.zeroize();
+        self.token_endpoint.zeroize();
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -82,7 +124,7 @@ impl ManualLogin {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     #[serde(default)]
@@ -91,15 +133,24 @@ struct TokenResponse {
     expires_in: Option<i64>,
 }
 
+impl Drop for TokenResponse {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
+}
+
 pub async fn begin_manual_login() -> Result<ManualLogin> {
     let discovery = fetch_discovery().await?;
     let (verifier, challenge) = generate_pkce();
-    let state = random_urlsafe(32);
+    let mut verifier = zeroize::Zeroizing::new(verifier);
+    let challenge = zeroize::Zeroizing::new(challenge);
+    let mut state = zeroize::Zeroizing::new(random_urlsafe(32));
     let authorize_url = build_authorize_url(&discovery.authorization_endpoint, &state, &challenge);
     Ok(ManualLogin {
         authorize_url,
-        state,
-        verifier,
+        state: std::mem::take(&mut *state),
+        verifier: std::mem::take(&mut *verifier),
         token_endpoint: discovery.token_endpoint,
     })
 }
@@ -123,7 +174,11 @@ pub async fn complete_manual_login_unpersisted(
     login: ManualLogin,
     input: &str,
 ) -> Result<StoredTokens> {
-    let code = parse_callback_input(input, &login.state, CallbackSource::ManualPaste)?;
+    let code = zeroize::Zeroizing::new(parse_callback_input(
+        input,
+        &login.state,
+        CallbackSource::ManualPaste,
+    )?);
     exchange_code(&login.token_endpoint, &code, &login.verifier).await
 }
 
@@ -141,7 +196,7 @@ async fn complete_login(
     source: CallbackSource,
     store: Option<&mut CredentialStore>,
 ) -> Result<StoredTokens> {
-    let code = parse_callback_input(input, &login.state, source)?;
+    let code = zeroize::Zeroizing::new(parse_callback_input(input, &login.state, source)?);
     let tokens = exchange_code(&login.token_endpoint, &code, &login.verifier).await?;
     match store {
         Some(store) => store_tokens_in(store, &tokens)?,
@@ -151,7 +206,7 @@ async fn complete_login(
 }
 
 pub async fn bearer_token_from_store(store: crate::credentials::CredentialStore) -> Result<String> {
-    let tokens = crate::auth::refresh_guard::credential_with_refresh(
+    let mut tokens = crate::auth::refresh_guard::credential_with_refresh(
         store,
         CREDENTIAL_KEY,
         "parsing stored xAI OAuth tokens",
@@ -167,7 +222,7 @@ pub async fn bearer_token_from_store(store: crate::credentials::CredentialStore)
         xai_terminal_refresh_error,
     )
     .await?;
-    Ok(tokens.access_token)
+    Ok(std::mem::take(&mut tokens.access_token))
 }
 
 pub fn is_logged_in() -> bool {
@@ -289,29 +344,29 @@ async fn token_request(
     params: &[(&str, &str)],
     fallback_refresh: Option<&str>,
 ) -> Result<StoredTokens> {
+    let request_body = zeroize::Zeroizing::new(form_body(params));
     let resp = oauth_http_client()?
         .post(token_endpoint)
         .header(
             reqwest::header::CONTENT_TYPE,
             "application/x-www-form-urlencoded",
         )
-        .body(form_body(params))
+        .body(request_body.as_bytes().to_vec())
         .send()
         .await
         .with_context(|| format!("POST {token_endpoint}"))?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = zeroize::Zeroizing::new(resp.text().await.unwrap_or_default());
     if !status.is_success() {
         return Err(classify_token_error(status, &body));
     }
-    let parsed: TokenResponse =
+    let mut parsed: TokenResponse =
         serde_json::from_str(&body).context("parsing xAI OAuth token response")?;
-    let refresh_token = parsed
-        .refresh_token
+    let refresh_token = std::mem::take(&mut parsed.refresh_token)
         .or_else(|| fallback_refresh.map(str::to_string))
         .context("xAI OAuth token response missing refresh_token")?;
     Ok(StoredTokens {
-        access_token: parsed.access_token,
+        access_token: std::mem::take(&mut parsed.access_token),
         refresh_token,
         expires_at: unix_now() + parsed.expires_in.unwrap_or(3600),
     })
@@ -516,8 +571,12 @@ pub async fn complete_local_callback_login_unpersisted(
     login: ManualLogin,
     listener: tokio::net::TcpListener,
 ) -> Result<StoredTokens> {
-    let callback = wait_for_callback_async(&listener).await?;
-    let code = parse_callback_input(&callback, &login.state, CallbackSource::LocalListener)?;
+    let callback = zeroize::Zeroizing::new(wait_for_callback_async(&listener).await?);
+    let code = zeroize::Zeroizing::new(parse_callback_input(
+        &callback,
+        &login.state,
+        CallbackSource::LocalListener,
+    )?);
     exchange_code(&login.token_endpoint, &code, &login.verifier).await
 }
 
@@ -534,7 +593,7 @@ async fn complete_local_callback_login_in_store(
     listener: tokio::net::TcpListener,
     store: Option<&mut CredentialStore>,
 ) -> Result<StoredTokens> {
-    let callback = wait_for_callback_async(&listener).await?;
+    let callback = zeroize::Zeroizing::new(wait_for_callback_async(&listener).await?);
     complete_login(login, &callback, CallbackSource::LocalListener, store).await
 }
 

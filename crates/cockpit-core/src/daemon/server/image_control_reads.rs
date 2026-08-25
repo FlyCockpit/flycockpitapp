@@ -20,14 +20,40 @@ use cockpit_config::config::image_generation::{
     ImageAdapterKind, ImageGenerationConfig, ImageTargetIdentity,
 };
 use cockpit_proto::image_control::{
-    ImageControlReadResponseV1, ImageControlReadResultV1, ImageEndpointSafeV1, ImageTargetSafeV1,
-    ImageWorkflowSafeV1,
+    ImageConfigMutationCapabilityV1, ImageControlReadResponseV1, ImageControlReadResultV1,
+    ImageEndpointSafeV1, ImageTargetSafeV1, ImageWorkflowSafeV1,
 };
 
 use crate::daemon::proto::{ErrorCode, ErrorPayload};
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 100;
+
+pub(crate) struct ImageControlReadAuthority {
+    pub daemon_instance_id: String,
+    pub requested_project_root: String,
+    pub canonical_project_root: String,
+    pub target_path: String,
+    pub target_revision: String,
+    pub mutation_capability: ImageConfigMutationCapabilityV1,
+    pub config_generation: u64,
+}
+
+fn response(
+    authority: &ImageControlReadAuthority,
+    result: ImageControlReadResultV1,
+) -> ImageControlReadResponseV1 {
+    ImageControlReadResponseV1::new(
+        authority.daemon_instance_id.clone(),
+        authority.requested_project_root.clone(),
+        authority.canonical_project_root.clone(),
+        authority.target_path.clone(),
+        authority.target_revision.clone(),
+        authority.mutation_capability.clone(),
+        authority.config_generation,
+        result,
+    )
+}
 
 fn bad_request(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
@@ -126,8 +152,7 @@ fn referencing_target_ids(cfg: &ImageGenerationConfig, workflow_id: &str) -> Vec
 pub(crate) fn endpoint_list(
     cfg: &ImageGenerationConfig,
     generation: &str,
-    daemon_instance_id: String,
-    project_id: String,
+    authority: &ImageControlReadAuthority,
     limit: Option<u16>,
     cursor: Option<&str>,
 ) -> Result<ImageControlReadResponseV1, ErrorPayload> {
@@ -140,9 +165,8 @@ pub(crate) fn endpoint_list(
         .into_iter()
         .map(|e| ImageEndpointSafeV1::project(e, generation.to_string()))
         .collect();
-    Ok(ImageControlReadResponseV1::new(
-        daemon_instance_id,
-        project_id,
+    Ok(response(
+        authority,
         ImageControlReadResultV1::EndpointPage {
             items,
             next_cursor,
@@ -154,8 +178,7 @@ pub(crate) fn endpoint_list(
 pub(crate) fn endpoint_get(
     cfg: &ImageGenerationConfig,
     generation: &str,
-    daemon_instance_id: String,
-    project_id: String,
+    authority: &ImageControlReadAuthority,
     endpoint_id: &str,
 ) -> Result<ImageControlReadResponseV1, ErrorPayload> {
     let endpoint = cfg
@@ -163,9 +186,8 @@ pub(crate) fn endpoint_get(
         .iter()
         .find(|e| e.id == endpoint_id)
         .ok_or_else(|| bad_request("image endpoint not found"))?;
-    Ok(ImageControlReadResponseV1::new(
-        daemon_instance_id,
-        project_id,
+    Ok(response(
+        authority,
         ImageControlReadResultV1::EndpointEntity {
             item: ImageEndpointSafeV1::project(endpoint, generation.to_string()),
         },
@@ -175,8 +197,7 @@ pub(crate) fn endpoint_get(
 pub(crate) fn target_list(
     cfg: &ImageGenerationConfig,
     generation: &str,
-    daemon_instance_id: String,
-    project_id: String,
+    authority: &ImageControlReadAuthority,
     limit: Option<u16>,
     cursor: Option<&str>,
 ) -> Result<ImageControlReadResponseV1, ErrorPayload> {
@@ -195,9 +216,8 @@ pub(crate) fn target_list(
             )
         })
         .collect();
-    Ok(ImageControlReadResponseV1::new(
-        daemon_instance_id,
-        project_id,
+    Ok(response(
+        authority,
         ImageControlReadResultV1::TargetPage {
             items,
             next_cursor,
@@ -209,8 +229,7 @@ pub(crate) fn target_list(
 pub(crate) fn target_get(
     cfg: &ImageGenerationConfig,
     generation: &str,
-    daemon_instance_id: String,
-    project_id: String,
+    authority: &ImageControlReadAuthority,
     target_id: &str,
 ) -> Result<ImageControlReadResponseV1, ErrorPayload> {
     let target = cfg
@@ -218,9 +237,8 @@ pub(crate) fn target_get(
         .iter()
         .find(|t| t.id == target_id)
         .ok_or_else(|| bad_request("image target not found"))?;
-    Ok(ImageControlReadResponseV1::new(
-        daemon_instance_id,
-        project_id,
+    Ok(response(
+        authority,
         ImageControlReadResultV1::TargetEntity {
             item: ImageTargetSafeV1::project(
                 target,
@@ -234,8 +252,7 @@ pub(crate) fn target_get(
 pub(crate) fn workflow_list(
     cfg: &ImageGenerationConfig,
     generation: &str,
-    daemon_instance_id: String,
-    project_id: String,
+    authority: &ImageControlReadAuthority,
     limit: Option<u16>,
     cursor: Option<&str>,
 ) -> Result<ImageControlReadResponseV1, ErrorPayload> {
@@ -254,9 +271,8 @@ pub(crate) fn workflow_list(
             )
         })
         .collect();
-    Ok(ImageControlReadResponseV1::new(
-        daemon_instance_id,
-        project_id,
+    Ok(response(
+        authority,
         ImageControlReadResultV1::WorkflowPage {
             items,
             next_cursor,
@@ -268,8 +284,7 @@ pub(crate) fn workflow_list(
 pub(crate) fn workflow_get(
     cfg: &ImageGenerationConfig,
     generation: &str,
-    daemon_instance_id: String,
-    project_id: String,
+    authority: &ImageControlReadAuthority,
     workflow_id: &str,
 ) -> Result<ImageControlReadResponseV1, ErrorPayload> {
     let workflow = cfg
@@ -278,9 +293,8 @@ pub(crate) fn workflow_get(
         .find(|w| w.id == workflow_id)
         .ok_or_else(|| bad_request("image workflow not found"))?;
     let refs = referencing_target_ids(cfg, workflow_id);
-    Ok(ImageControlReadResponseV1::new(
-        daemon_instance_id,
-        project_id,
+    Ok(response(
+        authority,
         ImageControlReadResultV1::WorkflowEntity {
             item: ImageWorkflowSafeV1::project(workflow, refs, generation.to_string()),
         },

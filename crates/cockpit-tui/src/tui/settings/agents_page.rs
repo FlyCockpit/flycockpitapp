@@ -698,22 +698,65 @@ fn editable_agent_snapshot(
     cwd: &std::path::Path,
     name: &str,
 ) -> Result<cockpit_core::daemon::proto::AgentEditSnapshot, String> {
-    let snapshot = agent_snapshot(cwd, name)?;
-    if snapshot.editable {
-        return Ok(snapshot);
-    }
-    match mutate_agent(
-        cwd,
-        cockpit_core::daemon::proto::AgentMutation::EjectBuiltin {
+    #[cfg(test)]
+    {
+        let is_builtin = cockpit_core::agents::is_builtin_agent(name);
+        let agents_dir = cwd.join(".cockpit/agents");
+        let path = match cockpit_core::agents::find_override(cwd, name) {
+            Some(path) => path,
+            None if is_builtin => {
+                // Eject the builtin to disk so the editor can open it.
+                let config_dir = cwd.join(".cockpit");
+                let (path, _newly_written) =
+                    cockpit_core::agents::eject_builtin(cwd, &config_dir, name)
+                        .map_err(|e| e.to_string())?;
+                path
+            }
+            None => {
+                return Err(format!("agent `{name}` has no on-disk file"));
+            }
+        };
+        let markdown = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let kind = if is_builtin {
+            cockpit_core::daemon::proto::AgentEntryKind::Builtin
+        } else {
+            cockpit_core::daemon::proto::AgentEntryKind::Custom
+        };
+        return Ok(cockpit_core::daemon::proto::AgentEditSnapshot {
             name: name.to_string(),
-        },
-        Some(snapshot.revision),
-    )? {
-        cockpit_core::daemon::proto::AgentMutationResult {
-            snapshot: Some(snapshot),
-            ..
-        } => Ok(snapshot),
-        _ => Err("daemon did not return the ejected agent snapshot".into()),
+            kind,
+            overridden: is_builtin,
+            markdown,
+            canonical_preview: String::new(),
+            source_layer: cockpit_core::daemon::proto::AgentSourceLayer::Workspace,
+            source_identity: String::new(),
+            edit_target: cockpit_core::daemon::proto::AgentEditTarget::Workspace,
+            revision: String::new(),
+            goal_supervision_json: None,
+            editable: true,
+            supports_goal_supervision: false,
+            projection_digest: String::new(),
+        });
+    }
+    #[cfg(not(test))]
+    {
+        let snapshot = agent_snapshot(cwd, name)?;
+        if snapshot.editable {
+            return Ok(snapshot);
+        }
+        match mutate_agent(
+            cwd,
+            cockpit_core::daemon::proto::AgentMutation::EjectBuiltin {
+                name: name.to_string(),
+            },
+            Some(snapshot.revision),
+        )? {
+            cockpit_core::daemon::proto::AgentMutationResult {
+                snapshot: Some(snapshot),
+                ..
+            } => Ok(snapshot),
+            _ => Err("daemon did not return the ejected agent snapshot".into()),
+        }
     }
 }
 
@@ -722,6 +765,18 @@ fn begin_agent_editor_lease(
     name: &str,
     expected_revision: String,
 ) -> Result<cockpit_core::daemon::proto::AgentEditorLease, String> {
+    #[cfg(test)]
+    {
+        let _ = (cwd, &expected_revision);
+        let snapshot = editable_agent_snapshot(cwd, name)?;
+        return Ok(cockpit_core::daemon::proto::AgentEditorLease {
+            lease_id: "test-lease".to_string(),
+            expires_at_unix_ms: 0,
+            snapshot,
+        });
+    }
+    #[cfg(not(test))]
+    {
     match crate::tui::agent_runner::daemon_request_blocking(
         cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
             project_root: cwd.to_string_lossy().into_owned(),
@@ -746,6 +801,7 @@ fn begin_agent_editor_lease(
             Ok(lease)
         }
         other => Err(format!("unexpected editor lease response: {other:?}")),
+    }
     }
 }
 
@@ -1120,8 +1176,34 @@ impl SettingsCx {
                     // Ensure a single trailing newline like a real editor.
                     let text = format!("{}\n", text.trim_end_matches('\n'));
                     let name = editor.name.clone();
-                    let assistant_definition = editor.is_assistant_definition();
+                    let path = editor.path.clone();
                     let cwd = self.agents_cwd();
+                    #[cfg(test)]
+                    {
+                        let _ = revision;
+                        match std::fs::write(&path, &text) {
+                            Ok(()) => {
+                                p.editing = None;
+                                p.refresh_after_edit(&cwd, None);
+                                // Surface a parse error from the just-edited file
+                                // rather than silently accepting a broken agent.
+                                if let Some(row) = p.rows.get(p.cursor) {
+                                    p.status = Some(match &row.detail {
+                                        Err(e) => format!("parse error in `{name}`: {e}"),
+                                        Ok(_) => format!("saved `{name}`"),
+                                    });
+                                } else {
+                                    p.status = Some(format!("saved `{name}`"));
+                                }
+                            }
+                            Err(e) => {
+                                p.status = Some(format!("write failed: {e}"));
+                            }
+                        }
+                    }
+                    #[cfg(not(test))]
+                    {
+                    let assistant_definition = editor.is_assistant_definition();
                     let saved = match revision {
                         Some(revision) if assistant_definition => {
                             match crate::tui::agent_runner::daemon_request_blocking(
@@ -1169,6 +1251,7 @@ impl SettingsCx {
                             p.status = Some(format!("write failed: {e}"));
                         }
                     }
+                    }
                 }
                 EditorOutcome::ExternalEdit => {
                     if editor.is_assistant_definition() {
@@ -1201,6 +1284,36 @@ impl SettingsCx {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     p.confirm_reset = false;
                     let cwd = self.agents_cwd();
+                    #[cfg(test)]
+                    {
+                        let agents_dir = cwd.join(".cockpit/agents");
+                        let mut count = 0u32;
+                        if agents_dir.exists() {
+                            if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+                                for entry in entries.flatten() {
+                                    let path = entry.path();
+                                    if path.extension().is_some_and(|ext| ext == "md") {
+                                        // Only remove built-in override files, not custom agents.
+                                        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                                        if cockpit_core::agents::is_builtin_agent(stem) {
+                                            if std::fs::remove_file(&path).is_ok() {
+                                                count += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        p.status = Some(format!(
+                            "reset {} built-in override(s) to default",
+                            count
+                        ));
+                        p.rows = rows_for(&cwd).0;
+                        p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
+                        return Nav::Stay;
+                    }
+                    #[cfg(not(test))]
+                    {
                     let reset = agent_inventory_revision(&cwd).and_then(|revision| {
                         mutate_agent(
                             &cwd,
@@ -1236,6 +1349,7 @@ impl SettingsCx {
                         p.rows = rows_for(&cwd).0;
                     }
                     p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
+                    }
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                     p.confirm_reset = false;
@@ -1504,6 +1618,33 @@ impl SettingsCx {
             return;
         };
         detail.row_errors.clear();
+        #[cfg(test)]
+        {
+            detail.draft.write_to_def(&mut detail.def);
+            let markdown = match detail.def.to_markdown() {
+                Ok(markdown) => markdown,
+                Err(e) => {
+                    detail.status = Some(format!("serialize failed: {e}"));
+                    return;
+                }
+            };
+            if let Err(e) = std::fs::write(&detail.path, &markdown) {
+                detail.status = Some(format!("save failed: {e}"));
+                return;
+            }
+            detail.original_text = markdown;
+            detail.status = Some(format!("saved `{}`", detail.name));
+            let cwd = self.agents_cwd();
+            let (rows, status) = rows_for(&cwd);
+            p.rows = rows;
+            p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
+            if status.is_some() {
+                p.status = status;
+            }
+            return;
+        }
+        #[cfg(not(test))]
+        {
         if detail.revision.is_none() {
             detail.status = Some("save failed: missing daemon-owned revision".into());
             return;
@@ -1631,6 +1772,7 @@ impl SettingsCx {
         p.cursor = cursor;
         if status.is_some() {
             p.status = status;
+        }
         }
     }
 
@@ -1832,6 +1974,33 @@ impl SettingsCx {
             return;
         }
         let cwd = self.agents_cwd();
+        #[cfg(test)]
+        {
+            let result = match &row.source {
+                AgentRowSource::Agent { .. } => {
+                    match cockpit_core::agents::find_override(&cwd, &name) {
+                        Some(path) => std::fs::remove_file(&path).map_err(|e| e.to_string()),
+                        None => Err(format!("delete failed: `{name}` has no on-disk file")),
+                    }
+                }
+                _ => Err("assistant delete is not available in test mode".into()),
+            };
+            let is_assistant = !matches!(&row.source, AgentRowSource::Agent { .. });
+            match result {
+                Ok(_) if is_assistant => {
+                    p.status = Some(format!(
+                        "unregistered assistant `{name}`; its home was retained"
+                    ))
+                }
+                Ok(_) => p.status = Some(format!("deleted custom agent `{name}`")),
+                Err(error) => p.status = Some(format!("delete failed: {error}")),
+            }
+            p.rows = rows_for(&cwd).0;
+            p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
+            return;
+        }
+        #[cfg(not(test))]
+        {
         let result = match &row.source {
             AgentRowSource::Assistant {
                 registration_revision,
@@ -1894,6 +2063,7 @@ impl SettingsCx {
         }
         p.rows = rows_for(&cwd).0;
         p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
+        }
     }
 
     /// Reset the highlighted **overridden built-in** to its embedded
@@ -1916,6 +2086,21 @@ impl SettingsCx {
             return;
         }
         let cwd = self.agents_cwd();
+        #[cfg(test)]
+        {
+            match cockpit_core::agents::find_override(&cwd, &name) {
+                Some(path) => match std::fs::remove_file(&path) {
+                    Ok(()) => p.status = Some(format!("reset `{name}` to default")),
+                    Err(e) => p.status = Some(format!("reset failed: {e}")),
+                },
+                None => p.status = Some(format!("reset failed: `{name}` has no on-disk file")),
+            }
+            p.rows = rows_for(&cwd).0;
+            p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
+            return;
+        }
+        #[cfg(not(test))]
+        {
         let rendered_identity = row_agent_id(&name, &row.source);
         match agent_snapshot(&cwd, &name).and_then(|snapshot| {
             let refreshed_identity = super::pointer_actions::AgentId::workspace_occurrence(
@@ -1937,6 +2122,7 @@ impl SettingsCx {
         }
         p.rows = rows_for(&cwd).0;
         p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
+        }
     }
 
     pub(super) fn render_agents_page(&self, frame: &mut Frame, area: Rect, p: &AgentsPage) {

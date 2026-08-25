@@ -18,6 +18,7 @@ impl App {
             || !self.pending_usage.is_empty()
             || !self.settings_blocking_actions.is_empty()
             || self.async_actions.has_unsettled_local_authority()
+            || !self.image_ingress_draft_discards.is_empty()
     }
 
     /// Return true only when shutdown may surrender all local authority.

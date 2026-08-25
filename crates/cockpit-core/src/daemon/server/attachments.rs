@@ -340,6 +340,85 @@ pub(super) async fn admit_image_ingress(
     ))
 }
 
+pub(super) async fn discard_image_ingress_draft(
+    ctx: &DaemonContext,
+    state: &mut MutableClientState,
+    session_id: Uuid,
+    admission_id: Uuid,
+    local_operation_id: Uuid,
+) -> std::result::Result<Response, ErrorPayload> {
+    use cockpit_db::media_attachments::LocalMediaActorRoleV1;
+    use sha2::{Digest as _, Sha256};
+
+    let unavailable = || ErrorPayload {
+        code: ErrorCode::BadRequest,
+        message: "media_attachment_unavailable".into(),
+    };
+    let row = ctx
+        .db
+        .get_session(session_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(unavailable)?;
+    let actor_role = match session_access_for_row(&state.principal, &row) {
+        SessionAccess::Owner => LocalMediaActorRoleV1::Owner,
+        SessionAccess::Writer => LocalMediaActorRoleV1::Writer,
+        _ => return Err(unavailable()),
+    };
+    let project = row.project_root.as_str();
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(project.as_bytes()));
+    let principal_digest = super::run_invocation::principal_digest(&state.principal);
+    let storage = ctx
+        .media_storage_recovery
+        .as_ref()
+        .ok_or_else(|| internal("media storage authority is unavailable"))?;
+    if let Some(receipt) = storage
+        .image_ingress_draft_discard_receipt(
+            admission_id,
+            session_id,
+            local_operation_id,
+            principal_digest.clone(),
+            project_digest.clone(),
+        )
+        .await
+        .map_err(internal)?
+    {
+        return Ok(Response::LocalMediaMutation(receipt));
+    }
+    let mutation = storage
+        .image_ingress_draft_discard_mutation(
+            admission_id,
+            session_id,
+            local_operation_id,
+            principal_digest,
+            actor_role,
+            project_digest,
+        )
+        .await
+        .map_err(|error| {
+            let text = error.to_string();
+            if text.contains("already referenced") {
+                ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "image ingress draft is already referenced".into(),
+                }
+            } else {
+                unavailable()
+            }
+        })?;
+    let receipt = storage
+        .discard_media_attachment(mutation, chrono::Utc::now().timestamp_millis())
+        .await
+        .map_err(internal)?;
+    if receipt.outcome == cockpit_db::media_attachments::LocalMediaMutationOutcomeV1::Applied {
+        storage
+            .reconcile_media_cleanup_intents(chrono::Utc::now().timestamp_millis())
+            .await
+            .map_err(internal)?;
+    }
+    Ok(Response::LocalMediaMutation(receipt))
+}
+
 struct AbandonIngressOnDrop {
     ledger: crate::media_reservation::MediaReservationLedger,
     reservation_id: Option<String>,

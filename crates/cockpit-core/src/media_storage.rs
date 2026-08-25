@@ -210,6 +210,42 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn image_ingress_draft_discard_receipt(
+        &self,
+        admission_id: Uuid,
+        session_id: Uuid,
+        local_operation_id: Uuid,
+        actor_principal_digest: String,
+        canonical_project_digest: String,
+    ) -> Result<Option<cockpit_db::media_attachments::LocalMediaMutationReceiptV1>> {
+        self.db
+            .read(move |conn| {
+                let stored = conn
+                    .query_row(
+                        "SELECT o.receipt_json FROM local_media_operations o JOIN media_ingress_admission_receipts r ON r.attachment_id=json_extract(o.receipt_json,'$.subjectId') JOIN media_attachments a ON a.attachment_id=r.attachment_id WHERE o.local_operation_id=?1 AND o.action='discard' AND r.admission_id=?2 AND r.session_id=?3 AND a.session_id=?3 AND a.canonical_project_digest=?4",
+                        params![
+                            local_operation_id.to_string(),
+                            admission_id.to_string(),
+                            session_id.to_string(),
+                            canonical_project_digest,
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let Some(json) = stored else { return Ok(None) };
+                let receipt: cockpit_db::media_attachments::LocalMediaMutationReceiptV1 =
+                    serde_json::from_str(&json)?;
+                ensure!(
+                    receipt.local_operation_id == local_operation_id
+                        && receipt.actor_principal_digest == actor_principal_digest
+                        && receipt.action == "discard",
+                    "image ingress discard replay conflict"
+                );
+                Ok(Some(receipt))
+            })
+            .await
+    }
+
     async fn discard_ingress_publication(
         &self,
         admission_id: Uuid,
@@ -292,6 +328,60 @@ impl MediaStorageRecovery {
             })
             .transpose()
         }).await
+    }
+
+    /// Resolve the exact current CAS identity for an ingress-created draft.
+    /// This is intentionally daemon-only: clients retain the admission
+    /// capability, never mutable attachment generations or project authority.
+    pub(crate) async fn image_ingress_draft_discard_mutation(
+        &self,
+        admission_id: Uuid,
+        session_id: Uuid,
+        local_operation_id: Uuid,
+        actor_principal_digest: String,
+        actor_role: cockpit_db::media_attachments::LocalMediaActorRoleV1,
+        canonical_project_digest: String,
+    ) -> Result<cockpit_db::media_attachments::LocalMediaMutationV1> {
+        self.db
+            .read(move |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT r.attachment_id,a.attachment_version,a.availability_generation,a.reference_generation FROM media_ingress_admission_receipts r JOIN media_attachments a ON a.attachment_id=r.attachment_id WHERE r.admission_id=?1 AND r.session_id=?2 AND a.session_id=?2 AND a.canonical_project_digest=?3",
+                        params![
+                            admission_id.to_string(),
+                            session_id.to_string(),
+                            canonical_project_digest,
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+                    .context("media_attachment_unavailable")?;
+                Ok(cockpit_db::media_attachments::LocalMediaMutationV1 {
+                    schema_version: 1,
+                    kind: "localMediaMutation".into(),
+                    local_operation_id,
+                    actor_principal_digest,
+                    actor_role,
+                    payload: cockpit_db::media_attachments::LocalMediaMutationPayloadV1::Discard {
+                        session_id,
+                        canonical_project_digest,
+                        attachment_id: Uuid::parse_str(&row.0)?,
+                        attachment_version: row.1.parse()?,
+                        availability_generation: row.2.parse()?,
+                        reference_generation: row.3.parse()?,
+                        origin_admission_id: Some(admission_id),
+                        origin_upload: None,
+                    },
+                })
+            })
+            .await
     }
 
     async fn finish_retained_https_orphan(
@@ -853,6 +943,7 @@ impl MediaStorageRecovery {
             attachment_version,
             availability_generation,
             reference_generation,
+            origin_admission_id,
             origin_upload,
         } = &mutation.payload
         else {
@@ -865,10 +956,11 @@ impl MediaStorageRecovery {
             attachment_version: *attachment_version,
             availability_generation: *availability_generation,
             reference_generation: *reference_generation,
+            origin_admission_id: *origin_admission_id,
             origin_upload: origin_upload.clone(),
         };
         let domain = format!(
-            "discard:{session_id}:{canonical_project_digest}:{attachment_id}:{attachment_version}:{availability_generation}:{reference_generation}"
+            "discard:{session_id}:{canonical_project_digest}:{attachment_id}:{attachment_version}:{availability_generation}:{reference_generation}:{origin_admission_id:?}"
         );
         let (request_digest, semantic_digest) =
             cockpit_db::Db::local_media_mutation_digests(&mutation)?;
@@ -8101,6 +8193,7 @@ mod tests {
                 attachment_version: 1,
                 availability_generation: 1,
                 reference_generation: 1,
+                origin_admission_id: None,
                 origin_upload: None,
             },
         };
@@ -8151,6 +8244,7 @@ mod tests {
                 attachment_version: 1,
                 availability_generation: 1,
                 reference_generation: 1,
+                origin_admission_id: None,
                 origin_upload: None,
             },
         };

@@ -800,6 +800,7 @@ fn paste_fence_session_switch_ordering_bounds_unconfirmed_and_recovers_after_lin
         },
         assembled_wire_digest: digest,
         slots: Vec::new(),
+        retained_drafts: Vec::new(),
         lifecycle,
     };
     app.submission_fences.insert(

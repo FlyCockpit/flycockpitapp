@@ -555,6 +555,7 @@ impl App {
     }
 
     pub(super) fn drain_async_actions(&mut self) -> bool {
+        self.start_pending_image_ingress_discards();
         self.start_pending_goal_settings_effect();
         self.start_pending_tools_effect();
         self.start_pending_settings_daemon_effects();
@@ -633,6 +634,81 @@ impl App {
             self.clear_changed_provider_auth_failures();
         }
         changed
+    }
+
+    fn start_pending_image_ingress_discards(&mut self) {
+        let mut retained = self
+            .paste_registry
+            .image_ingress_drafts()
+            .into_iter()
+            .map(|draft| draft.admission_id)
+            .collect::<std::collections::HashSet<_>>();
+        for fence in self.submission_fences.values() {
+            let possibly_sent =
+                fence.lifecycle == crate::tui::structured_paste::FenceLifecycle::PossiblySent;
+            if possibly_sent {
+                for draft in &fence.retained_drafts {
+                    self.image_ingress_draft_discards
+                        .remove(&draft.admission_id);
+                }
+            } else {
+                retained.extend(fence.retained_drafts.iter().map(|draft| draft.admission_id));
+            }
+            for slot in &fence.slots {
+                if let crate::tui::structured_paste::PasteSlotState::Ready {
+                    image:
+                        Some(crate::tui::structured_paste::PasteImageAdmission::Handle {
+                            draft, ..
+                        }),
+                    ..
+                } = slot
+                {
+                    if possibly_sent {
+                        self.image_ingress_draft_discards
+                            .remove(&draft.admission_id);
+                    } else {
+                        retained.insert(draft.admission_id);
+                    }
+                }
+            }
+        }
+        let pending = self
+            .image_ingress_draft_discards
+            .iter_mut()
+            .filter_map(|(_, (draft, in_flight))| {
+                (!*in_flight && !retained.contains(&draft.admission_id)).then(|| {
+                    *in_flight = true;
+                    draft.clone()
+                })
+            })
+            .collect::<Vec<_>>();
+        for draft in pending {
+            let request = cockpit_core::daemon::proto::Request::DiscardImageIngressDraft {
+                session_id: draft.session_id,
+                admission_id: draft.admission_id,
+                local_operation_id: draft.local_operation_id,
+            };
+            self.async_actions.start(
+                AsyncActionKind::DaemonRpc("paste.image_ingress_discard"),
+                AsyncActionPolicy::AllowConcurrent,
+                async move {
+                    let response = async {
+                        let client = crate::tui::settings::settings_daemon_client()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        client
+                            .request(request)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .map_err(|error| error.to_string())
+                    }
+                    .await;
+                    Ok(AsyncActionPayload::ImageIngressDraftDiscard(
+                        super::ImageIngressDraftDiscardCompletion { draft, response },
+                    ))
+                },
+            );
+        }
     }
 
     fn start_pending_goal_settings_effect(&mut self) {
@@ -936,6 +1012,32 @@ impl App {
                     self.apply_mcp_local_completion(result.id, completion);
                 } else {
                     self.apply_mcp_local_cancellation(result.id);
+                }
+            }
+            AsyncActionKind::DaemonRpc("paste.image_ingress_discard") => {
+                if let Ok(AsyncActionPayload::ImageIngressDraftDiscard(completion)) = result.payload
+                {
+                    let terminal = matches!(
+                        &completion.response,
+                        Ok(cockpit_core::daemon::proto::Response::LocalMediaMutation(receipt))
+                            if receipt.schema_version == 1
+                                && receipt.kind == "localMediaMutationReceipt"
+                                && receipt.local_operation_id
+                                    == completion.draft.local_operation_id
+                                && receipt.action == "discard"
+                                && receipt.subject_id == completion.draft.attachment_id
+                                && receipt.discard_result.is_some()
+                    );
+                    if terminal {
+                        self.image_ingress_draft_discards
+                            .remove(&completion.draft.admission_id);
+                    } else if let Some((owned, in_flight)) = self
+                        .image_ingress_draft_discards
+                        .get_mut(&completion.draft.admission_id)
+                        && *owned == completion.draft
+                    {
+                        *in_flight = false;
+                    }
                 }
             }
             AsyncActionKind::DaemonRpc("btw.resolve-interrupt") => match result.payload {
@@ -2220,6 +2322,17 @@ impl App {
         admission: Option<crate::tui::async_action::DaemonImagePathAdmission>,
         report_unavailable: bool,
     ) {
+        if let Some(admission) = admission.as_ref() {
+            let draft = crate::tui::paste::ImageIngressDraftAuthority {
+                session_id: admission.session_id,
+                admission_id: admission.admission_id,
+                attachment_id: admission.image_ref.id,
+                local_operation_id: admission.discard_operation_id,
+            };
+            self.image_ingress_draft_discards
+                .entry(draft.admission_id)
+                .or_insert((draft, false));
+        }
         let Some(probe) = self.pending_paste_probes.remove(&request_id) else {
             return;
         };
@@ -2256,6 +2369,12 @@ impl App {
                     "[image]".to_string(),
                     String::new(),
                     Some(crate::tui::structured_paste::PasteImageAdmission::Handle {
+                        draft: crate::tui::paste::ImageIngressDraftAuthority {
+                            session_id: admission.session_id,
+                            admission_id: admission.admission_id,
+                            attachment_id: admission.image_ref.id,
+                            local_operation_id: admission.discard_operation_id,
+                        },
                         image_ref: admission.image_ref,
                         normalized_byte_length: admission.normalized_byte_length,
                         sha256: admission.sha256,

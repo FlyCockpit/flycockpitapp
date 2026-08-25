@@ -1118,6 +1118,7 @@ async fn new_session_swap_old_epoch_bookkeeping_settles_fence_without_presentati
             },
             assembled_wire_digest: Some([1; 32]),
             slots: Vec::new(),
+            retained_drafts: Vec::new(),
             lifecycle: crate::tui::structured_paste::FenceLifecycle::PossiblySent,
         },
     );
@@ -1454,6 +1455,7 @@ async fn new_session_swap_waits_for_possibly_sent_fence_before_clear() {
             },
             assembled_wire_digest: Some([1; 32]),
             slots: Vec::new(),
+            retained_drafts: Vec::new(),
             lifecycle: FenceLifecycle::PossiblySent,
         },
     );
@@ -1527,6 +1529,7 @@ async fn new_session_swap_suppresses_outgoing_delivery_receipt_while_provisional
             },
             assembled_wire_digest: Some([9; 32]),
             slots: Vec::new(),
+            retained_drafts: Vec::new(),
             lifecycle: crate::tui::structured_paste::FenceLifecycle::Reconciling,
         },
     );
@@ -1694,6 +1697,7 @@ async fn new_session_swap_failed_barrier_does_not_mark_fence_possibly_sent() {
             },
             assembled_wire_digest: None,
             slots: Vec::new(),
+            retained_drafts: Vec::new(),
             lifecycle: FenceLifecycle::Ready,
         },
     );

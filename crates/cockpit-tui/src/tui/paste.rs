@@ -77,6 +77,7 @@ pub enum PasteKind {
     /// Daemon-retained image. The UI keeps only the opaque attachment ref and
     /// bounded display/accounting metadata; image bytes never return to it.
     ImageHandle {
+        draft: ImageIngressDraftAuthority,
         image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
         normalized_byte_length: u64,
         sha256: String,
@@ -85,10 +86,21 @@ pub enum PasteKind {
     },
 }
 
+/// Opaque, idempotent authority needed to dispose an admitted image draft.
+/// The daemon derives all mutable generations and principal/project identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ImageIngressDraftAuthority {
+    pub session_id: uuid::Uuid,
+    pub admission_id: uuid::Uuid,
+    pub attachment_id: uuid::Uuid,
+    pub local_operation_id: uuid::Uuid,
+}
+
 #[derive(Debug, Clone)]
 pub enum RetainedImage {
     Bytes(Vec<u8>),
     Handle {
+        draft: ImageIngressDraftAuthority,
         image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
         normalized_byte_length: u64,
         sha256: String,
@@ -317,6 +329,7 @@ impl PasteRegistry {
     pub fn register_image_handle(
         &mut self,
         at: usize,
+        draft: ImageIngressDraftAuthority,
         image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
         normalized_byte_length: u64,
         sha256: String,
@@ -332,6 +345,7 @@ impl PasteRegistry {
             end,
             number,
             kind: PasteKind::ImageHandle {
+                draft,
                 image_ref,
                 normalized_byte_length,
                 sha256,
@@ -729,6 +743,7 @@ impl PasteRegistry {
                         .or_insert_with(|| RetainedImage::Bytes(png.clone()));
                 }
                 PasteKind::ImageHandle {
+                    draft,
                     image_ref,
                     normalized_byte_length,
                     sha256,
@@ -737,6 +752,7 @@ impl PasteRegistry {
                     images
                         .entry(block.number)
                         .or_insert_with(|| RetainedImage::Handle {
+                            draft: draft.clone(),
                             image_ref: image_ref.clone(),
                             normalized_byte_length: *normalized_byte_length,
                             sha256: sha256.clone(),
@@ -746,6 +762,21 @@ impl PasteRegistry {
             }
         }
         images
+    }
+
+    /// Exact ingress drafts still represented by at least one composer block.
+    /// Duplicate/reference placeholders collapse to their admission identity.
+    pub fn image_ingress_drafts(&self) -> Vec<ImageIngressDraftAuthority> {
+        let mut seen = std::collections::HashSet::new();
+        self.blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                PasteKind::ImageHandle { draft, .. } if seen.insert(draft.admission_id) => {
+                    Some(draft.clone())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Parse editor-returned text into a normal composer buffer plus a fresh
@@ -813,11 +844,13 @@ impl PasteRegistry {
                 let placeholder = match image {
                     RetainedImage::Bytes(png) => registry.register_image(buffer.len(), png.clone()),
                     RetainedImage::Handle {
+                        draft,
                         image_ref,
                         normalized_byte_length,
                         sha256,
                     } => registry.register_image_handle(
                         buffer.len(),
+                        draft.clone(),
                         image_ref.clone(),
                         *normalized_byte_length,
                         sha256.clone(),

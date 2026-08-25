@@ -4353,6 +4353,15 @@
       "fcorRoles": [],
       "fcorSchema": "-",
       "strategy": "none",
+      "tag": "discard_image_ingress_draft"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
       "tag": "retain_https_media"
     },
     {

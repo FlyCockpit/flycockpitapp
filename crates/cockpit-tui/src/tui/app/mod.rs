@@ -830,6 +830,12 @@ pub(crate) struct WorkspaceTrustCompletion {
     pub(crate) result: Result<u64, String>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ImageIngressDraftDiscardCompletion {
+    pub(crate) draft: crate::tui::paste::ImageIngressDraftAuthority,
+    pub(crate) response: Result<cockpit_core::daemon::proto::Response, String>,
+}
+
 async fn set_workspace_trust_async(
     project_root: &str,
     mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
@@ -2350,6 +2356,13 @@ pub struct App {
     /// inline text + emit real image parts (vision) or text notes
     /// (non-vision). Cleared on submit and `/new`.
     pub(super) paste_registry: crate::tui::paste::PasteRegistry,
+    /// Admitted image drafts still owned by this frontend. Entries survive
+    /// composer/view removal until the daemon returns a terminal discard
+    /// receipt, or are explicitly transferred to a possibly-sent message.
+    pub(super) image_ingress_draft_discards: std::collections::HashMap<
+        uuid::Uuid,
+        (crate::tui::paste::ImageIngressDraftAuthority, bool),
+    >,
     pub(super) terminal_paste_classifier: crate::tui::structured_paste::TerminalPasteClassifier,
     pub(super) terminal_input_generation: Option<u64>,
     pub(super) submission_order: crate::tui::structured_paste::SubmissionOrderCoordinator,
@@ -3732,6 +3745,7 @@ impl App {
             at_suggestions_error: None,
             accepted_tags: Vec::new(),
             paste_registry: crate::tui::paste::PasteRegistry::new(),
+            image_ingress_draft_discards: Default::default(),
             terminal_paste_classifier:
                 crate::tui::structured_paste::TerminalPasteClassifier::default(),
             terminal_input_generation: None,

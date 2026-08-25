@@ -98,6 +98,11 @@ pub enum LocalMediaMutationPayloadV1 {
         attachment_version: u64,
         availability_generation: u64,
         reference_generation: u64,
+        /// Exact daemon image-ingress admission that created this draft.
+        /// Present only for draft disposal; it prevents a generic attachment
+        /// identity from being reused as authority over another admission.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        origin_admission_id: Option<Uuid>,
         #[serde(skip_serializing_if = "Option::is_none")]
         origin_upload: Option<MediaOriginUploadV1>,
     },
@@ -145,6 +150,8 @@ pub struct DiscardUnreferencedMediaAttachmentV1 {
     pub attachment_version: u64,
     pub availability_generation: u64,
     pub reference_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_admission_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_upload: Option<MediaOriginUploadV1>,
 }
@@ -1644,6 +1651,7 @@ impl super::Db {
                 attachment_version,
                 availability_generation,
                 reference_generation,
+                origin_admission_id,
                 origin_upload,
             } => {
                 ensure!(
@@ -1661,6 +1669,12 @@ impl super::Db {
                         "invalid upload origin"
                     )
                 };
+                if let Some(admission_id) = origin_admission_id {
+                    ensure!(
+                        is_strict_uuid_v7(*admission_id),
+                        "invalid image-ingress admission origin"
+                    );
+                }
                 (*session_id, canonical_project_digest)
             }
         };
@@ -2235,12 +2249,29 @@ impl super::Db {
         );
         let record = media_attachment_by_id(conn, request.attachment_id)?
             .context("media_attachment_unavailable")?;
+        if let Some(admission_id) = request.origin_admission_id {
+            let admitted_attachment: Option<String> = conn
+                .query_row(
+                    "SELECT attachment_id FROM media_ingress_admission_receipts WHERE admission_id=?1",
+                    [admission_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            ensure!(
+                admitted_attachment.as_deref() == Some(&request.attachment_id.to_string()),
+                "discard admission conflict"
+            );
+        }
         let expected_origin=conn.query_row("SELECT client_draft_id,upload_id,upload_generation FROM media_attachment_upload_origins WHERE attachment_id=?1",[request.attachment_id.to_string()],|row|Ok(MediaOriginUploadV1{client_draft_id:Uuid::parse_str(&row.get::<_,String>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_id:Uuid::parse_str(&row.get::<_,String>(1)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_generation:row.get::<_,String>(2)?.parse().map_err(|_|rusqlite::Error::InvalidQuery)?})).optional()?;
         ensure!(
             request.origin_upload == expected_origin,
             "discard origin conflict"
         );
-        let reason = if request.attachment_version != record.attachment_version {
+        let reason = if request.origin_admission_id.is_some()
+            && record.first_referenced_at_unix_ms.is_some()
+        {
+            Some(MediaDiscardReasonV1::MediaAttachmentInUse)
+        } else if request.attachment_version != record.attachment_version {
             Some(MediaDiscardReasonV1::StaleAttachmentVersion)
         } else if request.availability_generation != record.availability_generation {
             Some(MediaDiscardReasonV1::StaleAvailabilityGeneration)
@@ -3422,6 +3453,7 @@ mod tests {
             attachment_version: 1,
             availability_generation: availability,
             reference_generation: reference,
+            origin_admission_id: None,
             origin_upload: None,
         };
         let decisions = db
@@ -3473,6 +3505,7 @@ mod tests {
                         attachment_version: 1,
                         availability_generation: 5,
                         reference_generation: 3,
+                        origin_admission_id: None,
                         origin_upload: None,
                     },
                     5,

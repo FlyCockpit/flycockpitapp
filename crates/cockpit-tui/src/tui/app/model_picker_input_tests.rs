@@ -266,6 +266,7 @@ fn install_pending_model_submission(
             },
             assembled_wire_digest: None,
             slots: Vec::new(),
+            retained_drafts: Vec::new(),
             lifecycle: crate::tui::structured_paste::FenceLifecycle::Ready,
         },
     );

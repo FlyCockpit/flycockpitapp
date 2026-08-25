@@ -65,6 +65,8 @@ async fn admit_image_ingress_via_daemon(
     }
     Ok(crate::tui::async_action::DaemonImagePathAdmission {
         admission_id,
+        session_id,
+        discard_operation_id: uuid::Uuid::now_v7(),
         image_ref: admission.image_ref,
         normalized_byte_length: admission.normalized_byte_length,
         sha256: admission.normalized_sha256,
@@ -2675,6 +2677,7 @@ impl App {
             self.show_toast(message, super::ToastKind::Error);
             return false;
         }
+        let retained_drafts = self.paste_registry.image_ingress_drafts();
 
         let captured_model = self.active_model_selection.clone().unwrap_or_else(|| {
             cockpit_config::providers::ActiveModelRef {
@@ -2751,6 +2754,7 @@ impl App {
                 },
                 assembled_wire_digest: None,
                 slots,
+                retained_drafts,
                 lifecycle: fence_lifecycle,
             },
         );
@@ -3933,6 +3937,15 @@ impl App {
         &mut self,
         admission: crate::tui::async_action::DaemonImagePathAdmission,
     ) {
+        let draft = crate::tui::paste::ImageIngressDraftAuthority {
+            session_id: admission.session_id,
+            admission_id: admission.admission_id,
+            attachment_id: admission.image_ref.id,
+            local_operation_id: admission.discard_operation_id,
+        };
+        self.image_ingress_draft_discards
+            .entry(draft.admission_id)
+            .or_insert_with(|| (draft.clone(), false));
         let retained = self.paste_registry.image_payloads_by_number();
         let retained_bytes = retained
             .values()
@@ -3968,6 +3981,7 @@ impl App {
         self.composer.set_cursor(at);
         let placeholder = self.paste_registry.register_image_handle(
             at,
+            draft,
             admission.image_ref,
             admission.normalized_byte_length,
             admission.sha256,

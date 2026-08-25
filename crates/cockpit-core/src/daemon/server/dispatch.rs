@@ -6859,6 +6859,21 @@ async fn handle_serialized_request_impl(
             admission_id,
         } => attachments::admit_image_ingress(ctx, state, session_id, source, admission_id).await,
 
+        Request::DiscardImageIngressDraft {
+            session_id,
+            admission_id,
+            local_operation_id,
+        } => {
+            attachments::discard_image_ingress_draft(
+                ctx,
+                state,
+                session_id,
+                admission_id,
+                local_operation_id,
+            )
+            .await
+        }
+
         Request::GetAgentEditSnapshot { project_root, name } => {
             crate::daemon::agent_management::edit_snapshot(ctx, project_root, name).await
         }

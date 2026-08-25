@@ -112,6 +112,7 @@ impl AsyncActionKind {
                 | "mcp.local"
                 | "note"
                 | "paste.image_path_admission"
+                | "paste.image_ingress_discard"
                 | "rename"
                 | "resources.promote"
                 | "sealed"
@@ -411,6 +412,7 @@ pub enum AsyncActionPayload {
     SettingsDaemon(crate::tui::settings::SettingsDaemonEffectCompletion),
     SettingsBlocking(crate::tui::settings::SettingsBlockingEffectCompletion),
     McpLocal(crate::tui::app::McpLocalCompletion),
+    ImageIngressDraftDiscard(crate::tui::app::ImageIngressDraftDiscardCompletion),
     AgentRunnerAttached(Box<crate::tui::agent_runner::AgentRunner>),
     BtwRunnerAttached {
         session_id: uuid::Uuid,
@@ -422,6 +424,8 @@ pub enum AsyncActionPayload {
 #[derive(Debug)]
 pub struct DaemonImagePathAdmission {
     pub admission_id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+    pub discard_operation_id: uuid::Uuid,
     pub image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
     pub normalized_byte_length: u64,
     pub sha256: String,

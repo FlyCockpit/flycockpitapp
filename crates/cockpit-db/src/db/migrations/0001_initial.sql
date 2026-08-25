@@ -6427,6 +6427,26 @@ BEGIN
     SELECT RAISE(ABORT, 'agent editor terminal receipt is final');
 END;
 
+-- Secret-safe recovery intent for typed extended-config publication. Raw
+-- merged configuration (which may contain unknown secret-bearing keys) never
+-- enters SQLite: recovery compares only authoritative file hashes and replays
+-- the already-redacted terminal response.
+CREATE TABLE extended_config_patch_journals (
+    owner_digest          TEXT NOT NULL,
+    client_operation_id   TEXT NOT NULL,
+    request_hash          BLOB NOT NULL CHECK (length(request_hash) = 32),
+    fencing_generation    INTEGER NOT NULL CHECK (fencing_generation > 0),
+    project_root          TEXT NOT NULL,
+    target_path           TEXT NOT NULL,
+    consumed_content_hash TEXT NOT NULL CHECK (length(consumed_content_hash) = 64),
+    intended_content_hash TEXT NOT NULL CHECK (length(intended_content_hash) = 64),
+    terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
+    created_at_unix_ms    INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    CHECK (length(trim(project_root)) > 0),
+    CHECK (length(trim(target_path)) > 0)
+);
+
 -- Durable ownership claims for daemon-generated provider/MCP named secrets.
 -- Claims survive journal retirement so cleanup decisions do not depend on a
 -- pending write being present. Multiple roots may claim a shared reference;

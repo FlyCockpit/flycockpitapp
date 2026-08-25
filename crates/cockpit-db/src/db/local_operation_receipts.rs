@@ -117,6 +117,11 @@ impl Db {
                        SELECT 1 FROM mcp_config_journals journal
                        WHERE journal.owner_digest=local_operation_receipts.owner_digest
                          AND journal.client_operation_id=local_operation_receipts.client_operation_id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM extended_config_patch_journals journal
+                       WHERE journal.owner_digest=local_operation_receipts.owner_digest
+                         AND journal.client_operation_id=local_operation_receipts.client_operation_id
                    )",
                 params![outcome, now],
             )? as u64)

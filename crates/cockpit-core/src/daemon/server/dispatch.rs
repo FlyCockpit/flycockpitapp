@@ -5732,7 +5732,8 @@ async fn handle_serialized_request_impl(
             let operation = crate::daemon::fs_api::apply_extended_config_patch(
                 ctx,
                 client_operation_id.clone(),
-                local_operation_request_hash_hex(&request_hash),
+                request_hash,
+                fencing_generation,
                 project_root,
                 layer_id,
                 patch,
@@ -12435,6 +12436,9 @@ async fn finish_local_operation_error(
                      WHERE owner_digest=?1 AND client_operation_id=?2
                     UNION ALL
                     SELECT 1 FROM mcp_config_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                    UNION ALL
+                    SELECT 1 FROM extended_config_patch_journals
                      WHERE owner_digest=?1 AND client_operation_id=?2
                  )",
                 rusqlite::params![linked_owner, linked_operation],

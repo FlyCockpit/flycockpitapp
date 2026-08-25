@@ -667,7 +667,8 @@ fn unset_object_path(root: &mut serde_json::Value, path: &[String]) -> Result<()
 pub async fn apply_extended_config_patch(
     ctx: &crate::daemon::server::DaemonContext,
     client_operation_id: String,
-    request_hash: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
     project_root: String,
     layer_id: String,
     patch: cockpit_proto::ExtendedConfigPatch,
@@ -676,6 +677,8 @@ pub async fn apply_extended_config_patch(
     snapshot_session_id: String,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_settings_root(ctx, &project_root).await?;
+    let db = ctx.db.clone();
+    let runtime = tokio::runtime::Handle::current();
     let mut response = join_fs_handler(
         "apply_extended_config_patch",
         tokio::task::spawn_blocking(move || {
@@ -825,32 +828,20 @@ pub async fn apply_extended_config_patch(
             }
             let desired_hash = content_hash(&merged);
             let result_revision = settings_revision(capability.kind, &target, &desired_hash);
-            let config_generation = if desired_hash != current_hash || (materialize && !existed) {
-                // Re-open immediately before publication while the real
-                // per-target cross-process lock is held. Both identity and
-                // bytes must still describe the exact capability snapshot.
-                let (precommit, precommit_identity) = read_optional_config(&target)?;
-                if precommit_identity != capability.identity
-                    || content_hash(&precommit) != capability.raw_revision
-                {
-                    return Err(conflict(
-                        "configuration target changed immediately before commit",
-                    ));
-                }
-                cockpit_config::config::write_config_bytes_atomic(&target, &merged)
-                    .map_err(internal)?;
-                crate::daemon::server::inventory::publish_committed_config_generation()
+            let changed = desired_hash != current_hash || (materialize && !existed);
+            let config_generation = if changed {
+                crate::daemon::server::inventory::current_config_generation().saturating_add(1)
             } else {
                 crate::daemon::server::inventory::current_config_generation()
             };
-            Ok(Response::ExtendedConfigSaved {
-                client_operation_id,
-                request_hash,
+            let terminal_response = Response::ExtendedConfigSaved {
+                client_operation_id: client_operation_id.clone(),
+                request_hash: request_hash.iter().map(|byte| format!("{byte:02x}")).collect(),
                 hash: result_revision.clone(),
                 config_generation,
-                layer_id,
+                layer_id: layer_id.clone(),
                 layer: capability.kind,
-                consumed_revision: expected_revision,
+                consumed_revision: expected_revision.clone(),
                 result_revision: result_revision.clone(),
                 status: cockpit_proto::ConfigCommitStatus::Committed,
                 publication: cockpit_proto::ConfigPublicationStatus::Published,
@@ -864,7 +855,58 @@ pub async fn apply_extended_config_patch(
                         display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
                     })
                     .collect(),
-            })
+            };
+            let terminal_response_json = serde_json::to_string(&terminal_response).map_err(internal)?;
+            let journal_owner = owner.clone();
+            let journal_operation = client_operation_id.clone();
+            let journal_root = root.to_string_lossy().into_owned();
+            let journal_target = target.to_string_lossy().into_owned();
+            let journal_consumed = current_hash.clone();
+            let journal_intended = desired_hash.clone();
+            let journal_response = terminal_response_json.clone();
+            runtime.block_on(db.write(move |conn| {
+                conn.execute(
+                    "INSERT INTO extended_config_patch_journals
+                     (owner_digest,client_operation_id,request_hash,fencing_generation,
+                      project_root,target_path,consumed_content_hash,intended_content_hash,
+                      terminal_response_json,created_at_unix_ms)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    rusqlite::params![journal_owner,journal_operation,request_hash.as_slice(),fencing_generation,journal_root,journal_target,journal_consumed,journal_intended,journal_response,chrono::Utc::now().timestamp_millis()],
+                )?;
+                Ok(())
+            })).map_err(internal)?;
+            if changed {
+                // Re-open immediately before publication while the real
+                // per-target cross-process lock is held. Both identity and
+                // bytes must still describe the exact capability snapshot.
+                let (precommit, precommit_identity) = read_optional_config(&target)?;
+                if precommit_identity != capability.identity
+                    || content_hash(&precommit) != capability.raw_revision
+                {
+                    return Err(conflict(
+                        "configuration target changed immediately before commit",
+                    ));
+                }
+                cockpit_config::config::write_config_bytes_atomic(&target, &merged)
+                    .map_err(internal)?;
+                let published = crate::daemon::server::inventory::publish_committed_config_generation();
+                if published != config_generation {
+                    return Err(internal("typed settings config generation changed during serialized publication"));
+                }
+            }
+            let settle_owner = owner;
+            let settle_operation = client_operation_id;
+            runtime.block_on(db.transaction(move |conn| {
+                let updated = conn.execute(
+                    "UPDATE local_operation_receipts SET state='terminal_success',terminal_outcome_json=?5,execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                     WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4 AND state='executing'",
+                    rusqlite::params![settle_owner,settle_operation,request_hash.as_slice(),fencing_generation,terminal_response_json,chrono::Utc::now().timestamp_millis()],
+                )?;
+                if updated != 1 { anyhow::bail!("typed settings operation lost its execution fence"); }
+                conn.execute("DELETE FROM extended_config_patch_journals WHERE owner_digest=?1 AND client_operation_id=?2", rusqlite::params![settle_owner,settle_operation])?;
+                Ok(())
+            })).map_err(internal)?;
+            Ok(terminal_response)
         }),
     )
     .await?;
@@ -895,6 +937,83 @@ async fn trusted_settings_root(
         });
     }
     Ok(root)
+}
+
+/// Reconcile hash-only typed-settings publication intents before generic local
+/// operation interruption settlement. Matching intended bytes prove the exact
+/// redacted success receipt; matching consumed bytes prove publication never
+/// occurred and permit a fresh snapshot/retry. Divergence remains pending.
+pub(super) async fn recover_extended_config_patch_journals(
+    ctx: &crate::daemon::server::DaemonContext,
+) -> Result<(), ErrorPayload> {
+    type Row = (String, String, Vec<u8>, i64, String, String, String, String);
+    let rows: Vec<Row> = ctx
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT owner_digest,client_operation_id,request_hash,fencing_generation,
+                        target_path,consumed_content_hash,intended_content_hash,terminal_response_json
+                   FROM extended_config_patch_journals ORDER BY created_at_unix_ms",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(internal)?;
+    for (owner, operation, request_hash, fence, target, consumed, intended, response_json) in rows {
+        let observed = tokio::task::spawn_blocking(move || {
+            let path = std::path::PathBuf::from(target);
+            let (bytes, _) = read_optional_config(&path)?;
+            Ok::<_, ErrorPayload>(content_hash(&bytes))
+        })
+        .await
+        .map_err(|error| internal(error))??;
+        let terminal = if observed == intended {
+            Some(("terminal_success", response_json))
+        } else if observed == consumed {
+            Some((
+                "terminal_error",
+                serde_json::to_string(&ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "typed settings publication did not occur before daemon restart; reload the authoritative snapshot and retry".into(),
+                })
+                .map_err(internal)?,
+            ))
+        } else {
+            None
+        };
+        let Some((state, outcome)) = terminal else {
+            tracing::warn!(client_operation_id = %operation, "typed settings recovery observed divergent content; settlement remains unknown");
+            continue;
+        };
+        ctx.db
+            .transaction(move |conn| {
+                let updated = conn.execute(
+                    "UPDATE local_operation_receipts SET state=?5,terminal_outcome_json=?6,execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?7
+                     WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4 AND state='executing'",
+                    rusqlite::params![owner,operation,request_hash,fence,state,outcome,chrono::Utc::now().timestamp_millis()],
+                )?;
+                if updated != 1 { anyhow::bail!("typed settings recovery lost its execution fence"); }
+                conn.execute("DELETE FROM extended_config_patch_journals WHERE owner_digest=?1 AND client_operation_id=?2", rusqlite::params![owner,operation])?;
+                Ok(())
+            })
+            .await
+            .map_err(internal)?;
+    }
+    Ok(())
 }
 
 fn discovered_settings_layers(

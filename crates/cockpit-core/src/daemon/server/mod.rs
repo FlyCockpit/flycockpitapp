@@ -3700,10 +3700,14 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
             .await
             .map_err(|error| anyhow::anyhow!(error.message))
             .context("startup MCP-config journal recovery failed")?;
+        crate::daemon::fs_api::recover_extended_config_patch_journals(&ctx)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))
+            .context("startup typed-settings journal recovery failed")?;
         dispatch::recover_committed_oauth_settlements(&ctx)
             .await
             .context("reconciling committed OAuth authority operations")?;
-        // Provider/MCP journals above get the first opportunity to reconcile
+        // Provider/MCP/typed-settings journals above get the first opportunity to reconcile
         // a proven commit. Any remaining generic local receipt is ambiguous;
         // fail it closed rather than time-taking-over and repeating an
         // external side effect from the previous daemon process.

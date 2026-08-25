@@ -87,7 +87,7 @@ impl App {
         let operation_id = uuid::Uuid::new_v4();
         let worker_report_id = report_id.clone();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        tokio::task::spawn_blocking(move || {
+        let _ = tokio::task::spawn_blocking(move || {
             let result = (|| {
                 let capability = match crate::tui::agent_runner::daemon_request_at_blocking(
                     &socket,

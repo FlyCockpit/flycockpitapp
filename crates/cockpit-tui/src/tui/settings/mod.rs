@@ -570,6 +570,13 @@ pub(crate) struct SettingsBlockingEffectCompletion {
     pub(crate) outcome: Result<SettingsBlockingOutcome, String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SettingsBlockingEffectMetadata {
+    pub(crate) dialog_id: uuid::Uuid,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) target: SettingsEffectTarget,
+}
+
 /// Run a short daemon RPC from an input reducer. Production reducers execute
 /// beneath the application's multi-thread Tokio runtime. Unit reducers are
 /// intentionally synchronous, so give those tests the same daemon boundary

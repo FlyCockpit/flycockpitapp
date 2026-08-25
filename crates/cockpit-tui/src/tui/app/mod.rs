@@ -2111,6 +2111,12 @@ pub struct App {
     /// blocking filesystem/subprocess probes can complete through this tick
     /// drain instead of freezing the event loop.
     pub(super) async_actions: AsyncActionRunner,
+    /// Correlation metadata retained outside blocking workers so runner-level
+    /// timeout/cancellation can still settle the exact settings operation.
+    pub(super) settings_blocking_actions: std::collections::HashMap<
+        crate::tui::async_action::AsyncActionId,
+        crate::tui::settings::SettingsBlockingEffectMetadata,
+    >,
     // Declared after `async_actions`: Rust drops fields in declaration order,
     // so every export owner is released before the process reaper drains.
     pub(super) _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard,
@@ -3607,6 +3613,7 @@ impl App {
             pending_leak_reveal: None,
             display_attach_backoff: DisplayAttachBackoff::default(),
             async_actions: AsyncActionRunner::default(),
+            settings_blocking_actions: std::collections::HashMap::new(),
             _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard::new(),
             completed_async_actions: Vec::new(),
             skills_pane_generation: 0,

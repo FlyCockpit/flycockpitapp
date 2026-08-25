@@ -41,6 +41,15 @@ fn agent_editor_staging_is_dispatched_only_through_a_blocking_action() {
 }
 
 #[test]
+fn settings_blocking_timeout_retains_operation_metadata() {
+    let app = include_str!("../app/async_actions.rs");
+    let state = include_str!("../app/mod.rs");
+    assert!(app.contains("settings_blocking_actions.insert"));
+    assert!(app.contains("outcome: Err(error)"));
+    assert!(state.contains("SettingsBlockingEffectMetadata"));
+}
+
+#[test]
 fn queued_secret_payloads_have_redacted_debug_and_single_owners() {
     let sentinel = "provider-header-secret-sentinel";
     let payload = SecretPayload::new(sentinel.to_string());

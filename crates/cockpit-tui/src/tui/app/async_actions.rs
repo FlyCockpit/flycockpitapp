@@ -180,6 +180,17 @@ impl App {
         // buffers, order, and the cleared-view failure contract.
         let cancelled = self.async_actions.drain_cancelled();
         self.tombstone_cancelled_mouse_copies(&cancelled);
+        let settings_blocking_cancellations = cancelled
+            .iter()
+            .filter(|result| {
+                matches!(result.kind, AsyncActionKind::Blocking("settings.blocking-effect"))
+            })
+            .map(|result| AsyncActionResult {
+                id: result.id,
+                kind: result.kind.clone(),
+                payload: Err("operation cancelled".into()),
+            })
+            .collect::<Vec<_>>();
         let session_switch_cancellations = cancelled
             .into_iter()
             .filter(|result| {
@@ -194,7 +205,9 @@ impl App {
             std::time::Duration::from_secs(30),
         );
         results.extend(self.async_actions.drain_completed());
-        let changed = !results.is_empty() || !session_switch_cancellations.is_empty();
+        let changed = !results.is_empty()
+            || !session_switch_cancellations.is_empty()
+            || !settings_blocking_cancellations.is_empty();
         let oauth_completed = results.iter().any(|result| {
             matches!(
                 result.kind,
@@ -202,6 +215,9 @@ impl App {
             )
         });
         for result in session_switch_cancellations {
+            self.apply_async_action_result(result);
+        }
+        for result in settings_blocking_cancellations {
             self.apply_async_action_result(result);
         }
         for result in results {
@@ -334,7 +350,12 @@ impl App {
             let operation_id = effect.operation_id;
             let target = effect.target;
             let work = effect.work;
-            self.async_actions.start_blocking(
+            let metadata = crate::tui::settings::SettingsBlockingEffectMetadata {
+                dialog_id,
+                operation_id,
+                target: target.clone(),
+            };
+            let action_id = self.async_actions.start_blocking(
                 AsyncActionKind::Blocking("settings.blocking-effect"),
                 AsyncActionPolicy::AllowConcurrent,
                 move || {
@@ -348,7 +369,8 @@ impl App {
                         },
                     ))
                 },
-            );
+            ).id();
+            self.settings_blocking_actions.insert(action_id, metadata);
         }
     }
 
@@ -401,6 +423,9 @@ impl App {
                     | AsyncActionKind::DaemonRpc("sealed.effect")
             )
         {
+            if matches!(result.kind, AsyncActionKind::Blocking("settings.blocking-effect")) {
+                self.settings_blocking_actions.remove(&result.id);
+            }
             return;
         }
         match result.kind {
@@ -416,7 +441,27 @@ impl App {
                 }
             }
             AsyncActionKind::Blocking("settings.blocking-effect") => {
-                if let Ok(AsyncActionPayload::SettingsBlocking(completion)) = result.payload {
+                let metadata = self.settings_blocking_actions.remove(&result.id);
+                let completion = match result.payload {
+                    Ok(AsyncActionPayload::SettingsBlocking(completion)) => Some(completion),
+                    Err(error) => metadata.map(|metadata| {
+                        crate::tui::settings::SettingsBlockingEffectCompletion {
+                            dialog_id: metadata.dialog_id,
+                            operation_id: metadata.operation_id,
+                            target: metadata.target,
+                            outcome: Err(error),
+                        }
+                    }),
+                    Ok(_) => metadata.map(|metadata| {
+                        crate::tui::settings::SettingsBlockingEffectCompletion {
+                            dialog_id: metadata.dialog_id,
+                            operation_id: metadata.operation_id,
+                            target: metadata.target,
+                            outcome: Err("unexpected settings blocking result".into()),
+                        }
+                    }),
+                };
+                if let Some(completion) = completion {
                     self.dialog.apply_settings_blocking_completion(completion);
                 }
             }

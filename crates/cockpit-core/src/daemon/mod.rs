@@ -88,6 +88,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+#[cfg(unix)]
+use cockpit_host::daemon_lifecycle::verify_cockpit_daemon_pid_identity;
+#[cfg(any(unix, test))]
+use cockpit_host::daemon_lifecycle::{
+    ForegroundMetadataGuard, PidIdentity, remove_metadata_if_pid_matches,
+};
+use cockpit_host::daemon_lifecycle::{cmdline_is_cockpit_daemon, read_pid_file};
+#[cfg(all(test, unix))]
+use cockpit_host::daemon_lifecycle::{parse_macos_procargs2, split_proc_cmdline};
 use cockpit_host::private_fs::ensure_private_dir;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -109,41 +118,6 @@ const RESTART_RELEASE_CLEANUP_GRACE: Duration = Duration::from_secs(10);
 pub struct EventEnvelope {
     pub event: proto::Event,
     pub redact: Arc<RedactionTable>,
-}
-
-/// Owns foreground-daemon metadata from pid-file publication through boot and
-/// shutdown. Early startup failures (including schema rejection) must not
-/// leave a dead pid, socket, or endpoint record behind.
-#[cfg(any(unix, test))]
-struct ForegroundMetadataGuard {
-    paths: DaemonPaths,
-    pid: u32,
-    armed: bool,
-}
-
-#[cfg(any(unix, test))]
-impl ForegroundMetadataGuard {
-    fn new(paths: &DaemonPaths) -> Self {
-        Self {
-            paths: paths.clone(),
-            pid: std::process::id(),
-            armed: true,
-        }
-    }
-
-    fn cleanup(&mut self) {
-        if self.armed && remove_metadata_if_pid_matches(&self.paths, self.pid) {
-            remove_endpoint_record_if_owned(&self.paths);
-        }
-        self.armed = false;
-    }
-}
-
-#[cfg(any(unix, test))]
-impl Drop for ForegroundMetadataGuard {
-    fn drop(&mut self) {
-        self.cleanup();
-    }
 }
 
 pub type EventSender = broadcast::Sender<EventEnvelope>;
@@ -300,47 +274,6 @@ fn write_endpoint_record_with_pid_and_canonical(
     let path = endpoint_file_for_state(state);
     let data = serde_json::to_vec_pretty(&record).context("serializing daemon endpoint")?;
     std::fs::write(&path, data).with_context(|| format!("writing {}", path.display()))
-}
-
-#[cfg(any(unix, test))]
-fn remove_endpoint_record_if_owned(paths: &DaemonPaths) {
-    if paths.ephemeral {
-        return;
-    }
-    let Ok(canonical) = DaemonPaths::resolve_canonical() else {
-        tracing::debug!("skipping shared daemon endpoint cleanup: canonical paths unavailable");
-        return;
-    };
-    remove_endpoint_record_if_owned_with_canonical(paths, &canonical);
-}
-
-#[cfg(any(unix, test))]
-fn remove_endpoint_record_if_owned_with_canonical(paths: &DaemonPaths, canonical: &DaemonPaths) {
-    if paths.ephemeral {
-        return;
-    }
-    if paths != canonical {
-        tracing::debug!(
-            pid_file = %paths.pid_file.display(),
-            socket = %paths.socket.display(),
-            "skipping shared daemon endpoint cleanup for noncanonical paths"
-        );
-        return;
-    }
-    let Some(state) = canonical.pid_file.parent() else {
-        return;
-    };
-    let path = endpoint_file_for_state(state);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => return,
-    };
-    let Ok(record) = serde_json::from_slice::<DaemonEndpointRecord>(&bytes) else {
-        return;
-    };
-    if record.pid == std::process::id() && record.socket == paths.socket {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 #[cfg(any(unix, test))]
@@ -734,10 +667,10 @@ fn status_for_unreachable_pid_with_cleanup(
     paths: &DaemonPaths,
     cleanup: impl FnOnce(),
 ) -> DaemonStatus {
-    let Some(pid) = read_pid(paths) else {
+    let Some(pid) = read_pid_file(&paths.pid_file) else {
         return DaemonStatus::Stale;
     };
-    status_for_pid_identity(verify_daemon_pid_identity(pid), cleanup)
+    status_for_pid_identity(verify_cockpit_daemon_pid_identity(pid), cleanup)
 }
 
 #[cfg(unix)]
@@ -981,7 +914,7 @@ pub fn derive_restart_no_sandbox(paths: &DaemonPaths, explicit_no_sandbox: bool)
     }
     #[cfg(unix)]
     {
-        let Some(pid) = read_pid(paths) else {
+        let Some(pid) = read_pid_file(&paths.pid_file) else {
             return false;
         };
         read_process_cmdline(pid)
@@ -996,7 +929,7 @@ pub fn derive_restart_no_sandbox(paths: &DaemonPaths, explicit_no_sandbox: bool)
 }
 
 pub fn daemon_pid(paths: &DaemonPaths) -> Option<u32> {
-    read_pid(paths)
+    read_pid_file(&paths.pid_file)
 }
 
 pub fn restart_release_timeout(grace_secs: Option<u64>) -> Duration {
@@ -1024,7 +957,7 @@ pub async fn wait_for_restart_release(
 }
 
 fn restart_metadata_released(paths: &DaemonPaths, expected_pid: Option<u32>) -> bool {
-    let pid_released = expected_pid.is_none_or(|pid| read_pid(paths) != Some(pid));
+    let pid_released = expected_pid.is_none_or(|pid| read_pid_file(&paths.pid_file) != Some(pid));
     pid_released && !paths.pid_file.exists() && !paths.socket.exists()
 }
 
@@ -1352,7 +1285,20 @@ async fn run_foreground_inner_with_boot_db(
     let _ = std::fs::remove_file(&paths.socket);
     std::fs::write(&paths.pid_file, std::process::id().to_string())
         .with_context(|| format!("writing pid file {}", paths.pid_file.display()))?;
-    let mut metadata_guard = ForegroundMetadataGuard::new(&paths);
+    let endpoint_record = if !paths.ephemeral
+        && DaemonPaths::resolve_canonical()
+            .as_ref()
+            .is_ok_and(|canonical| canonical == &paths)
+    {
+        paths.pid_file.parent().map(endpoint_file_for_state)
+    } else {
+        None
+    };
+    let mut metadata_guard = ForegroundMetadataGuard::new(
+        paths.pid_file.clone(),
+        paths.socket.clone(),
+        endpoint_record,
+    );
 
     let uses_supplied_boot_db = boot_db.is_some();
     let ctx = std::sync::Arc::new(match boot_db {
@@ -1730,13 +1676,17 @@ async fn idle_watchdog(
 
 /// Kill the running daemon (if any) and clean up its pid + socket files.
 pub fn stop(paths: &DaemonPaths) -> Result<bool> {
-    let Some(pid) = read_pid(paths) else {
+    let Some(pid) = read_pid_file(&paths.pid_file) else {
         return Ok(false);
     };
     #[cfg(unix)]
-    return stop_unix_with(paths, pid, verify_daemon_pid_identity, send_sigterm, || {
-        paths.pid_file.exists()
-    });
+    return stop_unix_with(
+        paths,
+        pid,
+        verify_cockpit_daemon_pid_identity,
+        send_sigterm,
+        || paths.pid_file.exists(),
+    );
     #[cfg(not(unix))]
     {
         let _ = pid;
@@ -1744,15 +1694,6 @@ pub fn stop(paths: &DaemonPaths) -> Result<bool> {
         let _ = std::fs::remove_file(&paths.socket);
         Ok(true)
     }
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PidIdentity {
-    VerifiedDaemon,
-    NotDaemon,
-    Missing,
-    Unverified,
 }
 
 #[cfg(unix)]
@@ -1785,7 +1726,7 @@ fn stop_unix_with_timeout(
     match verify(pid) {
         PidIdentity::VerifiedDaemon => {}
         PidIdentity::Missing | PidIdentity::NotDaemon => {
-            remove_metadata_if_pid_matches(paths, pid);
+            remove_metadata_if_pid_matches(&paths.pid_file, &paths.socket, pid);
             return Ok(false);
         }
         PidIdentity::Unverified => {
@@ -1802,7 +1743,7 @@ fn stop_unix_with_timeout(
     signal(pid)?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if !pid_file_exists() || read_pid(paths) != Some(pid) {
+        if !pid_file_exists() || read_pid_file(&paths.pid_file) != Some(pid) {
             return Ok(true);
         }
         if std::time::Instant::now() >= deadline {
@@ -1815,7 +1756,7 @@ fn stop_unix_with_timeout(
     }
     match verify(pid) {
         PidIdentity::Missing | PidIdentity::NotDaemon => {
-            remove_metadata_if_pid_matches(paths, pid);
+            remove_metadata_if_pid_matches(&paths.pid_file, &paths.socket, pid);
             Ok(true)
         }
         PidIdentity::VerifiedDaemon => anyhow::bail!(
@@ -1827,16 +1768,6 @@ fn stop_unix_with_timeout(
     }
 }
 
-#[cfg(any(unix, test))]
-fn remove_metadata_if_pid_matches(paths: &DaemonPaths, expected_pid: u32) -> bool {
-    if read_pid(paths) != Some(expected_pid) {
-        return false;
-    }
-    let _ = std::fs::remove_file(&paths.pid_file);
-    let _ = std::fs::remove_file(&paths.socket);
-    true
-}
-
 #[cfg(unix)]
 fn send_sigterm(pid: u32) -> Result<()> {
     let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
@@ -1845,171 +1776,6 @@ fn send_sigterm(pid: u32) -> Result<()> {
     } else {
         Err(std::io::Error::last_os_error()).with_context(|| format!("signaling pid {pid}"))
     }
-}
-
-#[cfg(unix)]
-fn verify_daemon_pid_identity(pid: u32) -> PidIdentity {
-    if !process_exists(pid) {
-        return PidIdentity::Missing;
-    }
-    match read_process_cmdline(pid) {
-        Ok(args) if cmdline_is_cockpit_daemon(&args) => PidIdentity::VerifiedDaemon,
-        Ok(_) => PidIdentity::NotDaemon,
-        Err(_) => PidIdentity::Unverified,
-    }
-}
-
-#[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(all(unix, target_os = "linux"))]
-fn read_process_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
-    let bytes = std::fs::read(format!("/proc/{pid}/cmdline"))?;
-    Ok(split_proc_cmdline(&bytes))
-}
-
-#[cfg(all(unix, target_os = "macos"))]
-fn read_process_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
-    let mut argmax: libc::c_int = 0;
-    let mut argmax_len = std::mem::size_of_val(&argmax);
-    let mut argmax_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-    let rc = unsafe {
-        libc::sysctl(
-            argmax_mib.as_mut_ptr(),
-            argmax_mib.len() as libc::c_uint,
-            &mut argmax as *mut _ as *mut libc::c_void,
-            &mut argmax_len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if argmax <= 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "KERN_ARGMAX returned a non-positive argv buffer size",
-        ));
-    }
-
-    let mut bytes = vec![0_u8; argmax as usize];
-    let mut len = bytes.len();
-    let mut procargs_mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
-    let rc = unsafe {
-        libc::sysctl(
-            procargs_mib.as_mut_ptr(),
-            procargs_mib.len() as libc::c_uint,
-            bytes.as_mut_ptr() as *mut libc::c_void,
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    bytes.truncate(len);
-    parse_macos_procargs2(&bytes)
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn read_process_cmdline(_pid: u32) -> std::io::Result<Vec<String>> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "pid identity verification is unsupported on this platform",
-    ))
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn split_proc_cmdline(bytes: &[u8]) -> Vec<String> {
-    bytes
-        .split(|b| *b == 0)
-        .filter(|part| !part.is_empty())
-        .map(|part| String::from_utf8_lossy(part).into_owned())
-        .collect()
-}
-
-#[cfg(all(unix, any(test, target_os = "macos")))]
-fn parse_macos_procargs2(bytes: &[u8]) -> std::io::Result<Vec<String>> {
-    const ARG_COUNT_LEN: usize = std::mem::size_of::<libc::c_int>();
-    if bytes.len() < ARG_COUNT_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "KERN_PROCARGS2 data is shorter than argc",
-        ));
-    }
-
-    let argc =
-        i32::from_ne_bytes(bytes[..ARG_COUNT_LEN].try_into().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid argc width")
-        })?);
-    if argc <= 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "KERN_PROCARGS2 argc is not positive",
-        ));
-    }
-
-    let mut pos = ARG_COUNT_LEN;
-    let Some(exec_end) = bytes[pos..].iter().position(|b| *b == 0).map(|n| pos + n) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "KERN_PROCARGS2 data is missing executable path terminator",
-        ));
-    };
-    pos = exec_end + 1;
-
-    while pos < bytes.len() && bytes[pos] == 0 {
-        pos += 1;
-    }
-
-    let mut args = Vec::with_capacity(argc as usize);
-    while args.len() < argc as usize {
-        if pos >= bytes.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "KERN_PROCARGS2 data ended before argc arguments",
-            ));
-        }
-        let Some(arg_end) = bytes[pos..].iter().position(|b| *b == 0).map(|n| pos + n) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "KERN_PROCARGS2 argument is not NUL terminated",
-            ));
-        };
-        if arg_end > pos {
-            args.push(String::from_utf8_lossy(&bytes[pos..arg_end]).into_owned());
-        }
-        pos = arg_end + 1;
-    }
-
-    Ok(args)
-}
-
-fn cmdline_is_cockpit_daemon(args: &[String]) -> bool {
-    let Some(program) = args.first() else {
-        return false;
-    };
-    let program_name = std::path::Path::new(program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(program);
-    program_name.contains("cockpit")
-        && args
-            .windows(2)
-            .any(|pair| pair[0] == "daemon" && pair[1] == "start")
-}
-
-fn read_pid(paths: &DaemonPaths) -> Option<u32> {
-    let s = std::fs::read_to_string(&paths.pid_file).ok()?;
-    s.trim().parse().ok()
 }
 
 #[cfg(all(test, unix))]
@@ -2311,7 +2077,11 @@ mod tests {
             socket: canonical.socket.clone(),
             ephemeral: false,
         };
-        remove_endpoint_record_if_owned_with_canonical(&noncanonical, &canonical);
+        std::fs::write(&noncanonical.pid_file, std::process::id().to_string())
+            .expect("noncanonical pid file");
+        let mut guard =
+            ForegroundMetadataGuard::new(noncanonical.pid_file, noncanonical.socket, None);
+        guard.cleanup();
 
         assert!(
             endpoint.exists(),

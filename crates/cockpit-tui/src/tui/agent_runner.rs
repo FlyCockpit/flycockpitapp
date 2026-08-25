@@ -4498,7 +4498,9 @@ mod tests {
                 detail: "expanded source".to_string(),
                 ok: true,
             }],
-            images: vec![vec![0x89, b'P', b'N', b'G', 0, 1, 2, 3]],
+            images: vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+                0x89, b'P', b'N', b'G', 0, 1, 2, 3,
+            ])],
             forced_skill: Some("review".to_string()),
             origin_principal: Some("flycockpit:test-user".to_string()),
             job_id: Some("job-123".to_string()),

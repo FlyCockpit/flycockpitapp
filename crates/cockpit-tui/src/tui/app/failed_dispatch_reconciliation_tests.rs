@@ -363,7 +363,9 @@ fn transition_failure_removes_identical_queue_rows_by_uuid_not_text() {
         app.queue.push(item.clone());
         let mut submission = UserSubmission::text(format!("wire-{marker}"));
         submission.display_text = Some("same text".to_string());
-        submission.images = vec![marker.as_bytes().to_vec()];
+        submission.images = vec![cockpit_core::engine::message::SubmissionImage::png(
+            marker.as_bytes().to_vec(),
+        )];
         submission.forced_skill = Some(marker.to_string());
         expected_payloads.push(serde_json::to_value(&submission).unwrap());
         app.queue_pending_session_switch_submission_with_optimistic_state(
@@ -407,11 +409,15 @@ fn async_dispatch_failure_reconciles_exact_row_before_next_record_succeeds() {
     )));
     let mut first = UserSubmission::text("wire-a".to_string());
     first.display_text = Some("same visible text".to_string());
-    first.images = vec![vec![1, 2, 3]];
+    first.images = vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+        1, 2, 3,
+    ])];
     first.forced_skill = Some("review".to_string());
     let mut second = UserSubmission::text("wire-b".to_string());
     second.display_text = Some("same visible text".to_string());
-    second.images = vec![vec![4, 5, 6]];
+    second.images = vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+        4, 5, 6,
+    ])];
     second.forced_skill = Some("build".to_string());
     let expected_first = serde_json::to_value(&first).unwrap();
     let expected_second = serde_json::to_value(&second).unwrap();
@@ -1153,7 +1159,9 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
             detail: "expanded".to_string(),
             ok: true,
         }],
-        images: vec![vec![1, 2, 3, 4]],
+        images: vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+            1, 2, 3, 4,
+        ])],
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some("side-job".to_string()),
@@ -1260,7 +1268,10 @@ fn complete_dispatch_submission(marker: &str) -> UserSubmission {
             detail: format!("expanded-{marker}"),
             ok: true,
         }],
-        images: vec![marker.as_bytes().to_vec(), vec![0x89, b'P', b'N', b'G']],
+        images: vec![
+            cockpit_core::engine::message::SubmissionImage::png(marker.as_bytes().to_vec()),
+            cockpit_core::engine::message::SubmissionImage::png(vec![0x89, b'P', b'N', b'G']),
+        ],
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some(format!("job-{marker}")),
@@ -1668,7 +1679,10 @@ fn busy_submit_queue_full_retries_consumed_wire_payload_exactly() {
     assert_eq!(app.retained_pre_dispatch_submissions.len(), 1);
     let retained = &app.retained_pre_dispatch_submissions[0].pending.submission;
     assert_eq!(retained.display_text.as_deref(), Some(display.as_str()));
-    assert_eq!(retained.images, vec![png]);
+    assert_eq!(
+        retained.images,
+        vec![cockpit_core::engine::message::SubmissionImage::png(png)]
+    );
     assert!(
         retained
             .text
@@ -2054,7 +2068,9 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
             detail: "expanded before switch".to_string(),
             ok: true,
         }],
-        images: vec![vec![0x89, b'P', b'N', b'G']],
+        images: vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+            0x89, b'P', b'N', b'G',
+        ])],
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some("job-before-switch".to_string()),

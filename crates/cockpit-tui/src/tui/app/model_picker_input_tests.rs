@@ -189,7 +189,9 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
             text: "review expanded source\n\n<image>".to_string(),
             display_text: Some("review @src/model.rs with image".to_string()),
             tag_expansions: vec![tag.clone()],
-            images: vec![png.into_inner()],
+            images: vec![cockpit_core::engine::message::SubmissionImage::png(
+                png.into_inner(),
+            )],
             forced_skill: Some("review".to_string()),
             origin_principal: Some("flycockpit:test-user".to_string()),
             job_id: Some("job-1".to_string()),

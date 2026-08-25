@@ -207,7 +207,12 @@ fn complete_submission(index: usize) -> UserSubmission {
             detail: "complete".to_string(),
             ok: true,
         }],
-        images: vec![vec![index as u8, 2, 3, 4]],
+        images: vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+            index as u8,
+            2,
+            3,
+            4,
+        ])],
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some(format!("job-{index}")),

@@ -300,7 +300,6 @@ pub(super) async fn admit_image_ingress(
     // Publication now owns both the materialized object and the reservation:
     // its failure path verifies deletion before releasing accounting, while a
     // crash leaves the durable publication intent for boot recovery.
-    abandon.reservation_id = None;
     let published = storage
         .publish_ingress_image(crate::media_storage::PublishIngressImageInput {
             admission_id,
@@ -316,6 +315,11 @@ pub(super) async fn admit_image_ingress(
         })
         .await
         .map_err(internal)?;
+    // Transfer cleanup authority only after publication has durably consumed
+    // the intent and settled the reservation. If intent insertion or any
+    // later publication step fails, the guard remains armed; publication's
+    // own cleanup and this abandonment are deliberately idempotent.
+    abandon.reservation_id = None;
     Ok(Response::ImageIngressAdmitted(
         proto::ImageIngressAdmissionReceiptV1 {
             schema_version: 1,

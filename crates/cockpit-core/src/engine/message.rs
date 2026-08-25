@@ -117,7 +117,7 @@ pub struct UserSubmission {
     pub run_invocation_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SubmissionImage {
     Png {
@@ -1624,7 +1624,7 @@ mod tests {
         let text = format!("see {IMAGE_PART_SENTINEL} done");
         let msg = build_user_message(UserSubmission {
             text,
-            images: vec![vec![1u8, 2, 3]],
+            images: vec![SubmissionImage::png(vec![1u8, 2, 3])],
             ..Default::default()
         });
         let parts = user_parts(&msg);
@@ -1640,7 +1640,7 @@ mod tests {
         let text = format!("{IMAGE_PART_SENTINEL}after");
         let msg = build_user_message(UserSubmission {
             text,
-            images: vec![vec![9u8]],
+            images: vec![SubmissionImage::png(vec![9u8])],
             ..Default::default()
         });
         let parts = user_parts(&msg);
@@ -1779,7 +1779,7 @@ mod tests {
 
         let img = build_user_message(UserSubmission {
             text: IMAGE_PART_SENTINEL.to_string(),
-            images: vec![vec![1u8, 2]],
+            images: vec![SubmissionImage::png(vec![1u8, 2])],
             ..Default::default()
         });
         assert!(
@@ -1885,7 +1885,7 @@ mod tests {
                 detail: "expanded source".into(),
                 ok: true,
             }],
-            images: vec![vec![0, 1, 2, 3]],
+            images: vec![SubmissionImage::png(vec![0, 1, 2, 3])],
             forced_skill: Some("review".into()),
             origin_principal: receipt.origin_principal.clone(),
             queue_item_ids: vec![id],
@@ -2103,7 +2103,7 @@ mod tests {
                 detail: "12 lines".into(),
                 ok: true,
             }],
-            images: vec![vec![1, 2, 3, 4]],
+            images: vec![SubmissionImage::png(vec![1, 2, 3, 4])],
             forced_skill: Some("review".to_string()),
             ..Default::default()
         };
@@ -2157,7 +2157,10 @@ mod tests {
         );
 
         let mut changed = original.clone();
-        changed.images[0].push(5);
+        let SubmissionImage::Png { bytes } = &mut changed.images[0] else {
+            panic!("fixture image must remain inline PNG bytes");
+        };
+        bytes.push(5);
         let (_, conflict_snapshot, conflict) = queue
             .push_idempotent(
                 receipt(changed.client_fingerprint()),

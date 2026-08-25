@@ -248,6 +248,7 @@ impl App {
                 else {
                     return;
                 };
+                let admission_id = uuid::Uuid::new_v4();
                 self.pending_paste_probes.insert(
                     correlation_id,
                     super::PendingPasteProbe {
@@ -257,12 +258,12 @@ impl App {
                         owner_fence: Some(fence_id),
                         original_offset,
                         deadline,
+                        image_admission_id: Some(admission_id),
                         async_action_id: None,
                     },
                 );
                 let original = data;
                 let session_id = self.launch.session_id.unwrap_or(uuid::Uuid::nil());
-                let admission_id = uuid::Uuid::new_v4();
                 let daemon = self
                     .agent_runner
                     .as_ref()
@@ -353,6 +354,7 @@ impl App {
                 owner_fence: None,
                 original_offset: self.composer.cursor(),
                 deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
+                image_admission_id: None,
                 async_action_id: None,
             })
         } else {
@@ -3593,6 +3595,7 @@ impl App {
                         owner_fence: None,
                         original_offset: self.composer.cursor(),
                         deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
+                        image_admission_id: None,
                         async_action_id: None,
                     })
             }) else {
@@ -3604,6 +3607,8 @@ impl App {
             probe.original_data = data.clone();
             let source_draft_generation = probe.source_draft_generation;
             let cursor = probe.original_offset;
+            let admission_id = probe.image_admission_id.unwrap_or_else(uuid::Uuid::new_v4);
+            probe.image_admission_id = Some(admission_id);
             self.pending_paste_probes.insert(request_id, probe);
             let terminal_generation = self.terminal_input_generation;
             let session_id = self.launch.session_id.unwrap_or(uuid::Uuid::nil());
@@ -3612,7 +3617,6 @@ impl App {
                 .as_ref()
                 .and_then(|runner| runner.as_ref().ok())
                 .map(|runner| runner.attached_request_binding());
-            let admission_id = uuid::Uuid::new_v4();
             let action_id = self
                 .async_actions
                 .start(
@@ -3684,6 +3688,7 @@ impl App {
                         owner_fence: None,
                         original_offset: self.composer.cursor(),
                         deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
+                        image_admission_id: None,
                         async_action_id: None,
                     })
             }) else {
@@ -3695,10 +3700,11 @@ impl App {
             probe.original_data = data.clone();
             let source_draft_generation = probe.source_draft_generation;
             let cursor = probe.original_offset;
+            let admission_id = probe.image_admission_id.unwrap_or_else(uuid::Uuid::new_v4);
+            probe.image_admission_id = Some(admission_id);
             self.pending_paste_probes.insert(request_id, probe);
             let original = data.clone();
             let session_id = self.launch.session_id.unwrap_or(uuid::Uuid::nil());
-            let admission_id = uuid::Uuid::new_v4();
             let daemon = self
                 .agent_runner
                 .as_ref()
@@ -4834,23 +4840,29 @@ mod image_submit_validation_tests {
 
     #[test]
     fn accepts_valid_png_under_limits() {
-        validate_pasted_images_for_submit(&[sample_png()]).unwrap();
+        validate_pasted_images_for_submit(&[cockpit_core::engine::message::SubmissionImage::png(
+            sample_png(),
+        )])
+        .unwrap();
     }
 
     #[test]
     fn rejects_too_many_images_before_dispatch() {
         let png = sample_png();
-        let images = vec![png; cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE + 1];
+        let images = vec![
+            cockpit_core::engine::message::SubmissionImage::png(png);
+            cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE + 1
+        ];
         let err = validate_pasted_images_for_submit(&images).expect_err("too many");
         assert!(err.contains("Too many pasted images"));
     }
 
     #[test]
     fn rejects_oversized_single_image_before_dispatch() {
-        let images = vec![vec![
+        let images = vec![cockpit_core::engine::message::SubmissionImage::png(vec![
             0u8;
             cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES + 1
-        ]];
+        ])];
         let err = validate_pasted_images_for_submit(&images).expect_err("oversized");
         assert!(err.contains("too large"));
         assert!(err.contains("byte limit"));
@@ -4861,20 +4873,58 @@ mod image_submit_validation_tests {
         let count = cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE;
         let single = cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES;
         let total = cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES;
-        assert!(validate_pasted_image_sizes(&vec![vec![1]; count]).is_ok());
-        assert!(validate_pasted_image_sizes(&vec![vec![1]; count + 1]).is_err());
-        assert!(validate_pasted_image_sizes(&[vec![1; single]]).is_ok());
-        assert!(validate_pasted_image_sizes(&[vec![1; single + 1]]).is_err());
-        let first = single.min(total);
-        assert!(validate_pasted_image_sizes(&[vec![1; first], vec![1; total - first]]).is_ok());
         assert!(
-            validate_pasted_image_sizes(&[vec![1; first], vec![1; total - first + 1]]).is_err()
+            validate_pasted_image_sizes(&vec![
+                cockpit_core::engine::message::SubmissionImage::png(
+                    vec![1]
+                );
+                count
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_pasted_image_sizes(&vec![
+                cockpit_core::engine::message::SubmissionImage::png(
+                    vec![1]
+                );
+                count + 1
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_pasted_image_sizes(&[cockpit_core::engine::message::SubmissionImage::png(
+                vec![1; single]
+            )])
+            .is_ok()
+        );
+        assert!(
+            validate_pasted_image_sizes(&[cockpit_core::engine::message::SubmissionImage::png(
+                vec![1; single + 1]
+            )])
+            .is_err()
+        );
+        let first = single.min(total);
+        assert!(
+            validate_pasted_image_sizes(&[
+                cockpit_core::engine::message::SubmissionImage::png(vec![1; first]),
+                cockpit_core::engine::message::SubmissionImage::png(vec![1; total - first]),
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_pasted_image_sizes(&[
+                cockpit_core::engine::message::SubmissionImage::png(vec![1; first]),
+                cockpit_core::engine::message::SubmissionImage::png(vec![1; total - first + 1]),
+            ])
+            .is_err()
         );
     }
 
     #[test]
     fn rejects_malformed_png_before_dispatch() {
-        let images = vec![b"not png".to_vec()];
+        let images = vec![cockpit_core::engine::message::SubmissionImage::png(
+            b"not png".to_vec(),
+        )];
         let err = validate_pasted_images_for_submit(&images).expect_err("invalid png");
         assert!(err.contains("not a valid PNG"));
     }
@@ -5833,6 +5883,7 @@ mod paste_routing_tests {
                 owner_fence: None,
                 original_offset: 0,
                 deadline: std::time::Duration::from_secs(2),
+                image_admission_id: None,
                 async_action_id: None,
             },
         );
@@ -5871,6 +5922,7 @@ mod paste_routing_tests {
                 owner_fence: None,
                 original_offset: 0,
                 deadline: std::time::Duration::from_secs(2),
+                image_admission_id: None,
                 async_action_id: None,
             },
         );
@@ -5904,6 +5956,7 @@ mod paste_routing_tests {
                     owner_fence,
                     original_offset: 7,
                     deadline,
+                    image_admission_id: None,
                     async_action_id: None,
                 },
             );
@@ -5945,6 +5998,7 @@ mod paste_routing_tests {
                 owner_fence: None,
                 original_offset: 3,
                 deadline,
+                image_admission_id: None,
                 async_action_id: None,
             },
         );
@@ -5984,6 +6038,7 @@ mod paste_routing_tests {
                 owner_fence: None,
                 original_offset: 5,
                 deadline,
+                image_admission_id: None,
                 async_action_id: None,
             },
         );

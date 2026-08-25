@@ -349,6 +349,10 @@ pub(crate) struct PendingPasteProbe {
     pub owner_fence: Option<uuid::Uuid>,
     pub original_offset: usize,
     pub deadline: std::time::Duration,
+    /// Stable daemon idempotency identity for image admission. It lives with
+    /// the pending paste, outside the RPC future, so transport retries cannot
+    /// accidentally mint and charge a second retained attachment.
+    pub image_admission_id: Option<uuid::Uuid>,
     pub async_action_id: Option<crate::tui::async_action::AsyncActionId>,
 }
 

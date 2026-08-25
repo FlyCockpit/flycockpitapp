@@ -1060,7 +1060,9 @@ mod tests {
 
         let submission = cockpit_core::engine::message::UserSubmission {
             text: "exact wire".into(),
-            images: vec![vec![1, 2, 3]],
+            images: vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+                1, 2, 3,
+            ])],
             ..Default::default()
         };
         let digest = user_submission_wire_digest(&submission);

@@ -25313,7 +25313,10 @@ fn sample_png() -> Vec<u8> {
     out
 }
 
-fn assert_same_png_pixels(got: &[u8], want: &[u8]) {
+fn assert_same_png_pixels(got: &crate::engine::message::SubmissionImage, want: &[u8]) {
+    let crate::engine::message::SubmissionImage::Png { bytes: got } = got else {
+        panic!("dispatcher must resolve retained references to PNG bytes");
+    };
     let got = image::load_from_memory(got)
         .expect("got png")
         .to_rgba8()

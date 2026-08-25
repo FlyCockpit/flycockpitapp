@@ -2329,7 +2329,10 @@ async fn handle_send_user_message(
         text,
         display_text,
         tag_expansions,
-        images,
+        images: images
+            .into_iter()
+            .map(crate::engine::message::SubmissionImage::png)
+            .collect(),
         forced_skill,
         origin_principal: origin_principal.clone(),
         job_id: None,

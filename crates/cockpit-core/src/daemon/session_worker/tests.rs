@@ -613,7 +613,7 @@ async fn terminal_receipt_write_failure_returns_promptly_and_holds_the_exact_que
     let original = crate::engine::message::UserSubmission {
         text: "exact wire text".into(),
         display_text: Some("visible composer text".into()),
-        images: vec![vec![7, 8, 9]],
+        images: vec![crate::engine::message::SubmissionImage::png(vec![7, 8, 9])],
         forced_skill: Some("review".into()),
         origin_principal: receipt.origin_principal.clone(),
         queue_item_ids: vec![id],
@@ -855,7 +855,9 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
         let second = crate::engine::message::UserSubmission {
             text: "second exact wire text".into(),
             display_text: Some("second visible text".into()),
-            images: vec![vec![1, 2, 3, 4]],
+            images: vec![crate::engine::message::SubmissionImage::png(vec![
+                1, 2, 3, 4,
+            ])],
             forced_skill: Some("review".into()),
             origin_principal: Some("flycockpit:user-1".into()),
             ..Default::default()

@@ -16,6 +16,9 @@ pub(crate) enum GoalSettingsSaveTarget {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum GoalSettingsOutcome {
     Close,
+    /// A daemon-owned mutation has been queued. The pane remains open and
+    /// will emit `Apply` only after the correlated receipt is validated.
+    Pending,
     Apply {
         override_json: Option<String>,
         persist_session: bool,
@@ -41,6 +44,17 @@ struct GoalSettingsDraft {
     cold_skeptic_model: Option<String>,
     max_verification_attempts: Option<u32>,
     original: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Default for GoalSettingsDraft {
+    fn default() -> Self {
+        Self {
+            cold_skeptic_count: None,
+            cold_skeptic_model: None,
+            max_verification_attempts: None,
+            original: serde_json::Map::new(),
+        }
+    }
 }
 
 impl GoalSettingsDraft {
@@ -174,43 +188,238 @@ pub(crate) struct GoalSettingsPane {
     agent_name: String,
     cwd: PathBuf,
     root_foreground: bool,
-    revision: String,
+    revision: Option<String>,
     supports_agent_save: bool,
     draft: GoalSettingsDraft,
     cursor: usize,
     status: Option<String>,
     confirm: Option<GoalSettingsSaveTarget>,
+    pending_effect: Option<GoalSettingsEffect>,
+    in_flight: Option<GoalSettingsPending>,
+}
+
+#[derive(Debug)]
+pub(crate) struct GoalSettingsEffect {
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) agent_name: String,
+    pub(crate) project_root: String,
+    pub(crate) expected_revision: Option<String>,
+    pub(crate) request: cockpit_core::daemon::proto::Request,
+}
+
+#[derive(Debug)]
+enum GoalSettingsPending {
+    Load {
+        operation_id: uuid::Uuid,
+        agent_name: String,
+        project_root: String,
+    },
+    SaveAgent {
+        operation_id: uuid::Uuid,
+        agent_name: String,
+        project_root: String,
+        expected_revision: String,
+        mutation: cockpit_core::daemon::proto::AgentMutation,
+        patch: cockpit_core::daemon::proto::GoalSupervisionPatch,
+        prior_goal_json: Option<String>,
+        override_json: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct GoalSettingsCompletion {
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) agent_name: String,
+    pub(crate) project_root: String,
+    pub(crate) expected_revision: Option<String>,
+    pub(crate) response: Result<cockpit_core::daemon::proto::Response, String>,
 }
 
 impl GoalSettingsPane {
     pub(crate) fn open(cwd: &Path, agent_name: &str, root_foreground: bool) -> Result<Self> {
-        let response = crate::tui::agent_runner::daemon_request_blocking(
-            cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
-                project_root: cwd.to_string_lossy().into_owned(),
-                name: agent_name.to_string(),
-            },
-        )
-        .map_err(anyhow::Error::msg)?;
-        let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) = response else {
-            anyhow::bail!("daemon returned an unexpected agent snapshot");
+        let operation_id = uuid::Uuid::new_v4();
+        let project_root = cwd.to_string_lossy().into_owned();
+        let request = cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+            project_root: project_root.clone(),
+            name: agent_name.to_string(),
         };
-        super::settings::agents_page::validate_agent_snapshot(&snapshot, cwd, agent_name, None)
-            .map_err(anyhow::Error::msg)?;
-        let draft = GoalSettingsDraft::from_json(snapshot.goal_supervision_json.as_deref())?;
-        let status = (!root_foreground).then(|| {
-            "Apply is disabled while an interactive subagent holds the foreground.".to_string()
-        });
+        let status = (!root_foreground)
+            .then(|| {
+                "Apply is disabled while an interactive subagent holds the foreground.".to_string()
+            })
+            .or_else(|| Some("loading daemon-owned goal settings…".to_string()));
         Ok(Self {
             agent_name: agent_name.to_string(),
             cwd: cwd.to_path_buf(),
             root_foreground,
-            revision: snapshot.revision,
-            supports_agent_save: snapshot.supports_goal_supervision,
-            draft,
+            revision: None,
+            supports_agent_save: false,
+            draft: GoalSettingsDraft::default(),
             cursor: 0,
             status,
             confirm: None,
+            pending_effect: Some(GoalSettingsEffect {
+                operation_id,
+                agent_name: agent_name.to_string(),
+                project_root: project_root.clone(),
+                expected_revision: None,
+                request,
+            }),
+            in_flight: Some(GoalSettingsPending::Load {
+                operation_id,
+                agent_name: agent_name.to_string(),
+                project_root,
+            }),
         })
+    }
+
+    pub(crate) fn take_effect(&mut self) -> Option<GoalSettingsEffect> {
+        self.pending_effect.take()
+    }
+
+    /// Apply a host-delivered daemon result only when it belongs to the exact
+    /// operation and authority snapshot still owned by this pane. Duplicate,
+    /// late, and out-of-order completions are presentation no-ops.
+    pub(crate) fn apply_completion(
+        &mut self,
+        completion: GoalSettingsCompletion,
+    ) -> Option<GoalSettingsOutcome> {
+        let Some(pending) = self.in_flight.take() else {
+            return None;
+        };
+        let pending_id = match &pending {
+            GoalSettingsPending::Load { operation_id, .. }
+            | GoalSettingsPending::SaveAgent { operation_id, .. } => *operation_id,
+        };
+        let (pending_agent, pending_root, pending_revision) = match &pending {
+            GoalSettingsPending::Load {
+                agent_name,
+                project_root,
+                ..
+            } => (agent_name.as_str(), project_root.as_str(), None),
+            GoalSettingsPending::SaveAgent {
+                agent_name,
+                project_root,
+                expected_revision,
+                ..
+            } => (
+                agent_name.as_str(),
+                project_root.as_str(),
+                Some(expected_revision.as_str()),
+            ),
+        };
+        if completion.operation_id != pending_id
+            || completion.agent_name != pending_agent
+            || completion.project_root != pending_root
+            || completion.expected_revision.as_deref() != pending_revision
+        {
+            self.in_flight = Some(pending);
+            return None;
+        }
+        match pending {
+            GoalSettingsPending::Load {
+                agent_name,
+                project_root,
+                ..
+            } => {
+                if self.agent_name != agent_name
+                    || self.cwd.to_string_lossy().as_ref() != project_root
+                {
+                    return None;
+                }
+                let loaded = completion.response.and_then(|response| {
+                    let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) =
+                        response
+                    else {
+                        return Err("daemon returned an unexpected agent snapshot".to_string());
+                    };
+                    super::settings::agents_page::validate_agent_snapshot(
+                        &snapshot,
+                        &self.cwd,
+                        &self.agent_name,
+                        None,
+                    )?;
+                    let draft =
+                        GoalSettingsDraft::from_json(snapshot.goal_supervision_json.as_deref())
+                            .map_err(|error| error.to_string())?;
+                    Ok((snapshot, draft))
+                });
+                match loaded {
+                    Ok((snapshot, draft)) => {
+                        self.revision = Some(snapshot.revision);
+                        self.supports_agent_save = snapshot.supports_goal_supervision;
+                        self.draft = draft;
+                        self.status = (!self.root_foreground).then(|| {
+                            "Apply is disabled while an interactive subagent holds the foreground."
+                                .to_string()
+                        });
+                    }
+                    Err(error) => self.status = Some(format!("load failed: {error}")),
+                }
+                None
+            }
+            GoalSettingsPending::SaveAgent {
+                agent_name,
+                project_root,
+                expected_revision,
+                mutation,
+                patch,
+                prior_goal_json,
+                override_json,
+                ..
+            } => {
+                if self.agent_name != agent_name
+                    || self.cwd.to_string_lossy().as_ref() != project_root
+                    || self.revision.as_deref() != Some(expected_revision.as_str())
+                {
+                    return None;
+                }
+                let saved = completion.response.and_then(|response| {
+                    let cockpit_core::daemon::proto::Response::AgentMutated(result) = response
+                    else {
+                        return Err("daemon returned an unexpected goal-settings response".into());
+                    };
+                    super::settings::agents_page::validate_agent_mutation_result(
+                        &result,
+                        &self.cwd,
+                        &mutation,
+                        Some(&expected_revision),
+                        None,
+                    )?;
+                    let snapshot = result
+                        .snapshot
+                        .ok_or_else(|| "daemon omitted the goal-settings snapshot".to_string())?;
+                    cockpit_proto::validate_goal_supervision_projection(
+                        prior_goal_json.as_deref(),
+                        &patch,
+                        snapshot.goal_supervision_json.as_deref(),
+                    )?;
+                    let original = snapshot
+                        .goal_supervision_json
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|error| error.to_string())?
+                        .unwrap_or_default();
+                    Ok((snapshot.revision, original))
+                });
+                match saved {
+                    Ok((revision, original)) => {
+                        self.revision = Some(revision);
+                        self.draft.original = original;
+                        self.status = Some("agent goal settings committed".to_string());
+                        Some(GoalSettingsOutcome::Apply {
+                            override_json,
+                            persist_session: false,
+                        })
+                    }
+                    Err(error) => {
+                        self.status = Some(format!("save failed: {error}"));
+                        None
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -219,6 +428,13 @@ impl GoalSettingsPane {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<GoalSettingsOutcome> {
+        if self.in_flight.is_some() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                return Some(GoalSettingsOutcome::Close);
+            }
+            self.status = Some("goal settings operation is still pending".to_string());
+            return None;
+        }
         if self.confirm.is_some() {
             return self.handle_confirm_key(key);
         }
@@ -407,42 +623,34 @@ impl GoalSettingsPane {
                 name: self.agent_name.clone(),
                 patch: goal_patch.clone(),
             };
-            let expected_revision = self.revision.clone();
-            let response = crate::tui::agent_runner::daemon_request_blocking(
-                cockpit_core::daemon::proto::Request::MutateAgent {
-                    project_root: self.cwd.to_string_lossy().into_owned(),
+            let expected_revision = self.revision.clone().ok_or_else(|| {
+                anyhow::anyhow!("goal settings have no daemon-owned revision; reload first")
+            })?;
+            let operation_id = uuid::Uuid::new_v4();
+            let project_root = self.cwd.to_string_lossy().into_owned();
+            self.pending_effect = Some(GoalSettingsEffect {
+                operation_id,
+                agent_name: self.agent_name.clone(),
+                project_root: project_root.clone(),
+                expected_revision: Some(expected_revision.clone()),
+                request: cockpit_core::daemon::proto::Request::MutateAgent {
+                    project_root: project_root.clone(),
                     mutation: mutation.clone(),
                     expected_revision: Some(expected_revision.clone()),
                 },
-            )
-            .map_err(anyhow::Error::msg)?;
-            let cockpit_core::daemon::proto::Response::AgentMutated(result) = response else {
-                anyhow::bail!("daemon returned an unexpected goal-settings response");
-            };
-            super::settings::agents_page::validate_agent_mutation_result(
-                &result,
-                &self.cwd,
-                &mutation,
-                Some(&expected_revision),
-                None,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let snapshot = result
-                .snapshot
-                .ok_or_else(|| anyhow::anyhow!("daemon omitted the goal-settings snapshot"))?;
-            cockpit_proto::validate_goal_supervision_projection(
-                prior_goal_json.as_deref(),
-                &goal_patch,
-                snapshot.goal_supervision_json.as_deref(),
-            )
-            .map_err(anyhow::Error::msg)?;
-            self.revision = snapshot.revision;
-            self.draft.original = snapshot
-                .goal_supervision_json
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()?
-                .unwrap_or_default();
+            });
+            self.in_flight = Some(GoalSettingsPending::SaveAgent {
+                operation_id,
+                agent_name: self.agent_name.clone(),
+                project_root,
+                expected_revision,
+                mutation,
+                patch: goal_patch,
+                prior_goal_json,
+                override_json,
+            });
+            self.status = Some("saving agent goal settings…".to_string());
+            return Ok(GoalSettingsOutcome::Pending);
         }
         Ok(GoalSettingsOutcome::Apply {
             override_json,
@@ -540,6 +748,16 @@ fn adjust_positive(current: i64, delta: i32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn loaded_pane(cwd: &Path, supports_agent_save: bool) -> GoalSettingsPane {
+        let mut pane = GoalSettingsPane::open(cwd, "Build", true).unwrap();
+        pane.pending_effect = None;
+        pane.in_flight = None;
+        pane.revision = Some("test-revision".to_string());
+        pane.supports_agent_save = supports_agent_save;
+        pane.status = None;
+        pane
+    }
+
     fn focus_field(pane: &mut GoalSettingsPane, field: GoalSettingsField) {
         pane.cursor = FIELDS
             .iter()
@@ -562,7 +780,7 @@ mod tests {
     #[test]
     fn goal_settings_agent_save_refuses_vnext_builtin_without_ejecting() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut pane = GoalSettingsPane::open(tmp.path(), "Build", true).unwrap();
+        let mut pane = loaded_pane(tmp.path(), false);
         focus_field(&mut pane, GoalSettingsField::SkepticCount);
         pane.handle_key(KeyEvent::from(KeyCode::Char('t')));
         pane.start_confirm(GoalSettingsSaveTarget::Agent);
@@ -586,7 +804,7 @@ mod tests {
     #[test]
     fn goal_settings_requires_confirm_before_save() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut pane = GoalSettingsPane::open(tmp.path(), "Build", true).unwrap();
+        let mut pane = loaded_pane(tmp.path(), false);
 
         assert_eq!(
             pane.handle_key(KeyEvent::from(KeyCode::Char('s'))),
@@ -603,11 +821,53 @@ mod tests {
     #[test]
     fn goal_settings_dialog_shows_no_cache_warning() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut pane = GoalSettingsPane::open(tmp.path(), "Build", true).unwrap();
+        let mut pane = loaded_pane(tmp.path(), false);
         pane.start_confirm(GoalSettingsSaveTarget::Session);
 
         let status = pane.status_text().unwrap();
         assert!(!status.contains("cache"));
         assert!(!status.contains("prompt"));
+    }
+
+    #[test]
+    fn goal_settings_load_is_a_correlated_effect_and_stale_completion_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pane = GoalSettingsPane::open(tmp.path(), "Build", true).unwrap();
+        let effect = pane.take_effect().expect("load effect");
+        assert_eq!(effect.agent_name, "Build");
+        assert_eq!(effect.project_root, tmp.path().to_string_lossy());
+        assert!(effect.expected_revision.is_none());
+
+        let stale = GoalSettingsCompletion {
+            operation_id: uuid::Uuid::new_v4(),
+            agent_name: effect.agent_name,
+            project_root: effect.project_root,
+            expected_revision: None,
+            response: Err("must not be applied".to_string()),
+        };
+        assert!(pane.apply_completion(stale).is_none());
+        assert!(
+            pane.in_flight.is_some(),
+            "stale result must not settle load"
+        );
+    }
+
+    #[test]
+    fn agent_save_stages_once_and_keeps_exact_revision_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pane = loaded_pane(tmp.path(), true);
+        pane.start_confirm(GoalSettingsSaveTarget::Agent);
+        assert_eq!(pane.confirmed_save(), Some(GoalSettingsOutcome::Pending));
+        let effect = pane.take_effect().expect("save effect");
+        assert_eq!(effect.expected_revision.as_deref(), Some("test-revision"));
+        assert!(
+            pane.take_effect().is_none(),
+            "duplicate submission was staged"
+        );
+        assert_eq!(
+            pane.handle_key(KeyEvent::from(KeyCode::Enter)),
+            None,
+            "pending operation must keep the reducer responsive without resubmitting"
+        );
     }
 }

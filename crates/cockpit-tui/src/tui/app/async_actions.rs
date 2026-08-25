@@ -171,6 +171,7 @@ impl App {
     }
 
     pub(super) fn drain_async_actions(&mut self) -> bool {
+        self.start_pending_goal_settings_effect();
         // Cancellation is a terminal runner outcome; most kinds intentionally
         // skip UI mutation. Session switch/resume must still settle provisional
         // buffers, order, and the cleared-view failure contract.
@@ -213,6 +214,47 @@ impl App {
         changed
     }
 
+    fn start_pending_goal_settings_effect(&mut self) {
+        let effect = match &mut self.overlay {
+            Overlay::GoalSettings(pane) => pane.take_effect(),
+            _ => None,
+        };
+        let Some(effect) = effect else {
+            return;
+        };
+        let operation_id = effect.operation_id;
+        let agent_name = effect.agent_name;
+        let project_root = effect.project_root;
+        let expected_revision = effect.expected_revision;
+        let request = effect.request;
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("goal-settings.effect"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let response = async {
+                    let client = crate::tui::settings::settings_daemon_client()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    client
+                        .request(request)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .map_err(|error| error.to_string())
+                }
+                .await;
+                Ok(AsyncActionPayload::GoalSettings(
+                    crate::tui::goal_settings_pane::GoalSettingsCompletion {
+                        operation_id,
+                        agent_name,
+                        project_root,
+                        expected_revision,
+                        response,
+                    },
+                ))
+            },
+        );
+    }
+
     pub(super) fn apply_async_action_result(&mut self, result: AsyncActionResult) {
         // Provisional `/new` owns a cleared view. Only the switch/resume
         // settlement path and outgoing delivery-receipt fence bookkeeping may
@@ -228,6 +270,18 @@ impl App {
             return;
         }
         match result.kind {
+            AsyncActionKind::DaemonRpc("goal-settings.effect") => {
+                let outcome = match result.payload {
+                    Ok(AsyncActionPayload::GoalSettings(completion)) => match &mut self.overlay {
+                        Overlay::GoalSettings(pane) => pane.apply_completion(completion),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    self.handle_goal_settings_outcome(outcome);
+                }
+            }
             AsyncActionKind::DaemonRpc("sessions.list") => {
                 let mut live_ids = None;
                 let mut preview_request = None;

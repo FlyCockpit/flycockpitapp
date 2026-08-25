@@ -233,6 +233,7 @@ impl App {
     ) {
         match outcome {
             crate::tui::goal_settings_pane::GoalSettingsOutcome::Close => {}
+            crate::tui::goal_settings_pane::GoalSettingsOutcome::Pending => {}
             crate::tui::goal_settings_pane::GoalSettingsOutcome::Apply {
                 override_json,
                 persist_session,

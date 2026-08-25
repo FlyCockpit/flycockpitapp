@@ -884,7 +884,14 @@ impl App {
             }
             Overlay::GoalSettings(mut pane) => {
                 if let Some(outcome) = pane.handle_key(key) {
-                    self.handle_goal_settings_outcome(outcome);
+                    if matches!(
+                        outcome,
+                        crate::tui::goal_settings_pane::GoalSettingsOutcome::Pending
+                    ) {
+                        self.overlay = Overlay::GoalSettings(pane);
+                    } else {
+                        self.handle_goal_settings_outcome(outcome);
+                    }
                 } else {
                     self.overlay = Overlay::GoalSettings(pane);
                 }

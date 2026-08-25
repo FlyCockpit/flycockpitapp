@@ -268,6 +268,7 @@ pub enum AsyncActionPayload {
         question: Option<String>,
         error: Option<String>,
     },
+    GoalSettings(crate::tui::goal_settings_pane::GoalSettingsCompletion),
     MouseCopy(MouseCopyResult),
 }
 

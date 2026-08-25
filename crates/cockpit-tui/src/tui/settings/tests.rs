@@ -244,6 +244,8 @@ fn injected_settings_transport_uses_production_receipt_and_reconciliation_path()
     let effect = Arc::new(QueuedSettingsDaemon {
         responses: Mutex::new(std::collections::VecDeque::from([
             Ok(Response::ExtendedConfigSaved {
+                client_operation_id: "fixture-operation".into(),
+                request_hash: "aa".repeat(32),
                 hash: "revision-2".into(),
                 config_generation: 8,
                 layer_id: layer_id.into(),
@@ -297,6 +299,8 @@ fn injected_settings_transport_rejects_wrong_consumed_revision() {
     let effect = Arc::new(QueuedSettingsDaemon {
         responses: Mutex::new(std::collections::VecDeque::from([Ok(
             Response::ExtendedConfigSaved {
+                client_operation_id: "fixture-operation".into(),
+                request_hash: "aa".repeat(32),
                 hash: "revision-2".into(),
                 config_generation: 8,
                 layer_id: "layer-capability".into(),
@@ -8907,4 +8911,9 @@ fn oauth_and_project_receipts_are_bound_to_exact_authority_targets() {
     assert!(source.contains("owner_root == project_root"));
     assert!(mcp.contains("local_receipt_request_hash"));
     assert!(providers.contains("canonical_project_root"));
+    assert!(source.contains("client_operation_id: client_operation_id.clone()"));
+    assert!(source.contains("settings commit settlement is unknown"));
+    assert!(source.contains("typed settings commit remains unsettled"));
+    assert!(mcp.contains("expected_consumed_revision"));
+    assert!(mcp.contains("expected_result_revision"));
 }

@@ -387,6 +387,7 @@ impl std::fmt::Debug for ProviderSavePlan {
 
 #[derive(Debug)]
 pub(crate) struct TypedDocumentEditPlan {
+    client_operation_id: String,
     project_root: String,
     requested_path: String,
     patch: serde_json::Value,
@@ -577,6 +578,7 @@ pub(crate) async fn execute_settings_daemon_work(
             let expected_revision = layer.revision.clone();
             let response = client
                 .request(Request::ApplyExtendedConfigPatch {
+                    client_operation_id: plan.client_operation_id.clone(),
                     project_root: plan.project_root.clone(),
                     layer_id: expected_layer_id.clone(),
                     patch: cockpit_core::daemon::proto::ExtendedConfigPatch {
@@ -588,11 +590,45 @@ pub(crate) async fn execute_settings_daemon_work(
                     expected_revision: expected_revision.clone(),
                     snapshot_session_id: plan.snapshot_session_id.clone(),
                 })
-                .await
-                .map_err(|error| error.to_string())?
-                .map_err(|error| error.to_string())?;
+                .await;
+            let response = match response {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) | Err(_) => match client
+                    .request(Request::GetLocalOperationSettlement {
+                        client_operation_id: plan.client_operation_id.clone(),
+                    })
+                    .await
+                {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(_)) | Err(_) => Response::LocalOperationSettlement {
+                        client_operation_id: plan.client_operation_id.clone(),
+                        pending: true,
+                        response: None,
+                    },
+                },
+            };
+            let response = match response {
+                Response::LocalOperationSettlement {
+                    client_operation_id,
+                    pending: false,
+                    response: Some(response),
+                } if client_operation_id == plan.client_operation_id => *response,
+                response @ Response::LocalOperationSettlement {
+                    client_operation_id: ref returned_operation_id,
+                    pending: true,
+                    ..
+                } if returned_operation_id == &plan.client_operation_id => {
+                    return Ok(SettingsDaemonWorkOutcome {
+                        response: Ok(response),
+                        committed_refresh_needed: None,
+                    });
+                }
+                other => other,
+            };
             let (result_revision, result_generation) = match response {
                 Response::ExtendedConfigSaved {
+                    client_operation_id,
+                    request_hash,
                     hash,
                     layer_id,
                     layer,
@@ -601,7 +637,9 @@ pub(crate) async fn execute_settings_daemon_work(
                     status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
                     config_generation,
                     ..
-                } if layer_id == expected_layer_id
+                } if client_operation_id == plan.client_operation_id
+                    && cockpit_proto::is_opaque_authority_token(&request_hash)
+                    && layer_id == expected_layer_id
                     && layer == expected_layer_kind
                     && consumed_revision == expected_revision
                     && hash == result_revision
@@ -921,6 +959,7 @@ enum PendingSettingsOperation {
         snapshot_session_id: String,
     },
     ExtendedSave {
+        client_operation_id: String,
         requested_path: String,
         project_root: String,
         snapshot_session_id: String,
@@ -981,6 +1020,7 @@ enum PendingSettingsOperation {
     },
     TypedDocumentEdit {
         target: SettingsEffectTarget,
+        client_operation_id: String,
         requested_path: String,
         action: TypedDocumentEditAction,
     },
@@ -1411,6 +1451,7 @@ fn apply_settings_patch_via_daemon(
         .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
     let requested_path = path.display().to_string();
     let response = settings_daemon_request(Request::ApplyExtendedConfigPatch {
+        client_operation_id: uuid::Uuid::new_v4().to_string(),
         project_root: project_root.clone(),
         layer_id: layer_id.clone(),
         patch,
@@ -1428,6 +1469,7 @@ fn apply_settings_patch_via_daemon(
             status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
             publication,
             denylist: committed_denylist,
+            ..
         }) if returned_layer_id == layer_id
             && layer == expected_layer
             && consumed_revision == expected_revision
@@ -1534,6 +1576,7 @@ pub(super) fn apply_typed_settings_document_edit(
         .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
     let requested_path = path.display().to_string();
     let response = settings_daemon_request(Request::ApplyExtendedConfigPatch {
+        client_operation_id: uuid::Uuid::new_v4().to_string(),
         project_root: project_root.clone(),
         layer_id: layer_id.clone(),
         patch,
@@ -1551,6 +1594,7 @@ pub(super) fn apply_typed_settings_document_edit(
             status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
             publication,
             denylist: committed_denylist,
+            ..
         }) if returned_layer_id == layer_id
             && layer == expected_layer
             && consumed_revision == revision
@@ -2657,9 +2701,11 @@ impl SettingsCx {
             owner: requested_path.clone(),
             revision: Some(snapshot_session_id.clone()),
         };
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
         let operation_id = self.enqueue_daemon_work(
             target.clone(),
             SettingsDaemonEffectWork::TypedDocumentEdit(TypedDocumentEditPlan {
+                client_operation_id: client_operation_id.clone(),
                 project_root: project_root.display().to_string(),
                 requested_path: requested_path.clone(),
                 patch,
@@ -2670,6 +2716,7 @@ impl SettingsCx {
             operation_id,
             PendingSettingsOperation::TypedDocumentEdit {
                 target,
+                client_operation_id,
                 requested_path,
                 action,
             },
@@ -2823,7 +2870,9 @@ impl SettingsCx {
             .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
         let requested_path = self.extended_path.display().to_string();
         let snapshot_session_id = settings_snapshot_session_id().to_owned();
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
         let request = Request::ApplyExtendedConfigPatch {
+            client_operation_id: client_operation_id.clone(),
             project_root: project_root.clone(),
             layer_id: layer_id.clone(),
             patch: cockpit_core::daemon::proto::ExtendedConfigPatch {
@@ -2846,6 +2895,7 @@ impl SettingsCx {
         self.pending_settings.insert(
             operation_id,
             PendingSettingsOperation::ExtendedSave {
+                client_operation_id,
                 requested_path,
                 project_root,
                 snapshot_session_id,
@@ -3079,6 +3129,7 @@ impl SettingsCx {
                 }
             }
             PendingSettingsOperation::ExtendedSave {
+                client_operation_id,
                 requested_path,
                 project_root,
                 snapshot_session_id,
@@ -3099,6 +3150,8 @@ impl SettingsCx {
                 }
                 let receipt = match completion.response {
                     Ok(Response::ExtendedConfigSaved {
+                        client_operation_id: returned_operation_id,
+                        request_hash,
                         hash,
                         config_generation,
                         layer_id: returned_layer_id,
@@ -3108,7 +3161,9 @@ impl SettingsCx {
                         status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
                         publication,
                         denylist,
-                    }) if returned_layer_id == layer_id
+                    }) if returned_operation_id == client_operation_id
+                        && cockpit_proto::is_opaque_authority_token(&request_hash)
+                        && returned_layer_id == layer_id
                         && layer == expected_layer
                         && consumed_revision == expected_revision
                         && hash == result_revision
@@ -3129,7 +3184,24 @@ impl SettingsCx {
                     match receipt {
                         Ok(receipt) => receipt,
                         Err(error) => {
-                            self.extended_warnings = vec![format!("save failed: {error}")];
+                            self.queue_settlement_query(
+                                client_operation_id.clone(),
+                                PendingSettingsOperation::ExtendedSave {
+                                    client_operation_id,
+                                    requested_path,
+                                    project_root,
+                                    snapshot_session_id,
+                                    layer_id,
+                                    expected_layer,
+                                    expected_revision,
+                                    expected_generation,
+                                    operations,
+                                    denylist_plan,
+                                },
+                            );
+                            self.extended_warnings = vec![format!(
+                                "settings commit settlement is unknown ({error}); querying the exact receipt"
+                            )];
                             return Ok(());
                         }
                     };
@@ -3651,6 +3723,7 @@ impl SettingsCx {
             }
             PendingSettingsOperation::TypedDocumentEdit {
                 target,
+                client_operation_id,
                 requested_path,
                 action,
             } => {
@@ -3666,6 +3739,28 @@ impl SettingsCx {
                     return Ok(());
                 }
                 match completion.response {
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id: returned_operation_id,
+                        pending: true,
+                        ..
+                    }) if returned_operation_id == client_operation_id => {
+                        self.pending_settings.insert(
+                            completion.operation_id,
+                            PendingSettingsOperation::SettlementUnknown {
+                                target: target.clone(),
+                                client_operation_id: client_operation_id.clone(),
+                                original: Box::new(PendingSettingsOperation::TypedDocumentEdit {
+                                    target,
+                                    client_operation_id,
+                                    requested_path,
+                                    action,
+                                }),
+                            },
+                        );
+                        self.extended_warnings = vec![
+                            "typed settings commit remains unsettled; press any key to query the exact receipt again".into(),
+                        ];
+                    }
                     Ok(Response::ExtendedConfigSnapshot {
                         layers,
                         config_generation,

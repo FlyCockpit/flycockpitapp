@@ -666,6 +666,8 @@ fn unset_object_path(root: &mut serde_json::Value, path: &[String]) -> Result<()
 /// preserves the daemon-owned image registry.
 pub async fn apply_extended_config_patch(
     ctx: &crate::daemon::server::DaemonContext,
+    client_operation_id: String,
+    request_hash: String,
     project_root: String,
     layer_id: String,
     patch: cockpit_proto::ExtendedConfigPatch,
@@ -842,6 +844,8 @@ pub async fn apply_extended_config_patch(
                 crate::daemon::server::inventory::current_config_generation()
             };
             Ok(Response::ExtendedConfigSaved {
+                client_operation_id,
+                request_hash,
                 hash: result_revision.clone(),
                 config_generation,
                 layer_id,

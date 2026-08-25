@@ -653,6 +653,10 @@ pub enum Response {
     /// intentionally not echoed; callers receive only an opaque committed
     /// revision and can reload their own safe view.
     ExtendedConfigSaved {
+        #[serde(default)]
+        client_operation_id: String,
+        #[serde(default)]
+        request_hash: String,
         hash: String,
         config_generation: u64,
         layer_id: String,

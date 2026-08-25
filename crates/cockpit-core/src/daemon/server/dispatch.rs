@@ -5697,20 +5697,56 @@ async fn handle_serialized_request_impl(
         }
 
         Request::ApplyExtendedConfigPatch {
+            client_operation_id,
             project_root,
             layer_id,
             patch,
             expected_revision,
             snapshot_session_id,
         } => {
-            crate::daemon::fs_api::apply_extended_config_patch(
+            let owner = settings_capability_owner(state);
+            let request_hash = local_operation_secret_request_hash(
                 ctx,
+                b"flycockpit/local-operation/extended-config-patch/v1\0",
+                &(
+                    "apply_extended_config_patch",
+                    &project_root,
+                    &layer_id,
+                    &patch,
+                    &expected_revision,
+                    &snapshot_session_id,
+                ),
+            )?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "apply_extended_config_patch",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let operation = crate::daemon::fs_api::apply_extended_config_patch(
+                ctx,
+                client_operation_id.clone(),
+                local_operation_request_hash_hex(&request_hash),
                 project_root,
                 layer_id,
                 patch,
                 expected_revision,
-                settings_capability_owner(state),
+                owner.clone(),
                 snapshot_session_id,
+            );
+            terminalize_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                operation,
             )
             .await
         }
@@ -12622,6 +12658,10 @@ fn client_operation_id_from_response(
             ..
         }
         | Response::McpConfigCommitted {
+            client_operation_id,
+            ..
+        }
+        | Response::ExtendedConfigSaved {
             client_operation_id,
             ..
         }

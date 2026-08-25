@@ -7466,6 +7466,20 @@ mod tests {
     }
 
     #[test]
+    fn settings_v17_receipts_bind_exact_operations_and_content() {
+        let requests = proto_fixture_tests::read_fixture("request.json");
+        assert!(
+            requests["apply_extended_config_patch"]["params"]["client_operation_id"].is_string()
+        );
+        let responses = proto_fixture_tests::read_fixture("response.json");
+        let receipt = &responses["extended_config_saved"]["data"];
+        assert!(receipt["client_operation_id"].is_string());
+        assert_eq!(receipt["request_hash"].as_str().map(str::len), Some(64));
+        let mcp = &responses["mcp_config_committed"]["data"];
+        assert_eq!(mcp["request_hash"].as_str().map(str::len), Some(64));
+    }
+
+    #[test]
     fn archived_fixtures_are_retained_but_not_in_the_live_compatibility_window() {
         for version in [12, 13] {
             assert!(!is_protocol_compatible(version));

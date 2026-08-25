@@ -1904,6 +1904,7 @@
   },
   "apply_extended_config_patch": {
     "params": {
+      "client_operation_id": "44444444-4444-4444-8444-444444444444",
       "project_root": "/tmp/project",
       "layer_id": "layer-capability",
       "patch": {

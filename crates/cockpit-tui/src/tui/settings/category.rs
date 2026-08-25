@@ -3161,6 +3161,22 @@ impl SettingsCx {
                     p.status = Some("saved".into());
                 }
             }
+            Ok(super::SettingsSaveOutcome::Queued) => {
+                if id == SettingId::SandboxEscalationEnabled {
+                    self.queue_after_extended_commit(
+                        "sandbox escalation refresh",
+                        super::SettingsEffectTarget {
+                            surface: "settings.sandbox-escalation",
+                            owner: self.dialog_id.to_string(),
+                            revision: self.extended_revision.clone(),
+                        },
+                        cockpit_core::daemon::proto::Request::SetSandboxEscalation {
+                            enabled: self.extended.sandbox_escalation_enabled,
+                        },
+                    );
+                }
+                p.status = Some("saving…".into());
+            }
             Ok(super::SettingsSaveOutcome::CommittedRefreshNeeded(warning)) => {
                 p.status = Some(format!("committed; refresh needed: {warning}"));
             }

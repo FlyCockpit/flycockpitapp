@@ -350,7 +350,44 @@ pub(super) enum SettingsPatchOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SettingsSaveOutcome {
     Saved,
+    Queued,
     CommittedRefreshNeeded(String),
+}
+
+enum PendingSettingsOperation {
+    ExtendedLoad {
+        requested_path: String,
+        project_root: String,
+        snapshot_session_id: String,
+    },
+    ExtendedSave {
+        requested_path: String,
+        project_root: String,
+        snapshot_session_id: String,
+        layer_id: String,
+        expected_layer: cockpit_core::daemon::proto::CockpitConfigLayer,
+        expected_revision: String,
+        expected_generation: u64,
+        operations: Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>,
+        denylist_plan: Vec<cockpit_core::daemon::proto::DesiredDenylistEntry>,
+    },
+    ExtendedRefresh {
+        requested_path: String,
+        expected_layer: cockpit_core::daemon::proto::CockpitConfigLayer,
+        result_revision: String,
+        result_generation: u64,
+        operations: Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>,
+        committed_denylist: Vec<cockpit_core::daemon::proto::CommittedDenylistEntry>,
+        warning: Option<String>,
+    },
+    ProviderCatalog {
+        project_root: String,
+        provider_id: Option<String>,
+    },
+    Followup {
+        label: &'static str,
+        target: SettingsEffectTarget,
+    },
 }
 
 fn apply_settings_patch_via_daemon(
@@ -1349,6 +1386,8 @@ impl std::fmt::Debug for TestPageMut<'_> {
 pub struct SettingsCx {
     dialog_id: uuid::Uuid,
     daemon_effects: VecDeque<SettingsDaemonEffectRequest>,
+    pending_settings: BTreeMap<uuid::Uuid, PendingSettingsOperation>,
+    after_extended_commit: Vec<(SettingsEffectTarget, Request, &'static str)>,
     pub config_path: PathBuf,
     /// Path to the cockpit-only config keys. Same `config.json` as
     /// [`config_path`](Self::config_path) (GOALS §2a) — the provider/model
@@ -1462,6 +1501,403 @@ impl SettingsCx {
 
     fn take_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
         self.daemon_effects.pop_front()
+    }
+
+    fn queue_extended_load(&mut self) {
+        let project_context = self
+            .active_project_root
+            .as_deref()
+            .or(self.picker_cwd.as_deref());
+        let Ok(project_root) = config_layer_request(&self.extended_path, project_context) else {
+            self.extended_warnings = vec!["settings request has no workspace root".into()];
+            return;
+        };
+        let requested_path = self.extended_path.display().to_string();
+        let snapshot_session_id = settings_snapshot_session_id().to_owned();
+        let target = SettingsEffectTarget {
+            surface: "settings.extended-load",
+            owner: requested_path.clone(),
+            revision: Some(snapshot_session_id.clone()),
+        };
+        let request = Request::GetExtendedConfigSnapshot {
+            project_root: project_root.clone(),
+            snapshot_session_id: snapshot_session_id.clone(),
+        };
+        let operation_id = self.enqueue_daemon_effect(target, request);
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ExtendedLoad {
+                requested_path,
+                project_root,
+                snapshot_session_id,
+            },
+        );
+        self.extended_revision = None;
+        self.extended_warnings = vec!["loading daemon-owned settings…".into()];
+    }
+
+    fn queue_provider_catalog(&mut self, provider_id: Option<String>) {
+        let project_root = self
+            .active_project_root
+            .clone()
+            .or_else(|| self.picker_cwd.clone())
+            .or_else(|| config_cwd(&self.config_path))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .display()
+            .to_string();
+        let owner = format!(
+            "{}::{}",
+            project_root,
+            provider_id.as_deref().unwrap_or("*")
+        );
+        let operation_id = self.enqueue_daemon_effect(
+            SettingsEffectTarget {
+                surface: "settings.provider-catalog",
+                owner,
+                revision: None,
+            },
+            Request::GetProviderCatalogSnapshot {
+                project_root: project_root.clone(),
+                provider_id: provider_id.clone(),
+            },
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ProviderCatalog {
+                project_root,
+                provider_id,
+            },
+        );
+    }
+
+    fn queue_extended_save(&mut self) -> Result<SettingsSaveOutcome, String> {
+        if self.pending_settings.values().any(|pending| {
+            matches!(
+                pending,
+                PendingSettingsOperation::ExtendedSave { .. }
+                    | PendingSettingsOperation::ExtendedRefresh { .. }
+            )
+        }) {
+            return Err("a settings save is already pending".into());
+        }
+        let expected_revision = self
+            .extended_revision
+            .clone()
+            .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
+        let desired_value =
+            serde_json::to_value(&self.extended).map_err(|error| error.to_string())?;
+        let operations = changed_extended_paths(&self.extended_base, &desired_value)?;
+        let denylist = denylist_mutations(&self.extended_base, &self.extended.redact.denylist)?;
+        let project_root = config_layer_request(
+            &self.extended_path,
+            self.active_project_root
+                .as_deref()
+                .or(self.picker_cwd.as_deref()),
+        )?;
+        let layer_id = self
+            .extended_base
+            .get("__cockpit_settings_layer_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "settings snapshot omitted its layer capability".to_string())?
+            .to_owned();
+        let expected_layer = serde_json::from_value(
+            self.extended_base
+                .get("__cockpit_settings_layer_kind")
+                .cloned()
+                .ok_or_else(|| "settings snapshot omitted its layer kind".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let expected_generation = self
+            .extended_base
+            .get("__cockpit_settings_generation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
+        let requested_path = self.extended_path.display().to_string();
+        let snapshot_session_id = settings_snapshot_session_id().to_owned();
+        let request = Request::ApplyExtendedConfigPatch {
+            project_root: project_root.clone(),
+            layer_id: layer_id.clone(),
+            patch: cockpit_core::daemon::proto::ExtendedConfigPatch {
+                operations: operations.clone(),
+                materialize: false,
+                denylist: denylist.clone(),
+                redacted_mutations: Vec::new(),
+            },
+            expected_revision: expected_revision.clone(),
+            snapshot_session_id: snapshot_session_id.clone(),
+        };
+        let operation_id = self.enqueue_daemon_effect(
+            SettingsEffectTarget {
+                surface: "settings.extended-save",
+                owner: layer_id.clone(),
+                revision: Some(expected_revision.clone()),
+            },
+            request,
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ExtendedSave {
+                requested_path,
+                project_root,
+                snapshot_session_id,
+                layer_id,
+                expected_layer,
+                expected_revision,
+                expected_generation,
+                operations,
+                denylist_plan: denylist,
+            },
+        );
+        Ok(SettingsSaveOutcome::Queued)
+    }
+
+    fn queue_after_extended_commit(
+        &mut self,
+        label: &'static str,
+        target: SettingsEffectTarget,
+        request: Request,
+    ) {
+        self.after_extended_commit.push((target, request, label));
+    }
+
+    fn apply_general_completion(
+        &mut self,
+        completion: SettingsDaemonEffectCompletion,
+    ) -> Result<(), SettingsDaemonEffectCompletion> {
+        let Some(pending) = self.pending_settings.remove(&completion.operation_id) else {
+            return Err(completion);
+        };
+        match pending {
+            PendingSettingsOperation::ExtendedLoad {
+                requested_path,
+                project_root: _,
+                snapshot_session_id,
+            } => {
+                if completion.target
+                    != (SettingsEffectTarget {
+                        surface: "settings.extended-load",
+                        owner: requested_path.clone(),
+                        revision: Some(snapshot_session_id),
+                    })
+                {
+                    return Ok(());
+                }
+                match completion.response {
+                    Ok(Response::ExtendedConfigSnapshot {
+                        layers,
+                        config_generation,
+                    }) => match layers
+                        .into_iter()
+                        .find(|layer| layer.display_path == requested_path)
+                        .ok_or_else(|| {
+                            "settings target is not a daemon-discovered layer".to_string()
+                        })
+                        .and_then(|layer| decode_extended_layer(layer, config_generation))
+                    {
+                        Ok((extended, base, revision)) => {
+                            self.extended = extended;
+                            self.extended_base = base;
+                            self.extended_revision = Some(revision);
+                            self.extended_warnings.clear();
+                        }
+                        Err(error) => self.extended_warnings = vec![error],
+                    },
+                    Ok(other) => {
+                        self.extended_warnings =
+                            vec![format!("unexpected settings snapshot response: {other:?}")]
+                    }
+                    Err(error) => self.extended_warnings = vec![format!("load failed: {error}")],
+                }
+            }
+            PendingSettingsOperation::ProviderCatalog {
+                project_root,
+                provider_id,
+            } => {
+                let expected = SettingsEffectTarget {
+                    surface: "settings.provider-catalog",
+                    owner: format!(
+                        "{}::{}",
+                        project_root,
+                        provider_id.as_deref().unwrap_or("*")
+                    ),
+                    revision: None,
+                };
+                if completion.target != expected {
+                    return Ok(());
+                }
+                match completion.response {
+                    Ok(Response::ProviderCatalogSnapshot { config }) => {
+                        let parsed = providers_config_from_view(&config);
+                        self.config = parsed.clone();
+                        self.original_config = parsed;
+                        if let Some(raw) = config.mcp_config_json
+                            && let Ok(mcp) = cockpit_core::mcp::config::McpConfig::parse(&raw)
+                        {
+                            self.mcp_config = mcp;
+                        }
+                    }
+                    Ok(other) => {
+                        tracing::warn!(response = ?other, "unexpected async provider catalog response")
+                    }
+                    Err(error) => tracing::warn!(%error, "async provider catalog load failed"),
+                }
+            }
+            PendingSettingsOperation::ExtendedSave {
+                requested_path,
+                project_root,
+                snapshot_session_id,
+                layer_id,
+                expected_layer,
+                expected_revision,
+                expected_generation,
+                operations,
+                denylist_plan,
+            } => {
+                let expected_target = SettingsEffectTarget {
+                    surface: "settings.extended-save",
+                    owner: layer_id.clone(),
+                    revision: Some(expected_revision.clone()),
+                };
+                if completion.target != expected_target {
+                    return Ok(());
+                }
+                let receipt = match completion.response {
+                    Ok(Response::ExtendedConfigSaved {
+                        hash,
+                        config_generation,
+                        layer_id: returned_layer_id,
+                        layer,
+                        consumed_revision,
+                        result_revision,
+                        status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+                        publication,
+                        denylist,
+                    }) if returned_layer_id == layer_id
+                        && layer == expected_layer
+                        && consumed_revision == expected_revision
+                        && hash == result_revision
+                        && cockpit_proto::is_opaque_authority_token(&result_revision)
+                        && validate_committed_denylist(&denylist_plan, &denylist).is_ok()
+                        && (config_generation == expected_generation
+                            || config_generation == expected_generation.saturating_add(1)) =>
+                    {
+                        let warning = (publication
+                            == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded)
+                            .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
+                        Ok((result_revision, config_generation, denylist, warning))
+                    }
+                    Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
+                    Err(error) => Err(error),
+                };
+                let (result_revision, result_generation, committed_denylist, warning) =
+                    match receipt {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            self.extended_warnings = vec![format!("save failed: {error}")];
+                            return Ok(());
+                        }
+                    };
+                // Once the commit receipt is valid, local cancellation or a
+                // refresh failure cannot turn it into a reported rejection.
+                self.extended_revision = None;
+                for (target, request, label) in std::mem::take(&mut self.after_extended_commit) {
+                    let followup_id = self.enqueue_daemon_effect(target.clone(), request);
+                    self.pending_settings.insert(
+                        followup_id,
+                        PendingSettingsOperation::Followup { label, target },
+                    );
+                }
+                let operation_id = self.enqueue_daemon_effect(
+                    SettingsEffectTarget {
+                        surface: "settings.extended-refresh",
+                        owner: layer_id,
+                        revision: Some(result_revision.clone()),
+                    },
+                    Request::GetExtendedConfigSnapshot {
+                        project_root,
+                        snapshot_session_id,
+                    },
+                );
+                self.pending_settings.insert(
+                    operation_id,
+                    PendingSettingsOperation::ExtendedRefresh {
+                        requested_path,
+                        expected_layer,
+                        result_revision,
+                        result_generation,
+                        operations,
+                        committed_denylist,
+                        warning,
+                    },
+                );
+                self.extended_warnings = vec!["settings committed; reconciling…".into()];
+            }
+            PendingSettingsOperation::ExtendedRefresh {
+                requested_path,
+                expected_layer,
+                result_revision,
+                result_generation,
+                operations,
+                committed_denylist,
+                warning,
+            } => {
+                if completion.target.surface != "settings.extended-refresh"
+                    || completion.target.revision.as_deref() != Some(result_revision.as_str())
+                {
+                    return Ok(());
+                }
+                let reconciled = match completion.response {
+                    Ok(Response::ExtendedConfigSnapshot {
+                        layers,
+                        config_generation,
+                    }) if warning.is_none() && config_generation == result_generation => layers
+                        .into_iter()
+                        .find(|layer| {
+                            layer.display_path == requested_path
+                                && layer.kind == expected_layer
+                                && layer.revision == result_revision
+                                && same_denylist_occurrences(&layer.denylist, &committed_denylist)
+                                && validate_settings_operations(
+                                    &operations,
+                                    &serde_json::to_value(&layer.config)
+                                        .unwrap_or(serde_json::Value::Null),
+                                    &layer.authored_paths,
+                                )
+                                .is_ok()
+                        })
+                        .map(|layer| (layer, config_generation)),
+                    _ => None,
+                };
+                match reconciled {
+                    Some((layer, generation)) => match decode_extended_layer(layer, generation) {
+                        Ok((extended, base, revision)) => {
+                            self.extended = extended;
+                            self.extended_base = base;
+                            self.extended_revision = Some(revision);
+                            self.extended_warnings.clear();
+                        }
+                        Err(error) => self.extended_warnings = vec![format!(
+                            "settings committed, but authoritative refresh was invalid: {error}"
+                        )],
+                    },
+                    None => self.extended_warnings = vec![warning.unwrap_or_else(|| {
+                        format!(
+                            "settings committed at generation {result_generation}, but refresh did not reconcile; reload before editing again"
+                        )
+                    })],
+                }
+            }
+            PendingSettingsOperation::Followup { label, target } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                if let Err(error) = completion.response {
+                    self.extended_warnings
+                        .push(format!("{label} failed after settings committed: {error}"));
+                }
+            }
+        }
+        Ok(())
     }
     /// Return a cached metadata-only inventory answer and arrange a background
     /// refresh on a cache miss.  This is deliberately safe to call from a
@@ -2757,6 +3193,10 @@ fn dispatch_from_settings_action(
 
 impl SettingsDialog {
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
+        let completion = match self.cx.apply_general_completion(completion) {
+            Ok(()) => return,
+            Err(completion) => completion,
+        };
         if let Some(page) = self.page.downcast_mut::<AgentsPage>() {
             page.apply_daemon_completion(&mut self.cx, completion);
         }
@@ -3034,13 +3474,10 @@ impl SettingsDialog {
 
 impl SettingsDialog {
     pub fn open(config_path: PathBuf) -> Self {
-        let project_root = config_path
-            .parent()
-            .and_then(std::path::Path::parent)
-            .or_else(|| config_path.parent())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let config = daemon_provider_snapshot(project_root, None).unwrap_or_default();
-        Self::open_with_config(config_path, config)
+        let mut settings = Self::open_with_config(config_path, ProvidersConfig::default());
+        settings.cx.queue_provider_catalog(None);
+        settings.cx.queue_extended_load();
+        settings
     }
 
     /// Construct settings from an already-authoritative provider snapshot.
@@ -3050,25 +3487,23 @@ impl SettingsDialog {
         // The cockpit-only keys live in the same `config.json` as the
         // layer-wide provider metadata (GOALS §2a).
         let extended_path = config_path.clone();
-        let (extended, extended_base, extended_revision, extended_warnings) =
-            extended_config_layer_snapshot(&extended_path, None)
-                .map(|(config, value, revision)| (config, value, Some(revision), Vec::new()))
-                .unwrap_or_else(|_| {
-                    let config = ExtendedConfig::default();
-                    let value = serde_json::to_value(&config).unwrap_or_default();
-                    (config, value, None, Vec::new())
-                });
+        let extended = ExtendedConfig::default();
+        let extended_base = serde_json::to_value(&extended).unwrap_or_default();
+        let extended_revision = None;
+        let extended_warnings = vec!["loading daemon-owned settings…".into()];
         // Fresh install (no config at this location yet): seed the
         // skills scan-dir list with the defaults so they show as ordinary
         // editable rows. Materialization-only — an existing config whose
         // `scan_dirs` is absent/empty stays empty (clean break).
-        let mcp_config = daemon_mcp_snapshot(&config_path).unwrap_or_default();
+        let mcp_config = cockpit_core::mcp::config::McpConfig::default();
         Self {
             page: root_page(0),
             stack: Vec::new(),
             cx: SettingsCx {
                 dialog_id: uuid::Uuid::new_v4(),
                 daemon_effects: VecDeque::new(),
+                pending_settings: BTreeMap::new(),
+                after_extended_commit: Vec::new(),
                 config_path,
                 extended_path,
                 scroll_states: SettingsScrollStates::default(),
@@ -3114,19 +3549,11 @@ impl SettingsDialog {
     /// Same as [`Self::open`] but records the cwd of the picker that
     /// opened this dialog so Root's back keybind can reopen it.
     pub fn open_from_picker(config_path: PathBuf, cwd: PathBuf) -> Self {
-        let config = daemon_provider_snapshot(&cwd, None).unwrap_or_default();
-        let mut s = Self::open_with_config(config_path, config);
+        let mut s = Self::open_with_config(config_path, ProvidersConfig::default());
         s.picker_cwd = Some(cwd.clone());
         s.active_project_root = Some(cwd);
-        if let Some(snapshot) = s
-            .active_project_root
-            .as_deref()
-            .and_then(|root| daemon_provider_view_snapshot(root, None))
-            .and_then(|config| config.mcp_config_json)
-            .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
-        {
-            s.cx.mcp_config = snapshot;
-        }
+        s.cx.queue_provider_catalog(None);
+        s.cx.queue_extended_load();
         // `open_with_config` already loaded the exact selected layer together
         // with its opaque revision. Do not replace it with the layered
         // effective projection here: doing so would materialize inherited
@@ -3136,56 +3563,12 @@ impl SettingsDialog {
 
     /// Reload the authoritative extended-config snapshot after saving.
     fn reload_extended(&mut self) {
-        if let Ok((extended, base, revision)) = extended_config_layer_snapshot(
-            &self.extended_path,
-            self.active_project_root
-                .as_deref()
-                .or(self.picker_cwd.as_deref()),
-        ) {
-            self.extended = extended;
-            self.extended_base = base;
-            self.extended_revision = Some(revision);
-            self.extended_warnings.clear();
-        }
+        self.cx.queue_extended_load();
     }
 
     /// Persist the cached extended-config through daemon authority.
     pub(super) fn save_extended(&mut self) -> Result<SettingsSaveOutcome, String> {
-        let revision = self
-            .extended_revision
-            .as_deref()
-            .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
-        let outcome = apply_settings_patch_via_daemon(
-            &self.extended_path,
-            self.active_project_root
-                .as_deref()
-                .or(self.picker_cwd.as_deref()),
-            &self.extended_base,
-            &self.extended,
-            revision,
-        )?;
-        match outcome {
-            SettingsPatchOutcome::Reconciled {
-                layer,
-                config_generation,
-            } => {
-                let (extended, base, revision) = decode_extended_layer(layer, config_generation)?;
-                self.extended = extended;
-                self.extended_base = base;
-                self.extended_revision = Some(revision);
-                self.extended_warnings.clear();
-                return Ok(SettingsSaveOutcome::Saved);
-            }
-            SettingsPatchOutcome::CommittedRefreshNeeded {
-                result_revision: _,
-                config_generation: _,
-                warning,
-            } => {
-                self.extended_revision = None;
-                self.extended_warnings = vec![warning.clone()];
-                return Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning));
-            }
-        }
+        self.cx.queue_extended_save()
     }
 
     #[cfg(test)]
@@ -4201,6 +4584,7 @@ impl SaveStatusValue for SettingsSaveOutcome {
     fn status(self) -> String {
         match self {
             SettingsSaveOutcome::Saved => "saved".into(),
+            SettingsSaveOutcome::Queued => "saving…".into(),
             SettingsSaveOutcome::CommittedRefreshNeeded(warning) => {
                 format!("committed; refresh needed: {warning}")
             }
@@ -4353,55 +4737,11 @@ impl SettingsCx {
     }
 
     fn reload_extended(&mut self) {
-        if let Ok((extended, base, revision)) = extended_config_layer_snapshot(
-            &self.extended_path,
-            self.active_project_root
-                .as_deref()
-                .or(self.picker_cwd.as_deref()),
-        ) {
-            self.extended = extended;
-            self.extended_base = base;
-            self.extended_revision = Some(revision);
-            self.extended_warnings.clear();
-        }
+        self.queue_extended_load();
     }
 
     pub(super) fn save_extended(&mut self) -> Result<SettingsSaveOutcome, String> {
-        let revision = self
-            .extended_revision
-            .as_deref()
-            .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
-        let outcome = apply_settings_patch_via_daemon(
-            &self.extended_path,
-            self.active_project_root
-                .as_deref()
-                .or(self.picker_cwd.as_deref()),
-            &self.extended_base,
-            &self.extended,
-            revision,
-        )?;
-        match outcome {
-            SettingsPatchOutcome::Reconciled {
-                layer,
-                config_generation,
-            } => {
-                let (extended, base, revision) = decode_extended_layer(layer, config_generation)?;
-                self.extended = extended;
-                self.extended_base = base;
-                self.extended_revision = Some(revision);
-                self.extended_warnings.clear();
-                return Ok(SettingsSaveOutcome::Saved);
-            }
-            SettingsPatchOutcome::CommittedRefreshNeeded {
-                result_revision: _,
-                config_generation: _,
-                warning,
-            } => {
-                self.extended_revision = None;
-                self.extended_warnings = vec![warning.clone()];
-                return Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning));
-            }
-        }
+        self.queue_extended_save()
     }
 
     fn protect_provider_literal_headers(

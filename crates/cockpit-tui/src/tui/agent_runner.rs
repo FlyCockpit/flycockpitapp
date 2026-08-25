@@ -6,7 +6,7 @@
 //! pipes the per-tick event stream from the daemon's broadcast back
 //! to the TUI in the same `Arc<Mutex<Vec<TurnEvent>>>` shape the rest
 //! of `app.rs` already consumes. The wire-shape of events is
-//! [`cockpit_core::daemon::proto::Event`]; we translate to [`TurnEvent`] at
+//! [`cockpit_proto::Event`]; we translate to [`TurnEvent`] at
 //! the boundary so the TUI rendering paths don't need to know they
 //! talk to a daemon.
 
@@ -26,11 +26,11 @@ use cockpit_core::daemon::bulk_upload::{
 };
 use cockpit_core::daemon::client::{DaemonClient, LifecycleMode, probe_or_spawn};
 use cockpit_core::daemon::image_upload::{ImageUploadError, upload_submission_images};
-use cockpit_core::daemon::proto::{self, ErrorCode, ErrorPayload, Request, Response};
 use cockpit_core::engine::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
 use cockpit_core::jitter::{JitterSource, SystemJitter};
+use cockpit_proto::{self, ErrorCode, ErrorPayload, Request, Response};
 
 /// The three 30-day autocomplete count maps fetched at session start.
 /// `models` and `slash` are global; `tags` is scoped to this session's
@@ -3035,7 +3035,7 @@ pub(crate) fn daemon_request_blocking_classified(
                 BlockingDaemonRequestError::Other(format!("daemon request: {error}"))
             })? {
                 Ok(response) => Ok(response),
-                Err(error) if error.code == cockpit_core::daemon::proto::ErrorCode::Conflict => {
+                Err(error) if error.code == cockpit_proto::ErrorCode::Conflict => {
                     Err(BlockingDaemonRequestError::Conflict(error.message))
                 }
                 Err(error) => Err(BlockingDaemonRequestError::Other(format!(
@@ -4576,9 +4576,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_history_page_blocking_rejects_unexpected_response() {
-        use cockpit_core::daemon::proto::{
-            Body, Envelope, ProtoStream, RecvFrame, Request, Response,
-        };
+        use cockpit_proto::{Body, Envelope, ProtoStream, RecvFrame, Request, Response};
         use tokio::net::UnixListener;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -4598,7 +4596,7 @@ mod tests {
                         active_sessions: 0,
                         socket_path: "test.sock".to_string(),
                         daemon_version: "test".to_string(),
-                        protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
+                        protocol_version: cockpit_proto::PROTOCOL_VERSION,
                         paused_sessions: 0,
                         database_path: "test.db".to_string(),
                         // Handshake negotiation intentionally ignores database
@@ -5936,7 +5934,7 @@ mod tests {
                                 session_id,
                                 &attach_context,
                                 &last,
-                                cockpit_core::daemon::proto::PROTOCOL_VERSION,
+                                cockpit_proto::PROTOCOL_VERSION,
                                 |request| async move {
                                     match request {
                                         Request::Attach {
@@ -6313,7 +6311,7 @@ mod tests {
         let outcome = switch_session_with_attach_request(
             attach_context,
             SessionTarget::New,
-            cockpit_core::daemon::proto::PROTOCOL_VERSION,
+            cockpit_proto::PROTOCOL_VERSION,
             move |request| {
                 captured.lock().unwrap().push(request);
                 async move {
@@ -6927,7 +6925,7 @@ mod tests {
         assert!(!is_global_turn_event(&TurnEvent::InterruptDecision {
             session_id: Uuid::new_v4(),
             interrupt_id: Uuid::new_v4(),
-            decision: cockpit_core::daemon::proto::InterruptDecision {
+            decision: cockpit_proto::InterruptDecision {
                 permission: true,
                 cancelled: false,
                 lines: Vec::new(),
@@ -6937,7 +6935,7 @@ mod tests {
         assert!(is_global_event(&proto::Event::InterruptResolved {
             session_id: Uuid::new_v4(),
             interrupt_id: Uuid::new_v4(),
-            decision: Some(cockpit_core::daemon::proto::InterruptDecision {
+            decision: Some(cockpit_proto::InterruptDecision {
                 permission: true,
                 cancelled: false,
                 lines: Vec::new(),

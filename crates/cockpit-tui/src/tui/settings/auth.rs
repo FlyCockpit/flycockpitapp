@@ -7,8 +7,8 @@
 //! async plumbing, not UI state.
 
 use cockpit_config::providers::ProviderEntry;
-use cockpit_core::daemon::proto::{ProviderModelFetchOutcome, Request, Response};
 use cockpit_core::providers::models_fetch::FetchOutcome;
+use cockpit_proto::{ProviderModelFetchOutcome, Request, Response};
 use std::sync::{Arc, Mutex};
 
 /// Shared cell for an in-flight `/models` fetch. The background task

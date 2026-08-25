@@ -93,7 +93,7 @@ fn fresh_queue_ack_does_not_duplicate_optimistic_user_row() {
     app.apply_event(TurnEvent::QueuedUserMessagesFolded {
         text: "fresh hello".to_string(),
         display_text: None,
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: "src/lib.rs".to_string(),
             detail: "1 line".to_string(),
@@ -580,7 +580,7 @@ fn queued_fold_event_renders_daemon_display_and_tag_metadata() {
     app.apply_event(TurnEvent::QueuedUserMessagesFolded {
         text: "<file path=\"src/lib.rs\">expanded</file>".to_string(),
         display_text: Some("queued @src/lib.rs".to_string()),
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: "src/lib.rs".to_string(),
             ok: true,

@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use cockpit_config::extended::ExtendedConfig;
 use cockpit_core::agents::{AgentKind, BUILTIN_AGENT_NAMES};
-use cockpit_core::daemon::proto::{
+use cockpit_proto::{
     AgentEditSnapshot, AgentEditTarget, AgentEditorCompletion, AgentEditorLease,
     AgentEditorSettlementStatus, AgentEntryKind, AgentInventoryEntry, AgentMutation,
     AgentMutationOutcome, AgentMutationResult, AgentSourceLayer, CockpitConfigLayer,
@@ -954,7 +954,7 @@ fn provider_catalog_snapshot(
             let headers = entry
                 .headers
                 .iter()
-                .map(|header| cockpit_core::daemon::proto::ProviderHeaderView {
+                .map(|header| cockpit_proto::ProviderHeaderView {
                     name: header.name.clone(),
                     value: "[redacted]".to_string(),
                     redacted: true,
@@ -965,7 +965,7 @@ fn provider_catalog_snapshot(
             projected.headers.clear();
             (
                 id.clone(),
-                cockpit_core::daemon::proto::ProviderEntryView {
+                cockpit_proto::ProviderEntryView {
                     entry: projected,
                     headers,
                     credential_configured,
@@ -993,7 +993,7 @@ fn provider_catalog_snapshot(
         serde_json::to_string(&config).ok()
     };
     Ok(Response::ProviderCatalogSnapshot {
-        config: cockpit_core::daemon::proto::ProviderConfigView {
+        config: cockpit_proto::ProviderConfigView {
             providers,
             category_defaults: config.category_defaults.clone(),
             on_unlisted_models_fetch: config.on_unlisted_models_fetch,

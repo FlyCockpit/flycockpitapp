@@ -20,7 +20,7 @@ pub(super) fn observe_export_write_thread(
 use crate::tui::agent_runner::AttachedRequest;
 use crate::tui::agent_runner::AttachedRequestBinding;
 use base64::Engine;
-use cockpit_core::daemon::proto::{ExportSessionKind, Request, Response};
+use cockpit_proto::{ExportSessionKind, Request, Response};
 #[cfg(test)]
 use tokio::sync::mpsc;
 
@@ -324,7 +324,7 @@ pub(super) async fn write_export_no_clobber(
 /// does not reproduce both exactly is rejected rather than written to disk.
 async fn pull_bulk_transfer(
     attached_request: &AttachedRequestBinding,
-    transfer: &cockpit_core::daemon::proto::bulk_transfer::BulkTransferRef,
+    transfer: &cockpit_proto::bulk_transfer::BulkTransferRef,
     command: &'static str,
     shutdown: &AsyncActionCancellation,
 ) -> Result<Vec<u8>, String> {
@@ -400,8 +400,8 @@ async fn pull_bulk_transfer(
 mod tests {
     use super::*;
     use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
-    use cockpit_core::daemon::proto::ExportSessionData;
-    use cockpit_core::daemon::proto::bulk_transfer as proto_bulk;
+    use cockpit_proto::ExportSessionData;
+    use cockpit_proto::bulk_transfer as proto_bulk;
     use std::sync::{Arc, Mutex};
 
     fn last_plain(app: &App) -> &str {

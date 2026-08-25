@@ -42,7 +42,7 @@ use crate::tui::message_block::{MessageBlock, MessageBlockRole, render_markdown_
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::pane_shared::{boxed_row, resolve_project_id, short_id};
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
-use cockpit_core::daemon::proto::{MessageRole, SessionMessage, SessionSummary};
+use cockpit_proto::{MessageRole, SessionMessage, SessionSummary};
 
 const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -125,19 +125,19 @@ pub fn classify(summary: &SessionSummary, live: Option<(bool, bool)>) -> Tier {
         return Tier::ActiveSchedules;
     }
     match summary.activity_state {
-        Some(cockpit_core::daemon::proto::SessionActivityState::ToolRunning) => {
+        Some(cockpit_proto::SessionActivityState::ToolRunning) => {
             return Tier::ToolRunning;
         }
-        Some(cockpit_core::daemon::proto::SessionActivityState::InferenceInProgress) => {
+        Some(cockpit_proto::SessionActivityState::InferenceInProgress) => {
             return Tier::InferenceInProgress;
         }
-        Some(cockpit_core::daemon::proto::SessionActivityState::Interrupted) => {
+        Some(cockpit_proto::SessionActivityState::Interrupted) => {
             return Tier::Interrupted;
         }
-        Some(cockpit_core::daemon::proto::SessionActivityState::PendingQuestion) => {
+        Some(cockpit_proto::SessionActivityState::PendingQuestion) => {
             return Tier::PendingQuestion;
         }
-        Some(cockpit_core::daemon::proto::SessionActivityState::Parked) | None => {}
+        Some(cockpit_proto::SessionActivityState::Parked) | None => {}
     }
     if let Some((_has_schedules, processing)) = live
         && processing
@@ -260,7 +260,7 @@ pub(crate) struct SessionsMutationEffect {
     pub(crate) pane_id: Uuid,
     pub(crate) operation_id: Uuid,
     pub(crate) target: SessionsMutationTarget,
-    pub(crate) request: cockpit_core::daemon::proto::Request,
+    pub(crate) request: cockpit_proto::Request,
 }
 
 #[derive(Debug)]
@@ -268,7 +268,7 @@ pub(crate) struct SessionsMutationCompletion {
     pub(crate) pane_id: Uuid,
     pub(crate) operation_id: Uuid,
     pub(crate) target: SessionsMutationTarget,
-    pub(crate) response: Result<cockpit_core::daemon::proto::Response, String>,
+    pub(crate) response: Result<cockpit_proto::Response, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1032,7 +1032,7 @@ impl SessionsPane {
         session_id: Uuid,
         choice: ConfirmChoice,
     ) -> Option<SessionsOutcome> {
-        use cockpit_core::daemon::proto::Request;
+        use cockpit_proto::Request;
         let req = match choice {
             ConfirmChoice::Cancel => {
                 self.step = Step::Browse;
@@ -1068,7 +1068,7 @@ impl SessionsPane {
         Some(SessionsOutcome::Mutate(self.begin_mutation(
             s.session_id,
             "unarchive",
-            cockpit_core::daemon::proto::Request::UnarchiveSession {
+            cockpit_proto::Request::UnarchiveSession {
                 session_id: s.session_id,
             },
         )))
@@ -1078,7 +1078,7 @@ impl SessionsPane {
         &mut self,
         session_id: Uuid,
         kind: &'static str,
-        request: cockpit_core::daemon::proto::Request,
+        request: cockpit_proto::Request,
     ) -> SessionsMutationEffect {
         let operation_id = Uuid::new_v4();
         let target = SessionsMutationTarget { session_id, kind };
@@ -1111,7 +1111,7 @@ impl SessionsPane {
         }
         self.pending_mutation = None;
         match completion.response {
-            Ok(cockpit_core::daemon::proto::Response::Ack) => {
+            Ok(cockpit_proto::Response::Ack) => {
                 self.error = None;
                 self.notice = Some(format!("{} committed", completion.target.kind));
                 self.reload_current_level();
@@ -2280,14 +2280,13 @@ mod tests {
     #[test]
     fn classify_distinguishes_activity_states() {
         let mut s = summary(Uuid::new_v4(), 100);
-        s.activity_state = Some(cockpit_core::daemon::proto::SessionActivityState::ToolRunning);
+        s.activity_state = Some(cockpit_proto::SessionActivityState::ToolRunning);
         assert_eq!(classify(&s, Some((false, true))), Tier::ToolRunning);
-        s.activity_state =
-            Some(cockpit_core::daemon::proto::SessionActivityState::InferenceInProgress);
+        s.activity_state = Some(cockpit_proto::SessionActivityState::InferenceInProgress);
         assert_eq!(classify(&s, None), Tier::InferenceInProgress);
-        s.activity_state = Some(cockpit_core::daemon::proto::SessionActivityState::Interrupted);
+        s.activity_state = Some(cockpit_proto::SessionActivityState::Interrupted);
         assert_eq!(classify(&s, None), Tier::Interrupted);
-        s.activity_state = Some(cockpit_core::daemon::proto::SessionActivityState::PendingQuestion);
+        s.activity_state = Some(cockpit_proto::SessionActivityState::PendingQuestion);
         s.open_interrupts = 2;
         assert_eq!(classify(&s, None), Tier::PendingQuestion);
         assert_eq!(classify(&s, Some((true, true))), Tier::ActiveSchedules);

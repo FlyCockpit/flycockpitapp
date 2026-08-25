@@ -15,17 +15,17 @@ use super::{App, ToastKind, render};
 
 fn pin_rpc(
     socket: &std::path::Path,
-    request: cockpit_core::daemon::proto::Request,
-) -> Result<cockpit_core::daemon::proto::Response, String> {
+    request: cockpit_proto::Request,
+) -> Result<cockpit_proto::Response, String> {
     crate::tui::agent_runner::daemon_request_at_blocking(socket, request)
 }
 
 fn load_pin_state(socket: &std::path::Path, sid: uuid::Uuid) -> Result<(usize, Vec<i64>), String> {
     match pin_rpc(
         socket,
-        cockpit_core::daemon::proto::Request::PinnedMessageState { session_id: sid },
+        cockpit_proto::Request::PinnedMessageState { session_id: sid },
     )? {
-        cockpit_core::daemon::proto::Response::PinState { state } => {
+        cockpit_proto::Response::PinState { state } => {
             Ok((state.count.max(0) as usize, state.seqs))
         }
         other => Err(format!("unexpected pin-state response: {other:?}")),
@@ -209,12 +209,12 @@ impl App {
             move || {
                 let now_pinned = match pin_rpc(
                     &socket,
-                    cockpit_core::daemon::proto::Request::TogglePinnedMessage {
+                    cockpit_proto::Request::TogglePinnedMessage {
                         session_id: sid,
                         seq,
                     },
                 )? {
-                    cockpit_core::daemon::proto::Response::PinToggled { pinned } => pinned,
+                    cockpit_proto::Response::PinToggled { pinned } => pinned,
                     other => return Err(format!("unexpected pin-toggle response: {other:?}")),
                 };
                 let (count, pinned_seqs) = load_pin_state(&socket, sid)?;
@@ -272,11 +272,9 @@ impl App {
             move || {
                 let pins = match pin_rpc(
                     &socket,
-                    cockpit_core::daemon::proto::Request::ListPinnedMessagesWithText {
-                        session_id: sid,
-                    },
+                    cockpit_proto::Request::ListPinnedMessagesWithText { session_id: sid },
                 )? {
-                    cockpit_core::daemon::proto::Response::PinsWithText { pins } => pins,
+                    cockpit_proto::Response::PinsWithText { pins } => pins,
                     other => return Err(format!("unexpected pins-review response: {other:?}")),
                 };
                 Ok(AsyncActionPayload::PinsReview {
@@ -290,7 +288,7 @@ impl App {
     pub(super) fn apply_pins_review(
         &mut self,
         sid: uuid::Uuid,
-        pins: Vec<cockpit_core::daemon::proto::PinnedMessage>,
+        pins: Vec<cockpit_proto::PinnedMessage>,
     ) {
         if self.current_session_id() != Some(sid) {
             return;
@@ -515,14 +513,12 @@ impl App {
                         move || {
                             let inserted = match pin_rpc(
                                 &socket,
-                                cockpit_core::daemon::proto::Request::PinMessage {
+                                cockpit_proto::Request::PinMessage {
                                     session_id: sid,
                                     seq,
                                 },
                             )? {
-                                cockpit_core::daemon::proto::Response::PinChanged { changed } => {
-                                    changed
-                                }
+                                cockpit_proto::Response::PinChanged { changed } => changed,
                                 other => return Err(format!("unexpected pin response: {other:?}")),
                             };
                             let (count, pinned_seqs) = load_pin_state(&socket, sid)?;
@@ -596,12 +592,12 @@ impl App {
                 move || {
                     match pin_rpc(
                         &socket,
-                        cockpit_core::daemon::proto::Request::UnpinMessage {
+                        cockpit_proto::Request::UnpinMessage {
                             session_id: sid,
                             seq,
                         },
                     )? {
-                        cockpit_core::daemon::proto::Response::PinChanged { .. } => {}
+                        cockpit_proto::Response::PinChanged { .. } => {}
                         other => return Err(format!("unexpected unpin response: {other:?}")),
                     }
                     let (count, pinned_seqs) = load_pin_state(&socket, sid)?;
@@ -1096,9 +1092,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fork_for_seq_sends_fork_session_request_with_message_seq() {
-        use cockpit_core::daemon::proto::{
-            Body, Envelope, ProtoStream, RecvFrame, Request, Response,
-        };
+        use cockpit_proto::{Body, Envelope, ProtoStream, RecvFrame, Request, Response};
         use tokio::net::UnixListener;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1118,7 +1112,7 @@ mod tests {
                         active_sessions: 0,
                         socket_path: "test.sock".to_string(),
                         daemon_version: "test".to_string(),
-                        protocol_version: cockpit_core::daemon::proto::PROTOCOL_VERSION,
+                        protocol_version: cockpit_proto::PROTOCOL_VERSION,
                         paused_sessions: 0,
                         database_path: "test.db".to_string(),
                         // Handshake negotiation intentionally ignores database

@@ -313,7 +313,7 @@ fn settings_layer_base(
     );
     object.insert(
         "__cockpit_settings_layer_kind".into(),
-        serde_json::to_value(cockpit_core::daemon::proto::CockpitConfigLayer::Project).unwrap(),
+        serde_json::to_value(cockpit_proto::CockpitConfigLayer::Project).unwrap(),
     );
     object.insert(
         "__cockpit_settings_generation".into(),
@@ -338,18 +338,18 @@ fn injected_settings_transport_uses_production_receipt_and_reconciliation_path()
                 hash: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243".into(),
                 config_generation: 8,
                 layer_id: layer_id.into(),
-                layer: cockpit_core::daemon::proto::CockpitConfigLayer::Project,
+                layer: cockpit_proto::CockpitConfigLayer::Project,
                 consumed_revision: "revision-1".into(),
                 result_revision: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243"
                     .into(),
-                status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
-                publication: cockpit_core::daemon::proto::ConfigPublicationStatus::Published,
+                status: cockpit_proto::ConfigCommitStatus::Committed,
+                publication: cockpit_proto::ConfigPublicationStatus::Published,
                 denylist: Vec::new(),
             }),
             Ok(Response::ExtendedConfigSnapshot {
-                layers: vec![cockpit_core::daemon::proto::ExtendedConfigLayerSnapshot {
+                layers: vec![cockpit_proto::ExtendedConfigLayerSnapshot {
                     layer_id: layer_id.into(),
-                    kind: cockpit_core::daemon::proto::CockpitConfigLayer::Project,
+                    kind: cockpit_proto::CockpitConfigLayer::Project,
                     display_path: path.display().to_string(),
                     config: Box::new(config.clone()),
                     denylist: Vec::new(),
@@ -396,12 +396,12 @@ fn injected_settings_transport_rejects_wrong_consumed_revision() {
                 hash: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243".into(),
                 config_generation: 8,
                 layer_id: "layer-capability".into(),
-                layer: cockpit_core::daemon::proto::CockpitConfigLayer::Project,
+                layer: cockpit_proto::CockpitConfigLayer::Project,
                 consumed_revision: "wrong-revision".into(),
                 result_revision: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243"
                     .into(),
-                status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
-                publication: cockpit_core::daemon::proto::ConfigPublicationStatus::Published,
+                status: cockpit_proto::ConfigCommitStatus::Committed,
+                publication: cockpit_proto::ConfigPublicationStatus::Published,
                 denylist: Vec::new(),
             },
         )])),
@@ -456,11 +456,11 @@ fn settings_config_mutations_stay_daemon_owned() {
 #[test]
 fn denylist_draft_occurrences_do_not_infer_identity_from_equal_masks() {
     let entries = vec![
-        cockpit_core::daemon::proto::RedactedDenylistEntry {
+        cockpit_proto::RedactedDenylistEntry {
             entry_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
         },
-        cockpit_core::daemon::proto::RedactedDenylistEntry {
+        cockpit_proto::RedactedDenylistEntry {
             entry_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
             display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
         },
@@ -481,12 +481,12 @@ fn denylist_draft_occurrences_do_not_infer_identity_from_equal_masks() {
     let planned = super::denylist_mutations(&base, &desired).unwrap();
     assert!(matches!(
         &planned[0],
-        cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
+        cockpit_proto::DesiredDenylistEntry::Existing { entry_id }
             if entry_id == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     ));
     assert!(matches!(
         &planned[1],
-        cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
+        cockpit_proto::DesiredDenylistEntry::Existing { entry_id }
             if entry_id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     ));
 }
@@ -509,22 +509,22 @@ fn denylist_commit_receipt_binds_consumed_and_created_occurrences_exactly() {
     let result_new = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     let nonce = "11111111-1111-4111-8111-111111111111";
     let planned = vec![
-        cockpit_core::daemon::proto::DesiredDenylistEntry::Existing {
+        cockpit_proto::DesiredDenylistEntry::Existing {
             entry_id: existing.into(),
         },
-        cockpit_core::daemon::proto::DesiredDenylistEntry::New {
+        cockpit_proto::DesiredDenylistEntry::New {
             client_nonce: nonce.into(),
-            literal: cockpit_core::daemon::proto::SensitiveWireLiteral::new("secret".into()),
+            literal: cockpit_proto::SensitiveWireLiteral::new("secret".into()),
         },
     ];
     let committed = vec![
-        cockpit_core::daemon::proto::CommittedDenylistEntry {
+        cockpit_proto::CommittedDenylistEntry {
             entry_id: result_existing.into(),
             consumed_entry_id: Some(existing.into()),
             client_nonce: None,
             display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
         },
-        cockpit_core::daemon::proto::CommittedDenylistEntry {
+        cockpit_proto::CommittedDenylistEntry {
             entry_id: result_new.into(),
             consumed_entry_id: None,
             client_nonce: Some(nonce.into()),
@@ -5779,7 +5779,7 @@ fn seed_workspace_trust(root: &std::path::Path) {
         match client
             .request(Request::SetWorkspaceTrust {
                 project_root,
-                mode: cockpit_core::daemon::proto::WorkspaceTrustMode::Trust,
+                mode: cockpit_proto::WorkspaceTrustMode::Trust,
                 expected_config_generation,
             })
             .await
@@ -8772,7 +8772,7 @@ async fn tools_page_web_key_entry_persists_and_renders_masked() {
     let response = client
         .request(Request::ListSecretInventory {
             cursor: None,
-            limit: Some(cockpit_core::daemon::proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES as u16),
+            limit: Some(cockpit_proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES as u16),
         })
         .await
         .expect("owner inventory transport")
@@ -8782,7 +8782,7 @@ async fn tools_page_web_key_entry_persists_and_renders_masked() {
     };
     assert!(
         entries.iter().any(|entry| entry.name == "firecrawl"
-            && entry.kind == cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord),
+            && entry.kind == cockpit_proto::SecretInventoryKind::CredentialRecord),
         "owner vault must hold the firecrawl web-key credential: {entries:?}"
     );
     let wire = serde_json::to_string(&entries).expect("inventory serializes");

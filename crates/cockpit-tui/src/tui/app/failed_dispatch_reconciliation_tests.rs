@@ -27,7 +27,7 @@ fn runner_with_sender(
 
 fn runner_with_channels(
     input_tx: mpsc::Sender<RunnerInput>,
-    record_tx: mpsc::Sender<cockpit_core::daemon::proto::Request>,
+    record_tx: mpsc::Sender<cockpit_proto::Request>,
     events: Arc<Mutex<Vec<crate::tui::agent_runner::QueuedTurnEvent>>>,
 ) -> AgentRunner {
     let (control_tx, _control_rx) = mpsc::channel(1);
@@ -36,7 +36,7 @@ fn runner_with_channels(
 
 fn runner_with_all_channels(
     input_tx: mpsc::Sender<RunnerInput>,
-    record_tx: mpsc::Sender<cockpit_core::daemon::proto::Request>,
+    record_tx: mpsc::Sender<cockpit_proto::Request>,
     control_tx: mpsc::Sender<ControlRequest>,
     events: Arc<Mutex<Vec<crate::tui::agent_runner::QueuedTurnEvent>>>,
 ) -> AgentRunner {
@@ -248,8 +248,7 @@ fn seed_new_session_reset_state(app: &mut App) -> mpsc::Receiver<ControlRequest>
     app.usage_slash.insert("/new".to_string(), 1);
     app.usage_tags.insert("src/lib.rs".to_string(), 1);
     app.project_id = Some("project-old".to_string());
-    app.pending_usage
-        .push(cockpit_core::daemon::proto::Request::CancelTurn);
+    app.pending_usage.push(cockpit_proto::Request::CancelTurn);
     app.last_usage = Some(cockpit_core::tokens::TokenUsage {
         input_tokens: 10,
         output_tokens: 2,
@@ -671,7 +670,7 @@ fn session_switch_busy_guard_interrupts_only_when_busy() {
     app.cancel_outgoing_turn_if_busy();
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(cockpit_core::daemon::proto::Request::CancelTurn)
+        Ok(cockpit_proto::Request::CancelTurn)
     ));
     assert!(control_rx.try_recv().is_err(), "only one cancel is sent");
 }
@@ -710,7 +709,7 @@ fn new_session_clear_failure_is_nonfatal_and_finishes_reset() {
     assert!(changed, "serviced /new must request a follow-up redraw");
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(cockpit_core::daemon::proto::Request::CancelTurn)
+        Ok(cockpit_proto::Request::CancelTurn)
     ));
     assert!(control_rx.try_recv().is_err(), "only one cancel is sent");
     assert!(!app.pending_new_session);
@@ -1154,7 +1153,7 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
         origin: Default::default(),
         text: "exact wire text".to_string(),
         display_text: Some("visible side draft".to_string()),
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: "src/lib.rs".to_string(),
             detail: "expanded".to_string(),
@@ -1263,7 +1262,7 @@ fn complete_dispatch_submission(marker: &str) -> UserSubmission {
         origin: Default::default(),
         text: format!("wire-{marker}"),
         display_text: Some(format!("visible-{marker}")),
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: format!("src/{marker}.rs"),
             detail: format!("expanded-{marker}"),
@@ -1785,7 +1784,7 @@ fn failed_fresh_dispatch_removes_unsent_tag_rows() {
     let mut app = App::new(Some(tmp.path()), false);
     app.agent_runner = Some(Err("model missing".to_string()));
     app.begin_working_span();
-    let tags = vec![cockpit_core::daemon::proto::TagExpansionMeta {
+    let tags = vec![cockpit_proto::TagExpansionMeta {
         tool: "read".to_string(),
         path: "src/lib.rs".to_string(),
         detail: "10 lines".to_string(),
@@ -1873,7 +1872,7 @@ fn multireview_kickoff_queue_full_reconciles_user_row_and_ends_span() {
 
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(cockpit_core::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
+        Ok(cockpit_proto::Request::SetAgent { name }) if name == "Multireview"
     ));
     app.apply_event(cockpit_core::engine::TurnEvent::ControlRequestFinished {
         request_id: cockpit_core::engine::ControlRequestId(1),
@@ -1917,7 +1916,7 @@ fn multireview_kickoff_closed_reconciles_user_row_and_ends_span() {
 
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(cockpit_core::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
+        Ok(cockpit_proto::Request::SetAgent { name }) if name == "Multireview"
     ));
     app.apply_event(cockpit_core::engine::TurnEvent::ControlRequestFinished {
         request_id: cockpit_core::engine::ControlRequestId(1),
@@ -1948,7 +1947,7 @@ fn multireview_kickoff_success_warns_pushes_user_and_dispatches() {
 
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(cockpit_core::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
+        Ok(cockpit_proto::Request::SetAgent { name }) if name == "Multireview"
     ));
     app.apply_event(cockpit_core::engine::TurnEvent::ControlRequestFinished {
         request_id: cockpit_core::engine::ControlRequestId(1),
@@ -2063,7 +2062,7 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
             cockpit_core::engine::message::IMAGE_PART_SENTINEL
         ),
         display_text: Some("visible composer text".to_string()),
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: "src/lib.rs".to_string(),
             detail: "expanded before switch".to_string(),

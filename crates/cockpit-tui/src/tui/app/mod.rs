@@ -320,7 +320,7 @@ pub(crate) struct PendingModelSelection {
     pub requested: cockpit_config::providers::ActiveModelRef,
     // Origin retained for lifecycle diagnostics. It is metadata only: the
     // daemon remains the authority for the resulting session state.
-    pub trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+    pub trigger: cockpit_proto::ActiveModelSwitchTrigger,
     /// Any terminal result from an older authoritative state is stale and
     /// cannot release input into this selection.
     pub minimum_generation: u64,
@@ -335,7 +335,7 @@ pub(crate) struct QueuedModelSubmission {
     pub composer_text: String,
     pub display: String,
     pub submission: cockpit_core::engine::message::UserSubmission,
-    pub tag_expansions: Vec<cockpit_core::daemon::proto::TagExpansionMeta>,
+    pub tag_expansions: Vec<cockpit_proto::TagExpansionMeta>,
 }
 
 pub(crate) struct PendingPasteProbe {
@@ -359,7 +359,7 @@ pub(crate) struct PendingPasteProbe {
 pub(crate) struct DeferredFenceDispatch {
     pub display: String,
     pub submission: cockpit_core::engine::message::UserSubmission,
-    pub tag_expansions: Vec<cockpit_core::daemon::proto::TagExpansionMeta>,
+    pub tag_expansions: Vec<cockpit_proto::TagExpansionMeta>,
     pub waiting_model_selection: Option<uuid::Uuid>,
     pub parked_fence_sequence: Option<u64>,
 }
@@ -408,7 +408,7 @@ pub(crate) struct McpLocalCompletion {
     pub project_root: String,
     pub intent: McpLocalIntent,
     pub phase: McpLocalPhase,
-    pub response: Result<cockpit_core::daemon::proto::Response, String>,
+    pub response: Result<cockpit_proto::Response, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -440,7 +440,7 @@ pub(crate) struct ModelSelectionRetry {
     /// preference. It remains paired with the optional held wire submission
     /// so a later unrelated quick/cycle choice cannot silently consume it.
     pub requested: cockpit_config::providers::ActiveModelRef,
-    pub trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+    pub trigger: cockpit_proto::ActiveModelSwitchTrigger,
     pub queued_submission: Option<QueuedModelSubmission>,
 }
 
@@ -708,14 +708,12 @@ impl App {
         mode: cockpit_config::WorkspaceTrustMode,
     ) -> bool {
         let rpc_mode = match mode {
-            cockpit_config::WorkspaceTrustMode::Trust => {
-                cockpit_core::daemon::proto::WorkspaceTrustMode::Trust
-            }
+            cockpit_config::WorkspaceTrustMode::Trust => cockpit_proto::WorkspaceTrustMode::Trust,
             cockpit_config::WorkspaceTrustMode::IgnoreConfig => {
-                cockpit_core::daemon::proto::WorkspaceTrustMode::IgnoreConfig
+                cockpit_proto::WorkspaceTrustMode::IgnoreConfig
             }
             cockpit_config::WorkspaceTrustMode::Untrusted => {
-                cockpit_core::daemon::proto::WorkspaceTrustMode::Untrusted
+                cockpit_proto::WorkspaceTrustMode::Untrusted
             }
         };
         if self.pending_workspace_trust.is_some() {
@@ -816,7 +814,7 @@ struct PendingWorkspaceTrust {
     operation_id: uuid::Uuid,
     root: cockpit_config::trust::TrustRoot,
     mode: cockpit_config::WorkspaceTrustMode,
-    rpc_mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    rpc_mode: cockpit_proto::WorkspaceTrustMode,
     project_root: String,
     expected_generation: u64,
 }
@@ -825,7 +823,7 @@ struct PendingWorkspaceTrust {
 pub(crate) struct WorkspaceTrustCompletion {
     pub(crate) operation_id: uuid::Uuid,
     pub(crate) project_root: String,
-    pub(crate) mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    pub(crate) mode: cockpit_proto::WorkspaceTrustMode,
     pub(crate) expected_generation: u64,
     pub(crate) result: Result<u64, String>,
 }
@@ -833,12 +831,12 @@ pub(crate) struct WorkspaceTrustCompletion {
 #[derive(Debug)]
 pub(crate) struct ImageIngressDraftDiscardCompletion {
     pub(crate) draft: crate::tui::paste::ImageIngressDraftAuthority,
-    pub(crate) response: Result<cockpit_core::daemon::proto::Response, String>,
+    pub(crate) response: Result<cockpit_proto::Response, String>,
 }
 
 async fn set_workspace_trust_async(
     project_root: &str,
-    mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    mode: cockpit_proto::WorkspaceTrustMode,
     mut expected_generation: u64,
 ) -> Result<u64, String> {
     let client = crate::tui::settings::settings_daemon_client()
@@ -846,7 +844,7 @@ async fn set_workspace_trust_async(
         .map_err(|error| error.to_string())?;
     for attempt in 0..=1 {
         let response = client
-            .request(cockpit_core::daemon::proto::Request::SetWorkspaceTrust {
+            .request(cockpit_proto::Request::SetWorkspaceTrust {
                 project_root: project_root.to_string(),
                 mode,
                 expected_config_generation: expected_generation,
@@ -854,31 +852,25 @@ async fn set_workspace_trust_async(
             .await
             .map_err(|error| format!("daemon request: {error}"))?;
         match response {
-            Ok(cockpit_core::daemon::proto::Response::WorkspaceTrustSet { config_generation })
+            Ok(cockpit_proto::Response::WorkspaceTrustSet { config_generation })
                 if config_generation > expected_generation =>
             {
                 return Ok(config_generation);
             }
-            Ok(cockpit_core::daemon::proto::Response::WorkspaceTrustSet { .. }) => {
+            Ok(cockpit_proto::Response::WorkspaceTrustSet { .. }) => {
                 return Err("daemon returned a non-advancing workspace trust generation".into());
             }
             Ok(other) => return Err(format!("unexpected workspace trust response: {other:?}")),
-            Err(error)
-                if error.code == cockpit_core::daemon::proto::ErrorCode::Conflict
-                    && attempt == 0 =>
-            {
+            Err(error) if error.code == cockpit_proto::ErrorCode::Conflict && attempt == 0 => {
                 expected_generation = match client
-                    .request(
-                        cockpit_core::daemon::proto::Request::GetStartupDisclosures {
-                            project_root: project_root.to_string(),
-                        },
-                    )
+                    .request(cockpit_proto::Request::GetStartupDisclosures {
+                        project_root: project_root.to_string(),
+                    })
                     .await
                     .map_err(|error| format!("daemon request: {error}"))?
                 {
-                    Ok(cockpit_core::daemon::proto::Response::StartupDisclosures {
-                        config_generation,
-                        ..
+                    Ok(cockpit_proto::Response::StartupDisclosures {
+                        config_generation, ..
                     }) => config_generation,
                     Ok(other) => {
                         return Err(format!(
@@ -897,37 +889,34 @@ async fn set_workspace_trust_async(
 #[cfg(test)]
 fn set_workspace_trust_with_retry(
     project_root: &str,
-    mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    mode: cockpit_proto::WorkspaceTrustMode,
     mut expected_generation: u64,
     mut request: impl FnMut(
-        cockpit_core::daemon::proto::Request,
+        cockpit_proto::Request,
     ) -> Result<
-        cockpit_core::daemon::proto::Response,
+        cockpit_proto::Response,
         crate::tui::agent_runner::BlockingDaemonRequestError,
     >,
 ) -> Result<u64, String> {
     for attempt in 0..=1 {
-        let response = request(cockpit_core::daemon::proto::Request::SetWorkspaceTrust {
+        let response = request(cockpit_proto::Request::SetWorkspaceTrust {
             project_root: project_root.to_string(),
             mode,
             expected_config_generation: expected_generation,
         });
         match response {
-            Ok(cockpit_core::daemon::proto::Response::WorkspaceTrustSet { config_generation }) => {
+            Ok(cockpit_proto::Response::WorkspaceTrustSet { config_generation }) => {
                 return Ok(config_generation);
             }
             Ok(other) => return Err(format!("unexpected workspace trust response: {other:?}")),
             Err(crate::tui::agent_runner::BlockingDaemonRequestError::Conflict(_))
                 if attempt == 0 =>
             {
-                expected_generation = match request(
-                    cockpit_core::daemon::proto::Request::GetStartupDisclosures {
-                        project_root: project_root.to_string(),
-                    },
-                ) {
-                    Ok(cockpit_core::daemon::proto::Response::StartupDisclosures {
-                        config_generation,
-                        ..
+                expected_generation = match request(cockpit_proto::Request::GetStartupDisclosures {
+                    project_root: project_root.to_string(),
+                }) {
+                    Ok(cockpit_proto::Response::StartupDisclosures {
+                        config_generation, ..
                     }) => config_generation,
                     Ok(other) => {
                         return Err(format!(
@@ -1378,7 +1367,7 @@ pub(super) struct PendingPausedWork {
 /// history needs an explicit repair/fork/export decision.
 pub(super) struct PendingResumeRepair {
     pub(super) interrupt_id: uuid::Uuid,
-    pub(super) state: cockpit_core::daemon::proto::ResumeRepairState,
+    pub(super) state: cockpit_proto::ResumeRepairState,
 }
 
 #[derive(Default)]
@@ -1595,7 +1584,7 @@ pub(super) enum RunnerAttachContinuation {
         label: String,
         active: cockpit_config::providers::ActiveModelRef,
         persist_as_default: bool,
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger,
     },
     BtwCommand(String),
     Compact,
@@ -1896,7 +1885,7 @@ pub(crate) struct HeldConfig {
     /// The daemon's redacted provider projection: header *values* stripped,
     /// header *names* + `credential_configured` retained. Read by consumers
     /// that need provider identity/auth state without secret material.
-    pub(crate) provider_view: cockpit_core::daemon::proto::ProviderConfigView,
+    pub(crate) provider_view: cockpit_proto::ProviderConfigView,
     /// Reconstructed from [`Self::provider_view`] for the `resolve_*` /
     /// model-listing consumers. Header values are absent (never needed for
     /// resolution); the TUI never renders credential material from it.
@@ -1908,7 +1897,7 @@ impl HeldConfig {
         generation: u64,
         from_daemon: bool,
         extended: cockpit_config::extended::ExtendedConfig,
-        provider_view: cockpit_core::daemon::proto::ProviderConfigView,
+        provider_view: cockpit_proto::ProviderConfigView,
     ) -> Self {
         let mut providers = providers_from_view(&provider_view);
         providers.set_resolution_generation(generation);
@@ -1926,7 +1915,7 @@ impl HeldConfig {
 /// view carries no secrets (credential refs and header values are stripped
 /// daemon-side); the TUI only ever renders this projection.
 fn providers_from_view(
-    view: &cockpit_core::daemon::proto::ProviderConfigView,
+    view: &cockpit_proto::ProviderConfigView,
 ) -> cockpit_config::providers::ProvidersConfig {
     cockpit_config::providers::ProvidersConfig {
         providers: view
@@ -2607,7 +2596,7 @@ pub struct App {
     pub(super) pending_stop_confirm: Option<Vec<String>>,
     /// `RecordUsage` requests made before the daemon runner exists.
     /// Flushed (with tag project ids backfilled) once it's created.
-    pub(super) pending_usage: Vec<cockpit_core::daemon::proto::Request>,
+    pub(super) pending_usage: Vec<cockpit_proto::Request>,
     /// Ctrl+G was pressed — the event loop suspends ratatui, runs
     /// `$EDITOR` against the composer text, then reloads the file back
     /// into the composer.
@@ -2824,11 +2813,11 @@ pub struct App {
     /// Persistent enterprise org-policy session-log sync disclosure. Loaded
     /// from durable sync state at startup; absence means no active policy.
     #[cfg(feature = "remote")]
-    pub(super) org_sync_disclosure: Option<cockpit_core::daemon::proto::OrgSyncDisclosure>,
+    pub(super) org_sync_disclosure: Option<cockpit_proto::OrgSyncDisclosure>,
     /// Persisted/daemon-broadcast remote connector status. Drives the additive
     /// remote-access chrome slot while connector access is enabled.
     #[cfg(feature = "remote")]
-    pub(super) connector_disclosure: Option<cockpit_core::daemon::proto::ConnectorDisclosure>,
+    pub(super) connector_disclosure: Option<cockpit_proto::ConnectorDisclosure>,
     has_no_providers_at_startup: bool,
     first_run_flow: FirstRunFlow,
     /// An open `/side` side conversation, or `None` in the main session. While
@@ -3956,7 +3945,7 @@ impl App {
         )
         .await;
         if let Some(notice) = self.startup_daemon_notice.take() {
-            let key = cockpit_core::daemon::proto::AppFlagKey::DaemonAutostartNotice;
+            let key = cockpit_proto::AppFlagKey::DaemonAutostartNotice;
             // Startup is already async. Await the daemon directly so the runtime
             // worker remains available to the daemon connection and terminal
             // event sources instead of synchronously re-entering it.
@@ -3965,15 +3954,15 @@ impl App {
                     .await
                     .map_err(|error| error.to_string())?;
                 client
-                    .request(cockpit_core::daemon::proto::Request::GetAppFlag { key })
+                    .request(cockpit_proto::Request::GetAppFlag { key })
                     .await
                     .map_err(|error| error.to_string())?
                     .map_err(|error| error.to_string())
             }
             .await;
             match state {
-                Ok(cockpit_core::daemon::proto::Response::AppFlag { seen: true, .. }) => {}
-                Ok(cockpit_core::daemon::proto::Response::AppFlag {
+                Ok(cockpit_proto::Response::AppFlag { seen: true, .. }) => {}
+                Ok(cockpit_proto::Response::AppFlag {
                     seen: false,
                     version,
                     ..
@@ -3983,7 +3972,7 @@ impl App {
                             .await
                             .map_err(|error| error.to_string())?;
                         client
-                            .request(cockpit_core::daemon::proto::Request::MarkAppFlagSeen {
+                            .request(cockpit_proto::Request::MarkAppFlagSeen {
                                 key,
                                 expected_version: version,
                             })
@@ -4072,7 +4061,7 @@ impl App {
             if let Some(Ok(runner)) = self.agent_runner.as_ref() {
                 let binding = runner.attached_request_binding();
                 let _ = binding
-                    .request(cockpit_core::daemon::proto::Request::EndBtwFork {
+                    .request(cockpit_proto::Request::EndBtwFork {
                         parent_session_id: runner.session_id(),
                     })
                     .await;

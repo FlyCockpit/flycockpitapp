@@ -364,6 +364,88 @@ fn tui_sources() -> String {
     sources
 }
 
+#[test]
+fn production_uses_cockpit_proto_directly() {
+    fn use_paths(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<String>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                use_paths(&path.tree, prefix, out);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                prefix.push(name.ident.to_string());
+                out.push(prefix.join("::"));
+                prefix.pop();
+            }
+            syn::UseTree::Rename(rename) => {
+                prefix.push(rename.ident.to_string());
+                out.push(prefix.join("::"));
+                prefix.pop();
+            }
+            syn::UseTree::Glob(_) => out.push(prefix.join("::")),
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    use_paths(item, prefix, out);
+                }
+            }
+        }
+    }
+
+    fn visit(path: &Path, findings: &mut Vec<String>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, findings);
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("rs")
+                || path.components().any(|part| part.as_os_str() == "tests")
+                || is_explicit_cfg_test_module(&path)
+            {
+                continue;
+            }
+            let source = production_source(&fs::read_to_string(&path).unwrap());
+            let compact = source
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>();
+            if compact.contains("cockpit_core::daemon::proto") {
+                findings.push(format!(
+                    "{}: qualified cockpit-core protocol re-export",
+                    path.display()
+                ));
+            }
+            let parsed = syn::parse_file(&source).expect("production TUI source must parse");
+            for item in parsed.items {
+                if let syn::Item::Use(import) = item {
+                    let mut paths = Vec::new();
+                    use_paths(&import.tree, &mut Vec::new(), &mut paths);
+                    for imported in paths {
+                        if imported == "cockpit_core::daemon"
+                            || imported == "cockpit_core::daemon::proto"
+                            || imported.starts_with("cockpit_core::daemon::proto::")
+                        {
+                            findings.push(format!(
+                                "{}: protocol import must use cockpit_proto directly: {imported}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    visit(&repo_root().join("crates/cockpit-tui/src"), &mut findings);
+    assert!(
+        findings.is_empty(),
+        "cockpit-core protocol re-export leaks:\n{}",
+        findings.join("\n")
+    );
+}
+
 const BLOCKING_TRANSPORT_ROOTS: &[&str] = &[
     "daemon_request_blocking",
     "daemon_request_at_blocking",

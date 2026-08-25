@@ -28,7 +28,7 @@ use crate::tui::geometry::{MIN_HISTORY_HEIGHT, STATUS_HEIGHT};
 use crate::tui::keys_overlay::{DialogBindingId, dialog_binding, dialog_footer_bindings};
 use crate::tui::pane::Pane;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
-use cockpit_core::daemon::proto::{
+use cockpit_proto::{
     CommandDetail, InterruptOption, InterruptQuestion, InterruptQuestionSet, ResolveResponse,
     SandboxEscalation,
 };
@@ -2785,7 +2785,7 @@ mod tests {
     // ---- bash command-detail block --------------------------------------
 
     use cockpit_core::approval::{ID_APPROVE_ONCE, ID_APPROVE_SESSION};
-    use cockpit_core::daemon::proto::{CharSpan, CommandDetail};
+    use cockpit_proto::{CharSpan, CommandDetail};
 
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -2924,7 +2924,7 @@ mod tests {
         let mut detail = base_command_detail();
         detail.cwd = Some("/workspace/project".into());
         detail.remembered_key = Some("echo hi".into());
-        detail.write_content = Some(cockpit_core::daemon::proto::WriteContentPreview {
+        detail.write_content = Some(cockpit_proto::WriteContentPreview {
             content: "safe\x1b[2Jbell\x07del\x7f\nnext".into(),
             dynamic: false,
         });
@@ -3736,12 +3736,12 @@ mod tests {
             // only from a live dispatch (inert upstream), so they fail closed
             // (`cost_unknown`, no digest) rather than fabricating a value; the
             // plan-projection/config-derived fields are populated.
-            image_plan_review: Some(cockpit_core::daemon::proto::ImagePlanReview {
+            image_plan_review: Some(cockpit_proto::ImagePlanReview {
                 plan_digest: None,
                 destination_location_classes: vec!["remote_hosted".into()],
                 conservative_cost_usd_micros: None,
                 cost_unknown: true,
-                budget_dispositions: vec![cockpit_core::daemon::proto::ImageBudgetDisposition {
+                budget_dispositions: vec![cockpit_proto::ImageBudgetDisposition {
                     scope: "session".into(),
                     disposition: "within_budget".into(),
                 }],

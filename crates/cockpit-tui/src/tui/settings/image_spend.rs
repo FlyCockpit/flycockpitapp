@@ -8,7 +8,7 @@ use cockpit_config::config::image_spend::{
     BudgetPolicy, ImageSpendSettings, ImageSpendSuggestions, ProjectEpochPolicy,
 };
 #[cfg(test)]
-use cockpit_core::daemon::proto::{Request, Response};
+use cockpit_proto::{Request, Response};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;

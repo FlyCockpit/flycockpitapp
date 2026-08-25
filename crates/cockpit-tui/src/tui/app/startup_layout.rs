@@ -79,7 +79,7 @@ impl App {
                             if self.notify_active_model_selected(
                                 active,
                                 false,
-                                cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+                                cockpit_proto::ActiveModelSwitchTrigger::Picker,
                             ) {
                                 self.submit_after_model_selection = false;
                                 let _ = self.submit_input();
@@ -195,7 +195,7 @@ impl App {
             AsyncActionKind::Internal("startup.remote_disclosures"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("startup.remote_disclosures")),
             move || {
-                let request = cockpit_core::daemon::proto::Request::GetStartupDisclosures {
+                let request = cockpit_proto::Request::GetStartupDisclosures {
                     project_root: disclosure_root.clone(),
                 };
                 let response = match disclosure_socket.as_deref() {
@@ -203,7 +203,7 @@ impl App {
                     None => agent_runner::daemon_request_from_blocking_worker(request),
                 }?;
                 match response {
-                    cockpit_core::daemon::proto::Response::StartupDisclosures {
+                    cockpit_proto::Response::StartupDisclosures {
                         org_sync,
                         connector,
                         ..

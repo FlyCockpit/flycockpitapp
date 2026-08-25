@@ -54,7 +54,7 @@ use super::shell::{
     push_label_value_row, push_wrapped_text, selected_style, settings_text_columns, warning_style,
 };
 use super::ui_page::{InstructionsPage, RedactPatternsPage, UtilityModelPicker};
-use cockpit_core::daemon::proto::Request;
+use cockpit_proto::Request;
 
 use super::{Nav, SettingsCx, SettingsPage, save_status};
 
@@ -3357,7 +3357,7 @@ impl SettingsCx {
             Ok(super::SettingsSaveOutcome::Saved) => {
                 if id == SettingId::SandboxEscalationEnabled {
                     self.pending_daemon_request =
-                        Some(cockpit_core::daemon::proto::Request::SetSandboxEscalation {
+                        Some(cockpit_proto::Request::SetSandboxEscalation {
                             enabled: self.extended.sandbox_escalation_enabled,
                         });
                 }
@@ -3380,7 +3380,7 @@ impl SettingsCx {
                             owner: self.dialog_id.to_string(),
                             revision: self.extended_revision.clone(),
                         },
-                        cockpit_core::daemon::proto::Request::SetSandboxEscalation {
+                        cockpit_proto::Request::SetSandboxEscalation {
                             enabled: self.extended.sandbox_escalation_enabled,
                         },
                     );

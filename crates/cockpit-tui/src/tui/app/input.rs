@@ -18,20 +18,20 @@ use super::{
 use crate::tui::agent_runner;
 use crate::tui::async_action::{AsyncActionKey, AsyncActionPayload, AsyncActionPolicy};
 use crate::tui::settings::Dialog;
-use cockpit_core::daemon::proto::{self, Request, Response};
 use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
+use cockpit_proto::{self, Request, Response};
 
 async fn admit_image_ingress_via_daemon(
     daemon: crate::tui::agent_runner::AttachedRequestBinding,
     session_id: uuid::Uuid,
-    source: cockpit_core::daemon::proto::ImageIngressSourceV1,
+    source: cockpit_proto::ImageIngressSourceV1,
     admission_id: uuid::Uuid,
 ) -> Result<crate::tui::async_action::DaemonImagePathAdmission, String> {
     // Retry once with the exact same durable id and source binding. A lost
     // response must recover the daemon receipt rather than minting a second
     // charged attachment (and terminal capabilities are intentionally
     // one-shot, so a retry with a fresh id could never be correct).
-    let request = || cockpit_core::daemon::proto::Request::AdmitImageIngress {
+    let request = || cockpit_proto::Request::AdmitImageIngress {
         session_id,
         source: source.clone(),
         admission_id,
@@ -43,7 +43,7 @@ async fn admit_image_ingress_via_daemon(
             .await
             .map_err(|second_error| format!("{first_error}; retry failed: {second_error}"))?,
     };
-    let cockpit_core::daemon::proto::Response::ImageIngressAdmitted(admission) = response else {
+    let cockpit_proto::Response::ImageIngressAdmitted(admission) = response else {
         return Err("daemon returned an unexpected image ingress response".into());
     };
     if admission.schema_version != 1
@@ -54,12 +54,11 @@ async fn admit_image_ingress_via_daemon(
         || admission.availability_generation == 0
         || admission.reservation_id.is_empty()
         || admission.normalized_byte_length == 0
-        || admission.normalized_byte_length as usize
-            > cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES
+        || admission.normalized_byte_length as usize > cockpit_proto::MAX_SINGLE_IMAGE_BYTES
         || admission.width == 0
         || admission.height == 0
-        || admission.width > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
-        || admission.height > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+        || admission.width > cockpit_proto::MAX_IMAGE_DIMENSION_PIXELS
+        || admission.height > cockpit_proto::MAX_IMAGE_DIMENSION_PIXELS
     {
         return Err("daemon returned an invalid image ingress receipt".into());
     }
@@ -282,7 +281,7 @@ impl App {
                                 admit_image_ingress_via_daemon(
                                     daemon,
                                     session_id,
-                                    cockpit_core::daemon::proto::ImageIngressSourceV1::PrivateTerminalCapability { capability },
+                                    cockpit_proto::ImageIngressSourceV1::PrivateTerminalCapability { capability },
                                     admission_id,
                                 )
                                 .await
@@ -1999,7 +1998,7 @@ impl App {
             // commit, so it's deliberately not counted here.
             let project_id = self.project_id.clone();
             self.record_usage(
-                cockpit_core::daemon::proto::UsageKind::Tag,
+                cockpit_proto::UsageKind::Tag,
                 sug.replacement.clone(),
                 project_id,
             );
@@ -2017,10 +2016,7 @@ impl App {
     /// line in the chat (GOALS §1e). One line per tag, in the same
     /// `→ tool(path)` idiom the agent's own tools use, with a ✓/✗ + the
     /// detail (lines read / entries listed / why it was skipped).
-    pub(super) fn push_tag_call_entries(
-        &mut self,
-        expansions: &[cockpit_core::daemon::proto::TagExpansionMeta],
-    ) {
+    pub(super) fn push_tag_call_entries(&mut self, expansions: &[cockpit_proto::TagExpansionMeta]) {
         for e in expansions {
             let mark = if e.ok { '✓' } else { '✗' };
             self.push_plain(format!("  → {}({}) {mark} {}", e.tool, e.path, e.detail));
@@ -2814,7 +2810,7 @@ impl App {
         let tag_expansions = expanded
             .expansions
             .into_iter()
-            .map(cockpit_core::daemon::proto::TagExpansionMeta::from)
+            .map(cockpit_proto::TagExpansionMeta::from)
             .collect::<Vec<_>>();
         let submission = cockpit_core::engine::message::UserSubmission {
             expected_model_state_generation: self
@@ -3455,7 +3451,7 @@ fn redaction_selected_ids(
     result: &crate::tui::dialog::question::QuestionResult,
 ) -> Option<Vec<String>> {
     use crate::tui::dialog::question::QuestionResult;
-    use cockpit_core::daemon::proto::ResolveResponse;
+    use cockpit_proto::ResolveResponse;
     match result {
         QuestionResult::Submit { responses, .. } => match responses.first() {
             Some(ResolveResponse::Multi { selected_ids }) => Some(selected_ids.clone()),
@@ -3469,7 +3465,7 @@ fn redaction_selected_ids(
 /// `None` for cancel / a malformed response.
 fn init_selected_id(result: &crate::tui::dialog::question::QuestionResult) -> Option<String> {
     use crate::tui::dialog::question::QuestionResult;
-    use cockpit_core::daemon::proto::ResolveResponse;
+    use cockpit_proto::ResolveResponse;
     match result {
         QuestionResult::Submit { responses, .. } => match responses.first() {
             Some(ResolveResponse::Single { selected_id }) => Some(selected_id.clone()),
@@ -3643,11 +3639,10 @@ impl App {
                             admit_image_ingress_via_daemon(
                                 daemon,
                                 session_id,
-                                cockpit_core::daemon::proto::ImageIngressSourceV1::ClipboardPng {
-                                    png_base64:
-                                        cockpit_core::daemon::proto::SensitiveWirePayload::new(
-                                            base64::engine::general_purpose::STANDARD.encode(png),
-                                        ),
+                                cockpit_proto::ImageIngressSourceV1::ClipboardPng {
+                                    png_base64: cockpit_proto::SensitiveWirePayload::new(
+                                        base64::engine::general_purpose::STANDARD.encode(png),
+                                    ),
                                     byte_length,
                                     sha256,
                                 },
@@ -3728,7 +3723,9 @@ impl App {
                             admit_image_ingress_via_daemon(
                                 daemon,
                                 session_id,
-                                cockpit_core::daemon::proto::ImageIngressSourceV1::PrivateTerminalCapability { capability },
+                                cockpit_proto::ImageIngressSourceV1::PrivateTerminalCapability {
+                                    capability,
+                                },
                                 admission_id,
                             )
                             .await
@@ -3909,11 +3906,9 @@ impl App {
         let total = retained.values().try_fold(png.len() as u64, |sum, image| {
             sum.checked_add(image.normalized_byte_length())
         });
-        if png.len() > cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES
-            || total.is_none_or(|total| {
-                total > cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES as u64
-            })
-            || retained.len() >= cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE
+        if png.len() > cockpit_proto::MAX_SINGLE_IMAGE_BYTES
+            || total.is_none_or(|total| total > cockpit_proto::MAX_TOTAL_IMAGE_BYTES as u64)
+            || retained.len() >= cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE
         {
             self.show_toast("Paste unavailable", super::ToastKind::Error);
             return;
@@ -3968,12 +3963,10 @@ impl App {
             })
             .count();
         if admission.normalized_byte_length == 0
-            || admission.normalized_byte_length
-                > cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES as u64
-            || retained_bytes.is_none_or(|total| {
-                total > cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES as u64
-            })
-            || image_count >= cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE
+            || admission.normalized_byte_length > cockpit_proto::MAX_SINGLE_IMAGE_BYTES as u64
+            || retained_bytes
+                .is_none_or(|total| total > cockpit_proto::MAX_TOTAL_IMAGE_BYTES as u64)
+            || image_count >= cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE
         {
             self.show_toast("Paste unavailable", super::ToastKind::Error);
             return;
@@ -4784,14 +4777,14 @@ pub(super) fn validate_pasted_images_for_submit(
         let display_idx = idx + 1;
         let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
             .map_err(|_| format!("Pasted image #{display_idx} is not a valid PNG."))?;
-        if image.width() > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
-            || image.height() > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+        if image.width() > cockpit_proto::MAX_IMAGE_DIMENSION_PIXELS
+            || image.height() > cockpit_proto::MAX_IMAGE_DIMENSION_PIXELS
         {
             return Err(format!(
                 "Pasted image #{display_idx} is too large: {}x{} exceeds the {} pixel dimension limit.",
                 image.width(),
                 image.height(),
-                cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+                cockpit_proto::MAX_IMAGE_DIMENSION_PIXELS
             ));
         }
     }
@@ -4801,11 +4794,11 @@ pub(super) fn validate_pasted_images_for_submit(
 fn validate_pasted_image_sizes(
     images: &[cockpit_core::engine::message::SubmissionImage],
 ) -> Result<(), String> {
-    if images.len() > cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE {
+    if images.len() > cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE {
         return Err(format!(
             "Too many pasted images: {} exceeds the {} image limit.",
             images.len(),
-            cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE
+            cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE
         ));
     }
     let mut total = 0usize;
@@ -4817,21 +4810,21 @@ fn validate_pasted_image_sizes(
         if png.is_empty() {
             return Err(format!("Pasted image #{display_idx} is empty."));
         }
-        if png.len() > cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES {
+        if png.len() > cockpit_proto::MAX_SINGLE_IMAGE_BYTES {
             return Err(format!(
                 "Pasted image #{display_idx} is too large: {} bytes exceeds the {} byte limit.",
                 png.len(),
-                cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES
+                cockpit_proto::MAX_SINGLE_IMAGE_BYTES
             ));
         }
         total = total
             .checked_add(png.len())
             .ok_or_else(|| "Pasted image byte count overflowed.".to_string())?;
-        if total > cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES {
+        if total > cockpit_proto::MAX_TOTAL_IMAGE_BYTES {
             return Err(format!(
                 "Pasted images are too large: {} total bytes exceeds the {} byte limit.",
                 total,
-                cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES
+                cockpit_proto::MAX_TOTAL_IMAGE_BYTES
             ));
         }
     }
@@ -4868,7 +4861,7 @@ mod image_submit_validation_tests {
         let png = sample_png();
         let images = vec![
             cockpit_core::engine::message::SubmissionImage::png(png);
-            cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE + 1
+            cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE + 1
         ];
         let err = validate_pasted_images_for_submit(&images).expect_err("too many");
         assert!(err.contains("Too many pasted images"));
@@ -4878,7 +4871,7 @@ mod image_submit_validation_tests {
     fn rejects_oversized_single_image_before_dispatch() {
         let images = vec![cockpit_core::engine::message::SubmissionImage::png(vec![
             0u8;
-            cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES + 1
+            cockpit_proto::MAX_SINGLE_IMAGE_BYTES + 1
         ])];
         let err = validate_pasted_images_for_submit(&images).expect_err("oversized");
         assert!(err.contains("too large"));
@@ -4887,9 +4880,9 @@ mod image_submit_validation_tests {
 
     #[test]
     fn exact_image_count_and_byte_boundaries() {
-        let count = cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE;
-        let single = cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES;
-        let total = cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES;
+        let count = cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE;
+        let single = cockpit_proto::MAX_SINGLE_IMAGE_BYTES;
+        let total = cockpit_proto::MAX_TOTAL_IMAGE_BYTES;
         assert!(
             validate_pasted_image_sizes(&vec![
                 cockpit_core::engine::message::SubmissionImage::png(
@@ -5025,10 +5018,10 @@ mod queued_message_edit_tests {
     };
     use crate::tui::agent_runner::{AgentRunner, AttachedRequest, ClientTasks, UsageCounts};
     use crate::tui::app::App;
-    use cockpit_core::daemon::proto::{
+    use cockpit_core::engine::message::QueueItemStatus as EngineQueueItemStatus;
+    use cockpit_proto::{
         QueueItem, QueueItemStatus, RemoveQueuedUserMessageReason, Request, Response,
     };
-    use cockpit_core::engine::message::QueueItemStatus as EngineQueueItemStatus;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
@@ -5081,8 +5074,8 @@ mod queued_message_edit_tests {
         }
     }
 
-    fn proto_target(id: &str) -> cockpit_core::daemon::proto::QueueTarget {
-        cockpit_core::daemon::proto::QueueTarget {
+    fn proto_target(id: &str) -> cockpit_proto::QueueTarget {
+        cockpit_proto::QueueTarget {
             id: id.to_string(),
             agent: "Build".to_string(),
             depth: 0,
@@ -5093,7 +5086,7 @@ mod queued_message_edit_tests {
     fn proto_item_with_target(
         text: &str,
         status: QueueItemStatus,
-        target: cockpit_core::daemon::proto::QueueTarget,
+        target: cockpit_proto::QueueTarget,
     ) -> QueueItem {
         QueueItem {
             id: uuid::Uuid::new_v4(),
@@ -5105,11 +5098,7 @@ mod queued_message_edit_tests {
     }
 
     fn proto_item(text: &str, status: QueueItemStatus) -> QueueItem {
-        proto_item_with_target(
-            text,
-            status,
-            cockpit_core::daemon::proto::QueueTarget::default(),
-        )
+        proto_item_with_target(text, status, cockpit_proto::QueueTarget::default())
     }
 
     #[test]
@@ -5129,14 +5118,14 @@ mod queued_message_edit_tests {
                     status: QueueItemStatus::Queued,
                     text: older.text,
                     display_text: None,
-                    target: cockpit_core::daemon::proto::QueueTarget::default(),
+                    target: cockpit_proto::QueueTarget::default(),
                 },
                 QueueItem {
                     id: newer.id,
                     status: QueueItemStatus::Queued,
                     text: newer.text,
                     display_text: Some("edit @a.rs".to_string()),
-                    target: cockpit_core::daemon::proto::QueueTarget::default(),
+                    target: cockpit_proto::QueueTarget::default(),
                 },
             ],
             queue: Vec::new(),
@@ -5201,7 +5190,7 @@ mod queued_message_edit_tests {
                 status: QueueItemStatus::Queued,
                 text: editable.text,
                 display_text: Some("editable @compact".to_string()),
-                target: cockpit_core::daemon::proto::QueueTarget::default(),
+                target: cockpit_proto::QueueTarget::default(),
             }],
             queue: Vec::new(),
         });
@@ -5482,7 +5471,7 @@ mod paste_routing_tests {
     use crate::tui::paste::{PasteKind, PasteRegistry};
     use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
     use crate::tui::settings::Dialog;
-    use cockpit_core::daemon::proto::PinnedMessage;
+    use cockpit_proto::PinnedMessage;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -5523,7 +5512,7 @@ mod paste_routing_tests {
                 thinking_mode: None,
                 prompt_cache_retention: None,
             },
-            trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+            trigger: cockpit_proto::ActiveModelSwitchTrigger::Picker,
             minimum_generation: app.active_model_state_generation,
             started_at: std::time::Instant::now(),
             queued_submission: None,
@@ -6429,7 +6418,7 @@ mod chat_scrollback_key_tests {
     use super::super::Selection;
     use super::*;
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
-    use cockpit_core::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+    use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
     use crossterm::event::{KeyEventState, KeyModifiers};
     use std::time::Duration;
     use uuid::Uuid;

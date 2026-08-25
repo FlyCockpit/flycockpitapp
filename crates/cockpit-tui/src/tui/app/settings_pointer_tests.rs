@@ -54,7 +54,7 @@ pub(crate) fn run_settings_pointer_z_order_matrix() {
     app.auth_failure_notice = Some(crate::tui::auth_failure::AuthFailureNotice {
         provider: "fixture".into(),
         model: "fixture".into(),
-        kind: cockpit_core::daemon::proto::AuthFailureKind::ProviderNotConfigured,
+        kind: cockpit_proto::AuthFailureKind::ProviderNotConfigured,
     });
     app.auth_notice_switch_rect = Some(target);
     app.auth_notice_fix_rect = Some(target);

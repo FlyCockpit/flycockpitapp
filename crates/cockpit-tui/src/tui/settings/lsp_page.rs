@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use crate::tui::textfield::TextField;
-use cockpit_core::daemon::proto::{LspControlAction, Request};
+use cockpit_proto::{LspControlAction, Request};
 
 use super::pointer_actions::{
     LspAction as PointerLspAction, LspEdit as PointerLspEdit, LspServerId, SettingsPointerAction,

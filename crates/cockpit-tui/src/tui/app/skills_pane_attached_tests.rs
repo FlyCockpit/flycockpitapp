@@ -2,7 +2,7 @@ use super::{App, Overlay};
 use crate::tui::agent_runner::{AgentRunner, AttachedRequest, ClientTasks, UsageCounts};
 use crate::tui::async_action::{AsyncActionKind, AsyncActionPayload, AsyncActionResult};
 use crate::tui::skills_pane::{SkillsPaneFetchResult, SkillsPaneSource};
-use cockpit_core::daemon::proto::{Request, Response, SkillSummary};
+use cockpit_proto::{Request, Response, SkillSummary};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

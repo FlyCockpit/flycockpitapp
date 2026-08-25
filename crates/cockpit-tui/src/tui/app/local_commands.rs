@@ -539,7 +539,7 @@ impl App {
         submission: cockpit_core::engine::message::UserSubmission,
         error_prefix: &str,
         owns_working_span: bool,
-        tag_expansions: &[cockpit_core::daemon::proto::TagExpansionMeta],
+        tag_expansions: &[cockpit_proto::TagExpansionMeta],
     ) -> DispatchOutcome {
         self.dispatch_optimistic_user_submission_with_id(
             uuid::Uuid::new_v4(),
@@ -558,7 +558,7 @@ impl App {
         mut submission: cockpit_core::engine::message::UserSubmission,
         error_prefix: &str,
         owns_working_span: bool,
-        tag_expansions: &[cockpit_core::daemon::proto::TagExpansionMeta],
+        tag_expansions: &[cockpit_proto::TagExpansionMeta],
     ) -> DispatchOutcome {
         if submission.display_text.is_none() && submission.text != display {
             submission.display_text = Some(display.clone());
@@ -750,13 +750,13 @@ impl App {
         let request = match selected_id {
             Some("resume") => {
                 self.push_plain("/resume: resuming paused daemon work.".to_string());
-                cockpit_core::daemon::proto::Request::ResumePausedWork {
+                cockpit_proto::Request::ResumePausedWork {
                     session_id: pending.session_id,
                 }
             }
             Some("cancel") | None => {
                 self.push_plain("/resume: cancelled paused daemon work.".to_string());
-                cockpit_core::daemon::proto::Request::CancelPausedWork {
+                cockpit_proto::Request::CancelPausedWork {
                     session_id: pending.session_id,
                 }
             }
@@ -771,7 +771,7 @@ impl App {
         };
         self.start_goal_request(
             "goal.disposition",
-            cockpit_core::daemon::proto::Request::GoalStatus { session_id },
+            cockpit_proto::Request::GoalStatus { session_id },
         );
     }
 
@@ -781,7 +781,7 @@ impl App {
         };
         self.start_goal_request(
             "goal.create",
-            cockpit_core::daemon::proto::Request::CreateGoal {
+            cockpit_proto::Request::CreateGoal {
                 session_id,
                 objective,
                 token_budget,
@@ -789,17 +789,13 @@ impl App {
         );
     }
 
-    pub(super) fn set_goal_status(
-        &mut self,
-        status: cockpit_core::daemon::proto::GoalDisposition,
-        label: &str,
-    ) {
+    pub(super) fn set_goal_status(&mut self, status: cockpit_proto::GoalDisposition, label: &str) {
         let Some(session_id) = self.goal_session_id(label) else {
             return;
         };
         self.start_goal_request(
             "goal.set",
-            cockpit_core::daemon::proto::Request::SetGoalStatus { session_id, status },
+            cockpit_proto::Request::SetGoalStatus { session_id, status },
         );
     }
 
@@ -809,7 +805,7 @@ impl App {
         };
         self.start_goal_request(
             "goal.clear",
-            cockpit_core::daemon::proto::Request::ClearGoal { session_id },
+            cockpit_proto::Request::ClearGoal { session_id },
         );
     }
 
@@ -826,11 +822,7 @@ impl App {
         }
     }
 
-    fn start_goal_request(
-        &mut self,
-        kind: &'static str,
-        request: cockpit_core::daemon::proto::Request,
-    ) {
+    fn start_goal_request(&mut self, kind: &'static str, request: cockpit_proto::Request) {
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
             unreachable!("goal_session_id checks the attached runner first");
         };
@@ -841,7 +833,7 @@ impl App {
             async move {
                 let response = attached_request.request(request).await?;
                 match response {
-                    cockpit_core::daemon::proto::Response::GoalStatus { goal: Some(goal) } => {
+                    cockpit_proto::Response::GoalStatus { goal: Some(goal) } => {
                         let phase = goal.phase.map(|phase| format!("/{phase:?}")).unwrap_or_default();
                         let detail = goal.latest_gap_or_blocker.as_deref().unwrap_or("no actionable gap");
                         Ok(AsyncActionPayload::Text(format!(
@@ -863,37 +855,37 @@ impl App {
                             detail,
                         )))
                     }
-                    cockpit_core::daemon::proto::Response::GoalStatus { goal: None } => Ok(
+                    cockpit_proto::Response::GoalStatus { goal: None } => Ok(
                         AsyncActionPayload::Text(
                             "/goal: no goal. Usage: /goal <objective> | status | pause | resume | clear | edit"
                                 .to_string(),
                         ),
                     ),
-                    cockpit_core::daemon::proto::Response::GoalUpdated { goal } => {
+                    cockpit_proto::Response::GoalUpdated { goal } => {
                         let state = match goal.disposition {
-                            cockpit_core::daemon::proto::GoalDisposition::Running => "active",
-                            cockpit_core::daemon::proto::GoalDisposition::UserPaused => "paused",
-                            cockpit_core::daemon::proto::GoalDisposition::InfraPaused => {
+                            cockpit_proto::GoalDisposition::Running => "active",
+                            cockpit_proto::GoalDisposition::UserPaused => "paused",
+                            cockpit_proto::GoalDisposition::InfraPaused => {
                                 "paused by infrastructure"
                             }
-                            cockpit_core::daemon::proto::GoalDisposition::Blocked => "blocked",
-                            cockpit_core::daemon::proto::GoalDisposition::NoProgressPaused => {
+                            cockpit_proto::GoalDisposition::Blocked => "blocked",
+                            cockpit_proto::GoalDisposition::NoProgressPaused => {
                                 "paused for no progress"
                             }
-                            cockpit_core::daemon::proto::GoalDisposition::BudgetLimited => {
+                            cockpit_proto::GoalDisposition::BudgetLimited => {
                                 "budget limited"
                             }
-                            cockpit_core::daemon::proto::GoalDisposition::Complete => "complete",
-                            cockpit_core::daemon::proto::GoalDisposition::Cleared => "cleared",
+                            cockpit_proto::GoalDisposition::Complete => "complete",
+                            cockpit_proto::GoalDisposition::Cleared => "cleared",
                         };
                         Ok(AsyncActionPayload::Text(format!(
                             "/goal: goal is now {state}."
                         )))
                     }
-                    cockpit_core::daemon::proto::Response::GoalCleared { cleared: true } => Ok(
+                    cockpit_proto::Response::GoalCleared { cleared: true } => Ok(
                         AsyncActionPayload::Text("/goal clear: cleared current goal.".to_string()),
                     ),
-                    cockpit_core::daemon::proto::Response::GoalCleared { cleared: false } => Ok(
+                    cockpit_proto::Response::GoalCleared { cleared: false } => Ok(
                         AsyncActionPayload::Text("/goal clear: no open goal.".to_string()),
                     ),
                     other => Err(format!("unexpected goal response: {other:?}")),
@@ -963,7 +955,7 @@ impl App {
     pub(super) fn cancel_schedule(&mut self, job_id: &str, cmd: &str) {
         self.send_daemon_request(
             cmd,
-            cockpit_core::daemon::proto::Request::CancelSchedule {
+            cockpit_proto::Request::CancelSchedule {
                 job_id: job_id.to_string(),
             },
             ControlApplied::ScheduleCancel {
@@ -1030,7 +1022,7 @@ impl App {
         config: Option<cockpit_core::mcp::config::McpConfig>,
         mutation_intent_hash: Option<String>,
         authority: Option<McpLocalAuthority>,
-        request: cockpit_core::daemon::proto::Request,
+        request: cockpit_proto::Request,
     ) {
         self.slash_menu_cache.borrow_mut().take();
         if let Some(pending) = self.pending_mcp_local.take() {
@@ -1091,7 +1083,7 @@ impl App {
             pending.config,
             pending.mutation_intent_hash,
             pending.authority,
-            cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+            cockpit_proto::Request::GetLocalOperationSettlement {
                 client_operation_id: pending.operation_id.to_string(),
             },
         );
@@ -1116,7 +1108,7 @@ impl App {
             pending.config,
             pending.mutation_intent_hash,
             pending.authority,
-            cockpit_core::daemon::proto::Request::GetProviderCatalogSnapshot {
+            cockpit_proto::Request::GetProviderCatalogSnapshot {
                 project_root: pending.project_root,
                 provider_id: None,
                 snapshot_session_id,
@@ -1167,7 +1159,7 @@ impl App {
             None,
             None,
             None,
-            cockpit_core::daemon::proto::Request::GetProviderCatalogSnapshot {
+            cockpit_proto::Request::GetProviderCatalogSnapshot {
                 project_root,
                 provider_id: None,
                 snapshot_session_id,
@@ -1229,7 +1221,7 @@ impl App {
             McpLocalPhase::Snapshot {
                 snapshot_session_id,
             } => {
-                let cockpit_core::daemon::proto::Response::ProviderCatalogSnapshot {
+                let cockpit_proto::Response::ProviderCatalogSnapshot {
                     config,
                     snapshot_session_id: returned_session_id,
                     ..
@@ -1368,7 +1360,7 @@ impl App {
                                 return;
                             }
                         };
-                        let request = cockpit_core::daemon::proto::Request::SaveMcpConfig {
+                        let request = cockpit_proto::Request::SaveMcpConfig {
                             client_operation_id: pending.operation_id.to_string(),
                             project_root: pending.project_root.clone(),
                             snapshot_capability: authority.snapshot_capability.clone(),
@@ -1395,7 +1387,7 @@ impl App {
                 }
             }
             McpLocalPhase::Save => {
-                let cockpit_core::daemon::proto::Response::McpConfigCommitted {
+                let cockpit_proto::Response::McpConfigCommitted {
                     client_operation_id,
                     request_hash,
                     mutation_intent_hash,
@@ -1441,7 +1433,7 @@ impl App {
                     pending.config,
                     pending.mutation_intent_hash,
                     pending.authority,
-                    cockpit_core::daemon::proto::Request::GetProviderCatalogSnapshot {
+                    cockpit_proto::Request::GetProviderCatalogSnapshot {
                         project_root: pending.project_root,
                         provider_id: None,
                         snapshot_session_id,
@@ -1449,7 +1441,7 @@ impl App {
                 );
             }
             McpLocalPhase::Settlement => {
-                let cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+                let cockpit_proto::Response::LocalOperationSettlement {
                     client_operation_id,
                     operation_kind,
                     request_hash,
@@ -1495,7 +1487,7 @@ impl App {
                     self.start_mcp_settlement(pending, false);
                     return;
                 };
-                let cockpit_core::daemon::proto::Response::McpConfigCommitted {
+                let cockpit_proto::Response::McpConfigCommitted {
                     client_operation_id,
                     request_hash: receipt_request_hash,
                     mutation_intent_hash,
@@ -1545,7 +1537,7 @@ impl App {
                     pending.config,
                     pending.mutation_intent_hash,
                     pending.authority,
-                    cockpit_core::daemon::proto::Request::GetProviderCatalogSnapshot {
+                    cockpit_proto::Request::GetProviderCatalogSnapshot {
                         project_root: pending.project_root,
                         provider_id: None,
                         snapshot_session_id,
@@ -1557,7 +1549,7 @@ impl App {
                 result_revision,
                 config_generation,
             } => {
-                let cockpit_core::daemon::proto::Response::ProviderCatalogSnapshot {
+                let cockpit_proto::Response::ProviderCatalogSnapshot {
                     config,
                     snapshot_session_id: returned_session_id,
                     config_generation: returned_generation,
@@ -1743,11 +1735,7 @@ impl App {
         self.composer.clear();
         self.paste_registry.clear();
         self.reset_slash_window();
-        self.record_usage(
-            cockpit_core::daemon::proto::UsageKind::Slash,
-            "skill".to_string(),
-            None,
-        );
+        self.record_usage(cockpit_proto::UsageKind::Slash, "skill".to_string(), None);
         let display = if args.trim().is_empty() {
             format!("/{name}")
         } else {

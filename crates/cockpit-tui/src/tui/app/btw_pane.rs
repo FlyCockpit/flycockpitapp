@@ -7,11 +7,11 @@ use crate::tui::agent_runner::{self, AgentRunner};
 use crate::tui::async_action::AsyncActionPayload;
 use crate::tui::composer::Composer;
 use crate::tui::history::{HistoryEntry, PendingMsg};
-use cockpit_core::daemon::proto::{self, Request, Response};
 use cockpit_core::engine::TurnEvent;
 use cockpit_core::engine::message::{
     QueueItemStatus, QueueTarget, QueuedUserMessage, UserSubmission,
 };
+use cockpit_proto::{self, Request, Response};
 
 use super::{
     App, FreshQueueAck,
@@ -1127,13 +1127,11 @@ impl App {
             return;
         };
         let lockout = match reason {
-            cockpit_core::daemon::proto::InterruptRaiseReason::Initial => self.dialog_lockout(),
-            cockpit_core::daemon::proto::InterruptRaiseReason::Advance => {
+            cockpit_proto::InterruptRaiseReason::Initial => self.dialog_lockout(),
+            cockpit_proto::InterruptRaiseReason::Advance => {
                 crate::tui::dialog::DialogState::NO_LOCKOUT
             }
-            cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
-                self.rehydrated_dialog_lockout()
-            }
+            cockpit_proto::InterruptRaiseReason::Rehydration => self.rehydrated_dialog_lockout(),
         };
         self.question_dialog = Some(
             crate::tui::dialog::question::QuestionDialog::new(
@@ -1156,7 +1154,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cockpit_core::daemon::proto::{
+    use cockpit_proto::{
         InterruptOption, InterruptQuestion, InterruptQuestionSet, InterruptRaiseReason,
     };
 

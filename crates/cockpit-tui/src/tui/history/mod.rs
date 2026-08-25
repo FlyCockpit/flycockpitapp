@@ -120,7 +120,7 @@ pub enum HistoryEntry {
     /// maintenance so dismissed decisions can be styled from the wire
     /// `cancelled` flag instead of string-matching the answer.
     InterruptDecision {
-        decision: cockpit_core::daemon::proto::InterruptDecision,
+        decision: cockpit_proto::InterruptDecision,
     },
     /// A user-authored session-history note (`/note <text>`,
     /// implementation note). Rendered as a DISTINCT "note to
@@ -1773,9 +1773,7 @@ fn render_user_markdown(
     (out, continuations, pin_region, Some(copy))
 }
 
-fn render_interrupt_decision(
-    decision: &cockpit_core::daemon::proto::InterruptDecision,
-) -> Vec<Line<'static>> {
+fn render_interrupt_decision(decision: &cockpit_proto::InterruptDecision) -> Vec<Line<'static>> {
     let prefix = if decision.permission {
         "approval"
     } else {

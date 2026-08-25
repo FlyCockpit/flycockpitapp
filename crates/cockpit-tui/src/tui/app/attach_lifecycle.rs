@@ -366,8 +366,8 @@ impl App {
             // backfilling tag project ids now that we know the project.
             let pid = self.project_id.clone();
             for mut req in std::mem::take(&mut self.pending_usage) {
-                if let cockpit_core::daemon::proto::Request::RecordUsage {
-                    kind: cockpit_core::daemon::proto::UsageKind::Tag,
+                if let cockpit_proto::Request::RecordUsage {
+                    kind: cockpit_proto::UsageKind::Tag,
                     project_id,
                     ..
                 } = &mut req
@@ -414,7 +414,7 @@ impl App {
             self.refresh_skill_commands();
             self.send_daemon_request(
                 "/capabilities",
-                cockpit_core::daemon::proto::Request::GetHostCapabilities,
+                cockpit_proto::Request::GetHostCapabilities,
                 crate::tui::app::ControlApplied::None,
             );
         }
@@ -428,7 +428,7 @@ impl App {
     pub(super) fn start_model_state_epoch(
         &mut self,
         new_session_id: Option<uuid::Uuid>,
-        state: Option<&cockpit_core::daemon::proto::ActiveModelState>,
+        state: Option<&cockpit_proto::ActiveModelState>,
     ) {
         for operation in self.pending_sealed_operations.values() {
             operation.invalidate();
@@ -543,7 +543,7 @@ impl App {
             0,
             false,
             waiting_extended,
-            cockpit_core::daemon::proto::ProviderConfigView::default(),
+            cockpit_proto::ProviderConfigView::default(),
         );
         self.apply_tui_config_from_snapshot();
         self.refresh_active_model_projection();
@@ -646,14 +646,14 @@ impl App {
             move || {
                 let resp = agent_runner::daemon_request_at_blocking(
                     &socket,
-                    cockpit_core::daemon::proto::Request::GuidanceEstimate {
+                    cockpit_proto::Request::GuidanceEstimate {
                         project_root,
                         provider,
                         model,
                     },
                 )?;
                 match resp {
-                    cockpit_core::daemon::proto::Response::GuidanceEstimate {
+                    cockpit_proto::Response::GuidanceEstimate {
                         file,
                         tokens,
                         system_tokens,
@@ -678,18 +678,18 @@ impl App {
     /// runner exists.
     pub(super) fn record_usage(
         &mut self,
-        kind: cockpit_core::daemon::proto::UsageKind,
+        kind: cockpit_proto::UsageKind,
         key: String,
         project_id: Option<String>,
     ) {
-        use cockpit_core::daemon::proto::UsageKind;
+        use cockpit_proto::UsageKind;
         let map = match kind {
             UsageKind::Model => &mut self.usage_models,
             UsageKind::Slash => &mut self.usage_slash,
             UsageKind::Tag => &mut self.usage_tags,
         };
         *map.entry(key.clone()).or_insert(0) += 1;
-        let req = cockpit_core::daemon::proto::Request::RecordUsage {
+        let req = cockpit_proto::Request::RecordUsage {
             kind,
             key,
             project_id,

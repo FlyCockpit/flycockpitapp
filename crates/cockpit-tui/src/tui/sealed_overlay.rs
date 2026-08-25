@@ -31,12 +31,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use zeroize::Zeroizing;
 
-use cockpit_core::daemon::proto::{
+use cockpit_core::sealed::identity::SealedScopeKind;
+use cockpit_core::sealed::owner_commands::{SealedActionCommand, SealedCommand};
+use cockpit_proto::{
     MAX_SENSITIVE_FRAME_BYTES, Request, Response, SealedOwnerInventoryItem, SealedOwnerScopeKind,
     SensitiveWireLiteral,
 };
-use cockpit_core::sealed::identity::SealedScopeKind;
-use cockpit_core::sealed::owner_commands::{SealedActionCommand, SealedCommand};
 
 /// The ephemeral recover reveal lifetime: 30 seconds (mirrors `/leaks`).
 pub const SEALED_REVEAL_BUFFER_TTL: Duration = Duration::from_secs(30);

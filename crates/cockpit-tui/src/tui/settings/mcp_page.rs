@@ -547,7 +547,7 @@ impl SettingsCx {
                             owner: flow.server.clone(),
                             revision: Some(flow_id.clone()),
                         },
-                        cockpit_core::daemon::proto::Request::CancelMcpOAuth {
+                        cockpit_proto::Request::CancelMcpOAuth {
                             client_operation_id: client_operation_id.clone(),
                             begin_client_operation_id: flow.begin_client_operation_id.clone(),
                             flow_id: Some(flow_id.clone()),
@@ -682,7 +682,7 @@ impl SettingsCx {
                                 owner: name.clone(),
                                 revision: None,
                             },
-                            cockpit_core::daemon::proto::Request::BeginMcpOAuth {
+                            cockpit_proto::Request::BeginMcpOAuth {
                                 client_operation_id: client_operation_id.clone(),
                                 project_root,
                                 server: name.clone(),

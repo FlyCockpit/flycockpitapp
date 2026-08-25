@@ -4,7 +4,7 @@ use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
 };
 use crate::tui::skills_pane::{SkillsPane, SkillsPaneFetchResult, SkillsPaneSource};
-use cockpit_core::daemon::proto::{Request, Response};
+use cockpit_proto::{Request, Response};
 use std::path::PathBuf;
 
 const SKILLS_LIST_ACTION: &str = "skills.list";

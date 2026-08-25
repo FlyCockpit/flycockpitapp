@@ -25,7 +25,7 @@ use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::pane_shared::{resolve_project_id, short_id};
 use crate::tui::progress::render_bar;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-use cockpit_core::daemon::proto::{
+use cockpit_proto::{
     LanguageSection, RecoverySection, StatsRange, StatsRollup, StatsScope, TokenSpend,
 };
 
@@ -440,7 +440,7 @@ pub(crate) fn fetch_stats_rollup(
     socket: Option<&std::path::Path>,
     key: StatsPaneFetchKey,
 ) -> StatsPaneFetchResult {
-    let request = cockpit_core::daemon::proto::Request::StatsRollup {
+    let request = cockpit_proto::Request::StatsRollup {
         project_id: match key.scope() {
             StatsScope::Project(id) => Some(id),
             StatsScope::All => None,
@@ -453,7 +453,7 @@ pub(crate) fn fetch_stats_rollup(
         None => Err("Unavailable — reconnect to the daemon, then Retry".to_string()),
     }
     .and_then(|response| match response {
-        cockpit_core::daemon::proto::Response::StatsRollup { rollup } => Ok(rollup),
+        cockpit_proto::Response::StatsRollup { rollup } => Ok(rollup),
         other => Err(format!("unexpected stats response: {other:?}")),
     });
     StatsPaneFetchResult { key, result }
@@ -821,7 +821,7 @@ fn fmt_cost(c: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cockpit_core::daemon::proto::{
+    use cockpit_proto::{
         HardFailShapeRow, LanguageRow, NonFileRow, RecoveryModeRow, RecoveryRow, RecoveryStageRow,
         RecoveryToolRow,
     };
@@ -1110,7 +1110,7 @@ mod tests {
     #[test]
     fn cursor_follow_accounts_for_expanded_variable_height_rows() {
         let mut rollup = empty_rollup();
-        rollup.tokens.by_model = vec![cockpit_core::daemon::proto::TokenRow {
+        rollup.tokens.by_model = vec![cockpit_proto::TokenRow {
             model: "tok".into(),
             provider: "p".into(),
             input_tokens: 1,

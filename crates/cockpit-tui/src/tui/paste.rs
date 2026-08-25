@@ -78,7 +78,7 @@ pub enum PasteKind {
     /// bounded display/accounting metadata; image bytes never return to it.
     ImageHandle {
         draft: ImageIngressDraftAuthority,
-        image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::ImageAttachmentRef,
         normalized_byte_length: u64,
         sha256: String,
         hash: u64,
@@ -101,7 +101,7 @@ pub enum RetainedImage {
     Bytes(Vec<u8>),
     Handle {
         draft: ImageIngressDraftAuthority,
-        image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::ImageAttachmentRef,
         normalized_byte_length: u64,
         sha256: String,
     },
@@ -330,7 +330,7 @@ impl PasteRegistry {
         &mut self,
         at: usize,
         draft: ImageIngressDraftAuthority,
-        image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
+        image_ref: cockpit_proto::ImageAttachmentRef,
         normalized_byte_length: u64,
         sha256: String,
     ) -> String {
@@ -892,7 +892,7 @@ impl PasteRegistry {
 /// the caller can interleave text and image content parts in order. Chosen
 /// to be vanishingly unlikely in user text and inert if it somehow leaks
 /// through (it reads as a tagged placeholder).
-pub use cockpit_core::daemon::proto::IMAGE_PART_SENTINEL;
+pub use cockpit_proto::IMAGE_PART_SENTINEL;
 
 #[cfg(test)]
 mod tests {

@@ -804,7 +804,7 @@ pub(crate) async fn execute_settings_daemon_work(
             let expected_layer_id = layer.layer_id.clone();
             let expected_layer_kind = layer.kind;
             let expected_revision = layer.revision.clone();
-            let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+            let patch = cockpit_proto::ExtendedConfigPatch {
                 operations,
                 materialize: true,
                 denylist: Vec::new(),
@@ -897,7 +897,7 @@ pub(crate) async fn execute_settings_daemon_work(
                     layer,
                     consumed_revision,
                     result_revision,
-                    status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+                    status: cockpit_proto::ConfigCommitStatus::Committed,
                     config_generation,
                     ..
                 } if client_operation_id == plan.client_operation_id
@@ -1142,7 +1142,7 @@ fn extended_config_layer_snapshot(
 }
 
 fn decode_extended_layer(
-    layer: cockpit_core::daemon::proto::ExtendedConfigLayerSnapshot,
+    layer: cockpit_proto::ExtendedConfigLayerSnapshot,
     config_generation: u64,
 ) -> Result<(ExtendedConfig, serde_json::Value, String), String> {
     let layer_uuid = uuid::Uuid::parse_str(&layer.layer_id)
@@ -1210,7 +1210,7 @@ fn decode_extended_layer(
 #[derive(Debug, Clone)]
 pub(super) enum SettingsPatchOutcome {
     Reconciled {
-        layer: cockpit_core::daemon::proto::ExtendedConfigLayerSnapshot,
+        layer: cockpit_proto::ExtendedConfigLayerSnapshot,
         config_generation: u64,
     },
     CommittedRefreshNeeded {
@@ -1240,20 +1240,20 @@ enum PendingSettingsOperation {
         snapshot_session_id: String,
         layer_id: String,
         mutation_intent_hash: String,
-        expected_layer: cockpit_core::daemon::proto::CockpitConfigLayer,
+        expected_layer: cockpit_proto::CockpitConfigLayer,
         expected_revision: String,
         expected_generation: u64,
-        operations: Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>,
-        denylist_plan: Vec<cockpit_core::daemon::proto::DesiredDenylistEntry>,
+        operations: Vec<cockpit_proto::ExtendedConfigPathMutation>,
+        denylist_plan: Vec<cockpit_proto::DesiredDenylistEntry>,
     },
     ExtendedRefresh {
         target: SettingsEffectTarget,
         requested_path: String,
-        expected_layer: cockpit_core::daemon::proto::CockpitConfigLayer,
+        expected_layer: cockpit_proto::CockpitConfigLayer,
         result_revision: String,
         result_generation: u64,
-        operations: Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>,
-        committed_denylist: Vec<cockpit_core::daemon::proto::CommittedDenylistEntry>,
+        operations: Vec<cockpit_proto::ExtendedConfigPathMutation>,
+        committed_denylist: Vec<cockpit_proto::CommittedDenylistEntry>,
         warning: Option<String>,
     },
     ProviderCatalog {
@@ -1835,7 +1835,7 @@ fn apply_settings_patch_via_daemon(
     let operations = changed_extended_paths(base, &desired_value)?;
     let denylist = denylist_mutations(base, &desired.redact.denylist)?;
     let denylist_receipt_plan = denylist.clone();
-    let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+    let patch = cockpit_proto::ExtendedConfigPatch {
         operations: operations.clone(),
         materialize: false,
         denylist,
@@ -1875,7 +1875,7 @@ fn apply_settings_patch_via_daemon(
             layer,
             consumed_revision,
             result_revision,
-            status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+            status: cockpit_proto::ConfigCommitStatus::Committed,
             publication,
             denylist: committed_denylist,
             ..
@@ -1889,7 +1889,7 @@ fn apply_settings_patch_via_daemon(
                 || config_generation == expected_generation.saturating_add(1)) =>
         {
             let warning = (publication
-                == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded)
+                == cockpit_proto::ConfigPublicationStatus::Degraded)
                 .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
             Ok((
                 result_revision,
@@ -1960,7 +1960,7 @@ pub(super) fn apply_typed_settings_document_edit(
     let operations = changed_extended_paths(&authority_base, &desired_value)?;
     let denylist = denylist_mutations(&authority_base, &desired.redact.denylist)?;
     let denylist_receipt_plan = denylist.clone();
-    let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+    let patch = cockpit_proto::ExtendedConfigPatch {
         operations: operations.clone(),
         materialize: true,
         denylist,
@@ -2000,7 +2000,7 @@ pub(super) fn apply_typed_settings_document_edit(
             layer,
             consumed_revision,
             result_revision,
-            status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+            status: cockpit_proto::ConfigCommitStatus::Committed,
             publication,
             denylist: committed_denylist,
             ..
@@ -2014,7 +2014,7 @@ pub(super) fn apply_typed_settings_document_edit(
                 || config_generation == expected_generation.saturating_add(1)) =>
         {
             let warning = (publication
-                == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded)
+                == cockpit_proto::ConfigPublicationStatus::Degraded)
                 .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
             Ok((
                 result_revision,
@@ -2091,8 +2091,8 @@ fn apply_json_merge_patch_local(target: &mut serde_json::Value, patch: serde_jso
 fn changed_extended_paths(
     base: &serde_json::Value,
     desired: &serde_json::Value,
-) -> Result<Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>, String> {
-    use cockpit_core::daemon::proto::{ExtendedConfigField, ExtendedConfigPathMutation as M};
+) -> Result<Vec<cockpit_proto::ExtendedConfigPathMutation>, String> {
+    use cockpit_proto::{ExtendedConfigField, ExtendedConfigPathMutation as M};
     let base = base
         .as_object()
         .ok_or_else(|| "settings base is not an object".to_string())?;
@@ -2156,7 +2156,7 @@ fn changed_extended_paths(
 }
 
 fn validate_settings_operations(
-    operations: &[cockpit_core::daemon::proto::ExtendedConfigPathMutation],
+    operations: &[cockpit_proto::ExtendedConfigPathMutation],
     snapshot: &serde_json::Value,
     authored_paths: &[Vec<String>],
 ) -> Result<(), String> {
@@ -2183,7 +2183,7 @@ fn validate_settings_operations(
     }
     for operation in operations {
         match operation {
-            cockpit_core::daemon::proto::ExtendedConfigPathMutation::Set { path, value } => {
+            cockpit_proto::ExtendedConfigPathMutation::Set { path, value } => {
                 if !authored_paths
                     .iter()
                     .any(|authored| authored == path || authored.starts_with(path))
@@ -2194,7 +2194,7 @@ fn validate_settings_operations(
                     );
                 }
             }
-            cockpit_core::daemon::proto::ExtendedConfigPathMutation::Unset { path } => {
+            cockpit_proto::ExtendedConfigPathMutation::Unset { path } => {
                 if authored_paths
                     .iter()
                     .any(|authored| authored == path || authored.starts_with(path))
@@ -2212,10 +2212,8 @@ fn validate_settings_operations(
 fn denylist_mutations(
     base: &serde_json::Value,
     desired: &[String],
-) -> Result<Vec<cockpit_core::daemon::proto::DesiredDenylistEntry>, String> {
-    use cockpit_core::daemon::proto::{
-        DesiredDenylistEntry as D, RedactedDenylistEntry, SensitiveWireLiteral,
-    };
+) -> Result<Vec<cockpit_proto::DesiredDenylistEntry>, String> {
+    use cockpit_proto::{DesiredDenylistEntry as D, RedactedDenylistEntry, SensitiveWireLiteral};
     let entries: Vec<RedactedDenylistEntry> = serde_json::from_value(
         base.get("__cockpit_denylist_entries")
             .cloned()
@@ -2258,8 +2256,8 @@ fn denylist_mutations(
 }
 
 fn validate_committed_denylist(
-    planned: &[cockpit_core::daemon::proto::DesiredDenylistEntry],
-    committed: &[cockpit_core::daemon::proto::CommittedDenylistEntry],
+    planned: &[cockpit_proto::DesiredDenylistEntry],
+    committed: &[cockpit_proto::CommittedDenylistEntry],
 ) -> Result<(), String> {
     if planned.len() != committed.len() {
         return Err("denylist receipt has the wrong length".into());
@@ -2275,10 +2273,10 @@ fn validate_committed_denylist(
             );
         }
         match planned {
-            cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
+            cockpit_proto::DesiredDenylistEntry::Existing { entry_id }
                 if committed.client_nonce.is_none()
                     && committed.consumed_entry_id.as_ref() == Some(entry_id) => {}
-            cockpit_core::daemon::proto::DesiredDenylistEntry::New {
+            cockpit_proto::DesiredDenylistEntry::New {
                 client_nonce,
                 literal: _,
             } if committed.client_nonce.as_ref() == Some(client_nonce)
@@ -2294,8 +2292,8 @@ fn validate_committed_denylist(
 }
 
 fn same_denylist_occurrences(
-    authoritative: &[cockpit_core::daemon::proto::RedactedDenylistEntry],
-    receipt: &[cockpit_core::daemon::proto::CommittedDenylistEntry],
+    authoritative: &[cockpit_proto::RedactedDenylistEntry],
+    receipt: &[cockpit_proto::CommittedDenylistEntry],
 ) -> bool {
     authoritative.len() == receipt.len()
         && authoritative.iter().zip(receipt).all(|(left, right)| {
@@ -2311,23 +2309,20 @@ fn same_denylist_occurrences(
 pub(crate) async fn secret_inventory_contains(
     client: &cockpit_core::daemon::client::DaemonClient,
     name: &str,
-    kind: Option<cockpit_core::daemon::proto::SecretInventoryKind>,
+    kind: Option<cockpit_proto::SecretInventoryKind>,
 ) -> Result<bool, String> {
     let mut cursor = None;
     let mut restarts = 0;
     loop {
         let response = match client
-            .request(cockpit_core::daemon::proto::Request::ListSecretInventory {
+            .request(cockpit_proto::Request::ListSecretInventory {
                 cursor: cursor.clone(),
-                limit: Some(cockpit_core::daemon::proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES as u16),
+                limit: Some(cockpit_proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES as u16),
             })
             .await
         {
             Ok(Ok(response)) => response,
-            Ok(Err(error))
-                if error.code == cockpit_core::daemon::proto::ErrorCode::Conflict
-                    && restarts < 2 =>
-            {
+            Ok(Err(error)) if error.code == cockpit_proto::ErrorCode::Conflict && restarts < 2 => {
                 restarts += 1;
                 cursor = None;
                 continue;
@@ -2335,7 +2330,7 @@ pub(crate) async fn secret_inventory_contains(
             Err(error) => return Err(error.to_string()),
             Ok(Err(error)) => return Err(error.to_string()),
         };
-        let cockpit_core::daemon::proto::Response::SecretInventory {
+        let cockpit_proto::Response::SecretInventory {
             entries,
             next_cursor,
         } = response
@@ -2354,8 +2349,8 @@ pub(crate) async fn secret_inventory_contains(
         cursor = Some(next_cursor);
     }
 }
-use cockpit_core::daemon::proto::{Request, Response};
 use cockpit_core::providers::models_fetch::FetchOutcome;
+use cockpit_proto::{Request, Response};
 use shell::{
     SettingsHeaderAction, SettingsPointerAction, SettingsPointerSurface, SettingsScrollStates,
     marker, muted_style, selected_or_field,
@@ -3456,7 +3451,7 @@ impl SettingsCx {
         let requested_path = self.extended_path.display().to_string();
         let snapshot_session_id = settings_snapshot_session_id().to_owned();
         let client_operation_id = uuid::Uuid::new_v4().to_string();
-        let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+        let patch = cockpit_proto::ExtendedConfigPatch {
             operations: operations.clone(),
             materialize: false,
             denylist: denylist.clone(),
@@ -3816,7 +3811,7 @@ impl SettingsCx {
                         layer,
                         consumed_revision,
                         result_revision,
-                        status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+                        status: cockpit_proto::ConfigCommitStatus::Committed,
                         publication,
                         denylist,
                     }) if returned_operation_id == client_operation_id
@@ -3832,7 +3827,7 @@ impl SettingsCx {
                             || config_generation == expected_generation.saturating_add(1)) =>
                     {
                         let warning = (publication
-                            == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded)
+                            == cockpit_proto::ConfigPublicationStatus::Degraded)
                             .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
                         Ok((result_revision, config_generation, denylist, warning))
                     }
@@ -4241,9 +4236,7 @@ impl SettingsCx {
                     {
                         self.invalidate_secret_inventory_entry(
                             &provider_id,
-                            Some(
-                                cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord,
-                            ),
+                            Some(cockpit_proto::SecretInventoryKind::CredentialRecord),
                         );
                         Ok(format!("stored credential for {provider_id}"))
                     }
@@ -4280,9 +4273,7 @@ impl SettingsCx {
                     {
                         self.invalidate_secret_inventory_entry(
                             &provider_id,
-                            Some(
-                                cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord,
-                            ),
+                            Some(cockpit_proto::SecretInventoryKind::CredentialRecord),
                         );
                         self.completed_web_credential = Some((provider_id.clone(), Ok(())));
                         Ok(format!("stored credential for {provider_id}"))
@@ -4635,7 +4626,7 @@ impl SettingsCx {
     pub(super) fn cached_secret_inventory_contains(
         &self,
         name: &str,
-        kind: Option<cockpit_core::daemon::proto::SecretInventoryKind>,
+        kind: Option<cockpit_proto::SecretInventoryKind>,
     ) -> Option<bool> {
         let key = format!("{kind:?}:{name}");
         if let Ok(cache) = self.secret_inventory_cache.lock()
@@ -4650,7 +4641,7 @@ impl SettingsCx {
     pub(super) fn refresh_secret_inventory_entry(
         &self,
         name: String,
-        kind: Option<cockpit_core::daemon::proto::SecretInventoryKind>,
+        kind: Option<cockpit_proto::SecretInventoryKind>,
     ) {
         // Synchronous unit-render tests intentionally have no Tokio runtime;
         // leave their cache miss as "checking" rather than panicking.
@@ -4685,7 +4676,7 @@ impl SettingsCx {
     pub(super) fn invalidate_secret_inventory_entry(
         &self,
         name: &str,
-        kind: Option<cockpit_core::daemon::proto::SecretInventoryKind>,
+        kind: Option<cockpit_proto::SecretInventoryKind>,
     ) {
         let key = format!("{kind:?}:{name}");
         if let Ok(mut cache) = self.secret_inventory_cache.lock() {
@@ -4953,7 +4944,7 @@ fn lsp_page(page: LspPage) -> PageBox {
 use agents_page::AgentsPage;
 use category::{Category, CategoryPage};
 #[cfg(test)]
-use cockpit_core::daemon::proto::LspControlAction;
+use cockpit_proto::LspControlAction;
 use harnesses_page::HarnessesPage;
 use lsp_page::LspPage;
 #[cfg(test)]
@@ -8256,9 +8247,7 @@ fn merge_dialog_provider_config(
     }
 }
 
-fn providers_config_from_view(
-    view: &cockpit_core::daemon::proto::ProviderConfigView,
-) -> ProvidersConfig {
+fn providers_config_from_view(view: &cockpit_proto::ProviderConfigView) -> ProvidersConfig {
     ProvidersConfig {
         providers: view
             .providers
@@ -8287,7 +8276,7 @@ fn providers_config_from_view(
 }
 
 fn provider_view_matches_mutation(
-    view: &cockpit_core::daemon::proto::ProviderConfigView,
+    view: &cockpit_proto::ProviderConfigView,
     upserts: &[(String, ProviderEntry)],
     deletes: &[String],
     metadata: Option<&cockpit_proto::ProviderLayerMetadataPatch>,
@@ -8340,7 +8329,7 @@ fn daemon_provider_snapshot(
 fn daemon_provider_view_snapshot(
     cwd: &std::path::Path,
     provider_id: Option<&str>,
-) -> Option<cockpit_core::daemon::proto::ProviderConfigView> {
+) -> Option<cockpit_proto::ProviderConfigView> {
     let project_root = cwd.display().to_string();
     let provider_id = provider_id.map(str::to_string);
     daemon_provider_view_snapshot_inner(project_root, provider_id)
@@ -8350,7 +8339,7 @@ fn daemon_provider_view_snapshot(
 fn daemon_provider_view_snapshot_inner(
     project_root: String,
     provider_id: Option<String>,
-) -> Option<cockpit_core::daemon::proto::ProviderConfigView> {
+) -> Option<cockpit_proto::ProviderConfigView> {
     match settings_daemon_request(Request::GetProviderCatalogSnapshot {
         project_root,
         provider_id,

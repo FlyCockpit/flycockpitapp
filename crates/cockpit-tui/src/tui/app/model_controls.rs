@@ -12,7 +12,7 @@ impl App {
         }
         self.send_daemon_request(
             "/agent",
-            cockpit_core::daemon::proto::Request::SetAgent {
+            cockpit_proto::Request::SetAgent {
                 name: name.to_string(),
             },
             ControlApplied::PrimaryAgentSwitch {
@@ -56,7 +56,7 @@ impl App {
     pub(super) fn start_multireview(&mut self, kickoff: String) {
         self.send_daemon_request(
             "/multireview",
-            cockpit_core::daemon::proto::Request::SetAgent {
+            cockpit_proto::Request::SetAgent {
                 name: "Multireview".to_string(),
             },
             ControlApplied::Multireview { kickoff },
@@ -216,7 +216,7 @@ impl App {
                 };
                 self.send_daemon_request(
                     "/tools",
-                    cockpit_core::daemon::proto::Request::SetToolSurfaceOverride {
+                    cockpit_proto::Request::SetToolSurfaceOverride {
                         override_json,
                         persist_session,
                         prune_after_switch: cache_break,
@@ -241,7 +241,7 @@ impl App {
             } => {
                 self.send_daemon_request(
                     "/goal-settings",
-                    cockpit_core::daemon::proto::Request::SetGoalSettingsOverride {
+                    cockpit_proto::Request::SetGoalSettingsOverride {
                         override_json,
                         persist_session,
                     },
@@ -279,7 +279,7 @@ impl App {
         &mut self,
         provider: String,
         model: String,
-        kind: cockpit_core::daemon::proto::AuthFailureKind,
+        kind: cockpit_proto::AuthFailureKind,
         failed_at_epoch_secs: i64,
     ) {
         self.auth_failure_annotations.insert(
@@ -359,7 +359,7 @@ impl App {
         };
         let oauth_expired = matches!(
             notice.kind,
-            cockpit_core::daemon::proto::AuthFailureKind::OAuthExpired { .. }
+            cockpit_proto::AuthFailureKind::OAuthExpired { .. }
         );
         self.dialog = crate::tui::settings::Dialog::open_provider_settings(
             &self.launch.cwd,
@@ -403,7 +403,7 @@ impl App {
             if self.notify_active_model_selected(
                 active,
                 persist_as_default,
-                cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+                cockpit_proto::ActiveModelSwitchTrigger::Picker,
             ) {
                 let scope = if persist_as_default {
                     format!("Selecting {provider}/{model} for this session; saving default…")
@@ -423,12 +423,12 @@ impl App {
         &mut self,
         active: cockpit_config::providers::ActiveModelRef,
         persist_as_default: bool,
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger,
     ) -> bool {
         let provider = active.provider.clone();
         let model = active.model.clone();
         self.record_usage(
-            cockpit_core::daemon::proto::UsageKind::Model,
+            cockpit_proto::UsageKind::Model,
             format!("{provider}/{model}"),
             None,
         );
@@ -440,7 +440,7 @@ impl App {
         label: &str,
         active: cockpit_config::providers::ActiveModelRef,
         persist_as_default: bool,
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger,
     ) -> bool {
         if self.has_pending_session_switch_action() {
             self.show_model_selection_error(
@@ -477,10 +477,7 @@ impl App {
         }
         if let Some(retry) = self.current_model_selection_retry()
             && retry.requested != active
-            && !matches!(
-                trigger,
-                cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker
-            )
+            && !matches!(trigger, cockpit_proto::ActiveModelSwitchTrigger::Picker)
         {
             self.push_plain(format!(
                 "A failed {:?} selection for {}/{} and its queued message are waiting for retry; open `/model` to retry it or explicitly choose a replacement.",
@@ -585,13 +582,10 @@ impl App {
     pub(super) fn show_model_selection_error(
         &mut self,
         active: &cockpit_config::providers::ActiveModelRef,
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger,
         message: String,
     ) {
-        if matches!(
-            trigger,
-            cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker
-        ) {
+        if matches!(trigger, cockpit_proto::ActiveModelSwitchTrigger::Picker) {
             self.open_model_picker_highlighting(Some(active));
             if let Overlay::ModelPicker(picker) = &mut self.overlay {
                 picker.set_error(message);
@@ -614,7 +608,7 @@ impl App {
                 if self.notify_active_model_selected(
                     active,
                     false,
-                    cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Cycle,
+                    cockpit_proto::ActiveModelSwitchTrigger::Cycle,
                 ) {
                     self.push_plain(format!("/model: selecting {provider}/{model} ★"));
                 }
@@ -682,14 +676,14 @@ impl App {
         if let Some(mode) = commit.llm_mode {
             self.send_daemon_request(
                 "/quick",
-                cockpit_core::daemon::proto::Request::SetSessionLlmMode { mode },
+                cockpit_proto::Request::SetSessionLlmMode { mode },
                 ControlApplied::CacheBreakWarning,
             );
         }
         if let Some((enabled, default_depth)) = commit.recursion {
             self.send_daemon_request(
                 "/quick",
-                cockpit_core::daemon::proto::Request::SetDelegationRecursion {
+                cockpit_proto::Request::SetDelegationRecursion {
                     enabled,
                     default_depth,
                 },
@@ -699,7 +693,7 @@ impl App {
         if commit.sandbox_mode.is_some() || commit.container_network_enabled.is_some() {
             self.send_daemon_request(
                 "/quick",
-                cockpit_core::daemon::proto::Request::SetSandbox {
+                cockpit_proto::Request::SetSandbox {
                     mode: commit.sandbox_mode,
                     container_network_enabled: commit.container_network_enabled,
                 },
@@ -709,7 +703,7 @@ impl App {
         if let Some(mode) = commit.approval_mode {
             self.send_daemon_request(
                 "/quick",
-                cockpit_core::daemon::proto::Request::SetApprovalMode { mode },
+                cockpit_proto::Request::SetApprovalMode { mode },
                 ControlApplied::None,
             );
         }
@@ -745,7 +739,7 @@ impl App {
             let model = active.model.clone();
             if model_changed {
                 self.record_usage(
-                    cockpit_core::daemon::proto::UsageKind::Model,
+                    cockpit_proto::UsageKind::Model,
                     format!("{provider}/{model}"),
                     None,
                 );
@@ -754,7 +748,7 @@ impl App {
                 "/quick",
                 active,
                 false,
-                cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+                cockpit_proto::ActiveModelSwitchTrigger::Quick,
             );
         }
     }
@@ -792,7 +786,7 @@ impl App {
     pub(super) fn send_daemon_request(
         &mut self,
         label: &str,
-        req: cockpit_core::daemon::proto::Request,
+        req: cockpit_proto::Request,
         applied: ControlApplied,
     ) {
         let Some(Ok(runner)) = self.agent_runner.as_ref() else {
@@ -1200,7 +1194,7 @@ impl super::App {
         let provider = active.provider.clone();
         let model = active.model.clone();
         self.push_plain(format!("Saving default for {provider}/{model}…"));
-        let req = cockpit_core::daemon::proto::Request::SetDefaultModel {
+        let req = cockpit_proto::Request::SetDefaultModel {
             default_update_id,
             provider: Some(active.provider),
             model: Some(active.model),
@@ -1219,9 +1213,9 @@ fn active_model_request(
     selection_id: uuid::Uuid,
     active: cockpit_config::providers::ActiveModelRef,
     persist_as_default: bool,
-    trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
-) -> cockpit_core::daemon::proto::Request {
-    cockpit_core::daemon::proto::Request::SetActiveModel {
+    trigger: cockpit_proto::ActiveModelSwitchTrigger,
+) -> cockpit_proto::Request {
+    cockpit_proto::Request::SetActiveModel {
         selection_id,
         provider: active.provider,
         model: active.model,

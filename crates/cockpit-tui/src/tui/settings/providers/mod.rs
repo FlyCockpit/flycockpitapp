@@ -856,7 +856,7 @@ impl CopilotSetupState {
                 owner: provider_id.clone(),
                 revision: Some(operation_id.0.to_string()),
             },
-            cockpit_core::daemon::proto::Request::SetupCopilotAuth {
+            cockpit_proto::Request::SetupCopilotAuth {
                 client_operation_id: client_operation_id.clone(),
                 project_root: project_root.clone(),
                 provider_id: provider_id.clone(),
@@ -1862,7 +1862,7 @@ impl SettingsCx {
         // cache miss asynchronously instead of waiting on the daemon socket.
         self.cached_secret_inventory_contains(
             provider_id,
-            Some(cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord),
+            Some(cockpit_proto::SecretInventoryKind::CredentialRecord),
         )
     }
 
@@ -1900,7 +1900,7 @@ impl SettingsCx {
                 owner: provider_id.clone(),
                 revision: Some(client_operation_id.clone()),
             },
-            cockpit_core::daemon::proto::Request::DeleteProviderCredential {
+            cockpit_proto::Request::DeleteProviderCredential {
                 client_operation_id: client_operation_id.clone(),
                 provider_id: provider_id.clone(),
                 project_root: Some(project_root.clone()),
@@ -4675,7 +4675,7 @@ fn render_header_edit_popup(cx: &SettingsCx, frame: &mut Frame, area: Rect, h: &
             matches!(
                 cx.cached_secret_inventory_contains(
                     name,
-                    Some(cockpit_core::daemon::proto::SecretInventoryKind::NamedSecret),
+                    Some(cockpit_proto::SecretInventoryKind::NamedSecret),
                 ),
                 Some(false)
             )

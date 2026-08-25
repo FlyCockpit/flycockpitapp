@@ -94,7 +94,7 @@ fn attach_coalescing_retains_typed_model_and_btw_continuations() {
         "/model",
         active.clone(),
         false,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+        cockpit_proto::ActiveModelSwitchTrigger::Picker,
     ));
     app.start_runner_attach(
         true,

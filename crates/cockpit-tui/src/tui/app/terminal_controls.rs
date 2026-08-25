@@ -80,7 +80,7 @@ impl App {
     pub(super) fn interrupt_agent(&mut self) {
         self.send_daemon_request(
             "interrupt",
-            cockpit_core::daemon::proto::Request::CancelTurn,
+            cockpit_proto::Request::CancelTurn,
             ControlApplied::None,
         );
     }

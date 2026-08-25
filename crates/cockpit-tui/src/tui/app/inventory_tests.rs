@@ -3,7 +3,7 @@
 
 use super::inventory::*;
 use cockpit_config::config::providers::ModelTrust;
-use cockpit_core::daemon::proto::{AgentSummary, ModelSummary, SkillSummary};
+use cockpit_proto::{AgentSummary, ModelSummary, SkillSummary};
 use uuid::Uuid;
 
 fn agent(name: &str) -> AgentSummary {

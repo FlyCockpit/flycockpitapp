@@ -18,10 +18,10 @@ use crate::tui::theme::{
     button_hover_style, button_idle_style,
 };
 use cockpit_config::{extended::LlmMode, sandbox_mode::SandboxMode};
-#[cfg(feature = "remote")]
-use cockpit_core::daemon::proto::{ConnectorDisclosure, OrgSyncDisclosure};
 use cockpit_core::git::repo_counts;
 use cockpit_core::welcome::LaunchInfo;
+#[cfg(feature = "remote")]
+use cockpit_proto::{ConnectorDisclosure, OrgSyncDisclosure};
 
 pub fn status_line_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));

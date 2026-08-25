@@ -24,7 +24,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use zeroize::Zeroizing;
 
-use cockpit_core::daemon::proto::{
+use cockpit_proto::{
     LeakReportMetadata, LeakRotationDisposition, LeakRotationState, Request, Response,
 };
 

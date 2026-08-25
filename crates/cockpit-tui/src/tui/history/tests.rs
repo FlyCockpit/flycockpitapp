@@ -85,10 +85,10 @@ fn link_reference_definition_start_shape_is_position_aware() {
 #[test]
 fn interrupt_decision_renders_as_dedicated_styled_dismissed_row() {
     let entry = HistoryEntry::InterruptDecision {
-        decision: cockpit_core::daemon::proto::InterruptDecision {
+        decision: cockpit_proto::InterruptDecision {
             permission: true,
             cancelled: true,
-            lines: vec![cockpit_core::daemon::proto::InterruptDecisionLine {
+            lines: vec![cockpit_proto::InterruptDecisionLine {
                 prompt: "Run command?".to_string(),
                 answer: "Allow".to_string(),
             }],

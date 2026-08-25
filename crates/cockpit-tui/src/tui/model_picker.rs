@@ -176,7 +176,7 @@ pub struct ModelChoice {
 /// Build ordered model choices from a daemon inventory-bundle model list.
 /// Does not read credentials or the local provider config tree.
 pub fn ordered_model_choices_from_inventory(
-    models: &[cockpit_core::daemon::proto::ModelSummary],
+    models: &[cockpit_proto::ModelSummary],
     global_mode: cockpit_config::extended::LlmMode,
     counts: &HashMap<String, u64>,
 ) -> Vec<ModelChoice> {
@@ -1665,9 +1665,7 @@ mod tests {
         let failures = [(
             ("p".to_string(), "claude".to_string()),
             crate::tui::auth_failure::AuthFailureRecord {
-                kind: cockpit_core::daemon::proto::AuthFailureKind::CredentialsRejected {
-                    status: 403,
-                },
+                kind: cockpit_proto::AuthFailureKind::CredentialsRejected { status: 403 },
                 failed_at_epoch_secs: 10_000,
             },
         )]

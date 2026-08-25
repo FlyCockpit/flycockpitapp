@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use cockpit_core::daemon::proto::{Request, Response, WorkspaceTrustMode};
+use cockpit_proto::{Request, Response, WorkspaceTrustMode};
 
 use super::set_workspace_trust_with_retry;
 use crate::tui::agent_runner::BlockingDaemonRequestError;

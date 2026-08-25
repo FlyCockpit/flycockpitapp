@@ -5,8 +5,8 @@ use super::{
 use crate::tui::agent_runner::{AgentRunner, ClientTasks, ControlRequest, UsageCounts};
 use crate::tui::settings::Dialog;
 use cockpit_config::extended::LlmMode;
-use cockpit_core::daemon::proto::Request;
 use cockpit_core::engine::{ControlRequestId, ControlRequestOutcome, TurnEvent};
+use cockpit_proto::Request;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,

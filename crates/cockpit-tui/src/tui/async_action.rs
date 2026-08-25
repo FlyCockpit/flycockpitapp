@@ -195,23 +195,23 @@ pub enum AsyncActionPayload {
     Text(String),
     Bool(bool),
     #[allow(dead_code)]
-    DaemonResponse(Box<cockpit_core::daemon::proto::Response>),
-    Sessions(Vec<cockpit_core::daemon::proto::SessionSummary>),
+    DaemonResponse(Box<cockpit_proto::Response>),
+    Sessions(Vec<cockpit_proto::SessionSummary>),
     SessionsMutation(crate::tui::sessions_pane::SessionsMutationCompletion),
     SessionMessages {
         session_id: uuid::Uuid,
         before_seq: Option<i64>,
-        messages: Vec<cockpit_core::daemon::proto::SessionMessage>,
+        messages: Vec<cockpit_proto::SessionMessage>,
         has_more: bool,
     },
     ClientSubmissionReceipt {
         client_submission_id: uuid::Uuid,
-        result: Result<cockpit_core::daemon::proto::ClientSubmissionReceiptStatus, String>,
+        result: Result<cockpit_proto::ClientSubmissionReceiptStatus, String>,
     },
     SessionLiveStatus(std::collections::HashMap<uuid::Uuid, (bool, bool)>),
     ResourceSnapshot(cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot),
     PromoteResource {
-        status: cockpit_core::daemon::proto::ResourcePromoteStatus,
+        status: cockpit_proto::ResourcePromoteStatus,
         message: String,
         snapshot: cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot,
     },
@@ -226,7 +226,7 @@ pub enum AsyncActionPayload {
     NoteRecorded {
         text: String,
     },
-    DelegationSteer(cockpit_core::daemon::proto::DelegationSteerResult),
+    DelegationSteer(cockpit_proto::DelegationSteerResult),
     GuidanceEstimate(crate::tui::agent_runner::GuidanceEstimate),
     StartupGuidanceEstimate {
         cwd: std::path::PathBuf,
@@ -254,8 +254,8 @@ pub enum AsyncActionPayload {
         launch_session_id: Option<uuid::Uuid>,
         session_id: Option<uuid::Uuid>,
         attachment_epoch: Option<u64>,
-        org: Option<cockpit_core::daemon::proto::OrgSyncDisclosure>,
-        connector: Option<cockpit_core::daemon::proto::ConnectorDisclosure>,
+        org: Option<cockpit_proto::OrgSyncDisclosure>,
+        connector: Option<cockpit_proto::ConnectorDisclosure>,
     },
     AssistantSessionResolved {
         session_id: uuid::Uuid,
@@ -300,7 +300,7 @@ pub enum AsyncActionPayload {
     },
     ProviderUsage(Vec<cockpit_core::providers::usage::ProviderUsageSnapshot>),
     Skills(crate::tui::skills_pane::SkillsPaneFetchResult),
-    InventoryBundle(cockpit_core::daemon::proto::Response),
+    InventoryBundle(cockpit_proto::Response),
     NotesRpc(crate::tui::notes_pane::NotesRpcResult),
     LeaksRpc(crate::tui::leaks_pane::LeaksRpcResult),
     PasteTokenCount {
@@ -338,7 +338,7 @@ pub enum AsyncActionPayload {
     },
     PinsReview {
         session_id: uuid::Uuid,
-        pins: Vec<cockpit_core::daemon::proto::PinnedMessage>,
+        pins: Vec<cockpit_proto::PinnedMessage>,
     },
     PinMessage {
         session_id: uuid::Uuid,
@@ -400,7 +400,7 @@ pub enum AsyncActionPayload {
         suggestions: Vec<cockpit_core::tags::Suggestion>,
     },
     BtwTransition {
-        created: Option<cockpit_core::daemon::proto::BtwForkInfo>,
+        created: Option<cockpit_proto::BtwForkInfo>,
         ended: bool,
         question: Option<String>,
         error: Option<String>,
@@ -426,7 +426,7 @@ pub struct DaemonImagePathAdmission {
     pub admission_id: uuid::Uuid,
     pub session_id: uuid::Uuid,
     pub discard_operation_id: uuid::Uuid,
-    pub image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
+    pub image_ref: cockpit_proto::ImageAttachmentRef,
     pub normalized_byte_length: u64,
     pub sha256: String,
     pub width: u32,

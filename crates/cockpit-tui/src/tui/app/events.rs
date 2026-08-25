@@ -91,12 +91,12 @@ pub(super) fn remove_correlated_optimistic_user_history<H: FoldedUserHistory>(
 /// every represented optimistic row with the one authoritative history row.
 pub(super) fn reconcile_history_replay<H: FoldedUserHistory>(
     history: &mut H,
-    wire: Vec<cockpit_core::daemon::proto::HistoryEntry>,
+    wire: Vec<cockpit_proto::HistoryEntry>,
 ) {
     let replayed_ids = wire
         .iter()
         .flat_map(|entry| match entry {
-            cockpit_core::daemon::proto::HistoryEntry::User {
+            cockpit_proto::HistoryEntry::User {
                 client_submission_ids,
                 ..
             } => client_submission_ids.clone(),
@@ -204,7 +204,7 @@ impl App {
         {
             self.send_daemon_request(
                 "/capabilities",
-                cockpit_core::daemon::proto::Request::RefreshHostCapabilities,
+                cockpit_proto::Request::RefreshHostCapabilities,
                 crate::tui::app::ControlApplied::None,
             );
         } else {
@@ -546,7 +546,7 @@ impl App {
         &mut self,
         text: String,
         display_text: Option<String>,
-        tag_expansions: Vec<cockpit_core::daemon::proto::TagExpansionMeta>,
+        tag_expansions: Vec<cockpit_proto::TagExpansionMeta>,
         queue_item_ids: Vec<uuid::Uuid>,
         seq: Option<i64>,
         preflight_cleaned: Option<String>,
@@ -730,7 +730,7 @@ impl App {
             } => {
                 let (applied, user_message, generation, applied_state, default_update) =
                     match &outcome {
-                        cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
+                        cockpit_proto::ModelSelectionOutcome::Applied {
                             active_state,
                             default_update,
                         } => (
@@ -740,10 +740,9 @@ impl App {
                             Some(active_state.clone()),
                             Some(default_update.clone()),
                         ),
-                        cockpit_core::daemon::proto::ModelSelectionOutcome::Rejected {
-                            user_message,
-                            ..
-                        } => (false, Some(user_message.clone()), 0, None, None),
+                        cockpit_proto::ModelSelectionOutcome::Rejected { user_message, .. } => {
+                            (false, Some(user_message.clone()), 0, None, None)
+                        }
                     };
                 // Every applied result carries daemon-authoritative state for
                 // this live worker epoch. Apply it independently of local
@@ -836,10 +835,10 @@ impl App {
                 }
                 if applied && let Some(default_update) = default_update {
                     match default_update {
-                        cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested => {
+                        cockpit_proto::DefaultModelUpdateOutcome::NotRequested => {
                             self.push_plain(format!("Using {provider}/{model} for this session."));
                         }
-                        cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Verified {
+                        cockpit_proto::DefaultModelUpdateOutcome::Verified {
                             selection,
                             scope_label,
                             unchanged,
@@ -921,7 +920,7 @@ impl App {
                 }
                 self.pending_default_model_update_id = None;
                 match outcome {
-                    cockpit_core::daemon::proto::DefaultModelStandaloneOutcome::Applied {
+                    cockpit_proto::DefaultModelStandaloneOutcome::Applied {
                         selection,
                         scope_label,
                         unchanged,
@@ -942,9 +941,8 @@ impl App {
                         }
                         self.resync_config_after_local_write();
                     }
-                    cockpit_core::daemon::proto::DefaultModelStandaloneOutcome::Rejected {
-                        user_message,
-                        ..
+                    cockpit_proto::DefaultModelStandaloneOutcome::Rejected {
+                        user_message, ..
                     } => {
                         self.push_plain(format!("Default model was not changed — {user_message}"));
                     }
@@ -1436,7 +1434,7 @@ impl App {
                 if removed
                     && matches!(
                         disposition,
-                        cockpit_core::daemon::proto::UserMessageTerminalDisposition::PreflightRejected
+                        cockpit_proto::UserMessageTerminalDisposition::PreflightRejected
                     )
                 {
                     self.end_working_span();
@@ -1959,7 +1957,7 @@ impl App {
                 let is_approval = questions.questions.iter().any(|q| {
                     matches!(
                         q,
-                        cockpit_core::daemon::proto::InterruptQuestion::Single {
+                        cockpit_proto::InterruptQuestion::Single {
                             permission: true,
                             approval_class: None,
                             ..
@@ -1995,13 +1993,11 @@ impl App {
                 // background notification or duplicate same-id re-raise must
                 // not disarm the next visible approval.
                 let lockout = match reason {
-                    cockpit_core::daemon::proto::InterruptRaiseReason::Initial => {
-                        self.dialog_lockout()
-                    }
-                    cockpit_core::daemon::proto::InterruptRaiseReason::Advance => {
+                    cockpit_proto::InterruptRaiseReason::Initial => self.dialog_lockout(),
+                    cockpit_proto::InterruptRaiseReason::Advance => {
                         crate::tui::dialog::DialogState::NO_LOCKOUT
                     }
-                    cockpit_core::daemon::proto::InterruptRaiseReason::Rehydration => {
+                    cockpit_proto::InterruptRaiseReason::Rehydration => {
                         self.rehydrated_dialog_lockout()
                     }
                 };
@@ -2401,15 +2397,14 @@ impl App {
                 relay_region,
                 last_error,
             } => {
-                self.connector_disclosure =
-                    Some(cockpit_core::daemon::proto::ConnectorDisclosure {
-                        enabled,
-                        status,
-                        relay_url,
-                        relay_id,
-                        relay_region,
-                        last_error,
-                    });
+                self.connector_disclosure = Some(cockpit_proto::ConnectorDisclosure {
+                    enabled,
+                    status,
+                    relay_url,
+                    relay_id,
+                    relay_region,
+                    last_error,
+                });
             }
             TurnEvent::DaemonDraining { forced } => {
                 // Daemon-global drain notice
@@ -2518,15 +2513,12 @@ impl App {
     /// Stale pushes — a lower generation than a previously daemon-sourced
     /// snapshot — are dropped. Applying is a cheap field swap plus a projection
     /// refresh; it performs no disk read or config resolution.
-    pub(super) fn apply_config_snapshot(
-        &mut self,
-        snapshot: cockpit_core::daemon::proto::ConfigSnapshot,
-    ) {
+    pub(super) fn apply_config_snapshot(&mut self, snapshot: cockpit_proto::ConfigSnapshot) {
         if self.config_snapshot.from_daemon && snapshot.generation < self.config_snapshot.generation
         {
             return;
         }
-        let cockpit_core::daemon::proto::ConfigSnapshot {
+        let cockpit_proto::ConfigSnapshot {
             generation,
             extended,
             providers,
@@ -2915,10 +2907,8 @@ fn restored_tool_state(hard_fail: bool) -> ToolCallState {
 /// consecutive boxable calls coalesce into one `ToolBox`) — no separate
 /// read-only rendering path. Tool-call rows honor the wire-vs-user split
 /// (GOALS §14): the user-facing summary is built from `original_input`.
-pub(super) fn wire_history_to_entries(
-    wire: Vec<cockpit_core::daemon::proto::HistoryEntry>,
-) -> Vec<HistoryEntry> {
-    use cockpit_core::daemon::proto::HistoryEntry as Wire;
+pub(super) fn wire_history_to_entries(wire: Vec<cockpit_proto::HistoryEntry>) -> Vec<HistoryEntry> {
+    use cockpit_proto::HistoryEntry as Wire;
     let mut out: Vec<HistoryEntry> = Vec::new();
     let mut pending_mcp_children: std::collections::BTreeMap<String, Vec<ToolCall>> =
         std::collections::BTreeMap::new();
@@ -4360,7 +4350,7 @@ mod tests {
 
     #[test]
     fn restored_session_reconstructs_children() {
-        let child = cockpit_core::daemon::proto::HistoryEntry::ToolCall {
+        let child = cockpit_proto::HistoryEntry::ToolCall {
             seq: 1,
             agent: "Build".into(),
             call_id: "outer:mcp:0".into(),
@@ -4387,7 +4377,7 @@ mod tests {
             truncated: false,
             hint: None,
         };
-        let parent = cockpit_core::daemon::proto::HistoryEntry::ToolCall {
+        let parent = cockpit_proto::HistoryEntry::ToolCall {
             seq: 2,
             agent: "Build".into(),
             call_id: "outer".into(),

@@ -19,7 +19,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-use cockpit_core::daemon::proto::SkillSummary;
+use cockpit_proto::SkillSummary;
 
 pub struct SkillsPane {
     generation: u64,
@@ -54,7 +54,7 @@ pub struct SkillsPaneFetchResult {
     pub source: SkillsPaneSource,
     pub skills: Result<Vec<SkillSummary>, String>,
     /// Full bundle when the fetch came from GetInventoryBundle (for inventory state).
-    pub bundle: Option<cockpit_core::daemon::proto::Response>,
+    pub bundle: Option<cockpit_proto::Response>,
 }
 
 impl SkillsPane {

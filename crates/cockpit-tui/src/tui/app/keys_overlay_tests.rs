@@ -1,9 +1,7 @@
 use super::{App, HistoryEntry, Overlay, SLASH_COMMANDS, SideConversation, input};
 use crate::tui::async_action::AsyncActionKind;
 use crate::tui::keys_overlay::KeyContext;
-use cockpit_core::daemon::proto::{
-    InterruptOption, InterruptQuestion, InterruptQuestionSet, SessionSummary,
-};
+use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet, SessionSummary};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use std::fs;

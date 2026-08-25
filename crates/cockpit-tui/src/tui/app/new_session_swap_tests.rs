@@ -201,7 +201,7 @@ fn complete_submission(index: usize) -> UserSubmission {
         origin: Default::default(),
         text: format!("wire-{index}"),
         display_text: Some(format!("display-{index}")),
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: format!("src/{index}.rs"),
             detail: "complete".to_string(),
@@ -884,7 +884,7 @@ async fn new_session_swap_discards_old_epoch_events_while_provisional() {
             },
             TurnEvent::QueueUpdated { queue: vec![] },
             TurnEvent::ConfigSnapshot {
-                snapshot: Box::new(cockpit_core::daemon::proto::ConfigSnapshot {
+                snapshot: Box::new(cockpit_proto::ConfigSnapshot {
                     session_id: uuid::Uuid::nil(),
                     generation: 1,
                     extended: config_extended.clone(),
@@ -1349,7 +1349,7 @@ async fn new_session_switch_outcome_adopts_identity_after_immediate_reset() {
         thinking_mode: None,
         prompt_cache_retention: None,
     };
-    let active_model = cockpit_core::daemon::proto::ActiveModelState {
+    let active_model = cockpit_proto::ActiveModelState {
         selection: selection.clone(),
         default_selection: Some(selection.clone()),
         diverged: false,
@@ -1540,12 +1540,10 @@ async fn new_session_swap_suppresses_outgoing_delivery_receipt_while_provisional
         async move {
             Ok(AsyncActionPayload::ClientSubmissionReceipt {
                 client_submission_id,
-                result: Ok(
-                    cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Terminal {
-                        disposition: "accepted".into(),
-                        wire_fingerprint: "abc".into(),
-                    },
-                ),
+                result: Ok(cockpit_proto::ClientSubmissionReceiptStatus::Terminal {
+                    disposition: "accepted".into(),
+                    wire_fingerprint: "abc".into(),
+                }),
             })
         },
     );
@@ -2174,10 +2172,10 @@ async fn provisional_new_suppresses_caffeinate_presentation() {
 }
 
 fn seed_outgoing_model_and_config_chrome(app: &mut App) {
-    let mut providers = cockpit_core::daemon::proto::ProviderConfigView::default();
+    let mut providers = cockpit_proto::ProviderConfigView::default();
     providers.providers.insert(
         "outgoing".into(),
-        cockpit_core::daemon::proto::ProviderEntryView {
+        cockpit_proto::ProviderEntryView {
             entry: cockpit_config::providers::ProviderEntry {
                 name: Some("Outgoing".into()),
                 models: vec![cockpit_config::providers::ModelEntry {
@@ -2200,7 +2198,7 @@ fn seed_outgoing_model_and_config_chrome(app: &mut App) {
     });
     let mut extended = app.config_snapshot.extended.clone();
     extended.dialog.lockout_ms = 4242;
-    app.apply_config_snapshot(cockpit_core::daemon::proto::ConfigSnapshot {
+    app.apply_config_snapshot(cockpit_proto::ConfigSnapshot {
         session_id: uuid::Uuid::nil(),
         generation: 9,
         extended,
@@ -2510,7 +2508,7 @@ async fn provisional_new_suppresses_model_selection_cancel_notice() {
             thinking_mode: None,
             prompt_cache_retention: None,
         },
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger::Picker,
         minimum_generation: 1,
         started_at: Instant::now(),
         queued_submission: None,

@@ -32,7 +32,7 @@ use crate::tui::composer::Composer;
 use crate::tui::markdown;
 use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-use cockpit_core::daemon::proto::{ProjectNote, Request, Response};
+use cockpit_proto::{ProjectNote, Request, Response};
 
 /// Which part of the dialog has focus / what the user is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]

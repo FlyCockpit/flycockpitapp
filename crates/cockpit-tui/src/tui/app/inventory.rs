@@ -6,7 +6,7 @@
 
 #![allow(dead_code)] // public reducer API exercised by inventory_tests and App wiring
 
-use cockpit_core::daemon::proto::{AgentSummary, ModelSummary, SkillSummary};
+use cockpit_proto::{AgentSummary, ModelSummary, SkillSummary};
 use uuid::Uuid;
 
 /// Authoritative inventory projection for one selected session/agent.

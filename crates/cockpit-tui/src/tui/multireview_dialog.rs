@@ -212,7 +212,7 @@ impl MultireviewDialog {
     pub fn open(
         cwd: &Path,
         extended: &cockpit_config::extended::ExtendedConfig,
-        models: &[cockpit_core::daemon::proto::ModelSummary],
+        models: &[cockpit_proto::ModelSummary],
         counts: &std::collections::HashMap<String, u64>,
     ) -> Result<Self, String> {
         let defaults: BTreeSet<String> = extended

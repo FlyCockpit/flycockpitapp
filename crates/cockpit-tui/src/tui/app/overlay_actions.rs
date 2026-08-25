@@ -30,15 +30,15 @@ fn canonical_leak_capability(value: &str) -> bool {
 
 fn cancel_leak_capability_blocking(
     socket: &std::path::Path,
-    capability: cockpit_core::daemon::proto::LeakRevealToken,
+    capability: cockpit_proto::LeakRevealToken,
     expected_report_id: &str,
 ) -> bool {
     matches!(
         crate::tui::agent_runner::daemon_request_at_blocking(
             socket,
-            cockpit_core::daemon::proto::Request::CancelLeakReveal { capability },
+            cockpit_proto::Request::CancelLeakReveal { capability },
         ),
-        Ok(cockpit_core::daemon::proto::Response::LeakRevealCancelled { report_id })
+        Ok(cockpit_proto::Response::LeakRevealCancelled { report_id })
             if report_id == expected_report_id
     )
 }
@@ -136,13 +136,11 @@ impl App {
             let result = (|| {
                 let capability = match crate::tui::agent_runner::daemon_request_at_blocking(
                     &socket,
-                    cockpit_core::daemon::proto::Request::BeginLeakReveal {
+                    cockpit_proto::Request::BeginLeakReveal {
                         report_id: worker_report_id.clone(),
                     },
                 ) {
-                    Ok(cockpit_core::daemon::proto::Response::LeakRevealCapability {
-                        capability,
-                    }) => capability,
+                    Ok(cockpit_proto::Response::LeakRevealCapability { capability }) => capability,
                     _ => {
                         return Err(
                             cockpit_core::daemon::leak_reveal::LeakRevealDenied::Unauthorized,

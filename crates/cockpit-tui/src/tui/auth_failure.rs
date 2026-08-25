@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use cockpit_core::daemon::proto::AuthFailureKind;
+use cockpit_proto::AuthFailureKind;
 
 pub type AuthFailureAnnotations = HashMap<(String, String), AuthFailureRecord>;
 
@@ -71,7 +71,7 @@ pub fn notice_text(notice: &AuthFailureNotice, mouse: bool) -> String {
 /// secret-value edit, since the daemon redacts values before they cross the
 /// wire.
 pub fn provider_auth_fingerprint(
-    view: &cockpit_core::daemon::proto::ProviderConfigView,
+    view: &cockpit_proto::ProviderConfigView,
     provider_id: &str,
 ) -> u64 {
     let entry = view.providers.get(provider_id);

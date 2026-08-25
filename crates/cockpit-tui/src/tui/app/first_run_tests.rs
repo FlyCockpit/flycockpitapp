@@ -179,7 +179,7 @@ fn first_run_configuration_queues_held_draft_behind_selected_model() {
 
     let request = control_rx.try_recv().expect("model request queued").request;
     let selection_id = match request {
-        cockpit_core::daemon::proto::Request::SetActiveModel { selection_id, .. } => selection_id,
+        cockpit_proto::Request::SetActiveModel { selection_id, .. } => selection_id,
         other => panic!("expected model request, got {other:?}"),
     };
     let pending = app

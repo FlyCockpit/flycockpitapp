@@ -16,29 +16,23 @@ fn valid_settlement_request_hash(value: &str) -> bool {
 async fn oauth_settlement(
     client: &cockpit_core::daemon::client::DaemonClient,
     client_operation_id: String,
-) -> anyhow::Result<
-    Result<cockpit_core::daemon::proto::Response, cockpit_core::daemon::proto::ErrorPayload>,
-> {
+) -> anyhow::Result<Result<cockpit_proto::Response, cockpit_proto::ErrorPayload>> {
     const ATTEMPTS: usize = 3;
     for attempt in 0..ATTEMPTS {
         let response = tokio::time::timeout(
             OAUTH_SETTLEMENT_TIMEOUT,
-            client.request(
-                cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
-                    client_operation_id: client_operation_id.clone(),
-                },
-            ),
+            client.request(cockpit_proto::Request::GetLocalOperationSettlement {
+                client_operation_id: client_operation_id.clone(),
+            }),
         )
         .await;
         if let Ok(result) = response {
             if !matches!(
                 result,
-                Ok(Ok(
-                    cockpit_core::daemon::proto::Response::LocalOperationSettlement {
-                        pending: true,
-                        ..
-                    }
-                ))
+                Ok(Ok(cockpit_proto::Response::LocalOperationSettlement {
+                    pending: true,
+                    ..
+                }))
             ) || attempt + 1 == ATTEMPTS
             {
                 return result;
@@ -97,7 +91,7 @@ async fn begin_provider_oauth(
         .map_err(|e| e.to_string())?;
     let response = tokio::time::timeout(
         OAUTH_BEGIN_TIMEOUT,
-        client.request(cockpit_core::daemon::proto::Request::BeginProviderOAuth {
+        client.request(cockpit_proto::Request::BeginProviderOAuth {
             client_operation_id: client_operation_id.clone(),
             provider_id: provider_id.to_string(),
         }),
@@ -112,7 +106,7 @@ async fn begin_provider_oauth(
         },
     };
     match response.map_err(|e| e.to_string())? {
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -124,7 +118,7 @@ async fn begin_provider_oauth(
             && valid_settlement_request_hash(&settlement_hash) =>
         {
             match *response {
-                cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
+                cockpit_proto::Response::ProviderOAuthStarted {
                     client_operation_id: receipt_operation_id,
                     request_hash,
                     flow_id,
@@ -144,7 +138,7 @@ async fn begin_provider_oauth(
                 ))),
             }
         }
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -158,7 +152,7 @@ async fn begin_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
         }
-        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
+        Ok(cockpit_proto::Response::ProviderOAuthStarted {
             client_operation_id: receipt_operation_id,
             request_hash,
             flow_id,
@@ -171,7 +165,7 @@ async fn begin_provider_oauth(
                 user_code,
             })
         }
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -205,7 +199,7 @@ async fn complete_provider_oauth(
         &client_operation_id,
         &flow_id,
     ))?;
-    let request = cockpit_core::daemon::proto::Request::CompleteProviderOAuth {
+    let request = cockpit_proto::Request::CompleteProviderOAuth {
         client_operation_id: client_operation_id.clone(),
         flow_id: flow_id.clone(),
         input: input.map(|value| cockpit_proto::SensitiveWirePayload::new(value.take())),
@@ -220,7 +214,7 @@ async fn complete_provider_oauth(
         },
     };
     match response.map_err(|e| e.to_string())? {
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -232,7 +226,7 @@ async fn complete_provider_oauth(
             && valid_settlement_request_hash(&settlement_hash) =>
         {
             match *response {
-                cockpit_core::daemon::proto::Response::ProviderOAuthCompleted {
+                cockpit_proto::Response::ProviderOAuthCompleted {
                     client_operation_id: receipt_operation_id,
                     request_hash,
                     flow_id: receipt_flow_id,
@@ -249,7 +243,7 @@ async fn complete_provider_oauth(
                 ))),
             }
         }
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -263,7 +257,7 @@ async fn complete_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
         }
-        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCompleted {
+        Ok(cockpit_proto::Response::ProviderOAuthCompleted {
             client_operation_id: receipt_operation_id,
             request_hash,
             flow_id: receipt_flow_id,
@@ -275,7 +269,7 @@ async fn complete_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
         }
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -311,7 +305,7 @@ async fn cancel_provider_oauth(
         .map_err(|e| e.to_string())?;
     let response = tokio::time::timeout(
         OAUTH_CANCEL_TIMEOUT,
-        client.request(cockpit_core::daemon::proto::Request::CancelProviderOAuth {
+        client.request(cockpit_proto::Request::CancelProviderOAuth {
             client_operation_id: client_operation_id.clone(),
             begin_client_operation_id: begin_client_operation_id.clone(),
             flow_id: flow_id.clone(),
@@ -327,7 +321,7 @@ async fn cancel_provider_oauth(
         },
     };
     match response {
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -339,7 +333,7 @@ async fn cancel_provider_oauth(
             && settlement_hash == expected_hash =>
         {
             match *response {
-                cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+                cockpit_proto::Response::ProviderOAuthCancelled {
                     client_operation_id: receipt_operation_id,
                     request_hash,
                     flow_id: receipt_flow_id,
@@ -350,7 +344,7 @@ async fn cancel_provider_oauth(
                 {
                     Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
                 }
-                cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+                cockpit_proto::Response::ProviderOAuthCancelled {
                     client_operation_id: receipt_operation_id,
                     request_hash,
                     flow_id: receipt_flow_id,
@@ -366,7 +360,7 @@ async fn cancel_provider_oauth(
                 ))),
             }
         }
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -380,7 +374,7 @@ async fn cancel_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
         }
-        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+        Ok(cockpit_proto::Response::ProviderOAuthCancelled {
             client_operation_id: receipt_operation_id,
             request_hash,
             flow_id: receipt_flow_id,
@@ -391,7 +385,7 @@ async fn cancel_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
         }
-        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+        Ok(cockpit_proto::Response::ProviderOAuthCancelled {
             client_operation_id: receipt_operation_id,
             request_hash,
             flow_id: receipt_flow_id,
@@ -402,7 +396,7 @@ async fn cancel_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal)
         }
-        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+        Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
             request_hash: settlement_hash,
@@ -434,10 +428,10 @@ fn oauth_request_hash<T: serde::Serialize>(value: &T) -> Result<String, String> 
 }
 
 fn provider_usage_from_wire(
-    row: cockpit_core::daemon::proto::ProviderUsageSnapshotView,
+    row: cockpit_proto::ProviderUsageSnapshotView,
 ) -> cockpit_core::providers::usage::ProviderUsageSnapshot {
-    use cockpit_core::daemon::proto::ProviderUsageAvailabilityView as Wire;
     use cockpit_core::providers::usage::{ProviderUsageSnapshot, UsageAvailability, UsageWindow};
+    use cockpit_proto::ProviderUsageAvailabilityView as Wire;
 
     let availability = match row.availability {
         Wire::Fetched {
@@ -683,7 +677,7 @@ impl App {
             })
             .collect::<Vec<_>>();
         for draft in pending {
-            let request = cockpit_core::daemon::proto::Request::DiscardImageIngressDraft {
+            let request = cockpit_proto::Request::DiscardImageIngressDraft {
                 session_id: draft.session_id,
                 admission_id: draft.admission_id,
                 local_operation_id: draft.local_operation_id,
@@ -1019,7 +1013,7 @@ impl App {
                 {
                     let terminal = matches!(
                         &completion.response,
-                        Ok(cockpit_core::daemon::proto::Response::LocalMediaMutation(receipt))
+                        Ok(cockpit_proto::Response::LocalMediaMutation(receipt))
                             if receipt.schema_version == 1
                                 && receipt.kind == "localMediaMutationReceipt"
                                 && receipt.local_operation_id
@@ -1267,8 +1261,7 @@ impl App {
                 }) = result.payload
                 {
                     match result {
-                        Ok(cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Pending)
-                        | Err(_) => {
+                        Ok(cockpit_proto::ClientSubmissionReceiptStatus::Pending) | Err(_) => {
                             if let Some(record) = self
                                 .delivery_unconfirmed_records
                                 .get_mut(&client_submission_id)
@@ -1283,15 +1276,17 @@ impl App {
                         }
                         Ok(status) => {
                             let (outcome, wire_fingerprint) = match status {
-                                cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Accepted {
+                                cockpit_proto::ClientSubmissionReceiptStatus::Accepted {
                                     wire_fingerprint,
                                     ..
                                 } => ("accepted".to_string(), wire_fingerprint),
-                                cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Terminal {
+                                cockpit_proto::ClientSubmissionReceiptStatus::Terminal {
                                     disposition,
                                     wire_fingerprint,
                                 } => (disposition, wire_fingerprint),
-                                cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Pending => unreachable!(),
+                                cockpit_proto::ClientSubmissionReceiptStatus::Pending => {
+                                    unreachable!()
+                                }
                             };
                             if let Some(record) = self
                                 .delivery_unconfirmed_records
@@ -1696,16 +1691,10 @@ impl App {
                         pane.apply_snapshot_result(Ok(snapshot));
                     }
                     let kind = match status {
-                        cockpit_core::daemon::proto::ResourcePromoteStatus::Promoted => {
-                            ToastKind::Success
-                        }
-                        cockpit_core::daemon::proto::ResourcePromoteStatus::NotQueued
-                        | cockpit_core::daemon::proto::ResourcePromoteStatus::NotFound => {
-                            ToastKind::Info
-                        }
-                        cockpit_core::daemon::proto::ResourcePromoteStatus::Disabled => {
-                            ToastKind::Warning
-                        }
+                        cockpit_proto::ResourcePromoteStatus::Promoted => ToastKind::Success,
+                        cockpit_proto::ResourcePromoteStatus::NotQueued
+                        | cockpit_proto::ResourcePromoteStatus::NotFound => ToastKind::Info,
+                        cockpit_proto::ResourcePromoteStatus::Disabled => ToastKind::Warning,
                     };
                     self.show_toast(message, kind);
                 }
@@ -2474,7 +2463,7 @@ impl App {
             for (inserted, (offset, image)) in resolved_images.iter().enumerate() {
                 let offset = floor_char_boundary(&original_wire, *offset);
                 let existing_before = original_wire[..offset]
-                    .matches(cockpit_core::daemon::proto::IMAGE_PART_SENTINEL)
+                    .matches(cockpit_proto::IMAGE_PART_SENTINEL)
                     .count();
                 deferred.submission.images.insert(
                     existing_before + inserted,
@@ -2496,14 +2485,14 @@ impl App {
                 deferred
                     .submission
                     .text
-                    .insert_str(offset, cockpit_core::daemon::proto::IMAGE_PART_SENTINEL);
+                    .insert_str(offset, cockpit_proto::IMAGE_PART_SENTINEL);
             }
         } else {
             for (_, image) in &resolved_images {
                 deferred
                     .submission
                     .text
-                    .push_str(cockpit_core::daemon::proto::IMAGE_PART_SENTINEL);
+                    .push_str(cockpit_proto::IMAGE_PART_SENTINEL);
                 deferred.submission.images.push(match image {
                     crate::tui::structured_paste::PasteImageAdmission::Bytes(bytes) => {
                         cockpit_core::engine::message::SubmissionImage::png(bytes.clone())
@@ -2650,7 +2639,7 @@ impl App {
                                     client_flow_id.subscription_ack_operation_id();
                                 let expected_hash =
                                     oauth_request_hash(&("put_subscription_ack", provider_id))?;
-                                let request = cockpit_core::daemon::proto::Request::PutSubscriptionAck {
+                                let request = cockpit_proto::Request::PutSubscriptionAck {
                                     client_operation_id: client_operation_id.clone(),
                                     provider_id: provider_id.to_string(),
                                 };
@@ -2670,7 +2659,7 @@ impl App {
                                     Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
                                         let settlement = match tokio::time::timeout(
                                             std::time::Duration::from_secs(10),
-                                            client.request(cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                                            client.request(cockpit_proto::Request::GetLocalOperationSettlement {
                                                 client_operation_id: client_operation_id.clone(),
                                             }),
                                         )
@@ -2683,7 +2672,7 @@ impl App {
                                             )),
                                         };
                                         match settlement {
-                                            cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+                                            cockpit_proto::Response::LocalOperationSettlement {
                                                 client_operation_id: returned_id,
                                                 operation_kind,
                                                 request_hash,
@@ -2694,7 +2683,7 @@ impl App {
                                             } if returned_id == client_operation_id
                                                 && operation_kind == "put_subscription_ack"
                                                 && request_hash == expected_hash => *response,
-                                            cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+                                            cockpit_proto::Response::LocalOperationSettlement {
                                                 client_operation_id: returned_id,
                                                 operation_kind,
                                                 request_hash,
@@ -2715,7 +2704,7 @@ impl App {
                                     }
                                 };
                                 match response {
-                                    cockpit_core::daemon::proto::Response::SubscriptionAckCommitted {
+                                    cockpit_proto::Response::SubscriptionAckCommitted {
                                         client_operation_id: returned_id,
                                         provider_id: returned_provider,
                                         request_hash,
@@ -2880,7 +2869,7 @@ impl App {
             AsyncActionKind::DaemonRpc("resources.snapshot"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("resources.snapshot")),
             || match crate::tui::agent_runner::resource_snapshot_blocking()? {
-                cockpit_core::daemon::proto::Response::ResourceSnapshot { snapshot } => {
+                cockpit_proto::Response::ResourceSnapshot { snapshot } => {
                     Ok(AsyncActionPayload::ResourceSnapshot(snapshot))
                 }
                 other => Err(format!("unexpected resource_snapshot response: {other:?}")),
@@ -2898,7 +2887,7 @@ impl App {
             move || match crate::tui::agent_runner::promote_resource_blocking(
                 request_id, session_id,
             )? {
-                cockpit_core::daemon::proto::Response::PromoteResourceResult {
+                cockpit_proto::Response::PromoteResourceResult {
                     status,
                     message,
                     snapshot,
@@ -3005,23 +2994,21 @@ impl App {
                     .await
                     .map_err(|e| e.to_string())?;
                 match client
-                    .request(
-                        cockpit_core::daemon::proto::Request::GetProviderUsageSnapshot {
-                            project_root: cwd.display().to_string(),
-                            provider_id: filter,
-                        },
-                    )
+                    .request(cockpit_proto::Request::GetProviderUsageSnapshot {
+                        project_root: cwd.display().to_string(),
+                        provider_id: filter,
+                    })
                     .await
                     .map_err(|e| e.to_string())?
                 {
-                    Ok(cockpit_core::daemon::proto::Response::ProviderUsageSnapshot {
-                        snapshots,
-                    }) => Ok(AsyncActionPayload::ProviderUsage(
-                        snapshots
-                            .into_iter()
-                            .map(provider_usage_from_wire)
-                            .collect(),
-                    )),
+                    Ok(cockpit_proto::Response::ProviderUsageSnapshot { snapshots }) => {
+                        Ok(AsyncActionPayload::ProviderUsage(
+                            snapshots
+                                .into_iter()
+                                .map(provider_usage_from_wire)
+                                .collect(),
+                        ))
+                    }
                     Ok(other) => Err(format!(
                         "unexpected provider usage daemon response: {other:?}"
                     )),

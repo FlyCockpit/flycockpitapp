@@ -941,7 +941,7 @@ fn run_favorite(app: &mut App, _: &str) -> bool {
     let favorite = !model.favorite;
     app.send_daemon_request(
         "/favorite",
-        cockpit_core::daemon::proto::Request::SetModelFavorite {
+        cockpit_proto::Request::SetModelFavorite {
             provider: active.provider.clone(),
             model: active.model.clone(),
             favorite,
@@ -1173,8 +1173,8 @@ fn run_sealed(app: &mut App, args: &str) -> bool {
 /// (usage) for anything unrecognized. Recognizes exactly the subcommands in the
 /// usage string: bare/`list`, `rotate <id> <accept|dismiss|rotated>`, and
 /// `delete <id>`. No `reveal` subcommand is parsed here.
-fn leaks_request(args: &str) -> Option<cockpit_core::daemon::proto::Request> {
-    use cockpit_core::daemon::proto::{LeakRotationDisposition, Request};
+fn leaks_request(args: &str) -> Option<cockpit_proto::Request> {
+    use cockpit_proto::{LeakRotationDisposition, Request};
     let args = args.trim();
     if args.is_empty() || args == "list" {
         return Some(Request::ListLeakReports {
@@ -1218,7 +1218,7 @@ fn leaks_request(args: &str) -> Option<cockpit_core::daemon::proto::Request> {
 /// `&LeakReportsPage`, which cannot represent plaintext, ciphertext, prefix,
 /// length, or fingerprint by construction; every rendered field is safe
 /// metadata.
-fn format_leak_reports(page: &cockpit_core::daemon::proto::LeakReportsPage) -> String {
+fn format_leak_reports(page: &cockpit_proto::LeakReportsPage) -> String {
     if page.reports.is_empty() {
         return "/leaks: no contained leak reports".to_string();
     }
@@ -1252,8 +1252,8 @@ fn format_leak_reports(page: &cockpit_core::daemon::proto::LeakReportsPage) -> S
 /// Map a `/leaks` daemon result to transcript text. Follows the `/sealed`
 /// shape; there is no `Response::Error` variant, and the unexpected-response
 /// arm never renders the `Debug` of a daemon response.
-fn leak_response_text(result: Result<cockpit_core::daemon::proto::Response, String>) -> String {
-    use cockpit_core::daemon::proto::Response;
+fn leak_response_text(result: Result<cockpit_proto::Response, String>) -> String {
+    use cockpit_proto::Response;
     match result {
         Ok(Response::LeakReports { page }) => format_leak_reports(&page),
         Ok(Response::LeakRotationUpdated {
@@ -1380,11 +1380,7 @@ impl App {
         self.composer.clear();
         self.paste_registry.clear();
         self.reset_slash_window();
-        self.record_usage(
-            cockpit_core::daemon::proto::UsageKind::Slash,
-            cmd.name.to_string(),
-            None,
-        );
+        self.record_usage(cockpit_proto::UsageKind::Slash, cmd.name.to_string(), None);
         let args = slash_args(&raw);
         (cmd.run)(self, &args)
     }
@@ -1432,9 +1428,7 @@ impl App {
         if target.exists() {
             // Existing target: ask update / overwrite / cancel via the
             // shared question dialog, driven locally (no daemon interrupt).
-            use cockpit_core::daemon::proto::{
-                InterruptOption, InterruptQuestion, InterruptQuestionSet,
-            };
+            use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
             let interrupt_id = uuid::Uuid::new_v4();
             let set = InterruptQuestionSet {
                 questions: vec![InterruptQuestion::Single {
@@ -1526,7 +1520,7 @@ impl App {
         };
         let mut parts = args.split_whitespace();
         let action = match parts.next().unwrap_or("status") {
-            "status" => cockpit_core::daemon::proto::CuratorAction::Status,
+            "status" => cockpit_proto::CuratorAction::Status,
             "run" => {
                 let mut dry_run = false;
                 let mut consolidate = false;
@@ -1540,7 +1534,7 @@ impl App {
                         }
                     }
                 }
-                cockpit_core::daemon::proto::CuratorAction::Run {
+                cockpit_proto::CuratorAction::Run {
                     dry_run,
                     consolidate,
                 }
@@ -1552,11 +1546,9 @@ impl App {
                     return;
                 };
                 match command {
-                    "pin" => cockpit_core::daemon::proto::CuratorAction::Pin { name: name.into() },
-                    "unpin" => {
-                        cockpit_core::daemon::proto::CuratorAction::Unpin { name: name.into() }
-                    }
-                    _ => cockpit_core::daemon::proto::CuratorAction::Restore { name: name.into() },
+                    "pin" => cockpit_proto::CuratorAction::Pin { name: name.into() },
+                    "unpin" => cockpit_proto::CuratorAction::Unpin { name: name.into() },
+                    _ => cockpit_proto::CuratorAction::Restore { name: name.into() },
                 }
             }
             other => {
@@ -1564,7 +1556,7 @@ impl App {
                 return;
             }
         };
-        let request = cockpit_core::daemon::proto::Request::Curator {
+        let request = cockpit_proto::Request::Curator {
             project_root: self.launch.cwd.to_string_lossy().into_owned(),
             action,
         };
@@ -1592,16 +1584,10 @@ impl App {
         }
         match trimmed {
             "pause" => {
-                self.set_goal_status(
-                    cockpit_core::daemon::proto::GoalDisposition::UserPaused,
-                    "/goal pause",
-                );
+                self.set_goal_status(cockpit_proto::GoalDisposition::UserPaused, "/goal pause");
             }
             "resume" => {
-                self.set_goal_status(
-                    cockpit_core::daemon::proto::GoalDisposition::Running,
-                    "/goal resume",
-                );
+                self.set_goal_status(cockpit_proto::GoalDisposition::Running, "/goal resume");
             }
             "clear" => self.clear_goal(),
             "edit" => {
@@ -1697,7 +1683,7 @@ impl App {
             }
             self.send_daemon_request(
                 "/schedule",
-                cockpit_core::daemon::proto::Request::CancelSchedule {
+                cockpit_proto::Request::CancelSchedule {
                     job_id: job_id.to_string(),
                 },
                 ControlApplied::ScheduleCancel {
@@ -1806,7 +1792,7 @@ impl App {
         }
         self.send_daemon_request(
             "/llm-mode",
-            cockpit_core::daemon::proto::Request::SetLlmMode { mode: requested },
+            cockpit_proto::Request::SetLlmMode { mode: requested },
             ControlApplied::LlmModeSwitchWarning,
         );
         // The `LlmModeChanged` event pushes the "Switched to …" confirmation
@@ -1873,22 +1859,22 @@ impl App {
             );
             return;
         };
-        let request = cockpit_core::daemon::proto::Request::ResolveAssistantSession {
+        let request = cockpit_proto::Request::ResolveAssistantSession {
             assistant_id: name.to_string(),
             project_root: self.launch.cwd.to_string_lossy().into_owned(),
-            mode: cockpit_core::daemon::proto::AssistantSessionResolutionMode::MostRecentOrCreate,
+            mode: cockpit_proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         };
         let source_session_id = self.launch.session_id;
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("assistant.resolve"),
             AsyncActionPolicy::AllowConcurrent,
             move || match agent_runner::daemon_request_at_blocking(&socket, request)? {
-                cockpit_core::daemon::proto::Response::AssistantSessionResolved {
-                    session, ..
-                } => Ok(AsyncActionPayload::AssistantSessionResolved {
-                    session_id: session.session_id,
-                    source_session_id,
-                }),
+                cockpit_proto::Response::AssistantSessionResolved { session, .. } => {
+                    Ok(AsyncActionPayload::AssistantSessionResolved {
+                        session_id: session.session_id,
+                        source_session_id,
+                    })
+                }
                 other => Err(format!("unexpected assistant response: {other:?}")),
             },
         );
@@ -1981,7 +1967,7 @@ impl App {
         };
         self.send_daemon_request(
             "/sandbox",
-            cockpit_core::daemon::proto::Request::SetSandbox {
+            cockpit_proto::Request::SetSandbox {
                 mode,
                 container_network_enabled: network,
             },
@@ -2007,7 +1993,7 @@ impl App {
             Ok(SandboxEscalationCommand::Set(enabled)) => {
                 self.send_daemon_request(
                     "/sandbox-escalate",
-                    cockpit_core::daemon::proto::Request::SetSandboxEscalation { enabled },
+                    cockpit_proto::Request::SetSandboxEscalation { enabled },
                     ControlApplied::None,
                 );
             }
@@ -2079,7 +2065,7 @@ impl App {
         };
         self.send_daemon_request(
             "/preflight",
-            cockpit_core::daemon::proto::Request::SetPreflight { enabled },
+            cockpit_proto::Request::SetPreflight { enabled },
             ControlApplied::None,
         );
     }
@@ -2098,7 +2084,7 @@ impl App {
         };
         self.send_daemon_request(
             "/longcache",
-            cockpit_core::daemon::proto::Request::SetLongcache { enabled },
+            cockpit_proto::Request::SetLongcache { enabled },
             ControlApplied::None,
         );
     }
@@ -2148,7 +2134,7 @@ impl App {
         };
         self.send_daemon_request(
             "/caffeinate",
-            cockpit_core::daemon::proto::Request::SetCaffeinate { mode },
+            cockpit_proto::Request::SetCaffeinate { mode },
             ControlApplied::None,
         );
     }
@@ -2164,7 +2150,7 @@ impl App {
         }
         self.send_daemon_request(
             "/pin-context",
-            cockpit_core::daemon::proto::Request::Pin {
+            cockpit_proto::Request::Pin {
                 text: text.to_string(),
             },
             ControlApplied::PinContext {
@@ -2343,12 +2329,12 @@ impl App {
         };
         if title.is_empty() {
             self.push_plain("/rename: generating".to_string());
-            let request = cockpit_core::daemon::proto::Request::AutoTitle { session_id };
+            let request = cockpit_proto::Request::AutoTitle { session_id };
             self.async_actions.start_blocking(
                 AsyncActionKind::Internal("rename.auto"),
                 AsyncActionPolicy::AllowConcurrent,
                 move || match agent_runner::daemon_request_from_blocking_worker(request)? {
-                    cockpit_core::daemon::proto::Response::AutoTitle { title, .. } => {
+                    cockpit_proto::Response::AutoTitle { title, .. } => {
                         Ok(AsyncActionPayload::Text(title))
                     }
                     other => Err(format!("unexpected auto-title response: {other:?}")),
@@ -2356,7 +2342,7 @@ impl App {
             );
             return;
         }
-        let req = cockpit_core::daemon::proto::Request::RenameSession {
+        let req = cockpit_proto::Request::RenameSession {
             session_id,
             title: title.to_string(),
         };
@@ -2436,7 +2422,7 @@ impl App {
             self.push_plain("/note: no active session yet — send a message first".to_string());
             return;
         };
-        let req = cockpit_core::daemon::proto::Request::RecordSessionNote {
+        let req = cockpit_proto::Request::RecordSessionNote {
             session_id,
             text: text.to_string(),
         };
@@ -2446,7 +2432,7 @@ impl App {
             AsyncActionKind::DaemonRpc("note"),
             AsyncActionPolicy::AllowConcurrent,
             move || match agent_runner::daemon_request_from_blocking_worker(req) {
-                Ok(cockpit_core::daemon::proto::Response::NoteRecorded { .. }) => {
+                Ok(cockpit_proto::Response::NoteRecorded { .. }) => {
                     Ok(AsyncActionPayload::NoteRecorded { text })
                 }
                 Ok(_) => Err("unexpected daemon response".to_string()),
@@ -2472,9 +2458,9 @@ impl App {
             return;
         };
         let label = match &request {
-            cockpit_core::daemon::proto::Request::ListLeakReports { .. } => "leaks-list",
-            cockpit_core::daemon::proto::Request::MarkLeakRotated { .. } => "leaks-rotate",
-            cockpit_core::daemon::proto::Request::DeleteLeakReport { .. } => "leaks-delete",
+            cockpit_proto::Request::ListLeakReports { .. } => "leaks-list",
+            cockpit_proto::Request::MarkLeakRotated { .. } => "leaks-rotate",
+            cockpit_proto::Request::DeleteLeakReport { .. } => "leaks-delete",
             _ => "leaks",
         };
         self.async_actions.start_blocking(
@@ -2541,7 +2527,7 @@ impl App {
         &mut self,
         binding: agent_runner::AttachedRequestBinding,
         pending: PendingSealedOperation,
-        future: impl std::future::Future<Output = Result<cockpit_core::daemon::proto::Response, String>>
+        future: impl std::future::Future<Output = Result<cockpit_proto::Response, String>>
         + Send
         + 'static,
     ) {
@@ -2572,7 +2558,7 @@ impl App {
 
     /// Send a metadata-only sealed-owner RPC over the attached binding and render
     /// its safe response text. Never carries or renders a literal.
-    fn dispatch_sealed_metadata(&mut self, request: cockpit_core::daemon::proto::Request) {
+    fn dispatch_sealed_metadata(&mut self, request: cockpit_proto::Request) {
         let Some(binding) = self.attached_sealed_binding() else {
             self.push_plain("/sealed: attach a session first".to_string());
             return;
@@ -2609,21 +2595,17 @@ impl App {
             },
             async move {
                 let response = request_binding.request(plan.begin).await?;
-                if let cockpit_core::daemon::proto::Response::SealedOwnerOperationBegun {
-                    capability_id,
-                    ..
-                } = &response
+                if let cockpit_proto::Response::SealedOwnerOperationBegun { capability_id, .. } =
+                    &response
                     && !worker_active.load(std::sync::atomic::Ordering::Acquire)
                 {
                     let settlement = request_binding
                         .request(crate::tui::sealed_overlay::cancel_request(capability_id))
                         .await;
                     return match settlement {
-                        Ok(
-                            cockpit_core::daemon::proto::Response::SealedOwnerOperationCancelled {
-                                ..
-                            },
-                        ) => Err("sealed write cancelled by attachment transition".to_string()),
+                        Ok(cockpit_proto::Response::SealedOwnerOperationCancelled { .. }) => {
+                            Err("sealed write cancelled by attachment transition".to_string())
+                        }
                         _ => Err("sealed capability settlement failed".to_string()),
                     };
                 }
@@ -2639,7 +2621,7 @@ impl App {
     pub(super) fn apply_sealed_write(
         &mut self,
         capability_id: &str,
-        literal: cockpit_core::daemon::proto::SensitiveWireLiteral,
+        literal: cockpit_proto::SensitiveWireLiteral,
         summary: Option<String>,
     ) {
         let Some(binding) = self.sealed_capability_bindings.remove(capability_id) else {
@@ -2663,18 +2645,26 @@ impl App {
             },
             async move {
                 match request_binding.request(request).await {
-                    Ok(response @ cockpit_core::daemon::proto::Response::SealedOwnerOperationApplied { .. }) => Ok(response),
+                    Ok(response @ cockpit_proto::Response::SealedOwnerOperationApplied { .. }) => {
+                        Ok(response)
+                    }
                     other => {
                         let settlement = request_binding
                             .request(crate::tui::sealed_overlay::cancel_request(&capability_id))
                             .await;
                         match settlement {
-                            Ok(cockpit_core::daemon::proto::Response::SealedOwnerOperationCancelled { spent: true }) => {}
+                            Ok(cockpit_proto::Response::SealedOwnerOperationCancelled {
+                                spent: true,
+                            }) => {}
                             // Apply may already have consumed the capability before
                             // returning an error; `spent: false` is the exact
                             // fail-closed receipt for that state.
-                            Ok(cockpit_core::daemon::proto::Response::SealedOwnerOperationCancelled { spent: false }) => {}
-                            Ok(_) | Err(_) => return Err("sealed capability settlement failed".to_string()),
+                            Ok(cockpit_proto::Response::SealedOwnerOperationCancelled {
+                                spent: false,
+                            }) => {}
+                            Ok(_) | Err(_) => {
+                                return Err("sealed capability settlement failed".to_string());
+                            }
                         }
                         other
                     }
@@ -2771,11 +2761,9 @@ impl App {
                 .await;
             if !matches!(
                 receipt,
-                Ok(
-                    cockpit_core::daemon::proto::Response::SealedOwnerOperationCancelled {
-                        spent: true | false
-                    }
-                )
+                Ok(cockpit_proto::Response::SealedOwnerOperationCancelled {
+                    spent: true | false
+                })
             ) {
                 tracing::warn!(
                     capability_id = %capability_id,
@@ -2813,7 +2801,7 @@ impl App {
     /// `SensitiveWireLiteral`, whose debug/serialization surfaces are redacted,
     /// and never enters transcript, history, or a cache.
     pub(super) fn recover_sealed_into_overlay(&mut self, record_id: String) {
-        use cockpit_core::daemon::proto::{Request, Response};
+        use cockpit_proto::{Request, Response};
         let Some(binding) = self.attached_sealed_binding() else {
             self.push_plain("/sealed: attach a session first".to_string());
             return;
@@ -2887,7 +2875,7 @@ impl App {
     }
 
     pub(super) fn apply_sealed_completion(&mut self, completion: SealedCompletion) {
-        use cockpit_core::daemon::proto::Response;
+        use cockpit_proto::Response;
         let Some(pending) = self
             .pending_sealed_operations
             .remove(&completion.operation_id)
@@ -2992,7 +2980,7 @@ pub(crate) struct SealedCompletion {
     pub(crate) operation_id: uuid::Uuid,
     pub(crate) session_id: uuid::Uuid,
     pub(crate) attachment_epoch: u64,
-    pub(crate) response: Result<cockpit_core::daemon::proto::Response, String>,
+    pub(crate) response: Result<cockpit_proto::Response, String>,
 }
 
 #[derive(Debug)]
@@ -3479,7 +3467,7 @@ pub(super) fn builtin_slash_name_taken(name: &str) -> bool {
 /// entries, dropping any whose name collides with a builtin (the builtin keeps
 /// the bare name; the skill stays reachable via `/skill <name>`).
 pub(super) fn bare_skill_commands_from(
-    skills: Vec<cockpit_core::daemon::proto::SkillSummary>,
+    skills: Vec<cockpit_proto::SkillSummary>,
 ) -> Vec<SkillCommand> {
     let mut out = Vec::with_capacity(skills.len());
     for s in skills {
@@ -3627,7 +3615,7 @@ mod table_tests {
 
         assert!(matches!(
             control_rx.try_recv().expect("favorite request").request,
-            cockpit_core::daemon::proto::Request::SetModelFavorite {
+            cockpit_proto::Request::SetModelFavorite {
                 provider,
                 model,
                 favorite: true,
@@ -3800,9 +3788,9 @@ mod table_tests {
 
     fn leak_report_row(
         id: &str,
-        plan: Option<cockpit_core::daemon::proto::LeakRotationPlan>,
-    ) -> cockpit_core::daemon::proto::LeakReportMetadata {
-        cockpit_core::daemon::proto::LeakReportMetadata {
+        plan: Option<cockpit_proto::LeakRotationPlan>,
+    ) -> cockpit_proto::LeakReportMetadata {
+        cockpit_proto::LeakReportMetadata {
             report_id: id.to_string(),
             session_id: uuid::Uuid::nil(),
             source: "provider".to_string(),
@@ -3823,7 +3811,7 @@ mod table_tests {
 
     #[test]
     fn leaks_request_parses_list_rotate_delete_variants() {
-        use cockpit_core::daemon::proto::{LeakRotationDisposition, Request};
+        use cockpit_proto::{LeakRotationDisposition, Request};
         for input in ["", "  ", "list"] {
             assert!(
                 matches!(
@@ -3881,7 +3869,7 @@ mod table_tests {
 
     #[test]
     fn leaks_response_text_maps_known_variants_and_hides_unexpected_debug() {
-        use cockpit_core::daemon::proto::{LeakReportsPage, Response};
+        use cockpit_proto::{LeakReportsPage, Response};
         let page = LeakReportsPage {
             reports: vec![leak_report_row("rpt-a", None)],
             next_cursor: None,
@@ -3924,7 +3912,7 @@ mod table_tests {
 
     #[test]
     fn leaks_format_reports_renders_empty_rows_and_has_more() {
-        use cockpit_core::daemon::proto::LeakReportsPage;
+        use cockpit_proto::LeakReportsPage;
         let empty = LeakReportsPage {
             reports: vec![],
             next_cursor: None,
@@ -3972,7 +3960,7 @@ mod tests {
         AgentRunner, AttachedRequest, ClientTasks, ControlRequest, UsageCounts,
     };
     use crate::tui::history::HistoryEntry;
-    use cockpit_core::daemon::proto::{GoalDisposition, GoalSummary, Request, Response};
+    use cockpit_proto::{GoalDisposition, GoalSummary, Request, Response};
 
     fn app_with_attached_request_rx() -> (App, mpsc::Receiver<AttachedRequest>) {
         let tmp = tempfile::tempdir().unwrap();
@@ -4036,10 +4024,10 @@ mod tests {
             context: None,
             disposition,
             phase: (disposition == GoalDisposition::Running)
-                .then_some(cockpit_core::daemon::proto::GoalPhase::Executing),
+                .then_some(cockpit_proto::GoalPhase::Executing),
             resume_phase: None,
             pause_reason: (disposition == GoalDisposition::UserPaused)
-                .then_some(cockpit_core::daemon::proto::GoalPauseReason::User),
+                .then_some(cockpit_proto::GoalPauseReason::User),
             contract_available: true,
             latest_gap_or_blocker: None,
             verification_attempts: 2,
@@ -4049,7 +4037,7 @@ mod tests {
             tokens_used: 4,
             remaining_tokens: 96,
             elapsed_active_ms: 1_250,
-            lifecycle_history: vec![cockpit_core::daemon::proto::GoalLifecycleHistoryEntry {
+            lifecycle_history: vec![cockpit_proto::GoalLifecycleHistoryEntry {
                 at: 0,
                 disposition,
                 phase: None,

@@ -5,7 +5,7 @@ impl App {
     /// alone resolves `$secret:` references and persists the resulting model
     /// metadata; this UI only renders the safe outcome projection.
     pub(super) fn spawn_fetch_models(&mut self) {
-        use cockpit_core::daemon::proto::{ProviderModelFetchOutcome, Request, Response};
+        use cockpit_proto::{ProviderModelFetchOutcome, Request, Response};
 
         let cwd = self.launch.cwd.clone();
         let progress = Arc::clone(&self.fetch_models_progress);

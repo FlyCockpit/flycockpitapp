@@ -146,7 +146,7 @@ impl App {
             AsyncActionKind::Internal("subagent.history"),
             AsyncActionPolicy::Replace(AsyncActionKey::new(key)),
             move || {
-                let request = cockpit_core::daemon::proto::Request::ReadSubagentHistoryPage {
+                let request = cockpit_proto::Request::ReadSubagentHistoryPage {
                     session_id,
                     task_call_id: task_call_id.clone(),
                     label: label.clone(),
@@ -155,7 +155,7 @@ impl App {
                 };
                 let response =
                     crate::tui::agent_runner::daemon_request_at_blocking(&socket, request)?;
-                let cockpit_core::daemon::proto::Response::SubagentHistoryPage {
+                let cockpit_proto::Response::SubagentHistoryPage {
                     entries,
                     has_more,
                     oldest_seq,
@@ -367,7 +367,7 @@ impl App {
             persist_failed: false,
         });
         self.push_plain("steer queued for next turn boundary".to_string());
-        let req = cockpit_core::daemon::proto::Request::SteerDelegation {
+        let req = cockpit_proto::Request::SteerDelegation {
             session_id,
             task_call_id: view.task_call_id,
             label: view.label,
@@ -377,7 +377,7 @@ impl App {
             AsyncActionKind::DaemonRpc("subagent.steer"),
             AsyncActionPolicy::AllowConcurrent,
             move || match agent_runner::daemon_request_from_blocking_worker(req)? {
-                cockpit_core::daemon::proto::Response::DelegationSteer { result } => {
+                cockpit_proto::Response::DelegationSteer { result } => {
                     Ok(AsyncActionPayload::DelegationSteer(result))
                 }
                 other => Err(format!("unexpected steer response: {other:?}")),
@@ -388,32 +388,32 @@ impl App {
 
     pub(super) fn apply_subagent_steer_result(
         &mut self,
-        result: cockpit_core::daemon::proto::DelegationSteerResult,
+        result: cockpit_proto::DelegationSteerResult,
     ) {
         let line = match result.status {
-            cockpit_core::daemon::proto::DelegationSteerStatus::Queued => {
+            cockpit_proto::DelegationSteerStatus::Queued => {
                 let label = result.label.clone().unwrap_or_default();
                 format!(
                     "steer queued for {}/{} at next turn boundary",
                     result.task_call_id, label
                 )
             }
-            cockpit_core::daemon::proto::DelegationSteerStatus::NotSteerable => {
+            cockpit_proto::DelegationSteerStatus::NotSteerable => {
                 format!("steer not queued: {}", result.message)
             }
-            cockpit_core::daemon::proto::DelegationSteerStatus::InternalError => {
+            cockpit_proto::DelegationSteerStatus::InternalError => {
                 format!("steer failed: {}", result.message)
             }
         };
         match result.status {
-            cockpit_core::daemon::proto::DelegationSteerStatus::Queued => {
+            cockpit_proto::DelegationSteerStatus::Queued => {
                 if let Some(view) = self.active_subagent_view_mut() {
                     view.notice = Some(line);
                 } else {
                     self.show_toast(line, ToastKind::Success);
                 }
             }
-            cockpit_core::daemon::proto::DelegationSteerStatus::NotSteerable => {
+            cockpit_proto::DelegationSteerStatus::NotSteerable => {
                 if let Some(view) = self.active_subagent_view_mut() {
                     view.read_only = true;
                     view.finished = true;
@@ -426,7 +426,7 @@ impl App {
                     self.show_toast(line, ToastKind::Warning);
                 }
             }
-            cockpit_core::daemon::proto::DelegationSteerStatus::InternalError => {
+            cockpit_proto::DelegationSteerStatus::InternalError => {
                 if let Some(view) = self.active_subagent_view_mut() {
                     view.notice = Some(line);
                 } else {

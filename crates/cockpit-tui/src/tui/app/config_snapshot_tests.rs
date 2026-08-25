@@ -79,12 +79,12 @@ fn with_trusted_tree<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
 
 /// Build the wire snapshot the daemon would push for a config tree: the
 /// resolved `ExtendedConfig` plus the redacted provider projection.
-fn snapshot_from_tree(cwd: &Path, generation: u64) -> cockpit_core::daemon::proto::ConfigSnapshot {
+fn snapshot_from_tree(cwd: &Path, generation: u64) -> cockpit_proto::ConfigSnapshot {
     with_trusted_tree(cwd, || {
         let extended = cockpit_config::extended::load_for_cwd(cwd);
         let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
         let providers = cockpit_config::providers::ConfigDoc::providers_from_paths(&paths);
-        cockpit_core::daemon::proto::ConfigSnapshot {
+        cockpit_proto::ConfigSnapshot {
             session_id: uuid::Uuid::new_v4(),
             generation,
             extended,
@@ -100,7 +100,7 @@ fn marked_snapshot(
     provider_id: &str,
     lockout_ms: u64,
     context_tokens: u32,
-) -> cockpit_core::daemon::proto::ConfigSnapshot {
+) -> cockpit_proto::ConfigSnapshot {
     let mut snapshot = snapshot_from_tree(cwd, generation);
     snapshot.session_id = session_id;
     snapshot.extended.dialog.lockout_ms = lockout_ms;

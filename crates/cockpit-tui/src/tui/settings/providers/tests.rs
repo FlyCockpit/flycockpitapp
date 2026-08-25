@@ -97,18 +97,16 @@ fn seed_oauth_credential_via_daemon(credential_ref: &str) {
             .await
             .expect("settings daemon client for oauth credential seed");
         let response = client
-            .request(
-                cockpit_core::daemon::proto::Request::PutProviderCredential {
-                    client_operation_id: "oauth-seed".into(),
-                    provider_id: credential_ref,
-                    record: r#"{"api_key":"test-oauth-token"}"#.to_string().into(),
-                },
-            )
+            .request(cockpit_proto::Request::PutProviderCredential {
+                client_operation_id: "oauth-seed".into(),
+                provider_id: credential_ref,
+                record: r#"{"api_key":"test-oauth-token"}"#.to_string().into(),
+            })
             .await
             .expect("oauth credential seed transport")
             .expect("oauth credential seed response");
         assert!(
-            matches!(response, cockpit_core::daemon::proto::Response::Ack),
+            matches!(response, cockpit_proto::Response::Ack),
             "unexpected oauth credential seed response: {response:?}"
         );
     };
@@ -186,22 +184,22 @@ fn dialog_with_config(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDi
                 .await
                 .expect("provider fixture daemon client");
             let expected_config_generation = match client
-                .request(cockpit_core::daemon::proto::Request::GetWorkspaceTrust {
+                .request(cockpit_proto::Request::GetWorkspaceTrust {
                     project_root: project_root.clone(),
                 })
                 .await
                 .expect("provider fixture trust read transport")
                 .expect("provider fixture trust read response")
             {
-                cockpit_core::daemon::proto::Response::WorkspaceTrust {
+                cockpit_proto::Response::WorkspaceTrust {
                     config_generation, ..
                 } => config_generation,
                 other => panic!("unexpected provider fixture trust read: {other:?}"),
             };
             let response = client
-                .request(cockpit_core::daemon::proto::Request::SetWorkspaceTrust {
+                .request(cockpit_proto::Request::SetWorkspaceTrust {
                     project_root,
-                    mode: cockpit_core::daemon::proto::WorkspaceTrustMode::Trust,
+                    mode: cockpit_proto::WorkspaceTrustMode::Trust,
                     expected_config_generation,
                 })
                 .await
@@ -209,7 +207,7 @@ fn dialog_with_config(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDi
                 .expect("provider fixture trust response");
             assert!(matches!(
                 response,
-                cockpit_core::daemon::proto::Response::WorkspaceTrustSet { .. }
+                cockpit_proto::Response::WorkspaceTrustSet { .. }
             ));
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -544,7 +542,7 @@ fn pointer_active_model_retention_renders_dispatches_and_persists() {
         ProviderRowEditorAction, ProvidersAction, SettingsPointerAction,
     };
     use cockpit_config::providers::{ActiveModelRef, PromptCacheRetention};
-    use cockpit_core::daemon::proto::Request;
+    use cockpit_proto::Request;
 
     fn fixture() -> (tempfile::TempDir, SettingsDialog) {
         let mut config = one_provider_config(None);
@@ -4443,7 +4441,7 @@ fn github_token_applies_without_env_mutation() {
     // send.  A regression that drops the effect call, or puts the token in the
     // process environment instead, must fail these assertions.
     struct DaemonSpy {
-        requests: Vec<cockpit_core::daemon::proto::Request>,
+        requests: Vec<cockpit_proto::Request>,
         token: String,
     }
     impl CopilotSetupEffect for DaemonSpy {
@@ -4453,12 +4451,11 @@ fn github_token_applies_without_env_mutation() {
             _rc_path: &std::path::Path,
             _credential_store_path: Option<&std::path::Path>,
         ) -> Result<String, String> {
-            self.requests
-                .push(cockpit_core::daemon::proto::Request::PutNamedSecret {
-                    name: cockpit_core::providers::models_fetch::COPILOT_TOKEN_CREDENTIAL_KEY
-                        .to_string(),
-                    value: self.token.clone(),
-                });
+            self.requests.push(cockpit_proto::Request::PutNamedSecret {
+                name: cockpit_core::providers::models_fetch::COPILOT_TOKEN_CREDENTIAL_KEY
+                    .to_string(),
+                value: self.token.clone(),
+            });
             Ok("daemon credential saved".into())
         }
     }
@@ -4483,7 +4480,7 @@ fn github_token_applies_without_env_mutation() {
         "exactly one credential RPC is expected"
     );
     match &daemon.requests[0] {
-        cockpit_core::daemon::proto::Request::PutNamedSecret { name, value } => {
+        cockpit_proto::Request::PutNamedSecret { name, value } => {
             assert_eq!(
                 name,
                 cockpit_core::providers::models_fetch::COPILOT_TOKEN_CREDENTIAL_KEY
@@ -5328,20 +5325,18 @@ fn provider_delete_removes_grok_oauth_provider_via_daemon() {
     });
     let seeded = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(
-            client.request(
-                cockpit_core::daemon::proto::Request::PutProviderCredential {
-                    client_operation_id: "provider-delete-seed".into(),
-                    provider_id: provider_id.to_string(),
-                    record: json!({"access_token": "opaque-fixture-token"})
-                        .to_string()
-                        .into(),
-                },
-            ),
+            client.request(cockpit_proto::Request::PutProviderCredential {
+                client_operation_id: "provider-delete-seed".into(),
+                provider_id: provider_id.to_string(),
+                record: json!({"access_token": "opaque-fixture-token"})
+                    .to_string()
+                    .into(),
+            }),
         )
     })
     .expect("provider credential seed transport")
     .expect("provider credential seed response");
-    assert!(matches!(seeded, cockpit_core::daemon::proto::Response::Ack));
+    assert!(matches!(seeded, cockpit_proto::Response::Ack));
 
     assert_eq!(
         dialog
@@ -5355,7 +5350,7 @@ fn provider_delete_removes_grok_oauth_provider_via_daemon() {
 
     let inventory = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(client.request(
-            cockpit_core::daemon::proto::Request::ListSecretInventory {
+            cockpit_proto::Request::ListSecretInventory {
                 cursor: None,
                 limit: None,
             },
@@ -5363,12 +5358,12 @@ fn provider_delete_removes_grok_oauth_provider_via_daemon() {
     })
     .expect("provider credential inventory transport")
     .expect("provider credential inventory response");
-    let cockpit_core::daemon::proto::Response::SecretInventory { entries, .. } = inventory else {
+    let cockpit_proto::Response::SecretInventory { entries, .. } = inventory else {
         panic!("unexpected provider credential inventory response");
     };
     assert!(!entries.iter().any(|entry| {
         entry.name == provider_id
-            && entry.kind == cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord
+            && entry.kind == cockpit_proto::SecretInventoryKind::CredentialRecord
     }));
 }
 

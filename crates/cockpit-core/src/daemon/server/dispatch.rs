@@ -10417,6 +10417,7 @@ async fn apply_provider_mutation(
             .cloned()
             .ok_or_else(|| bad_request("provider edit capability is absent or expired"))?
     };
+    recover_provider_config_journals(ctx, &capability.project_root, None).await?;
     let (_, _, current) = daemon_provider_config(ctx, &capability.project_root).await?;
     let observed_revision = provider_config_revision(&current)?;
     validate_provider_edit_capability(
@@ -10663,24 +10664,23 @@ async fn stage_and_recover_provider_batch(
         desired.on_unlisted_models_fetch = Some(metadata.on_unlisted_models_fetch);
     }
 
+    // Cleanup is pair-scoped. A reference retained by the same provider in
+    // the final layer must keep both its vault row and its exact ownership
+    // claim; a global "reference is live somewhere" check is too late because
+    // retiring this provider's claim would still break its next resolution.
+    retain_only_stale_provider_credentials(&desired, &mut cleanup_credentials);
+
     let journal_id = format!("provider-batch-{batch_id}");
-    let payload = ProviderBatchJournalPayload {
-        config_path: target.to_string_lossy().into_owned(),
-        config: desired,
-        cleanup_credentials,
-    };
-    let payload_json = serde_json::to_string(&payload).map_err(internal)?;
     let cleanup_named_json = serde_json::to_string(&cleanup_named).map_err(internal)?;
     let project_root_owned = project_root.to_string();
     let vault = ctx.secret_vault.clone();
     let journal_id_for_tx = journal_id.clone();
-    let staged_names = staged
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect::<Vec<_>>();
-    let credential_claims_for_compensation = credential_claims.clone();
+    let config_path = target.to_string_lossy().into_owned();
     ctx.db
         .transaction(move |conn| {
+            let mut inserted_named_claims = std::collections::BTreeSet::new();
+            let mut inserted_credential_claims =
+                std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
             for reference in &static_refs {
                 ensure_static_named_reference_owned_on_conn(
                     conn,
@@ -10703,8 +10703,8 @@ async fn stage_and_recover_provider_batch(
                     name,
                     secret.as_bytes(),
                 )?;
-                conn.execute(
-                    "INSERT OR IGNORE INTO secret_named_ownership
+                let inserted = conn.execute(
+                    "INSERT INTO secret_named_ownership
                      (item_id, owner_kind, project_root, created_at)
                      VALUES (?1, 'provider', ?2, ?3)",
                     rusqlite::params![
@@ -10713,20 +10713,32 @@ async fn stage_and_recover_provider_batch(
                         chrono::Utc::now().timestamp_millis()
                     ],
                 )?;
+                if inserted != 1 {
+                    anyhow::bail!("new provider secret claim was not inserted");
+                }
+                inserted_named_claims.insert(name.clone());
             }
             for (provider_id, reference) in &credential_claims {
-                conn.execute(
-                    "INSERT OR IGNORE INTO secret_credential_ownership
-                     (item_id, provider_id, project_root, created_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![
-                        reference,
-                        provider_id,
-                        project_root_owned,
-                        chrono::Utc::now().timestamp_millis()
-                    ],
+                let inserted = claim_provider_credential_on_conn(
+                    conn,
+                    reference,
+                    provider_id,
+                    &project_root_owned,
                 )?;
+                if inserted == 1 {
+                    inserted_credential_claims
+                        .entry(provider_id.clone())
+                        .or_default()
+                        .insert(reference.clone());
+                }
             }
+            let payload_json = serde_json::to_string(&ProviderBatchJournalPayload {
+                config_path,
+                config: desired,
+                cleanup_credentials,
+                inserted_named_claims,
+                inserted_credential_claims,
+            })?;
             conn.execute(
                 "INSERT INTO provider_config_journals
                  (journal_id, project_root, provider_id, action, entry_json,
@@ -10745,13 +10757,7 @@ async fn stage_and_recover_provider_batch(
         .await
         .map_err(map_named_secret_tx_error)?;
     if let Err(error) = ctx.publish_owner_redaction_table() {
-        let compensation = compensate_provider_batch_staging(
-            ctx,
-            &journal_id,
-            &staged_names,
-            &credential_claims_for_compensation,
-        )
-        .await;
+        let compensation = compensate_provider_batch_staging(ctx, &journal_id).await;
         ctx.poison_redaction_publication(&error);
         return match compensation {
             Ok(()) => Err(internal(error)),
@@ -10770,16 +10776,19 @@ async fn stage_and_recover_provider_batch(
 async fn compensate_provider_batch_staging(
     ctx: &DaemonContext,
     journal_id: &str,
-    staged_names: &[String],
-    credential_claims: &[(String, String)],
 ) -> std::result::Result<(), ErrorPayload> {
     let journal_id = journal_id.to_string();
-    let staged_names = staged_names.to_vec();
-    let credential_claims = credential_claims.to_vec();
     let vault = ctx.secret_vault.clone();
     ctx.db
         .transaction(move |conn| {
-            for name in &staged_names {
+            let payload_json: String = conn.query_row(
+                "SELECT entry_json FROM provider_config_journals
+                 WHERE journal_id = ?1 AND action = 'batch'",
+                [&journal_id],
+                |row| row.get(0),
+            )?;
+            let payload: ProviderBatchJournalPayload = serde_json::from_str(&payload_json)?;
+            for name in &payload.inserted_named_claims {
                 vault.delete_item_on_conn(
                     conn,
                     cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
@@ -10792,14 +10801,15 @@ async fn compensate_provider_batch_staging(
                     rusqlite::params![name, journal_id],
                 )?;
             }
-            for (provider_id, reference) in &credential_claims {
-                conn.execute(
-                    "DELETE FROM secret_credential_ownership
-                     WHERE item_id = ?1 AND provider_id = ?2
-                       AND project_root = (SELECT project_root FROM provider_config_journals WHERE journal_id = ?3)
-                       AND created_at >= (SELECT created_at FROM provider_config_journals WHERE journal_id = ?3)",
-                    rusqlite::params![reference, provider_id, journal_id],
-                )?;
+            for (provider_id, references) in &payload.inserted_credential_claims {
+                for reference in references {
+                    conn.execute(
+                        "DELETE FROM secret_credential_ownership
+                         WHERE item_id = ?1 AND provider_id = ?2
+                           AND project_root = (SELECT project_root FROM provider_config_journals WHERE journal_id = ?3)",
+                        rusqlite::params![reference, provider_id, journal_id],
+                    )?;
+                }
             }
             conn.execute(
                 "DELETE FROM provider_config_journals WHERE journal_id = ?1",
@@ -11499,14 +11509,6 @@ async fn provider_config_upsert(
     if provider_id.trim().is_empty() {
         return Err(bad_request("provider_id must not be empty"));
     }
-    // Upsert is also used by redacted settings projections. A missing
-    // credential_ref means “unchanged” in that projection, never removal.
-    if entry.credential_ref.is_none() {
-        let (_, _, current) = daemon_provider_config(ctx, project_root).await?;
-        if let Some(existing) = current.providers.get(provider_id) {
-            entry.credential_ref = existing.credential_ref.clone();
-        }
-    }
     let header_secrets = vec![None; entry.headers.len()];
     provider_config_save(ctx, project_root, provider_id, entry, header_secrets).await
 }
@@ -11649,6 +11651,84 @@ mod provider_atomic_authority_tests {
             .expect("provider batch recovery source");
         assert!(recovery.contains("ConfigDoc::load(&path)"));
         assert!(recovery.contains("doc.write(&payload.config)"));
+    }
+
+    #[test]
+    fn retained_provider_credential_pair_is_not_cleanup_work() {
+        let mut desired = crate::config::providers::ProvidersConfig::default();
+        desired.providers.insert(
+            "provider".into(),
+            crate::config::providers::ProviderEntry {
+                credential_ref: Some("credential".into()),
+                ..Default::default()
+            },
+        );
+        let mut cleanup = std::collections::BTreeMap::from([(
+            "provider".into(),
+            std::collections::BTreeSet::from(["credential".into(), "stale".into()]),
+        )]);
+        retain_only_stale_provider_credentials(&desired, &mut cleanup);
+        assert_eq!(
+            cleanup.get("provider"),
+            Some(&std::collections::BTreeSet::from(["stale".into()]))
+        );
+    }
+
+    #[test]
+    fn foreign_provider_credential_claim_is_rejected_transactionally() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE secret_vault_items (kind TEXT, item_id TEXT);
+             CREATE TABLE secret_credential_ownership (
+                 item_id TEXT, provider_id TEXT, project_root TEXT, created_at INTEGER,
+                 PRIMARY KEY (item_id, provider_id, project_root)
+             );
+             INSERT INTO secret_vault_items VALUES ('credential_record', 'credential');
+             INSERT INTO secret_credential_ownership
+             VALUES ('credential', 'foreign-provider', '/foreign', 1);",
+        )
+        .unwrap();
+        let error = claim_provider_credential_on_conn(&conn, "credential", "provider", "/project")
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<ProviderCredentialClaimConflict>()
+                .is_some()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM secret_credential_ownership",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn filtered_legacy_recovery_includes_whole_layer_batch_first() {
+        let source = include_str!("dispatch.rs");
+        let recovery = source
+            .split("pub(super) async fn recover_provider_config_journals")
+            .nth(1)
+            .and_then(|tail| tail.split("for journal in journals").next())
+            .expect("provider recovery query source");
+        assert!(recovery.contains("action = 'batch' OR provider_id = ?2"));
+        assert!(recovery.contains("CASE WHEN action = 'batch' THEN 0 ELSE 1 END"));
+    }
+
+    #[test]
+    fn batch_compensation_uses_only_journaled_exact_claims() {
+        let source = include_str!("dispatch.rs");
+        let compensation = source
+            .split("async fn compensate_provider_batch_staging")
+            .nth(1)
+            .and_then(|tail| tail.split("fn redacted_extended_config_json").next())
+            .expect("provider batch compensation source");
+        assert!(compensation.contains("payload.inserted_named_claims"));
+        assert!(compensation.contains("payload.inserted_credential_claims"));
+        assert!(!compensation.contains("created_at >="));
     }
 }
 
@@ -11832,8 +11912,11 @@ pub(super) async fn recover_provider_config_journals(
         .read(move |conn| {
             let mut statement = conn.prepare(
                 "SELECT journal_id, provider_id, action, entry_json, cleanup_named_json, cleanup_credential_json
-                 FROM provider_config_journals WHERE project_root = ?1 AND (?2 IS NULL OR provider_id = ?2)
-                 ORDER BY created_at, journal_id",
+                 FROM provider_config_journals
+                 WHERE project_root = ?1
+                   AND (?2 IS NULL OR action = 'batch' OR provider_id = ?2)
+                 ORDER BY CASE WHEN action = 'batch' THEN 0 ELSE 1 END,
+                          created_at, journal_id",
             )?;
             statement
                 .query_map(rusqlite::params![project_root_query, provider_id], |row| {
@@ -11980,7 +12063,15 @@ pub(super) async fn recover_provider_config_journals(
             )
             .map_err(internal)?;
             for (provider_id, references) in payload.cleanup_credentials {
+                let retained_by_same_pair = effective
+                    .providers
+                    .get(&provider_id)
+                    .map(|entry| provider_owned_secret_references(entry).1)
+                    .unwrap_or_default();
                 for reference in references {
+                    if retained_by_same_pair.contains(&reference) {
+                        continue;
+                    }
                     let sole_claim =
                         release_credential_ownership(ctx, &reference, &provider_id, &project_root)
                             .await?;
@@ -12019,6 +12110,27 @@ struct ProviderBatchJournalPayload {
     config: crate::config::providers::ProvidersConfig,
     #[serde(default)]
     cleanup_credentials: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Exact claims inserted by this batch. Compensation must never infer
+    /// ownership from timestamps because two transactions can share a clock
+    /// tick and pre-existing claims must survive a failed publication.
+    #[serde(default)]
+    inserted_named_claims: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    inserted_credential_claims:
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+fn retain_only_stale_provider_credentials(
+    desired: &crate::config::providers::ProvidersConfig,
+    cleanup: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) {
+    for (provider_id, references) in cleanup.iter_mut() {
+        if let Some(final_entry) = desired.providers.get(provider_id) {
+            let retained = provider_owned_secret_references(final_entry).1;
+            references.retain(|reference| !retained.contains(reference));
+        }
+    }
+    cleanup.retain(|_, references| !references.is_empty());
 }
 
 #[cfg(any(unix, test))]
@@ -12083,8 +12195,7 @@ async fn compensate_provider_config_save(
                     "DELETE FROM secret_credential_ownership
                      WHERE item_id = ?1
                        AND provider_id = (SELECT provider_id FROM provider_config_journals WHERE journal_id = ?2)
-                       AND project_root = (SELECT project_root FROM provider_config_journals WHERE journal_id = ?2)
-                       AND created_at >= (SELECT created_at FROM provider_config_journals WHERE journal_id = ?2)",
+                       AND project_root = (SELECT project_root FROM provider_config_journals WHERE journal_id = ?2)",
                     rusqlite::params![reference, journal_id],
                 )?;
             }
@@ -12133,6 +12244,15 @@ async fn provider_config_save_under_lock(
         ));
     }
     let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
+    // Reference-only legacy upserts use absence as "unchanged". Resolve that
+    // meaning only after whole-layer journal recovery and under the publication
+    // lock; doing it in the outer dispatcher can resurrect the credential from
+    // a snapshot that predates an outstanding atomic batch.
+    if entry.credential_ref.is_none()
+        && let Some(existing) = config.providers.get(provider_id)
+    {
+        entry.credential_ref = existing.credential_ref.clone();
+    }
     let old_references = config
         .providers
         .get(provider_id)
@@ -12224,7 +12344,7 @@ async fn provider_config_save_under_lock(
     let staged_for_tx = staged.clone();
     let credential_ref_for_tx = entry.credential_ref.clone();
     let static_named_refs_for_tx = static_named_refs.clone();
-    ctx.db.transaction(move |conn| {
+    let inserted_credential_claim = ctx.db.transaction(move |conn| {
         // Atomic backstop for the non-staged static header references: each must
         // still be owned by this exact provider/root with a live vault row,
         // verified on THIS connection under the writer lock (fails closed on a
@@ -12254,25 +12374,24 @@ async fn provider_config_save_under_lock(
                 rusqlite::params![name, project_root_owned, chrono::Utc::now().timestamp_millis()],
             )?;
         }
-        if let Some(reference) = credential_ref_for_tx {
-            conn.execute(
-                "INSERT OR IGNORE INTO secret_credential_ownership
-                 (item_id, provider_id, project_root, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![
+        let inserted_credential_claim = credential_ref_for_tx
+            .as_deref()
+            .map(|reference| {
+                claim_provider_credential_on_conn(
+                    conn,
                     reference,
-                    provider_id_owned.clone(),
-                    project_root_owned.clone(),
-                    chrono::Utc::now().timestamp_millis()
-                ],
-            )?;
-        }
+                    &provider_id_owned,
+                    &project_root_owned,
+                )
+            })
+            .transpose()?
+            .unwrap_or(false);
         conn.execute(
             "INSERT INTO provider_config_journals (journal_id, project_root, provider_id, action, entry_json, cleanup_named_json, cleanup_credential_json, created_at)
              VALUES (?1, ?2, ?3, 'save', ?4, ?5, ?6, ?7)",
             rusqlite::params![journal_id_owned, project_root_owned, provider_id_owned, entry_json, named_json, credentials_json, chrono::Utc::now().timestamp_millis()],
         )?;
-        Ok(())
+        Ok(inserted_credential_claim)
     }).await.map_err(map_named_secret_tx_error)?;
     // The staged writes above intentionally bypass `mutate_owner_vault_item`
     // so they can share one SQLite transaction with the recovery journal. Do
@@ -12289,7 +12408,10 @@ async fn provider_config_save_under_lock(
             ctx,
             &journal_id,
             &staged_names,
-            entry.credential_ref.as_deref(),
+            entry
+                .credential_ref
+                .as_deref()
+                .filter(|_| inserted_credential_claim),
         )
         .await
         .err()
@@ -12918,10 +13040,72 @@ async fn ensure_mcp_ownership_available(
 /// [`NamedSecretClaimConflict`] becomes a `BadRequest` (fail-closed ownership
 /// rejection), everything else an `internal` fault.
 fn map_named_secret_tx_error(error: anyhow::Error) -> ErrorPayload {
+    if let Some(conflict) = error.downcast_ref::<ProviderCredentialClaimConflict>() {
+        return bad_request(conflict.to_string());
+    }
     match error.downcast::<NamedSecretClaimConflict>() {
         Ok(conflict) => bad_request(conflict.to_string()),
         Err(error) => internal(error),
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("provider credential reference `{reference}` {reason}")]
+struct ProviderCredentialClaimConflict {
+    reference: String,
+    reason: &'static str,
+}
+
+/// Admit an exact provider/root credential claim under the same SQLite writer
+/// transaction that journals the config mutation. Existing ownership by the
+/// exact pair is idempotent; any other pair is foreign authority and cannot be
+/// acquired implicitly.
+fn claim_provider_credential_on_conn(
+    conn: &rusqlite::Connection,
+    reference: &str,
+    provider_id: &str,
+    project_root: &str,
+) -> anyhow::Result<bool> {
+    let vault_item_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM secret_vault_items
+                        WHERE kind = 'credential_record' AND item_id = ?1)",
+        [reference],
+        |row| row.get(0),
+    )?;
+    if !vault_item_exists {
+        return Err(ProviderCredentialClaimConflict {
+            reference: reference.to_string(),
+            reason: "is absent from the daemon vault",
+        }
+        .into());
+    }
+    let foreign_owner: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM secret_credential_ownership
+             WHERE item_id = ?1
+               AND NOT (provider_id = ?2 AND project_root = ?3)
+         )",
+        rusqlite::params![reference, provider_id, project_root],
+        |row| row.get(0),
+    )?;
+    if foreign_owner {
+        return Err(ProviderCredentialClaimConflict {
+            reference: reference.to_string(),
+            reason: "is owned by another provider or workspace",
+        }
+        .into());
+    }
+    Ok(conn.execute(
+        "INSERT OR IGNORE INTO secret_credential_ownership
+         (item_id, provider_id, project_root, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            reference,
+            provider_id,
+            project_root,
+            chrono::Utc::now().timestamp_millis()
+        ],
+    )? == 1)
 }
 
 /// Validate that every named-secret reference in a normalized MCP config is

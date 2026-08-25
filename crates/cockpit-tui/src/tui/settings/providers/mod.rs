@@ -527,6 +527,17 @@ impl ProvidersPointerSurface {
 }
 
 impl ProvidersPage {
+    pub(super) fn has_unsettled_oauth_operation(&self) -> bool {
+        match self {
+            Self::OAuthSetup { state, .. } => state.pending || state.polling,
+            Self::Add(state) => state
+                .oauth_auth
+                .as_ref()
+                .is_some_and(|oauth| oauth.pending || oauth.polling),
+            _ => false,
+        }
+    }
+
     pub(super) fn has_unsettled_authority_operation(&self) -> bool {
         match self {
             Self::OAuthSetup { state, .. } => state.pending || state.polling,

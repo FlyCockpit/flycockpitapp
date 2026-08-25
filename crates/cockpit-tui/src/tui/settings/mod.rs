@@ -5392,6 +5392,20 @@ impl SettingsDialog {
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         if self.authority_operation_pending() {
+            // OAuth is the sole authority operation with an interactive
+            // terminal settlement control. Route only plain Escape to the
+            // owning flow reducer so it can mint a correlated cancellation;
+            // every other key remains blocked by this outer dialog gate.
+            let oauth_cancel = matches!(key.code, KeyCode::Esc)
+                && key.modifiers.is_empty()
+                && self
+                    .page
+                    .downcast_ref::<ProvidersPage>()
+                    .is_some_and(ProvidersPage::has_unsettled_oauth_operation);
+            if oauth_cancel {
+                let nav = self.page.handle_key(&mut self.cx, key);
+                return self.apply_nav(nav);
+            }
             self.cx.extended_warnings = vec![
                 "Waiting for the daemon to settle this settings operation; navigation is disabled."
                     .into(),

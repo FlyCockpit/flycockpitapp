@@ -40,9 +40,11 @@ pub use agent_installation::{
 };
 pub use agent_management::{
     AgentEditSnapshot, AgentEditorLease, AgentEntryKind, AgentInventoryEntry, AgentMutation,
-    AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
-    agent_edit_projection_digest, agent_inventory_entry_projection_digest,
-    validate_agent_edit_snapshot, validate_agent_mutation_envelope, validate_agent_source_identity,
+    AgentMutationOutcome, AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES,
+    MAX_AGENT_NAME_BYTES, MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES,
+    MAX_ASSISTANT_HOME_BYTES, agent_edit_projection_digest,
+    agent_inventory_entry_projection_digest, validate_agent_edit_snapshot,
+    validate_agent_mutation_envelope, validate_agent_source_identity,
     validate_goal_supervision_projection,
 };
 pub use config_management::{
@@ -1042,6 +1044,14 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// escaping) fits comfortably in the remaining 349,524 bytes. 1 MiB is the
 /// smallest clean power-of-two bound with that headroom.
 pub const MAX_NDJSON_FRAME_BYTES: usize = 1_048_576;
+/// Maximum serialized daemon response envelope, including its trailing NDJSON
+/// newline. This deliberately leaves transport headroom beneath the codec's
+/// hard frame ceiling for escaping and envelope metadata.
+pub const MAX_SERIALIZED_RESPONSE_BYTES: usize = 900 * 1024;
+pub const MAX_AGENT_INVENTORY_ENTRIES: usize = 1_024;
+pub const MAX_ASSISTANT_SUMMARIES: usize = 512;
+pub const MAX_EXTENDED_CONFIG_LAYERS: usize = 32;
+pub const MAX_EXTENDED_CONFIG_SOURCE_BYTES: usize = 512 * 1024;
 
 /// Bounds for owner-only secret-management RPC fields. These are deliberately
 /// below the NDJSON frame limit so a single request cannot consume the whole
@@ -2239,9 +2249,6 @@ pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'st
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     }
-    const MAX_ASSISTANT_HOME_BYTES: usize = 16 * 1024;
-    const MAX_ASSISTANT_CONFIG_BYTES: usize = 256 * 1024;
-    const MAX_ASSISTANT_DIAGNOSTIC_BYTES: usize = 16 * 1024;
     if summary.name.is_empty()
         || summary.name.len() > MAX_AGENT_NAME_BYTES
         || summary.home_dir.len() > MAX_ASSISTANT_HOME_BYTES
@@ -6963,6 +6970,30 @@ mod tests {
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
             .expect("current v14 assistant inventory must carry bounded opaque revisions");
+    }
+
+    #[test]
+    fn authority_commit_receipts_are_frozen_in_current_response_fixtures() {
+        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let denylist = &fixture["extended_config_saved"]["data"]["denylist"];
+        assert_eq!(
+            denylist[0]["consumed_entry_id"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert!(denylist[0]["client_nonce"].is_null());
+        assert!(denylist[1]["consumed_entry_id"].is_null());
+        assert_eq!(
+            denylist[1]["client_nonce"],
+            "33333333-3333-4333-8333-333333333333"
+        );
+        assert_eq!(
+            fixture["agent_mutated"]["data"]["outcome"]["status"],
+            "reconciled"
+        );
+        assert_eq!(
+            fixture["agent_editor_lease_completed"]["data"]["outcome"]["status"],
+            "reconciled"
+        );
     }
 
     #[test]

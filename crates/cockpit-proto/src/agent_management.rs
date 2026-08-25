@@ -19,6 +19,9 @@ where
 pub const MAX_AGENT_NAME_BYTES: usize = 128;
 pub const MAX_AGENT_MARKDOWN_BYTES: usize = 256 * 1024;
 pub const MAX_AGENT_METADATA_BYTES: usize = 16 * 1024;
+pub const MAX_ASSISTANT_HOME_BYTES: usize = 16 * 1024;
+pub const MAX_ASSISTANT_CONFIG_BYTES: usize = 256 * 1024;
+pub const MAX_ASSISTANT_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -147,6 +150,17 @@ pub struct AgentMutationResult {
     /// Present only on the completion response for this exact editor lease.
     #[serde(deserialize_with = "deserialize_present_option")]
     pub completed_lease_id: Option<String>,
+    /// Whether the daemon could reconcile the post-commit projection. A
+    /// refresh-needed result is still a committed mutation and must never be
+    /// retried as though the write failed.
+    pub outcome: AgentMutationOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AgentMutationOutcome {
+    Reconciled,
+    CommittedRefreshNeeded { warning: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +199,19 @@ pub fn validate_agent_mutation_envelope(
     }
     if !inventory_wide && result.affected > 1 {
         return Err("single-agent mutation affected multiple definitions");
+    }
+    if let AgentMutationOutcome::CommittedRefreshNeeded { warning } = &result.outcome
+        && (warning.trim().is_empty() || warning.len() > MAX_AGENT_METADATA_BYTES)
+    {
+        return Err("agent mutation refresh warning is invalid");
+    }
+    if !inventory_wide
+        && matches!(
+            &result.outcome,
+            AgentMutationOutcome::CommittedRefreshNeeded { .. }
+        )
+    {
+        return Err("single-agent mutation cannot require an inventory refresh");
     }
     Ok(())
 }

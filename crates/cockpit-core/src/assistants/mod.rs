@@ -708,6 +708,12 @@ pub async fn snapshots(db: &Db) -> Result<Vec<AssistantSnapshot>> {
     tokio::task::spawn_blocking(move || {
         recover_unregister_journals_sync(&db)?;
         let rows = db.write_blocking(crate::db::Db::list_assistants_conn)?;
+        if rows.len() > cockpit_proto::MAX_ASSISTANT_SUMMARIES {
+            bail!(
+                "assistant inventory exceeds the {}-entry local response limit",
+                cockpit_proto::MAX_ASSISTANT_SUMMARIES
+            );
+        }
         let mut names = std::collections::HashSet::new();
         let mut snapshots = Vec::with_capacity(rows.len());
         for row in rows {
@@ -770,6 +776,15 @@ fn snapshot_from_row_sync(db: &Db, row: AssistantRow) -> Result<AssistantSnapsho
     let Some(bytes) = cockpit_config::config::read_config_file_nofollow(&target)? else {
         return Ok(unavailable(row, "assistant definition is missing".into()));
     };
+    if bytes.len() > cockpit_proto::MAX_AGENT_MARKDOWN_BYTES {
+        return Ok(unavailable(
+            row,
+            format!(
+                "assistant definition exceeds the {}-byte local response limit",
+                cockpit_proto::MAX_AGENT_MARKDOWN_BYTES
+            ),
+        ));
+    }
     if sha256_hex(&bytes) != row.content_hash {
         return Ok(unavailable(
             row,

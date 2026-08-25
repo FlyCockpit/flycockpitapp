@@ -571,13 +571,6 @@ fn valid_agent_inventory(
         })
 }
 
-fn is_lower_hex_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
 fn agent_snapshot(
     cwd: &std::path::Path,
     name: &str,
@@ -625,7 +618,7 @@ fn mutate_agent(
             expected_revision,
         },
     )? {
-        cockpit_core::daemon::proto::Response::AgentMutated(result) => {
+        cockpit_core::daemon::proto::Response::AgentMutated(mut result) => {
             validate_agent_mutation_result(
                 &result,
                 cwd,
@@ -641,10 +634,23 @@ fn mutate_agent(
                     .inventory_revision
                     .as_deref()
                     .ok_or_else(|| "daemon omitted reset-all inventory receipt".to_string())?;
-                if agent_inventory_revision(cwd)? != expected_inventory {
-                    return Err(
-                        "reset-all result did not reconcile to the refreshed inventory".into(),
-                    );
+                if matches!(
+                    &result.outcome,
+                    cockpit_core::daemon::proto::AgentMutationOutcome::Reconciled
+                ) {
+                    match agent_inventory_revision(cwd) {
+                        Ok(actual) if actual == expected_inventory => {}
+                        Ok(_) => {
+                            result.outcome = cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                                warning: "built-in overrides were committed, but the refreshed inventory did not match; reopen Agents to refresh".into(),
+                            };
+                        }
+                        Err(_) => {
+                            result.outcome = cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                                warning: "built-in overrides were committed, but inventory refresh failed; reopen Agents to refresh".into(),
+                            };
+                        }
+                    }
                 }
             } else if result.inventory_revision.is_some() {
                 return Err("single-agent mutation returned an unrelated inventory receipt".into());
@@ -740,14 +746,19 @@ fn assistant_rows() -> Result<Vec<AgentRow>, String> {
                 }
             }
             (None, None)
-                if row.definition_diagnostic.is_some() && !row.registration_revision.is_empty() =>
+                if row.definition_diagnostic.is_some()
+                    && !row.registration_revision.is_empty()
+                    && summary_validation.is_ok() =>
             {
                 AgentRowSource::AssistantUnavailable {
                     registration_revision: row.registration_revision.clone(),
                 }
             }
             _ => AgentRowSource::AssistantUnavailable {
-                registration_revision: row.registration_revision.clone(),
+                // A malformed presentation must never carry deletion
+                // authority into a UI row. It remains visible only as a
+                // diagnostic projection and cannot authorize a mutation.
+                registration_revision: String::new(),
             },
         };
         let definition = match &source {
@@ -933,6 +944,13 @@ pub(crate) fn validate_agent_mutation_result(
                 .is_none_or(str::is_empty)
             {
                 return Err("daemon omitted the reset-all inventory revision".into());
+            }
+            if let cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                warning,
+            } = &result.outcome
+                && warning.trim().is_empty()
+            {
+                return Err("daemon omitted the committed reset refresh warning".into());
             }
         }
         M::SaveGoalSupervision { name, .. } => {
@@ -1156,16 +1174,33 @@ impl SettingsCx {
                             Some(revision),
                         )
                     });
+                    let mut refresh_needed = false;
                     match reset {
                         Ok(result) => {
-                            p.status = Some(format!(
-                                "reset {} built-in override(s) to default",
-                                result.affected
-                            ));
+                            p.status = Some(match result.outcome {
+                                cockpit_core::daemon::proto::AgentMutationOutcome::Reconciled => {
+                                    format!(
+                                        "reset {} built-in override(s) to default",
+                                        result.affected
+                                    )
+                                }
+                                cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded { warning } => {
+                                    refresh_needed = true;
+                                    format!("reset committed for {} built-in override(s); {warning}", result.affected)
+                                }
+                            });
                         }
                         Err(e) => p.status = Some(format!("reset failed: {e}")),
                     }
-                    p.rows = rows_for(&cwd).0;
+                    if refresh_needed {
+                        // The mutation is committed. Drop every locally-held
+                        // authority projection so the action cannot be
+                        // accidentally retried against stale state.
+                        p.rows.clear();
+                        p.detail = None;
+                    } else {
+                        p.rows = rows_for(&cwd).0;
+                    }
                     p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {

@@ -768,12 +768,14 @@ fn validate_committed_denylist(
             );
         }
         match planned {
-            cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { .. }
-                if committed.client_nonce.is_none() => {}
+            cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
+                if committed.client_nonce.is_none()
+                    && committed.consumed_entry_id.as_ref() == Some(entry_id) => {}
             cockpit_core::daemon::proto::DesiredDenylistEntry::New {
                 client_nonce,
                 literal: _,
             } if committed.client_nonce.as_ref() == Some(client_nonce)
+                && committed.consumed_entry_id.is_none()
                 && uuid::Uuid::parse_str(client_nonce)
                     .is_ok_and(|nonce| nonce.to_string() == *client_nonce) => {}
             _ => {
@@ -790,7 +792,9 @@ fn same_denylist_occurrences(
 ) -> bool {
     authoritative.len() == receipt.len()
         && authoritative.iter().zip(receipt).all(|(left, right)| {
-            left.entry_id == right.entry_id && left.display_mask == right.display_mask
+            left.entry_id == right.entry_id
+                && left.display_mask == right.display_mask
+                && right.display_mask == cockpit_proto::REDACTED_DENYLIST_MASK
         })
 }
 

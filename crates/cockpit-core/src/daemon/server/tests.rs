@@ -18,6 +18,21 @@ use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
+#[test]
+fn oversized_response_is_replaced_before_the_ndjson_writer() {
+    let id = Uuid::new_v4();
+    let envelope = bounded_response_envelope(
+        id,
+        Response::PolicyExported {
+            bundle_json: "x".repeat(proto::MAX_SERIALIZED_RESPONSE_BYTES),
+        },
+    );
+    assert!(matches!(&envelope.body, proto::Body::Error { .. }));
+    assert!(
+        serde_json::to_vec(&envelope).unwrap().len() + 1 <= proto::MAX_SERIALIZED_RESPONSE_BYTES
+    );
+}
+
 fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
     crate::config::trust::WorkspaceTrustPolicy {
         root: crate::config::trust::TrustRoot {

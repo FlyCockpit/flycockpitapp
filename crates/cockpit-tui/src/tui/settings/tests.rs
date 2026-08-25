@@ -229,6 +229,42 @@ fn typed_mask_text_is_new_and_cannot_alias_an_existing_occurrence() {
     assert!(error.contains("display masks are reserved"));
 }
 
+#[test]
+fn denylist_commit_receipt_binds_consumed_and_created_occurrences_exactly() {
+    let existing = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let result_existing = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let result_new = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let nonce = "11111111-1111-4111-8111-111111111111";
+    let planned = vec![
+        cockpit_core::daemon::proto::DesiredDenylistEntry::Existing {
+            entry_id: existing.into(),
+        },
+        cockpit_core::daemon::proto::DesiredDenylistEntry::New {
+            client_nonce: nonce.into(),
+            literal: "secret".into(),
+        },
+    ];
+    let committed = vec![
+        cockpit_core::daemon::proto::CommittedDenylistEntry {
+            entry_id: result_existing.into(),
+            consumed_entry_id: Some(existing.into()),
+            client_nonce: None,
+            display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
+        },
+        cockpit_core::daemon::proto::CommittedDenylistEntry {
+            entry_id: result_new.into(),
+            consumed_entry_id: None,
+            client_nonce: Some(nonce.into()),
+            display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
+        },
+    ];
+    super::validate_committed_denylist(&planned, &committed).unwrap();
+
+    let mut forged = committed;
+    forged[0].consumed_entry_id = Some(result_existing.into());
+    assert!(super::validate_committed_denylist(&planned, &forged).is_err());
+}
+
 fn entry(id_models: &[&str]) -> ProviderEntry {
     ProviderEntry {
         url: "https://x.example/v1".into(),

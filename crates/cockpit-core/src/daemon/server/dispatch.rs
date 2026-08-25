@@ -4223,9 +4223,33 @@ async fn handle_serialized_request_impl(
         }
 
         Request::ListAssistants => {
-            let assistants = crate::assistants::snapshots(&ctx.db)
+            let snapshots = crate::assistants::snapshots(&ctx.db)
                 .await
-                .map_err(internal)?
+                .map_err(internal)?;
+            if snapshots.len() > proto::MAX_ASSISTANT_SUMMARIES {
+                return Err(bad_request(format!(
+                    "assistant inventory exceeds the {}-entry local response limit; remove unused assistants",
+                    proto::MAX_ASSISTANT_SUMMARIES
+                )));
+            }
+            if snapshots.iter().any(|snapshot| {
+                snapshot.row.name.len() > proto::MAX_AGENT_NAME_BYTES
+                    || snapshot.row.home_dir.len() > proto::MAX_ASSISTANT_HOME_BYTES
+                    || snapshot.row.config_json.len() > proto::MAX_ASSISTANT_CONFIG_BYTES
+                    || snapshot
+                        .definition_markdown
+                        .as_ref()
+                        .is_some_and(|value| value.len() > proto::MAX_AGENT_MARKDOWN_BYTES)
+                    || snapshot
+                        .definition_diagnostic
+                        .as_ref()
+                        .is_some_and(|value| value.len() > proto::MAX_ASSISTANT_DIAGNOSTIC_BYTES)
+            }) {
+                return Err(bad_request(
+                    "an assistant projection exceeds the safe local response bounds; repair or remove the assistant",
+                ));
+            }
+            let assistants = snapshots
                 .into_iter()
                 .map(assistant_snapshot_to_proto)
                 .collect();
@@ -9397,15 +9421,6 @@ async fn handle_concurrent_request_impl(
                 label,
                 history,
             })
-        }
-        Request::ListAssistants => {
-            let assistants = crate::assistants::snapshots(&ctx.db)
-                .await
-                .map_err(internal)?
-                .into_iter()
-                .map(assistant_snapshot_to_proto)
-                .collect();
-            Ok(Response::Assistants { assistants })
         }
         Request::CountPinnedMessages { session_id } => ctx
             .db

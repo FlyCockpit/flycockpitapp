@@ -199,6 +199,7 @@ pub async fn complete_editor_lease(
             inventory_revision: None,
             consumed_revision: Some(consumed_lease_revision),
             completed_lease_id: None,
+            outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
         }),
     };
     let Response::AgentMutated(mut result) = result else {
@@ -250,8 +251,14 @@ fn inventory_sync(
 }
 
 fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, ErrorPayload> {
-    crate::agents::list_all(root)
-        .into_iter()
+    let all = crate::agents::list_all(root);
+    if all.len() > cockpit_proto::MAX_AGENT_INVENTORY_ENTRIES {
+        return Err(bad_request(format!(
+            "agent inventory exceeds the {}-entry local response limit; remove unused definitions",
+            cockpit_proto::MAX_AGENT_INVENTORY_ENTRIES
+        )));
+    }
+    all.into_iter()
         .map(|entry| {
             let source = source_snapshot_parts(root, &entry.name).or_else(|error| {
                 let Some(path) = crate::agents::find_override(root, &entry.name) else {
@@ -281,6 +288,20 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, ErrorPaylo
                     ),
                 ),
             };
+            if [
+                description.as_deref(),
+                model.as_deref(),
+                diagnostic.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|value| value.len() > cockpit_proto::MAX_AGENT_METADATA_BYTES)
+            {
+                return Err(bad_request(format!(
+                    "agent `{}` metadata exceeds the safe local response bounds",
+                    entry.name
+                )));
+            }
             let (source_layer, source_identity, markdown, target_exists) = source?;
             let revision = definition_revision(
                 &entry.name,
@@ -319,6 +340,12 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
         .map_err(bad_config)?
         .ok_or_else(|| bad_request(format!("agent `{name}` was not found")))?;
     let canonical_preview = def.to_markdown().map_err(bad_config)?;
+    if canonical_preview.len() > cockpit_proto::MAX_AGENT_MARKDOWN_BYTES {
+        return Err(bad_request(format!(
+            "canonical agent preview exceeds the {}-byte local editor limit",
+            cockpit_proto::MAX_AGENT_MARKDOWN_BYTES
+        )));
+    }
     let (source_layer, source_identity, markdown, target_exists) =
         source_snapshot_parts(root, name)?;
     let revision = definition_revision(
@@ -331,6 +358,14 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
     let goal_supervision_json = (!def.goal_supervision.is_empty())
         .then(|| serde_json::to_string(&def.goal_supervision).map_err(bad_config))
         .transpose()?;
+    if goal_supervision_json
+        .as_ref()
+        .is_some_and(|value| value.len() > cockpit_proto::MAX_AGENT_METADATA_BYTES)
+    {
+        return Err(bad_request(
+            "agent goal supervision projection is too large",
+        ));
+    }
     Ok(AgentEditSnapshot {
         name: name.to_string(),
         kind: if crate::agents::is_builtin_agent(name) {
@@ -372,6 +407,12 @@ fn source_snapshot_parts(
             let raw = nofollow_read(&source)?.ok_or_else(|| {
                 conflict("agent source changed while the snapshot was being acquired")
             })?;
+            if raw.len() > cockpit_proto::MAX_AGENT_MARKDOWN_BYTES {
+                return Err(bad_request(format!(
+                    "agent definition exceeds the {}-byte local editor limit",
+                    cockpit_proto::MAX_AGENT_MARKDOWN_BYTES
+                )));
+            }
             let markdown = String::from_utf8(raw)
                 .map_err(|_| bad_request("agent definition is not valid UTF-8"))?;
             let layer = classify_source_layer(root, &source, &project_override);
@@ -384,6 +425,12 @@ fn source_snapshot_parts(
                 .ok_or_else(|| bad_request(format!("agent `{name}` was not found")))?
                 .to_markdown()
                 .map_err(bad_config)?;
+            if markdown.len() > cockpit_proto::MAX_AGENT_MARKDOWN_BYTES {
+                return Err(bad_request(format!(
+                    "embedded agent definition exceeds the {}-byte local editor limit",
+                    cockpit_proto::MAX_AGENT_MARKDOWN_BYTES
+                )));
+            }
             let identity = embedded_source_identity(root, name, markdown.as_bytes());
             Ok((
                 AgentSourceLayer::Embedded,
@@ -587,9 +634,30 @@ fn mutate_sync(
     } else {
         generation_before
     };
-    let result_inventory_revision = resets_inventory
-        .then(|| current_inventory_revision(root))
-        .transpose()?;
+    let (result_inventory_revision, outcome) = if resets_inventory {
+        match current_inventory_revision(root) {
+            Ok(revision) => (
+                Some(revision),
+                cockpit_proto::AgentMutationOutcome::Reconciled,
+            ),
+            Err(_) => (
+                Some(crate::daemon::authority_token::mint(
+                    b"agent-reset-commit-receipt/v1",
+                    &[
+                        root.as_os_str().as_encoded_bytes(),
+                        consumed_revision.as_deref().unwrap_or_default().as_bytes(),
+                        &affected.to_le_bytes(),
+                        &generation.to_le_bytes(),
+                    ],
+                )),
+                cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                    warning: "built-in overrides were committed, but the refreshed agent inventory is unavailable; reopen Agents to refresh".into(),
+                },
+            ),
+        }
+    } else {
+        (None, cockpit_proto::AgentMutationOutcome::Reconciled)
+    };
     Ok(Response::AgentMutated(AgentMutationResult {
         changed,
         affected,
@@ -598,6 +666,7 @@ fn mutate_sync(
         inventory_revision: result_inventory_revision,
         consumed_revision,
         completed_lease_id: None,
+        outcome,
     }))
 }
 

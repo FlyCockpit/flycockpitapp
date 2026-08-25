@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 pub const OPAQUE_AUTHORITY_TOKEN_BYTES: usize = 64;
 pub const REDACTED_DENYLIST_MASK: &str = "••••";
 
@@ -329,12 +337,16 @@ pub struct RedactedDenylistEntry {
     pub display_mask: String,
 }
 
-/// One occurrence in a committed denylist receipt. A nonce is echoed only for
-/// a newly-created occurrence, binding its server-assigned ID to the exact
-/// request occurrence without exposing a value-derived equality oracle.
+/// One occurrence in a committed denylist receipt. Existing occurrences echo
+/// the exact authority ID consumed by the request; newly-created occurrences
+/// echo their client nonce. In both cases `entry_id` is the exact refreshed
+/// post-commit occurrence ID and no value-derived equality oracle is exposed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedDenylistEntry {
     pub entry_id: String,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub consumed_entry_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
     pub client_nonce: Option<String>,
     pub display_mask: String,
 }

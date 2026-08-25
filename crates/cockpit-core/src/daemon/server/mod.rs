@@ -488,9 +488,8 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 // strings generically can invalidate enums and typed command
                 // structures, so preserve it byte-semantically here.  Opaque
                 // capability and revision fields must also remain exact.
-                for entry in &mut layer.denylist {
-                    scrub_string(&mut entry.display_mask, redact);
-                }
+                // Fixed display masks and opaque authority fields are protocol
+                // constants/capabilities, not free text. Preserve them exact.
             }
         }
         proto::Response::AgentInventory {
@@ -5419,9 +5418,9 @@ fn response_envelope_for_shared(
             match response {
                 Some(mut response) => {
                     finalize_response_projections(&mut response);
-                    Envelope::response(id, response)
+                    bounded_response_envelope(id, response)
                 }
-                None => Envelope::error(
+                None => bounded_error_envelope(
                     Some(id),
                     ErrorPayload {
                         code: ErrorCode::Internal,
@@ -5430,7 +5429,127 @@ fn response_envelope_for_shared(
                 ),
             }
         }
-        Err(err) => Envelope::error(Some(id), err),
+        Err(err) => bounded_error_envelope(Some(id), err),
+    }
+}
+
+fn bounded_response_envelope(id: Uuid, response: proto::Response) -> Envelope {
+    if !local_authority_response_within_bounds(&response) {
+        return bounded_error_envelope(
+            Some(id),
+            ErrorPayload {
+                code: ErrorCode::Internal,
+                message: "daemon authority projection exceeds its safe local response bounds; reduce the local inventory or authored file size".into(),
+            },
+        );
+    }
+    let envelope = Envelope::response(id, response);
+    if serde_json::to_vec(&envelope)
+        .is_ok_and(|bytes| bytes.len().saturating_add(1) <= proto::MAX_SERIALIZED_RESPONSE_BYTES)
+    {
+        envelope
+    } else {
+        bounded_error_envelope(
+            Some(id),
+            ErrorPayload {
+                code: ErrorCode::Internal,
+                message: "response exceeds the safe local protocol budget; narrow the request or reduce the local inventory".into(),
+            },
+        )
+    }
+}
+
+fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
+    let assistant =
+        |summary: &proto::AssistantSummary| proto::validate_assistant_summary(summary).is_ok();
+    let agent_snapshot =
+        |snapshot: &proto::AgentEditSnapshot| proto::validate_agent_edit_snapshot(snapshot).is_ok();
+    let inventory_entry = |entry: &proto::AgentInventoryEntry| {
+        entry.name.len() <= proto::MAX_AGENT_NAME_BYTES
+            && [
+                entry.description.as_deref(),
+                entry.model.as_deref(),
+                entry.diagnostic.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .all(|value| value.len() <= proto::MAX_AGENT_METADATA_BYTES)
+            && proto::is_opaque_authority_token(&entry.source_identity)
+            && proto::is_opaque_authority_token(&entry.revision)
+            && entry.projection_digest == proto::agent_inventory_entry_projection_digest(entry)
+    };
+    match response {
+        proto::Response::Assistant { assistant: value } => value.as_ref().is_none_or(assistant),
+        proto::Response::Assistants { assistants } => {
+            assistants.len() <= proto::MAX_ASSISTANT_SUMMARIES && assistants.iter().all(assistant)
+        }
+        proto::Response::AssistantUpserted { assistant: value }
+        | proto::Response::AssistantDefinitionSaved {
+            assistant: value, ..
+        } => assistant(value),
+        proto::Response::ExtendedConfigSnapshot { layers, .. } => {
+            layers.len() <= proto::MAX_EXTENDED_CONFIG_LAYERS
+                && layers.iter().all(|layer| {
+                    layer.display_path.len() <= proto::MAX_AGENT_METADATA_BYTES
+                        && layer.denylist.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                        && serde_json::to_vec(layer).is_ok_and(|bytes| {
+                            bytes.len() <= proto::MAX_EXTENDED_CONFIG_SOURCE_BYTES
+                        })
+                })
+        }
+        proto::Response::ExtendedConfigSaved { denylist, .. } => {
+            let mut result_ids = std::collections::HashSet::new();
+            let mut consumed_ids = std::collections::HashSet::new();
+            let mut nonces = std::collections::HashSet::new();
+            denylist.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && denylist.iter().all(|entry| {
+                    proto::is_opaque_authority_token(&entry.entry_id)
+                        && result_ids.insert(entry.entry_id.as_str())
+                        && entry.display_mask == proto::REDACTED_DENYLIST_MASK
+                        && match (&entry.consumed_entry_id, &entry.client_nonce) {
+                            (Some(consumed), None) => {
+                                proto::is_opaque_authority_token(consumed)
+                                    && consumed_ids.insert(consumed.as_str())
+                            }
+                            (None, Some(nonce)) => {
+                                uuid::Uuid::parse_str(nonce)
+                                    .is_ok_and(|parsed| parsed.to_string() == *nonce)
+                                    && nonces.insert(nonce.as_str())
+                            }
+                            _ => false,
+                        }
+                })
+        }
+        proto::Response::AgentInventory { entries, .. } => {
+            entries.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && entries.iter().all(inventory_entry)
+        }
+        proto::Response::AgentEditSnapshot(value) => agent_snapshot(value),
+        proto::Response::AgentMutated(result)
+        | proto::Response::AgentEditorLeaseCompleted(result) => {
+            result.snapshot.as_ref().is_none_or(agent_snapshot)
+        }
+        proto::Response::AgentEditorLeaseBegun(lease) => agent_snapshot(&lease.snapshot),
+        _ => true,
+    }
+}
+
+fn bounded_error_envelope(id: Option<Uuid>, error: ErrorPayload) -> Envelope {
+    let envelope = Envelope::error(id, error);
+    if serde_json::to_vec(&envelope)
+        .is_ok_and(|bytes| bytes.len().saturating_add(1) <= proto::MAX_SERIALIZED_RESPONSE_BYTES)
+    {
+        envelope
+    } else {
+        Envelope::error(
+            id,
+            ErrorPayload {
+                code: ErrorCode::Internal,
+                message:
+                    "daemon response could not be represented within the local protocol budget"
+                        .into(),
+            },
+        )
     }
 }
 

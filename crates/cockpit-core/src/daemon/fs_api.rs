@@ -311,10 +311,23 @@ pub async fn get_extended_config_snapshot(
             let mut layers = Vec::new();
             let mut pending_capabilities = Vec::new();
             let now = Instant::now();
-            for (kind, target) in discovered_settings_layers(&root)? {
+            let discovered = discovered_settings_layers(&root)?;
+            if discovered.len() > cockpit_proto::MAX_EXTENDED_CONFIG_LAYERS {
+                return Err(bad_request(format!(
+                    "settings inventory exceeds the {}-layer local response limit",
+                    cockpit_proto::MAX_EXTENDED_CONFIG_LAYERS
+                )));
+            }
+            for (kind, target) in discovered {
                 let guard =
                     cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
                 let (raw, identity) = read_optional_config(&target)?;
+                if raw.len() > cockpit_proto::MAX_EXTENDED_CONFIG_SOURCE_BYTES {
+                    return Err(bad_request(format!(
+                        "an authored settings file exceeds the {}-byte local snapshot limit; edit it outside the TUI",
+                        cockpit_proto::MAX_EXTENDED_CONFIG_SOURCE_BYTES
+                    )));
+                }
                 let raw_revision = content_hash(&raw);
                 let revision = settings_revision(kind, &target, &raw_revision);
                 let raw_document: serde_json::Value =
@@ -341,6 +354,21 @@ pub async fn get_extended_config_snapshot(
                 let (redacted_config, redacted_occurrences) =
                     redact_extended_config_projection(config, &redaction)?;
                 config = redacted_config;
+                let config_projection_bytes = serde_json::to_vec(&config).map_err(internal)?;
+                if target.as_os_str().as_encoded_bytes().len()
+                    > cockpit_proto::MAX_AGENT_METADATA_BYTES
+                    || denylist.len() > cockpit_proto::MAX_AGENT_INVENTORY_ENTRIES
+                    || authored_paths.len() > cockpit_proto::MAX_AGENT_INVENTORY_ENTRIES
+                    || authored_paths.iter().flatten().any(|segment| {
+                        segment.len() > cockpit_proto::MAX_AGENT_METADATA_BYTES
+                    })
+                    || config_projection_bytes.len()
+                        > cockpit_proto::MAX_EXTENDED_CONFIG_SOURCE_BYTES
+                {
+                    return Err(bad_request(
+                        "an authored settings projection exceeds the safe local response bounds; simplify the file before opening it in the TUI",
+                    ));
+                }
                 let id = Uuid::new_v4();
                 drop(guard);
                 pending_capabilities.push((
@@ -827,6 +855,7 @@ pub async fn apply_extended_config_patch(
                     .enumerate()
                     .map(|(index, (_, client_nonce, value))| cockpit_proto::CommittedDenylistEntry {
                         entry_id: denylist_occurrence_id(capability.kind, &target, &result_revision, index, value),
+                        consumed_entry_id: client_nonce.is_none().then(|| denylist_values[index].0.clone()),
                         client_nonce: client_nonce.clone(),
                         display_mask: cockpit_proto::REDACTED_DENYLIST_MASK.into(),
                     })
@@ -1163,7 +1192,20 @@ fn validate_new_denylist_literal(value: &str) -> Result<(), ErrorPayload> {
     if value.is_empty() || value.len() > 64 * 1024 || value.contains('\0') {
         return Err(bad_request("denylist literal is invalid"));
     }
-    if value.starts_with("•••• (") && value.ends_with(" bytes)") {
+    let trimmed = value.trim();
+    let legacy_mask = trimmed.starts_with("•••• (") && trimmed.ends_with(" bytes)");
+    let star_mask = !trimmed.is_empty() && trimmed.bytes().all(|byte| byte == b'*');
+    let bullet_mask = !trimmed.is_empty() && trimmed.chars().all(|character| character == '•');
+    let numbered_legacy_mask = trimmed.starts_with("******** #")
+        && trimmed.strip_prefix("******** #").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    if trimmed == cockpit_proto::REDACTED_DENYLIST_MASK
+        || legacy_mask
+        || star_mask
+        || bullet_mask
+        || numbered_legacy_mask
+    {
         return Err(bad_request(
             "redacted denylist display masks are not accepted as literals",
         ));
@@ -2408,16 +2450,21 @@ mod tests {
 
     #[test]
     fn denylist_rejects_typed_display_mask_literal() {
-        let mut document = serde_json::json!({"redact": {"denylist": []}});
-        let error = apply_denylist_sequence(
-            document.as_object_mut().unwrap(),
-            vec![cockpit_proto::DesiredDenylistEntry::New {
-                client_nonce: "typed-mask".into(),
-                literal: "•••• (4 bytes)".into(),
-            }],
-            &[],
-        )
-        .unwrap_err();
-        assert_eq!(error.code, ErrorCode::BadRequest);
+        for (index, literal) in ["••••", "•••• (4 bytes)", "********", "******** #1"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut document = serde_json::json!({"redact": {"denylist": []}});
+            let error = apply_denylist_sequence(
+                document.as_object_mut().unwrap(),
+                vec![cockpit_proto::DesiredDenylistEntry::New {
+                    client_nonce: format!("00000000-0000-4000-8000-{index:012}"),
+                    literal: literal.into(),
+                }],
+                &[],
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::BadRequest, "literal: {literal}");
+        }
     }
 }

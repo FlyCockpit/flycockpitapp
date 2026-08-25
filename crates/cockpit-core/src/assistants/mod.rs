@@ -1198,7 +1198,7 @@ fn recover_unregister_journals_sync(db: &Db) -> Result<()> {
         let operation_id = Uuid::parse_str(&journal.operation_id)
             .context("assistant unregister journal operation ID is invalid")?;
         if operation_id.to_string() != journal.operation_id
-            || entry.file_name() != format!("{}.json", journal.operation_id)
+            || entry.file_name() != format!("{}.json", journal.operation_id).as_str()
         {
             bail!("assistant unregister journal filename does not match its identity");
         }

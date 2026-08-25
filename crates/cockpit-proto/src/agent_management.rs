@@ -332,7 +332,7 @@ pub fn agent_inventory_entry_projection_digest(entry: &AgentInventoryEntry) -> S
         entry.source_layer as u8,
         u8::from(entry.editable),
     ]);
-    format!("{:x}", digest.finalize())
+    crate::hex_lower(digest.finalize())
 }
 
 pub fn agent_edit_projection_digest(snapshot: &AgentEditSnapshot) -> String {
@@ -362,7 +362,7 @@ pub fn agent_edit_projection_digest(snapshot: &AgentEditSnapshot) -> String {
         u8::from(snapshot.editable),
         u8::from(snapshot.supports_goal_supervision),
     ]);
-    format!("{:x}", digest.finalize())
+    crate::hex_lower(digest.finalize())
 }
 
 pub fn validate_agent_source_identity(

@@ -325,7 +325,7 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, ErrorPaylo
                 valid,
                 diagnostic,
                 source_layer,
-                source_identity,
+                source_identity: source_identity.to_string(),
                 revision,
                 editable: source_layer == AgentSourceLayer::Workspace && !markdown.is_empty(),
                 projection_digest: String::new(),
@@ -374,10 +374,10 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
             AgentEntryKind::Custom
         },
         overridden: source_layer != AgentSourceLayer::Embedded,
-        markdown,
+        markdown: markdown.to_string(),
         canonical_preview,
         source_layer,
-        source_identity,
+        source_identity: source_identity.to_string(),
         edit_target: AgentEditTarget::Workspace,
         revision,
         goal_supervision_json,
@@ -1148,7 +1148,7 @@ fn bad_request(message: impl Into<String>) -> ErrorPayload {
     }
 }
 
-fn conflict(message: impl Into<String>) -> ErrorPayload {
+pub(crate) fn conflict(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::Conflict,
         message: message.into(),

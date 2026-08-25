@@ -1,3 +1,4 @@
+#[cfg(feature = "remote")]
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};

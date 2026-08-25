@@ -39,12 +39,12 @@ pub use agent_installation::{
     AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
 };
 pub use agent_management::{
-    AgentEditSnapshot, AgentEditorLease, AgentEntryKind, AgentInventoryEntry, AgentMutation,
-    AgentMutationOutcome, AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES,
-    MAX_AGENT_NAME_BYTES, MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES,
-    MAX_ASSISTANT_HOME_BYTES, agent_edit_projection_digest,
-    agent_inventory_entry_projection_digest, validate_agent_edit_snapshot,
-    validate_agent_mutation_envelope, validate_agent_source_identity,
+    AgentEditSnapshot, AgentEditTarget, AgentEditorLease, AgentEntryKind, AgentInventoryEntry,
+    AgentMutation, AgentMutationOutcome, AgentMutationResult, AgentSourceLayer,
+    GoalSupervisionPatch, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
+    MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES, MAX_ASSISTANT_HOME_BYTES,
+    agent_edit_projection_digest, agent_inventory_entry_projection_digest,
+    validate_agent_edit_snapshot, validate_agent_mutation_envelope, validate_agent_source_identity,
     validate_goal_supervision_projection,
 };
 pub use config_management::{
@@ -2293,7 +2293,7 @@ pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'st
         summary.definition_presentation_hash.as_deref(),
     ) {
         use sha2::Digest as _;
-        if format!("{:x}", sha2::Sha256::digest(markdown.as_bytes())) != presentation_hash {
+        if hex_lower(sha2::Sha256::digest(markdown.as_bytes())) != presentation_hash {
             return Err("assistant definition presentation hash is invalid");
         }
     }
@@ -2301,6 +2301,18 @@ pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'st
         return Err("assistant projection digest is invalid");
     }
     Ok(())
+}
+
+/// Lowercase hex-encode a byte slice without relying on `hybrid-array`'s
+/// `LowerHex` impl (absent in `sha2` 0.11).
+pub(crate) fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    out
 }
 
 pub fn assistant_projection_digest(summary: &AssistantSummary) -> String {
@@ -2326,7 +2338,7 @@ pub fn assistant_projection_digest(summary: &AssistantSummary) -> String {
             None => digest.update([0]),
         }
     }
-    format!("{:x}", digest.finalize())
+    hex_lower(digest.finalize())
 }
 
 fn assistant_revision_field(digest: &mut sha2::Sha256, value: &str) {

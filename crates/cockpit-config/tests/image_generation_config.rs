@@ -355,7 +355,11 @@ fn base_tier_known_cost_threshold_defaults_overrides_and_fails_closed() {
 
     // In-range authored overrides are honored: 0 (always prompt), a mid value,
     // and the exact hard ceiling.
-    for value in [0_u64, 1_000_000, BASE_TIER_KNOWN_COST_HARD_CEILING_USD_MICROS] {
+    for value in [
+        0_u64,
+        1_000_000,
+        BASE_TIER_KNOWN_COST_HARD_CEILING_USD_MICROS,
+    ] {
         let cfg: ImageGenerationConfig = serde_json::from_str(&format!(
             r#"{{"base_tier_known_cost_threshold_usd_micros": {value}}}"#
         ))

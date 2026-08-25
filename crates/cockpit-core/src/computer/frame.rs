@@ -90,7 +90,7 @@ impl FrameChecksum {
 }
 
 /// Helper: hex-encode without pulling in a new dependency.
-mod hex {
+pub(crate) mod hex {
     pub fn encode(bytes: &[u8]) -> String {
         let mut out = String::with_capacity(bytes.len() * 2);
         for b in bytes {

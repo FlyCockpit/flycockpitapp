@@ -3195,8 +3195,12 @@ mod tests {
             }
         }
         // The three distinct reserved identifiers, spelled out.
-        assert!(is_reserved_native_computer_tool_name(NATIVE_COMPUTER_TOOL_NAME));
-        assert!(is_reserved_native_computer_tool_name(OPENAI_COMPUTER_TOOL_TYPE));
+        assert!(is_reserved_native_computer_tool_name(
+            NATIVE_COMPUTER_TOOL_NAME
+        ));
+        assert!(is_reserved_native_computer_tool_name(
+            OPENAI_COMPUTER_TOOL_TYPE
+        ));
         assert!(is_reserved_native_computer_tool_name(
             ANTHROPIC_COMPUTER_TOOL_TYPE_20251124
         ));

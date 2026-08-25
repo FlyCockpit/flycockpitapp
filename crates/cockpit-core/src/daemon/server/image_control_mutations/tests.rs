@@ -725,6 +725,8 @@ fn durability_source_ratchet_requires_exact_cas_journal_and_post_commit_publicat
     assert!(recovery.contains("if receipt_state == \"terminal_success\""));
     assert!(recovery.contains("if terminal != response_json"));
     assert!(recovery.contains("does not exactly match its journaled response"));
+    assert!(recovery.contains("receipt.consumed_revision != consumed"));
+    assert!(recovery.contains("receipt.result_config_generation != expected_generation"));
     assert!(recovery.contains("Every terminal receipt is final"));
     assert!(recovery.contains("bounded terminal image recovery"));
     assert!(recovery.contains("if actual == intended"));

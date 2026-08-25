@@ -1489,14 +1489,18 @@ pub(crate) async fn recover_image_config_mutation_journals(
                     "terminal image mutation receipt has the wrong response",
                 ));
             };
-            if receipt.client_operation_id != operation || receipt.result_revision != intended {
+            let expected_generation =
+                consumed_generation.saturating_add(u64::from(intended != consumed));
+            if receipt.client_operation_id != operation
+                || receipt.consumed_revision != consumed
+                || receipt.result_revision != intended
+                || receipt.result_config_generation != expected_generation
+            {
                 return Err(internal(
                     "terminal image mutation receipt does not bind its journal",
                 ));
             }
-            inventory::publish_committed_config_generation_at_least(
-                receipt.result_config_generation,
-            );
+            inventory::publish_committed_config_generation_at_least(expected_generation);
             let retire_owner = owner;
             let retire_operation = operation;
             ctx.db

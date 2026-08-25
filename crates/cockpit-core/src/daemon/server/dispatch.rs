@@ -16995,7 +16995,8 @@ mod provider_atomic_authority_tests {
         assert!(provider.contains("settlement_phase == \"cleanup_pending\""));
         assert!(provider.contains("SET settlement_phase='cleanup_pending'"));
         assert!(provider.contains("SET terminal_response_json=?2"));
-        assert!(provider.contains("None => intended"));
+        assert!(provider.contains("None if journal.action == \"delete\" => intended"));
+        assert!(provider.contains("receipt-bound provider cleanup journal omitted"));
         assert!(provider.contains("Receiptless delete journals"));
         let mcp = source
             .split("async fn recover_mcp_config_journals_inner")
@@ -17315,7 +17316,12 @@ async fn recover_provider_config_journals_inner(
                     // Their intended generation was transactionally bound
                     // before publication and is sufficient for cleanup-only
                     // replay; never send them back through the stale file CAS.
-                    None => intended,
+                    None if journal.action == "delete" => intended,
+                    None => {
+                        return Err(internal(
+                            "receipt-bound provider cleanup journal omitted its terminal response",
+                        ));
+                    }
                 };
                 inventory::publish_committed_config_generation_at_least(published);
                 published

@@ -267,6 +267,10 @@ pub(super) async fn admit_image_ingress(
         .map_err(internal)?;
     let width = normalized.width;
     let height = normalized.height;
+    // Publication now owns both the materialized object and the reservation:
+    // its failure path verifies deletion before releasing accounting, while a
+    // crash leaves the durable publication intent for boot recovery.
+    abandon.reservation_id = None;
     let published = storage
         .publish_ingress_image(crate::media_storage::PublishIngressImageInput {
             admission_id,
@@ -281,7 +285,6 @@ pub(super) async fn admit_image_ingress(
         })
         .await
         .map_err(internal)?;
-    abandon.reservation_id = None;
     Ok(Response::ImageIngressAdmitted(
         proto::ImageIngressAdmissionReceiptV1 {
             schema_version: 1,

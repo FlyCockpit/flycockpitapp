@@ -209,6 +209,57 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    async fn discard_ingress_publication(
+        &self,
+        admission_id: Uuid,
+        reservation_id: &str,
+        storage_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        let mut proof = Sha256::new();
+        proof.update(b"media-ingress-orphan-cleanup-v1\0");
+        proof.update(admission_id.as_bytes());
+        proof.update([0]);
+        proof.update(storage_id.as_bytes());
+        if let Some(file) = open_optional_verified(&self.owned_root, storage_id)? {
+            let identity = stable_identity_digest(&file)?;
+            self.owned_root
+                .remove_file(storage_id)
+                .map_err(anyhow::Error::new)?;
+            proof.update(identity.as_bytes());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                ensure!(
+                    file.metadata()?.nlink() == 0,
+                    "ingress orphan was not deleted"
+                );
+            }
+        }
+        self.owned_root.sync().map_err(anyhow::Error::new)?;
+        let cleanup = crate::intel::hex_lower(&proof.finalize());
+        let admission = admission_id.to_string();
+        let reservation = reservation_id.to_owned();
+        self.db
+            .transaction(move |conn| {
+                crate::media_reservation::destroy_verified_media_artifacts_conn(
+                    conn,
+                    &reservation,
+                    &cleanup,
+                    u64::try_from(now_unix_ms)?,
+                )?;
+                ensure!(
+                    conn.execute(
+                        "DELETE FROM media_ingress_publication_intents WHERE admission_id=?1 AND reservation_id=?2",
+                        params![admission, reservation],
+                    )? == 1,
+                    "ingress publication intent lost"
+                );
+                Ok(())
+            })
+            .await
+    }
+
     pub(crate) async fn ingress_image_receipt(
         &self,
         admission_id: Uuid,
@@ -1162,8 +1213,14 @@ impl MediaStorageRecovery {
         let (identity, length) = match publication {
             Ok(proof) => proof,
             Err(error) => {
-                let _ = self.owned_root.remove_file(&storage_name);
-                let _ = self.owned_root.sync();
+                self.discard_ingress_publication(
+                    admission_id,
+                    &reservation_id,
+                    &storage_name,
+                    now_unix_ms,
+                )
+                .await
+                .context("failed to clean rejected ingress publication")?;
                 return Err(error);
             }
         };
@@ -1238,8 +1295,14 @@ impl MediaStorageRecovery {
             })
             .await;
         if let Err(error) = commit {
-            let _ = self.owned_root.remove_file(&storage_name);
-            let _ = self.owned_root.sync();
+            self.discard_ingress_publication(
+                admission_id,
+                &reservation_id,
+                &storage_name,
+                now_unix_ms,
+            )
+            .await
+            .context("failed to roll back ingress publication")?;
             return Err(error);
         }
         Ok(PublishedIngressImage {

@@ -4,8 +4,6 @@
 //! them available in the default local profile without compiling a remote
 //! protocol module merely to encode an integer.
 
-use serde::Deserialize as _;
-
 /// A malformed or non-canonical wire scalar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireScalarError(pub String);

@@ -1937,6 +1937,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "remote")]
     fn remote_project_files(root: &Path) -> ClientPrincipal {
         ClientPrincipal::from_verified_remote(
             "user-1".into(),
@@ -2161,10 +2162,12 @@ mod tests {
         let ctx = test_ctx(root);
         std::fs::write(root.join(".env"), "SECRET=value").unwrap();
         let path = root.join(".env").canonicalize().unwrap();
+        #[cfg(feature = "remote")]
         assert!(secret_blocked_for_sharee(&ctx, &remote_project_files(root), root, &path).unwrap());
         assert!(!secret_blocked_for_sharee(&ctx, &ClientPrincipal::owner(), root, &path).unwrap());
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn gitignored_file_is_flagged_in_listing() {
         let tmp = tempfile::tempdir().unwrap();

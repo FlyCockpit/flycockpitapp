@@ -16,3 +16,11 @@ pub mod flycockpit;
 mod refresh_guard;
 pub mod subscription_ack;
 pub mod xai_oauth;
+
+/// Reserved provider-credential key for the Flycockpit account credential.
+///
+/// Defined here rather than in the `remote`-gated `flycockpit` module so the
+/// semantic reservation check in `validate_request_semantics` applies even
+/// when the `remote` feature is off (the public v0.1 CLI). `flycockpit::
+/// CREDENTIAL_KEY` re-exports this value for the remote-enabled paths.
+pub(crate) const FLYCOCKPIT_CREDENTIAL_KEY: &str = "flycockpit";

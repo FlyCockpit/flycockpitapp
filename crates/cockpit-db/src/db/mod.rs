@@ -1279,8 +1279,7 @@ fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
         "SELECT version, name, sha256, schema_fingerprint, schema_profile \
              FROM schema_version ORDER BY version",
     )?;
-    let mut expected_version = 1_i64;
-    for row in stmt.query_map([], |row| {
+    for (idx, row) in stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
@@ -1288,7 +1287,10 @@ fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
         ))
-    })? {
+    })?
+    .enumerate()
+    {
+        let expected_version = idx as i64 + 1;
         let (version, name, hash, fingerprint, profile) = row?;
         if version != expected_version {
             anyhow::bail!(
@@ -1322,7 +1324,6 @@ fn verify_ledger(conn: &Connection, migrations: &[Migration]) -> Result<()> {
                 "database schema fingerprint mismatch at migration {version}: schema objects were altered or are missing"
             );
         }
-        expected_version += 1;
     }
     Ok(())
 }

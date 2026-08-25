@@ -1840,7 +1840,7 @@ impl Db {
         session_id: Uuid,
         now_unix_ms: i64,
     ) -> Result<()> {
-        ensure!(
+        anyhow::ensure!(
             now_unix_ms >= 0,
             "cleanup intent timestamp must be nonnegative"
         );
@@ -1977,10 +1977,10 @@ impl Db {
         let removed = self
             .transaction(move |conn| Self::discard_ephemeral_session_conn(conn, session_id))
             .await?;
-        if removed {
-            if let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
-                tracing::warn!(%error, %session_id, "discarded-session sidecar cleanup remains durably pending");
-            }
+        if removed
+            && let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await
+        {
+            tracing::warn!(%error, %session_id, "discarded-session sidecar cleanup remains durably pending");
         }
         Ok(removed)
     }

@@ -8639,21 +8639,24 @@ mod tests {
     #[test]
     fn owner_recovery_authority_rejects_every_remote_write_mode() {
         use crate::daemon::principal::{PrincipalGrant, PrincipalScope};
-        for scope in [
-            PrincipalScope::Agent,
-            PrincipalScope::AgentReadonly,
-            PrincipalScope::ProjectFiles,
-            PrincipalScope::Terminal,
-        ] {
-            let remote = ClientPrincipal::from_verified_remote(
-                format!("remote-{scope:?}"),
-                vec![PrincipalGrant {
-                    scope,
-                    project_root: Some("/project".into()),
-                }],
-                None,
-            );
-            assert!(DaemonLocalOwnerRecoveryAuthority::from_local_direct(&remote).is_err());
+        #[cfg(feature = "remote")]
+        {
+            for scope in [
+                PrincipalScope::Agent,
+                PrincipalScope::AgentReadonly,
+                PrincipalScope::ProjectFiles,
+                PrincipalScope::Terminal,
+            ] {
+                let remote = ClientPrincipal::from_verified_remote(
+                    format!("remote-{scope:?}"),
+                    vec![PrincipalGrant {
+                        scope,
+                        project_root: Some("/project".into()),
+                    }],
+                    None,
+                );
+                assert!(DaemonLocalOwnerRecoveryAuthority::from_local_direct(&remote).is_err());
+            }
         }
         assert!(
             DaemonLocalOwnerRecoveryAuthority::from_local_direct(&ClientPrincipal::Owner).is_ok()

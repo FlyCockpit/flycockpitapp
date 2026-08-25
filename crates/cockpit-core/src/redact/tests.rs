@@ -257,6 +257,7 @@ fn short_credential_shaped_key_value_respects_hard_floor() {
     assert_eq!(t.scrub("short def"), "short def");
 }
 
+#[cfg(feature = "remote")]
 #[test]
 fn stored_flycockpit_instance_token_is_forced_redaction_candidate() {
     let tmp = tempfile::TempDir::new().unwrap();

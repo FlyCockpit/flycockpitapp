@@ -2555,6 +2555,7 @@ impl<'de> Deserialize<'de> for SensitiveWireLiteral {
 /// literal. It carries no plaintext and no length, so the sealed plaintext never
 /// enters the (non-zeroizing) FCOR canonical digest buffer, its staging buffers,
 /// or the bytes handed to the hasher.
+#[cfg(feature = "remote")]
 const SEALED_LITERAL_FCOR_PLACEHOLDER: &[u8] = b"[sealed-literal-redacted-from-fcor]";
 
 // The apply request is an owner-remoted nonrepeatable mutation, so its params
@@ -3831,7 +3832,7 @@ mod proto_fixture_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod golden_wire_fixtures {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -4932,6 +4933,30 @@ mod errorcode_forward_tests {
 }
 
 // ---- Tests -----------------------------------------------------------------
+
+/// Fixture-file reader shared by tests that run in the default (non-`remote`)
+/// profile. The full `proto_fixture_tests` module is `remote`-gated because its
+/// round-trip coverage deserializes remote-only variants; this thin reader has
+/// no remote-type dependency and stays available so local-protocol fixture
+/// freezing checks keep running without `--features remote`.
+#[cfg(test)]
+mod proto_fixture_files {
+    use serde_json::{Map, Value};
+    use std::path::Path;
+
+    pub(super) fn read_fixture_for(version: u32, file_name: &str) -> Map<String, Value> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("daemon_proto")
+            .join(format!("v{version}"))
+            .join(file_name);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -6252,6 +6277,7 @@ mod tests {
             v: 9,
             body: Body::Request {
                 id,
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: Request::ListSecretInventory {
                     cursor: None,
@@ -6307,6 +6333,7 @@ mod tests {
             v: 9,
             body: Body::Request {
                 id,
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: Request::ListSessions {
                     project_id: None,
@@ -6457,6 +6484,7 @@ mod tests {
             assert_eq!(
                 body_required_protocol_version(&Body::Request {
                     id: Uuid::nil(),
+                    #[cfg(feature = "remote")]
                     operation: None,
                     request,
                 })
@@ -6503,7 +6531,8 @@ mod tests {
 
     #[test]
     fn every_new_cli_surface_shape_requires_v10() {
-        for request in [
+        #[cfg_attr(not(feature = "remote"), allow(unused_mut))]
+        let mut requests: Vec<Request> = vec![
             Request::ListPackages,
             Request::AddPackage {
                 project_root: "/tmp/project".into(),
@@ -6528,8 +6557,6 @@ mod tests {
             Request::ImportKclPackages {
                 project_root: "/tmp/project".into(),
             },
-            Request::GetConnectorState,
-            Request::GetOrgSyncStatus,
             Request::ListFailedToolCalls {
                 since_epoch: 0,
                 tool: None,
@@ -6570,11 +6597,17 @@ mod tests {
                 package: Some("tokio".into()),
                 project_root: None,
             },
-        ] {
+        ];
+        #[cfg(feature = "remote")]
+        {
+            requests.extend([Request::GetConnectorState, Request::GetOrgSyncStatus]);
+        }
+        for request in requests {
             let tag = request.wire_tag();
             assert_eq!(
                 body_required_protocol_version(&Body::Request {
                     id: Uuid::nil(),
+                    #[cfg(feature = "remote")]
                     operation: None,
                     request,
                 })
@@ -6583,7 +6616,8 @@ mod tests {
                 "{tag} must be gated to v10"
             );
         }
-        for response in [
+        #[cfg_attr(not(feature = "remote"), allow(unused_mut))]
+        let mut responses: Vec<Response> = vec![
             Response::Packages {
                 packages_json: "[]".into(),
             },
@@ -6598,13 +6632,6 @@ mod tests {
             },
             Response::KclPackagesImported {
                 result_json: "{}".into(),
-            },
-            Response::ConnectorState {
-                connector_json: "null".into(),
-            },
-            Response::OrgSyncStatus {
-                org_states_json: "[]".into(),
-                audit_states_json: "[]".into(),
             },
             Response::FailedToolCalls {
                 calls_json: "[]".into(),
@@ -6636,7 +6663,20 @@ mod tests {
             Response::DocsAnswer {
                 answer: String::new(),
             },
-        ] {
+        ];
+        #[cfg(feature = "remote")]
+        {
+            responses.extend([
+                Response::ConnectorState {
+                    connector_json: "null".into(),
+                },
+                Response::OrgSyncStatus {
+                    org_states_json: "[]".into(),
+                    audit_states_json: "[]".into(),
+                },
+            ]);
+        }
+        for response in responses {
             let tag = response.wire_tag();
             assert_eq!(
                 body_required_protocol_version(&Body::Response {
@@ -6660,6 +6700,7 @@ mod tests {
             v: 9,
             body: Body::Request {
                 id,
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: Request::GetDoctorSnapshot {
                     project_root: None,
@@ -6689,6 +6730,7 @@ mod tests {
             v: 9,
             body: Body::Request {
                 id,
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: Request::DocsAsk {
                     question: "how do tasks work?".into(),
@@ -6762,6 +6804,7 @@ mod tests {
             assert_eq!(
                 body_required_protocol_version(&Body::Request {
                     id: Uuid::nil(),
+                    #[cfg(feature = "remote")]
                     operation: None,
                     request,
                 })
@@ -6822,6 +6865,7 @@ mod tests {
             v: 9,
             body: Body::Request {
                 id,
+                #[cfg(feature = "remote")]
                 operation: None,
                 request: Request::ApplySealedOwnerOperation {
                     capability_id: "cap".into(),

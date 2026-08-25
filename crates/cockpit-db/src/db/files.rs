@@ -276,7 +276,7 @@ pub(crate) fn publish_private_file_durable(destination: &Path, bytes: &[u8]) -> 
             let _ = std::fs::remove_file(&self.0);
         }
     }
-    let guard = TempGuard(temporary.clone());
+    let _guard = TempGuard(temporary.clone());
     #[cfg(unix)]
     let file_result = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -328,7 +328,7 @@ pub(crate) fn publish_private_file_durable(destination: &Path, bytes: &[u8]) -> 
                 destination.display()
             )
         })?;
-        std::mem::forget(guard);
+        std::mem::forget(_guard);
     }
     #[cfg(windows)]
     let directory = {

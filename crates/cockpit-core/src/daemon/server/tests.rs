@@ -8,7 +8,9 @@ use super::*;
 use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownPhase;
 use crate::session::Session;
-use std::collections::{BTreeSet, HashMap, HashSet};
+#[cfg(feature = "remote")]
+use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 // Brings the `Write` trait methods (`write_all`) into scope for the
 // `zip::ZipWriter` calls below without binding a name (so it neither shadows the
@@ -878,7 +880,7 @@ async fn list_packages_response_carries_no_planted_secret() {
     // Precondition: the secret really lives in the daemon vault.
     assert_eq!(
         store.named_secret("list-packages-redaction-probe"),
-        Some(token.clone())
+        Some(token.as_str())
     );
     crate::packages::add_local(&ctx.db, "fixture-pkg", std::env::temp_dir().as_path())
         .await
@@ -1814,8 +1816,8 @@ async fn authorized_fcor_resources_normalize_attach_and_nested_schedule_roots() 
     );
 }
 
-#[tokio::test]
 #[cfg(feature = "remote")]
+#[tokio::test]
 async fn authorized_fcor_resources_order_file_modes_and_provider_model() {
     use proto::remote_operation_fcor::RemoteOperationResourceKind as Kind;
     let ctx = test_ctx();
@@ -1862,8 +1864,8 @@ async fn authorized_fcor_resources_order_file_modes_and_provider_model() {
     );
 }
 
-#[tokio::test]
 #[cfg(feature = "remote")]
+#[tokio::test]
 async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dispatch() {
     let ctx = test_ctx();
     let state = MutableClientState::detached_for_test();
@@ -1895,33 +1897,36 @@ async fn authorized_resource_bytes_change_operation_hash_and_conflict_before_dis
         .unwrap();
     assert_ne!(first, second);
 
-    let operation_id = characterized_operation_id();
-    let side_effects = std::sync::atomic::AtomicUsize::new(0);
-    let first_hash = remote_request_hash(&ctx, &first);
-    let second_hash = remote_request_hash(&ctx, &second);
-    assert!(matches!(
-        characterize_operation_dispatch(
-            &ctx.db,
-            Uuid::new_v4(),
-            operation_id,
-            first_hash,
-            &side_effects,
-        )
-        .await,
-        CharacterizedDispatchOutcome::Applied(_)
-    ));
-    assert_eq!(
-        characterize_operation_dispatch(
-            &ctx.db,
-            Uuid::new_v4(),
-            operation_id,
-            second_hash,
-            &side_effects,
-        )
-        .await,
-        CharacterizedDispatchOutcome::Conflict
-    );
-    assert_eq!(side_effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    #[cfg(feature = "remote")]
+    {
+        let operation_id = characterized_operation_id();
+        let side_effects = std::sync::atomic::AtomicUsize::new(0);
+        let first_hash = remote_request_hash(&ctx, &first);
+        let second_hash = remote_request_hash(&ctx, &second);
+        assert!(matches!(
+            characterize_operation_dispatch(
+                &ctx.db,
+                Uuid::new_v4(),
+                operation_id,
+                first_hash,
+                &side_effects,
+            )
+            .await,
+            CharacterizedDispatchOutcome::Applied(_)
+        ));
+        assert_eq!(
+            characterize_operation_dispatch(
+                &ctx.db,
+                Uuid::new_v4(),
+                operation_id,
+                second_hash,
+                &side_effects,
+            )
+            .await,
+            CharacterizedDispatchOutcome::Conflict
+        );
+        assert_eq!(side_effects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]
@@ -11067,16 +11072,19 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
     // The durable `complete_*` request carries only the client-supplied flow id
     // and callback input — never the server-held verifier — and its canonical
     // remote-operation params encode exactly those two fields.
-    let request = Request::CompleteProviderOAuth {
-        flow_id: "flow-123".into(),
-        input: Some("https://callback.example/?code=abc".into()),
-    };
-    let params = request.canonical_remote_operation_params_v1().unwrap();
-    assert!(
-        !params
-            .windows(verifier.len())
-            .any(|w| w == verifier.as_bytes())
-    );
+    #[cfg(feature = "remote")]
+    {
+        let request = Request::CompleteProviderOAuth {
+            flow_id: "flow-123".into(),
+            input: Some("https://callback.example/?code=abc".into()),
+        };
+        let params = request.canonical_remote_operation_params_v1().unwrap();
+        assert!(
+            !params
+                .windows(verifier.len())
+                .any(|w| w == verifier.as_bytes())
+        );
+    }
 }
 
 #[tokio::test]
@@ -13735,8 +13743,8 @@ fn dispatch_matrix_rows() -> Vec<DispatchMatrixRow> {
     proto::command!(dispatch_matrix_rows_from_command_table)
 }
 
-#[derive(Debug, PartialEq, Eq)]
 #[cfg(feature = "remote")]
+#[derive(Debug, PartialEq, Eq)]
 enum CharacterizedDispatchOutcome {
     Applied(Vec<u8>),
     Conflict,
@@ -18654,11 +18662,13 @@ async fn assert_worker_delivery_happy(kind: &str) {
                     "remove_queued_user_message",
                     SessionWork::RemoveQueuedUserMessage {
                         queue_item_id,
+                        #[cfg(feature = "remote")]
                         remote_operation,
                         respond_to,
                     },
                 ) => {
                     assert_eq!(queue_item_id, Uuid::from_u128(1));
+                    #[cfg(feature = "remote")]
                     assert!(remote_operation.is_none());
                     respond_to
                         .send(Ok(proto::RemoveQueuedUserMessageResult {
@@ -29633,6 +29643,7 @@ async fn daemon_load_configs_uses_session_policy_over_global_policy() {
     crate::config::trust::clear_runtime_policy_for_tests();
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn response_redaction_scrubs_queue_display_metadata() {
     crate::auth::flycockpit::with_redaction_token_override("fci_response_secret_12345", || {
@@ -29663,6 +29674,7 @@ async fn response_redaction_scrubs_queue_display_metadata() {
     });
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn redaction_preserves_uuid_when_secret_overlaps() {
     crate::auth::flycockpit::with_redaction_token_override("88c0e13f", || {
@@ -29710,6 +29722,7 @@ async fn redaction_preserves_uuid_when_secret_overlaps() {
     });
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn event_redaction_preserves_typed_fields() {
     crate::auth::flycockpit::with_redaction_token_override("88c0e13f", || {
@@ -29754,6 +29767,7 @@ async fn event_redaction_preserves_typed_fields() {
     });
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn redaction_preserves_structural_string_fields() {
     crate::auth::flycockpit::with_redaction_token_override("secret-struct", || {
@@ -29847,6 +29861,7 @@ async fn redaction_preserves_structural_string_fields() {
     });
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn history_redaction_preserves_typed_fields() {
     crate::auth::flycockpit::with_redaction_token_override("call-secret-123", || {
@@ -29897,6 +29912,7 @@ async fn history_redaction_preserves_typed_fields() {
     });
 }
 
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn history_redaction_scrubs_display_text_and_tag_expansions() {
     crate::auth::flycockpit::with_redaction_token_override("fci_history_secret_12345", || {

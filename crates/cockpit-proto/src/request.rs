@@ -127,6 +127,7 @@ where
     deserialize_bounded_optional_string::<MAX_OWNER_PROJECT_ROOT_BYTES, D>(deserializer)
 }
 
+#[cfg(feature = "remote")]
 fn deserialize_owner_org_id<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -4276,9 +4277,7 @@ mod tests {
 
     macro_rules! command_tags {
         (($($context:ident),*) [$($(#[$row_attr:meta])* ($pattern:pat, $tag:literal, $authz:ident $(($authz_arg:ident))?, $session:ident $(($session_arg:ident))?, $mutating:literal, $remote_class:ident, $recovery:ident $(($recovery_evidence:ident))?, $ordering:ident, $audit_path:ident $(($($audit_arg:ident),+))?, $fcor_schema:literal, [$($fcor_field:ident: $fcor_type:ty => $fcor_role:ident $(($($fcor_role_arg:ident),*))?),*]);)+]) => {{
-            let mut tags = Vec::new();
-            $($(#[$row_attr])* tags.push($tag);)+
-            tags
+            vec![$($(#[$row_attr])* $tag),+]
         }};
     }
 
@@ -4686,6 +4685,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn agent_installation_rpcs_are_local_owner_only() {
         // Installation commands operate on the daemon's local workspace and
@@ -5115,10 +5115,13 @@ mod tests {
         );
         assert_ne!("get_session_compactions", "read_history_page");
         // ReadHistoryPage is unchanged (still a read).
-        assert_eq!(
-            remote_operation_class_for_tag("read_history_page"),
-            Some(RemoteOperationClass::ReadOnly)
-        );
+        #[cfg(feature = "remote")]
+        {
+            assert_eq!(
+                remote_operation_class_for_tag("read_history_page"),
+                Some(RemoteOperationClass::ReadOnly)
+            );
+        }
     }
 
     #[test]
@@ -5129,8 +5132,11 @@ mod tests {
         assert!(!command_tags.contains(&"list_sealed_values"));
         assert!(!command_tags.contains(&"delete_sealed_value"));
         // No `Request` variant serializes to the retired tags either.
-        assert_eq!(remote_operation_class_for_tag("list_sealed_values"), None);
-        assert_eq!(remote_operation_class_for_tag("delete_sealed_value"), None);
+        #[cfg(feature = "remote")]
+        {
+            assert_eq!(remote_operation_class_for_tag("list_sealed_values"), None);
+            assert_eq!(remote_operation_class_for_tag("delete_sealed_value"), None);
+        }
     }
 
     #[test]

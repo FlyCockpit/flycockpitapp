@@ -672,6 +672,31 @@ fn reducers_and_async_loop_do_not_reenter_daemon_runtime_synchronously() {
 }
 
 #[test]
+fn every_production_block_on_is_test_only_or_worker_owned() {
+    let runner = include_str!("../agent_runner.rs");
+    assert_eq!(
+        runner.matches(".block_on(").count(),
+        5,
+        "agent-runner blocking adapters require a fresh call-site audit"
+    );
+    assert!(runner.contains("may be called only from an\n/// `AsyncActionRunner::start_blocking`/`spawn_blocking` worker"));
+
+    let settings = include_str!("../settings/mod.rs");
+    let test_only = settings
+        .split("#[cfg(test)]\nfn run_settings_daemon")
+        .nth(1)
+        .expect("test-only settings adapter remains explicitly gated");
+    assert_eq!(settings.matches(".block_on(").count(), 2);
+    assert_eq!(test_only.matches(".block_on(").count(), 2);
+
+    let image_spend = include_str!("../settings/image_spend.rs");
+    assert_eq!(image_spend.matches("handle.block_on(").count(), 1);
+    assert!(
+        image_spend.contains("image spend persistence may run only on its dedicated OS worker")
+    );
+}
+
+#[test]
 fn sealed_site_catalog_detects_a_deleted_manifest_row() {
     use super::blocking_operations::BLOCKING_OPERATION_MANIFEST;
     let declared = derive_production_sites().unwrap();

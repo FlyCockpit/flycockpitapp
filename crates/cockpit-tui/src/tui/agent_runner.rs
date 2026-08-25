@@ -2952,9 +2952,10 @@ fn local_guidance_estimate(
 /// Run one blocking daemon request against an already-running daemon and
 /// return the typed response. Connects only — never spawns — so the
 /// `/sessions` browser degrades gracefully (no live data, no DB writes,
-/// no crash) when the daemon isn't up. Mirrors `try_spawn_inner`'s
-/// `block_in_place` pattern so it's callable from the synchronous TUI
-/// key handlers. `Err(String)` for any transport/typed failure.
+/// no crash) when the daemon isn't up. This adapter may be called only from an
+/// `AsyncActionRunner::start_blocking`/`spawn_blocking` worker; reducers and
+/// event handlers use typed async effects. `Err(String)` for any
+/// transport/typed failure.
 pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
     use cockpit_core::daemon::{DaemonStatus, discover};
     let runtime =

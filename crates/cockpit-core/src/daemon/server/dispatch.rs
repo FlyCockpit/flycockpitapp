@@ -16979,6 +16979,7 @@ mod provider_atomic_authority_tests {
             .expect("provider recovery");
         assert!(provider.contains("settlement_phase == \"cleanup_pending\""));
         assert!(provider.contains("SET settlement_phase='cleanup_pending'"));
+        assert!(provider.contains("SET terminal_response_json=?2"));
         let mcp = source
             .split("async fn recover_mcp_config_journals_inner")
             .nth(1)
@@ -17449,6 +17450,15 @@ async fn recover_provider_config_journals_inner(
                         Response::CopilotAuthCommitted { .. } => "setup_copilot_auth",
                         _ => anyhow::bail!("provider journal has an unsupported receipt"),
                     };
+                    let amended = conn.execute(
+                        "UPDATE provider_config_journals
+                            SET terminal_response_json=?2
+                          WHERE journal_id=?1",
+                        rusqlite::params![journal_id, response],
+                    )?;
+                    if amended != 1 {
+                        anyhow::bail!("provider journal disappeared before receipt settlement");
+                    }
                     settle_journaled_local_success_on_conn(
                         conn,
                         operation_kind,

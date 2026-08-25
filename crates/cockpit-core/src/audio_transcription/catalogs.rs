@@ -42,7 +42,12 @@ pub struct CatalogProvenance {
 pub const GPT_TRANSCRIBE_PROVENANCE: CatalogProvenance = CatalogProvenance {
     source_url: "https://platform.openai.com/docs/guides/audio",
     retrieval_date: "2026-08-05",
-    sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+    // SHA-256 of the canonical digest input: every assigned code in canonical
+    // insertion order (alpha-2, then alpha-3, then regional-zh), one lowercase
+    // code per line with a required final LF. Pinned by
+    // [`verify_gpt_transcribe_catalog`]; recompute with [`gpt_transcribe_digest`]
+    // if and only if an explicit catalog revision changes the checked-in table.
+    sha256_hex: "ab9740554b899d752f05d741fed68eb713cc8d5e2279f505bbd1dbee4b8353c4",
     catalog_version: "gpt-transcribe-lang-v1",
 };
 
@@ -229,6 +234,24 @@ pub fn verify_whisper_catalog() -> Result<(), String> {
         Err(format!(
             "whisper catalog digest mismatch: expected {}, got {}",
             WHISPER_PROVENANCE.sha256_hex, actual
+        ))
+    }
+}
+
+/// Verify that the checked-in GPT-transcribe catalog matches its pinned digest.
+///
+/// Fails closed: mutating one catalog entry (adding, removing, reordering, or
+/// editing any code) changes [`gpt_transcribe_digest`] and this returns an
+/// error carrying the expected/actual digests. It never accepts a placeholder
+/// all-zero digest.
+pub fn verify_gpt_transcribe_catalog() -> Result<(), String> {
+    let actual = gpt_transcribe_digest();
+    if actual == GPT_TRANSCRIBE_PROVENANCE.sha256_hex {
+        Ok(())
+    } else {
+        Err(format!(
+            "gpt-transcribe catalog digest mismatch: expected {}, got {}",
+            GPT_TRANSCRIBE_PROVENANCE.sha256_hex, actual
         ))
     }
 }

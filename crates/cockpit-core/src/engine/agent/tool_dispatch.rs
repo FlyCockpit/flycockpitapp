@@ -553,30 +553,29 @@ pub(crate) async fn execute_ordinary_call(
     // toolbox change that registers the name.
     let reserved_native_computer =
         crate::computer::is_reserved_native_computer_tool_name(resolved_name);
-    let rejection_reason: Option<&'static str> =
-        if reserved_native_computer {
-            Some("reserved_native_computer_tool")
-        } else if placeholder_blocked
-            || loop_guard_reject
-            || gate_block.is_some()
-            || cage_block.is_some()
-        {
-            None
-        } else if !repair_outcome.valid {
-            // A model-hallucinated nonexistent path gets its own reason so
-            // path-hallucination telemetry stays separate from genuine
-            // schema-repair failures (`defensive-tool-descriptions-
-            // weak-model-routing.md`).
-            if path_not_found {
-                Some("path_not_found")
-            } else {
-                Some("schema_invalid_unrepairable")
-            }
-        } else if env.active_tools.get(resolved_name).is_none() {
-            Some("not_in_advertised_set")
+    let rejection_reason: Option<&'static str> = if reserved_native_computer {
+        Some("reserved_native_computer_tool")
+    } else if placeholder_blocked
+        || loop_guard_reject
+        || gate_block.is_some()
+        || cage_block.is_some()
+    {
+        None
+    } else if !repair_outcome.valid {
+        // A model-hallucinated nonexistent path gets its own reason so
+        // path-hallucination telemetry stays separate from genuine
+        // schema-repair failures (`defensive-tool-descriptions-
+        // weak-model-routing.md`).
+        if path_not_found {
+            Some("path_not_found")
         } else {
-            None
-        };
+            Some("schema_invalid_unrepairable")
+        }
+    } else if env.active_tools.get(resolved_name).is_none() {
+        Some("not_in_advertised_set")
+    } else {
+        None
+    };
     let lifecycle_started = (placeholder_blocked || repair_outcome.valid)
         && env.active_tools.get(resolved_name).is_some();
     // Pin the AUTHORING model's frame inputs ONCE — its `(provider, model)`, the
@@ -2218,6 +2217,7 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver: None,
+            image_generation_dispatch: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,

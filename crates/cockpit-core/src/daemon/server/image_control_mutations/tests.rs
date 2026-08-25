@@ -10,12 +10,11 @@
 
 use cockpit_config::config::image_generation::{
     DEFAULT_BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS, IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
-    ImageAdapterKind, ImageCapabilityEvidence,
-    ImageDimensionDescriptor, ImageDimensionRequestPolicy, ImageEndpoint, ImageEvidence,
-    ImageFormat, ImageGenerationConfig, ImageGenerationTarget, ImageLocationClass, ImageParameter,
-    ImageParameterDescriptor, ImagePrice, ImageTargetIdentity, ReferenceImageSupport,
-    RegisteredComfyWorkflow, WorkflowBinding, WorkflowOutput, WorkflowValueType,
-    canonical_workflow_digest,
+    ImageAdapterKind, ImageCapabilityEvidence, ImageDimensionDescriptor,
+    ImageDimensionRequestPolicy, ImageEndpoint, ImageEvidence, ImageFormat, ImageGenerationConfig,
+    ImageGenerationTarget, ImageLocationClass, ImageParameter, ImageParameterDescriptor,
+    ImagePrice, ImageTargetIdentity, ReferenceImageSupport, RegisteredComfyWorkflow,
+    WorkflowBinding, WorkflowOutput, WorkflowValueType, canonical_workflow_digest,
 };
 use cockpit_config::config::providers::CapabilityStatus;
 

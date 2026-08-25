@@ -1977,9 +1977,7 @@ impl Db {
         let removed = self
             .transaction(move |conn| Self::discard_ephemeral_session_conn(conn, session_id))
             .await?;
-        if removed
-            && let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await
-        {
+        if removed && let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await {
             tracing::warn!(%error, %session_id, "discarded-session sidecar cleanup remains durably pending");
         }
         Ok(removed)

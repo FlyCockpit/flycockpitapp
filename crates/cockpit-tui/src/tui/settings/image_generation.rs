@@ -26,7 +26,7 @@ use std::any::Any;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
@@ -114,8 +114,70 @@ pub(crate) struct GenerationPrincipal {
     pub admin_exact_project: bool,
 }
 
+/// A real, minimal description of the capability state the TUI host already
+/// holds for the active session, from which a [`GenerationPrincipal`] is
+/// derived. This is the single production source of truth: the navigation
+/// path never fabricates an Owner principal, it derives one from this
+/// snapshot.
+///
+/// The local settings dialog only runs for the LOCAL owner of this daemon
+/// (there is no remote settings surface in the TUI), so `local_owner` is a
+/// derived fact of the host context, not a hardcoded capability grant. Remote
+/// surfaces that later reach this model MUST populate the remote grant /
+/// ceiling fields from the control-plane grant snapshot rather than setting
+/// `local_owner`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SessionCapabilitySnapshot {
+    /// True only for a LOCAL owner session (the local TUI settings host).
+    pub local_owner: bool,
+    /// The project id an ACTIVE exact-project `ImageGenerationAdmin` grant was
+    /// minted for, if any. `None` when the session carries no admin grant.
+    pub image_admin_grant_project: Option<String>,
+    /// The active project id the surface is scoped to (for exact-project
+    /// comparison against `image_admin_grant_project`).
+    pub active_project_id: Option<String>,
+    /// Exact-project `project_read=1` ceiling.
+    pub project_read: bool,
+    /// Current-session `session_read=7` ceiling.
+    pub session_read: bool,
+    /// Current-session `session_write=8` ceiling.
+    pub session_write: bool,
+}
+
 impl GenerationPrincipal {
-    /// A local Owner principal: all reads, all mutations.
+    /// Derive the principal from the session capability snapshot the TUI host
+    /// holds. This is the production constructor used on the navigation path;
+    /// it never hardcodes Owner. A local owner session resolves to full
+    /// read/mutate; a remote session resolves strictly from its grant scopes
+    /// and ceilings, and an admin grant only mutates when it was minted for the
+    /// exact active project.
+    pub(crate) fn from_session(snapshot: &SessionCapabilitySnapshot) -> Self {
+        let exact_project_admin = snapshot.image_admin_grant_project.is_some();
+        let admin_exact_project = match (
+            snapshot.image_admin_grant_project.as_deref(),
+            snapshot.active_project_id.as_deref(),
+        ) {
+            (Some(grant), Some(active)) => !grant.is_empty() && grant == active,
+            _ => false,
+        };
+        Self {
+            local_owner: snapshot.local_owner,
+            exact_project_admin,
+            admin_exact_project,
+            // A local owner has every read/mutate ceiling implicitly; a remote
+            // principal only what its ceilings grant.
+            project_read: snapshot.local_owner || snapshot.project_read,
+            session_read: snapshot.local_owner || snapshot.session_read,
+            session_write: snapshot.local_owner || snapshot.session_write,
+        }
+    }
+
+    /// A local Owner principal: all reads, all mutations. Test-only — the
+    /// production navigation path derives its principal from
+    /// [`GenerationPrincipal::from_session`] and must never construct Owner
+    /// directly (a hardcoded Owner would leak mutation affordances to any
+    /// principal the open path is reused for).
+    #[cfg(test)]
     pub(crate) fn local_owner() -> Self {
         Self {
             local_owner: true,
@@ -385,6 +447,22 @@ pub(crate) struct JobReducer {
     pub monotonic_version: u64,
 }
 
+/// The disposition of a daemon job event against the reducer's view identity.
+/// Lets the App event-loop seam distinguish a wrong-identity/duplicate event
+/// (drop silently) from a version gap (must rehydrate a fresh snapshot before
+/// trusting further events).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobEventOutcome {
+    /// The event committed to the reducer.
+    Applied,
+    /// Wrong daemon/project/session/generation, or an out-of-order duplicate:
+    /// dropped without mutating state.
+    Discarded,
+    /// A monotonic version gap: the caller must request a fresh snapshot and
+    /// [`JobReducer::rehydrate`] before enabling cancel/mutation.
+    RehydrateRequired,
+}
+
 impl JobReducer {
     pub(crate) fn new(daemon_instance: String, project_id: String, session_id: String) -> Self {
         Self {
@@ -447,6 +525,52 @@ impl JobReducer {
             self.selected_job_id = None;
         }
         true
+    }
+
+    /// Classify and apply a daemon job event, returning the disposition so the
+    /// App event-loop seam can drive rehydrate-vs-discard. This is the entry
+    /// point the daemon push/snapshot wiring calls; it shares all identity,
+    /// generation, ordering, and gap rules with [`Self::apply_job_event`].
+    ///
+    /// NOTE (inert dispatch): image-generation dispatch is fail-closed upstream
+    /// (the runtime adapter/destination map ships empty), so no live job event
+    /// is produced today. This plumbing handles events correctly when a live
+    /// source lands; until then the reducer stays at its empty default.
+    pub(crate) fn classify_and_apply(
+        &mut self,
+        daemon_instance: &str,
+        project_id: &str,
+        session_id: &str,
+        job: JobCard,
+        config_generation: &str,
+        version: u64,
+    ) -> JobEventOutcome {
+        // Identity / generation / duplicate → discard.
+        let wrong_identity = self.daemon_instance != daemon_instance
+            || self.project_id != project_id
+            || self.session_id != session_id
+            || (!self.config_generation.is_empty() && self.config_generation != config_generation)
+            || version < self.monotonic_version;
+        if wrong_identity {
+            return JobEventOutcome::Discarded;
+        }
+        // A forward version gap requires a fresh snapshot before trusting more
+        // events; signal the caller rather than committing a hole.
+        if version > self.monotonic_version + 1 && self.monotonic_version > 0 {
+            return JobEventOutcome::RehydrateRequired;
+        }
+        if self.apply_job_event(
+            daemon_instance,
+            project_id,
+            session_id,
+            job,
+            config_generation,
+            version,
+        ) {
+            JobEventOutcome::Applied
+        } else {
+            JobEventOutcome::Discarded
+        }
     }
 
     /// Mark all data stale on connection loss.
@@ -627,6 +751,9 @@ pub(super) struct BudgetEditorPage {
     pub(super) principal: GenerationPrincipal,
     pub(super) state: BudgetEditorState,
     pub(super) viewport: GenerationViewportMode,
+    /// Last save disposition surfaced to the user (owner-RPC result). Never
+    /// carries a secret or path — only a stable outcome string.
+    pub(super) status: Option<String>,
 }
 
 /// Grant list page (list + revoke only; no GrantEditor).
@@ -712,6 +839,7 @@ pub(super) fn budget_editor_page(principal: GenerationPrincipal) -> PageBox {
         principal,
         state: BudgetEditorState::unconfigured(),
         viewport: GenerationViewportMode::Full,
+        status: None,
     })
 }
 
@@ -740,6 +868,50 @@ fn boxed<P: SettingsPage + 'static>(page: P) -> PageBox {
 
 type GenerationBinding = Option<(GenerationAction, bool, Option<&'static str>)>;
 
+/// Carve the mode-driven layout for a Generation page and draw its chrome,
+/// returning the content rect the page body renders into. The returned rect
+/// structure differs by breakpoint (real `Layout::split`): `Full` reserves a
+/// right-hand info column (two-pane), `Compact` stacks a mode header above the
+/// body (stacked), and `Reduced` is a single column with no chrome. `Blocked`
+/// is handled by the caller before this is reached.
+fn generation_layout(frame: &mut Frame, area: Rect, mode: GenerationViewportMode) -> Rect {
+    match mode {
+        GenerationViewportMode::Full => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(26)])
+                .split(area);
+            let info = Paragraph::new(vec![
+                Line::from("Layout: Full"),
+                Line::from(""),
+                Line::from("Only daemon-redacted"),
+                Line::from("projections are shown."),
+                Line::from("No secret, provider URL,"),
+                Line::from("or host path is rendered."),
+            ])
+            .block(Block::default().borders(Borders::ALL).title(" Context "))
+            .wrap(Wrap { trim: false });
+            frame.render_widget(info, cols[1]);
+            cols[0]
+        }
+        GenerationViewportMode::Compact => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
+                .split(area);
+            frame.render_widget(
+                Paragraph::new(Line::from("Layout: Compact — daemon-redacted view")),
+                rows[0],
+            );
+            rows[1]
+        }
+        // Reduced renders a single column with no auxiliary chrome.
+        GenerationViewportMode::Reduced => area,
+        // Blocked never reaches here; the caller renders the resize blocker.
+        GenerationViewportMode::Blocked => area,
+    }
+}
+
 fn render_generation_page(
     cx: &SettingsCx,
     frame: &mut Frame,
@@ -749,11 +921,19 @@ fn render_generation_page(
     rows: Vec<(String, GenerationBinding)>,
     selected: Option<usize>,
 ) {
+    // Recompute the viewport mode from the live frame area every render (the
+    // constructors default to Full but must not freeze Full forever).
+    let mode = generation_viewport_mode(area.width, area.height);
+    if mode == GenerationViewportMode::Blocked {
+        render_resize_blocker(frame, area);
+        return;
+    }
+    let content = generation_layout(frame, area, mode);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {title} "));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = block.inner(content);
+    frame.render_widget(block, content);
     let mut lines = Vec::with_capacity(rows.len());
     let mut controls = Vec::with_capacity(rows.len());
     for (text, binding) in rows {
@@ -879,15 +1059,9 @@ impl SettingsPage for GenerationListPage {
         self.handle_node_key(cx, key)
     }
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        if self.viewport == GenerationViewportMode::Blocked {
-            render_resize_blocker(frame, area);
-            return;
-        }
-        let mut lines = Vec::new();
-        let mut controls = Vec::new();
+        let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         for (i, title) in GENERATION_NODE_TITLES.iter().enumerate() {
             let marker = if i == self.cursor { "▸ " } else { "  " };
-            lines.push(Line::from(format!("{marker}{title}")));
             let node = match i {
                 0 => super::pointer_actions::GenerationNodeId::Endpoints,
                 1 => super::pointer_actions::GenerationNodeId::Targets,
@@ -896,26 +1070,19 @@ impl SettingsPage for GenerationListPage {
                 4 => super::pointer_actions::GenerationNodeId::Grants,
                 _ => super::pointer_actions::GenerationNodeId::Jobs,
             };
-            controls.push(Some((
-                super::pointer_actions::SettingsPointerAction::Generation(
-                    super::pointer_actions::GenerationAction::OpenNode(node),
-                ),
-                true,
-                None,
-            )));
+            rows.push((
+                format!("{marker}{title}"),
+                Some((GenerationAction::OpenNode(node), true, None)),
+            ));
         }
-        let selected_line = Some(self.cursor);
-        cx.scroll_states.render_control_lines(
+        render_generation_page(
+            cx,
             frame,
             area,
             "generation:list",
-            (lines, selected_line),
-            controls,
-            (
-                &cx.pointer_surface,
-                super::shell::SettingsScrollRegionId("generation:list"),
-            )
-                .into(),
+            "Generation",
+            rows,
+            Some(self.cursor),
         );
     }
     fn title(&self, _cx: &SettingsCx) -> String {
@@ -965,10 +1132,6 @@ impl SettingsPage for EndpointEditorPage {
         )
     }
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        if self.viewport == GenerationViewportMode::Blocked {
-            render_resize_blocker(frame, area);
-            return;
-        }
         let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.config_section_reason() {
             rows.push((format!("Disabled: {reason}"), None));
@@ -1061,10 +1224,6 @@ impl SettingsPage for TargetEditorPage {
         )
     }
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        if self.viewport == GenerationViewportMode::Blocked {
-            render_resize_blocker(frame, area);
-            return;
-        }
         let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.targets_section_reason() {
             rows.push((format!("Disabled: {reason}"), None));
@@ -1167,10 +1326,6 @@ impl SettingsPage for WorkflowEditorPage {
         )
     }
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        if self.viewport == GenerationViewportMode::Blocked {
-            render_resize_blocker(frame, area);
-            return;
-        }
         let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.config_section_reason() {
             rows.push((format!("Disabled: {reason}"), None));
@@ -1232,37 +1387,99 @@ impl SettingsPage for WorkflowEditorPage {
     }
 }
 
+impl BudgetEditorPage {
+    /// Resolve the owner-remoted budget project key from the dialog context.
+    /// Falls back to the edited config layer path when no active launch project
+    /// root is present (the same rule the Image Spend page uses).
+    fn budget_project_key(cx: &SettingsCx) -> String {
+        cx.active_project_root
+            .as_ref()
+            .unwrap_or(&cx.extended_path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Dispatch the reviewed budget save through the owner-remoted
+    /// `SaveImageSpendPolicy` control-plane RPC (the same reviewed-save path the
+    /// Image Spend page uses for generation budgets). This is NOT a local store
+    /// write: the daemon owner validates and activates the policy, and the
+    /// result — never a secret or path — is surfaced as a status line.
+    ///
+    /// Mutation is gated on `can_mutate_config`; an unauthorized principal never
+    /// reaches the daemon and is told why with a stable reason.
+    fn dispatch_save(&mut self, cx: &mut SettingsCx) {
+        if !self.principal.can_mutate_config() {
+            self.status = Some(format!(
+                "Save unavailable: {REASON_FORBIDDEN_IMAGE_ADMIN}"
+            ));
+            return;
+        }
+        let settings = cockpit_config::config::image_spend::ImageSpendSettings {
+            request: self.state.request.policy.clone(),
+            session: self.state.session.policy.clone(),
+            project: self.state.project.policy.clone(),
+            // The budget editor scopes are request/session/project; the project
+            // epoch policy is owned by the Image Spend page and is left
+            // unchanged here (None = daemon keeps its current epoch policy).
+            project_epoch: None,
+        };
+        let settings_json = match serde_json::to_string(&settings) {
+            Ok(json) => json,
+            Err(error) => {
+                self.status = Some(format!("Save failed: {error}"));
+                return;
+            }
+        };
+        let project_key = Self::budget_project_key(cx);
+        match super::settings_daemon_request(
+            cockpit_core::daemon::proto::Request::SaveImageSpendPolicy {
+                project_key,
+                settings_json,
+                // First-write semantics: no optimistic version fence yet (the
+                // editor does not load a prior policy version). The daemon owner
+                // remains the single authority and rejects an inconsistent set.
+                expected_policy_version: None,
+            },
+        ) {
+            Ok(cockpit_core::daemon::proto::Response::ImageSpendPolicySaved { policy_version }) => {
+                self.state.blocks_paid_generation = false;
+                self.status = Some(format!("Budget saved (policy v{policy_version})."));
+            }
+            Ok(other) => {
+                self.status = Some(format!("Unexpected save response: {other:?}"));
+            }
+            Err(error) => {
+                self.status = Some(format!("Save failed: {error}"));
+            }
+        }
+    }
+}
+
 impl SettingsPage for BudgetEditorPage {
     fn pointer_surface_kind(&self) -> SettingsPointerSurfaceKind {
         SettingsPointerSurfaceKind::BudgetEditor
     }
-    fn handle_key(&mut self, _cx: &mut SettingsCx, key: KeyEvent) -> Nav {
+    fn handle_key(&mut self, cx: &mut SettingsCx, key: KeyEvent) -> Nav {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => Nav::Back,
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => Nav::Stay,
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.dispatch_save(cx);
+                Nav::Stay
+            }
             _ => Nav::Stay,
         }
     }
-    fn handle_pointer_control(
-        &mut self,
-        _cx: &mut SettingsCx,
-        action: SettingsPointerAction,
-    ) -> Nav {
-        accept_or_back(
-            action.clone(),
-            matches!(
-                &action,
-                SettingsPointerAction::Generation(
-                    GenerationAction::SaveBudget | GenerationAction::Cancel
-                )
-            ),
-        )
+    fn handle_pointer_control(&mut self, cx: &mut SettingsCx, action: SettingsPointerAction) -> Nav {
+        match &action {
+            SettingsPointerAction::Generation(GenerationAction::SaveBudget) => {
+                self.dispatch_save(cx);
+                Nav::Stay
+            }
+            SettingsPointerAction::Generation(GenerationAction::Cancel) => Nav::Back,
+            _ => Nav::Stay,
+        }
     }
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        if self.viewport == GenerationViewportMode::Blocked {
-            render_resize_blocker(frame, area);
-            return;
-        }
         let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.config_section_reason() {
             rows.push((format!("Disabled: {reason}"), None));
@@ -1320,6 +1537,10 @@ impl SettingsPage for BudgetEditorPage {
                 "[Cancel]".into(),
                 Some((GenerationAction::Cancel, true, None)),
             ));
+            if let Some(status) = &self.status {
+                rows.push((String::new(), None));
+                rows.push((status.clone(), None));
+            }
         }
         render_generation_page(
             cx,
@@ -1388,10 +1609,6 @@ impl SettingsPage for GrantListPage {
         }
     }
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        if self.viewport == GenerationViewportMode::Blocked {
-            render_resize_blocker(frame, area);
-            return;
-        }
         let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.config_section_reason() {
             rows.push((format!("Disabled: {reason}"), None));
@@ -1509,10 +1726,6 @@ impl SettingsPage for JobListPage {
         }
     }
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        if self.viewport == GenerationViewportMode::Blocked {
-            render_resize_blocker(frame, area);
-            return;
-        }
         let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.jobs_section_reason() {
             rows.push((format!("Disabled: {reason}"), None));
@@ -1624,10 +1837,6 @@ impl SettingsPage for JobDetailPage {
         }
     }
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        if self.viewport == GenerationViewportMode::Blocked {
-            render_resize_blocker(frame, area);
-            return;
-        }
         let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
         if let Some(reason) = self.principal.jobs_section_reason() {
             rows.push((format!("Disabled: {reason}"), None));
@@ -1775,10 +1984,6 @@ impl SettingsPage for LateResultActionPage {
         }
     }
     fn render(&self, cx: &SettingsCx, frame: &mut Frame, area: Rect) {
-        if self.viewport == GenerationViewportMode::Blocked {
-            render_resize_blocker(frame, area);
-            return;
-        }
         let text = self.action.label();
         let confirm_label = self.action.confirm_label();
         let mut rows: Vec<(String, GenerationBinding)> = Vec::new();
@@ -2208,6 +2413,7 @@ mod tests {
             principal: GenerationPrincipal::local_owner(),
             state: BudgetEditorState::unconfigured(),
             viewport: GenerationViewportMode::Full,
+            status: None,
         };
         let dialog = test_dialog();
         let lines = render_page_lines(&page, &dialog, 80, 24);
@@ -2482,6 +2688,7 @@ mod tests {
             principal: GenerationPrincipal::local_owner(),
             state: BudgetEditorState::unconfigured(),
             viewport: GenerationViewportMode::Full,
+            status: None,
         };
         assert_eq!(
             budget.pointer_surface_kind(),

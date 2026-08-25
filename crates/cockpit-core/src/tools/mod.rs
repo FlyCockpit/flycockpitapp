@@ -52,6 +52,7 @@ pub mod task;
 pub mod task_repair;
 pub mod text_search;
 pub mod todo;
+pub mod transcribe_audio;
 pub mod unlock;
 pub mod use_sealed_value;
 pub mod web;

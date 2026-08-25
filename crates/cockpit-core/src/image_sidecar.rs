@@ -134,6 +134,50 @@ impl fmt::Debug for CredentialFingerprint {
     }
 }
 
+/// The canonical hex form of a [`CredentialFingerprint`], as a type-enforced
+/// newtype for binding into request digests and audit provenance.
+///
+/// The inner string is private, and the sole production constructor is
+/// [`CredentialFingerprintDigest::from_fingerprint`], which routes through the
+/// real fingerprint computation ([`CredentialFingerprint::from_identity`] then
+/// the module-private canonical hex). This makes a raw credential TOKEN (or any
+/// other arbitrary string) unrepresentable here: only a genuine 64-hex
+/// credential *fingerprint* digest — never the credential itself — can be placed
+/// in a field of this type and reach a bound digest, audit log, or prompt sink.
+/// Mirrors [`crate::audio_transcription::authorization::MediaEgressRequestDigest`].
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct CredentialFingerprintDigest(String);
+
+impl CredentialFingerprintDigest {
+    /// The sole production constructor: bind to the real credential-fingerprint
+    /// computation. The value is the canonical hex of the fingerprint bytes, an
+    /// opaque digest of credential identity — not the credential material.
+    pub fn from_fingerprint(fingerprint: &CredentialFingerprint) -> Self {
+        Self(fingerprint.canonical_hex())
+    }
+
+    /// The full lowercase 64-hex fingerprint digest, for binding and for the
+    /// redacted authorization audit. Read-only.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Test-only raw constructor. `#[cfg(test)]`-gated so production code cannot
+    /// bypass [`Self::from_fingerprint`].
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl fmt::Debug for CredentialFingerprintDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The digest is an opaque fingerprint (not the credential); show it so
+        // the bound value is debuggable, mirroring `MediaEgressRequestDigest`.
+        write!(f, "CredentialFingerprintDigest({})", self.0)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Normalized endpoint origin
 // ---------------------------------------------------------------------------

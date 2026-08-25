@@ -3672,9 +3672,9 @@ fn project_shadow_remove_patch(path: &[&str]) -> serde_json::Value {
     let Some((last, parents)) = path.split_last() else {
         return serde_json::Value::Null;
     };
-    let mut patch = serde_json::json!({ (last): null });
+    let mut patch = serde_json::json!({ (*last): null });
     for parent in parents.iter().rev() {
-        patch = serde_json::json!({ (parent): patch });
+        patch = serde_json::json!({ (*parent): patch });
     }
     patch
 }

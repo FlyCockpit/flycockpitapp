@@ -373,12 +373,20 @@ mod tests {
     fn reserve_then_install_makes_values_readable_with_derived_expiry() {
         let mut store = PendingProposalStore::new();
         let k = key(1, 2, 3, 4, 5);
-        store.reserve(k.clone(), ProposalId([9; 16])).expect("first reserve wins");
+        store
+            .reserve(k.clone(), ProposalId([9; 16]))
+            .expect("first reserve wins");
         assert!(store.is_scope_occupied(&k));
         assert!(!store.contains(&k), "reserved but not yet installed");
 
         store
-            .install(k.clone(), ProposalId([9; 16]), vec![rule()], Some("why".into()), 100)
+            .install(
+                k.clone(),
+                ProposalId([9; 16]),
+                vec![rule()],
+                Some("why".into()),
+                100,
+            )
             .expect("install after durable commit");
         let p = store.get(&k).expect("installed");
         assert_eq!(p.rationale.as_deref(), Some("why"));
@@ -389,7 +397,9 @@ mod tests {
     fn reserve_rejects_a_second_create_for_the_same_scope() {
         let mut store = PendingProposalStore::new();
         let k = key(1, 2, 3, 4, 5);
-        store.reserve(k.clone(), ProposalId([1; 16])).expect("first reserve wins");
+        store
+            .reserve(k.clone(), ProposalId([1; 16]))
+            .expect("first reserve wins");
         // A second reserve loses BEFORE any durable work — even under a new id.
         let err = store
             .reserve(k.clone(), ProposalId([2; 16]))
@@ -416,10 +426,15 @@ mod tests {
         assert!(!store.release(&k, ProposalId([8; 16])));
         assert!(store.is_scope_occupied(&k));
         // The matching id frees it.
-        assert!(store.release(&k, ProposalId([9; 16])), "reservation released");
+        assert!(
+            store.release(&k, ProposalId([9; 16])),
+            "reservation released"
+        );
         assert!(!store.is_scope_occupied(&k));
         // A later create may now proceed.
-        store.reserve(k.clone(), ProposalId([1; 16])).expect("scope is free again");
+        store
+            .reserve(k.clone(), ProposalId([1; 16]))
+            .expect("scope is free again");
     }
 
     #[test]
@@ -464,7 +479,10 @@ mod tests {
             store.install(k.clone(), ProposalId([9; 16]), vec![rule()], None, 0),
             Err(ProposalInstallError::NotReserved)
         );
-        assert!(!store.contains(&k), "no memory restored for an invalidated scope");
+        assert!(
+            !store.contains(&k),
+            "no memory restored for an invalidated scope"
+        );
     }
 
     /// remove_committed drops memory only after the durable transition, and is
@@ -475,7 +493,13 @@ mod tests {
         let k = key(1, 2, 3, 4, 5);
         store.reserve(k.clone(), ProposalId([9; 16])).unwrap();
         store
-            .install(k.clone(), ProposalId([9; 16]), vec![rule()], Some("r".into()), 0)
+            .install(
+                k.clone(),
+                ProposalId([9; 16]),
+                vec![rule()],
+                Some("r".into()),
+                0,
+            )
             .unwrap();
 
         // Wrong id: nothing removed.
@@ -498,11 +522,21 @@ mod tests {
         let k = key(1, 1, 1, 1, 1);
         store.reserve(k.clone(), ProposalId([1; 16])).unwrap();
         store
-            .install(k.clone(), ProposalId([1; 16]), vec![rule()], Some("r".into()), 0)
+            .install(
+                k.clone(),
+                ProposalId([1; 16]),
+                vec![rule()],
+                Some("r".into()),
+                0,
+            )
             .unwrap();
 
         // One second before expiry: no candidates, nothing removed.
-        assert!(store.expired_candidates(PROPOSAL_EXPIRY_SECS - 1).is_empty());
+        assert!(
+            store
+                .expired_candidates(PROPOSAL_EXPIRY_SECS - 1)
+                .is_empty()
+        );
         assert!(store.contains(&k));
 
         // Exactly at expiry: enumerated but NOT removed (non-mutating).
@@ -512,7 +546,11 @@ mod tests {
         assert!(store.contains(&k), "enumeration must not drop the record");
 
         // Orchestrator commits the durable expiry, then removes.
-        assert!(store.remove_committed(&due[0].key, due[0].proposal_id).is_some());
+        assert!(
+            store
+                .remove_committed(&due[0].key, due[0].proposal_id)
+                .is_some()
+        );
         assert!(store.is_empty());
     }
 

@@ -150,13 +150,15 @@ pub fn validate_prompt(raw: &str) -> Result<Option<String>> {
     if trimmed.is_empty() {
         return Ok(None);
     }
+    // Redaction: never echo the caller prompt content or its measured length —
+    // name the field and the rule only.
     let scalars = trimmed.chars().count();
     if scalars > PROMPT_MAX_SCALARS {
-        bail!("prompt_too_long: {scalars} scalars exceeds {PROMPT_MAX_SCALARS}");
+        bail!("prompt exceeds the maximum length");
     }
     let utf8_bytes = trimmed.len();
     if utf8_bytes > PROMPT_MAX_UTF8_BYTES {
-        bail!("prompt_too_long: {utf8_bytes} bytes exceeds {PROMPT_MAX_UTF8_BYTES}");
+        bail!("prompt exceeds the maximum length");
     }
     Ok(Some(trimmed.to_string()))
 }
@@ -173,15 +175,16 @@ pub fn validate_keyword(raw: &str) -> Result<String> {
     }
     let trimmed = trim_sp_tab(raw);
     if trimmed.is_empty() {
-        bail!("keyword_empty: trimmed keyword must be nonempty");
+        bail!("keyword must be nonempty");
     }
+    // Redaction: never echo the keyword content or its measured length.
     let scalars = trimmed.chars().count();
     if scalars > KEYWORD_MAX_SCALARS {
-        bail!("keyword_too_long: {scalars} scalars exceeds {KEYWORD_MAX_SCALARS}");
+        bail!("keyword exceeds the maximum length");
     }
     let utf8_bytes = trimmed.len();
     if utf8_bytes > KEYWORD_MAX_UTF8_BYTES {
-        bail!("keyword_too_long: {utf8_bytes} bytes exceeds {KEYWORD_MAX_UTF8_BYTES}");
+        bail!("keyword exceeds the maximum length");
     }
     Ok(trimmed.to_string())
 }
@@ -191,10 +194,7 @@ pub fn validate_keyword(raw: &str) -> Result<String> {
 /// rather than dedupe.
 pub fn validate_keywords(raw: &[String]) -> Result<Vec<String>> {
     if raw.len() > KEYWORDS_MAX_ENTRIES {
-        bail!(
-            "too_many_keywords: {} exceeds {KEYWORDS_MAX_ENTRIES}",
-            raw.len()
-        );
+        bail!("keyword count exceeds the maximum");
     }
     let mut validated = Vec::with_capacity(raw.len());
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
@@ -210,17 +210,13 @@ pub fn validate_keywords(raw: &[String]) -> Result<Vec<String>> {
             .checked_add(trimmed.chars().count())
             .ok_or_else(|| anyhow::anyhow!("keyword_aggregate_overflow: scalar count overflow"))?;
         if agg_scalars > KEYWORDS_AGGREGATE_MAX_SCALARS {
-            bail!(
-                "keywords_aggregate_too_long: {agg_scalars} scalars exceeds {KEYWORDS_AGGREGATE_MAX_SCALARS}"
-            );
+            bail!("keywords exceed the aggregate maximum length");
         }
         agg_bytes = agg_bytes
             .checked_add(trimmed.len())
             .ok_or_else(|| anyhow::anyhow!("keyword_aggregate_overflow: byte count overflow"))?;
         if agg_bytes > KEYWORDS_AGGREGATE_MAX_UTF8_BYTES {
-            bail!(
-                "keywords_aggregate_too_long: {agg_bytes} bytes exceeds {KEYWORDS_AGGREGATE_MAX_UTF8_BYTES}"
-            );
+            bail!("keywords exceed the aggregate maximum length");
         }
         validated.push(trimmed);
     }
@@ -231,19 +227,17 @@ pub fn validate_keywords(raw: &[String]) -> Result<Vec<String>> {
 /// values in caller order; each must be a member of the GPT catalog.
 pub fn validate_gpt_languages(raw: &[String]) -> Result<Vec<RequestedLanguageV1>> {
     if raw.len() > LANGUAGES_MAX_ENTRIES {
-        bail!(
-            "too_many_languages: {} exceeds {LANGUAGES_MAX_ENTRIES}",
-            raw.len()
-        );
+        bail!("language count exceeds the model limit");
     }
     let mut seen: HashSet<String> = HashSet::new();
     let mut result = Vec::with_capacity(raw.len());
     for code in raw {
+        // Redaction: never echo the caller-supplied language value.
         if !seen.insert(code.clone()) {
-            bail!("language_duplicate: exact caller duplicates reject");
+            bail!("unsupported or duplicate language code for gpt-transcribe");
         }
         if GptTranscribeLanguageCodeV1::new(code).is_none() {
-            bail!("language_unlisted: {code} is not in the GPT-transcribe catalog");
+            bail!("unsupported or duplicate language code for gpt-transcribe");
         }
         result.push(RequestedLanguageV1::new(code.clone()));
     }
@@ -254,12 +248,13 @@ pub fn validate_gpt_languages(raw: &[String]) -> Result<Vec<RequestedLanguageV1>
 /// `en|WhisperLanguageCodeV1`.
 pub fn validate_whisper_languages(raw: &[String]) -> Result<Vec<RequestedLanguageV1>> {
     if raw.len() > 1 {
-        bail!("whisper_language_count: whisper-1 accepts zero or one language");
+        bail!("language count exceeds the model limit");
     }
     let mut result = Vec::with_capacity(raw.len());
     for code in raw {
+        // Redaction: never echo the caller-supplied language value.
         if WhisperLanguageCodeV1::new(code).is_none() {
-            bail!("language_unlisted: {code} is not in the Whisper catalog");
+            bail!("unsupported or unlisted language code for whisper-1");
         }
         result.push(RequestedLanguageV1::new(code.clone()));
     }
@@ -270,16 +265,17 @@ pub fn validate_whisper_languages(raw: &[String]) -> Result<Vec<RequestedLanguag
 /// only from the assigned ISO 639-1 subset of the GPT catalog.
 pub fn validate_diarize_languages(raw: &[String]) -> Result<Vec<RequestedLanguageV1>> {
     if raw.len() > 1 {
-        bail!("diarize_language_count: diarization accepts zero or one language");
+        bail!("language count exceeds the model limit");
     }
     let mut result = Vec::with_capacity(raw.len());
     for code in raw {
-        // Must be in the ISO 639-1 subset (alpha-2 only)
+        // Must be in the ISO 639-1 subset (alpha-2 only). Redaction: never echo
+        // the caller-supplied language value.
         if gpt_transcribe_iso639_1_subset()
             .iter()
             .all(|c| *c != code.as_str())
         {
-            bail!("language_unlisted: {code} is not in the diarization ISO 639-1 subset");
+            bail!("unsupported or unlisted language code for diarization");
         }
         result.push(RequestedLanguageV1::new(code.clone()));
     }
@@ -585,6 +581,14 @@ pub fn plan_whisper_1(
         });
     }
     finalize_plan(file_bytes, parts, boundary)
+}
+
+/// Form a multipart boundary from an injected 128-bit value: the
+/// `flycockpit-` prefix plus exactly 32 lowercase hex digits (the zero-padded
+/// hex of the value). Deterministic in its input; the injected value source
+/// (never `std::env` or a global RNG here) is supplied by the caller.
+pub fn make_boundary(value: u128) -> String {
+    format!("{BOUNDARY_PREFIX}{value:032x}")
 }
 
 /// Validate the boundary: `flycockpit-` plus 32 lowercase hex digits.

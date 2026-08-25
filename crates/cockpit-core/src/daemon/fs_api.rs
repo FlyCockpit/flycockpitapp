@@ -342,7 +342,7 @@ pub async fn get_extended_config_snapshot(
                     .enumerate()
                     .map(|(index, value)| denylist_occurrence_id(kind, &target, &revision, index, value))
                     .collect();
-                let denylist = config
+                let denylist: Vec<_> = config
                     .redact
                     .denylist
                     .iter()

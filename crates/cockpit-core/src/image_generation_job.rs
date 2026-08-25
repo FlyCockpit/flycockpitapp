@@ -1651,6 +1651,741 @@ impl ImageGenerationJobService {
     }
 }
 
+use crate::approval::{Approver, AuthorizationRequest, Decision};
+use crate::image_generation_agent_tools::{
+    BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS, BudgetDisposition, ImageGenerationPlanProjection,
+    ImageReferenceTag, LocationClass, PlanDigest, ProjectionDestination, ProjectionReference,
+    ProjectionSize, SpendPolicyChoice, TypedParameter, plan_projection_digest,
+};
+use cockpit_db::image_spend::{BudgetPolicy, CurrentImageSpendPolicy, ImageSpendSettings};
+
+/// Redacted, model-safe refusal copy. None of these carries a prompt, a raw
+/// filesystem path, a provider secret, or reference bytes.
+const DISPATCH_NO_TARGETS: &str = "image generation requires at least one target.";
+const DISPATCH_PREFLIGHT_UNAVAILABLE: &str = "image generation is temporarily unavailable: no \
+     dispatch target could be resolved. Try again after image generation target configuration is \
+     refreshed.";
+const DISPATCH_SPEND_POLICY_UNAVAILABLE: &str = "image generation is unavailable: an image spend \
+     budget has not been configured for this project.";
+const DISPATCH_OUTPUT_DIR_UNAVAILABLE: &str = "image generation is unavailable: the output \
+     directory could not be opened as a write destination.";
+const DISPATCH_OWNER_UNAVAILABLE: &str =
+    "image generation is unavailable: this session is no longer authorized for the project.";
+const DISPATCH_COMMIT_UNAVAILABLE: &str = "image generation is temporarily unavailable: the job \
+     could not be queued. Try again after image generation target configuration is refreshed.";
+
+/// Owned, already-parsed `generate_image` tool arguments. The tool/schema layer
+/// (owned separately) validates the raw JSON, resolves shared-vs-per-target
+/// width/height/format, defaults `samples`, and produces this DTO; the dispatch
+/// service never re-parses raw tool input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerateImageDispatchArgs {
+    /// The generation prompt. Held only so the tool layer can hand it through;
+    /// it is NEVER placed in a projection, an Approver fact, or a refusal.
+    pub prompt: String,
+    /// The requested output directory (a daemon-local path). Never surfaced to
+    /// the model: only its opened write-authority digest reaches the Approver.
+    pub directory: String,
+    /// The output filename stem (a validated path component, not a full path).
+    pub base_stem: String,
+    /// Per-target entries (already distinct and resolved).
+    pub targets: Vec<GenerateImageDispatchTarget>,
+    /// Typed reference tags (attachment id or daemon-local path). Raw URLs and
+    /// provider JSON are rejected upstream at the schema layer.
+    pub references: Vec<ImageReferenceTag>,
+}
+
+/// One resolved per-target entry inside [`GenerateImageDispatchArgs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerateImageDispatchTarget {
+    pub target_id: String,
+    pub samples: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: String,
+    pub parameters: BTreeMap<String, TypedParameter>,
+    /// Reference tags bound to this target (by index into
+    /// [`GenerateImageDispatchArgs::references`]).
+    pub reference_indices: Vec<usize>,
+}
+
+/// Terminal outcome of [`ImageGenerationDispatchService::dispatch_generate_image`].
+///
+/// `Refused` is the fail-closed terminal for every rejection path (Approver deny
+/// / ask-cancel / standing reject, unconfigured budget, unresolved destination,
+/// unavailable output authority): no job is created, no spend or media is
+/// reserved, and no provider is contacted. Its `reason` is model-safe (never a
+/// prompt, raw path, secret, or reference byte).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerateImageDispatchOutcome {
+    /// The request was authorized and committed as a durable `queued` job.
+    Queued { job_id: Uuid },
+    /// The request was refused before any spend/media reservation or provider
+    /// contact. `reason` is redacted, model-safe copy.
+    Refused { reason: String },
+    /// Preflight rejected the request against sealed target capability. The
+    /// alternatives carry only redacted per-target capability facts.
+    Incompatible {
+        alternatives: Vec<ImageGenerationTargetAlternativeV1>,
+    },
+}
+
+/// Redacted, session-safe outcome of
+/// [`ImageGenerationDispatchService::job_status`]. `NotFound` hides both a
+/// missing job and one owned by another session (existence-hiding). `Status`
+/// carries only the durable lifecycle state, plan slot count, cancellation flag,
+/// and — once terminal — the safe disjoint slot counts. It NEVER carries a
+/// prompt, path, cost, destination, credential, or artifact identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetImageJobStatusOutcome {
+    Status {
+        state: String,
+        slot_count: u32,
+        cancellation_requested: bool,
+        terminal: Option<ImageGenerationJobTerminalSummary>,
+    },
+    NotFound,
+}
+
+/// The safe, disjoint terminal slot counts of a finished job. Every count is a
+/// non-identifying integer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationJobTerminalSummary {
+    pub terminal_state: String,
+    pub published: u32,
+    pub failed: u32,
+    pub cancelled: u32,
+    pub late_published: u32,
+    pub late_quarantined: u32,
+    pub discarded: u32,
+}
+
+/// Redacted, idempotent outcome of
+/// [`ImageGenerationDispatchService::cancel_job`]. `NotFound` hides both a
+/// missing job and one owned by another session; `AlreadyTerminal` means the
+/// owned job has no cancellable slots left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelImageJobOutcome {
+    CancellationRequested,
+    NotFound,
+    AlreadyTerminal,
+}
+
+/// Session-scoped funnel that authorizes a `generate_image` tool call through the
+/// central [`Approver`] chokepoint and, on `Allow`, turns it into a durable
+/// `queued` [`ImageGenerationJobService`] job.
+///
+/// It lives in this module (alongside the private-field
+/// [`ImageGenerationResolutionAuthorityV1`]) so it can assemble the sealed
+/// authority directly without any public constructor leaking elsewhere. The
+/// pipeline mirrors the chokepoint prompt order: preflight (resolve targets to
+/// their sealed destination + capability via the registry) -> authorize (build
+/// the immutable plan projection, digest it, and call
+/// `Approver::authorize(AuthorizationRequest::ImageGeneration { .. })`) ->
+/// spend/media reservation -> job creation. Every fallible real call uses `?`;
+/// no `unwrap`/`expect` on a fallible call. Refusal copy is always redacted.
+///
+/// Redacted identity of the output-path write authority, threaded into
+/// [`crate::approval::AuthorizationRequest::ImageGeneration`]. Its private inner
+/// string is the opened directory's canonical-destination digest; the ONLY
+/// production constructor is [`OutputPathAuthorityId::from_verified_output_directory`],
+/// so a raw absolute path can never be wrapped as an authority id and reach the
+/// persisted interrupt-prompt sink (`approval/policy.rs`), which reads only
+/// [`OutputPathAuthorityId::as_str`]. This is the second half of the inc1-review
+/// hard constraint (the first is [`crate::image_generation_agent_tools::PlanDigest`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputPathAuthorityId(String);
+
+impl OutputPathAuthorityId {
+    /// The sole production constructor: the opened, verified output directory's
+    /// canonical-destination digest — never a raw path.
+    pub(crate) fn from_verified_output_directory(authority: &VerifiedOutputDirectoryAuthority) -> Self {
+        Self(authority.0.canonical_destination_digest.clone())
+    }
+
+    /// The redacted authority digest, for display at the authz boundary.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Test-only raw constructor. `#[cfg(test)]`-gated so production cannot
+    /// bypass [`Self::from_verified_output_directory`].
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+#[derive(Clone)]
+pub struct ImageGenerationDispatchService {
+    db: cockpit_db::Db,
+    registry: std::sync::Arc<ImageRuntimeRegistry>,
+    boot_id: uuid::Uuid,
+    principal: ClientPrincipal,
+    config_generation: u64,
+    clock: std::sync::Arc<dyn crate::media_reservation::MonotonicClock>,
+}
+
+impl ImageGenerationDispatchService {
+    pub fn new(
+        db: cockpit_db::Db,
+        registry: std::sync::Arc<ImageRuntimeRegistry>,
+        boot_id: uuid::Uuid,
+        principal: ClientPrincipal,
+        config_generation: u64,
+        clock: std::sync::Arc<dyn crate::media_reservation::MonotonicClock>,
+    ) -> Self {
+        Self {
+            db,
+            registry,
+            boot_id,
+            principal,
+            config_generation,
+            clock,
+        }
+    }
+
+    /// Authorize and (on `Allow`) commit a `generate_image` request.
+    pub async fn dispatch_generate_image(
+        &self,
+        session: &crate::session::Session,
+        approver: &Approver,
+        args: &GenerateImageDispatchArgs,
+    ) -> Result<GenerateImageDispatchOutcome> {
+        if args.targets.is_empty() {
+            return Ok(GenerateImageDispatchOutcome::Refused {
+                reason: DISPATCH_NO_TARGETS.to_string(),
+            });
+        }
+
+        // (1) Preflight: resolve every requested target to its sealed
+        // destination (adapter kind + connected location class) via the image
+        // runtime registry.
+        let Some(destinations) = self.resolve_projection_destinations(args)? else {
+            return Ok(GenerateImageDispatchOutcome::Refused {
+                reason: DISPATCH_PREFLIGHT_UNAVAILABLE.to_string(),
+            });
+        };
+
+        // (2) Hold the output directory as the write authority. Its opened
+        // canonical-destination digest is the ONLY output-path fact that reaches
+        // the Approver — never the raw path. A failure to open is a redacted
+        // refusal, never a raw-path error surfaced to the model.
+        let extension = args.targets[0].format.clone();
+        let held = match open_image_generation_output_directory(
+            Path::new(&args.directory),
+            self.config_generation,
+            args.base_stem.clone(),
+            extension,
+        ) {
+            Ok(held) => held,
+            Err(_) => {
+                return Ok(GenerateImageDispatchOutcome::Refused {
+                    reason: DISPATCH_OUTPUT_DIR_UNAVAILABLE.to_string(),
+                });
+            }
+        };
+        let output_path_authority = held.authority().0.canonical_destination_digest.clone();
+        let output_path_authority_id =
+            OutputPathAuthorityId::from_verified_output_directory(held.authority());
+        let output_write_authorized = true;
+        // Local-path references are not read-authorized at this seam yet; an
+        // attachment-only reference set needs no local read authority.
+        let path_read_authorized = args
+            .references
+            .iter()
+            .all(|reference| matches!(reference, ImageReferenceTag::Attachment { .. }));
+
+        // (3) Spend policy choices. An unconfigured scope is a hard block: refuse
+        // before contacting the Approver, reserving spend, or contacting any
+        // provider.
+        let Some(policy) = self
+            .db
+            .current_image_spend_policy(session.project_id.clone())
+            .await?
+        else {
+            return Ok(GenerateImageDispatchOutcome::Refused {
+                reason: DISPATCH_SPEND_POLICY_UNAVAILABLE.to_string(),
+            });
+        };
+        let Some((spend_request, spend_session, spend_project)) =
+            Self::spend_policy_choices(&policy.settings)
+        else {
+            return Ok(GenerateImageDispatchOutcome::Refused {
+                reason: DISPATCH_SPEND_POLICY_UNAVAILABLE.to_string(),
+            });
+        };
+
+        // (4) Build the immutable plan projection and digest it. The projection
+        // carries only redacted facts (destination classes, sizes, formats,
+        // parameters, counts) and the output write-authority digest — no prompt
+        // text, raw path, provider secret, or reference bytes.
+        let fanout = destinations.len() as u32;
+        let total_outputs: u32 = args
+            .targets
+            .iter()
+            .map(|target| target.samples)
+            .fold(0_u32, |total, samples| total.saturating_add(samples));
+        // TODO(inc3-tests): real per-target provider cost estimation is a
+        // separate concern (provider cost models are not resolvable at this
+        // seam). Until then the plan carries an unknown cost, which the risk
+        // classifier and budget disposition treat conservatively.
+        let cost_maximum: Option<u64> = None;
+        let budget_disposition = Self::budget_disposition(&policy.settings, cost_maximum);
+        let reference_egress_unmatched = !args.references.is_empty()
+            && destinations
+                .iter()
+                .any(|destination| !matches!(destination.location_class, LocationClass::Local));
+        let projection = ImageGenerationPlanProjection {
+            destinations: destinations.clone(),
+            prompt_collapsed: true,
+            references: args
+                .references
+                .iter()
+                .enumerate()
+                .map(|(index, _)| ProjectionReference {
+                    name: format!("reference-{}", index + 1),
+                    thumbnail: false,
+                    destination_target_id: args.targets[0].target_id.clone(),
+                })
+                .collect(),
+            sizes: args
+                .targets
+                .iter()
+                .map(|target| ProjectionSize {
+                    target_id: target.target_id.clone(),
+                    width: target.width,
+                    height: target.height,
+                })
+                .collect(),
+            formats: {
+                let mut formats: Vec<String> =
+                    args.targets.iter().map(|target| target.format.clone()).collect();
+                formats.sort();
+                formats.dedup();
+                formats
+            },
+            parameters: {
+                let mut parameters = BTreeMap::new();
+                for target in &args.targets {
+                    for (key, value) in &target.parameters {
+                        parameters.insert(key.clone(), value.clone());
+                    }
+                }
+                parameters
+            },
+            fanout,
+            total_outputs,
+            cost_maximum,
+            budget_disposition,
+            output_directory: output_path_authority.clone(),
+            output_base_stem: args.base_stem.clone(),
+            digest: String::new(),
+        };
+        let plan_digest = plan_projection_digest(&projection)?;
+
+        // (5) Hard gates sourced from the registry health / capability /
+        // transport snapshot per resolved destination.
+        let (destination_enabled, capability_fresh, insecure_transport_allowed) =
+            self.resolve_destination_gates(&destinations)?;
+
+        // (6) Central authorization chokepoint. Never a faked allow.
+        let decision = approver
+            .authorize(AuthorizationRequest::ImageGeneration {
+                plan_digest: &plan_digest,
+                destinations: destinations.as_slice(),
+                fanout,
+                total_outputs,
+                cost_maximum,
+                reference_egress_unmatched,
+                base_threshold_usd_micros: BASE_TIER_KNOWN_COST_THRESHOLD_USD_MICROS,
+                spend_request,
+                spend_session,
+                spend_project,
+                path_read_authorized,
+                output_write_authorized,
+                destination_enabled,
+                capability_fresh,
+                insecure_transport_allowed,
+                output_path_authority: &output_path_authority_id,
+            })
+            .await?;
+        if !matches!(decision, Decision::Allow { .. }) {
+            // Deny / ask-cancel / standing reject: no job, no spend, no media, no
+            // provider contact.
+            return Ok(GenerateImageDispatchOutcome::Refused {
+                reason: Self::refusal_reason(&decision),
+            });
+        }
+
+        // (7) Allow: reserve spend + media, resolve, and commit the queued job.
+        self.commit_queued_job(session, args, &policy, &plan_digest, held)
+            .await
+    }
+
+    /// Return the redacted, session-authorized status of an image-generation job.
+    ///
+    /// The live attached session's owner identity is derived exactly as
+    /// [`Self::commit_queued_job`] derives it (session id + principal, revalidated
+    /// against the durable session), then handed to the owner-scoped cockpit-db
+    /// reader. A job that does not exist, or that belongs to another session, is
+    /// reported as [`GetImageJobStatusOutcome::NotFound`] — the two are
+    /// indistinguishable (existence-hiding). An owner-context that cannot be
+    /// established for this session is likewise `NotFound`. No prompt, path, cost,
+    /// destination, credential, or artifact identity is ever surfaced, and no
+    /// content is opened.
+    pub async fn job_status(
+        &self,
+        session: &crate::session::Session,
+        job_id: Uuid,
+    ) -> Result<GetImageJobStatusOutcome> {
+        let principal = self.principal.clone();
+        let session_id = session.id;
+        let config_generation = self.config_generation;
+        let outcome = self
+            .db
+            .read(move |conn| {
+                let owner = match ImageGenerationOwnerContextAuthority::from_attached_session(
+                    conn,
+                    session_id,
+                    &principal,
+                    config_generation,
+                ) {
+                    Ok(owner) => owner,
+                    Err(_) => {
+                        return Ok(cockpit_db::db::image_generation::OwnedImageGenerationJobStatus::NotFound);
+                    }
+                };
+                let scope = cockpit_db::db::image_generation::ImageGenerationJobOwnerScope {
+                    owner_session_id: owner.session_id,
+                    owner_principal_digest: &owner.principal_digest,
+                    project_identity_digest: &owner.project_identity_digest,
+                    config_generation: owner.config_generation,
+                };
+                cockpit_db::Db::read_owned_image_generation_job_status_conn(conn, job_id, &scope)
+            })
+            .await?;
+        Ok(match outcome {
+            cockpit_db::db::image_generation::OwnedImageGenerationJobStatus::Status(safe) => {
+                GetImageJobStatusOutcome::Status {
+                    state: safe.state.as_str().to_string(),
+                    slot_count: safe.slot_count,
+                    cancellation_requested: safe.cancellation_requested,
+                    terminal: safe.terminal.map(|counts| ImageGenerationJobTerminalSummary {
+                        terminal_state: counts.terminal_state.as_str().to_string(),
+                        published: counts.published_count,
+                        failed: counts.failed_count,
+                        cancelled: counts.cancelled_count,
+                        late_published: counts.late_published_count,
+                        late_quarantined: counts.late_quarantined_count,
+                        discarded: counts.discarded_count,
+                    }),
+                }
+            }
+            cockpit_db::db::image_generation::OwnedImageGenerationJobStatus::NotFound => {
+                GetImageJobStatusOutcome::NotFound
+            }
+        })
+    }
+
+    /// Request idempotent, owner-checked cancellation of an image-generation job.
+    ///
+    /// Owner identity is derived from the live attached session exactly as
+    /// [`Self::job_status`], then handed to the owner-scoped cockpit-db cancel
+    /// wrapper (which verifies ownership before invoking the existing
+    /// cancellation CAS). A missing job, a job owned by another session, or an
+    /// owner-context that cannot be established is reported as
+    /// [`CancelImageJobOutcome::NotFound`] (existence-hiding);
+    /// `AlreadyTerminal` means the owned job has no cancellable slots. No prompt,
+    /// path, cost, or another session's data is surfaced.
+    pub async fn cancel_job(
+        &self,
+        session: &crate::session::Session,
+        job_id: Uuid,
+    ) -> Result<CancelImageJobOutcome> {
+        let principal = self.principal.clone();
+        let session_id = session.id;
+        let config_generation = self.config_generation;
+        let requested_at_unix_ms = i64::try_from(self.clock.now_ms()).unwrap_or(i64::MAX);
+        // A deterministic per-job operation id: the first cancellation of the job
+        // consumes it, and any later owner request is reported idempotently
+        // without re-invoking the CAS.
+        let request_operation_id = format!("agent-cancel:{job_id}");
+        let outcome = self
+            .db
+            .transaction(move |conn| {
+                let owner = match ImageGenerationOwnerContextAuthority::from_attached_session(
+                    conn,
+                    session_id,
+                    &principal,
+                    config_generation,
+                ) {
+                    Ok(owner) => owner,
+                    Err(_) => {
+                        return Ok(cockpit_db::db::image_generation::OwnedImageGenerationCancellation::NotFound);
+                    }
+                };
+                let scope = cockpit_db::db::image_generation::ImageGenerationJobOwnerScope {
+                    owner_session_id: owner.session_id,
+                    owner_principal_digest: &owner.principal_digest,
+                    project_identity_digest: &owner.project_identity_digest,
+                    config_generation: owner.config_generation,
+                };
+                cockpit_db::Db::request_owned_image_generation_cancellation_conn(
+                    conn,
+                    &cockpit_db::db::image_generation::OwnedImageGenerationCancellationRequest {
+                        job_id,
+                        scope,
+                        cancellation_version: 1,
+                        request_operation_id: &request_operation_id,
+                        requested_at_unix_ms,
+                    },
+                )
+            })
+            .await?;
+        Ok(match outcome {
+            cockpit_db::db::image_generation::OwnedImageGenerationCancellation::CancellationRequested => {
+                CancelImageJobOutcome::CancellationRequested
+            }
+            cockpit_db::db::image_generation::OwnedImageGenerationCancellation::NotFound => {
+                CancelImageJobOutcome::NotFound
+            }
+            cockpit_db::db::image_generation::OwnedImageGenerationCancellation::AlreadyTerminal => {
+                CancelImageJobOutcome::AlreadyTerminal
+            }
+        })
+    }
+
+    /// Resolve each requested target to its sealed [`ProjectionDestination`]
+    /// (adapter kind + connected location class) via the image runtime registry.
+    ///
+    /// Returns `Ok(None)` (fail closed) when any requested target has no resolved
+    /// sealed destination, so the caller refuses without contacting the Approver.
+    ///
+    /// TODO(inc3-tests): the concrete `target_id -> {adapter kind, endpoint
+    /// identity, connected location class, sealed capability}` map is materialized
+    /// by the daemon reconciliation wiring from the same `ExtendedConfig`
+    /// image-generation config that seals the plan; it is installed separately
+    /// (this increment ships an empty adapter map + no resolved destinations).
+    /// Until that map is present no target resolves here and preflight fails
+    /// closed. When it lands, this pushes one `ProjectionDestination` per
+    /// requested target (and the sealed capability threads into
+    /// [`Self::commit_queued_job`]).
+    fn resolve_projection_destinations(
+        &self,
+        args: &GenerateImageDispatchArgs,
+    ) -> Result<Option<Vec<ProjectionDestination>>> {
+        // Bind preflight to the live registry adapter set.
+        let _registry = self.registry.as_ref();
+        let mut destinations = Vec::with_capacity(args.targets.len());
+        for target in &args.targets {
+            // No sealed destination is resolvable until the daemon destination
+            // map is installed (see the method-level TODO).
+            let resolved: Option<ProjectionDestination> = None;
+            if let Some(destination) = resolved {
+                destinations.push(destination);
+            }
+            let _ = target;
+        }
+        if destinations.len() != args.targets.len() {
+            return Ok(None);
+        }
+        Ok(Some(destinations))
+    }
+
+    /// Resolve the `destination_enabled` / `capability_fresh` /
+    /// `insecure_transport_allowed` hard gates from the registry health +
+    /// transport snapshot for each resolved destination.
+    ///
+    /// TODO(inc3-tests): reads `self.registry.snapshot(endpoint, target)` per
+    /// resolved destination once the destination map (endpoint ids + sealed
+    /// capability) is installed by the daemon reconciliation wiring. Fails closed
+    /// (all gates `false`) until then, so authorization can never pass on an
+    /// unverified destination.
+    fn resolve_destination_gates(
+        &self,
+        destinations: &[ProjectionDestination],
+    ) -> Result<(bool, bool, bool)> {
+        let _ = (self.registry.as_ref(), destinations);
+        Ok((false, false, false))
+    }
+
+    /// Map the three [`BudgetPolicy`] scopes onto [`SpendPolicyChoice`]. An
+    /// `Unconfigured` scope is a hard block (returns `None`).
+    fn spend_policy_choices(
+        settings: &ImageSpendSettings,
+    ) -> Option<(SpendPolicyChoice, SpendPolicyChoice, SpendPolicyChoice)> {
+        Some((
+            Self::budget_policy_choice(&settings.request)?,
+            Self::budget_policy_choice(&settings.session)?,
+            Self::budget_policy_choice(&settings.project)?,
+        ))
+    }
+
+    fn budget_policy_choice(policy: &BudgetPolicy) -> Option<SpendPolicyChoice> {
+        match policy {
+            BudgetPolicy::Unlimited => Some(SpendPolicyChoice::Unlimited),
+            BudgetPolicy::Finite { usd_micros } => Some(SpendPolicyChoice::Finite {
+                usd_micros: *usd_micros,
+            }),
+            BudgetPolicy::Unconfigured => None,
+        }
+    }
+
+    fn budget_disposition(
+        settings: &ImageSpendSettings,
+        cost_maximum: Option<u64>,
+    ) -> BudgetDisposition {
+        match cost_maximum {
+            Some(_) => BudgetDisposition::WithinBudget,
+            None => {
+                if settings.request == BudgetPolicy::Unlimited
+                    && settings.session == BudgetPolicy::Unlimited
+                    && settings.project == BudgetPolicy::Unlimited
+                {
+                    BudgetDisposition::UnknownCostAllowed
+                } else {
+                    BudgetDisposition::UnknownCostBlocked
+                }
+            }
+        }
+    }
+
+    fn refusal_reason(decision: &Decision) -> String {
+        match decision {
+            Decision::Allow { .. } => String::new(),
+            Decision::Deny => "image generation was declined at the approval prompt.".to_string(),
+            Decision::NoninteractiveDeny => crate::approval::NONINTERACTIVE_RUN_DENIAL.to_string(),
+            Decision::StandingReject { .. } => {
+                "image generation is disallowed by a saved user decision.".to_string()
+            }
+        }
+    }
+
+    fn to_plan_parameters(
+        source: &BTreeMap<String, TypedParameter>,
+    ) -> BTreeMap<String, TypedParameterV1> {
+        source
+            .iter()
+            .map(|(key, value)| {
+                let converted = match value {
+                    TypedParameter::Boolean(flag) => TypedParameterV1::Boolean(*flag),
+                    TypedParameter::Integer(number) => TypedParameterV1::Integer(*number),
+                    TypedParameter::Text(text) => TypedParameterV1::Text(text.clone()),
+                };
+                (key.clone(), converted)
+            })
+            .collect()
+    }
+
+    /// On `Allow`: build the immutable request (ids sorted + deduped exactly as
+    /// [`resolve_image_generation`] requires), assemble the sealed
+    /// [`ImageGenerationResolutionAuthorityV1`], reserve spend + media, resolve,
+    /// and commit the queued job via [`ImageGenerationJobService::create_queued_job`].
+    async fn commit_queued_job(
+        &self,
+        session: &crate::session::Session,
+        args: &GenerateImageDispatchArgs,
+        policy: &CurrentImageSpendPolicy,
+        plan_digest: &PlanDigest,
+        held: HeldImageGenerationOutputDirectory,
+    ) -> Result<GenerateImageDispatchOutcome> {
+        // Immutable request: target + reference ids strictly increasing.
+        let mut target_ids: Vec<String> =
+            args.targets.iter().map(|target| target.target_id.clone()).collect();
+        target_ids.sort();
+        target_ids.dedup();
+        let mut reference_attachment_ids: Vec<Uuid> = args
+            .references
+            .iter()
+            .filter_map(|reference| match reference {
+                ImageReferenceTag::Attachment { attachment_id } => {
+                    Uuid::parse_str(attachment_id).ok()
+                }
+                ImageReferenceTag::LocalPath { .. } => None,
+            })
+            .collect();
+        reference_attachment_ids.sort();
+        reference_attachment_ids.dedup();
+        let primary = &args.targets[0];
+        let request = ImageGenerationRequestV1 {
+            width: primary.width,
+            height: primary.height,
+            format: primary.format.clone(),
+            samples_per_target: primary.samples,
+            target_ids,
+            parameters: Self::to_plan_parameters(&primary.parameters),
+            reference_attachment_ids,
+        };
+
+        // Owner context authority, revalidated against the live attached session.
+        let owner = {
+            let principal = self.principal.clone();
+            let session_id = session.id;
+            let config_generation = self.config_generation;
+            self.db
+                .read(move |conn| {
+                    ImageGenerationOwnerContextAuthority::from_attached_session(
+                        conn,
+                        session_id,
+                        &principal,
+                        config_generation,
+                    )
+                })
+                .await
+        };
+        let owner = match owner {
+            Ok(owner) => owner,
+            Err(_) => {
+                return Ok(GenerateImageDispatchOutcome::Refused {
+                    reason: DISPATCH_OWNER_UNAVAILABLE.to_string(),
+                });
+            }
+        };
+
+        // The sealed plan's deadline boot id and the queued-job timestamp.
+        let deadline_boot_id = self.boot_id;
+        let created_at_unix_ms = i64::try_from(self.clock.now_ms()).unwrap_or(i64::MAX);
+
+        // TODO(inc3-tests): assemble `ImageGenerationResolutionAuthorityV1` and
+        // reserve spend + media, then commit via
+        // `ImageGenerationJobService::new(self.db.clone()).create_queued_job(..)`,
+        // mapping `ImageGenerationJobCreation::Queued { job_id }` ->
+        // `GenerateImageDispatchOutcome::Queued { job_id }` and `Incompatible(alts)`
+        // -> `GenerateImageDispatchOutcome::Incompatible { alternatives: alts }`.
+        // Requires collaborators the daemon reconciliation wiring installs
+        // separately (this increment does not have them cleanly available):
+        //   * sealed action grants -> `grant_requirement_from_sealed_grant`
+        //   * media reservation plans + identities -> `MediaReservationLedger::new(
+        //     self.db.clone(), self.clock.clone()).reserve(..)` +
+        //     `resource_reservation_from_media_reservation` (the media
+        //     reservation_id MUST equal the resolved
+        //     `central_resources[0].reservation_identity`)
+        //   * slot/artifact id allocation + per-attempt spend graph ->
+        //     `self.db.reserve_image_spend(reservation_id, SpendScopeKeys { .. },
+        //     attempts, policy.policy_version, created_at_unix_ms)` ->
+        //     `spend_plan_from_spend_reservation`
+        //   * the sealed `RuntimeTargetAuthorityV1` per target (from the resolved
+        //     registry destination map; see `resolve_projection_destinations`)
+        // The resolved sequence mirrors the worked test
+        // `image_generation_job_service_creates_queued_job_without_tool`. Until the
+        // wiring lands, fail closed BEFORE any spend/media reservation or provider
+        // contact, and BEFORE any job row is written.
+        let _deferred = (
+            owner,
+            deadline_boot_id,
+            created_at_unix_ms,
+            policy.policy_version,
+            plan_digest.as_str().len(),
+            held.authority().0.authority_generation,
+            request.samples_per_target,
+        );
+        Ok(GenerateImageDispatchOutcome::Refused {
+            reason: DISPATCH_COMMIT_UNAVAILABLE.to_string(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTargetAuthorityV1 {
     target_id: String,

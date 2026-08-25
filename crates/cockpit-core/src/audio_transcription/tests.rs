@@ -26,6 +26,47 @@ mod catalog_tests {
     }
 
     #[test]
+    fn external_audio_transcription_catalog_gpt_digest_matches_pinned() {
+        let digest = gpt_transcribe_digest();
+        assert_eq!(digest, GPT_TRANSCRIBE_PROVENANCE.sha256_hex);
+        verify_gpt_transcribe_catalog().unwrap();
+    }
+
+    #[test]
+    fn external_audio_transcription_catalog_gpt_digest_is_not_placeholder() {
+        // AC9: the all-zero placeholder digest must never ship.
+        assert_ne!(
+            GPT_TRANSCRIBE_PROVENANCE.sha256_hex,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(GPT_TRANSCRIBE_PROVENANCE.sha256_hex.len(), 64);
+    }
+
+    #[test]
+    fn external_audio_transcription_catalog_gpt_verify_fails_on_mutation() {
+        // Recompute the digest over a mutated (one entry dropped) catalog and
+        // confirm it differs from the pinned digest — verify would fail closed.
+        use sha2::{Digest, Sha256};
+        let mut mutated: Vec<&str> = GPT_TRANSCRIBE_ALPHA2.to_vec();
+        mutated.pop();
+        let mut hasher = Sha256::new();
+        for code in mutated
+            .iter()
+            .chain(GPT_TRANSCRIBE_ALPHA3.iter())
+            .chain(GPT_TRANSCRIBE_REGIONAL_ZH.iter())
+        {
+            hasher.update(code.as_bytes());
+            hasher.update(b"\n");
+        }
+        let mutated_hex: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_ne!(mutated_hex, GPT_TRANSCRIBE_PROVENANCE.sha256_hex);
+    }
+
+    #[test]
     fn external_audio_transcription_catalog_whisper_has_98_entries_no_english() {
         assert_eq!(WHISPER_MULTILINGUAL.len(), 98);
         assert!(!WHISPER_MULTILINGUAL.contains(&"en"));
@@ -714,6 +755,59 @@ mod result_tests {
     }
 
     #[test]
+    fn language_codecs_roundtrip_exact_tags() {
+        // AC1: each codec serializes with its exact tag and round-trips.
+        let req = RequestedLanguageV1::new("en".into());
+        let applied = AppliedLanguageV1::new("es".into());
+        let detected = DetectedLanguageV1::new("fr".into());
+        let req_json = serde_json::to_string(&req).unwrap();
+        let applied_json = serde_json::to_string(&applied).unwrap();
+        let detected_json = serde_json::to_string(&detected).unwrap();
+        assert_eq!(req_json, r#"{"kind":"requested","code":"en"}"#);
+        assert_eq!(applied_json, r#"{"kind":"applied","code":"es"}"#);
+        assert_eq!(detected_json, r#"{"kind":"detected","code":"fr"}"#);
+        assert_eq!(
+            serde_json::from_str::<RequestedLanguageV1>(&req_json).unwrap(),
+            req
+        );
+        assert_eq!(
+            serde_json::from_str::<AppliedLanguageV1>(&applied_json).unwrap(),
+            applied
+        );
+        assert_eq!(
+            serde_json::from_str::<DetectedLanguageV1>(&detected_json).unwrap(),
+            detected
+        );
+    }
+
+    #[test]
+    fn language_codecs_reject_wrong_or_kind_valued_tag() {
+        // AC1 regression: a payload whose tag VALUE is the literal "kind"
+        // (the old serde-attribute bug) must fail, as must a cross-codec tag.
+        assert!(
+            serde_json::from_str::<RequestedLanguageV1>(r#"{"kind":"kind","code":"en"}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<RequestedLanguageV1>(r#"{"kind":"applied","code":"en"}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<AppliedLanguageV1>(r#"{"kind":"requested","code":"en"}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<DetectedLanguageV1>(r#"{"kind":"applied","code":"en"}"#).is_err()
+        );
+        // Missing tag, missing code, and unknown fields all reject.
+        assert!(serde_json::from_str::<RequestedLanguageV1>(r#"{"code":"en"}"#).is_err());
+        assert!(serde_json::from_str::<RequestedLanguageV1>(r#"{"kind":"requested"}"#).is_err());
+        assert!(
+            serde_json::from_str::<RequestedLanguageV1>(r#"{"kind":"requested","code":"en","x":1}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn normalized_transcription_result_v1_closed_result_rejects_unknown_fields() {
         let json = r#"{
             "schema_version": 1,
@@ -811,7 +905,7 @@ mod authorization_tests {
         MediaEgressTranscriptionRequest {
             provider_id: "openai".into(),
             model_id: "gpt-transcribe".into(),
-            credential_fingerprint_digest: "abc123".into(),
+            credential_fingerprint_digest: CredentialFingerprintDigest::from_raw_for_test("abc123"),
             origin: "cli".into(),
             resolved_location: "local".into(),
             project_digest: "proj1".into(),
@@ -835,7 +929,52 @@ mod authorization_tests {
         let d1 = transcription_request_digest(&req);
         let d2 = transcription_request_digest(&req);
         assert_eq!(d1, d2);
-        assert_eq!(d1.len(), 64);
+        assert_eq!(d1.as_str().len(), 64);
+    }
+
+    #[test]
+    fn media_egress_transcription_context_digest_no_field_boundary_collision() {
+        // Length-prefixing binds field boundaries: shifting content across the
+        // provider_id/model_id boundary must NOT collide, even though a naive
+        // label/newline concatenation would hash both identically.
+        let mut a = base_request();
+        a.provider_id = "open".into();
+        a.model_id = "ai-gpt".into();
+        let mut b = base_request();
+        b.provider_id = "openai".into();
+        b.model_id = "-gpt".into();
+        assert_ne!(
+            transcription_request_digest(&a),
+            transcription_request_digest(&b)
+        );
+
+        // Same for list boundaries: ["a","bc"] vs ["ab","c"] must differ.
+        let mut c = base_request();
+        c.keywords = vec!["a".into(), "bc".into()];
+        let mut d = base_request();
+        d.keywords = vec!["ab".into(), "c".into()];
+        assert_ne!(
+            transcription_request_digest(&c),
+            transcription_request_digest(&d)
+        );
+
+        // An embedded newline cannot forge a following field's value.
+        let mut e = base_request();
+        e.provider_id = "openai\nmodel_id:gpt-transcribe".into();
+        assert_ne!(
+            transcription_request_digest(&e),
+            transcription_request_digest(&base_request())
+        );
+    }
+
+    #[test]
+    fn media_egress_request_digest_newtype_is_type_enforced() {
+        // The only production constructor is the canonical hash; the test-only
+        // raw constructor exists for synthesis but is #[cfg(test)]-gated.
+        let d = transcription_request_digest(&base_request());
+        assert_eq!(d.as_str().len(), 64);
+        let raw = MediaEgressRequestDigest::from_raw_for_test("deadbeef");
+        assert_eq!(raw.as_str(), "deadbeef");
     }
 
     #[test]
@@ -1020,5 +1159,16 @@ mod whisper_preflight_tests {
     #[test]
     fn external_audio_whisper_prompt_preflight_encoding_is_r50k() {
         assert_eq!(WHISPER_ENCODING, cockpit_tokenizer::TiktokenEncoding::R50k);
+    }
+
+    #[test]
+    fn external_audio_whisper_tokenizer_digest_pinned_and_verifies() {
+        // AC3: the pinned tokenizer DATA digest matches the checked-in table's
+        // behavior, so a healthy preflight verifies and permits dispatch (never
+        // Unavailable). The digest fingerprints tokenizer DATA (real r50k_base
+        // token-id sequences), not a language-code list.
+        assert_eq!(whisper_tokenizer_data_digest(), WHISPER_TOKENIZER_DIGEST);
+        verify_whisper_tokenizer_digest().unwrap();
+        assert!(whisper_prompt_preflight("").allows_dispatch());
     }
 }

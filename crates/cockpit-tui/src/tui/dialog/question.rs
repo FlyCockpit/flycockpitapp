@@ -1120,6 +1120,88 @@ impl QuestionDialog {
             }
         }
         out.extend(self.command_risk_lines(cd));
+        out.extend(self.command_image_plan_lines(cd));
+        out
+    }
+
+    /// Render the typed image-generation authorization-review fields when the
+    /// pending approval carries an [`ImagePlanReview`]. This renders dedicated
+    /// plan digest / cost / budget-disposition / output-location rows — never
+    /// only the `full_command` string.
+    ///
+    /// SECURITY / INERT-DISPATCH: `plan_digest` and the conservative cost are
+    /// produced only by a LIVE dispatch, which is inert upstream today. Those
+    /// fields fail closed to a clearly-labeled placeholder (`plan digest:
+    /// pending dispatch`, `cost: unknown`) rather than a fabricated value. No
+    /// credential, provider URL, workflow JSON, or host path is ever shown.
+    fn command_image_plan_lines(&self, cd: &CommandDetail) -> Vec<Line<'static>> {
+        let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
+        let mut out: Vec<Line<'static>> = Vec::new();
+        let Some(review) = cd.image_plan_review.as_ref() else {
+            return out;
+        };
+        out.push(Line::default());
+        out.push(Line::from(Span::styled("image plan review:", muted)));
+
+        let digest = review
+            .plan_digest
+            .as_deref()
+            .map(|d| format!("plan digest: {d}"))
+            .unwrap_or_else(|| "plan digest: pending dispatch".to_string());
+        out.push(Line::from(Span::styled(digest, muted)));
+
+        let cost = if review.cost_unknown {
+            "cost: unknown (cost_unknown)".to_string()
+        } else if let Some(micros) = review.conservative_cost_usd_micros {
+            format!("cost (max, conservative): {micros} usd_micros")
+        } else {
+            "cost: pending dispatch".to_string()
+        };
+        out.push(Line::from(Span::styled(cost, muted)));
+
+        if !review.budget_dispositions.is_empty() {
+            for disposition in &review.budget_dispositions {
+                out.push(Line::from(Span::styled(
+                    format!("budget[{}]: {}", disposition.scope, disposition.disposition),
+                    muted,
+                )));
+            }
+        }
+        if let Some(location) = review.output_location_class.as_deref() {
+            out.push(Line::from(Span::styled(
+                format!("output location: {location}"),
+                muted,
+            )));
+        }
+        if !review.destination_location_classes.is_empty() {
+            out.push(Line::from(Span::styled(
+                format!(
+                    "destinations: {}",
+                    review.destination_location_classes.join(", ")
+                ),
+                muted,
+            )));
+        }
+        if let Some(egress) = review.reference_egress_summary.as_deref() {
+            out.push(Line::from(Span::styled(
+                format!("reference egress: {egress}"),
+                muted,
+            )));
+        }
+        match (review.fanout, review.slots) {
+            (Some(fanout), Some(slots)) => out.push(Line::from(Span::styled(
+                format!("fanout: {fanout}  slots: {slots}"),
+                muted,
+            ))),
+            (Some(fanout), None) => out.push(Line::from(Span::styled(
+                format!("fanout: {fanout}"),
+                muted,
+            ))),
+            (None, Some(slots)) => {
+                out.push(Line::from(Span::styled(format!("slots: {slots}"), muted)))
+            }
+            (None, None) => {}
+        }
         out
     }
 
@@ -2752,6 +2834,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         }
     }
 
@@ -2786,6 +2869,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         })
     }
 
@@ -2900,6 +2984,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         });
         let text = rendered_dialog_text(d, 80, 14);
         assert!(text.contains(" approval "), "{text}");
@@ -2963,6 +3048,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         });
         let area = Rect::new(0, 0, 80, 16);
         let text = render_text(&d, area);
@@ -2994,6 +3080,7 @@ mod tests {
             native_tool_hints: vec!["Use `write` for durable writes.".to_string()],
             offered_scopes: vec!["once".to_string()],
             policy_cap: Some("once".to_string()),
+            image_plan_review: None,
         });
         let text = render_text(&d, Rect::new(0, 0, 90, 18));
         assert!(text.contains("risk: destructive"), "{text}");
@@ -3022,6 +3109,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         });
         let cd = d.command_detail().unwrap().clone();
         let block = d.command_block_lines(&cd);
@@ -3074,6 +3162,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         });
         // The full command block carries every source line (1 per line).
         let cd = d.command_detail().unwrap().clone();
@@ -3117,6 +3206,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         });
         // Learn a terminal height so the expanded cap is computed.
         d.sync_viewport(Rect::new(0, 0, 80, 16), 40);
@@ -3227,6 +3317,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         });
         let area = Rect::new(0, 0, 80, 16);
         d.sync_viewport(area, 24);
@@ -3278,6 +3369,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         });
         d.sync_viewport(Rect::new(0, 0, 80, 16), 24);
         let before = d.state.cursor();
@@ -3327,6 +3419,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         });
         let area = Rect::new(0, 0, 80, 16);
         let text = render_text(&d, area);
@@ -3364,6 +3457,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         });
         // Two options -> cursor wraps 0,1,0 (no third "custom" slot).
         assert_eq!(d.state.cursor(), 0);
@@ -3401,6 +3495,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         });
         assert!(!d.handle_key(press(KeyCode::Char('2'))));
         assert!(d.take_result().is_none(), "number key only selects");
@@ -3451,6 +3546,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         });
         let cd = d.command_detail().unwrap().clone();
         let block = d.command_block_lines(&cd);
@@ -3496,6 +3592,7 @@ mod tests {
                     native_tool_hints: Vec::new(),
                     offered_scopes: Vec::new(),
                     policy_cap: None,
+                    image_plan_review: None,
                 })),
                 permission: true,
                 approval_class: None,
@@ -3602,6 +3699,7 @@ mod tests {
             native_tool_hints: Vec::new(),
             offered_scopes: Vec::new(),
             policy_cap: None,
+            image_plan_review: None,
         });
         assert!(d.sandbox_escalation().is_none());
         let area = Rect::new(0, 0, 80, 20);
@@ -3635,6 +3733,24 @@ mod tests {
             native_tool_hints: vec!["generate_image".into()],
             offered_scopes: vec!["once".into(), "session".into(), "project".into()],
             policy_cap: None,
+            // A typed image-plan review. `plan_digest`/conservative cost come
+            // only from a live dispatch (inert upstream), so they fail closed
+            // (`cost_unknown`, no digest) rather than fabricating a value; the
+            // plan-projection/config-derived fields are populated.
+            image_plan_review: Some(cockpit_core::daemon::proto::ImagePlanReview {
+                plan_digest: None,
+                destination_location_classes: vec!["remote_hosted".into()],
+                conservative_cost_usd_micros: None,
+                cost_unknown: true,
+                budget_dispositions: vec![cockpit_core::daemon::proto::ImageBudgetDisposition {
+                    scope: "session".into(),
+                    disposition: "within_budget".into(),
+                }],
+                output_location_class: Some("local".into()),
+                reference_egress_summary: Some("1 reference (remote)".into()),
+                fanout: Some(1),
+                slots: Some(1),
+            }),
         };
         let d = approval_dialog(cd.clone());
         // It is an approval (permission=true), not a plain question.
@@ -3648,6 +3764,23 @@ mod tests {
             text.contains("generate_image"),
             "approval overlay must show the command, got text length {}",
             text.len()
+        );
+        // Dedicated typed plan fields render — not only the command string.
+        assert!(
+            text.contains("plan digest: pending dispatch"),
+            "overlay must show the fail-closed plan-digest placeholder"
+        );
+        assert!(
+            text.contains("cost_unknown"),
+            "overlay must show cost_unknown when the conservative cost is unbounded"
+        );
+        assert!(
+            text.contains("budget[session]") && text.contains("within_budget"),
+            "overlay must show per-scope budget disposition"
+        );
+        assert!(
+            text.contains("output location: local"),
+            "overlay must show the output location class"
         );
         // Only scopes once, session, and project are offered — never global.
         assert!(

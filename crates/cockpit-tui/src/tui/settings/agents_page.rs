@@ -2122,7 +2122,8 @@ pub(crate) fn validate_agent_mutation_result(
             && result.changed != (snapshot.revision != prior)
         {
             return Err(
-                "daemon mutation change flag disagrees with its exact revision transition".into(),
+                "daemon mutation change flag disagrees with its exact revision transition"
+                    .to_string(),
             );
         }
         Ok(snapshot)

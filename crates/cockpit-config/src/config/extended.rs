@@ -167,6 +167,15 @@ pub struct ExtendedConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_use: Option<ComputerUseMode>,
 
+    /// Layer-local opt-in for user-reviewed typed computer-use guidance
+    /// proposals. Each layer (global, canonical machine-local project,
+    /// provider, model) is `absent | enabled | disabled`; missing is neutral
+    /// during cross-layer resolution. All-absent resolves to disabled and any
+    /// explicit disable is a sticky safety veto (see
+    /// `cockpit_core::computer::guidance::resolve_enablement`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_computer_guidance_proposals: Option<bool>,
+
     /// Opt-in to fetching remote `.well-known/cockpit` configs.
     #[serde(default)]
     pub allow_remote_config: bool,
@@ -1578,6 +1587,7 @@ impl Default for ExtendedConfig {
             tools: HashMap::new(),
             web: WebConfig::default(),
             computer_use: None,
+            allow_computer_guidance_proposals: None,
             allow_remote_config: false,
             utility_model: None,
             translation_model: None,
@@ -2025,6 +2035,115 @@ fn resolve_computer_use_policy_from_docs(docs: &[ExtendedConfigDoc]) -> Option<C
     }))
 }
 
+/// The two document-scoped layers of `allow_computer_guidance_proposals`,
+/// read separately (NOT combined most-restrictively like `computer_use`).
+///
+/// Each slot is `absent | enabled | disabled` encoded as `Option<bool>`
+/// (`None | Some(true) | Some(false)`). The provider and model layers are
+/// read separately by the caller from the provider catalog; these two doc
+/// layers are the global (home-scoped) and canonical machine-local project
+/// layers. cockpit-config cannot depend on cockpit-core, so this returns raw
+/// `Option<bool>` values for cockpit-core to map into `EnablementLayers` and
+/// feed to `resolve_enablement`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GuidanceProposalDocLayers {
+    /// Global (home-scoped) layer value.
+    pub global: Option<bool>,
+    /// Canonical machine-local project layer value.
+    pub project: Option<bool>,
+}
+
+/// Fold a newly seen layer value into an accumulated slot, preserving the
+/// sticky-disable-wins / else-enable / else-absent algebra that
+/// `resolve_enablement` applies across layers. Multiple discovered
+/// directories can map to the same doc slot (e.g. both home-scoped
+/// directories are "global"); a disable in any of them stays a veto.
+fn fold_enablement_value(acc: Option<bool>, next: Option<bool>) -> Option<bool> {
+    match (acc, next) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (None, None) => None,
+    }
+}
+
+/// Read the `allow_computer_guidance_proposals` field from a single config
+/// document, applying the same malformed-value posture as the computer_use
+/// resolver: a present-but-malformed value is skipped (treated as absent)
+/// with a field-only warning.
+fn guidance_proposal_field_from_doc(doc: &ExtendedConfigDoc) -> Option<bool> {
+    let value = doc.raw_field("allow_computer_guidance_proposals")?;
+    match serde_json::from_value::<Option<bool>>(value.clone()) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::warn!(
+                path = %doc.path.display(),
+                key = "allow_computer_guidance_proposals",
+                %error,
+                "skipping malformed allow_computer_guidance_proposals value"
+            );
+            None
+        }
+    }
+}
+
+/// Resolve the global and canonical machine-local project doc layers of
+/// `allow_computer_guidance_proposals` for `cwd`.
+///
+/// Home-scoped directories (`~/.config/cockpit`, `~/.cockpit`) fold into the
+/// global slot; the machine-local per-cwd directory and any project
+/// `.cockpit` directories fold into the project slot. When `COCKPIT_CONFIG`
+/// selects a single file, that file is the effective (most-specific) layer and
+/// its value is treated as the project slot.
+pub fn resolve_guidance_proposal_doc_layers_for_cwd(cwd: &Path) -> GuidanceProposalDocLayers {
+    // Honor the single-file override exactly as config_file_paths_for_load
+    // does: it collapses discovery to one concrete file.
+    if let Some(path) = std::env::var_os(crate::config::dirs::COCKPIT_CONFIG_ENV)
+        && !path.is_empty()
+    {
+        let mut layers = GuidanceProposalDocLayers::default();
+        for path in config_file_paths_for_load(cwd) {
+            if !path.exists() {
+                continue;
+            }
+            match ExtendedConfigDoc::load(&path) {
+                Ok(doc) => {
+                    layers.project =
+                        fold_enablement_value(layers.project, guidance_proposal_field_from_doc(&doc));
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "skipping malformed config layer");
+                }
+            }
+        }
+        return layers;
+    }
+
+    let mut layers = GuidanceProposalDocLayers::default();
+    for dir in discover_config_dirs(cwd) {
+        let path = dir.path.join(crate::config::dirs::CONFIG_FILE);
+        if !path.exists() {
+            continue;
+        }
+        let doc = match ExtendedConfigDoc::load(&path) {
+            Ok(doc) => doc,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "skipping malformed config layer");
+                continue;
+            }
+        };
+        let value = guidance_proposal_field_from_doc(&doc);
+        match dir.kind {
+            ConfigDirKind::HomeXdg | ConfigDirKind::HomeDot => {
+                layers.global = fold_enablement_value(layers.global, value);
+            }
+            ConfigDirKind::MachineLocal | ConfigDirKind::Project => {
+                layers.project = fold_enablement_value(layers.project, value);
+            }
+        }
+    }
+    layers
+}
+
 /// Round-trip loader/saver for the cockpit-only keys in `config.json` that
 /// preserves unknown fields. Same pattern as
 /// [`crate::config::providers::ConfigDoc`] (which owns layer-wide provider
@@ -2326,6 +2445,10 @@ impl ExtendedConfigDoc {
         parse_field!("tools", tools);
         parse_field!("web", web);
         parse_field!("computer_use", computer_use);
+        parse_field!(
+            "allow_computer_guidance_proposals",
+            allow_computer_guidance_proposals
+        );
         parse_field!("allow_remote_config", allow_remote_config);
         parse_field!("utility_model", utility_model);
         parse_field!("translation_model", translation_model);
@@ -2470,6 +2593,7 @@ impl ExtendedConfigDoc {
         }
         remove_malformed!("tui", TuiConfig);
         remove_malformed!("computer_use", Option<ComputerUseMode>);
+        remove_malformed!("allow_computer_guidance_proposals", Option<bool>);
         remove_malformed!("project_knowledge", bool);
         remove_malformed!("knowledge_inject_max_tokens", usize);
         remove_malformed!("sandboxEscalationEnabled", bool);

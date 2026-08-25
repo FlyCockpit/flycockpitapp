@@ -7,6 +7,7 @@ use super::sessions::*;
 #[cfg(feature = "remote")]
 use super::sessions_remote::{self, RemoteSessionLedger};
 use super::*;
+use crate::daemon::agent_management::conflict;
 
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
 use sha2::{Digest, Sha256};
@@ -5047,7 +5048,7 @@ async fn handle_serialized_request_impl(
             let snapshot = crate::assistants::snapshot(&ctx.db, &name)
                 .await
                 .map_err(internal)?
-                .context("assistant disappeared after creation")?;
+                .ok_or_else(|| internal("assistant disappeared after creation"))?;
             let response = Response::AssistantUpserted {
                 assistant: assistant_snapshot_to_proto(snapshot),
             };
@@ -5083,7 +5084,7 @@ async fn handle_serialized_request_impl(
             let assistant = crate::assistants::snapshot(&ctx.db, &name)
                 .await
                 .map_err(internal)?
-                .context("assistant disappeared after definition save")?;
+                .ok_or_else(|| internal("assistant disappeared after definition save"))?;
             Ok(Response::AssistantDefinitionSaved {
                 assistant: assistant_snapshot_to_proto(assistant),
                 consumed_definition_revision: expected_revision,

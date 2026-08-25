@@ -266,16 +266,16 @@ async fn show(name: &str) -> Result<()> {
     let def = verified_assistant_definition(&assistant)?;
     println!("name: {}", def.name);
     println!("description: {}", def.description);
-    println!("home_dir: {}", def.home_dir.display());
-    println!("definition: {}", def.agent.source.display());
+    println!("home_dir: {}", default_home_dir(&def.name)?.display());
+    println!("definition: {}", def.source.display());
     if let Some(hash) = &assistant.definition_presentation_hash {
         println!("presentation_hash: {hash}");
     }
     println!(
         "agent_id: {}",
-        def.agent.vnext.as_ref().map_or("<legacy>", |v| &v.agent_id)
+        def.vnext.as_ref().map_or("<legacy>", |v| &v.agent_id)
     );
-    let execution_kind = match def.agent.vnext.as_ref().map(|v| v.execution_kind) {
+    let execution_kind = match def.vnext.as_ref().map(|v| v.execution_kind) {
         Some(cockpit_core::agents::ExecutionKind::Assistant) => "assistant",
         Some(cockpit_core::agents::ExecutionKind::Coding) => "coding",
         Some(cockpit_core::agents::ExecutionKind::Computer) => "computer",

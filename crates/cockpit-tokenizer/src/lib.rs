@@ -55,8 +55,17 @@ impl TiktokenEncoding {
     }
 
     pub fn count(self, text: &str) -> usize {
+        self.encode_ids(text).len()
+    }
+
+    /// Encode `text` into its exact token-id sequence using the pinned BPE
+    /// table (special tokens included). This exposes the token ids — not just
+    /// the count — so callers can fingerprint the actual tokenizer DATA
+    /// (vocab/merges behavior), since a corrupt table changes the ids a fixed
+    /// corpus encodes to. The empty string encodes to no tokens.
+    pub fn encode_ids(self, text: &str) -> Vec<u32> {
         if text.is_empty() {
-            return 0;
+            return Vec::new();
         }
         let bpe = match self {
             Self::R50k => r50k_base_singleton(),
@@ -65,7 +74,10 @@ impl TiktokenEncoding {
             Self::Cl100k => cl100k_base_singleton(),
             Self::O200k => o200k_base_singleton(),
         };
-        bpe.encode_with_special_tokens(text).len()
+        bpe.encode_with_special_tokens(text)
+            .into_iter()
+            .map(|id| id as u32)
+            .collect()
     }
 
     pub fn warm(self) {

@@ -828,6 +828,10 @@ pub fn is_consequential_action(class: ActionClass) -> bool {
     class.is_consequential()
 }
 
+/// Production resolver that reads the four `allow_computer_guidance_proposals`
+/// config layers and feeds them into [`resolve_enablement`].
+pub mod enablement;
+
 /// Daemon-memory custody for pending proposals (typed values + rationale live in
 /// memory only; the durable receipt/counter/audit half is separate).
 pub mod lifecycle;

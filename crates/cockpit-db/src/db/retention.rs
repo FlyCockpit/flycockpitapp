@@ -81,7 +81,20 @@ impl Db {
                     OR (state = 'open' AND expires_at_unix_ms < ?2))",
                 params![cutoff_unix_ms, now_unix_ms],
             )? as u64;
-            Ok(receipts.saturating_add(editor))
+            // Recovery-owned ambiguous intents stay inspectable. Only dead or
+            // already-terminal marker residue is eligible for bounded cleanup.
+            let patch_journals = conn.execute(
+                "DELETE FROM extended_config_patch_journals
+                  WHERE created_at_unix_ms < ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM local_operation_receipts receipt
+                         WHERE receipt.owner_digest=extended_config_patch_journals.owner_digest
+                           AND receipt.client_operation_id=extended_config_patch_journals.client_operation_id
+                           AND receipt.state IN ('prepared','executing')
+                    )",
+                params![cutoff_unix_ms],
+            )? as u64;
+            Ok(receipts.saturating_add(editor).saturating_add(patch_journals))
         })
         .await
     }

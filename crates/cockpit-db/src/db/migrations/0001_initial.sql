@@ -6434,18 +6434,20 @@ END;
 CREATE TABLE extended_config_patch_journals (
     owner_digest          TEXT NOT NULL,
     client_operation_id   TEXT NOT NULL,
-    request_hash          BLOB NOT NULL CHECK (length(request_hash) = 32),
+    request_hash          BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
     fencing_generation    INTEGER NOT NULL CHECK (fencing_generation > 0),
     project_root          TEXT NOT NULL,
     target_path           TEXT NOT NULL,
-    consumed_content_hash TEXT NOT NULL CHECK (length(consumed_content_hash) = 64),
-    intended_content_hash TEXT NOT NULL CHECK (length(intended_content_hash) = 64),
+    consumed_content_hash TEXT NOT NULL CHECK (length(consumed_content_hash) = 64 AND consumed_content_hash = lower(consumed_content_hash)),
+    intended_content_hash TEXT NOT NULL CHECK (length(intended_content_hash) = 64 AND intended_content_hash = lower(intended_content_hash)),
     terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
     created_at_unix_ms    INTEGER NOT NULL,
     PRIMARY KEY (owner_digest, client_operation_id),
     CHECK (length(trim(project_root)) > 0),
     CHECK (length(trim(target_path)) > 0)
 );
+CREATE INDEX extended_config_patch_journals_created
+ON extended_config_patch_journals(created_at_unix_ms);
 
 -- Durable ownership claims for daemon-generated provider/MCP named secrets.
 -- Claims survive journal retirement so cleanup decisions do not depend on a

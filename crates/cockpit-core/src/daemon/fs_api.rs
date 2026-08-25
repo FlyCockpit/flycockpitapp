@@ -834,7 +834,7 @@ pub async fn apply_extended_config_patch(
             } else {
                 crate::daemon::server::inventory::current_config_generation()
             };
-            let terminal_response = Response::ExtendedConfigSaved {
+            let mut terminal_response = Response::ExtendedConfigSaved {
                 client_operation_id: client_operation_id.clone(),
                 request_hash: request_hash.iter().map(|byte| format!("{byte:02x}")).collect(),
                 hash: result_revision.clone(),
@@ -856,7 +856,8 @@ pub async fn apply_extended_config_patch(
                     })
                     .collect(),
             };
-            let terminal_response_json = serde_json::to_string(&terminal_response).map_err(internal)?;
+            let mut terminal_response_json =
+                serde_json::to_string(&terminal_response).map_err(internal)?;
             let journal_owner = owner.clone();
             let journal_operation = client_operation_id.clone();
             let journal_root = root.to_string_lossy().into_owned();
@@ -864,6 +865,10 @@ pub async fn apply_extended_config_patch(
             let journal_consumed = current_hash.clone();
             let journal_intended = desired_hash.clone();
             let journal_response = terminal_response_json.clone();
+            // Do not wait on the SQLite writer while holding a filesystem
+            // mutation lock. Recovery is deliberately conservative if the
+            // target changes in this short prepare/reacquire interval.
+            drop(_guard);
             runtime.block_on(db.write(move |conn| {
                 conn.execute(
                     "INSERT INTO extended_config_patch_journals
@@ -875,23 +880,45 @@ pub async fn apply_extended_config_patch(
                 )?;
                 Ok(())
             })).map_err(internal)?;
-            if changed {
-                // Re-open immediately before publication while the real
-                // per-target cross-process lock is held. Both identity and
-                // bytes must still describe the exact capability snapshot.
-                let (precommit, precommit_identity) = read_optional_config(&target)?;
-                if precommit_identity != capability.identity
-                    || content_hash(&precommit) != capability.raw_revision
-                {
-                    return Err(conflict(
-                        "configuration target changed immediately before commit",
-                    ));
-                }
+            let _publication_guard =
+                cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
+            // Re-open after durable prepare and after reacquiring the target
+            // lock. This closes both external-editor and daemon-writer races.
+            let (precommit, precommit_identity) = read_optional_config(&target)?;
+            if precommit_identity != capability.identity
+                || content_hash(&precommit) != capability.raw_revision
+            {
+                return Err(conflict(
+                    "configuration target changed immediately before commit",
+                ));
+            }
+            let published_generation = if changed {
                 cockpit_config::config::write_config_bytes_atomic(&target, &merged)
                     .map_err(internal)?;
-                let published = crate::daemon::server::inventory::publish_committed_config_generation();
+                Some(crate::daemon::server::inventory::publish_committed_config_generation())
+            } else {
+                None
+            };
+            drop(_publication_guard);
+            if let Some(published) = published_generation {
                 if published != config_generation {
-                    return Err(internal("typed settings config generation changed during serialized publication"));
+                    if let Response::ExtendedConfigSaved { config_generation, .. } = &mut terminal_response {
+                        *config_generation = published;
+                    }
+                    terminal_response_json = serde_json::to_string(&terminal_response).map_err(internal)?;
+                    let amend_owner = owner.clone();
+                    let amend_operation = client_operation_id.clone();
+                    let amended_response = terminal_response_json.clone();
+                    runtime.block_on(db.write(move |conn| {
+                        let changed = conn.execute(
+                            "UPDATE extended_config_patch_journals
+                                SET terminal_response_json=?3
+                              WHERE owner_digest=?1 AND client_operation_id=?2",
+                            rusqlite::params![amend_owner, amend_operation, amended_response],
+                        )?;
+                        if changed != 1 { anyhow::bail!("typed settings recovery intent disappeared before generation amendment"); }
+                        Ok(())
+                    })).map_err(internal)?;
                 }
             }
             let settle_owner = owner;
@@ -982,7 +1009,25 @@ pub(super) async fn recover_extended_config_patch_journals(
         .await
         .map_err(|error| internal(error))??;
         let terminal = if observed == intended {
-            Some(("terminal_success", response_json))
+            let mut response: Response = serde_json::from_str(&response_json).map_err(internal)?;
+            let generation = if intended == consumed {
+                crate::daemon::server::inventory::current_config_generation()
+            } else {
+                crate::daemon::server::inventory::publish_committed_config_generation()
+            };
+            let Response::ExtendedConfigSaved {
+                config_generation, ..
+            } = &mut response
+            else {
+                return Err(internal(
+                    "typed settings journal contains the wrong terminal response",
+                ));
+            };
+            *config_generation = generation;
+            Some((
+                "terminal_success",
+                serde_json::to_string(&response).map_err(internal)?,
+            ))
         } else if observed == consumed {
             Some((
                 "terminal_error",
@@ -2592,5 +2637,33 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.code, ErrorCode::BadRequest, "literal: {literal}");
         }
+    }
+
+    #[test]
+    fn typed_patch_recovery_stays_a_write_ahead_startup_boundary() {
+        let source = include_str!("fs_api.rs");
+        let apply = source
+            .split("pub async fn apply_extended_config_patch")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn trusted_settings_root").next())
+            .expect("typed patch implementation");
+        let release = apply.find("drop(_guard)").expect("config lock release");
+        let prepare = apply
+            .find("INSERT INTO extended_config_patch_journals")
+            .expect("durable prepare");
+        let publication = apply
+            .find("write_config_bytes_atomic")
+            .expect("atomic publication");
+        assert!(release < prepare && prepare < publication);
+        assert!(apply.contains("drop(_publication_guard)"));
+
+        let startup = include_str!("server/mod.rs");
+        let recovery = startup
+            .find("recover_extended_config_patch_journals")
+            .expect("typed patch startup recovery");
+        let generic = startup
+            .find("settle_interrupted_local_operations")
+            .expect("generic interrupted settlement");
+        assert!(recovery < generic);
     }
 }

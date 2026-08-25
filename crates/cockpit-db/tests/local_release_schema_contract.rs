@@ -65,7 +65,11 @@ fn provider_config_journal_actions_have_strict_payload_shapes() {
 #[test]
 fn authority_journals_bind_exact_fenced_terminal_receipts() {
     let sql = include_str!("../src/db/migrations/0001_initial.sql");
-    for table in ["provider_config_journals", "mcp_config_journals"] {
+    for table in [
+        "provider_config_journals",
+        "mcp_config_journals",
+        "extended_config_patch_journals",
+    ] {
         let declaration = sql
             .split(&format!("CREATE TABLE {table}"))
             .nth(1)

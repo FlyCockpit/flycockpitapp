@@ -35,7 +35,6 @@ pub use cockpit_db as db;
 mod terminal_host;
 
 use anyhow::Context;
-use clap::Parser;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -49,15 +48,15 @@ pub mod manpages {
     use std::io;
     use std::path::{Path, PathBuf};
 
-    use clap::{Command, CommandFactory};
+    use clap::Command;
 
-    use crate::cli::Cli;
+    use crate::cli;
 
     pub fn generate_manpages(output_dir: impl AsRef<Path>) -> io::Result<()> {
         let output_dir = output_dir.as_ref();
         fs::create_dir_all(output_dir)?;
 
-        let mut command = Cli::command();
+        let mut command = cli::public_v0_1_command();
         generate_command_page(&mut command, output_dir, &[String::from("cockpit")])
     }
 
@@ -724,7 +723,8 @@ fn error_stderr_line(err: &anyhow::Error) -> String {
 }
 
 async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    use clap::FromArgMatches as _;
+    let cli = Cli::from_arg_matches(&crate::cli::public_v0_1_command().get_matches())?;
 
     init_tracing(cli.log_level.as_deref(), cli.print_logs);
 
@@ -794,10 +794,9 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Init(args)) => commands::init::run(args, cli.no_sandbox).await,
         Some(Command::BashHints(sub)) => commands::bash_hints::run(sub).await,
         Some(Command::Completion { shell }) => {
-            use clap::CommandFactory;
             clap_complete::generate(
                 shell,
-                &mut Cli::command(),
+                &mut crate::cli::public_v0_1_command(),
                 "cockpit",
                 &mut std::io::stdout(),
             );

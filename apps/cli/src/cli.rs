@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 #[derive(Debug, Parser)]
@@ -53,6 +53,24 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+/// Authoritative top-level command surface advertised by the public v0.1
+/// artifact. Commands outside this list remain parseable for compatibility,
+/// but are absent from help, generated man pages, and shell completions.
+pub const PUBLIC_V0_1_COMMANDS: &[&str] = &[
+    "ask", "run", "agent", "provider", "setup", "models", "daemon", "doctor", "session", "trust",
+    "export", "config", "init",
+];
+
+pub(crate) fn public_v0_1_command() -> clap::Command {
+    let mut command = Cli::command();
+    for subcommand in command.get_subcommands_mut() {
+        if !PUBLIC_V0_1_COMMANDS.contains(&subcommand.get_name()) {
+            subcommand.hide(true);
+        }
+    }
+    command
 }
 
 #[derive(Debug, Subcommand)]

@@ -867,6 +867,7 @@ async fn project_note_list_preserves_sidebar_order() {
 async fn upsert_assistant_rpc_creates_daemon_owned_definition() {
     // `upsert_assistant` is now an owner-remoted persistent mutation, so it is
     // dispatched against a persistent (non-ephemeral) daemon.
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = persistent_test_ctx();
     let mut state = owner_state();
     let response = handle_request(

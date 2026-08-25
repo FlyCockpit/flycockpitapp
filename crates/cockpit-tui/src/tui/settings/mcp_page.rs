@@ -51,6 +51,7 @@ pub(super) struct ListState {
 
 pub(super) struct McpOAuthState {
     pub(super) server: String,
+    pub(super) begin_client_operation_id: String,
     pub(super) flow_id: String,
     pub(super) authorize_url: String,
     pub(super) callback: TextField,
@@ -367,11 +368,13 @@ impl SettingsCx {
             match completion {
                 super::PendingMcpOAuth::Started {
                     server,
+                    begin_client_operation_id,
                     flow_id,
                     authorize_url,
                 } => {
                     s.oauth = Some(McpOAuthState {
                         server,
+                        begin_client_operation_id,
                         flow_id,
                         authorize_url,
                         callback: TextField::default(),
@@ -413,6 +416,7 @@ impl SettingsCx {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     let flow_id = flow.flow_id.clone();
+                    let client_operation_id = uuid::Uuid::new_v4().to_string();
                     self.queue_simple_mutation(
                         super::SettingsEffectTarget {
                             surface: "settings.mcp-oauth-cancel",
@@ -420,11 +424,14 @@ impl SettingsCx {
                             revision: Some(flow_id.clone()),
                         },
                         cockpit_core::daemon::proto::Request::CancelMcpOAuth {
-                            flow_id: flow_id.clone(),
+                            client_operation_id: client_operation_id.clone(),
+                            begin_client_operation_id: flow.begin_client_operation_id.clone(),
+                            flow_id: Some(flow_id.clone()),
                         },
                         super::SettingsMutationAction::McpOAuthCancel {
                             server: flow.server.clone(),
                             flow_id,
+                            client_operation_id,
                         },
                     );
                     s.oauth = Some(flow);
@@ -440,6 +447,7 @@ impl SettingsCx {
                         return Nav::Stay;
                     }
                     let flow_id = flow.flow_id.clone();
+                    let client_operation_id = uuid::Uuid::new_v4().to_string();
                     self.queue_simple_secret_mutation(
                         super::SettingsEffectTarget {
                             surface: "settings.mcp-oauth-complete",
@@ -447,12 +455,14 @@ impl SettingsCx {
                             revision: Some(flow_id.clone()),
                         },
                         super::SettingsDaemonEffectWork::McpOAuthComplete {
+                            client_operation_id: client_operation_id.clone(),
                             flow_id: flow_id.clone(),
                             input: super::SecretPayload::new(input),
                         },
                         super::SettingsMutationAction::McpOAuthComplete {
                             server: flow.server.clone(),
                             flow_id,
+                            client_operation_id,
                         },
                     );
                     flow.status = Some("completing authentication…".into());
@@ -510,6 +520,7 @@ impl SettingsCx {
                 {
                     if matches!(server.auth, Auth::Oauth(_)) {
                         let name = name.clone();
+                        let client_operation_id = uuid::Uuid::new_v4().to_string();
                         let project_root = self
                             .active_project_root
                             .clone()
@@ -522,10 +533,14 @@ impl SettingsCx {
                                 revision: None,
                             },
                             cockpit_core::daemon::proto::Request::BeginMcpOAuth {
+                                client_operation_id: client_operation_id.clone(),
                                 project_root: project_root.display().to_string(),
                                 server: name.clone(),
                             },
-                            super::SettingsMutationAction::McpOAuthBegin { server: name },
+                            super::SettingsMutationAction::McpOAuthBegin {
+                                server: name,
+                                client_operation_id,
+                            },
                         );
                         s.status = Some("starting MCP OAuth…".into());
                     } else {

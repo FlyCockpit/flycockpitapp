@@ -10960,7 +10960,7 @@ async fn remote_owner_import_policy_rejects_literal_credential_and_closes_ledger
     assert!(replay.is_err(), "a closed operation must not re-run");
 }
 
-/// The three remaining owner-remoted setup/OAuth mutations are reachable by a
+/// The remaining owner-remoted setup mutations are reachable by a
 /// remote owner (they reserve a durable replay record before dispatch) and are
 /// ledger-wired (a domain failure closes the record `outcome_unknown` and a
 /// same-operation retry is refused rather than re-run). Their happy paths need a
@@ -10969,7 +10969,7 @@ async fn remote_owner_import_policy_rejects_literal_credential_and_closes_ledger
 /// outcome — determines.
 #[tokio::test]
 #[cfg(feature = "remote")]
-async fn remote_owner_setup_and_oauth_mutations_reserve_and_close_ledger() {
+async fn remote_owner_setup_mutations_reserve_and_close_ledger() {
     for request in [
         Request::ApplySetupWizard {
             project_root: tempfile::tempdir()
@@ -10988,14 +10988,6 @@ async fn remote_owner_setup_and_oauth_mutations_reserve_and_close_ledger() {
                 .to_string_lossy()
                 .into_owned(),
             provider_id: "unconfigured-provider".into(),
-        },
-        Request::CompleteProviderOAuth {
-            flow_id: Uuid::new_v4().to_string(),
-            input: Some("https://callback.example/?code=unknown-flow".into()),
-        },
-        Request::CompleteMcpOAuth {
-            flow_id: Uuid::new_v4().to_string(),
-            input: Some("unknown-flow-code".into()),
         },
     ] {
         let ctx = persistent_test_ctx();
@@ -11058,11 +11050,15 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
     // one and assert the projection carries the challenge, never the verifier.
     let started = [
         Response::ProviderOAuthStarted {
+            client_operation_id: "provider-begin".into(),
+            request_hash: "00".repeat(32),
             flow_id: Uuid::new_v4().to_string(),
             authorize_url: "https://auth.example/authorize?state=abc&code_challenge=PUB-CHALLENGE&code_challenge_method=S256".into(),
             user_code: Some("WXYZ-1234".into()),
         },
         Response::McpOAuthStarted {
+            client_operation_id: "mcp-begin".into(),
+            request_hash: "00".repeat(32),
             flow_id: Uuid::new_v4().to_string(),
             authorize_url: "https://mcp.example/authorize?state=def&code_challenge=PUB-CHALLENGE".into(),
         },
@@ -11088,10 +11084,16 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
     }
     let completed = [
         Response::ProviderOAuthCompleted {
+            client_operation_id: "provider-complete".into(),
+            request_hash: "00".repeat(32),
+            flow_id: "provider-flow".into(),
             logged_in: true,
             retry_after_seconds: None,
         },
         Response::McpOAuthCompleted {
+            client_operation_id: "mcp-complete".into(),
+            request_hash: "00".repeat(32),
+            flow_id: "mcp-flow".into(),
             authenticated: true,
         },
     ];
@@ -11114,21 +11116,16 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
             );
         }
     }
-    // The durable `complete_*` request carries only the client-supplied flow id
-    // and callback input — never the server-held verifier — and its canonical
-    // remote-operation params encode exactly those two fields.
+    // The flow is intentionally local-only as one coherent lifecycle; no
+    // canonical remote-operation payload may be produced for completion.
     #[cfg(feature = "remote")]
     {
         let request = Request::CompleteProviderOAuth {
+            client_operation_id: "provider-complete".into(),
             flow_id: "flow-123".into(),
             input: Some("https://callback.example/?code=abc".into()),
         };
-        let params = request.canonical_remote_operation_params_v1().unwrap();
-        assert!(
-            !params
-                .windows(verifier.len())
-                .any(|w| w == verifier.as_bytes())
-        );
+        assert!(request.canonical_remote_operation_params_v1().is_err());
     }
 }
 
@@ -16621,25 +16618,33 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             provider_id: "codex-oauth".into(),
         },
         "begin_provider_oauth" => Request::BeginProviderOAuth {
+            client_operation_id: "provider-begin".into(),
             provider_id: "codex-oauth".into(),
         },
         "complete_provider_oauth" => Request::CompleteProviderOAuth {
+            client_operation_id: "provider-complete".into(),
             flow_id: "missing-flow".into(),
             input: None,
         },
         "cancel_provider_oauth" => Request::CancelProviderOAuth {
-            flow_id: "missing-flow".into(),
+            client_operation_id: "provider-cancel".into(),
+            begin_client_operation_id: "provider-begin".into(),
+            flow_id: Some("missing-flow".into()),
         },
         "begin_mcp_oauth" => Request::BeginMcpOAuth {
+            client_operation_id: "mcp-begin".into(),
             project_root: root.clone(),
             server: "missing-server".into(),
         },
         "complete_mcp_oauth" => Request::CompleteMcpOAuth {
+            client_operation_id: "mcp-complete".into(),
             flow_id: "missing-flow".into(),
             input: None,
         },
         "cancel_mcp_oauth" => Request::CancelMcpOAuth {
-            flow_id: "missing-flow".into(),
+            client_operation_id: "mcp-cancel".into(),
+            begin_client_operation_id: "mcp-begin".into(),
+            flow_id: Some("missing-flow".into()),
         },
         "get_provider_catalog_snapshot" => Request::GetProviderCatalogSnapshot {
             project_root: root.clone(),
@@ -23813,12 +23818,12 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::EnrollFlycockpitOrgSync { org_id: "org-fixture".into() }, kind: "enroll_flycockpit_org_sync", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::PutSubscriptionAck { provider_id: "codex-oauth".into() }, kind: "put_subscription_ack", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::BeginProviderOAuth { provider_id: "example".into() }, kind: "begin_provider_oauth", session_id: None, audit_path: None, mutating: false },
-        CommandMetadataCase { request: Request::CompleteProviderOAuth { flow_id: "flow".into(), input: None }, kind: "complete_provider_oauth", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::CancelProviderOAuth { flow_id: "flow".into() }, kind: "cancel_provider_oauth", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::BeginMcpOAuth { project_root: "/tmp/project".into(), server: "example".into() }, kind: "begin_mcp_oauth", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
-        CommandMetadataCase { request: Request::CompleteMcpOAuth { flow_id: "flow".into(), input: None }, kind: "complete_mcp_oauth", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::CancelMcpOAuth { flow_id: "flow".into() }, kind: "cancel_mcp_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::BeginProviderOAuth { client_operation_id: "begin-provider".into(), provider_id: "example".into() }, kind: "begin_provider_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::CompleteProviderOAuth { client_operation_id: "complete-provider".into(), flow_id: "flow".into(), input: None }, kind: "complete_provider_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::CancelProviderOAuth { client_operation_id: "cancel-provider".into(), begin_client_operation_id: "begin-provider".into(), flow_id: Some("flow".into()) }, kind: "cancel_provider_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::BeginMcpOAuth { client_operation_id: "begin-mcp".into(), project_root: "/tmp/project".into(), server: "example".into() }, kind: "begin_mcp_oauth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::CompleteMcpOAuth { client_operation_id: "complete-mcp".into(), flow_id: "flow".into(), input: None }, kind: "complete_mcp_oauth", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::CancelMcpOAuth { client_operation_id: "cancel-mcp".into(), begin_client_operation_id: "begin-mcp".into(), flow_id: Some("flow".into()) }, kind: "cancel_mcp_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetProviderCatalogSnapshot { project_root: "/tmp/project".into(), provider_id: None, snapshot_session_id: "fixture-snapshot".into() }, kind: "get_provider_catalog_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ApplyProviderMutation { snapshot_session_id: "fixture-snapshot".into(), layer_id: "fixture-layer".into(), expected_revision: "fixture-revision".into(), client_operation_id: "fixture-operation".into(), mutation: cockpit_proto::ProviderMutationBatch { upserts: vec![cockpit_proto::ProviderMutationUpsert { provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }], deletes: Vec::new(), metadata: None } }, kind: "apply_provider_mutation", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetLocalOperationSettlement { client_operation_id: "fixture-operation".into() }, kind: "get_local_operation_settlement", session_id: None, audit_path: None, mutating: false },

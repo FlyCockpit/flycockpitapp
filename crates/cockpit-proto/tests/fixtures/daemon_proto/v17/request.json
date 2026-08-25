@@ -1507,12 +1507,14 @@
   },
   "begin_provider_oauth": {
     "params": {
+      "client_operation_id": "begin-provider",
       "provider_id": "grok-oauth"
     },
     "request": "begin_provider_oauth"
   },
   "complete_provider_oauth": {
     "params": {
+      "client_operation_id": "complete-provider",
       "flow_id": "flow-fixture",
       "input": null
     },
@@ -1520,12 +1522,15 @@
   },
   "cancel_provider_oauth": {
     "params": {
+      "begin_client_operation_id": "begin-provider",
+      "client_operation_id": "cancel-provider",
       "flow_id": "flow-fixture"
     },
     "request": "cancel_provider_oauth"
   },
   "begin_mcp_oauth": {
     "params": {
+      "client_operation_id": "begin-mcp",
       "project_root": "/tmp/project",
       "server": "example"
     },
@@ -1533,6 +1538,7 @@
   },
   "complete_mcp_oauth": {
     "params": {
+      "client_operation_id": "complete-mcp",
       "flow_id": "flow-fixture",
       "input": null
     },
@@ -1540,6 +1546,8 @@
   },
   "cancel_mcp_oauth": {
     "params": {
+      "begin_client_operation_id": "begin-mcp",
+      "client_operation_id": "cancel-mcp",
       "flow_id": "flow-fixture"
     },
     "request": "cancel_mcp_oauth"

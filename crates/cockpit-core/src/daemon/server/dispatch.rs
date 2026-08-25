@@ -106,7 +106,9 @@ enum ProviderOAuthFlow {
     /// Ready value before network I/O. The variant documents the state machine
     /// and makes accidental re-insertion of an in-flight flow conspicuous.
     #[allow(dead_code)]
-    Completing,
+    Completing {
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
 }
 
 #[derive(Clone)]
@@ -121,14 +123,23 @@ const OAUTH_FLOW_OWNER_CAPACITY: usize = 8;
 
 struct StoredProviderOAuthFlow {
     owner: String,
+    begin_client_operation_id: String,
     created_at: Instant,
     flow: ProviderOAuthFlow,
 }
 
 struct StoredMcpOAuthFlow {
     owner: String,
+    begin_client_operation_id: String,
     created_at: Instant,
-    flow: McpOAuthPending,
+    flow: McpOAuthFlow,
+}
+
+enum McpOAuthFlow {
+    Ready(McpOAuthPending),
+    Completing {
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
 }
 
 /// Daemon-owned OAuth state. Keeping this on the context prevents one daemon
@@ -185,7 +196,13 @@ impl OAuthFlowStore {
         }
     }
 
-    async fn insert_provider(&self, id: String, owner: String, flow: ProviderOAuthFlow) {
+    async fn insert_provider(
+        &self,
+        id: String,
+        owner: String,
+        begin_client_operation_id: String,
+        flow: ProviderOAuthFlow,
+    ) {
         let mut flows = self.provider.lock().await;
         Self::purge_provider(&mut flows);
         if flows.values().filter(|flow| flow.owner == owner).count() >= OAUTH_FLOW_OWNER_CAPACITY {
@@ -203,30 +220,87 @@ impl OAuthFlowStore {
             id,
             StoredProviderOAuthFlow {
                 owner,
+                begin_client_operation_id,
                 created_at: Instant::now(),
                 flow,
             },
         );
     }
 
-    async fn take_provider(&self, id: &str, owner: &str) -> Option<ProviderOAuthFlow> {
+    async fn claim_provider(
+        &self,
+        id: &str,
+        owner: &str,
+    ) -> Option<(
+        ProviderOAuthReady,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )> {
         let mut flows = self.provider.lock().await;
         Self::purge_provider(&mut flows);
-        (flows.get(id).is_some_and(|flow| flow.owner == owner))
-            .then(|| flows.remove(id).expect("flow checked above").flow)
+        let stored = flows.get_mut(id).filter(|flow| flow.owner == owner)?;
+        let ProviderOAuthFlow::Ready(ready) = &stored.flow else {
+            return None;
+        };
+        let ready = ready.clone();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        stored.flow = ProviderOAuthFlow::Completing {
+            cancelled: cancelled.clone(),
+        };
+        Some((ready, cancelled))
     }
 
-    async fn restore_provider(&self, id: String, owner: String, flow: ProviderOAuthFlow) {
-        self.insert_provider(id, owner, flow).await;
+    async fn restore_provider(&self, id: &str, owner: &str, flow: ProviderOAuthReady) {
+        let mut flows = self.provider.lock().await;
+        if let Some(stored) = flows.get_mut(id).filter(|flow| flow.owner == owner) {
+            stored.flow = ProviderOAuthFlow::Ready(flow);
+        }
+    }
+
+    async fn resolve_provider_id(
+        &self,
+        id: Option<&str>,
+        begin_id: &str,
+        owner: &str,
+    ) -> Option<String> {
+        let mut flows = self.provider.lock().await;
+        Self::purge_provider(&mut flows);
+        id.filter(|id| {
+            flows.get(*id).is_some_and(|flow| {
+                flow.owner == owner && flow.begin_client_operation_id == begin_id
+            })
+        })
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            flows
+                .iter()
+                .find(|(_, flow)| flow.owner == owner && flow.begin_client_operation_id == begin_id)
+                .map(|(id, _)| id.clone())
+        })
+    }
+
+    async fn cancel_provider(&self, id: &str, owner: &str) -> bool {
+        let mut flows = self.provider.lock().await;
+        Self::purge_provider(&mut flows);
+        let Some(stored) = flows.get(id).filter(|flow| flow.owner == owner) else {
+            return false;
+        };
+        if let ProviderOAuthFlow::Completing { cancelled } = &stored.flow {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        flows.remove(id).is_some()
     }
 
     async fn remove_provider(&self, id: &str, owner: &str) -> bool {
-        let mut flows = self.provider.lock().await;
-        Self::purge_provider(&mut flows);
-        flows.get(id).is_some_and(|flow| flow.owner == owner) && flows.remove(id).is_some()
+        self.cancel_provider(id, owner).await
     }
 
-    async fn insert_mcp(&self, id: String, owner: String, flow: McpOAuthPending) {
+    async fn insert_mcp(
+        &self,
+        id: String,
+        owner: String,
+        begin_client_operation_id: String,
+        flow: McpOAuthPending,
+    ) {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
         if flows.values().filter(|flow| flow.owner == owner).count() >= OAUTH_FLOW_OWNER_CAPACITY {
@@ -244,23 +318,71 @@ impl OAuthFlowStore {
             id,
             StoredMcpOAuthFlow {
                 owner,
+                begin_client_operation_id,
                 created_at: Instant::now(),
-                flow,
+                flow: McpOAuthFlow::Ready(flow),
             },
         );
     }
 
-    async fn take_mcp(&self, id: &str, owner: &str) -> Option<McpOAuthPending> {
+    async fn claim_mcp(
+        &self,
+        id: &str,
+        owner: &str,
+    ) -> Option<(
+        McpOAuthPending,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )> {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
-        (flows.get(id).is_some_and(|flow| flow.owner == owner))
-            .then(|| flows.remove(id).expect("flow checked above").flow)
+        let stored = flows.get_mut(id).filter(|flow| flow.owner == owner)?;
+        let flow = std::mem::replace(
+            &mut stored.flow,
+            McpOAuthFlow::Completing {
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        let McpOAuthFlow::Ready(pending) = flow else {
+            return None;
+        };
+        let McpOAuthFlow::Completing { cancelled } = &stored.flow else {
+            unreachable!()
+        };
+        Some((pending, cancelled.clone()))
+    }
+
+    async fn resolve_mcp_id(
+        &self,
+        id: Option<&str>,
+        begin_id: &str,
+        owner: &str,
+    ) -> Option<String> {
+        let mut flows = self.mcp.lock().await;
+        Self::purge_mcp(&mut flows);
+        id.filter(|id| {
+            flows.get(*id).is_some_and(|flow| {
+                flow.owner == owner && flow.begin_client_operation_id == begin_id
+            })
+        })
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            flows
+                .iter()
+                .find(|(_, flow)| flow.owner == owner && flow.begin_client_operation_id == begin_id)
+                .map(|(id, _)| id.clone())
+        })
     }
 
     async fn remove_mcp(&self, id: &str, owner: &str) -> bool {
         let mut flows = self.mcp.lock().await;
         Self::purge_mcp(&mut flows);
-        flows.get(id).is_some_and(|flow| flow.owner == owner) && flows.remove(id).is_some()
+        let Some(stored) = flows.get(id).filter(|flow| flow.owner == owner) else {
+            return false;
+        };
+        if let McpOAuthFlow::Completing { cancelled } = &stored.flow {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        flows.remove(id).is_some()
     }
 }
 
@@ -329,14 +451,33 @@ mod oauth_store_tests {
                 .insert_provider(
                     format!("flow-{index}"),
                     "owner-a".to_string(),
-                    ProviderOAuthFlow::Completing,
+                    format!("begin-{index}"),
+                    ProviderOAuthFlow::Completing {
+                        cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    },
                 )
                 .await;
         }
 
-        assert!(store.take_provider("flow-0", "owner-a").await.is_none());
-        assert!(store.take_provider("flow-1", "owner-b").await.is_none());
-        assert!(store.take_provider("flow-8", "owner-a").await.is_some());
+        assert!(
+            store
+                .resolve_provider_id(Some("flow-0"), "begin-0", "owner-a")
+                .await
+                .is_none()
+        );
+        assert!(
+            store
+                .resolve_provider_id(Some("flow-1"), "begin-1", "owner-b")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .resolve_provider_id(Some("flow-8"), "begin-8", "owner-a")
+                .await
+                .as_deref(),
+            Some("flow-8")
+        );
     }
 }
 
@@ -7379,14 +7520,30 @@ async fn handle_serialized_request_impl(
             }
         }
 
-        Request::BeginProviderOAuth { provider_id } => {
+        Request::BeginProviderOAuth {
+            client_operation_id,
+            provider_id,
+        } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
             }
-            let flow_id = uuid::Uuid::new_v4().to_string();
             let owner = oauth_owner(state);
+            let request_hash =
+                local_operation_request_hash(&("begin_provider_oauth", &provider_id))?;
+            if let Some(response) = begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "begin_provider_oauth",
+                request_hash,
+            )
+            .await?
+            {
+                return Ok(response);
+            }
+            let flow_id = uuid::Uuid::new_v4().to_string();
             let (flow, authorize_url, user_code) = match provider_id.as_str() {
                 crate::auth::xai_oauth::CREDENTIAL_KEY => {
                     let login = crate::auth::xai_oauth::begin_manual_login()
@@ -7414,37 +7571,46 @@ async fn handle_serialized_request_impl(
                 _ => return Err(bad_request("unsupported provider OAuth flow")),
             };
             ctx.oauth_flows
-                .insert_provider(flow_id.clone(), owner, flow)
+                .insert_provider(
+                    flow_id.clone(),
+                    owner.clone(),
+                    client_operation_id.clone(),
+                    flow,
+                )
                 .await;
-            Ok(Response::ProviderOAuthStarted {
+            let response = Response::ProviderOAuthStarted {
+                client_operation_id: client_operation_id.clone(),
+                request_hash: local_operation_request_hash_hex(&request_hash),
                 flow_id,
                 authorize_url,
                 user_code,
-            })
+            };
+            finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
+                .await?;
+            Ok(response)
         }
 
-        Request::CompleteProviderOAuth { flow_id, input } => {
+        Request::CompleteProviderOAuth {
+            client_operation_id,
+            flow_id,
+            input,
+        } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
             }
-            #[cfg(feature = "remote")]
-            let request = Request::CompleteProviderOAuth {
-                flow_id: flow_id.clone(),
-                input: input.clone(),
-            };
-            // The durable completion reserves a nonrepeatable remote operation
-            // before the one-shot exchange so an authenticated remote owner can
-            // retry it idempotently: a replay returns the cached safe response
-            // (which carries no token) without re-running the exchange. The PKCE
-            // verifier and the exchanged tokens stay server-side / in the vault
-            // and never enter the ledger's safe response or any log.
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) =
-                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
-                        .await?
+            let owner = oauth_owner(state);
+            let request_hash =
+                local_operation_request_hash(&("complete_provider_oauth", &flow_id, &input))?;
+            if let Some(response) = begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "complete_provider_oauth",
+                request_hash,
+            )
+            .await?
             {
                 return Ok(response);
             }
@@ -7454,30 +7620,19 @@ async fn handle_serialized_request_impl(
                 // lookup instead of issuing another token set. Restore only when
                 // validation or the pre-persistence exchange fails; once the
                 // provider has exchanged the code, replay must remain rejected.
-                let owner = oauth_owner(state);
-                let flow = ctx
+                let (ready, cancellation_fence) = ctx
                     .oauth_flows
-                    .take_provider(&flow_id, &owner)
+                    .claim_provider(&flow_id, &owner)
                     .await
                     .ok_or_else(|| {
                         bad_request("provider OAuth flow is unknown or already completed")
                     })?;
-                let ready = match flow {
-                    ProviderOAuthFlow::Ready(ready) => ready,
-                    ProviderOAuthFlow::Completing => {
-                        return Err(bad_request("provider OAuth flow is already completing"));
-                    }
-                };
                 let exchange_ready = ready.clone();
                 let exchange = match exchange_ready {
                     ProviderOAuthReady::Grok(login) => {
                         let Some(callback) = input.as_deref() else {
                             ctx.oauth_flows
-                                .restore_provider(
-                                    flow_id,
-                                    owner.clone(),
-                                    ProviderOAuthFlow::Ready(ProviderOAuthReady::Grok(login)),
-                                )
+                                .restore_provider(&flow_id, &owner, ProviderOAuthReady::Grok(login))
                                 .await;
                             return Err(bad_request(
                                 "Grok OAuth completion requires a callback URL or code",
@@ -7496,9 +7651,9 @@ async fn handle_serialized_request_impl(
                         if input.is_some() {
                             ctx.oauth_flows
                                 .restore_provider(
-                                    flow_id,
-                                    owner.clone(),
-                                    ProviderOAuthFlow::Ready(ProviderOAuthReady::Codex(login)),
+                                    &flow_id,
+                                    &owner,
+                                    ProviderOAuthReady::Codex(login),
                                 )
                                 .await;
                             return Err(bad_request(
@@ -7521,16 +7676,15 @@ async fn handle_serialized_request_impl(
                     Ok(value) => value,
                     Err(error) => {
                         ctx.oauth_flows
-                            .restore_provider(
-                                flow_id,
-                                owner.clone(),
-                                ProviderOAuthFlow::Ready(ready),
-                            )
+                            .restore_provider(&flow_id, &owner, ready)
                             .await;
                         return Err(error);
                     }
                 };
                 let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+                if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(conflict("provider OAuth completion was cancelled"));
+                }
                 ctx.mutate_owner_vault_item(
                     cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
                     provider_id,
@@ -7541,28 +7695,67 @@ async fn handle_serialized_request_impl(
                 // prevents a duplicate exchange after a successful completion.
                 ctx.oauth_flows.remove_provider(&flow_id, &owner).await;
                 Ok(Response::ProviderOAuthCompleted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    flow_id: flow_id.clone(),
                     logged_in: true,
                     retry_after_seconds: None,
                 })
             };
-            finish_provider_mutation_future!(
-                remote_operation,
-                ctx,
-                "complete_provider_oauth",
-                mutation
-            )
+            let response = mutation.await?;
+            finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
+                .await?;
+            Ok(response)
         }
 
-        Request::CancelProviderOAuth { flow_id } => {
+        Request::CancelProviderOAuth {
+            client_operation_id,
+            begin_client_operation_id,
+            flow_id,
+        } => {
             let owner = oauth_owner(state);
-            // Idempotent terminal settlement: an already-completed, expired,
-            // or previously-cancelled flow is indistinguishable from a
-            // successfully removed one to the owning client.
-            let _ = ctx.oauth_flows.remove_provider(&flow_id, &owner).await;
-            Ok(Response::Ack)
+            let request_hash = local_operation_request_hash(&(
+                "cancel_provider_oauth",
+                &begin_client_operation_id,
+                &flow_id,
+            ))?;
+            if let Some(response) = begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "cancel_provider_oauth",
+                request_hash,
+            )
+            .await?
+            {
+                return Ok(response);
+            }
+            let resolved_flow_id = ctx
+                .oauth_flows
+                .resolve_provider_id(flow_id.as_deref(), &begin_client_operation_id, &owner)
+                .await;
+            // Serialize with the persistence fence. An acknowledged cancellation
+            // therefore either wins before the vault commit or reports that the
+            // exact flow had already reached another terminal state.
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            let cancelled = if let Some(flow_id) = resolved_flow_id.as_deref() {
+                ctx.oauth_flows.cancel_provider(flow_id, &owner).await
+            } else {
+                false
+            };
+            let response = Response::ProviderOAuthCancelled {
+                client_operation_id: client_operation_id.clone(),
+                request_hash: local_operation_request_hash_hex(&request_hash),
+                flow_id: resolved_flow_id,
+                cancelled,
+            };
+            finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
+                .await?;
+            Ok(response)
         }
 
         Request::BeginMcpOAuth {
+            client_operation_id,
             project_root,
             server,
         } => {
@@ -7575,6 +7768,20 @@ async fn handle_serialized_request_impl(
             // stored root, and the in-transaction guard at `CompleteMcpOAuth` must
             // all key on the same canonical workspace root as later resolution.
             let project_root = crate::secret_ownership::canonical_owner_root(&project_root);
+            let owner = oauth_owner(state);
+            let request_hash =
+                local_operation_request_hash(&("begin_mcp_oauth", &project_root, &server))?;
+            if let Some(response) = begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "begin_mcp_oauth",
+                request_hash,
+            )
+            .await?
+            {
+                return Ok(response);
+            }
             let cwd = std::path::PathBuf::from(&project_root);
             let trust_policy =
                 crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
@@ -7616,7 +7823,8 @@ async fn handle_serialized_request_impl(
             ctx.oauth_flows
                 .insert_mcp(
                     flow_id.clone(),
-                    oauth_owner(state),
+                    owner.clone(),
+                    client_operation_id.clone(),
                     McpOAuthPending {
                         project_root,
                         server,
@@ -7624,42 +7832,45 @@ async fn handle_serialized_request_impl(
                     },
                 )
                 .await;
-            Ok(Response::McpOAuthStarted {
+            let response = Response::McpOAuthStarted {
+                client_operation_id: client_operation_id.clone(),
+                request_hash: local_operation_request_hash_hex(&request_hash),
                 flow_id,
                 authorize_url,
-            })
+            };
+            finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
+                .await?;
+            Ok(response)
         }
 
-        Request::CompleteMcpOAuth { flow_id, input } => {
+        Request::CompleteMcpOAuth {
+            client_operation_id,
+            flow_id,
+            input,
+        } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent MCP OAuth logins",
                 ));
             }
-            #[cfg(feature = "remote")]
-            let request = Request::CompleteMcpOAuth {
-                flow_id: flow_id.clone(),
-                input: input.clone(),
-            };
-            // Durable MCP OAuth completion: reserve a nonrepeatable remote
-            // operation before the one-shot exchange so a remote owner can retry
-            // idempotently (a replay returns the cached, token-free safe
-            // response). The exchanged tokens are staged into the vault inside
-            // the BEGIN IMMEDIATE transaction below and never enter the ledger
-            // safe response or any log.
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) =
-                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
-                        .await?
+            let owner = oauth_owner(state);
+            let request_hash =
+                local_operation_request_hash(&("complete_mcp_oauth", &flow_id, &input))?;
+            if let Some(response) = begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "complete_mcp_oauth",
+                request_hash,
+            )
+            .await?
             {
                 return Ok(response);
             }
             let mutation = async {
-                let owner = oauth_owner(state);
-                let pending = ctx
+                let (pending, cancellation_fence) = ctx
                     .oauth_flows
-                    .take_mcp(&flow_id, &owner)
+                    .claim_mcp(&flow_id, &owner)
                     .await
                     .ok_or_else(|| bad_request("MCP OAuth flow is unknown or already completed"))?;
                 // Once claimed, this flow is one-shot. A provider exchange may have
@@ -7670,6 +7881,9 @@ async fn handle_serialized_request_impl(
                     .map_err(internal)?;
                 let record = serde_json::to_vec(&tokens).map_err(internal)?;
                 let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+                if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(conflict("MCP OAuth completion was cancelled"));
+                }
                 let credential_key = crate::mcp::auth::cred_key(&pending.server);
                 let owner_root = pending.project_root.clone();
                 let vault = ctx.secret_vault.clone();
@@ -7719,16 +7933,60 @@ async fn handle_serialized_request_impl(
                     return Err(internal(error));
                 }
                 Ok(Response::McpOAuthCompleted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    flow_id: flow_id.clone(),
                     authenticated: true,
                 })
             };
-            finish_provider_mutation_future!(remote_operation, ctx, "complete_mcp_oauth", mutation)
+            let response = mutation.await?;
+            let _ = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
+            finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
+                .await?;
+            Ok(response)
         }
 
-        Request::CancelMcpOAuth { flow_id } => {
+        Request::CancelMcpOAuth {
+            client_operation_id,
+            begin_client_operation_id,
+            flow_id,
+        } => {
             let owner = oauth_owner(state);
-            let cancelled = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
-            Ok(Response::McpOAuthCancelled { cancelled })
+            let request_hash = local_operation_request_hash(&(
+                "cancel_mcp_oauth",
+                &begin_client_operation_id,
+                &flow_id,
+            ))?;
+            if let Some(response) = begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "cancel_mcp_oauth",
+                request_hash,
+            )
+            .await?
+            {
+                return Ok(response);
+            }
+            let resolved_flow_id = ctx
+                .oauth_flows
+                .resolve_mcp_id(flow_id.as_deref(), &begin_client_operation_id, &owner)
+                .await;
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            let cancelled = if let Some(flow_id) = resolved_flow_id.as_deref() {
+                ctx.oauth_flows.remove_mcp(flow_id, &owner).await
+            } else {
+                false
+            };
+            let response = Response::McpOAuthCancelled {
+                client_operation_id: client_operation_id.clone(),
+                request_hash: local_operation_request_hash_hex(&request_hash),
+                flow_id: resolved_flow_id,
+                cancelled,
+            };
+            finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
+                .await?;
+            Ok(response)
         }
 
         Request::DeleteProviderCredential {
@@ -10706,6 +10964,13 @@ fn local_operation_request_hash<T: serde::Serialize>(
     Ok(Sha256::digest(encoded).into())
 }
 
+fn local_operation_request_hash_hex(request_hash: &[u8; 32]) -> String {
+    request_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 async fn begin_local_operation(
     ctx: &DaemonContext,
     owner: &str,
@@ -10767,6 +11032,30 @@ fn client_operation_id_from_response(
             ..
         }
         | Response::CopilotAuthCommitted {
+            client_operation_id,
+            ..
+        }
+        | Response::ProviderOAuthStarted {
+            client_operation_id,
+            ..
+        }
+        | Response::ProviderOAuthCompleted {
+            client_operation_id,
+            ..
+        }
+        | Response::ProviderOAuthCancelled {
+            client_operation_id,
+            ..
+        }
+        | Response::McpOAuthStarted {
+            client_operation_id,
+            ..
+        }
+        | Response::McpOAuthCompleted {
+            client_operation_id,
+            ..
+        }
+        | Response::McpOAuthCancelled {
             client_operation_id,
             ..
         } => Ok(client_operation_id.clone()),

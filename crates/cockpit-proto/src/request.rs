@@ -151,6 +151,15 @@ fn validate_owner_identifier(label: &str, value: &str, max: usize) -> Result<(),
     Ok(())
 }
 
+fn validate_optional_oauth_flow_id(value: Option<&str>, label: &str) -> Result<(), String> {
+    if value.is_some_and(|flow_id| {
+        flow_id.is_empty() || flow_id.len() > MAX_OWNER_PROVIDER_ID_BYTES || flow_id.contains('\0')
+    }) {
+        return Err(format!("{label} OAuth flow id is invalid"));
+    }
+    Ok(())
+}
+
 fn validate_owner_project_root(value: &str) -> Result<(), String> {
     validate_owner_identifier("project root", value, MAX_OWNER_PROJECT_ROOT_BYTES)
 }
@@ -1475,6 +1484,8 @@ pub enum Request {
     /// only display-safe instructions and an opaque flow id.
     #[serde(rename = "begin_provider_oauth")]
     BeginProviderOAuth {
+        /// Stable owner-generated idempotency key for this begin attempt.
+        client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         provider_id: String,
     },
@@ -1484,6 +1495,7 @@ pub enum Request {
     /// ignore it and poll using state retained by the daemon.
     #[serde(rename = "complete_provider_oauth")]
     CompleteProviderOAuth {
+        client_operation_id: String,
         flow_id: String,
         #[serde(default)]
         input: Option<String>,
@@ -1493,13 +1505,19 @@ pub enum Request {
     /// idempotent so a client can settle a timed-out or already-consumed flow.
     #[serde(rename = "cancel_provider_oauth")]
     CancelProviderOAuth {
-        flow_id: String,
+        client_operation_id: String,
+        /// The begin operation is always known, even when its response (and
+        /// therefore the daemon flow id) was lost in transport.
+        begin_client_operation_id: String,
+        #[serde(default)]
+        flow_id: Option<String>,
     },
 
     /// Begin daemon-owned MCP OAuth. The daemon retains PKCE and loopback
     /// callback state; the client receives only an opaque flow id and URL.
     #[serde(rename = "begin_mcp_oauth")]
     BeginMcpOAuth {
+        client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
         server: String,
@@ -1509,6 +1527,7 @@ pub enum Request {
     /// URL/code supplied by a UI, but never a token.
     #[serde(rename = "complete_mcp_oauth")]
     CompleteMcpOAuth {
+        client_operation_id: String,
         flow_id: String,
         #[serde(default)]
         input: Option<String>,
@@ -1517,7 +1536,10 @@ pub enum Request {
     /// Cancel an in-progress daemon-owned MCP OAuth flow.
     #[serde(rename = "cancel_mcp_oauth")]
     CancelMcpOAuth {
-        flow_id: String,
+        client_operation_id: String,
+        begin_client_operation_id: String,
+        #[serde(default)]
+        flow_id: Option<String>,
     },
 
     /// Remove one provider credential record from the daemon vault.
@@ -2536,13 +2558,22 @@ impl Request {
             } => {
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
             }
-            Self::BeginProviderOAuth { provider_id } => {
+            Self::BeginProviderOAuth {
+                client_operation_id,
+                provider_id,
+            } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
                 if !matches!(provider_id.as_str(), "grok-oauth" | "codex-oauth") {
                     return Err("provider OAuth is only available for Grok or Codex".to_string());
                 }
             }
-            Self::CompleteProviderOAuth { flow_id, input } => {
+            Self::CompleteProviderOAuth {
+                client_operation_id,
+                flow_id,
+                input,
+            } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 if flow_id.is_empty()
                     || flow_id.len() > MAX_OWNER_PROVIDER_ID_BYTES
                     || flow_id.contains('\0')
@@ -2556,22 +2587,34 @@ impl Request {
                     return Err("OAuth callback input exceeds maximum length".to_string());
                 }
             }
-            Self::CancelProviderOAuth { flow_id } => {
-                if flow_id.is_empty()
-                    || flow_id.len() > MAX_OWNER_PROVIDER_ID_BYTES
-                    || flow_id.contains('\0')
-                {
-                    return Err("provider OAuth flow id is invalid".to_string());
-                }
+            Self::CancelProviderOAuth {
+                client_operation_id,
+                begin_client_operation_id,
+                flow_id,
+            } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
+                validate_owner_identifier(
+                    "begin client operation",
+                    begin_client_operation_id,
+                    128,
+                )?;
+                validate_optional_oauth_flow_id(flow_id.as_deref(), "provider")?;
             }
             Self::BeginMcpOAuth {
+                client_operation_id,
                 project_root,
                 server,
             } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
                 validate_owner_identifier("MCP server", server, MAX_OWNER_PROVIDER_ID_BYTES)?;
             }
-            Self::CompleteMcpOAuth { flow_id, input } => {
+            Self::CompleteMcpOAuth {
+                client_operation_id,
+                flow_id,
+                input,
+            } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 if flow_id.is_empty()
                     || flow_id.len() > MAX_OWNER_PROVIDER_ID_BYTES
                     || flow_id.contains('\0')
@@ -2585,13 +2628,18 @@ impl Request {
                     return Err("MCP OAuth callback input exceeds maximum length".to_string());
                 }
             }
-            Self::CancelMcpOAuth { flow_id } => {
-                if flow_id.is_empty()
-                    || flow_id.len() > MAX_OWNER_PROVIDER_ID_BYTES
-                    || flow_id.contains('\0')
-                {
-                    return Err("MCP OAuth flow id is invalid".to_string());
-                }
+            Self::CancelMcpOAuth {
+                client_operation_id,
+                begin_client_operation_id,
+                flow_id,
+            } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
+                validate_owner_identifier(
+                    "begin client operation",
+                    begin_client_operation_id,
+                    128,
+                )?;
+                validate_optional_oauth_flow_id(flow_id.as_deref(), "MCP")?;
             }
             Self::DeleteProviderCredential {
                 client_operation_id,
@@ -3502,23 +3550,15 @@ macro_rules! command {
             (Request::DeleteNamedSecret { name }, "delete_named_secret", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String", [name: String => param]);
             (Request::PutProviderCredential { client_operation_id, provider_id, record }, "put_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|provider_id:String|record:String", [client_operation_id: String => param, provider_id: String => param, record: String => param]);
             (Request::GetLocalOperationSettlement { client_operation_id }, "get_local_operation_settlement", owner_only, none, false, local_only, none, serialized, none, "client_operation_id:String", [client_operation_id: String => param]);
-            // OAuth handshakes retain daemon-process PKCE/device state. They
-            // cannot be safely replayed through a remote durable ledger after
-            // reconnect/restart; only the final vault mutation is durable.
-            // Provider/MCP OAuth is split for clean remoting: `begin_*` is a
-            // NON-DURABLE handshake that returns only the authorize URL (public
-            // `state` + `code_challenge`) to the authenticated owner, so it needs
-            // no remote-ledger reservation (`read_only`, non-mutating; the PKCE
-            // `code_verifier` never leaves the daemon). `complete_*` is the
-            // DURABLE completion: it accepts the callback code, exchanges it
-            // server-side, and stores the tokens in the vault, so it reserves a
-            // nonrepeatable remote operation and replays its safe response.
-            (Request::BeginProviderOAuth { provider_id }, "begin_provider_oauth", owner_only, none, false, read_only, none, serialized, none, "provider_id:String", [provider_id: String => param]);
-            (Request::CompleteProviderOAuth { flow_id, input }, "complete_provider_oauth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "flow_id:String|input:Option<String>", [flow_id: String => param, input: Option<String> => param]);
-            (Request::CancelProviderOAuth { flow_id }, "cancel_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "flow_id:String", [flow_id: String => param]);
-            (Request::BeginMcpOAuth { project_root, server }, "begin_mcp_oauth", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String|server:String", [project_root: String => project_root, server: String => param]);
-            (Request::CompleteMcpOAuth { flow_id, input }, "complete_mcp_oauth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "flow_id:String|input:Option<String>", [flow_id: String => param, input: Option<String> => param]);
-            (Request::CancelMcpOAuth { flow_id }, "cancel_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "flow_id:String", [flow_id: String => param]);
+            // OAuth is deliberately local-only as one coherent flow. Begin,
+            // completion, and cancellation all carry owner idempotency keys and
+            // use the local settlement ledger; none can cross the remote lane.
+            (Request::BeginProviderOAuth { client_operation_id, provider_id }, "begin_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|provider_id:String", [client_operation_id: String => param, provider_id: String => param]);
+            (Request::CompleteProviderOAuth { client_operation_id, flow_id, input }, "complete_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|flow_id:String|input:Option<String>", [client_operation_id: String => param, flow_id: String => param, input: Option<String> => param]);
+            (Request::CancelProviderOAuth { client_operation_id, begin_client_operation_id, flow_id }, "cancel_provider_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|begin_client_operation_id:String|flow_id:Option<String>", [client_operation_id: String => param, begin_client_operation_id: String => param, flow_id: Option<String> => param]);
+            (Request::BeginMcpOAuth { client_operation_id, project_root, server }, "begin_mcp_oauth", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|server:String", [client_operation_id: String => param, project_root: String => project_root, server: String => param]);
+            (Request::CompleteMcpOAuth { client_operation_id, flow_id, input }, "complete_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|flow_id:String|input:Option<String>", [client_operation_id: String => param, flow_id: String => param, input: Option<String> => param]);
+            (Request::CancelMcpOAuth { client_operation_id, begin_client_operation_id, flow_id }, "cancel_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|begin_client_operation_id:String|flow_id:Option<String>", [client_operation_id: String => param, begin_client_operation_id: String => param, flow_id: Option<String> => param]);
             (Request::DeleteProviderCredential { client_operation_id, provider_id, project_root }, "delete_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|provider_id:String|project_root:Option<String>", [client_operation_id: String => param, provider_id: String => param, project_root: Option<String> => param]);
             #[cfg(feature = "remote")]
             (Request::GetFlycockpitAccount, "get_flycockpit_account", owner_only, none, false, read_only, none, serialized, none, "-", []);

@@ -6238,6 +6238,7 @@ fn mcp_oauth_ui_retains_public_url_and_accepts_manual_callback() {
     callback.set("http://127.0.0.1:43123/callback?code=opaque");
     let state = mcp_page::McpOAuthState {
         server: "docs".into(),
+        begin_client_operation_id: "begin".into(),
         flow_id: "flow-id".into(),
         authorize_url: "https://auth.example.test/authorize".into(),
         callback,

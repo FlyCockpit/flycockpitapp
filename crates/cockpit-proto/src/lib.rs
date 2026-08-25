@@ -3134,7 +3134,12 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
         Body::Request { request, .. } => {
             let tag = request.wire_tag();
             let version = match tag {
-                "cancel_provider_oauth" => 17,
+                "begin_provider_oauth"
+                | "complete_provider_oauth"
+                | "cancel_provider_oauth"
+                | "begin_mcp_oauth"
+                | "complete_mcp_oauth"
+                | "cancel_mcp_oauth" => 17,
                 "cancel_leak_reveal" => 16,
                 "get_provider_catalog_snapshot" | "apply_provider_mutation" => 15,
                 "list_secret_inventory"
@@ -3154,11 +3159,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "set_provider_layer_metadata"
                 | "save_provider_config"
                 | "save_mcp_config"
-                | "begin_provider_oauth"
-                | "complete_provider_oauth"
-                | "begin_mcp_oauth"
-                | "complete_mcp_oauth"
-                | "cancel_mcp_oauth"
                 | "setup_copilot_auth"
                 | "apply_setup_wizard"
                 | "get_agent_inventory"
@@ -3229,6 +3229,12 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
         Body::Response { response, .. } => {
             let tag = response.wire_tag();
             let version = match tag {
+                "provider_oauth_started"
+                | "provider_oauth_completed"
+                | "provider_oauth_cancelled"
+                | "mcp_oauth_started"
+                | "mcp_oauth_completed"
+                | "mcp_oauth_cancelled" => 17,
                 "leak_reveal_cancelled" => 16,
                 "provider_catalog_snapshot" | "provider_mutation_committed" => 15,
                 "flycockpit_org_sync"
@@ -3237,11 +3243,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "provider_config_upserted"
                 | "secret_inventory"
                 | "flycockpit_account"
-                | "provider_oauth_started"
-                | "provider_oauth_completed"
-                | "mcp_oauth_started"
-                | "mcp_oauth_completed"
-                | "mcp_oauth_cancelled"
                 | "provider_credential_deleted"
                 | "mcp_config_saved"
                 | "extended_config_saved"
@@ -6569,7 +6570,9 @@ mod tests {
                 #[cfg(feature = "remote")]
                 operation: None,
                 request: Request::CancelProviderOAuth {
-                    flow_id: "flow".into(),
+                    client_operation_id: "cancel".into(),
+                    begin_client_operation_id: "begin".into(),
+                    flow_id: Some("flow".into()),
                 },
             })
             .0,
@@ -6659,22 +6662,28 @@ mod tests {
     fn every_new_oauth_and_durable_save_surface_requires_v10() {
         for request in [
             Request::BeginProviderOAuth {
+                client_operation_id: "begin-provider".into(),
                 provider_id: "codex-oauth".into(),
             },
             Request::CompleteProviderOAuth {
+                client_operation_id: "complete-provider".into(),
                 flow_id: "flow".into(),
                 input: None,
             },
             Request::BeginMcpOAuth {
+                client_operation_id: "begin-mcp".into(),
                 project_root: "/tmp/project".into(),
                 server: "server".into(),
             },
             Request::CompleteMcpOAuth {
+                client_operation_id: "complete-mcp".into(),
                 flow_id: "flow".into(),
                 input: None,
             },
             Request::CancelMcpOAuth {
-                flow_id: "flow".into(),
+                client_operation_id: "cancel-mcp".into(),
+                begin_client_operation_id: "begin-mcp".into(),
+                flow_id: Some("flow".into()),
             },
             Request::SetupCopilotAuth {
                 project_root: "/tmp/project".into(),
@@ -6694,22 +6703,37 @@ mod tests {
         }
         for response in [
             Response::ProviderOAuthStarted {
+                client_operation_id: "begin-provider".into(),
+                request_hash: "00".repeat(32),
                 flow_id: "flow".into(),
                 authorize_url: "https://example.test".into(),
                 user_code: None,
             },
             Response::ProviderOAuthCompleted {
+                client_operation_id: "complete-provider".into(),
+                request_hash: "00".repeat(32),
+                flow_id: "flow".into(),
                 logged_in: true,
                 retry_after_seconds: None,
             },
             Response::McpOAuthStarted {
+                client_operation_id: "begin-mcp".into(),
+                request_hash: "00".repeat(32),
                 flow_id: "flow".into(),
                 authorize_url: "https://example.test".into(),
             },
             Response::McpOAuthCompleted {
+                client_operation_id: "complete-mcp".into(),
+                request_hash: "00".repeat(32),
+                flow_id: "flow".into(),
                 authenticated: true,
             },
-            Response::McpOAuthCancelled { cancelled: true },
+            Response::McpOAuthCancelled {
+                client_operation_id: "cancel-mcp".into(),
+                request_hash: "00".repeat(32),
+                flow_id: Some("flow".into()),
+                cancelled: true,
+            },
             Response::McpConfigSaved {
                 credential_count: 0,
             },

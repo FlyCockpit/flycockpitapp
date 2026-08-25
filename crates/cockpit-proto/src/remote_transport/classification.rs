@@ -932,11 +932,8 @@ pub const REQUEST_CLASSIFICATION: &[RemoteMessageClassification] = &[
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
-    // OAuth flows: `begin_*` is a non-durable `read_only` handshake and
-    // `complete_*` a durable `nonrepeatable_mutation` in `request.rs`, but both
-    // are wire variants that still need a bounded transport-lane classification
-    // for exhaustive decoding.  This lane table is independent of the
-    // remote-operation eligibility axis and never grants it.
+    // OAuth is local-only in the authorization matrix. These rows exist solely
+    // for exhaustive frame sizing/decoding and do not grant remote eligibility.
     row(
         "begin_provider_oauth",
         RemoteMessageClass::BoundedRequestResponse,
@@ -1928,6 +1925,11 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
     ),
     row(
         "provider_oauth_completed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "provider_oauth_cancelled",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),

@@ -17,8 +17,23 @@ fn oauth_payload(
     }
 }
 
+fn oauth_operation_id(
+    client_flow_id: crate::tui::settings::pointer_actions::OAuthFlowId,
+    operation_id: crate::tui::settings::shell::PointerOperationId,
+    kind: &str,
+) -> String {
+    format!("tui-oauth-{}-{}-{kind}", client_flow_id.0, operation_id.0)
+}
+
+fn oauth_begin_operation_id(
+    client_flow_id: crate::tui::settings::pointer_actions::OAuthFlowId,
+) -> String {
+    format!("tui-oauth-{}-begin", client_flow_id.0)
+}
+
 async fn begin_provider_oauth(
     provider_id: &str,
+    client_operation_id: String,
 ) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
     let client = crate::tui::settings::settings_daemon_client()
         .await
@@ -26,16 +41,45 @@ async fn begin_provider_oauth(
     let response = tokio::time::timeout(
         OAUTH_BEGIN_TIMEOUT,
         client.request(cockpit_core::daemon::proto::Request::BeginProviderOAuth {
+            client_operation_id: client_operation_id.clone(),
             provider_id: provider_id.to_string(),
         }),
     )
-    .await
-    .map_err(|_| "provider OAuth begin timed out".to_string())?;
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => client
+            .request(
+                cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                    client_operation_id: client_operation_id.clone(),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?,
+    };
     match response.map_err(|e| e.to_string())? {
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            pending: false,
+            response: Some(response),
+            ..
+        }) => match *response {
+            cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
+                flow_id,
+                authorize_url,
+                user_code,
+                ..
+            } => Ok(crate::tui::async_action::OAuthAsyncResult::Began {
+                flow_id,
+                authorize_url,
+                user_code,
+            }),
+            other => Err(format!("unexpected OAuth begin settlement: {other:?}")),
+        },
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
             flow_id,
             authorize_url,
             user_code,
+            ..
         }) => Ok(crate::tui::async_action::OAuthAsyncResult::Began {
             flow_id,
             authorize_url,
@@ -49,6 +93,7 @@ async fn begin_provider_oauth(
 }
 
 async fn complete_provider_oauth(
+    client_operation_id: String,
     flow_id: String,
     input: Option<zeroize::Zeroizing<String>>,
 ) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
@@ -56,18 +101,33 @@ async fn complete_provider_oauth(
         .await
         .map_err(|e| e.to_string())?;
     let request = cockpit_core::daemon::proto::Request::CompleteProviderOAuth {
+        client_operation_id: client_operation_id.clone(),
         flow_id: flow_id.clone(),
         input: input.as_deref().map(ToOwned::to_owned),
     };
     let response = tokio::time::timeout(OAUTH_COMPLETE_TIMEOUT, client.request(request)).await;
     let response = match response {
         Ok(response) => response,
-        Err(_) => {
-            let _ = cancel_provider_oauth(Some(flow_id)).await;
-            return Err("provider OAuth completion timed out and was cancelled".into());
-        }
+        Err(_) => client
+            .request(
+                cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                    client_operation_id: client_operation_id.clone(),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?,
     };
     match response.map_err(|e| e.to_string())? {
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            pending: false,
+            response: Some(response),
+            ..
+        }) => match *response {
+            cockpit_core::daemon::proto::Response::ProviderOAuthCompleted { logged_in, .. } => {
+                Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
+            }
+            other => Err(format!("unexpected OAuth completion settlement: {other:?}")),
+        },
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCompleted { logged_in, .. }) => {
             Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
         }
@@ -79,25 +139,59 @@ async fn complete_provider_oauth(
 }
 
 async fn cancel_provider_oauth(
+    client_operation_id: String,
+    begin_client_operation_id: String,
     flow_id: Option<String>,
 ) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
-    let Some(flow_id) = flow_id else {
-        return Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled);
-    };
     let client = crate::tui::settings::settings_daemon_client()
         .await
         .map_err(|e| e.to_string())?;
     let response = tokio::time::timeout(
         OAUTH_CANCEL_TIMEOUT,
-        client.request(cockpit_core::daemon::proto::Request::CancelProviderOAuth { flow_id }),
+        client.request(cockpit_core::daemon::proto::Request::CancelProviderOAuth {
+            client_operation_id: client_operation_id.clone(),
+            begin_client_operation_id,
+            flow_id,
+        }),
     )
-    .await
-    .map_err(|_| "provider OAuth cancellation timed out".to_string())?
-    .map_err(|e| e.to_string())?;
+    .await;
+    let response = match response {
+        Ok(response) => response.map_err(|error| error.to_string())?,
+        Err(_) => client
+            .request(
+                cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                    client_operation_id,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?,
+    };
     match response {
-        Ok(cockpit_core::daemon::proto::Response::Ack) => {
-            Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
-        }
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            pending: false,
+            response: Some(response),
+            ..
+        }) => match *response {
+            cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+                cancelled: true,
+                ..
+            } => Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled),
+            cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+                cancelled: false,
+                ..
+            } => Err("OAuth flow had already reached another terminal outcome".into()),
+            other => Err(format!(
+                "unexpected OAuth cancellation settlement: {other:?}"
+            )),
+        },
+        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+            cancelled: true,
+            ..
+        }) => Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled),
+        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+            cancelled: false,
+            ..
+        }) => Err("OAuth flow had already reached another terminal outcome".into()),
         Ok(other) => Err(format!(
             "unexpected provider OAuth cancel response: {other:?}"
         )),
@@ -2047,7 +2141,11 @@ impl App {
                             Ok(oauth_payload(
                                 client_flow_id,
                                 operation_id,
-                                begin_provider_oauth("codex-oauth").await,
+                                begin_provider_oauth(
+                                    "codex-oauth",
+                                    oauth_begin_operation_id(client_flow_id),
+                                )
+                                .await,
                             ))
                         },
                     );
@@ -2060,7 +2158,12 @@ impl App {
                             Ok(oauth_payload(
                                 client_flow_id,
                                 operation_id,
-                                complete_provider_oauth(flow_id, None).await,
+                                complete_provider_oauth(
+                                    oauth_operation_id(client_flow_id, operation_id, "complete"),
+                                    flow_id,
+                                    None,
+                                )
+                                .await,
                             ))
                         },
                     );
@@ -2073,7 +2176,11 @@ impl App {
                             Ok(oauth_payload(
                                 client_flow_id,
                                 operation_id,
-                                begin_provider_oauth("grok-oauth").await,
+                                begin_provider_oauth(
+                                    "grok-oauth",
+                                    oauth_begin_operation_id(client_flow_id),
+                                )
+                                .await,
                             ))
                         },
                     );
@@ -2086,7 +2193,12 @@ impl App {
                             Ok(oauth_payload(
                                 client_flow_id,
                                 operation_id,
-                                complete_provider_oauth(flow_id, Some(input)).await,
+                                complete_provider_oauth(
+                                    oauth_operation_id(client_flow_id, operation_id, "complete"),
+                                    flow_id,
+                                    Some(input),
+                                )
+                                .await,
                             ))
                         },
                     );
@@ -2097,6 +2209,7 @@ impl App {
                         authorize_url,
                         user_code,
                         open_browser,
+                        advance_flow,
                     },
                 ) => {
                     let key = match provider {
@@ -2112,6 +2225,7 @@ impl App {
                                     authorize_url,
                                     user_code,
                                     open_browser,
+                                    advance_flow,
                                 )
                             });
                             let result = match tokio::time::timeout(OAUTH_HOST_TIMEOUT, worker)
@@ -2139,7 +2253,12 @@ impl App {
                             Ok(oauth_payload(
                                 client_flow_id,
                                 operation_id,
-                                cancel_provider_oauth(flow_id).await,
+                                cancel_provider_oauth(
+                                    oauth_operation_id(client_flow_id, operation_id, "cancel"),
+                                    oauth_begin_operation_id(client_flow_id),
+                                    flow_id,
+                                )
+                                .await,
                             ))
                         },
                     );

@@ -74,6 +74,7 @@ pub(crate) enum OAuthFlowOp {
         authorize_url: String,
         user_code: Option<String>,
         open_browser: bool,
+        advance_flow: bool,
     },
     Cancel {
         flow_id: Option<String>,
@@ -97,6 +98,7 @@ pub(crate) struct OAuthPresentationResult {
     pub(crate) copied: bool,
     pub(crate) copy_unverified: bool,
     pub(crate) opened: bool,
+    pub(crate) advance_flow: bool,
 }
 
 impl OAuthPresentationResult {
@@ -130,6 +132,7 @@ pub(crate) fn present_oauth_on_blocking_worker(
     authorize_url: String,
     user_code: Option<String>,
     open_browser: bool,
+    advance_flow: bool,
 ) -> Result<OAuthPresentationResult, String> {
     let effects = OAuthEffects::production();
     let copy_value = user_code.as_deref().unwrap_or(&authorize_url);
@@ -143,6 +146,7 @@ pub(crate) fn present_oauth_on_blocking_worker(
         copied,
         copy_unverified,
         opened,
+        advance_flow,
     })
 }
 
@@ -505,9 +509,9 @@ impl OAuthFlowState {
         &mut self,
         flow_id: OAuthFlowId,
         kind: super::super::pointer_actions::OAuthCopyKind,
-    ) -> bool {
+    ) -> Option<OAuthFlowRequest> {
         if self.flow_id != flow_id {
-            return false;
+            return None;
         }
         let (value, open_after_copy) = match kind {
             super::super::pointer_actions::OAuthCopyKind::AuthorizationUrl => {
@@ -524,17 +528,20 @@ impl OAuthFlowState {
             }
         };
         let Some(value) = value else {
-            return false;
+            return None;
         };
-        match kind {
-            super::super::pointer_actions::OAuthCopyKind::AuthorizationUrl => {
-                self.submit_copy(Some(&value), open_after_copy.as_deref(), self.effects);
-            }
-            super::super::pointer_actions::OAuthCopyKind::DeviceCode => {
-                self.submit_device_code(Some(&value), open_after_copy.as_deref(), self.effects);
-            }
-        }
-        true
+        Some(
+            self.request(OAuthFlowOp::Present {
+                authorize_url: open_after_copy.clone().unwrap_or_else(|| value.clone()),
+                user_code: matches!(
+                    kind,
+                    super::super::pointer_actions::OAuthCopyKind::DeviceCode
+                )
+                .then_some(value),
+                open_browser: open_after_copy.is_some(),
+                advance_flow: false,
+            }),
+        )
     }
 
     pub(super) fn complete_copy(
@@ -548,6 +555,7 @@ impl OAuthFlowState {
         }
     }
 
+    #[cfg(test)]
     fn submit_copy(
         &mut self,
         value: Option<&str>,
@@ -573,6 +581,7 @@ impl OAuthFlowState {
         );
     }
 
+    #[cfg(test)]
     fn submit_device_code(
         &mut self,
         value: Option<&str>,
@@ -625,13 +634,27 @@ impl OAuthFlowState {
     }
 
     pub(crate) fn apply_cancel(&mut self, result: Result<(), String>) {
-        self.pending = false;
-        self.polling = false;
-        self.paste_focused = false;
-        self.focus_paste_after_begin = false;
-        self.manual_input.set("");
-        self.session = OAuthSession::None;
-        self.status = Some(result.map(|()| "OAuth login cancelled".to_string()));
+        match result {
+            Ok(()) => {
+                self.pending = false;
+                self.polling = false;
+                self.paste_focused = false;
+                self.focus_paste_after_begin = false;
+                self.manual_input.set("");
+                self.session = OAuthSession::None;
+                self.status = Some(Ok("OAuth login cancelled".to_string()));
+            }
+            Err(error) => {
+                // Lost/ambiguous cancellation must retain surface ownership.
+                // Escape retries the exact begin target with a fresh cancel
+                // idempotency key; navigation stays fenced meanwhile.
+                self.pending = true;
+                self.polling = false;
+                self.status = Some(Err(format!(
+                    "OAuth cancellation is not settled; press Esc to retry: {error}"
+                )));
+            }
+        }
     }
 
     #[cfg(test)]
@@ -700,6 +723,7 @@ impl OAuthFlowState {
                     authorize_url: begin.authorize_url,
                     user_code: Some(code),
                     open_browser: !self.ssh,
+                    advance_flow: true,
                 }))
             }
             OAuthBeginResult::Public(Err(e)) if self.provider == OAuthProvider::Codex => {
@@ -719,6 +743,7 @@ impl OAuthFlowState {
                     authorize_url: begin.authorize_url,
                     user_code: None,
                     open_browser: !self.ssh,
+                    advance_flow: true,
                 }))
             }
             OAuthBeginResult::Public(Err(e)) if self.provider == OAuthProvider::Grok => {
@@ -749,6 +774,7 @@ impl OAuthFlowState {
                     authorize_url,
                     user_code,
                     open_browser,
+                    advance_flow,
                 },
             ..
         }) = next
@@ -763,6 +789,7 @@ impl OAuthFlowState {
                 .as_ref()
                 .is_ok_and(|result| crate::clipboard::feedback::classify(result).is_unverified()),
             opened: open_browser && (effects.open)(&authorize_url).is_ok(),
+            advance_flow,
         };
         assert!(self.accepts_result(client_flow_id, operation_id));
         self.apply_present(Ok(presentation))
@@ -772,6 +799,12 @@ impl OAuthFlowState {
         &mut self,
         result: Result<OAuthPresentationResult, String>,
     ) -> Option<OAuthFlowRequest> {
+        if result.as_ref().is_ok_and(|result| !result.advance_flow) {
+            self.status = Some(
+                result.map(|result| result.status(matches!(self.provider, OAuthProvider::Codex))),
+            );
+            return None;
+        }
         match self.provider {
             OAuthProvider::Codex => {
                 let status = match result {
@@ -943,7 +976,7 @@ pub(super) fn handle_oauth_flow_key_with(
     key: KeyEvent,
     s: &mut OAuthFlowState,
     host: OAuthHost,
-    effects: OAuthEffects,
+    _effects: OAuthEffects,
 ) -> OAuthKeyOutcome {
     // A provider flow owns this settings surface until its exact terminal
     // completion (including cancellation) is applied.  In particular, do not
@@ -998,26 +1031,43 @@ pub(super) fn handle_oauth_flow_key_with(
     match (s.provider, key.code) {
         (OAuthProvider::Grok, KeyCode::Char('c')) => {
             let url = s.authorize_url().map(ToOwned::to_owned);
-            s.submit_copy(url.as_deref(), None, effects);
-            return OAuthKeyOutcome::stay(None);
+            let action = url.map(|authorize_url| {
+                s.request(OAuthFlowOp::Present {
+                    authorize_url,
+                    user_code: None,
+                    open_browser: false,
+                    advance_flow: false,
+                })
+            });
+            return OAuthKeyOutcome::stay(action);
         }
         (OAuthProvider::Codex, KeyCode::Char('c')) => {
-            if s.ssh {
-                let url = s.device_login().map(|(_, url, _)| url.to_string());
-                s.submit_copy(url.as_deref(), None, effects);
-            } else {
-                let (code, url) = match s.device_login() {
-                    Some((_, url, code)) => (Some(code.to_string()), Some(url.to_string())),
-                    None => (None, None),
-                };
-                s.submit_device_code(code.as_deref(), url.as_deref(), effects);
-            }
-            return OAuthKeyOutcome::stay(None);
+            let login = s
+                .device_login()
+                .map(|(_, url, code)| (url.to_string(), code.to_string()));
+            let action = login.map(|(url, code)| {
+                s.request(OAuthFlowOp::Present {
+                    authorize_url: url,
+                    user_code: (!s.ssh).then_some(code),
+                    open_browser: !s.ssh,
+                    advance_flow: false,
+                })
+            });
+            return OAuthKeyOutcome::stay(action);
         }
         (OAuthProvider::Codex, KeyCode::Char('y')) => {
-            let code = s.device_login().map(|(_, _, code)| code.to_string());
-            s.submit_device_code(code.as_deref(), None, effects);
-            return OAuthKeyOutcome::stay(None);
+            let login = s
+                .device_login()
+                .map(|(_, url, code)| (url.to_string(), code.to_string()));
+            let action = login.map(|(url, code)| {
+                s.request(OAuthFlowOp::Present {
+                    authorize_url: url,
+                    user_code: Some(code),
+                    open_browser: false,
+                    advance_flow: false,
+                })
+            });
+            return OAuthKeyOutcome::stay(action);
         }
         _ => {}
     }

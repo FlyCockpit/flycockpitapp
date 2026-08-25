@@ -342,6 +342,8 @@ pub enum Response {
     /// secret.
     #[serde(rename = "provider_oauth_started")]
     ProviderOAuthStarted {
+        client_operation_id: String,
+        request_hash: String,
         flow_id: String,
         authorize_url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -350,9 +352,22 @@ pub enum Response {
     /// Completion/poll result for a daemon-owned provider OAuth flow.
     #[serde(rename = "provider_oauth_completed")]
     ProviderOAuthCompleted {
+        client_operation_id: String,
+        request_hash: String,
+        flow_id: String,
         logged_in: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_seconds: Option<u64>,
+    },
+    /// Idempotent terminal cancellation receipt. `cancelled` is true only
+    /// when cancellation fenced credential persistence; false means the exact
+    /// flow had already reached another terminal state.
+    #[serde(rename = "provider_oauth_cancelled")]
+    ProviderOAuthCancelled {
+        client_operation_id: String,
+        request_hash: String,
+        flow_id: Option<String>,
+        cancelled: bool,
     },
     /// Owner-only instructions for a daemon-owned MCP OAuth flow. The
     /// `authorize_url` is the authorization endpoint the owner opens; by OAuth
@@ -361,16 +376,24 @@ pub enum Response {
     /// token, an authorization/callback code, or any credential secret.
     #[serde(rename = "mcp_oauth_started")]
     McpOAuthStarted {
+        client_operation_id: String,
+        request_hash: String,
         flow_id: String,
         authorize_url: String,
     },
     /// Completion result for a daemon-owned MCP OAuth flow.
     #[serde(rename = "mcp_oauth_completed")]
     McpOAuthCompleted {
+        client_operation_id: String,
+        request_hash: String,
+        flow_id: String,
         authenticated: bool,
     },
     #[serde(rename = "mcp_oauth_cancelled")]
     McpOAuthCancelled {
+        client_operation_id: String,
+        request_hash: String,
+        flow_id: Option<String>,
         cancelled: bool,
     },
     /// Authoritative result of an MCP config publication. Credential refs are
@@ -1212,6 +1235,7 @@ macro_rules! response_variants {
             (Response::FlycockpitAccount { .. }, "flycockpit_account");
             (Response::ProviderOAuthStarted { .. }, "provider_oauth_started");
             (Response::ProviderOAuthCompleted { .. }, "provider_oauth_completed");
+            (Response::ProviderOAuthCancelled { .. }, "provider_oauth_cancelled");
             (Response::McpOAuthStarted { .. }, "mcp_oauth_started");
             (Response::McpOAuthCompleted { .. }, "mcp_oauth_completed");
             (Response::McpOAuthCancelled { .. }, "mcp_oauth_cancelled");
@@ -1353,6 +1377,8 @@ mod tests {
     #[test]
     fn mcp_oauth_wire_responses_are_opaque_to_tokens() {
         let started = serde_json::to_string(&Response::McpOAuthStarted {
+            client_operation_id: "begin".into(),
+            request_hash: "00".repeat(32),
             flow_id: "flow-opaque".into(),
             authorize_url: "https://auth.example.test/authorize?state=daemon-state".into(),
         })
@@ -1362,6 +1388,9 @@ mod tests {
         assert!(!started.contains("refresh_token"));
 
         let completed = serde_json::to_value(Response::McpOAuthCompleted {
+            client_operation_id: "complete".into(),
+            request_hash: "00".repeat(32),
+            flow_id: "flow-opaque".into(),
             authenticated: true,
         })
         .unwrap();

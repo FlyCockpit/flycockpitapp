@@ -260,6 +260,7 @@ pub(crate) enum SettingsDaemonEffectWork {
         record: SecretPayload,
     },
     McpOAuthComplete {
+        client_operation_id: String,
         flow_id: String,
         input: SecretPayload,
     },
@@ -412,19 +413,22 @@ pub(crate) async fn execute_settings_daemon_work(
                 .map_err(|error| error.to_string()),
             committed_refresh_needed: None,
         }),
-        SettingsDaemonEffectWork::McpOAuthComplete { flow_id, input } => {
-            Ok(SettingsDaemonWorkOutcome {
-                response: client
-                    .request(Request::CompleteMcpOAuth {
-                        flow_id,
-                        input: Some(input.take()),
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .map_err(|error| error.to_string()),
-                committed_refresh_needed: None,
-            })
-        }
+        SettingsDaemonEffectWork::McpOAuthComplete {
+            client_operation_id,
+            flow_id,
+            input,
+        } => Ok(SettingsDaemonWorkOutcome {
+            response: client
+                .request(Request::CompleteMcpOAuth {
+                    client_operation_id,
+                    flow_id,
+                    input: Some(input.take()),
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string()),
+            committed_refresh_needed: None,
+        }),
         SettingsDaemonEffectWork::McpConfigSave {
             client_operation_id,
             project_root,
@@ -1039,14 +1043,17 @@ enum SettingsMutationAction {
     },
     McpOAuthBegin {
         server: String,
+        client_operation_id: String,
     },
     McpOAuthComplete {
         server: String,
         flow_id: String,
+        client_operation_id: String,
     },
     McpOAuthCancel {
         server: String,
         flow_id: String,
+        client_operation_id: String,
     },
     ProviderCredentialDelete {
         provider_id: String,
@@ -1075,6 +1082,18 @@ impl SettingsMutationAction {
                 client_operation_id,
                 ..
             }
+            | Self::McpOAuthBegin {
+                client_operation_id,
+                ..
+            }
+            | Self::McpOAuthComplete {
+                client_operation_id,
+                ..
+            }
+            | Self::McpOAuthCancel {
+                client_operation_id,
+                ..
+            }
             | Self::ProviderCredentialDelete {
                 client_operation_id,
                 ..
@@ -1097,6 +1116,40 @@ impl SettingsMutationAction {
 
     fn matches_durable_receipt(&self, response: &Response) -> bool {
         match (self, response) {
+            (
+                Self::McpOAuthBegin {
+                    client_operation_id,
+                    ..
+                },
+                Response::McpOAuthStarted {
+                    client_operation_id: returned_id,
+                    ..
+                },
+            ) => returned_id == client_operation_id,
+            (
+                Self::McpOAuthComplete {
+                    client_operation_id,
+                    flow_id,
+                    ..
+                },
+                Response::McpOAuthCompleted {
+                    client_operation_id: returned_id,
+                    flow_id: returned_flow,
+                    ..
+                },
+            ) => returned_id == client_operation_id && returned_flow == flow_id,
+            (
+                Self::McpOAuthCancel {
+                    client_operation_id,
+                    flow_id,
+                    ..
+                },
+                Response::McpOAuthCancelled {
+                    client_operation_id: returned_id,
+                    flow_id: Some(returned_flow),
+                    ..
+                },
+            ) => returned_id == client_operation_id && returned_flow == flow_id,
             (
                 Self::McpSave {
                     client_operation_id,
@@ -1180,6 +1233,7 @@ enum CompletedProviderAuthMutation {
 enum PendingMcpOAuth {
     Started {
         server: String,
+        begin_client_operation_id: String,
         flow_id: String,
         authorize_url: String,
     },
@@ -3086,34 +3140,63 @@ impl SettingsCx {
                         Ok("MCP settings committed".to_string())
                     }
                     (
-                        SettingsMutationAction::McpOAuthBegin { server },
+                        SettingsMutationAction::McpOAuthBegin {
+                            server,
+                            client_operation_id,
+                        },
                         Ok(Response::McpOAuthStarted {
+                            client_operation_id: returned_operation_id,
                             flow_id,
                             authorize_url,
+                            ..
                         }),
-                    ) => {
+                    ) if returned_operation_id == client_operation_id => {
                         self.pending_mcp_oauth = Some(PendingMcpOAuth::Started {
                             server,
+                            begin_client_operation_id: client_operation_id,
                             flow_id,
                             authorize_url,
                         });
                         Ok("MCP OAuth started; open the authorization URL".to_string())
                     }
                     (
-                        SettingsMutationAction::McpOAuthComplete { server, flow_id },
+                        SettingsMutationAction::McpOAuthComplete {
+                            server,
+                            flow_id,
+                            client_operation_id,
+                        },
                         Ok(Response::McpOAuthCompleted {
+                            client_operation_id: returned_operation_id,
+                            flow_id: returned_flow_id,
                             authenticated: true,
+                            ..
                         }),
-                    ) => {
+                    ) if returned_operation_id == client_operation_id
+                        && returned_flow_id == flow_id =>
+                    {
                         self.invalidate_secret_inventory();
                         self.pending_mcp_oauth =
                             Some(PendingMcpOAuth::Completed { server, flow_id });
                         Ok("MCP OAuth authenticated".to_string())
                     }
                     (
-                        SettingsMutationAction::McpOAuthCancel { server, flow_id },
-                        Ok(Response::McpOAuthCancelled { cancelled: true }),
+                        SettingsMutationAction::McpOAuthCancel {
+                            server,
+                            flow_id,
+                            client_operation_id,
+                        },
+                        Ok(Response::McpOAuthCancelled {
+                            client_operation_id: returned_operation_id,
+                            flow_id: Some(returned_flow_id),
+                            cancelled: true,
+                            ..
+                        }),
                     ) => {
+                        if returned_operation_id != client_operation_id
+                            || returned_flow_id != flow_id
+                        {
+                            return Ok(());
+                        }
                         self.pending_mcp_oauth =
                             Some(PendingMcpOAuth::Cancelled { server, flow_id });
                         Ok("MCP OAuth cancelled".to_string())

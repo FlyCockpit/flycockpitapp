@@ -2591,6 +2591,12 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
+        "tag": "provider_oauth_cancelled"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
         "tag": "mcp_oauth_started"
       },
       {

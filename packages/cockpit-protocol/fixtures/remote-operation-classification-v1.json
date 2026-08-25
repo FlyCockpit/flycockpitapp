@@ -2918,25 +2918,35 @@
       "tag": "get_local_operation_settlement"
     },
     {
-      "class": "read_only",
+      "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "provider_id:string",
+      "fcorCanonicalSchema": "client_operation_id:string|provider_id:string",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "provider_id",
           "role": "param",
           "type": "String"
         }
       ],
-      "fcorSchema": "provider_id:String",
+      "fcorSchema": "client_operation_id:String|provider_id:String",
       "strategy": "none",
       "tag": "begin_provider_oauth"
     },
     {
-      "class": "nonrepeatable_mutation",
+      "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "flow_id:string|input:option<string>",
+      "fcorCanonicalSchema": "client_operation_id:string|flow_id:string|input:option<string>",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "flow_id",
           "role": "param",
@@ -2948,30 +2958,45 @@
           "type": "Option<String>"
         }
       ],
-      "fcorSchema": "flow_id:String|input:Option<String>",
-      "strategy": "nonrepeatable_dispatch",
+      "fcorSchema": "client_operation_id:String|flow_id:String|input:Option<String>",
+      "strategy": "none",
       "tag": "complete_provider_oauth"
     },
     {
       "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "flow_id:string",
+      "fcorCanonicalSchema": "client_operation_id:string|begin_client_operation_id:string|flow_id:option<string>",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "begin_client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "flow_id",
           "role": "param",
-          "type": "String"
+          "type": "Option<String>"
         }
       ],
-      "fcorSchema": "flow_id:String",
+      "fcorSchema": "client_operation_id:String|begin_client_operation_id:String|flow_id:Option<String>",
       "strategy": "none",
       "tag": "cancel_provider_oauth"
     },
     {
-      "class": "read_only",
+      "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "project_root:string|server:string",
+      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|server:string",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "project_root",
           "role": "project_root",
@@ -2983,15 +3008,20 @@
           "type": "String"
         }
       ],
-      "fcorSchema": "project_root:String|server:String",
+      "fcorSchema": "client_operation_id:String|project_root:String|server:String",
       "strategy": "none",
       "tag": "begin_mcp_oauth"
     },
     {
-      "class": "nonrepeatable_mutation",
+      "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "flow_id:string|input:option<string>",
+      "fcorCanonicalSchema": "client_operation_id:string|flow_id:string|input:option<string>",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "flow_id",
           "role": "param",
@@ -3003,22 +3033,32 @@
           "type": "Option<String>"
         }
       ],
-      "fcorSchema": "flow_id:String|input:Option<String>",
-      "strategy": "nonrepeatable_dispatch",
+      "fcorSchema": "client_operation_id:String|flow_id:String|input:Option<String>",
+      "strategy": "none",
       "tag": "complete_mcp_oauth"
     },
     {
       "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "flow_id:string",
+      "fcorCanonicalSchema": "client_operation_id:string|begin_client_operation_id:string|flow_id:option<string>",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "begin_client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "flow_id",
           "role": "param",
-          "type": "String"
+          "type": "Option<String>"
         }
       ],
-      "fcorSchema": "flow_id:String",
+      "fcorSchema": "client_operation_id:String|begin_client_operation_id:String|flow_id:Option<String>",
       "strategy": "none",
       "tag": "cancel_mcp_oauth"
     },

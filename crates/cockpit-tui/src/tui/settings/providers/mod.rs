@@ -5289,7 +5289,9 @@ impl SettingsPage for ProvidersPage {
             super::pointer_actions::ProvidersAction::CopyOAuth(flow_id, kind),
         ) = (&mut *self, &provider_action)
         {
-            state.submit_pointer_copy(*flow_id, *kind);
+            if let Some(action) = state.submit_pointer_copy(*flow_id, *kind) {
+                cx.pending_oauth_action = Some(action);
+            }
             return Nav::Stay;
         }
         if let (

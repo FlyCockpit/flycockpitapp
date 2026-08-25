@@ -1,6 +1,8 @@
 {
   "app_flag": {
     "data": {
+      "client_operation_id": "begin-provider",
+      "request_hash": "0000000000000000000000000000000000000000000000000000000000000000",
       "key": "daemon_autostart_notice",
       "seen": false,
       "version": 7
@@ -1890,12 +1892,26 @@
   },
   "provider_oauth_completed": {
     "data": {
+      "client_operation_id": "complete-provider",
+      "request_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "flow_id": "flow-fixture",
       "logged_in": false
     },
     "response": "provider_oauth_completed"
   },
+  "provider_oauth_cancelled": {
+    "data": {
+      "client_operation_id": "cancel-provider",
+      "request_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "flow_id": "flow-fixture",
+      "cancelled": true
+    },
+    "response": "provider_oauth_cancelled"
+  },
   "mcp_oauth_started": {
     "data": {
+      "client_operation_id": "begin-mcp",
+      "request_hash": "0000000000000000000000000000000000000000000000000000000000000000",
       "flow_id": "flow-fixture",
       "authorize_url": "https://example.test/authorize"
     },
@@ -1903,12 +1919,18 @@
   },
   "mcp_oauth_completed": {
     "data": {
+      "client_operation_id": "complete-mcp",
+      "request_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "flow_id": "flow-fixture",
       "authenticated": false
     },
     "response": "mcp_oauth_completed"
   },
   "mcp_oauth_cancelled": {
     "data": {
+      "client_operation_id": "cancel-mcp",
+      "request_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "flow_id": "flow-fixture",
       "cancelled": true
     },
     "response": "mcp_oauth_cancelled"

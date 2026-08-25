@@ -686,6 +686,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::RunInvocationStatus { .. }
         | proto::Response::RunInvocationCancelResult { .. }
         | proto::Response::ProviderOAuthCompleted { .. }
+        | proto::Response::ProviderOAuthCancelled { .. }
         | proto::Response::McpOAuthCompleted { .. }
         | proto::Response::McpOAuthCancelled { .. } => {}
         proto::Response::McpConfigCommitted {

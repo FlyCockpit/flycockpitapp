@@ -670,6 +670,7 @@ async fn begin_provider_oauth_via_daemon(
     match daemon
         .client
         .request(Request::BeginProviderOAuth {
+            client_operation_id: uuid::Uuid::new_v4().to_string(),
             provider_id: provider_id.to_string(),
         })
         .await?
@@ -678,6 +679,7 @@ async fn begin_provider_oauth_via_daemon(
             flow_id,
             authorize_url,
             user_code,
+            ..
         }) => Ok((flow_id, authorize_url, user_code)),
         Ok(other) => bail!("daemon returned unexpected OAuth begin response: {other:?}"),
         Err(error) => bail!("daemon rejected OAuth begin: {error}"),
@@ -690,7 +692,11 @@ async fn complete_provider_oauth_via_daemon(flow_id: String, input: Option<Strin
         .context("starting persistent daemon for OAuth login")?;
     match daemon
         .client
-        .request(Request::CompleteProviderOAuth { flow_id, input })
+        .request(Request::CompleteProviderOAuth {
+            client_operation_id: uuid::Uuid::new_v4().to_string(),
+            flow_id,
+            input,
+        })
         .await?
     {
         Ok(Response::ProviderOAuthCompleted {

@@ -16776,19 +16776,32 @@ mod provider_atomic_authority_tests {
     #[test]
     fn provider_batch_recovery_preserves_unknown_document_keys() {
         let source = include_str!("dispatch.rs");
-        let recovery = source
-            .split("fn reconcile_provider_journal_file")
+        let bounded = source
+            .split("async fn recover_provider_journal_file_bounded")
             .nth(1)
             .and_then(|tail| {
                 tail.split("fn settle_journaled_local_success_on_conn")
                     .next()
             })
+            .expect("bounded provider recovery source");
+        for marker in [
+            "with_target(&target",
+            "ProviderJournalFileClassification::Intended",
+            "ProviderJournalFileClassification::Consumed",
+            "ProviderJournalFileClassification::Diverged",
+        ] {
+            assert!(bounded.contains(marker), "missing recovery fence {marker}");
+        }
+        assert!(
+            !bounded.contains("hold_config_mutation_lock"),
+            "provider recovery must not block a runtime worker on a synchronous config lock",
+        );
+        let recovery = bounded
+            .split("fn reconcile_provider_journal_file")
+            .nth(1)
             .expect("provider batch recovery source");
         assert!(recovery.contains("ConfigDoc::load(path)"));
         assert!(recovery.contains("doc.write("));
-        assert!(source.contains("with_target(&target"));
-        assert!(source.contains("ProviderJournalFileClassification::Intended"));
-        assert!(source.contains("ProviderJournalFileClassification::Consumed"));
         assert!(recovery.contains("refusing to overwrite newer configuration"));
     }
 

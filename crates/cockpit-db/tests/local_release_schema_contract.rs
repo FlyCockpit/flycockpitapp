@@ -70,6 +70,7 @@ fn authority_journals_bind_exact_fenced_terminal_receipts() {
         "mcp_config_journals",
         "extended_config_patch_journals",
         "agent_mutation_journals",
+        "assistant_mutation_journals",
     ] {
         let declaration = sql
             .split(&format!("CREATE TABLE {table}"))
@@ -89,6 +90,39 @@ fn authority_journals_bind_exact_fenced_terminal_receipts() {
             );
         }
     }
+}
+
+#[test]
+fn assistant_mutation_recovery_is_hash_only_and_receipt_fenced() {
+    let sql = include_str!("../src/db/migrations/0001_initial.sql");
+    let declaration = sql
+        .split("CREATE TABLE assistant_mutation_journals")
+        .nth(1)
+        .and_then(|tail| tail.split(");").next())
+        .expect("assistant mutation journal must exist");
+    for field in [
+        "owner_digest",
+        "client_operation_id",
+        "request_hash",
+        "fencing_generation",
+        "mutation_intent_hash",
+        "requested_project_root",
+        "project_root",
+        "assistant_name",
+        "consumed_revision",
+        "intended_content_hash",
+        "terminal_response_json",
+    ] {
+        assert!(declaration.contains(field), "missing {field}");
+    }
+    for forbidden in ["markdown", "file_bytes", "secret"] {
+        assert!(
+            !declaration.contains(forbidden),
+            "assistant recovery must not persist {forbidden}"
+        );
+    }
+    let receipts = include_str!("../src/db/local_operation_receipts.rs");
+    assert!(receipts.contains("SELECT 1 FROM assistant_mutation_journals"));
 }
 
 #[test]

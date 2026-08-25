@@ -92,6 +92,8 @@ pub(super) struct AgentsPage {
     expected_inventory_after_commit: Option<String>,
     agent_rows: Vec<AgentRow>,
     assistant_rows: Vec<AgentRow>,
+    inventory_load_error: Option<String>,
+    assistant_load_error: Option<String>,
     pending_daemon: HashMap<uuid::Uuid, PendingAgentOperation>,
     /// Exact completion request retained after transport or response
     /// ambiguity. The page cannot close until the daemon replays a matching
@@ -123,14 +125,22 @@ enum PendingAgentOperation {
         querying: bool,
     },
     AssistantSave {
+        client_operation_id: String,
+        mutation_intent_hash: String,
+        cwd: PathBuf,
         name: String,
         markdown: String,
         expected_revision: String,
         purpose: SavePurpose,
+        querying: bool,
     },
     AssistantDelete {
+        client_operation_id: String,
+        mutation_intent_hash: String,
+        cwd: PathBuf,
         name: String,
         expected_registration_revision: String,
+        querying: bool,
     },
     BeginLease {
         client_operation_id: String,
@@ -373,6 +383,8 @@ impl AgentsPage {
                         | PendingAgentOperation::ReadStaging { .. }
                         | PendingAgentOperation::CompleteLease { .. }
                         | PendingAgentOperation::Mutation { .. }
+                        | PendingAgentOperation::AssistantSave { .. }
+                        | PendingAgentOperation::AssistantDelete { .. }
                 )
             })
     }
@@ -397,6 +409,8 @@ impl AgentsPage {
             expected_inventory_after_commit: None,
             agent_rows: Vec::new(),
             assistant_rows: Vec::new(),
+            inventory_load_error: None,
+            assistant_load_error: None,
             pending_daemon: HashMap::new(),
             uncertain_agent_operation: None,
         }
@@ -525,6 +539,93 @@ impl AgentsPage {
                     "querying durable agent mutation settlement…".into()
                 });
             }
+            PendingAgentOperation::AssistantSave {
+                client_operation_id,
+                mutation_intent_hash,
+                cwd,
+                name,
+                markdown,
+                expected_revision,
+                purpose,
+                querying,
+            } => {
+                let project_root = cwd.to_string_lossy().into_owned();
+                let request = if querying {
+                    cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
+                        client_operation_id: client_operation_id.clone(),
+                        mutation_intent_hash: mutation_intent_hash.clone(),
+                        project_root,
+                        name: name.clone(),
+                        markdown: markdown.clone(),
+                        expected_revision: expected_revision.clone(),
+                    }
+                } else {
+                    cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                        client_operation_id: client_operation_id.clone(),
+                    }
+                };
+                self.stage(
+                    cx,
+                    super::SettingsEffectTarget {
+                        surface: "agents.assistant-save",
+                        owner: name.clone(),
+                        revision: Some(expected_revision.clone()),
+                    },
+                    request,
+                    PendingAgentOperation::AssistantSave {
+                        client_operation_id,
+                        mutation_intent_hash,
+                        cwd,
+                        name,
+                        markdown,
+                        expected_revision,
+                        purpose,
+                        querying: !querying,
+                    },
+                );
+                self.status = Some("reconciling assistant save settlement…".into());
+            }
+            PendingAgentOperation::AssistantDelete {
+                client_operation_id,
+                mutation_intent_hash,
+                cwd,
+                name,
+                expected_registration_revision,
+                querying,
+            } => {
+                let project_root = cwd.to_string_lossy().into_owned();
+                let request = if querying {
+                    cockpit_core::daemon::proto::Request::DeleteAssistant {
+                        client_operation_id: client_operation_id.clone(),
+                        mutation_intent_hash: mutation_intent_hash.clone(),
+                        project_root,
+                        name: name.clone(),
+                        expected_revision: expected_registration_revision.clone(),
+                    }
+                } else {
+                    cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                        client_operation_id: client_operation_id.clone(),
+                    }
+                };
+                self.stage(
+                    cx,
+                    super::SettingsEffectTarget {
+                        surface: "agents.assistant-delete",
+                        owner: name.clone(),
+                        revision: Some(expected_registration_revision.clone()),
+                    },
+                    request,
+                    PendingAgentOperation::AssistantDelete {
+                        client_operation_id,
+                        mutation_intent_hash,
+                        cwd,
+                        name,
+                        expected_registration_revision,
+                        querying: !querying,
+                    },
+                );
+                self.status = Some("reconciling assistant delete settlement…".into());
+            }
             _ => unreachable!("only durable agent operations are retained for settlement"),
         }
     }
@@ -533,6 +634,8 @@ impl AgentsPage {
         let cwd = cx.agents_cwd();
         let generation = uuid::Uuid::new_v4();
         self.load_generation = generation;
+        self.inventory_load_error = None;
+        self.assistant_load_error = None;
         self.status = Some("loading daemon-owned agent inventory…".into());
         let project_root = cwd.to_string_lossy().into_owned();
         let inventory = cx.enqueue_daemon_effect(
@@ -563,6 +666,32 @@ impl AgentsPage {
         self.rows = self.agent_rows.clone();
         self.rows.extend(self.assistant_rows.clone());
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
+    }
+
+    fn refresh_paired_load_status(&mut self, generation: uuid::Uuid) {
+        if generation != self.load_generation {
+            return;
+        }
+        let waiting = self.pending_daemon.values().any(|pending| {
+            matches!(pending,
+                PendingAgentOperation::Inventory { generation: active }
+                | PendingAgentOperation::Assistants { generation: active }
+                if *active == generation)
+        });
+        let errors = [
+            self.inventory_load_error.as_deref(),
+            self.assistant_load_error.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        self.status = if !errors.is_empty() {
+            Some(format!("Agents Unavailable — {}; Retry", errors.join("; ")))
+        } else if waiting {
+            Some("loading daemon-owned agent inventory…".into())
+        } else {
+            None
+        };
     }
 
     pub(super) fn apply_daemon_completion(
@@ -621,6 +750,7 @@ impl AgentsPage {
             PendingAgentOperation::AssistantDelete {
                 name,
                 expected_registration_revision,
+                ..
             } => {
                 completion.target.surface == "agents.assistant-delete"
                     && completion.target.owner == *name
@@ -651,7 +781,41 @@ impl AgentsPage {
             | PendingAgentOperation::ReadStaging { .. } => false,
         };
         if !target_matches {
-            self.pending_daemon.insert(completion.operation_id, pending);
+            match pending {
+                durable @ (PendingAgentOperation::Mutation { .. }
+                | PendingAgentOperation::AssistantSave { .. }
+                | PendingAgentOperation::AssistantDelete { .. }
+                | PendingAgentOperation::BeginLease { .. }
+                | PendingAgentOperation::CompleteLease { .. }) => {
+                    self.uncertain_agent_operation = Some(Box::new(durable));
+                    self.status = Some(
+                        "durable agent completion target was malformed; press Enter to reconcile"
+                            .into(),
+                    );
+                }
+                PendingAgentOperation::Inventory { generation } => {
+                    if generation == self.load_generation {
+                        self.inventory_load_error =
+                            Some("inventory completion target was malformed".into());
+                        self.refresh_paired_load_status(generation);
+                    }
+                }
+                PendingAgentOperation::Assistants { generation } => {
+                    if generation == self.load_generation {
+                        self.assistant_load_error =
+                            Some("assistant completion target was malformed".into());
+                        self.refresh_paired_load_status(generation);
+                    }
+                }
+                PendingAgentOperation::Snapshot { .. }
+                | PendingAgentOperation::PrepareStaging { .. }
+                | PendingAgentOperation::ReadStaging { .. } => {
+                    self.status = Some(
+                        "stale or malformed read-only agent completion was discarded; retry the view"
+                            .into(),
+                    );
+                }
+            }
             return;
         }
         match pending {
@@ -664,6 +828,7 @@ impl AgentsPage {
                     .and_then(|response| inventory_rows_from_response(&cwd, response))
                 {
                     Ok((rows, inventory_revision)) => {
+                        self.inventory_load_error = None;
                         if let Some(expected) = self.expected_inventory_after_commit.take()
                             && inventory_revision != expected
                         {
@@ -679,14 +844,12 @@ impl AgentsPage {
                         self.agent_rows = rows;
                         self.inventory_revision = Some(inventory_revision);
                         self.rebuild_rows();
-                        if !self.pending_daemon.values().any(|pending| matches!(pending, PendingAgentOperation::Assistants { generation: active } if *active == generation)) {
-                            self.status = None;
-                        }
                     }
                     Err(error) => {
-                        self.status = Some(format!("Agents Unavailable — {error}; Retry"))
+                        self.inventory_load_error = Some(format!("inventory: {error}"));
                     }
                 }
+                self.refresh_paired_load_status(generation);
             }
             PendingAgentOperation::Assistants { generation } => {
                 if generation != self.load_generation {
@@ -694,18 +857,15 @@ impl AgentsPage {
                 }
                 match completion.response.and_then(assistant_rows_from_response) {
                     Ok(rows) => {
+                        self.assistant_load_error = None;
                         self.assistant_rows = rows;
                         self.rebuild_rows();
-                        if !self.pending_daemon.values().any(|pending| matches!(pending, PendingAgentOperation::Inventory { generation: active } if *active == generation)) {
-                            self.status = None;
-                        }
                     }
                     Err(error) => {
-                        self.status = Some(format!(
-                            "Assistants Unavailable — {error}; Retry by reopening Agents"
-                        ))
+                        self.assistant_load_error = Some(format!("assistants: {error}"));
                     }
                 }
+                self.refresh_paired_load_status(generation);
             }
             other => self.apply_operation_completion(cx, other, completion.response),
         }
@@ -1152,69 +1312,237 @@ impl AgentsPage {
                 }
             }
             PendingAgentOperation::AssistantSave {
+                client_operation_id,
+                mutation_intent_hash,
+                cwd,
                 name,
                 markdown,
                 expected_revision,
                 purpose,
+                querying,
             } => {
-                let saved = response.and_then(|response| match response {
+                let pending_for_retry = || PendingAgentOperation::AssistantSave {
+                    client_operation_id: client_operation_id.clone(),
+                    mutation_intent_hash: mutation_intent_hash.clone(),
+                    cwd: cwd.clone(),
+                    name: name.clone(),
+                    markdown: markdown.clone(),
+                    expected_revision: expected_revision.clone(),
+                    purpose,
+                    querying,
+                };
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.uncertain_agent_operation = Some(Box::new(pending_for_retry()));
+                        self.status = Some(format!(
+                            "assistant save outcome is unknown ({error}); press Enter to reconcile"
+                        ));
+                        return;
+                    }
+                };
+                let response = match bind_assistant_mutation_settlement(
+                    response,
+                    &client_operation_id,
+                    &mutation_intent_hash,
+                    "save_assistant_definition",
+                ) {
+                    Ok(AssistantMutationSettlement::Committed(response)) => response,
+                    Ok(AssistantMutationSettlement::Pending) => {
+                        self.uncertain_agent_operation = Some(Box::new(pending_for_retry()));
+                        self.status =
+                            Some("assistant save remains pending; press Enter to reconcile".into());
+                        return;
+                    }
+                    Ok(AssistantMutationSettlement::Rejected(error)) => {
+                        self.status = Some(format!("assistant save was rejected: {error}"));
+                        return;
+                    }
+                    Err(error) => {
+                        self.uncertain_agent_operation = Some(Box::new(pending_for_retry()));
+                        self.status = Some(format!(
+                            "assistant save receipt is unbound ({error}); press Enter to reconcile"
+                        ));
+                        return;
+                    }
+                };
+                let requested_root = cwd.to_string_lossy();
+                let saved = match response {
                     cockpit_core::daemon::proto::Response::AssistantDefinitionSaved {
+                        client_operation_id: returned_operation_id,
+                        mutation_intent_hash: returned_intent,
+                        project_root,
+                        requested_project_root,
+                        name: returned_name,
                         assistant,
-                        consumed_definition_revision,
-                    } => coherent_assistant_save_revision(
-                        &assistant,
-                        &name,
-                        &markdown,
-                        &consumed_definition_revision,
-                        &expected_revision,
-                    )
-                    .map(|revision| (assistant, revision)),
+                        consumed_revision,
+                        result_revision,
+                        consumed_config_generation,
+                        result_config_generation,
+                        outcome,
+                    } if returned_operation_id == client_operation_id
+                        && returned_intent == mutation_intent_hash
+                        && requested_project_root == requested_root.as_ref()
+                        && !project_root.trim().is_empty()
+                        && returned_name == name
+                        && consumed_revision == expected_revision
+                        && result_config_generation > consumed_config_generation =>
+                    {
+                        if let Some(assistant) = assistant {
+                                coherent_assistant_save_revision(
+                                    &assistant,
+                                    &name,
+                                    &markdown,
+                                    &consumed_revision,
+                                    &expected_revision,
+                                )
+                                .and_then(|revision| {
+                                    if revision != result_revision {
+                                        Err("assistant result revision is unbound".into())
+                                    } else {
+                                        Ok((Some(assistant), revision, outcome))
+                                    }
+                                })
+                            } else if matches!(
+                                &outcome,
+                                cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded { .. }
+                            ) {
+                                Ok((None, result_revision, outcome))
+                            } else {
+                                Err("assistant save omitted its reconciled snapshot".into())
+                            }
+                    }
                     other => Err(format!("unexpected assistant save response: {other:?}")),
-                });
+                };
                 match saved {
-                    Ok((assistant, revision)) => {
+                    Ok((assistant, revision, outcome)) => {
                         match purpose {
                             SavePurpose::Editor => self.editing = None,
                             SavePurpose::Detail => {
                                 if let Some(detail) = self.detail.as_mut() {
                                     detail.revision = Some(revision.clone());
-                                    detail.source = AgentRowSource::Assistant {
-                                        markdown: markdown.clone(),
-                                        revision,
-                                        registration_revision: assistant.registration_revision,
-                                    };
+                                    if let Some(assistant) = assistant {
+                                        detail.source = AgentRowSource::Assistant {
+                                            markdown: markdown.clone(),
+                                            revision,
+                                            registration_revision: assistant.registration_revision,
+                                        };
+                                    }
                                     detail.original_text = markdown;
                                     detail.status = Some(format!("saved `{name}`"));
                                 }
                             }
                         }
-                        self.status = Some(format!("saved assistant `{name}`"));
+                        self.status = Some(match outcome {
+                            cockpit_core::daemon::proto::AgentMutationOutcome::Reconciled => {
+                                format!("saved assistant `{name}`")
+                            }
+                            cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded { warning } => warning,
+                        });
                         self.queue_load(cx);
                     }
-                    Err(error) => self.status = Some(format!("save failed: {error}")),
+                    Err(error) => {
+                        self.uncertain_agent_operation = Some(Box::new(pending_for_retry()));
+                        self.status = Some(format!(
+                            "assistant save receipt is malformed ({error}); press Enter to reconcile"
+                        ));
+                    }
                 }
             }
             PendingAgentOperation::AssistantDelete {
+                client_operation_id,
+                mutation_intent_hash,
+                cwd,
                 name,
                 expected_registration_revision,
-            } => match response {
-                Ok(cockpit_core::daemon::proto::Response::AssistantDeleted {
-                    name: deleted_name,
-                    consumed_registration_revision,
-                    deleted: true,
-                }) if deleted_name == name
-                    && consumed_registration_revision == expected_registration_revision =>
-                {
-                    self.status = Some(format!(
-                        "unregistered assistant `{name}`; its home was retained"
-                    ));
-                    self.queue_load(cx);
+                querying,
+            } => {
+                let retain_unknown = |this: &mut Self, message: String| {
+                    this.uncertain_agent_operation =
+                        Some(Box::new(PendingAgentOperation::AssistantDelete {
+                            client_operation_id: client_operation_id.clone(),
+                            mutation_intent_hash: mutation_intent_hash.clone(),
+                            cwd: cwd.clone(),
+                            name: name.clone(),
+                            expected_registration_revision: expected_registration_revision.clone(),
+                            querying,
+                        }));
+                    this.status = Some(message);
+                };
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        retain_unknown(
+                            self,
+                            format!(
+                                "assistant delete outcome is unknown ({error}); press Enter to reconcile"
+                            ),
+                        );
+                        return;
+                    }
+                };
+                let response = match bind_assistant_mutation_settlement(
+                    response,
+                    &client_operation_id,
+                    &mutation_intent_hash,
+                    "delete_assistant",
+                ) {
+                    Ok(AssistantMutationSettlement::Committed(response)) => response,
+                    Ok(AssistantMutationSettlement::Pending) => {
+                        retain_unknown(
+                            self,
+                            "assistant delete remains pending; press Enter to reconcile".into(),
+                        );
+                        return;
+                    }
+                    Ok(AssistantMutationSettlement::Rejected(error)) => {
+                        self.status = Some(format!("assistant delete was rejected: {error}"));
+                        return;
+                    }
+                    Err(error) => {
+                        retain_unknown(
+                            self,
+                            format!(
+                                "assistant delete receipt is unbound ({error}); press Enter to reconcile"
+                            ),
+                        );
+                        return;
+                    }
+                };
+                match response {
+                    cockpit_core::daemon::proto::Response::AssistantDeleted {
+                        client_operation_id: returned_operation_id,
+                        mutation_intent_hash: returned_intent,
+                        project_root,
+                        requested_project_root,
+                        name: deleted_name,
+                        consumed_revision,
+                        result_revision,
+                        consumed_config_generation,
+                        result_config_generation,
+                        ..
+                    } if returned_operation_id == client_operation_id
+                        && returned_intent == mutation_intent_hash
+                        && requested_project_root == cwd.to_string_lossy().as_ref()
+                        && !project_root.trim().is_empty()
+                        && deleted_name == name
+                        && consumed_revision == expected_registration_revision
+                        && !result_revision.trim().is_empty()
+                        && result_config_generation > consumed_config_generation =>
+                    {
+                        self.status = Some(format!(
+                            "unregistered assistant `{name}`; its home was retained"
+                        ));
+                        self.queue_load(cx);
+                    }
+                    other => retain_unknown(
+                        self,
+                        format!(
+                            "assistant delete receipt is malformed ({other:?}); press Enter to reconcile"
+                        ),
+                    ),
                 }
-                Ok(other) => {
-                    self.status = Some(format!("unexpected assistant delete response: {other:?}"))
-                }
-                Err(error) => self.status = Some(format!("delete failed: {error}")),
-            },
+            }
             PendingAgentOperation::BeginLease {
                 client_operation_id,
                 cwd,
@@ -2424,6 +2752,80 @@ pub(crate) enum AgentMutationSettlement {
     Rejected(String),
 }
 
+enum AssistantMutationSettlement {
+    Committed(cockpit_core::daemon::proto::Response),
+    Pending,
+    Rejected(String),
+}
+
+fn bind_assistant_mutation_settlement(
+    response: cockpit_core::daemon::proto::Response,
+    client_operation_id: &str,
+    mutation_intent_hash: &str,
+    operation_kind: &str,
+) -> Result<AssistantMutationSettlement, String> {
+    use cockpit_core::daemon::proto::Response;
+    let receipt_matches = |response: &Response| match response {
+        Response::AssistantDefinitionSaved {
+            client_operation_id: returned,
+            mutation_intent_hash: returned_intent,
+            ..
+        }
+        | Response::AssistantDeleted {
+            client_operation_id: returned,
+            mutation_intent_hash: returned_intent,
+            ..
+        } => returned == client_operation_id && returned_intent == mutation_intent_hash,
+        _ => false,
+    };
+    if receipt_matches(&response) {
+        return Ok(AssistantMutationSettlement::Committed(response));
+    }
+    match response {
+        Response::LocalOperationSettlement {
+            client_operation_id: returned,
+            operation_kind: returned_kind,
+            request_hash,
+            pending,
+            response,
+            terminal_error,
+            terminal_cancelled,
+        } => {
+            if returned != client_operation_id
+                || returned_kind != operation_kind
+                || request_hash.len() != 64
+                || !request_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err("daemon returned an unbound assistant settlement".into());
+            }
+            if pending {
+                if response.is_some() || terminal_error.is_some() || terminal_cancelled {
+                    return Err("pending assistant settlement carried terminal data".into());
+                }
+                return Ok(AssistantMutationSettlement::Pending);
+            }
+            if terminal_cancelled {
+                return Ok(AssistantMutationSettlement::Rejected(
+                    "assistant mutation was durably cancelled".into(),
+                ));
+            }
+            if let Some(error) = terminal_error {
+                return Ok(AssistantMutationSettlement::Rejected(error.message));
+            }
+            let response = response.ok_or_else(|| {
+                "assistant settlement omitted its exact terminal receipt".to_string()
+            })?;
+            if !receipt_matches(&response) {
+                return Err("assistant settlement carried an unbound terminal receipt".into());
+            }
+            Ok(AssistantMutationSettlement::Committed(*response))
+        }
+        other => Err(format!("unexpected assistant mutation response: {other:?}")),
+    }
+}
+
 /// Bind a direct or replayed response to one exact owner-generated agent
 /// mutation. A transport error is handled by the caller by querying the local
 /// operation ledger with the same operation id.
@@ -2586,25 +2988,45 @@ impl SettingsCx {
                     let name = editor.name.clone();
                     let assistant_definition = editor.is_assistant_definition();
                     match revision {
-                        Some(revision) if assistant_definition => p.stage(
-                            self,
-                            super::SettingsEffectTarget {
-                                surface: "agents.assistant-save",
-                                owner: name.clone(),
-                                revision: Some(revision.clone()),
-                            },
-                            cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
-                                name: name.clone(),
-                                markdown: text.clone(),
-                                expected_revision: revision.clone(),
-                            },
-                            PendingAgentOperation::AssistantSave {
-                                name,
-                                markdown: text,
-                                expected_revision: revision,
-                                purpose: SavePurpose::Editor,
-                            },
-                        ),
+                        Some(revision) if assistant_definition => {
+                            let cwd = self.agents_cwd();
+                            let project_root = cwd.to_string_lossy().into_owned();
+                            let client_operation_id = uuid::Uuid::new_v4().to_string();
+                            let mutation_intent_hash =
+                                cockpit_proto::assistant_mutation_intent_hash(
+                                    &project_root,
+                                    "save",
+                                    &name,
+                                    &revision,
+                                    Some(&text),
+                                );
+                            p.stage(
+                                self,
+                                super::SettingsEffectTarget {
+                                    surface: "agents.assistant-save",
+                                    owner: name.clone(),
+                                    revision: Some(revision.clone()),
+                                },
+                                cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
+                                    client_operation_id: client_operation_id.clone(),
+                                    mutation_intent_hash: mutation_intent_hash.clone(),
+                                    project_root,
+                                    name: name.clone(),
+                                    markdown: text.clone(),
+                                    expected_revision: revision.clone(),
+                                },
+                                PendingAgentOperation::AssistantSave {
+                                    client_operation_id,
+                                    mutation_intent_hash,
+                                    cwd,
+                                    name,
+                                    markdown: text,
+                                    expected_revision: revision,
+                                    purpose: SavePurpose::Editor,
+                                    querying: false,
+                                },
+                            );
+                        }
                         Some(revision) => {
                             let cwd = self.agents_cwd();
                             let mutation =
@@ -2977,6 +3399,16 @@ impl SettingsCx {
                 detail.status = Some("save failed: missing assistant revision".into());
                 return;
             };
+            let cwd = self.agents_cwd();
+            let project_root = cwd.to_string_lossy().into_owned();
+            let client_operation_id = uuid::Uuid::new_v4().to_string();
+            let mutation_intent_hash = cockpit_proto::assistant_mutation_intent_hash(
+                &project_root,
+                "save",
+                &name,
+                &expected_revision,
+                Some(&markdown),
+            );
             p.stage(
                 self,
                 super::SettingsEffectTarget {
@@ -2985,15 +3417,22 @@ impl SettingsCx {
                     revision: Some(expected_revision.clone()),
                 },
                 cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
+                    client_operation_id: client_operation_id.clone(),
+                    mutation_intent_hash: mutation_intent_hash.clone(),
+                    project_root,
                     name: name.clone(),
                     markdown: markdown.clone(),
                     expected_revision: expected_revision.clone(),
                 },
                 PendingAgentOperation::AssistantSave {
+                    client_operation_id,
+                    mutation_intent_hash,
+                    cwd,
                     name,
                     markdown,
                     expected_revision,
                     purpose: SavePurpose::Detail,
+                    querying: false,
                 },
             );
         } else if let Some(revision) = detail.revision.clone() {
@@ -3186,22 +3625,40 @@ impl SettingsCx {
             }
             | AgentRowSource::AssistantUnavailable {
                 registration_revision,
-            } => p.stage(
-                self,
-                super::SettingsEffectTarget {
-                    surface: "agents.assistant-delete",
-                    owner: name.clone(),
-                    revision: Some(registration_revision.clone()),
-                },
-                cockpit_core::daemon::proto::Request::DeleteAssistant {
-                    name: name.clone(),
-                    expected_revision: registration_revision.clone(),
-                },
-                PendingAgentOperation::AssistantDelete {
-                    name,
-                    expected_registration_revision: registration_revision.clone(),
-                },
-            ),
+            } => {
+                let project_root = cwd.to_string_lossy().into_owned();
+                let client_operation_id = uuid::Uuid::new_v4().to_string();
+                let mutation_intent_hash = cockpit_proto::assistant_mutation_intent_hash(
+                    &project_root,
+                    "delete",
+                    &name,
+                    registration_revision,
+                    None,
+                );
+                p.stage(
+                    self,
+                    super::SettingsEffectTarget {
+                        surface: "agents.assistant-delete",
+                        owner: name.clone(),
+                        revision: Some(registration_revision.clone()),
+                    },
+                    cockpit_core::daemon::proto::Request::DeleteAssistant {
+                        client_operation_id: client_operation_id.clone(),
+                        mutation_intent_hash: mutation_intent_hash.clone(),
+                        project_root,
+                        name: name.clone(),
+                        expected_revision: registration_revision.clone(),
+                    },
+                    PendingAgentOperation::AssistantDelete {
+                        client_operation_id,
+                        mutation_intent_hash,
+                        cwd,
+                        name,
+                        expected_registration_revision: registration_revision.clone(),
+                        querying: false,
+                    },
+                );
+            }
             AgentRowSource::Agent { revision, .. } => {
                 let rendered_identity = row_agent_id(&name, &row.source);
                 let revision = revision.clone();

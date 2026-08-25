@@ -103,10 +103,22 @@ impl Db {
                     )",
                 params![cutoff_unix_ms],
             )? as u64;
+            let assistant_journals = conn.execute(
+                "DELETE FROM assistant_mutation_journals
+                  WHERE created_at_unix_ms < ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM local_operation_receipts receipt
+                         WHERE receipt.owner_digest=assistant_mutation_journals.owner_digest
+                           AND receipt.client_operation_id=assistant_mutation_journals.client_operation_id
+                           AND receipt.state IN ('prepared','executing')
+                    )",
+                params![cutoff_unix_ms],
+            )? as u64;
             Ok(receipts
                 .saturating_add(editor)
                 .saturating_add(patch_journals)
-                .saturating_add(agent_journals))
+                .saturating_add(agent_journals)
+                .saturating_add(assistant_journals))
         })
         .await
     }

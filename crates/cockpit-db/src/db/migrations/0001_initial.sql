@@ -6361,6 +6361,70 @@ BEGIN
     SELECT RAISE(ABORT, 'local operation terminal receipt is final');
 END;
 
+-- Hash-only recovery bridge for the global assistant registry mutations used
+-- by the daemon-connected TUI and CLI. Definition markdown is deliberately
+-- absent: the existing no-follow filesystem journal owns byte recovery, while
+-- this row binds its resulting projection to the authenticated local receipt.
+CREATE TABLE assistant_mutation_journals (
+    owner_digest          TEXT NOT NULL,
+    client_operation_id   TEXT NOT NULL,
+    request_hash          BLOB NOT NULL CHECK (
+        typeof(request_hash) = 'blob' AND length(request_hash) = 32
+    ),
+    fencing_generation    INTEGER NOT NULL CHECK (fencing_generation > 0),
+    mutation_intent_hash  TEXT NOT NULL CHECK (
+        length(mutation_intent_hash) = 64
+        AND mutation_intent_hash = lower(mutation_intent_hash)
+    ),
+    requested_project_root TEXT NOT NULL,
+    project_root          TEXT NOT NULL,
+    assistant_name        TEXT NOT NULL,
+    action                TEXT NOT NULL CHECK (action IN ('save', 'delete')),
+    consumed_revision     TEXT NOT NULL,
+    intended_content_hash TEXT CHECK (
+        intended_content_hash IS NULL OR (
+            length(intended_content_hash) = 64
+            AND intended_content_hash = lower(intended_content_hash)
+        )
+    ),
+    consumed_config_generation INTEGER NOT NULL CHECK (consumed_config_generation >= 0),
+    terminal_response_json TEXT CHECK (
+        terminal_response_json IS NULL OR json_valid(terminal_response_json)
+    ),
+    created_at_unix_ms    INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    FOREIGN KEY (owner_digest, client_operation_id)
+        REFERENCES local_operation_receipts(owner_digest, client_operation_id)
+        ON UPDATE RESTRICT ON DELETE CASCADE,
+    CHECK (length(trim(owner_digest)) > 0),
+    CHECK (length(trim(client_operation_id)) > 0),
+    CHECK (length(trim(requested_project_root)) > 0),
+    CHECK (length(trim(project_root)) > 0),
+    CHECK (length(trim(assistant_name)) > 0),
+    CHECK (length(trim(consumed_revision)) > 0),
+    CHECK ((action = 'save') = (intended_content_hash IS NOT NULL))
+);
+CREATE INDEX assistant_mutation_journals_created
+ON assistant_mutation_journals(created_at_unix_ms);
+CREATE TRIGGER assistant_mutation_journals_identity_immutable
+BEFORE UPDATE ON assistant_mutation_journals
+WHEN NEW.owner_digest <> OLD.owner_digest
+  OR NEW.client_operation_id <> OLD.client_operation_id
+  OR NEW.request_hash <> OLD.request_hash
+  OR NEW.fencing_generation <> OLD.fencing_generation
+  OR NEW.mutation_intent_hash <> OLD.mutation_intent_hash
+  OR NEW.requested_project_root <> OLD.requested_project_root
+  OR NEW.project_root <> OLD.project_root
+  OR NEW.assistant_name <> OLD.assistant_name
+  OR NEW.action <> OLD.action
+  OR NEW.consumed_revision <> OLD.consumed_revision
+  OR NEW.intended_content_hash IS NOT OLD.intended_content_hash
+  OR NEW.consumed_config_generation <> OLD.consumed_config_generation
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'assistant mutation journal identity is immutable');
+END;
+
 -- Hash-only recovery bridge for daemon-owned agent definition mutations.
 -- Agent markdown never enters SQLite.  The journal is inserted before the
 -- authoritative atomic file publication and binds the owner receipt fence to

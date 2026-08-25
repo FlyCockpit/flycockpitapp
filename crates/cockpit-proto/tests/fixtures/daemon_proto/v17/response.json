@@ -2197,9 +2197,16 @@
   },
   "assistant_deleted": {
     "data": {
+      "client_operation_id": "delete-assistant",
+      "mutation_intent_hash": "e81b903c65f09a18b2f28939545add32bfde680cca98b59d1b6a83656aa9d9bd",
+      "project_root": "/tmp/project",
+      "requested_project_root": "/tmp/project",
       "name": "helper-bot",
-      "consumed_registration_revision": "79aff49b93fd8d542e0f06df5af9d74068518331fc7ac87829882b1d9f8c662f",
-      "deleted": true
+      "consumed_revision": "79aff49b93fd8d542e0f06df5af9d74068518331fc7ac87829882b1d9f8c662f",
+      "result_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "consumed_config_generation": 2,
+      "result_config_generation": 3,
+      "outcome": { "status": "reconciled" }
     },
     "response": "assistant_deleted"
   },
@@ -2235,6 +2242,11 @@
   "assistant_definition_saved": {
     "response": "assistant_definition_saved",
     "data": {
+      "client_operation_id": "save-assistant-definition",
+      "mutation_intent_hash": "5c97b1ce8c88a2b23fb6c059237ee2fdf42372e1ddf8a9fbeaa712a5353dad6b",
+      "project_root": "/tmp/project",
+      "requested_project_root": "/tmp/project",
+      "name": "helper-bot",
       "assistant": {
         "config_json": "{\"installationId\":\"11111111-1111-4111-8111-111111111111\"}",
         "definition_presentation_hash": "17168aed892d39ea07739218659667149bc8c61cc436b58ca3c077ca6dac5b2a",
@@ -2247,7 +2259,11 @@
         "definition_diagnostic": null,
         "projection_digest": "f0dab748cadf30e98f718d9d1c78b3851cacb5135de9b88a17c21cc3a7f7e1e1"
       },
-      "consumed_definition_revision": "e9dd18f42de8a7050c58114a9d808a382a92189bc1920eb3c6ee5a29e520f67a"
+      "consumed_revision": "e9dd18f42de8a7050c58114a9d808a382a92189bc1920eb3c6ee5a29e520f67a",
+      "result_revision": "e9dd18f42de8a7050c58114a9d808a382a92189bc1920eb3c6ee5a29e520f67a",
+      "consumed_config_generation": 2,
+      "result_config_generation": 3,
+      "outcome": { "status": "reconciled" }
     }
   },
   "extended_config_snapshot": {

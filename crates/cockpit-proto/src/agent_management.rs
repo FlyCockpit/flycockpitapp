@@ -224,6 +224,31 @@ pub fn agent_mutation_intent_hash(
     crate::hex_lower(digest.finalize())
 }
 
+/// Public, non-secret identity for a global assistant definition mutation.
+/// The daemon additionally derives a vault-keyed request identity before
+/// reserving the owner-scoped durable operation id.
+pub fn assistant_mutation_intent_hash(
+    project_root: &str,
+    action: &str,
+    name: &str,
+    expected_revision: &str,
+    intended_markdown: Option<&str>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cockpit-assistant-mutation-intent-v1\0");
+    for field in [project_root, action, name, expected_revision] {
+        digest_field(&mut digest, field.as_bytes());
+    }
+    match intended_markdown {
+        Some(markdown) => {
+            digest.update([1]);
+            digest_field(&mut digest, markdown.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    crate::hex_lower(digest.finalize())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEditorLease {
     pub client_operation_id: String,
@@ -574,6 +599,33 @@ mod tests {
                 Some(&"11".repeat(32)),
             )
         );
+    }
+
+    #[test]
+    fn assistant_mutation_intent_binds_target_action_revision_and_bytes() {
+        let baseline =
+            assistant_mutation_intent_hash("/project", "save", "helper", "revision", Some("body"));
+        for changed in [
+            assistant_mutation_intent_hash("/other", "save", "helper", "revision", Some("body")),
+            assistant_mutation_intent_hash("/project", "delete", "helper", "revision", None),
+            assistant_mutation_intent_hash("/project", "save", "other", "revision", Some("body")),
+            assistant_mutation_intent_hash(
+                "/project",
+                "save",
+                "helper",
+                "other-revision",
+                Some("body"),
+            ),
+            assistant_mutation_intent_hash(
+                "/project",
+                "save",
+                "helper",
+                "revision",
+                Some("other-body"),
+            ),
+        ] {
+            assert_ne!(baseline, changed);
+        }
     }
 
     #[test]

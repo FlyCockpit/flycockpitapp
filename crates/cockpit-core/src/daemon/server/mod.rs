@@ -689,9 +689,13 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         } => {
             scrub_session_summary(session, redact);
         }
-        proto::Response::AssistantUpserted { assistant }
-        | proto::Response::AssistantDefinitionSaved { assistant, .. } => {
+        proto::Response::AssistantUpserted { assistant } => {
             scrub_assistant_summary(assistant, redact)
+        }
+        proto::Response::AssistantDefinitionSaved { assistant, .. } => {
+            if let Some(assistant) = assistant {
+                scrub_assistant_summary(assistant, redact);
+            }
         }
         proto::Response::ImportSessionArchive { .. } => {}
         // Opaque staged transfer bytes. Redaction is applied when the
@@ -1652,9 +1656,10 @@ fn finalize_response_projections(response: &mut proto::Response) {
             assistant: Some(value),
         } => assistant(value),
         proto::Response::Assistants { assistants } => assistants.iter_mut().for_each(assistant),
-        proto::Response::AssistantUpserted { assistant: value }
-        | proto::Response::AssistantDefinitionSaved {
-            assistant: value, ..
+        proto::Response::AssistantUpserted { assistant: value } => assistant(value),
+        proto::Response::AssistantDefinitionSaved {
+            assistant: Some(value),
+            ..
         } => assistant(value),
         proto::Response::AgentInventory { entries, .. } => {
             for entry in entries {
@@ -3743,6 +3748,19 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
     dispatch::recover_committed_oauth_settlements(ctx)
         .await
         .context("reconciling committed OAuth authority operations")?;
+    crate::assistants::recover_definition_journals(&ctx.db)
+        .await
+        .context("startup assistant-definition journal recovery failed")?;
+    let recovered_assistants = dispatch::recover_assistant_mutation_journals(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup assistant-mutation receipt recovery failed")?;
+    if recovered_assistants > 0 {
+        tracing::info!(
+            count = recovered_assistants,
+            "reconciled committed assistant mutations before socket publication"
+        );
+    }
     let interrupted = ctx
         .db
         .settle_interrupted_local_operations()
@@ -3754,9 +3772,6 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
             "settled interrupted local operations without re-execution"
         );
     }
-    crate::assistants::recover_definition_journals(&ctx.db)
-        .await
-        .context("startup assistant-definition journal recovery failed")?;
     crate::daemon::agent_management::recover_editor_leases_before_publish(ctx)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
@@ -5632,15 +5647,83 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
             && proto::is_opaque_authority_token(&entry.revision)
             && entry.projection_digest == proto::agent_inventory_entry_projection_digest(entry)
     };
+    let assistant_receipt = |operation: &str,
+                             intent: &str,
+                             root: &str,
+                             requested_root: &str,
+                             name: &str,
+                             consumed: &str,
+                             result: &str,
+                             consumed_generation: u64,
+                             result_generation: u64| {
+        !operation.is_empty()
+            && operation.len() <= 128
+            && proto::is_opaque_authority_token(intent)
+            && !root.is_empty()
+            && root.len() <= proto::MAX_OWNER_PROJECT_ROOT_BYTES
+            && !requested_root.is_empty()
+            && requested_root.len() <= proto::MAX_OWNER_PROJECT_ROOT_BYTES
+            && !name.is_empty()
+            && name.len() <= proto::MAX_AGENT_NAME_BYTES
+            && !consumed.is_empty()
+            && consumed.len() <= 128
+            && proto::is_opaque_authority_token(result)
+            && result_generation > consumed_generation
+    };
     match response {
         proto::Response::Assistant { assistant: value } => value.as_ref().is_none_or(assistant),
         proto::Response::Assistants { assistants } => {
             assistants.len() <= proto::MAX_ASSISTANT_SUMMARIES && assistants.iter().all(assistant)
         }
-        proto::Response::AssistantUpserted { assistant: value }
-        | proto::Response::AssistantDefinitionSaved {
-            assistant: value, ..
-        } => assistant(value),
+        proto::Response::AssistantUpserted { assistant: value } => assistant(value),
+        proto::Response::AssistantDefinitionSaved {
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            requested_project_root,
+            name,
+            assistant: value,
+            consumed_revision,
+            result_revision,
+            consumed_config_generation,
+            result_config_generation,
+            ..
+        } => {
+            value.as_ref().is_none_or(assistant)
+                && assistant_receipt(
+                    client_operation_id,
+                    mutation_intent_hash,
+                    project_root,
+                    requested_project_root,
+                    name,
+                    consumed_revision,
+                    result_revision,
+                    *consumed_config_generation,
+                    *result_config_generation,
+                )
+        }
+        proto::Response::AssistantDeleted {
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            requested_project_root,
+            name,
+            consumed_revision,
+            result_revision,
+            consumed_config_generation,
+            result_config_generation,
+            ..
+        } => assistant_receipt(
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            requested_project_root,
+            name,
+            consumed_revision,
+            result_revision,
+            *consumed_config_generation,
+            *result_config_generation,
+        ),
         proto::Response::ExtendedConfigSnapshot { layers, .. } => {
             layers.len() <= proto::MAX_EXTENDED_CONFIG_LAYERS
                 && layers.iter().all(|layer| {

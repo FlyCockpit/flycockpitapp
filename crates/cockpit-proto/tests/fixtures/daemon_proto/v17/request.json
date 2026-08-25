@@ -1152,6 +1152,9 @@
   },
   "upsert_assistant": {
     "params": {
+      "client_operation_id": "save-assistant-definition",
+      "mutation_intent_hash": "5c97b1ce8c88a2b23fb6c059237ee2fdf42372e1ddf8a9fbeaa712a5353dad6b",
+      "project_root": "/tmp/project",
       "name": "helper-bot",
       "description": "Helps with fixtures",
       "prompt": "Be helpful."
@@ -1854,6 +1857,9 @@
   },
   "save_assistant_definition": {
     "params": {
+      "client_operation_id": "delete-assistant",
+      "mutation_intent_hash": "e81b903c65f09a18b2f28939545add32bfde680cca98b59d1b6a83656aa9d9bd",
+      "project_root": "/tmp/project",
       "name": "helper-bot",
       "markdown": "---\nschemaVersion: 2\n---\nBe helpful.\n",
       "expected_revision": "revision"

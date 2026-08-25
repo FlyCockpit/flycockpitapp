@@ -1030,6 +1030,15 @@ async fn ephemeral_daemon_rejects_new_persistent_mutations() {
         },
         Request::PurgeEndedSessions { before: 0 },
         Request::DeleteAssistant {
+            client_operation_id: "delete-assistant".into(),
+            mutation_intent_hash: cockpit_proto::assistant_mutation_intent_hash(
+                "/repo",
+                "delete",
+                "helper-bot",
+                "revision",
+                None,
+            ),
+            project_root: "/repo".into(),
             name: "helper-bot".into(),
             expected_revision: "revision".into(),
         },
@@ -11523,6 +11532,7 @@ fn authority_recovery_precedes_both_socket_binds() {
         "recover_extended_config_patch_journals",
         "recover_agent_mutation_journals",
         "recover_committed_oauth_settlements",
+        "recover_assistant_mutation_journals",
         "settle_interrupted_local_operations",
         "recover_editor_leases_before_publish",
         "maintain_editor_leases",
@@ -11636,6 +11646,46 @@ fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
         .and_then(|tail| tail.split("fn reset_all_builtins_atomic_locked").next())
         .expect("reset journal recovery must exist");
     assert!(reset_recovery.contains("SELECT DISTINCT project_root FROM agent_mutation_journals"));
+}
+
+#[test]
+fn assistant_mutations_are_owner_receipted_and_crash_recoverable() {
+    let dispatch = include_str!("dispatch.rs");
+    for required in [
+        "begin_assistant_mutation_journal",
+        "record_assistant_mutation_terminal",
+        "recover_assistant_mutation_journals",
+        "assistant_mutation_journals",
+        "save_assistant_definition",
+        "delete_assistant",
+        "local_operation_secret_request_hash",
+        "CommittedRefreshNeeded",
+    ] {
+        assert!(
+            dispatch.contains(required),
+            "missing assistant receipt control {required}"
+        );
+    }
+    let server = include_str!("mod.rs");
+    let recovery = server
+        .split("pub async fn recover_before_socket_publish")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn run_accept_loop").next())
+        .expect("boot recovery body");
+    assert!(
+        recovery.find("recover_definition_journals").unwrap()
+            < recovery
+                .find("recover_assistant_mutation_journals")
+                .unwrap()
+    );
+    assert!(
+        recovery
+            .find("recover_assistant_mutation_journals")
+            .unwrap()
+            < recovery
+                .find("settle_interrupted_local_operations")
+                .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -17535,6 +17585,15 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             name: "helper-bot".into(),
         },
         "delete_assistant" => Request::DeleteAssistant {
+            client_operation_id: "delete-assistant".into(),
+            mutation_intent_hash: cockpit_proto::assistant_mutation_intent_hash(
+                "/tmp/project",
+                "delete",
+                "helper-bot",
+                "revision",
+                None,
+            ),
+            project_root: "/tmp/project".into(),
             name: "helper-bot".into(),
             expected_revision: "revision".into(),
         },
@@ -24388,7 +24447,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::GetSessionCompactions { session_id }, kind: "get_session_compactions", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::PurgeEndedSessions { before: 0 }, kind: "purge_ended_sessions", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetAssistant { name: "a".into() }, kind: "get_assistant", session_id: None, audit_path: None, mutating: false },
-        CommandMetadataCase { request: Request::DeleteAssistant { name: "a".into(), expected_revision: "revision".into() }, kind: "delete_assistant", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::DeleteAssistant { client_operation_id: "delete-assistant".into(), mutation_intent_hash: cockpit_proto::assistant_mutation_intent_hash(&project_root, "delete", "a", "revision", None), project_root: project_root.clone(), name: "a".into(), expected_revision: "revision".into() }, kind: "delete_assistant", session_id: None, audit_path: Some(project_root.as_str()), mutating: true },
         CommandMetadataCase { request: Request::DiagnoseMediaReservation { scope: "s".into(), id: "i".into() }, kind: "diagnose_media_reservation", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::RepairMediaReservation { scope: "s".into(), id: "i".into(), expected_block_generation: 0, repair_plan_digest: "d".into(), idempotency_key: "k".into() }, kind: "repair_media_reservation", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetDoctorSnapshot { project_root: None, no_sandbox: false, offline: false }, kind: "get_doctor_snapshot", session_id: None, audit_path: None, mutating: false },

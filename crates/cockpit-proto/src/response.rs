@@ -562,8 +562,17 @@ pub enum Response {
     },
 
     AssistantDefinitionSaved {
-        assistant: AssistantSummary,
-        consumed_definition_revision: String,
+        client_operation_id: String,
+        mutation_intent_hash: String,
+        project_root: String,
+        requested_project_root: String,
+        name: String,
+        assistant: Option<AssistantSummary>,
+        consumed_revision: String,
+        result_revision: String,
+        consumed_config_generation: u64,
+        result_config_generation: u64,
+        outcome: crate::AgentMutationOutcome,
     },
 
     AssistantSessionCreated {
@@ -998,9 +1007,16 @@ pub enum Response {
     },
     /// Result of deleting an assistant registry row.
     AssistantDeleted {
+        client_operation_id: String,
+        mutation_intent_hash: String,
+        project_root: String,
+        requested_project_root: String,
         name: String,
-        consumed_registration_revision: String,
-        deleted: bool,
+        consumed_revision: String,
+        result_revision: String,
+        consumed_config_generation: u64,
+        result_config_generation: u64,
+        outcome: crate::AgentMutationOutcome,
     },
     /// Media reservation accounting diagnosis as JSON.
     MediaReservationDiagnosis {

@@ -342,21 +342,46 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
     if expected_revision.is_empty() {
         bail!("assistant registration has no deletion revision");
     }
+    let project_root = std::env::current_dir()
+        .context("resolving assistant deletion workspace")?
+        .to_string_lossy()
+        .into_owned();
+    let client_operation_id = uuid::Uuid::new_v4().to_string();
     let response = daemon
         .client
-        .request(delete_assistant_request(&args.name, &expected_revision))
+        .request(delete_assistant_request(
+            &client_operation_id,
+            &project_root,
+            &args.name,
+            &expected_revision,
+        ))
         .await
         .context("requesting assistant delete from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected assistant delete: {error}"))?;
     let Response::AssistantDeleted {
+        client_operation_id: receipt_operation_id,
+        mutation_intent_hash,
+        requested_project_root,
         name,
-        consumed_registration_revision,
-        deleted: true,
+        consumed_revision,
+        ..
     } = response
     else {
         bail!("daemon returned unexpected response to assistant delete: {response:?}");
     };
-    if name != args.name || consumed_registration_revision != expected_revision {
+    let expected_intent = cockpit_proto::assistant_mutation_intent_hash(
+        &project_root,
+        "delete",
+        &args.name,
+        &expected_revision,
+        None,
+    );
+    if receipt_operation_id != client_operation_id
+        || mutation_intent_hash != expected_intent
+        || requested_project_root != project_root
+        || name != args.name
+        || consumed_revision != expected_revision
+    {
         bail!("daemon returned an incoherent assistant deletion receipt");
     }
     println!(
@@ -374,8 +399,22 @@ fn get_assistant_request(name: &str) -> Request {
 }
 
 /// Assemble the owner-remoted `DeleteAssistant` mutation.
-fn delete_assistant_request(name: &str, expected_revision: &str) -> Request {
+fn delete_assistant_request(
+    client_operation_id: &str,
+    project_root: &str,
+    name: &str,
+    expected_revision: &str,
+) -> Request {
     Request::DeleteAssistant {
+        client_operation_id: client_operation_id.to_string(),
+        mutation_intent_hash: cockpit_proto::assistant_mutation_intent_hash(
+            project_root,
+            "delete",
+            name,
+            expected_revision,
+            None,
+        ),
+        project_root: project_root.to_string(),
         name: name.to_string(),
         expected_revision: expected_revision.to_string(),
     }
@@ -531,12 +570,27 @@ mod tests {
         };
         assert_eq!(name, "helper-bot");
         let Request::DeleteAssistant {
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
             name,
             expected_revision,
-        } = delete_assistant_request("helper-bot", "rev-1")
+        } = delete_assistant_request("op-1", "/project", "helper-bot", "rev-1")
         else {
             panic!("delete must remove through DeleteAssistant");
         };
+        assert_eq!(client_operation_id, "op-1");
+        assert_eq!(project_root, "/project");
+        assert_eq!(
+            mutation_intent_hash,
+            cockpit_proto::assistant_mutation_intent_hash(
+                "/project",
+                "delete",
+                "helper-bot",
+                "rev-1",
+                None
+            )
+        );
         assert_eq!(name, "helper-bot");
         assert_eq!(expected_revision, "rev-1");
     }

@@ -7129,6 +7129,15 @@ mod tests {
                 name: "helper-bot".into(),
             },
             Request::DeleteAssistant {
+                client_operation_id: "delete-assistant".into(),
+                mutation_intent_hash: assistant_mutation_intent_hash(
+                    "/tmp/project",
+                    "delete",
+                    "helper-bot",
+                    "revision",
+                    None,
+                ),
+                project_root: "/tmp/project".into(),
                 name: "helper-bot".into(),
                 expected_revision: "revision".into(),
             },
@@ -7202,9 +7211,16 @@ mod tests {
             },
             Response::Assistant { assistant: None },
             Response::AssistantDeleted {
+                client_operation_id: "delete-assistant".into(),
+                mutation_intent_hash: "11".repeat(32),
+                project_root: "/tmp/project".into(),
+                requested_project_root: "/tmp/project".into(),
                 name: "helper".into(),
-                consumed_registration_revision: "revision".into(),
-                deleted: true,
+                consumed_revision: "revision".into(),
+                result_revision: "22".repeat(32),
+                consumed_config_generation: 1,
+                result_config_generation: 2,
+                outcome: AgentMutationOutcome::Reconciled,
             },
             Response::MediaReservationDiagnosis {
                 diagnosis_json: "{}".into(),
@@ -7596,6 +7612,20 @@ mod tests {
             fixture["agent_mutated"]["data"]["outcome"]["status"],
             "reconciled"
         );
+        for receipt in ["assistant_definition_saved", "assistant_deleted"] {
+            let data = &fixture[receipt]["data"];
+            assert!(data["client_operation_id"].is_string());
+            assert_eq!(data["mutation_intent_hash"].as_str().unwrap().len(), 64);
+            assert!(data["project_root"].is_string());
+            assert!(data["requested_project_root"].is_string());
+            assert!(data["name"].is_string());
+            assert!(data["consumed_revision"].is_string());
+            assert!(data["result_revision"].is_string());
+            assert!(
+                data["result_config_generation"].as_u64().unwrap()
+                    > data["consumed_config_generation"].as_u64().unwrap()
+            );
+        }
         let agent = &fixture["agent_mutated"]["data"];
         assert!(agent["client_operation_id"].is_string());
         assert_eq!(

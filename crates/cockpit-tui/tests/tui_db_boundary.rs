@@ -278,15 +278,8 @@ fn filesystem_authority_sites(source: &str) -> Vec<(usize, String)> {
         &["cockpit_config", "config", "write_config_bytes_atomic"],
     ];
     const SHORT_CALL_PATHS: &[&[&str]] = &[&["File", "create"], &["OpenOptions", "new"]];
-    const MUTATING_METHODS: &[&str] = &[
-        "write",
-        "write_all",
-        "set_len",
-        "append",
-        "truncate",
-        "create",
-        "create_new",
-    ];
+    const IO_METHODS: &[&str] = &["write", "write_all", "set_len"];
+    const OPEN_OPTIONS_METHODS: &[&str] = &["write", "append", "truncate", "create", "create_new"];
 
     struct Visitor(Vec<(usize, String)>);
     impl<'ast> Visit<'ast> for Visitor {
@@ -313,7 +306,12 @@ fn filesystem_authority_sites(source: &str) -> Vec<(usize, String)> {
 
         fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
             let method = call.method.to_string();
-            if MUTATING_METHODS.contains(&method.as_str()) && call.args.len() == 1 {
+            let receiver = call.receiver.to_token_stream().to_string();
+            let io_method = IO_METHODS.contains(&method.as_str());
+            let options_method = OPEN_OPTIONS_METHODS.contains(&method.as_str())
+                && receiver.contains("OpenOptions")
+                && receiver.contains("new");
+            if (io_method || options_method) && call.args.len() == 1 {
                 self.0
                     .push((call.span().start().line, format!(".{method}")));
             }
@@ -1088,6 +1086,10 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         ),
         ("crates/cockpit-tui/src/tui/async_action.rs", ".write(true)"),
         (
+            "crates/cockpit-tui/src/tui/async_action.rs",
+            ".create_new(true)",
+        ),
+        (
             "crates/cockpit-tui/src/tui/image_path_probe.rs",
             "std::fs::OpenOptions::new() // Unix no-follow read-only handle.",
         ),
@@ -1344,6 +1346,28 @@ fn every_tui_agent_mutation_is_exactly_receipted_and_recoverable() {
             "{surface} must fence close while settlement is unknown"
         );
     }
+}
+
+#[test]
+fn assistant_definition_mutations_are_durable_and_close_gated() {
+    let agents = read("crates/cockpit-tui/src/tui/settings/agents_page.rs");
+    for required in [
+        "assistant_mutation_intent_hash",
+        "client_operation_id",
+        "GetLocalOperationSettlement",
+        "bind_assistant_mutation_settlement",
+        "PendingAgentOperation::AssistantSave { .. }",
+        "PendingAgentOperation::AssistantDelete { .. }",
+        "assistant save outcome is unknown",
+        "assistant delete outcome is unknown",
+    ] {
+        assert!(
+            agents.contains(required),
+            "missing assistant authority gate {required}"
+        );
+    }
+    assert!(agents.contains("stale or malformed read-only agent completion was discarded"));
+    assert!(!agents.contains("self.pending_daemon.insert(completion.operation_id, pending)"));
 }
 
 #[test]

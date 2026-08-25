@@ -743,6 +743,11 @@ pub enum Request {
     /// Validate, CAS-write, and update the assistant registry as one daemon
     /// operation. Clients never combine generic FsWrite with registry upsert.
     SaveAssistantDefinition {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        client_operation_id: String,
+        mutation_intent_hash: String,
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
         name: String,
         markdown: String,
         expected_revision: String,
@@ -2252,6 +2257,11 @@ pub enum Request {
 
     /// Delete an assistant registry row by name (home dir left intact).
     DeleteAssistant {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        client_operation_id: String,
+        mutation_intent_hash: String,
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
         name: String,
         /// Revision returned by `GetAssistant`, covering the registry row and
         /// exact daemon-read definition bytes.
@@ -2867,6 +2877,58 @@ impl Request {
             }
             Self::GetAgentInventory { project_root } => {
                 validate_owner_project_root(project_root)?;
+            }
+            Self::SaveAssistantDefinition {
+                client_operation_id,
+                mutation_intent_hash,
+                project_root,
+                name,
+                markdown,
+                expected_revision,
+            } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("assistant name", name, crate::MAX_AGENT_NAME_BYTES)?;
+                if markdown.len() > crate::MAX_AGENT_MARKDOWN_BYTES {
+                    return Err("assistant markdown exceeds maximum length".into());
+                }
+                if expected_revision.is_empty() || expected_revision.len() > 128 {
+                    return Err("assistant definition revision is invalid".into());
+                }
+                let expected = crate::assistant_mutation_intent_hash(
+                    project_root,
+                    "save",
+                    name,
+                    expected_revision,
+                    Some(markdown),
+                );
+                if mutation_intent_hash != &expected {
+                    return Err("assistant mutation intent hash does not match its request".into());
+                }
+            }
+            Self::DeleteAssistant {
+                client_operation_id,
+                mutation_intent_hash,
+                project_root,
+                name,
+                expected_revision,
+            } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("assistant name", name, crate::MAX_AGENT_NAME_BYTES)?;
+                if expected_revision.is_empty() || expected_revision.len() > 128 {
+                    return Err("assistant registration revision is invalid".into());
+                }
+                let expected = crate::assistant_mutation_intent_hash(
+                    project_root,
+                    "delete",
+                    name,
+                    expected_revision,
+                    None,
+                );
+                if mutation_intent_hash != &expected {
+                    return Err("assistant mutation intent hash does not match its request".into());
+                }
             }
             Self::GetAgentEditSnapshot { project_root, name } => {
                 validate_owner_project_root(project_root)?;
@@ -3563,7 +3625,7 @@ macro_rules! command {
             (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
             (Request::ListAssistants, "list_assistants", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::UpsertAssistant { name, description, prompt }, "upsert_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|description:String|prompt:String", [name: String => param, description: String => param, prompt: String => param]);
-            (Request::SaveAssistantDefinition { name, markdown, expected_revision }, "save_assistant_definition", owner_only, none, true, local_only, none, serialized, none, "name:String|markdown:String|expected_revision:String", [name: String => param, markdown: String => param, expected_revision: String => param]);
+            (Request::SaveAssistantDefinition { client_operation_id, mutation_intent_hash, project_root, name, markdown, expected_revision }, "save_assistant_definition", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|name:String|markdown:String|expected_revision:String", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, name: String => param, markdown: String => param, expected_revision: String => param]);
             (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>", [name: String => param, project_root: String => project_root, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, env_snapshot: Option<EnvSnapshotWire> => param]);
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ExportSessionData { session_id, kind, include_generated_artifacts, include_sensitive }, "export_session_data", owner_only, field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool", [session_id: Uuid => session, kind: ExportSessionKind => param, include_generated_artifacts: bool => param, include_sensitive: bool => param]);
@@ -3749,7 +3811,7 @@ macro_rules! command {
             (Request::GetSessionCompactions { session_id }, "get_session_compactions", owner_only, none, false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => param]);
             (Request::PurgeEndedSessions { before }, "purge_ended_sessions", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "before:i64", [before: i64 => param]);
             (Request::GetAssistant { name }, "get_assistant", owner_only, none, false, read_only, none, concurrent, none, "name:String", [name: String => param]);
-            (Request::DeleteAssistant { name, expected_revision }, "delete_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|expected_revision:String", [name: String => param, expected_revision: String => param]);
+            (Request::DeleteAssistant { client_operation_id, mutation_intent_hash, project_root, name, expected_revision }, "delete_assistant", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|name:String|expected_revision:String", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, name: String => param, expected_revision: String => param]);
             (Request::DiagnoseMediaReservation { scope, id }, "diagnose_media_reservation", owner_only, none, false, read_only, none, concurrent, none, "scope:String|id:String", [scope: String => param, id: String => param]);
             (Request::RepairMediaReservation { scope, id, expected_block_generation, repair_plan_digest, idempotency_key }, "repair_media_reservation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "scope:String|id:String|expected_block_generation:u64|repair_plan_digest:String|idempotency_key:String", [scope: String => param, id: String => param, expected_block_generation: u64 => param, repair_plan_digest: String => param, idempotency_key: String => param]);
             (Request::GetDoctorSnapshot { project_root, no_sandbox, offline }, "get_doctor_snapshot", owner_only, none, false, read_only, none, concurrent, none, "project_root:Option<String>|no_sandbox:bool|offline:bool", [project_root: Option<String> => param, no_sandbox: bool => param, offline: bool => param]);
@@ -4893,7 +4955,6 @@ mod tests {
                         | "get_session_compactions"
                         | "purge_ended_sessions"
                         | "get_assistant"
-                        | "delete_assistant"
                         | "diagnose_media_reservation"
                         | "repair_media_reservation"
                         | "get_doctor_snapshot"
@@ -5427,7 +5488,6 @@ mod tests {
             "prune_packages",
             "import_kcl_packages",
             "purge_ended_sessions",
-            "delete_assistant",
             "repair_media_reservation",
         ] {
             assert_eq!(

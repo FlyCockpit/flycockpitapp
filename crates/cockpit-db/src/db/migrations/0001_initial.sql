@@ -6323,6 +6323,9 @@ CREATE TABLE local_operation_receipts (
 CREATE INDEX local_operation_receipts_unsettled
 ON local_operation_receipts(updated_at_unix_ms)
 WHERE state IN ('prepared', 'executing');
+CREATE INDEX local_operation_receipts_terminal_retention
+ON local_operation_receipts(updated_at_unix_ms)
+WHERE state LIKE 'terminal_%';
 CREATE TRIGGER local_operation_receipts_identity_immutable
 BEFORE UPDATE ON local_operation_receipts
 WHEN NEW.owner_digest <> OLD.owner_digest
@@ -6376,6 +6379,9 @@ CREATE TABLE agent_editor_leases (
 CREATE INDEX agent_editor_leases_open
 ON agent_editor_leases(expires_at_unix_ms)
 WHERE state <> 'terminal';
+CREATE INDEX agent_editor_leases_terminal_retention
+ON agent_editor_leases(updated_at_unix_ms)
+WHERE state = 'terminal';
 CREATE TRIGGER agent_editor_leases_identity_immutable
 BEFORE UPDATE ON agent_editor_leases
 WHEN NEW.owner_digest <> OLD.owner_digest

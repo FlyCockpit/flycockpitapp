@@ -3789,10 +3789,15 @@ fn retention_config() -> RetentionConfig {
 }
 
 fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
-    if outcome.sessions_expired > 0 || outcome.payload_rows_deleted > 0 || outcome.vacuumed {
+    if outcome.sessions_expired > 0
+        || outcome.payload_rows_deleted > 0
+        || outcome.local_authority_rows_purged > 0
+        || outcome.vacuumed
+    {
         tracing::info!(
             sessions_expired = outcome.sessions_expired,
             payload_rows_deleted = outcome.payload_rows_deleted,
+            local_authority_rows_purged = outcome.local_authority_rows_purged,
             vacuumed = outcome.vacuumed,
             "session payload retention pass completed"
         );

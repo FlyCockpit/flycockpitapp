@@ -58,10 +58,33 @@ pub struct RetentionOutcome {
     pub sessions_expired: u64,
     pub payload_rows_deleted: u64,
     pub goal_tombstones_purged: u64,
+    pub local_authority_rows_purged: u64,
     pub vacuumed: bool,
 }
 
 impl Db {
+    /// Bound secret-free local authority receipts while retaining a generous
+    /// replay/reconciliation window. Executing operations and completing
+    /// editor leases are deliberately excluded: ambiguous side effects remain
+    /// inspectable until their owning recovery path reaches a terminal state.
+    pub async fn prune_local_authority_receipts(&self, cutoff_unix_ms: i64) -> Result<u64> {
+        self.transaction(move |conn| {
+            let receipts = conn.execute(
+                "DELETE FROM local_operation_receipts
+                 WHERE state LIKE 'terminal_%' AND updated_at_unix_ms < ?1",
+                params![cutoff_unix_ms],
+            )? as u64;
+            let editor = conn.execute(
+                "DELETE FROM agent_editor_leases
+                 WHERE ((state = 'terminal' AND updated_at_unix_ms < ?1)
+                    OR (state = 'open' AND expires_at_unix_ms < ?1))",
+                params![cutoff_unix_ms],
+            )? as u64;
+            Ok(receipts.saturating_add(editor))
+        })
+        .await
+    }
+
     /// Delete old payload rows for closed sessions, preserving session rows.
     pub async fn prune_session_payloads(&self, payload_cutoff_secs: i64) -> Result<u64> {
         if payload_cutoff_secs <= 0 {
@@ -138,11 +161,20 @@ impl Db {
             .await?
             .try_into()
             .unwrap_or(u64::MAX);
+        // Local mutation receipts contain no request bodies or secret values,
+        // but they still disclose operation metadata and workspace targets.
+        // Keep ninety days for lost-response replay, then prune only terminal
+        // receipts and long-expired, never-consumed editor capabilities.
+        let authority_cutoff_ms = now_secs.saturating_sub(90 * 86_400).saturating_mul(1000);
+        outcome.local_authority_rows_purged = self
+            .prune_local_authority_receipts(authority_cutoff_ms)
+            .await?;
 
         let deleted = outcome
             .sessions_expired
             .saturating_add(outcome.payload_rows_deleted)
             .saturating_add(outcome.goal_tombstones_purged);
+        let deleted = deleted.saturating_add(outcome.local_authority_rows_purged);
         if self.path.is_some()
             && self.should_vacuum(deleted, now_secs, cfg).await
             && self.vacuum_retention_database().await?

@@ -205,6 +205,14 @@ pub async fn complete_editor_lease(
             message: "agent editor lease belongs to another client principal".into(),
         });
     }
+    // Validate every immutable capability target before changing the durable
+    // lease state. A typo, stale workspace selection, or malformed persisted
+    // snapshot must not poison an otherwise reusable lease by reserving its
+    // one completion slot.
+    if known_lease.project_root != root.to_string_lossy() {
+        return Err(bad_request("editor lease belongs to another workspace"));
+    }
+    serde_json::from_str::<AgentEditSnapshot>(&known_lease.snapshot_json).map_err(internal)?;
     // Expiry prevents an unacknowledged Begin from being replayed as apparent
     // success forever; it must not make an already-issued capability
     // impossible to settle. Completion remains exact-hash and owner bound, so
@@ -227,9 +235,6 @@ pub async fn complete_editor_lease(
         }
         crate::db::agent_editor_leases::AgentEditorCompletionClaim::Terminal(lease) => lease,
     };
-    if lease.project_root != root.to_string_lossy() {
-        return Err(bad_request("editor lease belongs to another workspace"));
-    }
     if let Some(json) = lease.terminal_result_json {
         let result = serde_json::from_str(&json).map_err(internal)?;
         return Ok(Response::AgentEditorLeaseCompleted(result));

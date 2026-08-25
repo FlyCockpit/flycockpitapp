@@ -6794,6 +6794,11 @@ mod tests {
                 flow_id: "flow".into(),
                 input: None,
             },
+            Request::CancelProviderOAuth {
+                client_operation_id: "cancel-provider".into(),
+                begin_client_operation_id: "begin-provider".into(),
+                flow_id: Some("flow".into()),
+            },
             Request::BeginMcpOAuth {
                 client_operation_id: "begin-mcp".into(),
                 project_root: "/tmp/project".into(),
@@ -6823,7 +6828,7 @@ mod tests {
                     request,
                 })
                 .0,
-                expected
+                17
             );
         }
         for response in [

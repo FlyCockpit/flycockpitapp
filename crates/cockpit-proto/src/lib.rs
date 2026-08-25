@@ -1025,13 +1025,13 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v17 adds explicit provider OAuth cancellation
-/// for leak-reveal capabilities so a local frontend can settle a minted token
-/// on every pre-reveal rejection path without materializing the secret.
+/// Current wire schema version. v17 adds explicit, owner-scoped provider OAuth
+/// cancellation so local frontends can terminally settle timed-out or dismissed
+/// daemon-owned PKCE/device flows.
 pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Oldest wire schema version this binary accepts. v17 is current-only: the
-/// leak-reveal lifecycle change has no safe compatibility fallback.
+/// provider OAuth lifecycle change has no safe compatibility fallback.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 17;
 
 /// Version string the daemon advertises to clients on attach/status.
@@ -3600,7 +3600,7 @@ mod proto_fixture_tests {
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
     const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[17];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]

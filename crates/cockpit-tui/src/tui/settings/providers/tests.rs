@@ -7395,3 +7395,69 @@ pub(crate) fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
     );
     assert_eq!(state.status.as_ref().unwrap().as_deref(), Ok("copied"));
 }
+
+#[test]
+fn pending_oauth_accepts_only_correlated_cancel_and_unlocks_on_terminal_result() {
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
+    let begin = handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::AddWizard)
+        .action
+        .expect("login starts a correlated begin");
+    assert!(state.polling);
+
+    for key in [
+        KeyCode::Enter,
+        KeyCode::Char('s'),
+        KeyCode::Char('c'),
+        KeyCode::Down,
+    ] {
+        let blocked = handle_oauth_flow_key(press(key), &mut state, OAuthHost::AddWizard);
+        assert!(
+            blocked.action.is_none(),
+            "pending OAuth must reject {key:?}"
+        );
+        assert_eq!(blocked.nav, OAuthNav::Stay);
+    }
+
+    let cancel = handle_oauth_flow_key(press(KeyCode::Esc), &mut state, OAuthHost::AddWizard)
+        .action
+        .expect("escape emits a correlated cancellation");
+    assert_eq!(cancel.client_flow_id, begin.client_flow_id);
+    assert_ne!(cancel.operation_id, begin.operation_id);
+    assert!(matches!(cancel.op, OAuthFlowOp::Cancel { flow_id: None }));
+    assert!(
+        state.polling,
+        "the surface remains locked until cancellation settles"
+    );
+    assert!(state.accepts_result(cancel.client_flow_id, cancel.operation_id));
+    state.apply_cancel(Ok(()));
+    assert!(!state.polling);
+    assert!(!state.pending);
+}
+
+#[test]
+fn oauth_action_completion_rejects_wrong_flow_and_superseded_operation() {
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
+    let first = handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::Standalone)
+        .action
+        .expect("begin action");
+    let cancel = handle_oauth_flow_key(press(KeyCode::Esc), &mut state, OAuthHost::Standalone)
+        .action
+        .expect("cancel action");
+    assert!(!state.accepts_result(first.client_flow_id, first.operation_id));
+    assert!(!state.accepts_result(
+        super::super::pointer_actions::OAuthFlowId(cancel.client_flow_id.0.saturating_add(1)),
+        cancel.operation_id,
+    ));
+    assert!(state.accepts_result(cancel.client_flow_id, cancel.operation_id));
+    assert!(!state.accepts_result(cancel.client_flow_id, cancel.operation_id));
+}
+
+#[test]
+fn oauth_false_completion_is_not_rendered_as_success() {
+    for provider in [OAuthProvider::Codex, OAuthProvider::Grok] {
+        let mut state = OAuthFlowState::new_without_acknowledgement_for_test(provider);
+        state.apply_complete(Ok(false));
+        assert!(!state.logged_in);
+        assert!(state.status.as_ref().is_some_and(|status| status.is_err()));
+    }
+}

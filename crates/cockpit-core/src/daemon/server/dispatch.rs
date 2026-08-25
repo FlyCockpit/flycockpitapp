@@ -8180,7 +8180,6 @@ async fn handle_serialized_request_impl(
                 return Err(bad_request("unsupported provider OAuth flow"));
             }
             let owner = oauth_owner(state);
-            purge_durable_oauth_flows(ctx, &owner)?;
             let request_hash = local_operation_secret_request_hash(
                 ctx,
                 b"flycockpit/local-operation/provider-oauth/begin/v1\0",
@@ -8227,6 +8226,9 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
+            // Never let capacity/expiry maintenance erase the durable target
+            // needed to replay an exact begin receipt.
+            purge_durable_oauth_flows(ctx, &owner)?;
             if let Some((flow_id, authorize_url, user_code)) = ctx
                 .oauth_flows
                 .provider_started(&owner, &client_operation_id)
@@ -8837,7 +8839,6 @@ async fn handle_serialized_request_impl(
             // all key on the same canonical workspace root as later resolution.
             let project_root = crate::secret_ownership::canonical_owner_root(&project_root);
             let owner = oauth_owner(state);
-            purge_durable_oauth_flows(ctx, &owner)?;
             let request_hash = local_operation_secret_request_hash(
                 ctx,
                 b"flycockpit/local-operation/mcp-oauth/begin/v1\0",
@@ -8845,28 +8846,10 @@ async fn handle_serialized_request_impl(
             )?;
             let receipt_request_hash =
                 local_operation_request_hash(&("begin_mcp_oauth", &project_root, &server))?;
-            let cwd = std::path::PathBuf::from(&project_root);
-            let trust_policy =
-                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-                    .await
-                    .map_err(workspace_trust_error)?;
-            let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
-            let config = mcp_config_from_paths(&paths)?;
-            let server_config = config
-                .servers
-                .get(&server)
-                .ok_or_else(|| bad_request(format!("MCP server `{server}` is not configured")))?;
-            if !matches!(server_config.auth, crate::mcp::config::Auth::Oauth(_)) {
-                return Err(bad_request(format!(
-                    "MCP server `{server}` is not configured for OAuth"
-                )));
-            }
-            ensure_mcp_ownership_available(
-                ctx,
-                &project_root,
-                [crate::mcp::auth::cred_key(&server)],
-            )
-            .await?;
+            // Admission and exact replay precede every mutable trust/config/
+            // ownership check and capacity sweep. Otherwise an already-settled
+            // begin can become unreplayable merely because its workspace was
+            // edited after the original request.
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -8897,6 +8880,29 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
+            purge_durable_oauth_flows(ctx, &owner)?;
+            let cwd = std::path::PathBuf::from(&project_root);
+            let trust_policy =
+                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+                    .await
+                    .map_err(workspace_trust_error)?;
+            let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
+            let config = mcp_config_from_paths(&paths)?;
+            let server_config = config
+                .servers
+                .get(&server)
+                .ok_or_else(|| bad_request(format!("MCP server `{server}` is not configured")))?;
+            if !matches!(server_config.auth, crate::mcp::config::Auth::Oauth(_)) {
+                return Err(bad_request(format!(
+                    "MCP server `{server}` is not configured for OAuth"
+                )));
+            }
+            ensure_mcp_ownership_available(
+                ctx,
+                &project_root,
+                [crate::mcp::auth::cred_key(&server)],
+            )
+            .await?;
             if let Some((flow_id, authorize_url)) = ctx
                 .oauth_flows
                 .mcp_started(&owner, &client_operation_id)
@@ -9472,6 +9478,22 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
+            // Bind/replay the authenticated operation identity before reading
+            // mutable config or vault state. A retry must resolve the original
+            // receipt even if the provider was renamed, its config was removed,
+            // or workspace trust changed after the first execution.
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "delete_provider_credential",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
             if let Some(root) = project_root.as_deref() {
                 recover_provider_config_journals(ctx, root, Some(&provider_id)).await?;
@@ -9544,18 +9566,6 @@ async fn handle_serialized_request_impl(
             };
             #[cfg(not(feature = "remote"))]
             let _ = (&response, changed, consumed_vault_generation);
-            let fencing_generation = match begin_local_operation(
-                ctx,
-                &settlement_owner,
-                &client_operation_id,
-                "delete_provider_credential",
-                request_hash,
-            )
-            .await?
-            {
-                LocalOperationStart::Replay(response) => return Ok(response),
-                LocalOperationStart::Execute(generation) => generation,
-            };
             let result = match {
                 #[cfg(feature = "remote")]
                 match remote_operation {

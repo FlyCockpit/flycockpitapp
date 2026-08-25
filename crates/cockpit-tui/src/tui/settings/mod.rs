@@ -164,6 +164,11 @@ fn settings_daemon_request(request: Request) -> Result<Response, String> {
     if let Some(effect) = TEST_SETTINGS_DAEMON_EFFECT.with(|slot| slot.borrow().clone()) {
         return effect.request(request);
     }
+    #[cfg(test)]
+    {
+        return Err("no test settings daemon effect is installed".to_string());
+    }
+    #[cfg(not(test))]
     ProductionSettingsDaemonEffect.request(request)
 }
 

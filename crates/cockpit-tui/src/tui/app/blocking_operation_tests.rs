@@ -625,6 +625,13 @@ fn reducers_and_async_loop_do_not_reenter_daemon_runtime_synchronously() {
         ("app/mod.rs", include_str!("mod.rs")),
         ("app/input.rs", include_str!("input.rs")),
         ("app/resume.rs", include_str!("resume.rs")),
+        (
+            "app/attach_lifecycle.rs",
+            include_str!("attach_lifecycle.rs"),
+        ),
+        ("app/model_controls.rs", include_str!("model_controls.rs")),
+        ("app/btw_pane.rs", include_str!("btw_pane.rs")),
+        ("app/overlay_actions.rs", include_str!("overlay_actions.rs")),
         ("tools_pane.rs", include_str!("../tools_pane.rs")),
         (
             "goal_settings_pane.rs",

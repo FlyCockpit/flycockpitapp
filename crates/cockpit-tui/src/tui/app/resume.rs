@@ -103,7 +103,11 @@ impl App {
     /// `/compact`: enqueue an in-place compaction turn on the active session.
     pub(super) fn start_compact(&mut self) {
         let submission = cockpit_core::engine::message::UserSubmission::compact_notice();
-        self.ensure_agent_runner();
+        if !matches!(self.agent_runner, Some(Ok(_))) {
+            self.start_runner_attach(true, RunnerAttachContinuation::Compact);
+            self.push_plain("/compact: connecting".to_string());
+            return;
+        }
         let span_orphaned = match self.agent_runner.as_ref() {
             Some(Ok(runner)) => match runner.try_send_input(submission) {
                 Ok(_) => {

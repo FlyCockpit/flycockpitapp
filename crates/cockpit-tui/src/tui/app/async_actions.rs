@@ -354,13 +354,20 @@ impl App {
         if self.provisional_new_session
             && !matches!(
                 result.kind,
-                AsyncActionKind::Internal("session.switch" | "session.resume")
-                    | AsyncActionKind::Blocking("paste.delivery_receipt")
+                AsyncActionKind::Internal(
+                    "session.switch" | "session.resume" | "runner.attach" | "btw.runner.attach"
+                ) | AsyncActionKind::Blocking("paste.delivery_receipt")
             )
         {
             return;
         }
         match result.kind {
+            AsyncActionKind::Internal("runner.attach") => {
+                self.apply_runner_attach_result(result.id, result.payload);
+            }
+            AsyncActionKind::Internal("btw.runner.attach") => {
+                self.apply_btw_runner_attach(result.id, result.payload);
+            }
             AsyncActionKind::DaemonRpc("settings.effect") => {
                 if let Ok(AsyncActionPayload::SettingsDaemon(completion)) = result.payload {
                     self.dialog.apply_settings_daemon_completion(completion);

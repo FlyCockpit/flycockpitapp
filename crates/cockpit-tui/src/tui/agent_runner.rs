@@ -436,6 +436,18 @@ impl Drop for ClientTasks {
     }
 }
 
+impl std::fmt::Debug for AgentRunner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentRunner")
+            .field("session_id", &self.session_id())
+            .field("short_id", &self.short_id)
+            .field("project_id", &self.project_id)
+            .field("owns_daemon", &self.owns_daemon)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AgentRunner {
     /// Retry exact submissions retained after a deterministic pre-acceptance
     /// rejection. Reusing the attachment watch gives the dispatcher a
@@ -2046,21 +2058,25 @@ impl Drop for AgentRunner {
 /// Returns `Err(String)` instead of `anyhow::Error` so `app.rs` can
 /// render the message in its fallback "input captured" stub without
 /// having to format an anyhow chain.
-pub fn try_spawn(cwd: &Path, no_sandbox: bool, mode: LifecycleMode) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, None, None, no_sandbox, mode)
+pub async fn try_spawn(
+    cwd: &Path,
+    no_sandbox: bool,
+    mode: LifecycleMode,
+) -> Result<AgentRunner, String> {
+    try_spawn_inner(cwd, None, None, no_sandbox, mode).await
 }
 
 /// Attach a fresh or model-less existing session seeded with the complete
 /// selection accepted by the picker. An existing durable selection is never
 /// overwritten during attach; the correlated SetActiveModel request does that.
-pub fn try_spawn_with_model(
+pub async fn try_spawn_with_model(
     cwd: &Path,
     session_id: Option<uuid::Uuid>,
     initial_model: cockpit_config::providers::ActiveModelRef,
     no_sandbox: bool,
     mode: LifecycleMode,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, session_id, Some(initial_model), no_sandbox, mode)
+    try_spawn_inner(cwd, session_id, Some(initial_model), no_sandbox, mode).await
 }
 
 /// Re-attach to an existing session by id (the `/compact` commit path,
@@ -2069,75 +2085,81 @@ pub fn try_spawn_with_model(
 /// channel onto the new compaction-handoff session. `no_sandbox` is
 /// ignored by the daemon on resume (the session keeps its own state),
 /// passed only to keep the attach shape uniform.
-pub fn attach_to_session(
+pub async fn attach_to_session(
     cwd: &Path,
     session_id: uuid::Uuid,
     no_sandbox: bool,
     mode: LifecycleMode,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, Some(session_id), None, no_sandbox, mode)
+    try_spawn_inner(cwd, Some(session_id), None, no_sandbox, mode).await
 }
 
-fn try_spawn_inner(
+async fn try_spawn_inner(
     cwd: &Path,
     session_id: Option<uuid::Uuid>,
     initial_model: Option<cockpit_config::providers::ActiveModelRef>,
     no_sandbox: bool,
     mode: LifecycleMode,
 ) -> Result<AgentRunner, String> {
-    let runtime = tokio::runtime::Handle::try_current()
-        .map_err(|_| "no tokio runtime — cockpit must be invoked from main".to_string())?;
-
-    // probe_or_spawn is async; we block the (async) caller on it so
-    // try_spawn returns a fully-attached handle to the TUI. We're
-    // already in a tokio context (`main` is `#[tokio::main]`), so we
-    // use `block_in_place` to run a `block_on` without panicking.
-    let attached = tokio::task::block_in_place(|| {
-        runtime.block_on(async {
-            let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
-            let daemon = probe_or_spawn(mode)
-                .await
-                .map_err(|e| format!("daemon probe: {e}"))?;
-            timer.phase("probe_or_spawn");
-            let owns_daemon = daemon.owns_daemon;
-            let socket = daemon.socket.clone();
-            let startup_notice = daemon.startup_notice.clone();
-            let project_root = cwd.to_string_lossy().into_owned();
-            let (env_snapshot, _env_diagnostic) =
-                cockpit_core::env_snapshot::capture_tui_shell_env();
-            let attached = match daemon
-                .client
-                .request(Request::Attach {
-                    session_id,
-                    since_seq: None,
-                    project_root: Some(project_root),
-                    initial_model,
-                    no_sandbox,
-                    // The TUI can answer interrupts (approval / loop-guard /
-                    // `question` prompts) — mark this attach interactive so
-                    // the loop guard prompts here instead of auto-rejecting.
-                    interactive: true,
-                    // The interactive TUI uses the session's active model; the
-                    // plan-level override is only for the headless plan-run
-                    // path (`cockpit run --model`).
-                    model_override: None,
-                    client_protocol_version: daemon.client.negotiated().version,
-                    env_snapshot: Some(env_snapshot.to_wire()),
-                    env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
-                })
-                .await
-            {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) if error.code == ErrorCode::ProtocolVersion => {
-                    return Err(incompatible_protocol_chip().to_string());
-                }
-                Ok(Err(error)) => return Err(format!("attach: daemon error: {error}")),
-                Err(e) => return Err(format!("attach: {e}")),
-            };
-            let (
+    let attached = {
+        let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
+        let daemon = probe_or_spawn(mode)
+            .await
+            .map_err(|e| format!("daemon probe: {e}"))?;
+        timer.phase("probe_or_spawn");
+        let owns_daemon = daemon.owns_daemon;
+        let socket = daemon.socket.clone();
+        let startup_notice = daemon.startup_notice.clone();
+        let project_root = cwd.to_string_lossy().into_owned();
+        let (env_snapshot, _env_diagnostic) = cockpit_core::env_snapshot::capture_tui_shell_env();
+        let attached = match daemon
+            .client
+            .request(Request::Attach {
+                session_id,
+                since_seq: None,
+                project_root: Some(project_root),
+                initial_model,
+                no_sandbox,
+                // The TUI can answer interrupts (approval / loop-guard /
+                // `question` prompts) — mark this attach interactive so
+                // the loop guard prompts here instead of auto-rejecting.
+                interactive: true,
+                // The interactive TUI uses the session's active model; the
+                // plan-level override is only for the headless plan-run
+                // path (`cockpit run --model`).
+                model_override: None,
+                client_protocol_version: daemon.client.negotiated().version,
+                env_snapshot: Some(env_snapshot.to_wire()),
+                env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+            })
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) if error.code == ErrorCode::ProtocolVersion => {
+                return Err(incompatible_protocol_chip().to_string());
+            }
+            Ok(Err(error)) => return Err(format!("attach: daemon error: {error}")),
+            Err(e) => return Err(format!("attach: {e}")),
+        };
+        let (
+            session_id,
+            short_id,
+            active_agent_name,
+            active_agent_path,
+            foreground_target,
+            active_model_state,
+            project_id,
+            history,
+            paused_work,
+            repair_required,
+            btw_fork,
+            daemon_version,
+            daemon_compatible,
+        ) = match attached {
+            Response::Attached {
                 session_id,
                 short_id,
-                active_agent_name,
+                active_agent,
                 active_agent_path,
                 foreground_target,
                 active_model_state,
@@ -2147,103 +2169,87 @@ fn try_spawn_inner(
                 repair_required,
                 btw_fork,
                 daemon_version,
-                daemon_compatible,
-            ) = match attached {
-                Response::Attached {
-                    session_id,
-                    short_id,
-                    active_agent,
-                    active_agent_path,
-                    foreground_target,
-                    active_model_state,
-                    project_id,
-                    history,
-                    paused_work,
-                    repair_required,
-                    btw_fork,
-                    daemon_version,
-                    compatible,
-                    ..
-                } => (
-                    session_id,
-                    short_id,
-                    active_agent,
-                    active_agent_path,
-                    foreground_target,
-                    active_model_state,
-                    project_id,
-                    history,
-                    paused_work,
-                    repair_required.map(|repair| *repair),
-                    btw_fork,
-                    daemon_version,
-                    compatible,
-                ),
-                other => return Err(format!("unexpected attach response: {other:?}")),
-            };
-            // Fetch the autocomplete frequency maps for this session's
-            // project. Best-effort: a daemon that doesn't speak
-            // `GetUsageCounts` just leaves the maps empty (no ranking).
-            let usage = match daemon
-                .client
-                .request_ok(Request::GetUsageCounts {
-                    project_id: Some(project_id.clone()),
-                })
-                .await
-            {
-                Ok(Response::UsageCounts {
-                    models,
-                    slash,
-                    tags,
-                }) => UsageCounts {
-                    models,
-                    slash,
-                    tags,
-                },
-                _ => UsageCounts::default(),
-            };
-            let skill_inventory_names = match daemon
-                .client
-                .request_ok(Request::GetInventoryBundle {
-                    project_root: cwd.to_string_lossy().into_owned(),
-                    session_id,
-                    selected_agent: active_agent_name.clone(),
-                })
-                .await
-            {
-                Ok(Response::InventoryBundle { skills, .. }) => Some(
-                    skills
-                        .into_iter()
-                        .map(|skill| skill.name)
-                        .collect::<std::collections::HashSet<_>>(),
-                ),
-                _ => None,
-            };
-            timer.phase("attach_and_usage");
-            timer.done();
-            Ok::<_, String>((
-                daemon.client,
+                compatible,
+                ..
+            } => (
                 session_id,
                 short_id,
-                active_agent_name,
+                active_agent,
                 active_agent_path,
                 foreground_target,
                 active_model_state,
                 project_id,
-                usage,
-                skill_inventory_names,
-                owns_daemon,
-                socket,
-                startup_notice,
                 history,
                 paused_work,
-                repair_required,
+                repair_required.map(|repair| *repair),
                 btw_fork,
                 daemon_version,
-                daemon_compatible,
-            ))
-        })
-    })?;
+                compatible,
+            ),
+            other => return Err(format!("unexpected attach response: {other:?}")),
+        };
+        // Fetch the autocomplete frequency maps for this session's
+        // project. Best-effort: a daemon that doesn't speak
+        // `GetUsageCounts` just leaves the maps empty (no ranking).
+        let usage = match daemon
+            .client
+            .request_ok(Request::GetUsageCounts {
+                project_id: Some(project_id.clone()),
+            })
+            .await
+        {
+            Ok(Response::UsageCounts {
+                models,
+                slash,
+                tags,
+            }) => UsageCounts {
+                models,
+                slash,
+                tags,
+            },
+            _ => UsageCounts::default(),
+        };
+        let skill_inventory_names = match daemon
+            .client
+            .request_ok(Request::GetInventoryBundle {
+                project_root: cwd.to_string_lossy().into_owned(),
+                session_id,
+                selected_agent: active_agent_name.clone(),
+            })
+            .await
+        {
+            Ok(Response::InventoryBundle { skills, .. }) => Some(
+                skills
+                    .into_iter()
+                    .map(|skill| skill.name)
+                    .collect::<std::collections::HashSet<_>>(),
+            ),
+            _ => None,
+        };
+        timer.phase("attach_and_usage");
+        timer.done();
+        Ok::<_, String>((
+            daemon.client,
+            session_id,
+            short_id,
+            active_agent_name,
+            active_agent_path,
+            foreground_target,
+            active_model_state,
+            project_id,
+            usage,
+            skill_inventory_names,
+            owns_daemon,
+            socket,
+            startup_notice,
+            history,
+            paused_work,
+            repair_required,
+            btw_fork,
+            daemon_version,
+            daemon_compatible,
+        ))
+    }?;
     let (
         client,
         session_id,

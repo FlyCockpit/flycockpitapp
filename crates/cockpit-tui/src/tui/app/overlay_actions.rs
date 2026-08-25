@@ -1,5 +1,17 @@
 use super::*;
 
+pub(super) struct PendingLeakReveal {
+    pub(super) operation_id: uuid::Uuid,
+    pub(super) report_id: String,
+    pub(super) generation: u64,
+    pub(super) receiver: std::sync::mpsc::Receiver<
+        Result<
+            cockpit_core::daemon::leak_reveal::RevealedLeakSecret,
+            cockpit_core::daemon::leak_reveal::LeakRevealDenied,
+        >,
+    >,
+}
+
 impl App {
     /// Open the project scratchpad dialog. Shared by the `/scratchpad`
     /// slash command and the Ctrl+N keyboard shortcut. The editor mirrors the
@@ -21,13 +33,12 @@ impl App {
         &mut self,
         action: crate::tui::notes_pane::NotesRpcAction,
     ) {
-        self.async_actions.start(
+        self.async_actions.start_blocking(
             crate::tui::async_action::AsyncActionKind::Internal("notes.rpc"),
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
-            async move {
+            move || {
                 action
                     .run()
-                    .await
                     .map(crate::tui::async_action::AsyncActionPayload::NotesRpc)
                     .map_err(|e| e.to_string())
             },
@@ -50,23 +61,22 @@ impl App {
         &mut self,
         action: crate::tui::leaks_pane::LeaksRpcAction,
     ) {
-        self.async_actions.start(
+        self.async_actions.start_blocking(
             crate::tui::async_action::AsyncActionKind::Internal("leaks.rpc"),
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
-            async move {
+            move || {
                 action
                     .run()
-                    .await
                     .map(crate::tui::async_action::AsyncActionPayload::LeaksRpc)
             },
         );
     }
 
     /// Reveal a leak secret and install it into the open `LeaksPane` buffer.
-    /// The plaintext is produced synchronously (begin RPC → sensitive-channel
-    /// reveal) and handed straight into the pane's zeroizing buffer — it never
-    /// crosses an `AsyncActionPayload`, the transcript, or any cache. Requests a
-    /// full clear-and-redraw whenever the buffer changes.
+    /// The plaintext is produced on a blocking worker (begin RPC →
+    /// sensitive-channel reveal) and handed through a private one-shot channel
+    /// into the pane's zeroizing buffer. It never crosses an
+    /// `AsyncActionPayload`, the transcript, or any cache.
     pub(super) fn reveal_leak_into_pane(&mut self, report_id: String, generation: u64) {
         let Some(socket) = self.startup_background.daemon_socket.clone() else {
             if let Overlay::Leaks(pane) = &mut self.overlay {
@@ -74,28 +84,63 @@ impl App {
             }
             return;
         };
-        // Begin: mint the single-use capability on the ordinary owner RPC.
-        let capability = match crate::tui::agent_runner::daemon_request_at_blocking(
-            &socket,
-            cockpit_core::daemon::proto::Request::BeginLeakReveal {
-                report_id: report_id.clone(),
-            },
-        ) {
-            Ok(cockpit_core::daemon::proto::Response::LeakRevealCapability { capability }) => {
-                capability.capability
-            }
-            _ => {
-                if let Overlay::Leaks(pane) = &mut self.overlay {
-                    pane.set_reveal_error("reveal denied");
-                }
-                return;
+        let operation_id = uuid::Uuid::new_v4();
+        let worker_report_id = report_id.clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        tokio::task::spawn_blocking(move || {
+            let result = (|| {
+                let capability = match crate::tui::agent_runner::daemon_request_at_blocking(
+                    &socket,
+                    cockpit_core::daemon::proto::Request::BeginLeakReveal {
+                        report_id: worker_report_id,
+                    },
+                ) {
+                    Ok(cockpit_core::daemon::proto::Response::LeakRevealCapability {
+                        capability,
+                    }) => capability.capability,
+                    _ => {
+                        return Err(
+                            cockpit_core::daemon::leak_reveal::LeakRevealDenied::Unauthorized,
+                        );
+                    }
+                };
+                crate::tui::agent_runner::daemon_reveal_leak_blocking(&socket, &capability)
+            })();
+            let _ = sender.send(result);
+        });
+        self.pending_leak_reveal = Some(PendingLeakReveal {
+            operation_id,
+            report_id,
+            generation,
+            receiver,
+        });
+    }
+
+    pub(super) fn drain_leak_reveal(&mut self) -> bool {
+        let Some(pending) = self.pending_leak_reveal.as_ref() else {
+            return false;
+        };
+        let result = match pending.receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(cockpit_core::daemon::leak_reveal::LeakRevealDenied::Internal)
             }
         };
-        // Reveal over the sensitive channel; the plaintext returns directly.
-        match crate::tui::agent_runner::daemon_reveal_leak_blocking(&socket, &capability) {
+        let pending = self
+            .pending_leak_reveal
+            .take()
+            .expect("leak reveal pending checked");
+        tracing::debug!(operation_id = %pending.operation_id, "leak reveal worker settled");
+        let Overlay::Leaks(pane) = &mut self.overlay else {
+            return false;
+        };
+        match result {
             Ok(secret) => {
-                if let Overlay::Leaks(pane) = &mut self.overlay {
-                    pane.install_reveal(secret.plaintext, secret.report_id, generation);
+                if secret.report_id == pending.report_id {
+                    pane.install_reveal(secret.plaintext, secret.report_id, pending.generation);
+                } else {
+                    pane.set_reveal_error("reveal denied");
                 }
                 // A new reveal replaced the buffer; request a full clear so the
                 // prior frame's cells (if any) don't linger.
@@ -109,11 +154,10 @@ impl App {
                     LeakRevealDenied::Unauthorized => "reveal denied",
                     LeakRevealDenied::Internal => "reveal failed",
                 };
-                if let Overlay::Leaks(pane) = &mut self.overlay {
-                    pane.set_reveal_error(message);
-                }
+                pane.set_reveal_error(message);
             }
         }
+        true
     }
 
     /// The active TUI context the which-key overlay should describe

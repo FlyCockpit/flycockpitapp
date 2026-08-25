@@ -273,6 +273,11 @@ pub enum AsyncActionPayload {
     WorkspaceTrust(crate::tui::app::WorkspaceTrustCompletion),
     Sealed(crate::tui::app::slash::SealedCompletion),
     SettingsDaemon(crate::tui::settings::SettingsDaemonEffectCompletion),
+    AgentRunnerAttached(Box<crate::tui::agent_runner::AgentRunner>),
+    BtwRunnerAttached {
+        session_id: uuid::Uuid,
+        runner: Box<crate::tui::agent_runner::AgentRunner>,
+    },
     MouseCopy(MouseCopyResult),
 }
 

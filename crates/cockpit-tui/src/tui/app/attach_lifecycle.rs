@@ -135,9 +135,193 @@ impl App {
         if matches!(self.agent_runner, Some(Ok(_))) {
             return;
         }
-        let runner =
-            agent_runner::try_spawn(&self.launch.cwd, self.no_sandbox, self.lifecycle_mode());
-        self.adopt_runner(runner);
+        self.start_runner_attach(true, RunnerAttachContinuation::RetryRetainedSubmissions);
+    }
+
+    /// Start the sole foreground runner attachment without waiting in the
+    /// reducer. Requests for the same launch identity coalesce behind one
+    /// operation; their typed continuations run only after that exact
+    /// operation is accepted by [`Self::apply_runner_attach_result`].
+    pub(super) fn start_runner_attach(
+        &mut self,
+        latch_error: bool,
+        continuation: RunnerAttachContinuation,
+    ) {
+        if matches!(self.agent_runner, Some(Ok(_))) {
+            self.apply_runner_attach_continuation(continuation);
+            return;
+        }
+        let requested_session_id = self.launch.session_id;
+        if let Some(pending) = self.pending_runner_attach.as_mut()
+            && pending.cwd == self.launch.cwd
+            && pending.requested_session_id == requested_session_id
+            && pending.model_state_generation == self.active_model_state_generation
+            && pending.config_generation == self.config_snapshot.generation
+        {
+            pending.latch_error |= latch_error;
+            let duplicate = matches!(
+                continuation,
+                RunnerAttachContinuation::RetryRetainedSubmissions
+            ) && pending
+                .continuations
+                .iter()
+                .any(|queued| matches!(queued, RunnerAttachContinuation::RetryRetainedSubmissions));
+            if !duplicate {
+                pending.continuations.push(continuation);
+            }
+            return;
+        }
+
+        let initial_model = match &continuation {
+            RunnerAttachContinuation::SelectModel { active, .. } => Some(active.clone()),
+            _ => None,
+        };
+        let cwd = self.launch.cwd.clone();
+        let no_sandbox = self.no_sandbox;
+        let mode = self.lifecycle_mode();
+        let worker_cwd = cwd.clone();
+        let action_id = self
+            .async_actions
+            .start(
+                AsyncActionKind::Internal("runner.attach"),
+                AsyncActionPolicy::Replace(AsyncActionKey::new("runner.attach")),
+                async move {
+                    let runner = match initial_model {
+                        Some(model) => {
+                            agent_runner::try_spawn_with_model(
+                                &worker_cwd,
+                                requested_session_id,
+                                model,
+                                no_sandbox,
+                                mode,
+                            )
+                            .await
+                        }
+                        None => agent_runner::try_spawn(&worker_cwd, no_sandbox, mode).await,
+                    }?;
+                    Ok(AsyncActionPayload::AgentRunnerAttached(Box::new(runner)))
+                },
+            )
+            .id();
+        let generation = self.next_runner_attach_generation;
+        self.next_runner_attach_generation = generation.wrapping_add(1).max(1);
+        self.pending_runner_attach = Some(PendingRunnerAttach {
+            action_id,
+            generation,
+            cwd,
+            requested_session_id,
+            model_state_generation: self.active_model_state_generation,
+            config_generation: self.config_snapshot.generation,
+            latch_error,
+            continuations: vec![continuation],
+        });
+    }
+
+    pub(super) fn apply_runner_attach_result(
+        &mut self,
+        action_id: crate::tui::async_action::AsyncActionId,
+        payload: Result<AsyncActionPayload, String>,
+    ) {
+        let Some(pending) = self.pending_runner_attach.as_ref() else {
+            return;
+        };
+        if pending.action_id != action_id {
+            return;
+        }
+        let identity_matches = pending.cwd == self.launch.cwd
+            && pending.requested_session_id == self.launch.session_id
+            && pending.model_state_generation == self.active_model_state_generation
+            && pending.config_generation == self.config_snapshot.generation;
+        let pending = self
+            .pending_runner_attach
+            .take()
+            .expect("runner attach pending checked");
+        if !identity_matches {
+            tracing::debug!(
+                generation = pending.generation,
+                "discarded stale runner attach"
+            );
+            let mut continuations = pending.continuations.into_iter();
+            if let Some(first) = continuations.next() {
+                self.start_runner_attach(pending.latch_error, first);
+                for continuation in continuations {
+                    self.start_runner_attach(pending.latch_error, continuation);
+                }
+            }
+            return;
+        }
+        match payload {
+            Ok(AsyncActionPayload::AgentRunnerAttached(runner)) => {
+                self.adopt_runner(Ok(*runner));
+                for continuation in pending.continuations {
+                    self.apply_runner_attach_continuation(continuation);
+                }
+            }
+            Ok(_) => {
+                let error = "runner attach returned an unexpected payload".to_string();
+                if pending.latch_error {
+                    self.adopt_runner(Err(error.clone()));
+                } else {
+                    self.display_attach_backoff.record_failure(Instant::now());
+                }
+                self.apply_runner_attach_failure(&pending.continuations, &error);
+            }
+            Err(error) => {
+                if pending.latch_error {
+                    self.adopt_runner(Err(error.clone()));
+                } else {
+                    self.display_attach_backoff.record_failure(Instant::now());
+                }
+                self.apply_runner_attach_failure(&pending.continuations, &error);
+            }
+        }
+    }
+
+    fn apply_runner_attach_failure(
+        &mut self,
+        continuations: &[RunnerAttachContinuation],
+        error: &str,
+    ) {
+        for continuation in continuations {
+            match continuation {
+                RunnerAttachContinuation::SelectModel {
+                    active, trigger, ..
+                } => self.show_model_selection_error(
+                    active,
+                    *trigger,
+                    format!("Could not start a session — {error}"),
+                ),
+                RunnerAttachContinuation::BtwCommand(_) => {
+                    self.history.push(HistoryEntry::CommandError {
+                        line: format!("/btw: {error}"),
+                    })
+                }
+                RunnerAttachContinuation::Compact => {
+                    self.history.push(HistoryEntry::CommandError {
+                        line: format!("/compact: {error}"),
+                    })
+                }
+                RunnerAttachContinuation::RetryRetainedSubmissions => {}
+            }
+        }
+    }
+
+    fn apply_runner_attach_continuation(&mut self, continuation: RunnerAttachContinuation) {
+        match continuation {
+            RunnerAttachContinuation::RetryRetainedSubmissions => {
+                let _ = self.retry_retained_pre_dispatch_submissions();
+            }
+            RunnerAttachContinuation::SelectModel {
+                label,
+                active,
+                persist_as_default,
+                trigger,
+            } => {
+                let _ = self.request_model_selection(&label, active, persist_as_default, trigger);
+            }
+            RunnerAttachContinuation::BtwCommand(args) => self.handle_btw_command(&args),
+            RunnerAttachContinuation::Compact => self.start_compact(),
+        }
     }
 
     /// Adopt a freshly-spawned runner: on success, record its identity
@@ -419,13 +603,7 @@ impl App {
                 return;
             }
         }
-        let runner =
-            agent_runner::try_spawn(&self.launch.cwd, self.no_sandbox, self.lifecycle_mode());
-        if runner.is_ok() {
-            self.adopt_runner(runner);
-        } else {
-            self.display_attach_backoff.record_failure(Instant::now());
-        }
+        self.start_runner_attach(false, RunnerAttachContinuation::RetryRetainedSubmissions);
         // On `Err`, drop it silently: leave `agent_runner` as `None` so a
         // later tick can retry once the daemon is actually reachable.
     }

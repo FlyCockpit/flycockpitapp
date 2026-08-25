@@ -251,7 +251,7 @@ pub struct LeaksRpcResult {
 }
 
 impl LeaksRpcAction {
-    pub async fn run(self) -> Result<LeaksRpcResult, String> {
+    pub fn run(self) -> Result<LeaksRpcResult, String> {
         let socket = self.daemon_socket;
         let send = |request| crate::tui::agent_runner::daemon_request_at_blocking(&socket, request);
         match self.kind {

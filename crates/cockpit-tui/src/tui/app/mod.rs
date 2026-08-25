@@ -1516,6 +1516,31 @@ pub(super) struct RetainedPreDispatchSubmission {
     pub pending: PendingSessionSwitchSubmission,
 }
 
+#[derive(Debug, Clone)]
+pub(super) enum RunnerAttachContinuation {
+    RetryRetainedSubmissions,
+    SelectModel {
+        label: String,
+        active: cockpit_config::providers::ActiveModelRef,
+        persist_as_default: bool,
+        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger,
+    },
+    BtwCommand(String),
+    Compact,
+}
+
+#[derive(Debug)]
+pub(super) struct PendingRunnerAttach {
+    action_id: crate::tui::async_action::AsyncActionId,
+    generation: u64,
+    cwd: PathBuf,
+    requested_session_id: Option<uuid::Uuid>,
+    model_state_generation: u64,
+    config_generation: u64,
+    latch_error: bool,
+    continuations: Vec<RunnerAttachContinuation>,
+}
+
 pub(super) struct RetainedSessionSwitchSubmissions {
     /// `None` is possible only for synthetic/tests that stage without first
     /// claiming a switch. Production entries are always target-bound.
@@ -2073,6 +2098,9 @@ pub struct App {
     /// `Result<AgentRunner, String>` so a failed init keeps the error
     /// around for next-time visibility.
     pub(super) agent_runner: Option<Result<AgentRunner, String>>,
+    pub(super) pending_runner_attach: Option<PendingRunnerAttach>,
+    pub(super) next_runner_attach_generation: u64,
+    pub(super) pending_leak_reveal: Option<overlay_actions::PendingLeakReveal>,
     display_attach_backoff: DisplayAttachBackoff,
     /// Shared client-side runner for TUI background actions. Daemon RPCs and
     /// blocking filesystem/subprocess probes can complete through this tick
@@ -3568,6 +3596,9 @@ impl App {
             daemon_signal_task: None,
             fetch_models_progress: Arc::new(Mutex::new(Vec::new())),
             agent_runner: None,
+            pending_runner_attach: None,
+            next_runner_attach_generation: 1,
+            pending_leak_reveal: None,
             display_attach_backoff: DisplayAttachBackoff::default(),
             async_actions: AsyncActionRunner::default(),
             _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard::new(),
@@ -4201,6 +4232,7 @@ impl App {
         changed |= self.drain_fetch_progress();
         changed |= self.drain_agent_events();
         changed |= self.drain_async_actions();
+        changed |= self.drain_leak_reveal();
         changed |= self.retry_pending_session_switch_submissions();
         changed |= self.retry_retained_pre_dispatch_submissions();
         changed |= self.drain_prediction();

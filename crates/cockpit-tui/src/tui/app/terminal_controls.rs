@@ -36,6 +36,7 @@ impl App {
             DaemonRpc("leaks-rotate"),
             DaemonRpc("mcp.local"),
             DaemonRpc("note"),
+            DaemonRpc("paste.image_path_admission"),
             DaemonRpc("rename"),
             DaemonRpc("resources.promote"),
             DaemonRpc("sealed"),

@@ -1090,14 +1090,6 @@ fn production_filesystem_mutations_have_device_ui_owners() {
             ".create_new(true)",
         ),
         (
-            "crates/cockpit-tui/src/tui/image_path_probe.rs",
-            "std::fs::OpenOptions::new() // Unix no-follow read-only handle.",
-        ),
-        (
-            "crates/cockpit-tui/src/tui/image_path_probe.rs",
-            "std::fs::OpenOptions::new() // Windows reparse-point read-only handle.",
-        ),
-        (
             "crates/cockpit-tui/src/tui/async_action.rs",
             "file.write_all(format!(\"v1\\n{name}\\n\").as_bytes())?",
         ),
@@ -1469,4 +1461,47 @@ fn filesystem_authority_classifier_has_path_complete_negative_fixtures() {
         0,
         "string literals must not manufacture an authority site"
     );
+}
+
+#[test]
+fn pasted_image_paths_are_admitted_only_by_the_daemon() {
+    let root = repo_root();
+    assert!(
+        !root
+            .join("crates/cockpit-tui/src/tui/image_path_probe.rs")
+            .exists(),
+        "the retired frontend path opener/decoder must not return"
+    );
+    let module = fs::read_to_string(root.join("crates/cockpit-tui/src/tui/mod.rs")).unwrap();
+    let input = fs::read_to_string(root.join("crates/cockpit-tui/src/tui/app/input.rs")).unwrap();
+    let daemon =
+        fs::read_to_string(root.join("crates/cockpit-core/src/daemon/server/attachments.rs"))
+            .unwrap();
+
+    assert!(!module.contains("mod image_path_probe"));
+    assert!(input.contains("Request::AdmitLocalImagePath"));
+    for forbidden in [
+        "std::fs::OpenOptions",
+        "ImageReader::with_format",
+        "DynamicImage::from_decoder",
+        "normalize_private_image",
+    ] {
+        assert!(
+            !production_source(&input).contains(forbidden),
+            "TUI retained authoritative image-path work: {forbidden}"
+        );
+    }
+    for required in [
+        "resolve_workspace_trust_policy_from_db",
+        "canonical.starts_with(project_root)",
+        "open_local_image_no_follow",
+        "source changed",
+        "MAX_SINGLE_IMAGE_BYTES",
+        "LocalImagePathAdmitted",
+    ] {
+        assert!(
+            daemon.contains(required),
+            "daemon image admission is missing {required}"
+        );
+    }
 }

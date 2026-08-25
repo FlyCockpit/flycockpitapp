@@ -1,5 +1,81 @@
 use super::*;
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct LocalImagePngPayload(zeroize::Zeroizing<String>);
+
+impl LocalImagePngPayload {
+    pub fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Debug for LocalImagePngPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "LocalImagePngPayload([REDACTED; {} bytes])",
+            self.0.len()
+        )
+    }
+}
+
+impl Serialize for LocalImagePngPayload {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalImagePngPayload {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let maximum = MAX_SINGLE_IMAGE_BYTES.saturating_add(2) / 3 * 4 + 4;
+        if value.len() > maximum {
+            return Err(serde::de::Error::custom(
+                "local image payload exceeds wire limit",
+            ));
+        }
+        Ok(Self::new(value))
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalImagePathAdmissionV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    pub admission_id: Uuid,
+    pub normalized_png_base64: LocalImagePngPayload,
+    pub normalized_sha256: String,
+    pub normalized_byte_length: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl std::fmt::Debug for LocalImagePathAdmissionV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalImagePathAdmissionV1")
+            .field("schema_version", &self.schema_version)
+            .field("kind", &self.kind)
+            .field("admission_id", &self.admission_id)
+            .field("normalized_png_base64", &"[REDACTED]")
+            .field("normalized_sha256", &self.normalized_sha256)
+            .field("normalized_byte_length", &self.normalized_byte_length)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish()
+    }
+}
+
 // ---- Responses -------------------------------------------------------------
 
 /// Daemon → client RPC responses. Each variant is the typed answer to
@@ -16,6 +92,8 @@ pub enum Response {
     MediaOwnerRecovery(cockpit_db::media_attachments::LocalMediaOwnerReceiptV1),
 
     LocalPathMediaRegistration(cockpit_db::media_attachments::LocalPathRegistrationReceiptV1),
+
+    LocalImagePathAdmitted(LocalImagePathAdmissionV1),
 
     RetainedHttpsMedia(cockpit_db::media_attachments::RetainedHttpsMediaReceiptV1),
 
@@ -1271,6 +1349,7 @@ macro_rules! response_variants {
             (Response::Ack, "ack");
             (Response::MediaOwnerRecovery(..), "media_owner_recovery");
             (Response::LocalPathMediaRegistration(..), "local_path_media_registration");
+            (Response::LocalImagePathAdmitted(..), "local_image_path_admitted");
             (Response::RetainedHttpsMedia(..), "retained_https_media");
             (Response::MediaAttachmentStatus(..), "media_attachment_status");
             (Response::MediaAttachmentPreview(..), "media_attachment_preview");

@@ -46,9 +46,9 @@ pub use agent_management::{
     MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES, MAX_ASSISTANT_HOME_BYTES,
     agent_edit_projection_material, agent_inventory_entry_projection_material,
     agent_mutation_intent_hash, agent_mutation_name, assistant_mutation_intent_hash,
-    validate_agent_edit_snapshot,
-    validate_agent_editor_completion, validate_agent_mutation_envelope,
-    validate_agent_source_identity, validate_goal_supervision_projection,
+    validate_agent_edit_snapshot, validate_agent_editor_completion,
+    validate_agent_mutation_envelope, validate_agent_source_identity,
+    validate_goal_supervision_projection,
 };
 pub use config_management::{
     CockpitConfigLayer, CommittedDenylistEntry, ConfigCommitStatus, ConfigPublicationStatus,
@@ -1050,7 +1050,8 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// receipts, including atomic image-spend policy receipts, and operation-bound
 /// external-editor settlement/status receipts. Agent and assistant inventory
 /// reads also carry one shared configuration generation, while agent inventory
-/// binds its canonical and requested workspace roots.
+/// binds its canonical and requested workspace roots. Browser-provided local
+/// image paths are admitted by a daemon-only, trust-scoped normalization RPC.
 pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Oldest wire schema version this binary accepts. v17 is current-only: the

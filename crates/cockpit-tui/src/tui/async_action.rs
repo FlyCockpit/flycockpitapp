@@ -178,7 +178,7 @@ pub enum AsyncActionPayload {
         original: String,
         source_draft_generation: u64,
         cursor: usize,
-        png: Option<Vec<u8>>,
+        admission: Option<DaemonImagePathAdmission>,
     },
     NativeImagePaste {
         request_id: uuid::Uuid,
@@ -282,6 +282,15 @@ pub enum AsyncActionPayload {
         runner: Box<crate::tui::agent_runner::AgentRunner>,
     },
     MouseCopy(MouseCopyResult),
+}
+
+#[derive(Debug)]
+pub struct DaemonImagePathAdmission {
+    pub admission_id: uuid::Uuid,
+    pub png: Vec<u8>,
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone)]

@@ -225,6 +225,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::AgentInstallation(_) => {}
         proto::Response::MediaOwnerRecovery(..)
         | proto::Response::LocalPathMediaRegistration(..)
+        | proto::Response::LocalImagePathAdmitted(..)
         | proto::Response::RetainedHttpsMedia(..)
         | proto::Response::MediaAttachmentStatus(..)
         | proto::Response::MediaAttachmentPreview(..)

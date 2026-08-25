@@ -1,6 +1,326 @@
 use super::sessions::*;
 use super::*;
 
+const LOCAL_IMAGE_PATH_MAX_INPUT_BYTES: u64 = 10 * 1024 * 1024;
+
+pub(super) async fn admit_local_image_path(
+    ctx: &DaemonContext,
+    project_root: String,
+    path: proto::SensitiveWirePayload,
+    admission_id: Uuid,
+) -> std::result::Result<Response, ErrorPayload> {
+    if project_root.trim().is_empty() || path.trim().is_empty() || path.len() > 4096 {
+        return Err(bad_request("local image path is unavailable"));
+    }
+    let root = std::fs::canonicalize(&project_root)
+        .map_err(|_| bad_request("local image path is unavailable"))?;
+    let trust = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &root)
+        .await
+        .map_err(|_| bad_request("local image path is unavailable"))?;
+    if trust.root.root != root && !root.starts_with(&trust.root.root) {
+        return Err(bad_request("local image path is unavailable"));
+    }
+    let (_, extended) = ctx
+        .config_source
+        .load_effective_for_daemon(&root, &trust)
+        .map_err(|_| bad_request("local image path is unavailable"))?;
+    let requested = std::path::PathBuf::from(path.as_str());
+    let root_for_worker = root.clone();
+    let admitted = tokio::task::spawn_blocking(move || {
+        normalize_project_image_path(&root_for_worker, &requested, admission_id)
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|_| bad_request("local image path is unavailable"))?;
+    evaluate_local_image_admission_policy(&extended.media_resources, &admitted)
+        .map_err(|_| bad_request("local image path is unavailable"))?;
+    Ok(Response::LocalImagePathAdmitted(admitted))
+}
+
+fn evaluate_local_image_admission_policy(
+    policy: &cockpit_config::config::media_budget::MediaResourcePolicy,
+    admitted: &proto::LocalImagePathAdmissionV1,
+) -> anyhow::Result<()> {
+    use cockpit_config::config::media_budget::{
+        MediaDimension, MediaEvaluationRequest, PASTE_IMAGE_PROFILE,
+    };
+    let pixels = u64::from(admitted.width)
+        .checked_mul(u64::from(admitted.height))
+        .ok_or_else(|| anyhow::anyhow!("pixel count overflow"))?;
+    for (dimension, requested) in [
+        (MediaDimension::QueuedOperationsGlobal, 1),
+        (MediaDimension::QueuedOperationsPerSession, 1),
+        (
+            MediaDimension::EncodedBytesPerObject,
+            admitted.normalized_byte_length,
+        ),
+        (
+            MediaDimension::RetainedBytesPerSession,
+            admitted.normalized_byte_length,
+        ),
+        (
+            MediaDimension::DecodedEdgePixels,
+            u64::from(admitted.width.max(admitted.height)),
+        ),
+        (MediaDimension::DecodedImagePixels, pixels),
+        (MediaDimension::AggregateDecodedPixelsPerRequest, pixels),
+        (MediaDimension::LocalCpuJobsGlobal, 1),
+        (
+            MediaDimension::OperationDeadlineSeconds,
+            policy
+                .limits()
+                .get(MediaDimension::OperationDeadlineSeconds),
+        ),
+    ] {
+        policy.evaluate(MediaEvaluationRequest {
+            dimension,
+            requested: Some(requested),
+            current_scope: 0,
+            profile: Some(PASTE_IMAGE_PROFILE),
+            adapter_limit: None,
+            request_limit: None,
+        })?;
+    }
+    Ok(())
+}
+
+fn normalize_project_image_path(
+    project_root: &std::path::Path,
+    requested: &std::path::Path,
+    admission_id: Uuid,
+) -> anyhow::Result<proto::LocalImagePathAdmissionV1> {
+    use base64::Engine as _;
+    use image::{DynamicImage, GenericImageView as _, ImageDecoder as _, ImageFormat, Limits};
+    use std::io::{Cursor, Read as _};
+
+    let joined = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        project_root.join(requested)
+    };
+    let canonical = std::fs::canonicalize(&joined)?;
+    anyhow::ensure!(
+        canonical.starts_with(project_root),
+        "path escaped workspace"
+    );
+    let mut file = open_local_image_no_follow(&canonical)?;
+    let before = file.metadata()?;
+    anyhow::ensure!(
+        before.is_file() && before.len() > 0 && before.len() <= LOCAL_IMAGE_PATH_MAX_INPUT_BYTES,
+        "invalid source"
+    );
+    let identity_before = local_image_identity(&before);
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len())?);
+    file.by_ref()
+        .take(LOCAL_IMAGE_PATH_MAX_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= LOCAL_IMAGE_PATH_MAX_INPUT_BYTES,
+        "source too large"
+    );
+    let after = file.metadata()?;
+    anyhow::ensure!(
+        before.len() == after.len()
+            && before.len() == bytes.len() as u64
+            && identity_before == local_image_identity(&after),
+        "source changed"
+    );
+
+    let format = image::guess_format(&bytes)?;
+    anyhow::ensure!(
+        matches!(
+            format,
+            ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP
+        ),
+        "unsupported image"
+    );
+    let extension = canonical
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| anyhow::anyhow!("missing image extension"))?;
+    anyhow::ensure!(
+        matches!(
+            (format, extension.as_str()),
+            (ImageFormat::Png, "png")
+                | (ImageFormat::Jpeg, "jpg" | "jpeg")
+                | (ImageFormat::Gif, "gif")
+                | (ImageFormat::WebP, "webp")
+        ),
+        "image extension does not match content"
+    );
+    reject_local_image_animation(format, &bytes)?;
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(proto::MAX_IMAGE_DIMENSION_PIXELS);
+    limits.max_image_height = Some(proto::MAX_IMAGE_DIMENSION_PIXELS);
+    limits.max_alloc = Some(proto::MAX_SINGLE_IMAGE_BYTES as u64);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder()?;
+    let orientation = decoder.orientation()?;
+    let mut image = DynamicImage::from_decoder(decoder)?;
+    image.apply_orientation(orientation);
+    let (width, height) = image.dimensions();
+    anyhow::ensure!(
+        width <= proto::MAX_IMAGE_DIMENSION_PIXELS && height <= proto::MAX_IMAGE_DIMENSION_PIXELS,
+        "image dimensions exceed policy"
+    );
+    let mut normalized = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image.into_rgba8()).write_to(&mut normalized, ImageFormat::Png)?;
+    let png = normalized.into_inner();
+    anyhow::ensure!(
+        !png.is_empty() && png.len() <= proto::MAX_SINGLE_IMAGE_BYTES,
+        "normalized image exceeds policy"
+    );
+    let digest = sha256_hex(&png);
+    Ok(proto::LocalImagePathAdmissionV1 {
+        schema_version: 1,
+        kind: "localImagePathAdmission".into(),
+        admission_id,
+        normalized_png_base64: proto::LocalImagePngPayload::new(
+            base64::engine::general_purpose::STANDARD.encode(&png),
+        ),
+        normalized_sha256: digest,
+        normalized_byte_length: png.len() as u64,
+        width,
+        height,
+    })
+}
+
+#[cfg(unix)]
+fn open_local_image_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_local_image_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_local_image_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+#[cfg(unix)]
+fn local_image_identity(metadata: &std::fs::Metadata) -> (u64, u64, u64, i128) {
+    use std::os::unix::fs::MetadataExt as _;
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()),
+    )
+}
+
+#[cfg(not(unix))]
+fn local_image_identity(metadata: &std::fs::Metadata) -> (u64, Option<std::time::SystemTime>) {
+    (metadata.len(), metadata.modified().ok())
+}
+
+fn reject_local_image_animation(format: image::ImageFormat, bytes: &[u8]) -> anyhow::Result<()> {
+    match format {
+        image::ImageFormat::Gif => anyhow::ensure!(
+            !local_gif_has_multiple_frames(bytes),
+            "animated image unsupported"
+        ),
+        image::ImageFormat::Png => anyhow::ensure!(
+            !bytes.windows(4).any(|window| window == b"acTL"),
+            "animated image unsupported"
+        ),
+        image::ImageFormat::WebP => anyhow::ensure!(
+            !bytes
+                .windows(4)
+                .any(|window| window == b"ANIM" || window == b"ANMF"),
+            "animated image unsupported"
+        ),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn local_gif_has_multiple_frames(bytes: &[u8]) -> bool {
+    let Some(packed) = bytes.get(10).copied() else {
+        return true;
+    };
+    let global_table = if packed & 0x80 != 0 {
+        3usize << (usize::from(packed & 0x07) + 1)
+    } else {
+        0
+    };
+    let Some(mut cursor) = 13usize.checked_add(global_table) else {
+        return true;
+    };
+    let mut frames = 0;
+    while let Some(marker) = bytes.get(cursor).copied() {
+        cursor += 1;
+        match marker {
+            0x3b => return frames > 1,
+            0x2c => {
+                frames += 1;
+                let Some(descriptor) = bytes.get(cursor..cursor + 9) else {
+                    return true;
+                };
+                cursor += 9;
+                if descriptor[8] & 0x80 != 0 {
+                    let Some(next) =
+                        cursor.checked_add(3usize << (usize::from(descriptor[8] & 7) + 1))
+                    else {
+                        return true;
+                    };
+                    cursor = next;
+                }
+                if bytes.get(cursor).is_none() {
+                    return true;
+                }
+                cursor += 1;
+                if !skip_local_gif_sub_blocks(bytes, &mut cursor) {
+                    return true;
+                }
+            }
+            0x21 => {
+                if bytes.get(cursor).is_none() {
+                    return true;
+                }
+                cursor += 1;
+                if !skip_local_gif_sub_blocks(bytes, &mut cursor) {
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+    }
+    true
+}
+
+fn skip_local_gif_sub_blocks(bytes: &[u8], cursor: &mut usize) -> bool {
+    loop {
+        let Some(size) = bytes.get(*cursor).copied().map(usize::from) else {
+            return false;
+        };
+        *cursor += 1;
+        if size == 0 {
+            return true;
+        }
+        let Some(next) = (*cursor).checked_add(size) else {
+            return false;
+        };
+        if next > bytes.len() {
+            return false;
+        }
+        *cursor = next;
+    }
+}
+
 #[derive(Default)]
 pub(super) struct PrunedMediaReservations {
     pub cancelled: Vec<crate::media_reservation::ReservationReceipt>,
@@ -847,6 +1167,39 @@ mod decode_cleanup_tests {
         fn now_ms(&self) -> u64 {
             0
         }
+    }
+
+    #[test]
+    fn local_image_path_admission_normalizes_without_disclosing_the_path() {
+        use base64::Engine as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("source.png");
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            3,
+            image::Rgba([1, 2, 3, 255]),
+        ));
+        image.save(&path).unwrap();
+        let admission_id = Uuid::now_v7();
+        let admitted = normalize_project_image_path(root.path(), &path, admission_id).unwrap();
+
+        assert_eq!(admitted.admission_id, admission_id);
+        assert_eq!((admitted.width, admitted.height), (2, 3));
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(admitted.normalized_png_base64.as_str())
+            .unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(admitted.normalized_byte_length, bytes.len() as u64);
+        assert_eq!(admitted.normalized_sha256, sha256_hex(&bytes));
+        assert!(!format!("{admitted:?}").contains(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn local_image_path_admission_rejects_workspace_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        assert!(normalize_project_image_path(root.path(), outside.path(), Uuid::now_v7()).is_err());
     }
 
     #[test]

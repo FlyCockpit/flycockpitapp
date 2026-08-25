@@ -1189,6 +1189,14 @@
     },
     "request": "register_local_path_media"
   },
+  "admit_local_image_path": {
+    "params": {
+      "project_root": "/tmp/project",
+      "path": "/tmp/project/file.png",
+      "admission_id": "01890f3e-7bcd-7abc-8abc-000000000021"
+    },
+    "request": "admit_local_image_path"
+  },
   "retain_https_media": {
     "params": {
       "schemaVersion": 1,

@@ -4324,6 +4324,31 @@
     {
       "class": "local_only",
       "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|path:sha256-redacted|admission_id:uuid",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "path",
+          "role": "param",
+          "type": "SensitiveWirePayload"
+        },
+        {
+          "field": "admission_id",
+          "role": "param",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "project_root:String|path:SensitiveWirePayload|admission_id:Uuid",
+      "strategy": "none",
+      "tag": "admit_local_image_path"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
       "fcorCanonicalSchema": "-",
       "fcorRoles": [],
       "fcorSchema": "-",

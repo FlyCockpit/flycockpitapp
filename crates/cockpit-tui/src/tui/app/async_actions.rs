@@ -1029,7 +1029,7 @@ impl App {
                     self.apply_startup_guidance_estimate(cwd, active_model, estimate);
                 }
             }
-            AsyncActionKind::Internal("paste.image_path_probe") => match result.payload {
+            AsyncActionKind::DaemonRpc("paste.image_path_admission") => match result.payload {
                 Ok(AsyncActionPayload::ImagePathProbe {
                     request_id,
                     request_generation,
@@ -1037,14 +1037,20 @@ impl App {
                     original: _,
                     source_draft_generation,
                     cursor,
-                    png: Some(png),
+                    admission: Some(admission),
                 }) if terminal_generation == self.terminal_input_generation => {
+                    let _receipt_metadata = (
+                        admission.admission_id,
+                        admission.sha256.as_str(),
+                        admission.width,
+                        admission.height,
+                    );
                     self.settle_paste_probe(
                         request_id,
                         request_generation,
                         source_draft_generation,
                         cursor,
-                        Some(png),
+                        Some(admission.png),
                         false,
                     );
                 }
@@ -1055,7 +1061,7 @@ impl App {
                     original: _,
                     source_draft_generation,
                     cursor: _,
-                    png: None,
+                    admission: None,
                 }) if terminal_generation == self.terminal_input_generation => {
                     self.settle_paste_probe(
                         request_id,

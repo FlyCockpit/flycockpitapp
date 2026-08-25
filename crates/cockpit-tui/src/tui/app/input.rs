@@ -21,6 +21,58 @@ use crate::tui::settings::Dialog;
 use cockpit_core::daemon::proto::{self, Request, Response};
 use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
 
+async fn admit_local_image_path_via_daemon(
+    daemon: crate::tui::settings::CapturedSettingsDaemon,
+    project_root: String,
+    path: std::path::PathBuf,
+    admission_id: uuid::Uuid,
+) -> Result<crate::tui::async_action::DaemonImagePathAdmission, String> {
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+
+    let response = daemon
+        .request(cockpit_core::daemon::proto::Request::AdmitLocalImagePath {
+            project_root,
+            path: cockpit_core::daemon::proto::SensitiveWirePayload::new(
+                path.to_string_lossy().into_owned(),
+            ),
+            admission_id,
+        })
+        .await?;
+    let cockpit_core::daemon::proto::Response::LocalImagePathAdmitted(admission) = response else {
+        return Err("daemon returned an unexpected local image admission response".into());
+    };
+    if admission.schema_version != 1
+        || admission.kind != "localImagePathAdmission"
+        || admission.admission_id != admission_id
+        || admission.normalized_byte_length == 0
+        || admission.normalized_byte_length as usize
+            > cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES
+        || admission.width == 0
+        || admission.height == 0
+        || admission.width > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+        || admission.height > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+    {
+        return Err("daemon returned an invalid local image admission receipt".into());
+    }
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(admission.normalized_png_base64.as_str())
+        .map_err(|_| "daemon returned an invalid local image payload".to_string())?;
+    if png.len() as u64 != admission.normalized_byte_length
+        || !png.starts_with(b"\x89PNG\r\n\x1a\n")
+        || format!("{:x}", Sha256::digest(&png)) != admission.normalized_sha256
+    {
+        return Err("daemon local image admission integrity check failed".into());
+    }
+    Ok(crate::tui::async_action::DaemonImagePathAdmission {
+        admission_id,
+        png,
+        sha256: admission.normalized_sha256,
+        width: admission.width,
+        height: admission.height,
+    })
+}
+
 impl App {
     /// Replay a rapid-paste candidate through the composer route that owned
     /// it at intake, without allowing a subsequently opened pane/modal to
@@ -177,8 +229,9 @@ impl App {
             if let Some(path) =
                 crate::tui::structured_paste::parse_private_image_path_literal(&data)
             {
-                let kind =
-                    crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe");
+                let kind = crate::tui::async_action::AsyncActionKind::DaemonRpc(
+                    "paste.image_path_admission",
+                );
                 let Some(fence_request) =
                     self.submission_fences.get_mut(&fence_id).and_then(|fence| {
                         fence.slots.iter_mut().find_map(|slot| match slot {
@@ -208,6 +261,9 @@ impl App {
                     },
                 );
                 let original = data;
+                let project_root = self.launch.cwd.to_string_lossy().into_owned();
+                let admission_id = uuid::Uuid::new_v4();
+                let daemon = crate::tui::settings::capture_settings_daemon();
                 let terminal_generation = self.terminal_input_generation;
                 let action_id = self
                     .async_actions
@@ -215,12 +271,14 @@ impl App {
                         kind,
                         crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
                         async move {
-                            let png = tokio::task::spawn_blocking(move || {
-                                crate::tui::image_path_probe::normalize_private_image(&path)
-                            })
+                            let admission = admit_local_image_path_via_daemon(
+                                daemon,
+                                project_root,
+                                path,
+                                admission_id,
+                            )
                             .await
-                            .ok()
-                            .and_then(Result::ok);
+                            .ok();
                             Ok(
                                 crate::tui::async_action::AsyncActionPayload::ImagePathProbe {
                                     request_id: correlation_id,
@@ -229,7 +287,7 @@ impl App {
                                     original,
                                     source_draft_generation,
                                     cursor: original_offset,
-                                    png,
+                                    admission,
                                 },
                             )
                         },
@@ -3572,7 +3630,7 @@ impl App {
 
         if let Some(path) = crate::tui::structured_paste::parse_private_image_path_literal(&data) {
             let kind =
-                crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe");
+                crate::tui::async_action::AsyncActionKind::DaemonRpc("paste.image_path_admission");
             if self.async_actions.pending_kind_count(&kind) >= 8 {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
@@ -3599,6 +3657,9 @@ impl App {
             let cursor = probe.original_offset;
             self.pending_paste_probes.insert(request_id, probe);
             let original = data.clone();
+            let project_root = self.launch.cwd.to_string_lossy().into_owned();
+            let admission_id = uuid::Uuid::new_v4();
+            let daemon = crate::tui::settings::capture_settings_daemon();
             let terminal_generation = self.terminal_input_generation;
             let action_id = self
                 .async_actions
@@ -3606,12 +3667,14 @@ impl App {
                     kind,
                     crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
                     async move {
-                        let normalized = tokio::task::spawn_blocking(move || {
-                            crate::tui::image_path_probe::normalize_private_image(&path)
-                        })
+                        let admission = admit_local_image_path_via_daemon(
+                            daemon,
+                            project_root,
+                            path,
+                            admission_id,
+                        )
                         .await
-                        .ok()
-                        .and_then(Result::ok);
+                        .ok();
                         Ok(
                             crate::tui::async_action::AsyncActionPayload::ImagePathProbe {
                                 request_id,
@@ -3620,7 +3683,7 @@ impl App {
                                 original,
                                 source_draft_generation,
                                 cursor,
-                                png: normalized,
+                                admission,
                             },
                         )
                     },
@@ -5669,7 +5732,7 @@ mod paste_routing_tests {
         assert!(!app.pending_paste_probes.contains_key(&stale_native_id));
         assert_eq!(
             app.async_actions.pending_kind_count(
-                &crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe")
+                &crate::tui::async_action::AsyncActionKind::DaemonRpc("paste.image_path_admission",)
             ),
             0
         );

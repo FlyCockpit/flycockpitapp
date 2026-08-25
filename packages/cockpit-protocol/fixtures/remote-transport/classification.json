@@ -1725,6 +1725,12 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
+        "tag": "admit_local_image_path"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
         "tag": "retain_https_media"
       },
       {
@@ -2658,6 +2664,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "local_path_media_registration"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "local_image_path_admitted"
       },
       {
         "class": "bounded_request_response",

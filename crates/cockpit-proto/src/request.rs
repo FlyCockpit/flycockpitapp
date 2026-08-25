@@ -2214,6 +2214,14 @@ pub enum Request {
     /// Register a project-contained local file while retaining its verified handle.
     RegisterLocalPathMedia(cockpit_db::media_attachments::RegisterLocalPathMediaV1),
 
+    /// Admit a browser-provided image path through daemon-owned workspace and
+    /// media policy. The path is ingress-only and is never echoed back.
+    AdmitLocalImagePath {
+        project_root: String,
+        path: SensitiveWirePayload,
+        admission_id: Uuid,
+    },
+
     /// Owner-only daemon-local retained HTTPS ingress.
     RetainHttpsMedia(cockpit_db::media_attachments::RetainHttpsMediaV1),
 
@@ -3686,6 +3694,7 @@ macro_rules! request_variants {
             (Request::GuidanceEstimate { .. }, "guidance_estimate");
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media");
             (Request::RegisterLocalPathMedia(..), "register_local_path_media");
+            (Request::AdmitLocalImagePath { .. }, "admit_local_image_path");
             (Request::RetainHttpsMedia(..), "retain_https_media");
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status");
             (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview");
@@ -3979,6 +3988,7 @@ macro_rules! command {
             (Request::GuidanceEstimate { project_root, provider, model }, "guidance_estimate", project_read(project_root), none, false, read_only, none, concurrent, none, "project_root:String|provider:Option<String>|model:Option<String>", [project_root: String => project_root, provider: Option<String> => provider_model_left(model), model: Option<String> => provider_model_right(provider)]);
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
+            (Request::AdmitLocalImagePath { project_root, path, admission_id }, "admit_local_image_path", project_read(project_root), none, true, local_only, none, concurrent, path(project_root), "project_root:String|path:SensitiveWirePayload|admission_id:Uuid", [project_root: String => project_root, path: SensitiveWirePayload => param, admission_id: Uuid => param]);
             (Request::RetainHttpsMedia(..), "retain_https_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status", public_read, none, false, read_only, none, serialized, none, "-", []);
             (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview", public_read, none, false, read_only, none, serialized, none, "-", []);

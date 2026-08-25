@@ -7602,7 +7602,7 @@ async fn handle_serialized_request_impl(
                 .map(|current| current.as_slice() != record_bytes.as_slice())
                 .unwrap_or(true);
             let receipt = Response::ProviderCredentialCommitted {
-                client_operation_id,
+                client_operation_id: client_operation_id.clone(),
                 provider_id: provider_id.clone(),
                 project_root: None,
                 owner_root: None,
@@ -7614,7 +7614,9 @@ async fn handle_serialized_request_impl(
                     .saturating_add(u64::from(changed)),
                 config_generation: inventory::current_config_generation(),
             };
-            let result = {
+            #[cfg(not(feature = "remote"))]
+            let _ = &receipt;
+            let result = match {
                 #[cfg(feature = "remote")]
                 match remote_operation {
                     Some(operation) => {
@@ -7637,24 +7639,44 @@ async fn handle_serialized_request_impl(
                                 &provider_id,
                                 Some(&record_bytes),
                             )
-                            .map_err(internal)?;
+                            .map_err(internal)
+                            .map(|_| receipt)
+                        } else {
+                            Ok(receipt)
                         }
-                        Ok(receipt)
                     }
                 }
                 #[cfg(not(feature = "remote"))]
                 {
-                    if changed {
-                        ctx.mutate_owner_vault_item(
-                            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                            &provider_id,
-                            Some(&record_bytes),
-                        )
-                        .map_err(internal)?;
-                    }
-                    Ok(receipt)
+                    commit_local_provider_credential(
+                        ctx,
+                        settlement_owner.clone(),
+                        client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        provider_id.clone(),
+                        None,
+                        provider_id.clone(),
+                        Some(record_bytes),
+                    )
+                    .await
                 }
-            }?;
+            } {
+                Ok(result) => result,
+                Err(error) => {
+                    finish_local_operation_error(
+                        ctx,
+                        settlement_owner.clone(),
+                        client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            #[cfg(feature = "remote")]
             finish_local_operation(
                 ctx,
                 settlement_owner,
@@ -8653,6 +8675,8 @@ async fn handle_serialized_request_impl(
                     .saturating_add(u64::from(changed)),
                 config_generation: inventory::current_config_generation(),
             };
+            #[cfg(not(feature = "remote"))]
+            let _ = (&response, changed, consumed_vault_generation);
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &settlement_owner,
@@ -8665,7 +8689,7 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
-            let result = {
+            let result = match {
                 #[cfg(feature = "remote")]
                 match remote_operation {
                     Some(operation) => {
@@ -8688,24 +8712,44 @@ async fn handle_serialized_request_impl(
                                 &credential_record_id,
                                 None,
                             )
-                            .map_err(internal)?;
+                            .map_err(internal)
+                            .map(|_| response)
+                        } else {
+                            Ok(response)
                         }
-                        Ok(response)
                     }
                 }
                 #[cfg(not(feature = "remote"))]
                 {
-                    if changed {
-                        ctx.mutate_owner_vault_item(
-                            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                            &credential_record_id,
-                            None,
-                        )
-                        .map_err(internal)?;
-                    }
-                    Ok(response)
+                    commit_local_provider_credential(
+                        ctx,
+                        settlement_owner.clone(),
+                        client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        provider_id.clone(),
+                        project_root.clone(),
+                        credential_record_id.clone(),
+                        None,
+                    )
+                    .await
                 }
-            }?;
+            } {
+                Ok(result) => result,
+                Err(error) => {
+                    finish_local_operation_error(
+                        ctx,
+                        settlement_owner.clone(),
+                        client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            #[cfg(feature = "remote")]
             finish_local_operation(
                 ctx,
                 settlement_owner,
@@ -11646,6 +11690,149 @@ async fn finish_local_operation(
         )
         .await
         .map_err(internal)
+}
+
+async fn finish_local_operation_error(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    error: &ErrorPayload,
+) -> std::result::Result<(), ErrorPayload> {
+    let error_json = serde_json::to_string(error).map_err(internal)?;
+    ctx.db
+        .finish_local_operation(
+            owner,
+            client_operation_id,
+            request_hash,
+            fencing_generation,
+            if error.code == ErrorCode::Shutdown {
+                "terminal_cancelled".into()
+            } else {
+                "terminal_error".into()
+            },
+            error_json,
+        )
+        .await
+        .map_err(internal)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_local_provider_credential(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    provider_id: String,
+    project_root: Option<String>,
+    credential_record_id: String,
+    record: Option<zeroize::Zeroizing<Vec<u8>>>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let vault = ctx.secret_vault.clone();
+    let response = ctx
+        .db
+        .transaction(move |conn| {
+            // The receipt fence, before/after inventory generations, exact
+            // target mutation, and terminal response share one SQLite commit.
+            // A crash can therefore expose either the old state + executing
+            // receipt or the new state + exact terminal receipt, never the
+            // changed=false fabrication that a later baseline read permits.
+            let fence_is_live: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_operation_receipts
+                 WHERE owner_digest=?1 AND client_operation_id=?2
+                   AND request_hash=?3 AND fencing_generation=?4 AND state='executing')",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation
+                ],
+                |row| row.get(0),
+            )?;
+            if !fence_is_live {
+                anyhow::bail!("local credential operation lost its execution fence");
+            }
+            let consumed_vault_generation =
+                cockpit_db::secret_vault::inventory_generation_conn(conn)?;
+            let current = match vault.get_item_on_conn(
+                conn,
+                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                &credential_record_id,
+            ) {
+                Ok(value) => Some(value),
+                Err(crate::secure_key::SecureKeyError::NotFound(_)) => None,
+                Err(error) => return Err(anyhow::anyhow!(error)),
+            };
+            let changed = match (&current, record.as_deref()) {
+                (Some(current), Some(desired)) => current.as_slice() != desired,
+                (None, None) => false,
+                _ => true,
+            };
+            if changed {
+                vault
+                    .mutate_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &credential_record_id,
+                        record.as_deref(),
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            let result_vault_generation =
+                cockpit_db::secret_vault::inventory_generation_conn(conn)?;
+            let owner_root = project_root
+                .as_deref()
+                .map(crate::secret_ownership::canonical_owner_root);
+            let owner_scope = owner_root
+                .as_ref()
+                .map(|root| format!("project:{root}"))
+                .unwrap_or_else(|| "global".into());
+            let response = Response::ProviderCredentialCommitted {
+                client_operation_id: client_operation_id.clone(),
+                provider_id,
+                project_root,
+                owner_root,
+                owner_scope,
+                stored: record.is_some(),
+                changed,
+                consumed_vault_generation,
+                result_vault_generation,
+                config_generation: inventory::current_config_generation(),
+            };
+            let response_json = serde_json::to_string(&response)?;
+            let updated = conn.execute(
+                "UPDATE local_operation_receipts
+                 SET state='terminal_success',terminal_outcome_json=?5,
+                     execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                 WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3
+                   AND fencing_generation=?4 AND state='executing'",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    response_json,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            if updated != 1 {
+                anyhow::bail!("local credential operation lost its execution fence");
+            }
+            Ok(response)
+        })
+        .await
+        .map_err(internal)?;
+    if matches!(
+        &response,
+        Response::ProviderCredentialCommitted { changed: true, .. }
+    ) && let Err(error) = ctx.publish_owner_redaction_table()
+    {
+        ctx.poison_redaction_publication(&error);
+        return Err(internal(error));
+    }
+    Ok(response)
 }
 
 fn client_operation_id_from_response(

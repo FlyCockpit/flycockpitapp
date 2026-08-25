@@ -3698,6 +3698,21 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
         if let Err(error) = dispatch::recover_all_mcp_config_journals(&ctx).await {
             tracing::error!(%error, "startup MCP-config journal recovery failed; MCP requests will retry it");
         }
+        // Provider/MCP journals above get the first opportunity to reconcile
+        // a proven commit. Any remaining generic local receipt is ambiguous;
+        // fail it closed rather than time-taking-over and repeating an
+        // external side effect from the previous daemon process.
+        let interrupted = ctx
+            .db
+            .settle_interrupted_local_operations()
+            .await
+            .context("settling interrupted local authority operations")?;
+        if interrupted > 0 {
+            tracing::warn!(
+                count = interrupted,
+                "settled interrupted local operations without re-execution"
+            );
+        }
         crate::assistants::recover_definition_journals(&ctx.db)
             .await
             .context("startup assistant-definition journal recovery failed")?;

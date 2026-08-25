@@ -59,14 +59,19 @@ impl Db {
                 params![owner_digest, client_operation_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             ).optional()?;
-            if let Some((kind, hash, state, outcome, generation, expires_at)) = existing {
+            if let Some((kind, hash, state, outcome, generation, _expires_at)) = existing {
                 if kind != operation_kind || hash.as_slice() != request_hash { bail!("client operation id was reused for a different request"); }
                 return match (state.as_str(), outcome) {
                     ("terminal_success", Some(json)) => Ok(LocalOperationBegin::TerminalSuccess(json)),
                     ("terminal_error", Some(json)) => Ok(LocalOperationBegin::TerminalError(json)),
                     ("terminal_cancelled", Some(json)) => Ok(LocalOperationBegin::TerminalCancelled(json)),
-                    ("executing", _) if expires_at.is_some_and(|expiry| expiry > now) => Ok(LocalOperationBegin::Pending),
-                    ("prepared" | "executing", _) => {
+                    // Never time-take over an executing external operation.
+                    // Its process may still be alive after a slow provider,
+                    // keyring, or filesystem call. Only daemon startup, after
+                    // singleton ownership is established, may settle work
+                    // interrupted by the previous process.
+                    ("executing", _) => Ok(LocalOperationBegin::Pending),
+                    ("prepared", _) => {
                         let next = generation.checked_add(1).ok_or_else(|| anyhow::anyhow!("local operation fencing generation exhausted"))?;
                         let changed = conn.execute(
                             "UPDATE local_operation_receipts SET state='executing',fencing_generation=?3,execution_started_at_unix_ms=?4,execution_expires_at_unix_ms=?5,updated_at_unix_ms=?4 WHERE owner_digest=?1 AND client_operation_id=?2 AND fencing_generation=?6 AND state IN ('prepared','executing')",
@@ -84,6 +89,29 @@ impl Db {
             )?;
             Ok(LocalOperationBegin::Dispatch { fencing_generation: 1 })
         }).await
+    }
+
+    /// Fail closed operations interrupted by a previous daemon process. This
+    /// is called exactly once during startup recovery, before accepting a
+    /// client, so it cannot fence live work in the current process. Domain
+    /// journals that can prove a commit must reconcile before this call.
+    pub async fn settle_interrupted_local_operations(&self) -> Result<u64> {
+        self.write(|conn| {
+            let now = chrono::Utc::now().timestamp_millis();
+            let outcome = serde_json::json!({
+                "code": "internal",
+                "message": "the daemon restarted before this local operation produced a durable terminal receipt; the operation was not re-executed"
+            })
+            .to_string();
+            Ok(conn.execute(
+                "UPDATE local_operation_receipts
+                 SET state='terminal_error',terminal_outcome_json=?1,
+                     execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?2
+                 WHERE state IN ('prepared','executing')",
+                params![outcome, now],
+            )? as u64)
+        })
+        .await
     }
 
     pub async fn finish_local_operation(

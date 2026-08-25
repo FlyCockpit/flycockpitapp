@@ -20,6 +20,31 @@ fn schema_inventory(conn: &Connection) -> BTreeMap<String, BTreeSet<String>> {
     inventory
 }
 
+#[test]
+fn provider_config_journal_actions_have_strict_payload_shapes() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))
+        .unwrap();
+
+    let insert = |provider_id: &str, action: &str, entry: Option<&str>| {
+        conn.execute(
+            "INSERT INTO provider_config_journals
+             (journal_id, project_root, provider_id, action, entry_json,
+              cleanup_named_json, cleanup_credential_json, created_at)
+             VALUES (lower(hex(randomblob(16))), '/project', ?1, ?2, ?3, '[]', '[]', 1)",
+            rusqlite::params![provider_id, action, entry],
+        )
+    };
+
+    assert!(insert("provider", "save", Some("{}")).is_ok());
+    assert!(insert("provider", "delete", None).is_ok());
+    assert!(insert("__provider_batch__", "batch", Some("{}")).is_ok());
+    assert!(insert("provider", "batch", Some("{}")).is_err());
+    assert!(insert("__provider_batch__", "save", Some("{}")).is_err());
+    assert!(insert("provider", "delete", Some("{}")).is_err());
+    assert!(insert("provider", "save", Some("not-json")).is_err());
+}
+
 #[derive(Debug)]
 struct Ownership {
     status: String,

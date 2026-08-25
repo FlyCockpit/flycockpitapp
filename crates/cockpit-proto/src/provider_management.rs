@@ -64,12 +64,8 @@ impl ProviderSecretValue {
         Self(Zeroizing::new(value))
     }
 
-    pub fn take(mut self) -> String {
-        std::mem::take(&mut self.0)
-    }
-
     pub fn into_zeroizing(mut self) -> Zeroizing<String> {
-        Zeroizing::new(std::mem::take(&mut self.0))
+        Zeroizing::new(std::mem::take(&mut *self.0))
     }
 
     pub fn is_empty(&self) -> bool {

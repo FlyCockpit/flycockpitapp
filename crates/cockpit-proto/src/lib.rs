@@ -3038,6 +3038,8 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
         Body::Request { request, .. } => {
             let tag = request.wire_tag();
             let version = match tag {
+                "cancel_leak_reveal" => 16,
+                "get_provider_catalog_snapshot" | "apply_provider_mutation" => 15,
                 "list_secret_inventory"
                 | "put_named_secret"
                 | "put_subscription_ack"
@@ -3048,7 +3050,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "set_flycockpit_connector_enabled"
                 | "sync_flycockpit_org_policy"
                 | "enroll_flycockpit_org_sync"
-                | "get_provider_catalog_snapshot"
                 | "fetch_provider_models"
                 | "get_provider_usage_snapshot"
                 | "upsert_provider_config"
@@ -3131,8 +3132,9 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
         Body::Response { response, .. } => {
             let tag = response.wire_tag();
             let version = match tag {
+                "leak_reveal_cancelled" => 16,
+                "provider_catalog_snapshot" | "provider_mutation_committed" => 15,
                 "flycockpit_org_sync"
-                | "provider_catalog_snapshot"
                 | "provider_models_fetched"
                 | "provider_usage_snapshot"
                 | "provider_config_upserted"
@@ -6387,6 +6389,92 @@ mod tests {
             })
             .0,
             10
+        );
+    }
+
+    #[test]
+    fn provider_atomic_catalog_shapes_require_v15_and_leak_cancel_requires_v16() {
+        let provider_requests = [
+            Request::GetProviderCatalogSnapshot {
+                project_root: "/project".into(),
+                provider_id: None,
+                snapshot_session_id: "snapshot".into(),
+            },
+            Request::ApplyProviderMutation {
+                snapshot_session_id: "snapshot".into(),
+                layer_id: "layer".into(),
+                expected_revision: "revision".into(),
+                client_operation_id: "operation".into(),
+                mutation: ProviderMutationBatch {
+                    upserts: Vec::new(),
+                    deletes: Vec::new(),
+                    metadata: None,
+                },
+            },
+        ];
+        for request in provider_requests {
+            assert_eq!(
+                body_required_protocol_version(&Body::Request {
+                    id: Uuid::nil(),
+                    #[cfg(feature = "remote")]
+                    operation: None,
+                    request,
+                })
+                .0,
+                15
+            );
+        }
+        for response in [
+            Response::ProviderCatalogSnapshot {
+                config: ProviderConfigView::default(),
+                snapshot_session_id: "snapshot".into(),
+                layer_id: "layer".into(),
+                base_revision: "revision".into(),
+                config_generation: 1,
+            },
+            Response::ProviderMutationCommitted {
+                client_operation_id: "operation".into(),
+                snapshot_session_id: "snapshot".into(),
+                layer_id: "layer".into(),
+                consumed_revision: "revision".into(),
+                result_revision: "next".into(),
+                config_generation: 2,
+                config: ProviderConfigView::default(),
+                status: ConfigCommitStatus::Committed,
+                publication: ConfigPublicationStatus::Published,
+            },
+        ] {
+            assert_eq!(
+                body_required_protocol_version(&Body::Response {
+                    id: Uuid::nil(),
+                    response: Box::new(response),
+                })
+                .0,
+                15
+            );
+        }
+
+        assert_eq!(
+            body_required_protocol_version(&Body::Request {
+                id: Uuid::nil(),
+                #[cfg(feature = "remote")]
+                operation: None,
+                request: Request::CancelLeakReveal {
+                    capability: "capability".into(),
+                },
+            })
+            .0,
+            16
+        );
+        assert_eq!(
+            body_required_protocol_version(&Body::Response {
+                id: Uuid::nil(),
+                response: Box::new(Response::LeakRevealCancelled {
+                    report_id: "report".into(),
+                }),
+            })
+            .0,
+            16
         );
     }
 

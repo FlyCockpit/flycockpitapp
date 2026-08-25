@@ -2,6 +2,23 @@ use super::shell::PointerOperationId;
 use super::*;
 
 #[test]
+fn settings_input_pages_do_not_wait_on_daemon_rpcs() {
+    for (name, source) in [
+        ("providers", include_str!("providers/mod.rs")),
+        ("mcp", include_str!("mcp_page.rs")),
+        ("tools", include_str!("tools_page.rs")),
+        ("category", include_str!("category.rs")),
+    ] {
+        assert!(
+            !source.contains("block_in_place")
+                && !source.contains("Handle::current().block_on")
+                && !source.contains("settings_daemon_request("),
+            "{name} settings input path contains a synchronous daemon wait"
+        );
+    }
+}
+
+#[test]
 fn empty_object_merge_patch_is_derived_as_noop_for_existing_object() {
     let mut authored = serde_json::json!({
         "tui": { "mouse": true },

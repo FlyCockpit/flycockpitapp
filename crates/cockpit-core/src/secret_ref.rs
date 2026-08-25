@@ -154,6 +154,7 @@ pub fn redact_provider_view(
         mcp_config_json: None,
         mcp_owner_root: None,
         mcp_config_path: None,
+        mcp_edit_capability: None,
         mcp_revision: None,
         extended_config_json: None,
     }

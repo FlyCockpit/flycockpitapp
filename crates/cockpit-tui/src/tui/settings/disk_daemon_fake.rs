@@ -122,7 +122,7 @@ impl SettingsDaemonEffect for DiskDaemonFake {
                 project_root,
                 config_json,
                 secret_values_json,
-                cleanup_names_json: _,
+                ..
             } => save_mcp_config(
                 &client_operation_id,
                 Path::new(&project_root),

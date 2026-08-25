@@ -416,6 +416,15 @@ pub(crate) struct PendingMcpLocal {
     pub phase: McpLocalPhase,
     pub config: Option<cockpit_core::mcp::config::McpConfig>,
     pub mutation_intent_hash: Option<String>,
+    pub authority: Option<McpLocalAuthority>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct McpLocalAuthority {
+    pub snapshot_capability: String,
+    pub owner_root: String,
+    pub config_path: String,
+    pub revision: String,
 }
 
 pub(crate) struct ModelSelectionRetry {

@@ -1342,6 +1342,7 @@ impl App {
             && !self.pending_prune_confirm
             && self.pending_stop_confirm.is_none()
             && self.pending_compact.is_none()
+            && self.pending_mcp_local.is_none()
             && !self.pending_external_edit
             && self.context_menu.is_none()
             && self.pane.is_none()

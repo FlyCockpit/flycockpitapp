@@ -1014,6 +1014,7 @@ impl App {
         phase: McpLocalPhase,
         config: Option<cockpit_core::mcp::config::McpConfig>,
         mutation_intent_hash: Option<String>,
+        authority: Option<McpLocalAuthority>,
         request: cockpit_core::daemon::proto::Request,
     ) {
         self.slash_menu_cache.borrow_mut().take();
@@ -1057,6 +1058,7 @@ impl App {
             phase,
             config,
             mutation_intent_hash,
+            authority,
         });
     }
 
@@ -1073,8 +1075,36 @@ impl App {
             McpLocalPhase::Settlement,
             pending.config,
             pending.mutation_intent_hash,
+            pending.authority,
             cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
                 client_operation_id: pending.operation_id.to_string(),
+            },
+        );
+    }
+
+    fn retry_mcp_refresh(&mut self, pending: PendingMcpLocal) {
+        let snapshot_session_id = match &pending.phase {
+            McpLocalPhase::Refresh {
+                snapshot_session_id,
+                ..
+            } => snapshot_session_id.clone(),
+            _ => {
+                self.start_mcp_settlement(pending, false);
+                return;
+            }
+        };
+        self.replace_mcp_local_action(
+            pending.operation_id,
+            pending.project_root.clone(),
+            pending.intent,
+            pending.phase.clone(),
+            pending.config,
+            pending.mutation_intent_hash,
+            pending.authority,
+            cockpit_core::daemon::proto::Request::GetProviderCatalogSnapshot {
+                project_root: pending.project_root,
+                provider_id: None,
+                snapshot_session_id,
             },
         );
     }
@@ -1101,6 +1131,13 @@ impl App {
     }
 
     fn start_mcp_snapshot(&mut self, intent: McpLocalIntent) {
+        if self.pending_mcp_local.is_some() {
+            self.push_plain(
+                "/mcp: another MCP operation is pending; wait for durable settlement before issuing a new command."
+                    .to_string(),
+            );
+            return;
+        }
         let operation_id = uuid::Uuid::new_v4();
         let project_root = self.launch.cwd.display().to_string();
         let snapshot_session_id = uuid::Uuid::new_v4().to_string();
@@ -1112,6 +1149,7 @@ impl App {
             McpLocalPhase::Snapshot {
                 snapshot_session_id: snapshot_session_id.clone(),
             },
+            None,
             None,
             None,
             cockpit_core::daemon::proto::Request::GetProviderCatalogSnapshot {
@@ -1155,16 +1193,18 @@ impl App {
         let response = match completion.response {
             Ok(response) => response,
             Err(error) => {
-                if matches!(
-                    pending.phase,
-                    McpLocalPhase::Save | McpLocalPhase::Settlement
-                ) {
-                    self.start_mcp_settlement(
+                match &pending.phase {
+                    McpLocalPhase::Save | McpLocalPhase::Settlement => self.start_mcp_settlement(
                         pending,
                         matches!(completion.phase, McpLocalPhase::Save),
-                    );
-                } else {
-                    self.push_plain(format!("/mcp: {error}"));
+                    ),
+                    McpLocalPhase::Refresh { .. } => {
+                        self.push_plain(format!(
+                            "/mcp: committed refresh was interrupted ({error}); retrying…"
+                        ));
+                        self.retry_mcp_refresh(pending);
+                    }
+                    McpLocalPhase::Snapshot { .. } => self.push_plain(format!("/mcp: {error}")),
                 }
                 return;
             }
@@ -1190,6 +1230,29 @@ impl App {
                 let Some(raw) = config.mcp_config_json else {
                     self.push_plain("/mcp: daemon snapshot omitted MCP configuration".to_string());
                     return;
+                };
+                let (
+                    Some(owner_root),
+                    Some(config_path),
+                    Some(snapshot_capability),
+                    Some(revision),
+                ) = (
+                    config.mcp_owner_root,
+                    config.mcp_config_path,
+                    config.mcp_edit_capability,
+                    config.mcp_revision,
+                )
+                else {
+                    self.push_plain(
+                        "/mcp: daemon snapshot omitted edit authority; reload required".to_string(),
+                    );
+                    return;
+                };
+                let authority = McpLocalAuthority {
+                    snapshot_capability,
+                    owner_root,
+                    config_path,
+                    revision,
                 };
                 let Ok(mut mcp) = cockpit_core::mcp::config::McpConfig::parse(&raw) else {
                     self.push_plain("/mcp: daemon returned an invalid MCP projection".to_string());
@@ -1224,29 +1287,27 @@ impl App {
                             }
                         };
                         self.push_plain("/mcp: saving configuration…".to_string());
+                        let Some(mutation_intent_hash) =
+                            mcp_mutation_intent_hash(&pending.project_root, &config_json)
+                        else {
+                            self.push_plain(
+                                "/mcp: failed to bind the save mutation intent".to_string(),
+                            );
+                            return;
+                        };
                         let request = cockpit_core::daemon::proto::Request::SaveMcpConfig {
                             client_operation_id: pending.operation_id.to_string(),
                             project_root: pending.project_root.clone(),
+                            snapshot_capability: authority.snapshot_capability.clone(),
+                            owner_root: authority.owner_root.clone(),
+                            config_path: authority.config_path.clone(),
+                            expected_revision: authority.revision.clone(),
+                            mutation_intent_hash: mutation_intent_hash.clone(),
                             config_json,
                             secret_values_json: cockpit_proto::SensitiveWirePayload::new(
                                 "{}".to_string(),
                             ),
                             cleanup_names_json: "[]".to_string(),
-                        };
-                        let Some(mutation_intent_hash) = mcp_mutation_intent_hash(
-                            &pending.project_root,
-                            match &request {
-                                cockpit_core::daemon::proto::Request::SaveMcpConfig {
-                                    config_json,
-                                    ..
-                                } => config_json,
-                                _ => unreachable!("constructed above"),
-                            },
-                        ) else {
-                            self.push_plain(
-                                "/mcp: failed to bind the save mutation intent".to_string(),
-                            );
-                            return;
                         };
                         self.replace_mcp_local_action(
                             pending.operation_id,
@@ -1255,6 +1316,7 @@ impl App {
                             McpLocalPhase::Save,
                             Some(mcp),
                             Some(mutation_intent_hash),
+                            Some(authority),
                             request,
                         );
                     }
@@ -1266,6 +1328,9 @@ impl App {
                     request_hash,
                     mutation_intent_hash,
                     project_root,
+                    owner_root,
+                    config_path,
+                    consumed_revision,
                     result_revision,
                     config_generation,
                     ..
@@ -1282,6 +1347,11 @@ impl App {
                         .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
                     || pending.mutation_intent_hash.as_deref()
                         != Some(mutation_intent_hash.as_str())
+                    || pending.authority.as_ref().is_none_or(|authority| {
+                        authority.owner_root != owner_root
+                            || authority.config_path != config_path
+                            || authority.revision != consumed_revision
+                    })
                 {
                     self.start_mcp_settlement(pending, true);
                     return;
@@ -1298,6 +1368,7 @@ impl App {
                     },
                     pending.config,
                     pending.mutation_intent_hash,
+                    pending.authority,
                     cockpit_core::daemon::proto::Request::GetProviderCatalogSnapshot {
                         project_root: pending.project_root,
                         provider_id: None,
@@ -1330,6 +1401,7 @@ impl App {
                         "/mcp: durable settlement response did not match the save request; editing remains unsafe."
                             .to_string(),
                     );
+                    self.start_mcp_settlement(pending, false);
                     return;
                 }
                 if is_pending {
@@ -1348,6 +1420,7 @@ impl App {
                     self.push_plain(
                         "/mcp: durable settlement was terminal without a save receipt.".to_string(),
                     );
+                    self.start_mcp_settlement(pending, false);
                     return;
                 };
                 let cockpit_core::daemon::proto::Response::McpConfigCommitted {
@@ -1355,6 +1428,9 @@ impl App {
                     request_hash: receipt_request_hash,
                     mutation_intent_hash,
                     project_root,
+                    owner_root,
+                    config_path,
+                    consumed_revision,
                     result_revision,
                     config_generation,
                     ..
@@ -1363,6 +1439,7 @@ impl App {
                     self.push_plain(
                         "/mcp: durable settlement returned the wrong receipt type.".to_string(),
                     );
+                    self.start_mcp_settlement(pending, false);
                     return;
                 };
                 if client_operation_id != pending.operation_id.to_string()
@@ -1370,11 +1447,17 @@ impl App {
                     || receipt_request_hash != request_hash
                     || pending.mutation_intent_hash.as_deref()
                         != Some(mutation_intent_hash.as_str())
+                    || pending.authority.as_ref().is_none_or(|authority| {
+                        authority.owner_root != owner_root
+                            || authority.config_path != config_path
+                            || authority.revision != consumed_revision
+                    })
                 {
                     self.push_plain(
                         "/mcp: durable save receipt did not match the requested target."
                             .to_string(),
                     );
+                    self.start_mcp_settlement(pending, false);
                     return;
                 }
                 let snapshot_session_id = uuid::Uuid::new_v4().to_string();
@@ -1389,6 +1472,7 @@ impl App {
                     },
                     pending.config,
                     pending.mutation_intent_hash,
+                    pending.authority,
                     cockpit_core::daemon::proto::Request::GetProviderCatalogSnapshot {
                         project_root: pending.project_root,
                         provider_id: None,
@@ -1409,8 +1493,10 @@ impl App {
                 } = response
                 else {
                     self.push_plain(
-                        "/mcp: saved, but the refreshed configuration is unavailable".to_string(),
+                        "/mcp: saved, but the refreshed configuration is unavailable; retrying"
+                            .to_string(),
                     );
+                    self.retry_mcp_refresh(pending);
                     return;
                 };
                 if returned_session_id != snapshot_session_id
@@ -1420,18 +1506,37 @@ impl App {
                         "/mcp: saved, but the refreshed configuration did not match its receipt"
                             .to_string(),
                     );
+                    self.retry_mcp_refresh(pending);
+                    return;
+                }
+                if pending.authority.as_ref().is_none_or(|authority| {
+                    config.mcp_owner_root.as_deref() != Some(authority.owner_root.as_str())
+                        || config.mcp_config_path.as_deref() != Some(authority.config_path.as_str())
+                        || config.mcp_revision.as_deref() != Some(result_revision.as_str())
+                        || config
+                            .mcp_edit_capability
+                            .as_deref()
+                            .is_none_or(str::is_empty)
+                }) {
+                    self.push_plain(
+                        "/mcp: committed refresh did not carry matching edit authority; retrying"
+                            .to_string(),
+                    );
+                    self.retry_mcp_refresh(pending);
                     return;
                 }
                 let Some(raw) = config.mcp_config_json else {
                     self.push_plain(
                         "/mcp: saved, but the refreshed MCP projection was absent".to_string(),
                     );
+                    self.retry_mcp_refresh(pending);
                     return;
                 };
                 let Ok(mcp) = cockpit_core::mcp::config::McpConfig::parse(&raw) else {
                     self.push_plain(
                         "/mcp: saved, but the refreshed MCP projection was invalid".to_string(),
                     );
+                    self.retry_mcp_refresh(pending);
                     return;
                 };
                 if mcp_projection_revision(&mcp).as_deref() != Some(result_revision.as_str()) {
@@ -1439,6 +1544,7 @@ impl App {
                         "/mcp: saved, but the refreshed MCP projection did not match its receipt"
                             .to_string(),
                     );
+                    self.retry_mcp_refresh(pending);
                     return;
                 }
                 self.mcp_local_snapshot = Some(mcp.clone());
@@ -1459,11 +1565,12 @@ impl App {
             .is_some_and(|pending| pending.action_id == action_id)
         {
             let pending = self.pending_mcp_local.take().expect("matched above");
-            if matches!(pending.phase, McpLocalPhase::Save) {
+            if !matches!(pending.phase, McpLocalPhase::Snapshot { .. }) {
                 self.push_plain(
-                    "/mcp: save interrupted; commit status is unknown. Re-open MCP settings before editing again."
+                    "/mcp: operation interrupted; retaining the mutation fence while durable settlement is checked."
                         .to_string(),
                 );
+                self.start_mcp_settlement(pending, false);
             } else {
                 self.push_plain("/mcp: operation cancelled.".to_string());
             }

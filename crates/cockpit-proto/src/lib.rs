@@ -282,6 +282,11 @@ pub struct ProviderConfigView {
     pub mcp_owner_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_config_path: Option<String>,
+    /// Opaque, daemon-issued capability binding the MCP owner, target path,
+    /// target-layer revision, and authenticated client that received this
+    /// snapshot. A save must present it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_edit_capability: Option<String>,
     /// SHA-256 revision of the authoritative target layer (not the merged
     /// effective projection in `mcp_config_json`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6843,6 +6848,11 @@ mod tests {
             Request::SaveMcpConfig {
                 client_operation_id: "save-mcp".into(),
                 project_root: "/tmp/project".into(),
+                snapshot_capability: "snapshot".into(),
+                owner_root: "/tmp/project".into(),
+                config_path: "/tmp/project/.cockpit/mcp.json".into(),
+                expected_revision: "00".repeat(32),
+                mutation_intent_hash: "11".repeat(32),
                 config_json: "{}".into(),
                 secret_values_json: SensitiveWirePayload::new("{}".into()),
                 cleanup_names_json: "[]".into(),
@@ -7721,6 +7731,21 @@ mod tests {
         ] {
             assert!(requests[tag]["params"]["client_operation_id"].is_string());
         }
+        let mcp = &requests["save_mcp_config"]["params"];
+        for field in [
+            "snapshot_capability",
+            "owner_root",
+            "config_path",
+            "expected_revision",
+            "mutation_intent_hash",
+        ] {
+            assert!(
+                mcp[field].is_string(),
+                "current v17 MCP CAS fixture must carry {field}"
+            );
+        }
+        assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
+        assert_eq!(mcp["mutation_intent_hash"].as_str().map(str::len), Some(64));
         for tag in ["cancel_provider_oauth", "cancel_mcp_oauth"] {
             assert!(requests[tag]["params"]["begin_client_operation_id"].is_string());
         }

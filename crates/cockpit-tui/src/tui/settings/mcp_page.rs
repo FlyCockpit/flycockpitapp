@@ -347,6 +347,9 @@ impl SettingsCx {
         let expected_config_path = self.mcp_config_path.clone().ok_or_else(|| {
             "MCP authority snapshot has no daemon-selected config path; reload settings".to_string()
         })?;
+        let snapshot_capability = self.mcp_edit_capability.clone().ok_or_else(|| {
+            "MCP authority snapshot has no edit capability; reload settings".to_string()
+        })?;
         let expected_consumed_revision = self.mcp_revision.clone().ok_or_else(|| {
             "MCP authority snapshot has no target-layer revision; reload settings".to_string()
         })?;
@@ -373,6 +376,11 @@ impl SettingsCx {
             super::SettingsDaemonEffectWork::McpConfigSave {
                 client_operation_id: client_operation_id.clone(),
                 project_root: owner.clone(),
+                snapshot_capability: snapshot_capability.clone(),
+                owner_root: expected_owner_root.clone(),
+                config_path: expected_config_path.clone(),
+                expected_revision: expected_consumed_revision.clone(),
+                mutation_intent_hash: expected_request_intent_hash.clone(),
                 config_json,
                 secret_values_json: super::SecretPayload::new(secret_values_json),
                 cleanup_names_json,
@@ -383,6 +391,7 @@ impl SettingsCx {
                 project_root: owner,
                 expected_owner_root,
                 expected_config_path,
+                snapshot_capability,
                 expected_consumed_revision,
                 expected_result_revision,
                 expected_request_intent_hash,

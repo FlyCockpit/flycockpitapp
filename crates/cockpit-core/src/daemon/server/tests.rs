@@ -8422,6 +8422,11 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
             Request::SaveMcpConfig {
                 client_operation_id: "reject-literal-mcp-save".into(),
                 project_root: root.clone(),
+                snapshot_capability: "snapshot".into(),
+                owner_root: root.clone(),
+                config_path: format!("{root}/.cockpit/mcp.json"),
+                expected_revision: "00".repeat(32),
+                mutation_intent_hash: "11".repeat(32),
                 config_json: serde_json::to_string(&config).unwrap(),
                 secret_values_json: "{}".into(),
                 cleanup_names_json: "[]".into(),
@@ -8462,6 +8467,11 @@ async fn mcp_save_stages_literal_and_persists_reference_only_config() {
         Request::SaveMcpConfig {
             client_operation_id: "staged-mcp-save".into(),
             project_root: root,
+            snapshot_capability: "snapshot".into(),
+            owner_root: "/tmp/project".into(),
+            config_path: "/tmp/project/.cockpit/mcp.json".into(),
+            expected_revision: "00".repeat(32),
+            mutation_intent_hash: "11".repeat(32),
             config_json: serde_json::to_string(&config).unwrap(),
             secret_values_json: serde_json::json!({
                 "mcp:staged:header": "Bearer staged-value"
@@ -8539,6 +8549,11 @@ async fn mcp_save_cannot_overwrite_a_provider_claimed_named_secret() {
         Request::SaveMcpConfig {
             client_operation_id: "ownership-race-mcp-save".into(),
             project_root: root.clone(),
+            snapshot_capability: "snapshot".into(),
+            owner_root: root.clone(),
+            config_path: format!("{root}/.cockpit/mcp.json"),
+            expected_revision: "00".repeat(32),
+            mutation_intent_hash: "11".repeat(32),
             config_json: serde_json::to_string(&config).unwrap(),
             secret_values_json: serde_json::Value::Object(secret_values).to_string().into(),
             cleanup_names_json: "[]".into(),
@@ -8970,6 +8985,11 @@ async fn mcp_save_rejects_unstaged_reference_to_provider_claimed_secret() {
         Request::SaveMcpConfig {
             client_operation_id: "foreign-reference-mcp-save".into(),
             project_root: root.clone(),
+            snapshot_capability: "snapshot".into(),
+            owner_root: root.clone(),
+            config_path: format!("{root}/.cockpit/mcp.json"),
+            expected_revision: "00".repeat(32),
+            mutation_intent_hash: "11".repeat(32),
             config_json: serde_json::to_string(&config).unwrap(),
             secret_values_json: "{}".into(),
             cleanup_names_json: "[]".into(),
@@ -9145,6 +9165,15 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
         Request::SaveMcpConfig {
             client_operation_id: "cleanup-mcp-save".into(),
             project_root: tmp.path().to_string_lossy().into_owned(),
+            snapshot_capability: "snapshot".into(),
+            owner_root: tmp.path().to_string_lossy().into_owned(),
+            config_path: tmp
+                .path()
+                .join(".cockpit/mcp.json")
+                .to_string_lossy()
+                .into_owned(),
+            expected_revision: "00".repeat(32),
+            mutation_intent_hash: "11".repeat(32),
             config_json: serde_json::json!({"servers": {}}).to_string(),
             secret_values_json: "{}".into(),
             cleanup_names_json: serde_json::json!(["unrelated"]).to_string(),
@@ -17521,6 +17550,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "save_mcp_config" => Request::SaveMcpConfig {
             client_operation_id: "matrix-operation".into(),
             project_root: root.clone(),
+            snapshot_capability: "snapshot".into(),
+            owner_root: root.clone(),
+            config_path: format!("{root}/.cockpit/mcp.json"),
+            expected_revision: "00".repeat(32),
+            mutation_intent_hash: "11".repeat(32),
             config_json: "{}".into(),
             secret_values_json: "{}".into(),
             cleanup_names_json: "[]".into(),
@@ -24578,7 +24612,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::GetProviderUsageSnapshot { project_root: "/tmp/project".into(), provider_id: None }, kind: "get_provider_usage_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::UpsertProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default() }, kind: "upsert_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SaveProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }, kind: "save_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::SaveMcpConfig { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), config_json: "{}".into(), secret_values_json: "{}".into(), cleanup_names_json: "[]".into() }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SaveMcpConfig { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), snapshot_capability: "snapshot".into(), owner_root: "/tmp/project".into(), config_path: "/tmp/project/.cockpit/mcp.json".into(), expected_revision: "00".repeat(32), mutation_intent_hash: "11".repeat(32), config_json: "{}".into(), secret_values_json: "{}".into(), cleanup_names_json: "[]".into() }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::DeleteProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), delete_stored_secrets: false }, kind: "delete_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SetProviderLayerMetadata { project_root: "/tmp/project".into(), category_defaults_json: "{}".into(), on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch::Keep }, kind: "set_provider_layer_metadata", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SetupCopilotAuth { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), provider_id: "example".into() }, kind: "setup_copilot_auth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },

@@ -6300,6 +6300,8 @@ CREATE TABLE mcp_config_journals (
     project_root      TEXT NOT NULL,
     config_path       TEXT NOT NULL,
     config_json       TEXT NOT NULL,
+    consumed_revision TEXT NOT NULL CHECK (length(consumed_revision) = 64),
+    intended_revision TEXT NOT NULL CHECK (length(intended_revision) = 64),
     cleanup_names_json TEXT NOT NULL,
     phase             TEXT NOT NULL CHECK (phase IN ('staged', 'published')),
     created_at        INTEGER NOT NULL

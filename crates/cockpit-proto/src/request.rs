@@ -1745,6 +1745,16 @@ pub enum Request {
         client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        snapshot_capability: String,
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        owner_root: String,
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        config_path: String,
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        expected_revision: String,
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        mutation_intent_hash: String,
         #[serde(deserialize_with = "deserialize_owner_mcp_json")]
         config_json: String,
         #[serde(deserialize_with = "deserialize_owner_mcp_secret_json")]
@@ -2904,12 +2914,22 @@ impl Request {
             Self::SaveMcpConfig {
                 client_operation_id,
                 project_root,
+                snapshot_capability,
+                owner_root,
+                config_path,
+                expected_revision,
+                mutation_intent_hash,
                 config_json,
                 secret_values_json,
                 cleanup_names_json,
             } => {
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
+                validate_owner_identifier("MCP snapshot capability", snapshot_capability, 128)?;
+                validate_owner_project_root(owner_root)?;
+                validate_owner_project_root(config_path)?;
+                validate_owner_identifier("MCP expected revision", expected_revision, 64)?;
+                validate_owner_identifier("MCP mutation intent", mutation_intent_hash, 64)?;
                 for (label, value) in [
                     ("MCP config", config_json),
                     ("MCP secret values", secret_values_json),
@@ -3896,7 +3916,7 @@ macro_rules! command {
             // Composite MCP publication is reserved in the remote ledger
             // before dispatch. The daemon's journal + staged vault commit
             // makes the nonrepeatable outcome replay-safe.
-            (Request::SaveMcpConfig { client_operation_id, project_root, config_json, secret_values_json, cleanup_names_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|config_json:String|secret_values_json:SensitiveWirePayload|cleanup_names_json:String", [client_operation_id: String => param, project_root: String => project_root, config_json: String => param, secret_values_json: SensitiveWirePayload => param, cleanup_names_json: String => param]);
+            (Request::SaveMcpConfig { client_operation_id, project_root, snapshot_capability, owner_root, config_path, expected_revision, mutation_intent_hash, config_json, secret_values_json, cleanup_names_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|snapshot_capability:String|owner_root:String|config_path:String|expected_revision:String|mutation_intent_hash:String|config_json:String|secret_values_json:SensitiveWirePayload|cleanup_names_json:String", [client_operation_id: String => param, project_root: String => project_root, snapshot_capability: String => param, owner_root: String => param, config_path: String => param, expected_revision: String => param, mutation_intent_hash: String => param, config_json: String => param, secret_values_json: SensitiveWirePayload => param, cleanup_names_json: String => param]);
             (Request::GetAgentInventory { project_root }, "get_agent_inventory", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAgentEditSnapshot { project_root, name }, "get_agent_edit_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|name:String", [project_root: String => project_root, name: String => param]);
             (Request::MutateAgent { client_operation_id, mutation_intent_hash, project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, mutation: crate::AgentMutation => param, expected_revision: Option<String> => param]);

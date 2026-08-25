@@ -1595,6 +1595,11 @@
     "params": {
       "client_operation_id": "11111111-1111-4111-8111-111111111111",
       "project_root": "/tmp/project",
+      "snapshot_capability": "snapshot-capability",
+      "owner_root": "/tmp/project",
+      "config_path": "/tmp/project/.cockpit/mcp.json",
+      "expected_revision": "0000000000000000000000000000000000000000000000000000000000000000",
+      "mutation_intent_hash": "1111111111111111111111111111111111111111111111111111111111111111",
       "config_json": "{}",
       "secret_values_json": "{}",
       "cleanup_names_json": "[]"

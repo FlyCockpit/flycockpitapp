@@ -85,6 +85,8 @@ struct ProviderEditCapability {
     layer_id: String,
     revision: String,
     config_generation: u64,
+    mcp_target_path: std::path::PathBuf,
+    mcp_revision: String,
     expires_at: Instant,
 }
 
@@ -11867,6 +11869,11 @@ async fn handle_serialized_request_impl(
         Request::SaveMcpConfig {
             client_operation_id,
             project_root,
+            snapshot_capability,
+            owner_root,
+            config_path,
+            expected_revision,
+            mutation_intent_hash,
             config_json,
             secret_values_json,
             cleanup_names_json,
@@ -11878,6 +11885,11 @@ async fn handle_serialized_request_impl(
                 &(
                     "save_mcp_config",
                     &project_root,
+                    &snapshot_capability,
+                    &owner_root,
+                    &config_path,
+                    &expected_revision,
+                    &mutation_intent_hash,
                     &config_json,
                     &secret_values_json,
                     &cleanup_names_json,
@@ -11905,6 +11917,11 @@ async fn handle_serialized_request_impl(
                 let request = Request::SaveMcpConfig {
                     client_operation_id: client_operation_id.clone(),
                     project_root: project_root.clone(),
+                    snapshot_capability: snapshot_capability.clone(),
+                    owner_root: owner_root.clone(),
+                    config_path: config_path.clone(),
+                    expected_revision: expected_revision.clone(),
+                    mutation_intent_hash: mutation_intent_hash.clone(),
                     config_json: config_json.clone(),
                     secret_values_json: secret_values_json.clone(),
                     cleanup_names_json: cleanup_names_json.clone(),
@@ -11924,6 +11941,11 @@ async fn handle_serialized_request_impl(
                     request_hash,
                     fencing_generation,
                     &project_root,
+                    &snapshot_capability,
+                    &owner_root,
+                    &config_path,
+                    &expected_revision,
+                    &mutation_intent_hash,
                     &config_json,
                     &secret_values_json,
                     &cleanup_names_json,
@@ -14213,6 +14235,7 @@ async fn provider_catalog_snapshot(
     );
     let layer_id =
         crate::intel::hex_lower(&<Sha256 as sha2::Digest>::digest(layer_material.as_bytes()));
+    let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
     {
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
             .lock()
@@ -14235,15 +14258,17 @@ async fn provider_catalog_snapshot(
                 layer_id: layer_id.clone(),
                 revision: revision.clone(),
                 config_generation,
+                mcp_target_path: std::path::PathBuf::from(&mcp.config_path),
+                mcp_revision: mcp.revision.clone(),
                 expires_at: now + PROVIDER_EDIT_CAPABILITY_TTL,
             },
         );
     }
     let mut view = crate::secret_ref::redact_provider_view(&config);
-    let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
     view.mcp_config_json = Some(mcp.config_json);
     view.mcp_owner_root = Some(canonical_root.clone());
     view.mcp_config_path = Some(mcp.config_path);
+    view.mcp_edit_capability = Some(snapshot_session_id.to_string());
     view.mcp_revision = Some(mcp.revision);
     view.extended_config_json = Some(redacted_extended_config_json(ctx, &cwd, &trust_policy)?);
     bounded_provider_response(Response::ProviderCatalogSnapshot {
@@ -14379,6 +14404,8 @@ async fn apply_provider_mutation(
                     layer_id: layer_id.clone(),
                     revision: commit.result_revision.clone(),
                     config_generation: commit.config_generation,
+                    mcp_target_path: capability.mcp_target_path,
+                    mcp_revision: capability.mcp_revision,
                     expires_at: Instant::now() + PROVIDER_EDIT_CAPABILITY_TTL,
                 },
             );
@@ -15729,6 +15756,7 @@ fn redacted_mcp_config_snapshot(
         .parent()
         .ok_or_else(|| bad_request("MCP config target has no parent"))?
         .join(cockpit_config::config::dirs::MCP_FILE);
+    let path = canonical_mcp_target_path(&path)?;
     let prior = match std::fs::read_to_string(&path) {
         Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -15798,6 +15826,40 @@ fn redacted_mcp_config_snapshot(
         config_path: path.to_string_lossy().into_owned(),
         revision: crate::intel::hex_lower(&Sha256::digest(prior_json.as_bytes())),
     })
+}
+
+fn canonical_mcp_target_path(
+    path: &std::path::Path,
+) -> std::result::Result<std::path::PathBuf, ErrorPayload> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let absolute = std::path::absolute(path).map_err(internal)?;
+            let mut ancestor = absolute.as_path();
+            while !ancestor.exists() {
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| bad_request("MCP config target has no existing ancestor"))?;
+            }
+            let canonical_ancestor = std::fs::canonicalize(ancestor).map_err(internal)?;
+            let suffix = absolute.strip_prefix(ancestor).map_err(internal)?;
+            Ok(canonical_ancestor.join(suffix))
+        }
+        Err(error) => Err(internal(error)),
+    }
+}
+
+fn mcp_target_layer_revision(path: &std::path::Path) -> std::result::Result<String, ErrorPayload> {
+    let config = match std::fs::read_to_string(path) {
+        Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::mcp::config::McpConfig::default()
+        }
+        Err(error) => return Err(internal(error)),
+    };
+    let json = serde_json::to_string(&config).map_err(internal)?;
+    use sha2::Digest as _;
+    Ok(crate::intel::hex_lower(&Sha256::digest(json.as_bytes())))
 }
 
 // Model fetch is parameterized by provider/model selectors plus the fetch-mode
@@ -16517,6 +16579,8 @@ mod provider_atomic_authority_tests {
             layer_id: "layer".into(),
             revision: "revision".into(),
             config_generation: 7,
+            mcp_target_path: "/project/.cockpit/mcp.json".into(),
+            mcp_revision: "mcp-revision".into(),
             expires_at: Instant::now() + Duration::from_secs(60),
         }
     }
@@ -17658,6 +17722,11 @@ async fn save_mcp_config(
     request_hash: [u8; 32],
     fencing_generation: i64,
     project_root: &str,
+    snapshot_capability: &str,
+    owner_root: &str,
+    config_path: &str,
+    expected_revision: &str,
+    supplied_mutation_intent_hash: &str,
     config_json: &str,
     secret_values_json: &str,
     cleanup_names_json: &str,
@@ -17670,12 +17739,45 @@ async fn save_mcp_config(
         &config_json,
         &cleanup_names_json,
     ))?);
+    if mutation_intent_hash != supplied_mutation_intent_hash {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message:
+                "MCP mutation intent does not match the submitted body; reload before retrying"
+                    .into(),
+        });
+    }
     // Canonicalize the workspace root once at this daemon boundary so every
     // ownership claim/guard/journal below (and later resolution) keys on the
     // same symlink-resolved form. The CLI (`cockpit mcp add`) sends a raw cwd;
     // canonicalizing here is what makes that raw wire spelling consistent.
     let project_root_canon = crate::secret_ownership::canonical_owner_root(project_root);
     let project_root = project_root_canon.as_str();
+    let capability = {
+        let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+            .lock()
+            .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
+        let now = Instant::now();
+        capabilities.retain(|_, capability| capability.expires_at > now);
+        capabilities.get(snapshot_capability).cloned()
+    }
+    .ok_or_else(|| ErrorPayload {
+        code: ErrorCode::Conflict,
+        message: "MCP edit capability is missing or expired; reload before retrying".into(),
+    })?;
+    if capability.owner != owner_digest
+        || capability.project_root != project_root
+        || owner_root != project_root
+        || capability.mcp_target_path != std::path::Path::new(config_path)
+        || capability.mcp_revision != expected_revision
+    {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message:
+                "MCP edit authority does not match the daemon snapshot; reload before retrying"
+                    .into(),
+        });
+    }
     recover_mcp_config_journals(ctx, project_root).await?;
     let mut config: crate::mcp::config::McpConfig =
         crate::mcp::config::McpConfig::parse(config_json).map_err(internal)?;
@@ -17726,6 +17828,15 @@ async fn save_mcp_config(
         .parent()
         .ok_or_else(|| bad_request("MCP config target has no parent"))?
         .join(cockpit_config::config::dirs::MCP_FILE);
+    let path = canonical_mcp_target_path(&path)?;
+    if path != capability.mcp_target_path || path != std::path::Path::new(config_path) {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message:
+                "MCP config target changed since the authority snapshot; reload before retrying"
+                    .into(),
+        });
+    }
     // Cleanup authority comes from the daemon's prior on-disk layer, never
     // from a caller-supplied list of arbitrary vault names. A malformed prior
     // layer is a hard failure: treating it as empty could delete credentials
@@ -17745,6 +17856,13 @@ async fn save_mcp_config(
     use sha2::Digest as _;
     let prior_json = serde_json::to_string(&prior_config).map_err(internal)?;
     let consumed_revision = crate::intel::hex_lower(&Sha256::digest(prior_json.as_bytes()));
+    if consumed_revision != expected_revision {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "MCP config changed since the authority snapshot; reload before retrying"
+                .into(),
+        });
+    }
     let journal_id = Uuid::now_v7().to_string();
     let cleanup_json = serde_json::to_string(&prior_references).map_err(internal)?;
     let config_json_owned = serde_json::to_string(&config).map_err(internal)?;
@@ -17782,6 +17900,14 @@ async fn save_mcp_config(
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     let result_revision = crate::intel::hex_lower(&Sha256::digest(config_json_owned.as_bytes()));
+    if mcp_target_layer_revision(&path)? != consumed_revision {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message:
+                "MCP config changed before its durable journal was created; reload before retrying"
+                    .into(),
+        });
+    }
     let credential_count = config
         .servers
         .iter()
@@ -17811,6 +17937,8 @@ async fn save_mcp_config(
             let project_root = project_root.to_string();
             let config_path = path.to_string_lossy().into_owned();
             let config_json = config_json_owned.clone();
+            let consumed_revision_for_tx = consumed_revision.clone();
+            let result_revision_for_tx = result_revision.clone();
             let cleanup_json = cleanup_json.clone();
             let owner_digest = owner_digest.to_owned();
             let client_operation_id = client_operation_id.to_owned();
@@ -17822,8 +17950,9 @@ async fn save_mcp_config(
                     "INSERT INTO mcp_config_journals
                      (journal_id, owner_digest, client_operation_id, request_hash,
                       fencing_generation, terminal_response_json, project_root,
-                      config_path, config_json, cleanup_names_json, phase, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'staged', ?11)",
+                      config_path, config_json, consumed_revision, intended_revision,
+                      cleanup_names_json, phase, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'staged', ?13)",
                     rusqlite::params![
                         journal_id,
                         owner_digest,
@@ -17834,8 +17963,10 @@ async fn save_mcp_config(
                         project_root,
                         config_path,
                         config_json,
+                        consumed_revision_for_tx,
+                        result_revision_for_tx,
                         cleanup_json,
-                        chrono::Utc::now().timestamp_millis(),
+                        chrono::Utc::now().timestamp_millis()
                     ],
                 )?;
                 // ATOMIC full-reference admission: re-check EVERY normalized
@@ -17895,7 +18026,22 @@ async fn save_mcp_config(
         ctx.poison_redaction_publication(&error);
         return Err(internal(error));
     }
+    crate::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
+    let file_lock = cockpit_config::config::hold_config_mutation_lock(&path).map_err(internal)?;
+    if canonical_mcp_target_path(&path)? != path
+        || mcp_target_layer_revision(&path)? != consumed_revision
+    {
+        drop(file_lock);
+        compensate_mcp_staged_and_retire(ctx, &journal_id, &staged_mutations).await?;
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message:
+                "MCP config target or revision changed before publication; staged credentials were rolled back"
+                    .into(),
+        });
+    }
     if let Err(error) = config.write_private(&path) {
+        drop(file_lock);
         let error = anyhow::anyhow!(error);
         ctx.poison_redaction_publication(&error);
         // The atomic write may have succeeded before reporting an error. Keep
@@ -17903,6 +18049,7 @@ async fn save_mcp_config(
         // vault value that the file may now reference.
         return Err(internal(error));
     }
+    drop(file_lock);
     if let Err(error) = ctx
         .db
         .write({
@@ -18619,27 +18766,57 @@ pub(super) async fn recover_mcp_config_journals(
     project_root: &str,
 ) -> std::result::Result<(), ErrorPayload> {
     let root = project_root.to_owned();
-    let journals: Vec<(String, String, String, String)> = ctx
+    let journals: Vec<(String, String, String, String, String, String)> = ctx
         .db
         .read(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT journal_id, config_path, config_json, cleanup_names_json
+                "SELECT journal_id, config_path, config_json, cleanup_names_json,
+                        consumed_revision, intended_revision
                  FROM mcp_config_journals WHERE project_root = ?1
                  ORDER BY created_at, journal_id",
             )?;
             stmt.query_map(rusqlite::params![root], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
         })
         .await
         .map_err(internal)?;
-    for (journal_id, path, config_json, cleanup_json) in journals {
+    for (journal_id, path, config_json, cleanup_json, consumed_revision, intended_revision) in
+        journals
+    {
+        let path = std::path::PathBuf::from(path);
+        crate::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
+        let file_lock =
+            cockpit_config::config::hold_config_mutation_lock(&path).map_err(internal)?;
+        if canonical_mcp_target_path(&path)? != path {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "MCP journal target was retargeted; durable settlement remains unknown"
+                    .into(),
+            });
+        }
+        let actual_revision = mcp_target_layer_revision(&path)?;
+        if actual_revision != intended_revision && actual_revision != consumed_revision {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "MCP journal found a third-party config revision; durable settlement remains unknown"
+                    .into(),
+            });
+        }
         let config = crate::mcp::config::McpConfig::parse(&config_json).map_err(internal)?;
-        config
-            .write_private(std::path::Path::new(&path))
-            .map_err(internal)?;
+        if actual_revision == consumed_revision {
+            config.write_private(&path).map_err(internal)?;
+        }
+        drop(file_lock);
         let cleanup: std::collections::BTreeSet<String> =
             serde_json::from_str(&cleanup_json).map_err(internal)?;
         let live = mcp_global_live_secret_references(ctx, project_root).await?;

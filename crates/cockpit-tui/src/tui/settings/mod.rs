@@ -333,6 +333,11 @@ pub(crate) enum SettingsDaemonEffectWork {
     McpConfigSave {
         client_operation_id: String,
         project_root: String,
+        snapshot_capability: String,
+        owner_root: String,
+        config_path: String,
+        expected_revision: String,
+        mutation_intent_hash: String,
         config_json: String,
         secret_values_json: SecretPayload,
         cleanup_names_json: String,
@@ -573,6 +578,11 @@ pub(crate) async fn execute_settings_daemon_work(
         SettingsDaemonEffectWork::McpConfigSave {
             client_operation_id,
             project_root,
+            snapshot_capability,
+            owner_root,
+            config_path,
+            expected_revision,
+            mutation_intent_hash,
             config_json,
             secret_values_json,
             cleanup_names_json,
@@ -581,6 +591,11 @@ pub(crate) async fn execute_settings_daemon_work(
                 .request(Request::SaveMcpConfig {
                     client_operation_id,
                     project_root,
+                    snapshot_capability,
+                    owner_root,
+                    config_path,
+                    expected_revision,
+                    mutation_intent_hash,
                     config_json,
                     secret_values_json: cockpit_proto::SensitiveWirePayload::new(
                         secret_values_json.take(),
@@ -1337,6 +1352,7 @@ enum SettingsMutationAction {
         project_root: String,
         expected_owner_root: String,
         expected_config_path: String,
+        snapshot_capability: String,
         expected_consumed_revision: String,
         expected_result_revision: String,
         expected_request_intent_hash: String,
@@ -2820,6 +2836,7 @@ pub struct SettingsCx {
     /// eligible until all three values came from the same catalog snapshot.
     pub(super) mcp_owner_root: Option<String>,
     pub(super) mcp_config_path: Option<String>,
+    pub(super) mcp_edit_capability: Option<String>,
     pub(super) mcp_revision: Option<String>,
     /// The cwd this dialog was opened against. Held so Root's `h`/←
     /// can reopen the picker without losing context. `None` when the
@@ -3678,17 +3695,26 @@ impl SettingsCx {
                         }
                         self.mcp_owner_root = None;
                         self.mcp_config_path = None;
+                        self.mcp_edit_capability = None;
                         self.mcp_revision = None;
-                        if let (Some(raw), Some(owner_root), Some(config_path), Some(revision)) = (
+                        if let (
+                            Some(raw),
+                            Some(owner_root),
+                            Some(config_path),
+                            Some(capability),
+                            Some(revision),
+                        ) = (
                             config.mcp_config_json,
                             config.mcp_owner_root,
                             config.mcp_config_path,
+                            config.mcp_edit_capability,
                             config.mcp_revision,
                         ) && let Ok(mcp) = cockpit_core::mcp::config::McpConfig::parse(&raw)
                         {
                             self.mcp_config = mcp;
                             self.mcp_owner_root = Some(owner_root);
                             self.mcp_config_path = Some(config_path);
+                            self.mcp_edit_capability = Some(capability);
                             self.mcp_revision = Some(revision);
                         }
                     }
@@ -3936,6 +3962,7 @@ impl SettingsCx {
                             project_root,
                             expected_owner_root,
                             expected_config_path,
+                            snapshot_capability,
                             expected_consumed_revision,
                             expected_result_revision,
                             expected_request_intent_hash,
@@ -3956,6 +3983,7 @@ impl SettingsCx {
                         && returned_root == project_root
                         && owner_root == expected_owner_root
                         && config_path == expected_config_path
+                        && !snapshot_capability.is_empty()
                         && consumed_revision == expected_consumed_revision
                         && result_revision == expected_result_revision
                         && mutation_intent_hash == expected_request_intent_hash
@@ -3965,6 +3993,10 @@ impl SettingsCx {
                         self.mcp_config = config;
                         self.mcp_owner_root = Some(expected_owner_root);
                         self.mcp_config_path = Some(expected_config_path);
+                        // The capability consumed the pre-commit revision. A
+                        // later edit must refresh and receive a new authority
+                        // token instead of reusing this stale snapshot.
+                        self.mcp_edit_capability = None;
                         self.mcp_revision = Some(expected_result_revision);
                         self.invalidate_secret_inventory();
                         if let Some((name, edited)) = self.pending_mcp_navigation.take() {
@@ -6476,6 +6508,7 @@ impl SettingsDialog {
                 mcp_config,
                 mcp_owner_root: None,
                 mcp_config_path: None,
+                mcp_edit_capability: None,
                 mcp_revision: None,
                 picker_cwd: None,
                 active_project_root: None,

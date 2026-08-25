@@ -1086,7 +1086,8 @@ impl AsyncActionRunner {
             // `advance_view_generation`, non-blocking work, etc.) must still
             // release pending/keyed ownership so a later same-key action is
             // not permanently stuck behind a discarded result.
-            if stale_view {
+            if stale_view && !matches!(&completed.kind, AsyncActionKind::DaemonRpc("sealed.effect"))
+            {
                 continue;
             }
             results.push(AsyncActionResult {

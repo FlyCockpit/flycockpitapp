@@ -2576,7 +2576,7 @@ impl App {
         let operation_id = uuid::Uuid::new_v4();
         let request_binding = binding.clone();
         self.start_sealed_effect(
-            binding,
+            binding.clone(),
             PendingSealedOperation::Metadata { operation_id },
             async move { request_binding.request(request).await },
         );
@@ -2592,14 +2592,39 @@ impl App {
         };
         let operation_id = uuid::Uuid::new_v4();
         let request_binding = binding.clone();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker_active = std::sync::Arc::clone(&active);
         self.start_sealed_effect(
-            binding,
+            binding.clone(),
             PendingSealedOperation::BeginWrite {
                 operation_id,
+                binding: binding.clone(),
+                active,
                 disposition: plan.disposition,
                 label: plan.label,
             },
-            async move { request_binding.request(plan.begin).await },
+            async move {
+                let response = request_binding.request(plan.begin).await?;
+                if let cockpit_core::daemon::proto::Response::SealedOwnerOperationBegun {
+                    capability_id,
+                    ..
+                } = &response
+                    && !worker_active.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    let settlement = request_binding
+                        .request(crate::tui::sealed_overlay::cancel_request(capability_id))
+                        .await;
+                    return match settlement {
+                        Ok(
+                            cockpit_core::daemon::proto::Response::SealedOwnerOperationCancelled {
+                                ..
+                            },
+                        ) => Err("sealed write cancelled by attachment transition".to_string()),
+                        _ => Err("sealed capability settlement failed".to_string()),
+                    };
+                }
+                Ok(response)
+            },
         );
     }
 
@@ -2613,10 +2638,11 @@ impl App {
         literal: cockpit_core::daemon::proto::SensitiveWireLiteral,
         summary: Option<String>,
     ) {
-        let Some(binding) = self.attached_sealed_binding() else {
-            // Drop the literal (zeroized on drop) — the capability expires unused.
+        let Some(binding) = self.sealed_capability_bindings.remove(capability_id) else {
+            // The exact originating binding was surrendered. Never redirect a
+            // single-use capability to a replacement session/epoch.
             drop(literal);
-            self.push_plain("/sealed: session detached; the capability will expire".to_string());
+            self.push_plain("/sealed: capability is no longer live".to_string());
             return;
         };
         let capability_id = capability_id.to_string();
@@ -2624,27 +2650,57 @@ impl App {
         let operation_id = uuid::Uuid::new_v4();
         let request_binding = binding.clone();
         self.start_sealed_effect(
-            binding,
+            binding.clone(),
             PendingSealedOperation::ApplyWrite {
                 operation_id,
-                capability_id,
+                capability_id: capability_id.clone(),
+                binding: binding.clone(),
                 summary,
             },
-            async move { request_binding.request(request).await },
+            async move {
+                match request_binding.request(request).await {
+                    Ok(response @ cockpit_core::daemon::proto::Response::SealedOwnerOperationApplied { .. }) => Ok(response),
+                    other => {
+                        let settlement = request_binding
+                            .request(crate::tui::sealed_overlay::cancel_request(&capability_id))
+                            .await;
+                        match settlement {
+                            Ok(cockpit_core::daemon::proto::Response::SealedOwnerOperationCancelled { spent: true }) => {}
+                            // Apply may already have consumed the capability before
+                            // returning an error; `spent: false` is the exact
+                            // fail-closed receipt for that state.
+                            Ok(cockpit_core::daemon::proto::Response::SealedOwnerOperationCancelled { spent: false }) => {}
+                            Ok(_) | Err(_) => return Err("sealed capability settlement failed".to_string()),
+                        }
+                        other
+                    }
+                }
+            },
         );
     }
 
     /// Cancel a minted capability (dismiss): spend its single-use compare-and-swap
     /// over the same binding without performing the operation.
     pub(super) fn cancel_sealed_capability(&mut self, capability_id: &str) {
-        let Some(binding) = self.attached_sealed_binding() else {
-            // No binding to cancel over; the capability expires on its own TTL.
+        let Some(binding) = self.sealed_capability_bindings.remove(capability_id) else {
             return;
         };
-        let request = crate::tui::sealed_overlay::cancel_request(capability_id);
-        // Cancel is best-effort and idempotent; the capability is spent (or gone)
-        // regardless of how the daemon replies, so a failure needs no surfacing.
-        let _ = binding.try_request_no_wait(request);
+        let operation_id = uuid::Uuid::new_v4();
+        let capability_id = capability_id.to_string();
+        let request_binding = binding.clone();
+        self.start_sealed_effect(
+            binding.clone(),
+            PendingSealedOperation::Cancel {
+                operation_id,
+                capability_id: capability_id.clone(),
+                binding: binding.clone(),
+            },
+            async move {
+                request_binding
+                    .request(crate::tui::sealed_overlay::cancel_request(&capability_id))
+                    .await
+            },
+        );
     }
 
     /// Exit/interrupt teardown for an open `/sealed` overlay. If a WRITE is
@@ -2663,6 +2719,63 @@ impl App {
             self.cancel_sealed_capability(&capability_id);
         }
         // `overlay` drops here, zeroizing any reveal/input buffer.
+    }
+
+    /// Exit settlement for every capability whose id is already known. Uses
+    /// the minting session/epoch binding retained with the capability and
+    /// awaits a typed spent/already-spent receipt before runner teardown.
+    pub(super) async fn settle_known_sealed_capabilities_before_shutdown(&mut self) {
+        let overlay_capability = match std::mem::take(&mut self.overlay) {
+            Overlay::Sealed(mut overlay) => overlay.take_pending_write_capability(),
+            other => {
+                self.overlay = other;
+                None
+            }
+        };
+        let mut settlements = self.sealed_capability_bindings.drain().collect::<Vec<_>>();
+        if let Some(capability_id) = overlay_capability
+            && !settlements.iter().any(|(id, _)| id == &capability_id)
+        {
+            tracing::warn!(
+                capability_id = %capability_id,
+                "sealed overlay lost its originating settlement binding"
+            );
+        }
+        for pending in self.pending_sealed_operations.values() {
+            match pending {
+                PendingSealedOperation::ApplyWrite {
+                    capability_id,
+                    binding,
+                    ..
+                }
+                | PendingSealedOperation::Cancel {
+                    capability_id,
+                    binding,
+                    ..
+                } if !settlements.iter().any(|(id, _)| id == capability_id) => {
+                    settlements.push((capability_id.clone(), binding.clone()));
+                }
+                _ => {}
+            }
+        }
+        for (capability_id, binding) in settlements {
+            let receipt = binding
+                .request(crate::tui::sealed_overlay::cancel_request(&capability_id))
+                .await;
+            if !matches!(
+                receipt,
+                Ok(
+                    cockpit_core::daemon::proto::Response::SealedOwnerOperationCancelled {
+                        spent: true | false
+                    }
+                )
+            ) {
+                tracing::warn!(
+                    capability_id = %capability_id,
+                    "sealed capability shutdown settlement was not confirmed"
+                );
+            }
+        }
     }
 
     /// The pointer-dismiss entry: a left-click on an open `/sealed` overlay. Takes
@@ -2701,11 +2814,14 @@ impl App {
         let operation_id = uuid::Uuid::new_v4();
         let request_binding = binding.clone();
         let pending_record_id = record_id.clone();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker_active = std::sync::Arc::clone(&active);
         self.start_sealed_effect(
             binding,
             PendingSealedOperation::Recover {
                 operation_id,
                 record_id: pending_record_id,
+                active,
             },
             async move {
                 // Begin and apply stay on the exact attached binding. The
@@ -2725,12 +2841,40 @@ impl App {
                     Response::SealedOwnerOperationBegun { capability_id, .. } => capability_id,
                     _ => return Err("unexpected daemon response".to_string()),
                 };
-                request_binding
+                if !worker_active.load(std::sync::atomic::Ordering::Acquire) {
+                    return match request_binding
+                        .request(crate::tui::sealed_overlay::cancel_request(&capability_id))
+                        .await
+                    {
+                        Ok(Response::SealedOwnerOperationCancelled { .. }) => {
+                            Err("sealed recover cancelled by attachment transition".to_string())
+                        }
+                        _ => Err("sealed recover capability settlement failed".to_string()),
+                    };
+                }
+                let apply = request_binding
                     .request(Request::ApplySealedOwnerOperation {
-                        capability_id,
+                        capability_id: capability_id.clone(),
                         literal: None,
                     })
-                    .await
+                    .await;
+                if !matches!(
+                    &apply,
+                    Ok(Response::SealedOwnerOperationApplied {
+                        revealed_literal: Some(_)
+                    })
+                ) {
+                    let settlement = request_binding
+                        .request(crate::tui::sealed_overlay::cancel_request(&capability_id))
+                        .await;
+                    if !matches!(
+                        settlement,
+                        Ok(Response::SealedOwnerOperationCancelled { .. })
+                    ) {
+                        return Err("sealed recover capability settlement failed".to_string());
+                    }
+                }
+                apply
             },
         );
     }
@@ -2743,23 +2887,29 @@ impl App {
         else {
             return;
         };
-        if !self.sealed_binding_is_current(completion.session_id, completion.attachment_epoch) {
-            return;
-        }
+        let binding_is_current =
+            self.sealed_binding_is_current(completion.session_id, completion.attachment_epoch);
         match pending {
             PendingSealedOperation::Metadata { .. } => {
-                self.push_plain(crate::tui::sealed_overlay::sealed_response_text(
-                    completion.response,
-                ));
+                if binding_is_current {
+                    self.push_plain(crate::tui::sealed_overlay::sealed_response_text(
+                        completion.response,
+                    ));
+                }
             }
             PendingSealedOperation::BeginWrite {
-                disposition, label, ..
+                binding,
+                disposition,
+                label,
+                ..
             } => match completion.response {
                 Ok(Response::SealedOwnerOperationBegun {
                     capability_id,
                     expires_at_ms,
                 }) => {
-                    if !matches!(self.overlay, Overlay::None) {
+                    self.sealed_capability_bindings
+                        .insert(capability_id.clone(), binding);
+                    if !matches!(self.overlay, Overlay::None) || !binding_is_current {
                         self.cancel_sealed_capability(&capability_id);
                         return;
                     }
@@ -2778,21 +2928,37 @@ impl App {
             },
             PendingSealedOperation::ApplyWrite {
                 capability_id: _capability_id,
+                binding: _binding,
                 summary,
                 ..
             } => match completion.response {
-                Ok(Response::SealedOwnerOperationApplied { .. }) => {
+                Ok(Response::SealedOwnerOperationApplied { .. }) if binding_is_current => {
                     let summary = summary.unwrap_or_else(|| "stored".to_string());
                     self.push_plain(format!("/sealed: {summary}"));
                 }
-                Ok(_) => self.push_plain("/sealed: unexpected daemon response".to_string()),
-                Err(error) => self.push_plain(format!("/sealed: {error}")),
+                Ok(Response::SealedOwnerOperationApplied { .. }) => {}
+                Ok(_) if binding_is_current => {
+                    self.push_plain("/sealed: unexpected daemon response".to_string())
+                }
+                Err(error) if binding_is_current => self.push_plain(format!("/sealed: {error}")),
+                Ok(_) | Err(_) => {}
+            },
+            PendingSealedOperation::Cancel { capability_id, .. } => match completion.response {
+                Ok(Response::SealedOwnerOperationCancelled { spent: true }) => {}
+                Ok(Response::SealedOwnerOperationCancelled { spent: false }) => tracing::debug!(
+                    capability_id = %capability_id,
+                    "sealed capability was already settled"
+                ),
+                Ok(_) | Err(_) if binding_is_current => self.push_plain(
+                    "/sealed: capability settlement could not be confirmed".to_string(),
+                ),
+                Ok(_) | Err(_) => {}
             },
             PendingSealedOperation::Recover { record_id, .. } => match completion.response {
                 Ok(Response::SealedOwnerOperationApplied {
                     revealed_literal: Some(literal),
                 }) => {
-                    if !matches!(self.overlay, Overlay::None) {
+                    if !matches!(self.overlay, Overlay::None) || !binding_is_current {
                         drop(literal);
                         return;
                     }
@@ -2829,17 +2995,26 @@ pub(super) enum PendingSealedOperation {
     },
     BeginWrite {
         operation_id: uuid::Uuid,
+        binding: agent_runner::AttachedRequestBinding,
+        active: std::sync::Arc<std::sync::atomic::AtomicBool>,
         disposition: crate::tui::sealed_overlay::SealedWriteDisposition,
         label: String,
     },
     ApplyWrite {
         operation_id: uuid::Uuid,
         capability_id: String,
+        binding: agent_runner::AttachedRequestBinding,
         summary: Option<String>,
+    },
+    Cancel {
+        operation_id: uuid::Uuid,
+        capability_id: String,
+        binding: agent_runner::AttachedRequestBinding,
     },
     Recover {
         operation_id: uuid::Uuid,
         record_id: String,
+        active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
 }
 
@@ -2849,8 +3024,36 @@ impl PendingSealedOperation {
             Self::Metadata { operation_id }
             | Self::BeginWrite { operation_id, .. }
             | Self::ApplyWrite { operation_id, .. }
+            | Self::Cancel { operation_id, .. }
             | Self::Recover { operation_id, .. } => *operation_id,
         }
+    }
+
+    pub(super) fn invalidate(&self) {
+        match self {
+            Self::BeginWrite { active, .. } | Self::Recover { active, .. } => {
+                active.store(false, std::sync::atomic::Ordering::Release);
+            }
+            Self::Metadata { .. } | Self::ApplyWrite { .. } | Self::Cancel { .. } => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod sealed_authority_lifecycle_tests {
+    use super::PendingSealedOperation;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn attachment_transition_invalidates_unsettled_recover_before_reveal() {
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let pending = PendingSealedOperation::Recover {
+            operation_id: uuid::Uuid::new_v4(),
+            record_id: "record-a".to_string(),
+            active: std::sync::Arc::clone(&active),
+        };
+        pending.invalidate();
+        assert!(!active.load(Ordering::Acquire));
     }
 }
 

@@ -1881,6 +1881,11 @@ pub struct App {
     pub(super) config_snapshot: HeldConfig,
     pending_workspace_trust: Option<PendingWorkspaceTrust>,
     pending_sealed_operations: HashMap<uuid::Uuid, slash::PendingSealedOperation>,
+    /// Originating attached binding for every minted, still-live sealed
+    /// capability. Session/epoch replacement must not redirect settlement to
+    /// a newer runner.
+    sealed_capability_bindings:
+        HashMap<String, crate::tui::agent_runner::AttachedRequestBinding>,
     exit_requested: bool,
     pub(super) active_model_state_generation: u64,
     /// Security disclosures must be fetched from the daemon before a session
@@ -3533,6 +3538,7 @@ impl App {
             config_snapshot,
             pending_workspace_trust: None,
             pending_sealed_operations: HashMap::new(),
+            sealed_capability_bindings: HashMap::new(),
             exit_requested: false,
             active_model_state_generation: 0,
             // Existing unit harnesses construct App without an event loop or
@@ -3982,7 +3988,7 @@ impl App {
         // capability over the still-live attached binding before the runner/daemon
         // teardown below, so a Ctrl-C×2 (or `/exit`) exit doesn't strand the
         // capability until its server-side expiry.
-        self.teardown_sealed_overlay();
+        self.settle_known_sealed_capabilities_before_shutdown().await;
         // Prevent a leak-reveal worker from entering the sensitive channel
         // after the pane/application has surrendered its operation binding.
         // The worker owns the exact token and receipt-settles it on this path.

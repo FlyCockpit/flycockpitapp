@@ -96,6 +96,16 @@ pub(crate) struct AttachedRequestBinding {
     intended_attachment_epoch: u64,
 }
 
+impl std::fmt::Debug for AttachedRequestBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AttachedRequestBinding")
+            .field("session_id", &self.intended_session_id)
+            .field("attachment_epoch", &self.intended_attachment_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AttachedRequestBinding {
     pub(crate) fn new(
         sender: mpsc::Sender<AttachedRequest>,
@@ -115,22 +125,6 @@ impl AttachedRequestBinding {
 
     pub(crate) fn attachment_epoch(&self) -> u64 {
         self.intended_attachment_epoch
-    }
-
-    /// Queue a best-effort request without waiting for its response. This is
-    /// reserved for idempotent teardown/cancel frames where blocking the input
-    /// reducer or shutdown path would be worse than allowing the daemon-side
-    /// capability TTL to expire after a full channel.
-    pub(crate) fn try_request_no_wait(&self, request: Request) -> Result<(), String> {
-        let (response_tx, _response_rx) = oneshot::channel();
-        self.sender
-            .try_send(AttachedRequest {
-                request,
-                intended_session_id: self.intended_session_id,
-                intended_attachment_epoch: self.intended_attachment_epoch,
-                response_tx,
-            })
-            .map_err(|error| format!("attached request queue unavailable: {error}"))
     }
 
     pub(crate) async fn request(&self, request: Request) -> Result<Response, String> {

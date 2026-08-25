@@ -430,6 +430,9 @@ impl App {
         new_session_id: Option<uuid::Uuid>,
         state: Option<&cockpit_core::daemon::proto::ActiveModelState>,
     ) {
+        for operation in self.pending_sealed_operations.values() {
+            operation.invalidate();
+        }
         // A submission held by the pending model transaction is not an
         // independently dispatchable paste fence. Keep it intact while the
         // model control is converted into a session-scoped retry below; that

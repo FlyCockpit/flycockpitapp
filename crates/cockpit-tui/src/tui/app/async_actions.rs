@@ -398,6 +398,7 @@ impl App {
                 AsyncActionKind::Internal(
                     "session.switch" | "session.resume" | "runner.attach" | "btw.runner.attach"
                 ) | AsyncActionKind::Blocking("paste.delivery_receipt")
+                    | AsyncActionKind::DaemonRpc("sealed.effect")
             )
         {
             return;

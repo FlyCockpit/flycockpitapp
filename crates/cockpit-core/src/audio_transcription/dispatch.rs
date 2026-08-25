@@ -138,18 +138,21 @@ pub async fn dispatch_multipart(
     let (boundary, body) = encode_with_boundary_retry(audio, boundaries, build)?;
     match transport.post_multipart(&boundary, body).await {
         Ok(response) if (200..300).contains(&response.status) => Ok(response),
-        Ok(response) => bail!("{}", TranscriptionEgressError::Status {
-            status: response.status
-        }
-        .redacted_reason()),
+        Ok(response) => bail!(
+            "{}",
+            TranscriptionEgressError::Status {
+                status: response.status
+            }
+            .redacted_reason()
+        ),
         Err(error) => bail!("{}", error.redacted_reason()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::request::{BOUNDARY_PREFIX, MultipartPart, plan_gpt_transcribe};
+    use super::*;
     use std::sync::Mutex;
 
     struct FakeTransport {
@@ -179,7 +182,10 @@ mod tests {
         assert!(b.starts_with(BOUNDARY_PREFIX));
         let rest = b.strip_prefix(BOUNDARY_PREFIX).unwrap();
         assert_eq!(rest.len(), 32);
-        assert!(rest.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            rest.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]
@@ -203,8 +209,9 @@ mod tests {
         let audio = format!("x--{audio_marker}x").into_bytes();
         // Supply the same colliding value repeatedly, more than the cap.
         let mut boundaries = std::iter::repeat(7u128).take(MAX_BOUNDARY_ATTEMPTS + 4);
-        let err = encode_with_boundary_retry(&audio, &mut boundaries, build_plan(audio.len() as u64))
-            .unwrap_err();
+        let err =
+            encode_with_boundary_retry(&audio, &mut boundaries, build_plan(audio.len() as u64))
+                .unwrap_err();
         assert!(err.to_string().contains("transcription_unavailable"));
     }
 

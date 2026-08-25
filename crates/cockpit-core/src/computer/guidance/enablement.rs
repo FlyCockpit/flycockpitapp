@@ -58,8 +58,7 @@ pub fn resolve_guidance_enablement(
     provider_id: &str,
     model_id: &str,
 ) -> EnablementResolution {
-    let doc_layers =
-        crate::config::extended::resolve_guidance_proposal_doc_layers_for_cwd(cwd);
+    let doc_layers = crate::config::extended::resolve_guidance_proposal_doc_layers_for_cwd(cwd);
 
     let layers = EnablementLayers {
         global: EnablementValue::from_bool(doc_layers.global),

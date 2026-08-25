@@ -2107,8 +2107,10 @@ pub fn resolve_guidance_proposal_doc_layers_for_cwd(cwd: &Path) -> GuidancePropo
             }
             match ExtendedConfigDoc::load(&path) {
                 Ok(doc) => {
-                    layers.project =
-                        fold_enablement_value(layers.project, guidance_proposal_field_from_doc(&doc));
+                    layers.project = fold_enablement_value(
+                        layers.project,
+                        guidance_proposal_field_from_doc(&doc),
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(path = %path.display(), %error, "skipping malformed config layer");

@@ -124,6 +124,17 @@ fn normalize_tests_core(tokens: &[String]) -> BTreeSet<String> {
             i += 1;
             continue;
         }
+        // CI deliberately skips the customer-operated tenant-authority
+        // reference service; docs omit the exclusion. Only this one member
+        // may be excluded without breaking argv equivalence.
+        if t == "--exclude" && tokens.get(i + 1).is_some_and(|m| m == "tenant-authority") {
+            i += 2;
+            continue;
+        }
+        if t == "--exclude=tenant-authority" {
+            i += 1;
+            continue;
+        }
         out.insert(t.clone());
         i += 1;
     }
@@ -347,6 +358,14 @@ fn exact_examples_companion_tokens(tokens: &[String]) -> bool {
                 i += 2;
             }
             other if other.starts_with("--target=") => i += 1,
+            // Same single sanctioned exclusion as `normalize_tests_core`.
+            "--exclude" => {
+                if tokens.get(i + 1).is_none_or(|m| m != "tenant-authority") {
+                    return false;
+                }
+                i += 2;
+            }
+            "--exclude=tenant-authority" => i += 1,
             _ => return false,
         }
     }

@@ -882,9 +882,10 @@ impl Tool for GenerateImageTool {
         // an outcome, and no prompt text, raw path, secret, or reference byte is
         // ever surfaced — the dispatch service returns only redacted, model-safe
         // copy.
-        let (Some(service), Some(approver)) =
-            (ctx.image_generation_dispatch.as_ref(), ctx.approver.as_ref())
-        else {
+        let (Some(service), Some(approver)) = (
+            ctx.image_generation_dispatch.as_ref(),
+            ctx.approver.as_ref(),
+        ) else {
             return Ok(ToolOutput::text(
                 "Image generation dispatch is not available in this session. No job was created \
                  and no provider was contacted."
@@ -910,7 +911,9 @@ impl Tool for GenerateImageTool {
             }
             crate::image_generation_job::GenerateImageDispatchOutcome::Incompatible {
                 alternatives,
-            } => Ok(ToolOutput::text(format_incompatible_alternatives(&alternatives))),
+            } => Ok(ToolOutput::text(format_incompatible_alternatives(
+                &alternatives,
+            ))),
         }
     }
 }
@@ -1013,10 +1016,7 @@ fn parse_generate_image_dispatch_target(
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_input("each target requires a `target_id`"))?
         .to_string();
-    let samples = entry
-        .get("samples")
-        .and_then(Value::as_u64)
-        .unwrap_or(1) as u32;
+    let samples = entry.get("samples").and_then(Value::as_u64).unwrap_or(1) as u32;
     let width = entry
         .get("width")
         .and_then(Value::as_u64)
@@ -1246,11 +1246,9 @@ impl Tool for CancelImageGenerationJobTool {
                     "Image-generation job `{job_id}` has already finished; there is nothing to cancel."
                 )))
             }
-            crate::image_generation_job::CancelImageJobOutcome::NotFound => {
-                Ok(ToolOutput::text(format!(
-                    "No image-generation job `{job_id}` is available to this session."
-                )))
-            }
+            crate::image_generation_job::CancelImageJobOutcome::NotFound => Ok(ToolOutput::text(
+                format!("No image-generation job `{job_id}` is available to this session."),
+            )),
         }
     }
 }

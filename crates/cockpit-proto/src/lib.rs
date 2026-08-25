@@ -46,9 +46,9 @@ pub use agent_management::{
     MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES, MAX_ASSISTANT_HOME_BYTES,
     agent_edit_projection_material, agent_inventory_entry_projection_material,
     agent_mutation_intent_hash, agent_mutation_name, assistant_mutation_intent_hash,
-    validate_agent_edit_snapshot,
-    validate_agent_editor_completion, validate_agent_mutation_envelope,
-    validate_agent_source_identity, validate_goal_supervision_projection,
+    validate_agent_edit_snapshot, validate_agent_editor_completion,
+    validate_agent_mutation_envelope, validate_agent_source_identity,
+    validate_goal_supervision_projection,
 };
 pub use config_management::{
     CockpitConfigLayer, CommittedDenylistEntry, ConfigCommitStatus, ConfigPublicationStatus,

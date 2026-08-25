@@ -6310,6 +6310,8 @@ CREATE TABLE provider_config_journals (
         CHECK (json_valid(cleanup_named_json) AND json_type(cleanup_named_json) = 'array'),
     cleanup_credential_json TEXT NOT NULL
         CHECK (json_valid(cleanup_credential_json) AND json_type(cleanup_credential_json) = 'array'),
+    settlement_phase TEXT NOT NULL DEFAULT 'publication_pending'
+        CHECK (settlement_phase IN ('publication_pending', 'cleanup_pending')),
     created_at       INTEGER NOT NULL,
     CHECK (length(trim(journal_id)) > 0),
     CHECK (length(trim(project_root)) > 0),
@@ -6357,8 +6359,11 @@ CREATE TABLE mcp_config_journals (
     patch_intent_json TEXT NOT NULL CHECK (json_valid(patch_intent_json)),
     consumed_revision TEXT NOT NULL CHECK (length(consumed_revision) = 64),
     intended_revision TEXT NOT NULL CHECK (length(intended_revision) = 64),
+    intended_config_generation INTEGER NOT NULL CHECK (intended_config_generation > 0),
     cleanup_names_json TEXT NOT NULL,
     phase             TEXT NOT NULL CHECK (phase IN ('staged', 'published')),
+    settlement_phase  TEXT NOT NULL DEFAULT 'publication_pending'
+        CHECK (settlement_phase IN ('publication_pending', 'cleanup_pending')),
     created_at        INTEGER NOT NULL
 );
 CREATE INDEX mcp_config_journals_scope

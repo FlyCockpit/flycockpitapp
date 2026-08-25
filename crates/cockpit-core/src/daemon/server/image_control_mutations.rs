@@ -990,9 +990,17 @@ pub(crate) async fn dispatch_image_control_mutation(
     let layer = authoritative_image_layer(ctx, &cwd, &trust_policy).map_err(internal)?;
     let target = layer.target;
     let target_display = target.to_string_lossy().into_owned();
-    let publication_guard =
-        cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
-    let consumed = read_document(&target).map_err(internal)?;
+    let read_target = target.clone();
+    let consumed = crate::daemon::config_publication_recovery::PreSocketConfigPublication::new()
+        .with_target(&target, move |_| {
+            read_document(&read_target).map_err(|error| anyhow::anyhow!(error.message))
+        })
+        .await
+        .map_err(|error| {
+            internal(anyhow::anyhow!(
+                "bounded image config read failed: {error:#}"
+            ))
+        })?;
     let consumed_revision = content_revision(ctx, consumed.as_slice());
     if consumed_revision != expected_revision {
         return Err(conflict(
@@ -1063,8 +1071,6 @@ pub(crate) async fn dispatch_image_control_mutation(
         change_set,
     ));
     let mut terminal_response_json = serde_json::to_string(&response).map_err(internal)?;
-    drop(publication_guard);
-
     let journal_owner = owner.clone();
     let journal_operation = client_operation_id.clone();
     let journal_project = cwd.to_string_lossy().into_owned();
@@ -1129,11 +1135,37 @@ pub(crate) async fn dispatch_image_control_mutation(
         })
         .await
         .map_err(internal)?;
-    let publication_guard =
-        cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
-    let precommit = read_document(&target).map_err(internal)?;
-    if content_revision(ctx, &precommit) != consumed_revision {
-        drop(publication_guard);
+    let commit_target = target.clone();
+    let commit_intended = intended.clone();
+    let revision_ctx = Arc::clone(ctx);
+    let commit_consumed_revision = consumed_revision.clone();
+    let commit_result_revision = result_revision.clone();
+    let published_generation =
+        crate::daemon::config_publication_recovery::PreSocketConfigPublication::new()
+            .with_target(&target, move |_| {
+                let precommit = read_document(&commit_target)
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                if content_revision(&revision_ctx, &precommit) != commit_consumed_revision {
+                    return Ok(None);
+                }
+                let generation = if commit_result_revision != commit_consumed_revision {
+                    cockpit_config::config::write_config_bytes_atomic(
+                        &commit_target,
+                        &commit_intended,
+                    )?;
+                    inventory::publish_committed_config_generation()
+                } else {
+                    inventory::current_config_generation()
+                };
+                Ok(Some(generation))
+            })
+            .await
+            .map_err(|error| {
+                internal(anyhow::anyhow!(
+                    "bounded image config commit failed: {error:#}"
+                ))
+            })?;
+    let Some(published_generation) = published_generation else {
         return Err(settle_unpublished_image_mutation(
             ctx,
             owner,
@@ -1143,17 +1175,7 @@ pub(crate) async fn dispatch_image_control_mutation(
             "publication_authorized",
         )
         .await?);
-    }
-    let published_generation = if result_revision != consumed_revision {
-        cockpit_config::config::write_config_bytes_atomic(&target, &intended).map_err(internal)?;
-        inventory::publish_committed_config_generation()
-    } else {
-        // A semantic/no-byte-change result still reports the generation at
-        // its commit observation point. Another config family may have
-        // published while this operation waited on the target file lock.
-        inventory::current_config_generation()
     };
-    drop(publication_guard);
 
     if published_generation != predicted_generation {
         amend_response_generation(ctx, &mut response, published_generation).map_err(internal)?;
@@ -1493,6 +1515,35 @@ pub(crate) async fn recover_image_config_mutation_journals(
             continue;
         }
 
+        // Every terminal receipt is final. In particular, recovery must never
+        // reinterpret an error/cancellation as success after observing the
+        // intended bytes: the terminal-outcome trigger deliberately forbids
+        // that rewrite, and the receipt is the durable client contract.
+        if matches!(
+            receipt_state.as_str(),
+            "terminal_error" | "terminal_cancelled"
+        ) {
+            let retire_owner = owner;
+            let retire_operation = operation;
+            ctx.db
+                .transaction(move |conn| {
+                    let retired = conn.execute(
+                        "DELETE FROM image_config_mutation_journals
+                      WHERE owner_digest=?1 AND client_operation_id=?2
+                        AND request_hash=?3 AND fencing_generation=?4",
+                        rusqlite::params![retire_owner, retire_operation, hash.as_slice(), fence],
+                    )?;
+                    if retired != 1 {
+                        anyhow::bail!("terminal image recovery lost its exact journal");
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(internal)?;
+            recovered = recovered.saturating_add(1);
+            continue;
+        }
+
         let target_path = PathBuf::from(target);
         let revision_ctx = Arc::clone(ctx);
         let observed_target = target_path.clone();
@@ -1508,52 +1559,7 @@ pub(crate) async fn recover_image_config_mutation_journals(
                 message: format!("bounded image-config recovery could not acquire publication authority: {error:#}"),
             })?;
 
-        // A terminal rejection/cancellation with no intended publication is
-        // also final. Inspect the file first so an atomic replace that crossed
-        // the boundary can still correct a prematurely persisted rejection.
-        if matches!(
-            receipt_state.as_str(),
-            "terminal_error" | "terminal_cancelled"
-        ) {
-            if actual == consumed {
-                let retire_owner = owner;
-                let retire_operation = operation;
-                ctx.db
-                    .transaction(move |conn| {
-                        let retired = conn.execute(
-                            "DELETE FROM image_config_mutation_journals
-                      WHERE owner_digest=?1 AND client_operation_id=?2
-                        AND request_hash=?3 AND fencing_generation=?4",
-                            rusqlite::params![
-                                retire_owner,
-                                retire_operation,
-                                hash.as_slice(),
-                                fence
-                            ],
-                        )?;
-                        if retired != 1 {
-                            anyhow::bail!("terminal image recovery lost its exact journal");
-                        }
-                        Ok(())
-                    })
-                    .await
-                    .map_err(internal)?;
-                recovered = recovered.saturating_add(1);
-                continue;
-            }
-            if actual != intended {
-                return Err(conflict(
-                    "terminal image mutation journal diverged from both consumed and intended revisions",
-                ));
-            }
-        }
-
-        if receipt_state != "executing"
-            && !matches!(
-                receipt_state.as_str(),
-                "terminal_error" | "terminal_cancelled"
-            )
-        {
+        if receipt_state != "executing" {
             return Err(internal(
                 "image mutation receipt has an invalid recovery state",
             ));
@@ -1571,7 +1577,7 @@ pub(crate) async fn recover_image_config_mutation_journals(
                 let changed = conn.execute(
                     "UPDATE local_operation_receipts SET state='terminal_success',terminal_outcome_json=?5,execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
                      WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4
-                       AND state IN ('executing','terminal_error','terminal_cancelled')",
+                       AND state = 'executing'",
                     rusqlite::params![owner,operation,hash.as_slice(),fence,terminal,chrono::Utc::now().timestamp_millis()],
                 )?;
                 if changed != 1 { anyhow::bail!("image mutation recovery lost its exact receipt"); }

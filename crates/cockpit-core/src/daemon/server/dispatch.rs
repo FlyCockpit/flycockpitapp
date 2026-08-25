@@ -14229,14 +14229,20 @@ async fn provider_catalog_snapshot(
         })
         .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
     let target_path = canonical_mcp_target_path(&target_path)?;
-    let revision = {
-        let _file_lock =
-            cockpit_config::config::hold_config_mutation_lock(&target_path).map_err(internal)?;
-        let layer = crate::config::providers::ConfigDoc::load(&target_path)
-            .map_err(internal)?
-            .providers();
-        provider_config_revision(ctx, &target_path, &layer)?
-    };
+    let revision_target = target_path.clone();
+    let revision_vault = ctx.secret_vault.clone();
+    let revision = crate::daemon::config_publication_recovery::PreSocketConfigPublication::new()
+        .with_target(&target_path, move |_| {
+            let layer = crate::config::providers::ConfigDoc::load(&revision_target)?.providers();
+            provider_config_revision_with_vault(&revision_vault, &revision_target, &layer)
+                .map_err(|error| anyhow::anyhow!(error.message))
+        })
+        .await
+        .map_err(|error| {
+            internal(anyhow::anyhow!(
+                "bounded provider config read failed: {error:#}"
+            ))
+        })?;
     let layer_material = format!(
         "provider-layer\0{canonical_root}\0{}\0{snapshot_session_id}",
         target_path.display()
@@ -14367,15 +14373,22 @@ async fn apply_provider_mutation(
                 .ok_or_else(|| bad_request("provider edit capability is absent or expired"))?
         };
         recover_provider_config_journals(ctx, &capability.project_root, None).await?;
-        let observed_revision = {
-            let _file_lock =
-                cockpit_config::config::hold_config_mutation_lock(&capability.target_path)
-                    .map_err(internal)?;
-            let layer = crate::config::providers::ConfigDoc::load(&capability.target_path)
-                .map_err(internal)?
-                .providers();
-            provider_config_revision(ctx, &capability.target_path, &layer)?
-        };
+        let revision_target = capability.target_path.clone();
+        let revision_vault = ctx.secret_vault.clone();
+        let observed_revision =
+            crate::daemon::config_publication_recovery::PreSocketConfigPublication::new()
+                .with_target(&capability.target_path, move |_| {
+                    let layer =
+                        crate::config::providers::ConfigDoc::load(&revision_target)?.providers();
+                    provider_config_revision_with_vault(&revision_vault, &revision_target, &layer)
+                        .map_err(|error| anyhow::anyhow!(error.message))
+                })
+                .await
+                .map_err(|error| {
+                    internal(anyhow::anyhow!(
+                        "bounded provider config CAS read failed: {error:#}"
+                    ))
+                })?;
         validate_provider_edit_capability(
             &capability,
             &capability_owner,
@@ -16710,6 +16723,7 @@ struct ProviderConfigJournal {
     entry_json: Option<String>,
     cleanup_named_json: String,
     cleanup_credential_json: String,
+    settlement_phase: String,
 }
 
 #[cfg(test)]
@@ -16948,6 +16962,29 @@ mod provider_atomic_authority_tests {
             .find("publish_mcp_journal_generation(ctx, &journal_id)")
             .expect("MCP generation publication");
         assert!(generation > file_commit);
+        assert!(mcp_save.contains("intended_config_generation"));
+        let mcp_publish = source
+            .split("async fn publish_mcp_journal_generation")
+            .nth(1)
+            .expect("MCP generation publication");
+        assert!(mcp_publish.contains("publish_committed_config_generation_at_least"));
+    }
+
+    #[test]
+    fn terminal_config_receipts_advance_to_cleanup_only_before_deferred_cleanup() {
+        let source = include_str!("dispatch.rs");
+        let provider = source
+            .split("pub(super) async fn recover_provider_config_journals")
+            .nth(1)
+            .expect("provider recovery");
+        assert!(provider.contains("settlement_phase == \"cleanup_pending\""));
+        assert!(provider.contains("SET settlement_phase='cleanup_pending'"));
+        let mcp = source
+            .split("async fn recover_mcp_config_journals_inner")
+            .nth(1)
+            .expect("MCP recovery");
+        assert!(mcp.contains("settlement_phase == \"cleanup_pending\""));
+        assert!(mcp.contains("must never be subjected to its old CAS"));
     }
 
     #[test]
@@ -17176,7 +17213,8 @@ async fn recover_provider_config_journals_inner(
                         fencing_generation, terminal_response_json, provider_id,
                         action, config_path, consumed_revision, intended_revision,
                         consumed_config_generation, intended_config_generation,
-                        entry_json, cleanup_named_json, cleanup_credential_json
+                        entry_json, cleanup_named_json, cleanup_credential_json,
+                        settlement_phase
                  FROM provider_config_journals
                  WHERE project_root = ?1
                    AND (?2 IS NULL OR action = 'batch' OR provider_id = ?2)
@@ -17202,6 +17240,7 @@ async fn recover_provider_config_journals_inner(
                         entry_json: row.get(13)?,
                         cleanup_named_json: row.get(14)?,
                         cleanup_credential_json: row.get(15)?,
+                        settlement_phase: row.get(16)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -17210,16 +17249,19 @@ async fn recover_provider_config_journals_inner(
         .await
         .map_err(internal)?;
     for journal in journals {
+        let cleanup_only = journal.settlement_phase == "cleanup_pending";
         let (cwd, trust_policy, _) = daemon_provider_config(ctx, project_root.as_str()).await?;
-        recover_provider_journal_file_bounded(
-            ctx,
-            project_root.as_str(),
-            &cwd,
-            &trust_policy,
-            &journal,
-            publication,
-        )
-        .await?;
+        if !cleanup_only {
+            recover_provider_journal_file_bounded(
+                ctx,
+                project_root.as_str(),
+                &cwd,
+                &trust_policy,
+                &journal,
+                publication,
+            )
+            .await?;
+        }
         let generation = if matches!(journal.action.as_str(), "save" | "delete" | "batch") {
             let consumed = journal.consumed_config_generation.ok_or_else(|| {
                 bad_request("provider journal is missing consumed config generation")
@@ -17234,13 +17276,32 @@ async fn recover_provider_config_journals_inner(
             }
             let intended = u64::try_from(intended)
                 .map_err(|_| bad_request("provider journal config generation is invalid"))?;
-            inventory::publish_committed_config_generation_at_least(intended);
-            intended
+            if cleanup_only {
+                let response: Response =
+                    serde_json::from_str(journal.terminal_response_json.as_deref().ok_or_else(
+                        || bad_request("provider cleanup journal is missing terminal response"),
+                    )?)
+                    .map_err(internal)?;
+                let published = match response {
+                    Response::ProviderMutationCommitted {
+                        config_generation, ..
+                    }
+                    | Response::CopilotAuthCommitted {
+                        config_generation, ..
+                    } => config_generation,
+                    _ => return Err(internal("provider cleanup journal has wrong response")),
+                };
+                inventory::publish_committed_config_generation_at_least(published);
+                published
+            } else {
+                inventory::publish_committed_config_generation_at_least(intended);
+                intended
+            }
         } else {
             unreachable!("validated provider journal action")
         };
         let (_, _, effective) = daemon_provider_config(ctx, project_root.as_str()).await?;
-        if let Some(response_json) = journal.terminal_response_json.as_mut() {
+        if !cleanup_only && let Some(response_json) = journal.terminal_response_json.as_mut() {
             let mut response: Response = serde_json::from_str(response_json).map_err(internal)?;
             match &mut response {
                 Response::ProviderMutationCommitted {
@@ -17398,7 +17459,13 @@ async fn recover_provider_config_journals_inner(
                         &response,
                     )?;
                 }
-                if !defer_secret_cleanup {
+                if defer_secret_cleanup {
+                    conn.execute(
+                        "UPDATE provider_config_journals SET settlement_phase='cleanup_pending'
+                         WHERE journal_id=?1 AND settlement_phase='publication_pending'",
+                        rusqlite::params![journal_id],
+                    )?;
+                } else {
                     conn.execute(
                         "DELETE FROM provider_config_journals WHERE journal_id = ?1",
                         rusqlite::params![journal_id],
@@ -18792,13 +18859,25 @@ async fn save_mcp_config(
             let all_refs = all_refs.clone();
             let static_nonstaged_refs = static_nonstaged_refs.clone();
             move |conn| {
+                let intended_config_generation =
+                    inventory_generation_conn(conn)?.saturating_add(1);
+                let mut terminal_response: Response =
+                    serde_json::from_str(&terminal_response_json)?;
+                let Response::McpConfigCommitted {
+                    config_generation, ..
+                } = &mut terminal_response
+                else {
+                    anyhow::bail!("MCP config journal has the wrong terminal response");
+                };
+                *config_generation = intended_config_generation;
+                let terminal_response_json = serde_json::to_string(&terminal_response)?;
                 conn.execute(
                     "INSERT INTO mcp_config_journals
                      (journal_id, owner_digest, client_operation_id, request_hash,
                       fencing_generation, terminal_response_json, project_root,
                       config_path, config_json, patch_intent_json, consumed_revision, intended_revision,
-                      cleanup_names_json, phase, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'staged', ?14)",
+                      intended_config_generation, cleanup_names_json, phase, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'staged', ?15)",
                     rusqlite::params![
                         journal_id,
                         owner_digest,
@@ -18812,6 +18891,7 @@ async fn save_mcp_config(
                         patch_intent_json,
                         consumed_revision_for_tx,
                         result_revision_for_tx,
+                        intended_config_generation,
                         cleanup_json,
                         chrono::Utc::now().timestamp_millis()
                     ],
@@ -18874,11 +18954,31 @@ async fn save_mcp_config(
         return Err(internal(error));
     }
     crate::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
-    let file_lock = cockpit_config::config::hold_config_mutation_lock(&path).map_err(internal)?;
-    if canonical_mcp_target_path(&path)? != path
-        || mcp_target_layer_revision(&path)? != consumed_revision
-    {
-        drop(file_lock);
+    let commit_path = path.clone();
+    let commit_config = config_json_owned.clone();
+    let commit_consumed = consumed_revision.clone();
+    let committed = crate::daemon::config_publication_recovery::PreSocketConfigPublication::new()
+        .with_target(&path, move |_| {
+            if canonical_mcp_target_path(&commit_path)
+                .map_err(|error| anyhow::anyhow!(error.message))?
+                != commit_path
+                || mcp_target_layer_revision(&commit_path)
+                    .map_err(|error| anyhow::anyhow!(error.message))?
+                    != commit_consumed
+            {
+                return Ok(false);
+            }
+            write_mcp_raw_private(&commit_path, &commit_config)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            Ok(true)
+        })
+        .await
+        .map_err(|error| {
+            let error = anyhow::anyhow!("bounded MCP config commit failed: {error:#}");
+            ctx.poison_redaction_publication(&error);
+            internal(error)
+        })?;
+    if !committed {
         compensate_mcp_staged_and_retire(ctx, &journal_id, &staged_mutations).await?;
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -18887,16 +18987,6 @@ async fn save_mcp_config(
                     .into(),
         });
     }
-    if let Err(error) = write_mcp_raw_private(&path, &config_json_owned) {
-        drop(file_lock);
-        let error = anyhow::anyhow!(error);
-        ctx.poison_redaction_publication(&error);
-        // The atomic write may have succeeded before reporting an error. Keep
-        // the journal and staged claims for recovery rather than deleting a
-        // vault value that the file may now reference.
-        return Err(internal(error));
-    }
-    drop(file_lock);
     if let Err(error) = ctx
         .db
         .write({
@@ -18975,35 +19065,37 @@ async fn publish_mcp_journal_generation(
         return Ok(response);
     }
     let journal_id = journal_id.to_owned();
-    let generation = inventory::publish_committed_config_generation();
-    ctx.db
-        .write(move |conn| {
-            let response_json: String = conn.query_row(
-                "SELECT terminal_response_json FROM mcp_config_journals WHERE journal_id = ?1",
+    let response: Response = ctx
+        .db
+        .read(move |conn| {
+            let (response_json, intended_generation): (String, u64) = conn.query_row(
+                "SELECT terminal_response_json,intended_config_generation
+                   FROM mcp_config_journals WHERE journal_id = ?1",
                 rusqlite::params![journal_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            let mut response: Response = serde_json::from_str(&response_json)?;
+            let response: Response = serde_json::from_str(&response_json)?;
             let Response::McpConfigCommitted {
                 config_generation, ..
-            } = &mut response
+            } = &response
             else {
                 anyhow::bail!("MCP config journal has the wrong terminal response");
             };
-            *config_generation = generation;
-            let amended = serde_json::to_string(&response)?;
-            let changed = conn.execute(
-                "UPDATE mcp_config_journals SET terminal_response_json = ?2
-                 WHERE journal_id = ?1",
-                rusqlite::params![journal_id, amended],
-            )?;
-            if changed != 1 {
-                anyhow::bail!("MCP config journal disappeared before publication");
+            if *config_generation != intended_generation {
+                anyhow::bail!("MCP config journal generation binding is inconsistent");
             }
             Ok(response)
         })
         .await
-        .map_err(internal)
+        .map_err(internal)?;
+    let Response::McpConfigCommitted {
+        config_generation, ..
+    } = &response
+    else {
+        unreachable!("validated MCP response")
+    };
+    inventory::publish_committed_config_generation_at_least(*config_generation);
+    Ok(response)
 }
 
 async fn delete_mcp_journal(
@@ -19049,6 +19141,15 @@ async fn delete_mcp_journal(
                     "DELETE FROM mcp_config_journals WHERE journal_id = ?1",
                     rusqlite::params![journal_id],
                 )?;
+            } else {
+                let changed = conn.execute(
+                    "UPDATE mcp_config_journals SET settlement_phase='cleanup_pending'
+                     WHERE journal_id=?1",
+                    rusqlite::params![journal_id],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("MCP journal did not advance to cleanup-only phase");
+                }
             }
             Ok(())
         })
@@ -19658,12 +19759,12 @@ async fn recover_mcp_config_journals_inner(
     publication: Option<crate::daemon::config_publication_recovery::PreSocketConfigPublication>,
 ) -> std::result::Result<(), ErrorPayload> {
     let root = project_root.to_owned();
-    let journals: Vec<(String, String, String, String, String, String)> = ctx
+    let journals: Vec<(String, String, String, String, String, String, String)> = ctx
         .db
         .read(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT journal_id, config_path, config_json, cleanup_names_json,
-                        consumed_revision, intended_revision
+                        consumed_revision, intended_revision, settlement_phase
                  FROM mcp_config_journals WHERE project_root = ?1
                  ORDER BY created_at, journal_id",
             )?;
@@ -19675,6 +19776,7 @@ async fn recover_mcp_config_journals_inner(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -19682,10 +19784,18 @@ async fn recover_mcp_config_journals_inner(
         })
         .await
         .map_err(internal)?;
-    for (journal_id, path, config_json, cleanup_json, consumed_revision, intended_revision) in
-        journals
+    for (
+        journal_id,
+        path,
+        config_json,
+        cleanup_json,
+        consumed_revision,
+        intended_revision,
+        settlement_phase,
+    ) in journals
     {
         let defer_secret_cleanup = publication.is_some();
+        let cleanup_only = settlement_phase == "cleanup_pending";
         let path = std::path::PathBuf::from(path);
         let reconcile_path = path.clone();
         let reconcile = move || {
@@ -19697,7 +19807,11 @@ async fn recover_mcp_config_journals_inner(
             )
             .map_err(|error| anyhow::anyhow!(error.message))
         };
-        if let Some(publication) = publication {
+        if cleanup_only {
+            // Receipt settlement already advanced this durable row to a
+            // replayable cleanup-only phase. A later file revision is outside
+            // this operation and must never be subjected to its old CAS.
+        } else if let Some(publication) = publication {
             publication
                 .with_target(&path, move |_| reconcile())
                 .await

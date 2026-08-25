@@ -505,6 +505,70 @@ async fn commit_oauth_cancel(
     Ok(())
 }
 
+/// Settle a failed one-shot exchange and remove its sealed claim atomically.
+/// An Exchanging marker without an executing receipt is neither replayable nor
+/// capacity-evictable, so the two pieces must never be torn across a crash.
+async fn fail_oauth_exchange(
+    ctx: &DaemonContext,
+    flow_id: String,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    error: &ErrorPayload,
+) -> std::result::Result<(), ErrorPayload> {
+    let terminal_error = ErrorPayload {
+        code: error.code.clone(),
+        message: if error.code == ErrorCode::Shutdown {
+            "the daemon stopped before the OAuth exchange completed"
+        } else {
+            "the OAuth exchange was rejected; inspect daemon diagnostics for details"
+        }
+        .to_owned(),
+    };
+    let error_json = serde_json::to_string(&terminal_error).map_err(internal)?;
+    let terminal_state = if error.code == ErrorCode::Shutdown {
+        "terminal_cancelled"
+    } else {
+        "terminal_error"
+    };
+    let vault = ctx.secret_vault.clone();
+    ctx.db
+        .transaction(move |conn| {
+            vault
+                .mutate_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                    &oauth_flow_vault_id(&flow_id),
+                    None,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let changed = conn.execute(
+                "UPDATE local_operation_receipts
+                 SET state=?5,terminal_outcome_json=?6,
+                     execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?7
+                 WHERE owner_digest=?1 AND client_operation_id=?2
+                   AND request_hash=?3 AND fencing_generation=?4
+                   AND state='executing'",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    terminal_state,
+                    error_json,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("OAuth exchange failure lost its receipt fence");
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
 /// Reconcile token commits that became durable before their owner receipt was
 /// acknowledged. The encrypted marker contains the exact admitted operation,
 /// keyed request identity, fence, and secret-free terminal response, so this
@@ -5847,7 +5911,7 @@ async fn handle_serialized_request_impl(
         } => {
             crate::daemon::agent_management::begin_editor_lease(
                 ctx,
-                client_operation_id,
+                client_operation_id.clone(),
                 project_root,
                 name,
                 expected_revision,
@@ -8814,8 +8878,9 @@ async fn handle_serialized_request_impl(
                 Ok(response) => response,
                 Err(error) => {
                     ctx.oauth_flows.remove_provider(&flow_id, &owner).await;
-                    finish_local_operation_error(
+                    fail_oauth_exchange(
                         ctx,
+                        flow_id,
                         owner,
                         client_operation_id,
                         request_hash,
@@ -8863,6 +8928,13 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
+            return terminalize_local_operation(
+                ctx,
+                owner.clone(),
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
+                async {
             let resolved_flow_id = ctx
                 .oauth_flows
                 .resolve_provider_id(flow_id.as_deref(), &begin_client_operation_id, &owner)
@@ -8873,17 +8945,49 @@ async fn handle_serialized_request_impl(
                 let candidate = if let Some(flow_id) = flow_id {
                     Some(flow_id)
                 } else {
-                    match ctx
+                    let settlement = match ctx
                         .db
                         .local_operation_settlement(
                             owner.clone(),
                             begin_client_operation_id.clone(),
                         )
                         .await
-                        .map_err(internal)?
+                        .map_err(internal)
                     {
+                        Ok(settlement) => settlement,
+                        Err(error) => {
+                            finish_local_operation_error(
+                                ctx,
+                                owner,
+                                client_operation_id,
+                                request_hash,
+                                fencing_generation,
+                                &error,
+                            )
+                            .await?;
+                            return Err(error);
+                        }
+                    };
+                    match settlement {
                         Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(_, json)) => {
-                            match serde_json::from_str::<Response>(&json).map_err(internal)? {
+                            let begin_response = match serde_json::from_str::<Response>(&json)
+                                .map_err(internal)
+                            {
+                                Ok(response) => response,
+                                Err(error) => {
+                                    finish_local_operation_error(
+                                        ctx,
+                                        owner,
+                                        client_operation_id,
+                                        request_hash,
+                                        fencing_generation,
+                                        &error,
+                                    )
+                                    .await?;
+                                    return Err(error);
+                                }
+                            };
+                            match begin_response {
                                 Response::ProviderOAuthStarted { flow_id, .. } => Some(flow_id),
                                 _ => None,
                             }
@@ -8921,7 +9025,22 @@ async fn handle_serialized_request_impl(
             // exact flow had already reached another terminal state.
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             let (cancelled, committed) = if let Some(flow_id) = resolved_flow_id.as_deref() {
-                match load_oauth_flow(ctx, flow_id)? {
+                let durable = match load_oauth_flow(ctx, flow_id) {
+                    Ok(flow) => flow,
+                    Err(error) => {
+                        finish_local_operation_error(
+                            ctx,
+                            owner,
+                            client_operation_id,
+                            request_hash,
+                            fencing_generation,
+                            &error,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
+                match durable {
                     Some(DurableOAuthFlow::ProviderCommitted {
                         owner: durable_owner,
                         begin_client_operation_id: durable_begin,
@@ -8955,17 +9074,29 @@ async fn handle_serialized_request_impl(
                 flow_id: resolved_flow_id.clone(),
                 cancelled,
             };
-            commit_oauth_cancel(
+            if let Err(error) = commit_oauth_cancel(
                 ctx,
                 resolved_flow_id.clone(),
                 cancelled,
                 owner.clone(),
-                client_operation_id,
+                client_operation_id.clone(),
                 request_hash,
                 fencing_generation,
                 &response,
             )
-            .await?;
+            .await
+            {
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
             if let Some(flow_id) = resolved_flow_id.as_deref() {
                 if cancelled {
                     ctx.oauth_flows.cancel_provider(flow_id, &owner).await;
@@ -8975,7 +9106,10 @@ async fn handle_serialized_request_impl(
                         .await;
                 }
             }
-            Ok(response)
+                    Ok(response)
+                },
+            )
+            .await;
         }
 
         Request::BeginMcpOAuth {
@@ -9034,29 +9168,47 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
-            purge_durable_oauth_flows(ctx, &owner).await?;
-            let cwd = std::path::PathBuf::from(&project_root);
-            let trust_policy =
-                crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-                    .await
-                    .map_err(workspace_trust_error)?;
-            let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
-            let config = mcp_config_from_paths(&paths)?;
-            let server_config = config
-                .servers
-                .get(&server)
-                .ok_or_else(|| bad_request(format!("MCP server `{server}` is not configured")))?;
-            if !matches!(server_config.auth, crate::mcp::config::Auth::Oauth(_)) {
-                return Err(bad_request(format!(
-                    "MCP server `{server}` is not configured for OAuth"
-                )));
+            let server_config = match async {
+                purge_durable_oauth_flows(ctx, &owner).await?;
+                let cwd = std::path::PathBuf::from(&project_root);
+                let trust_policy =
+                    crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+                        .await
+                        .map_err(workspace_trust_error)?;
+                let paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
+                let config = mcp_config_from_paths(&paths)?;
+                let server_config = config.servers.get(&server).cloned().ok_or_else(|| {
+                    bad_request(format!("MCP server `{server}` is not configured"))
+                })?;
+                if !matches!(server_config.auth, crate::mcp::config::Auth::Oauth(_)) {
+                    return Err(bad_request(format!(
+                        "MCP server `{server}` is not configured for OAuth"
+                    )));
+                }
+                ensure_mcp_ownership_available(
+                    ctx,
+                    &project_root,
+                    [crate::mcp::auth::cred_key(&server)],
+                )
+                .await?;
+                Ok::<_, ErrorPayload>(server_config)
             }
-            ensure_mcp_ownership_available(
-                ctx,
-                &project_root,
-                [crate::mcp::auth::cred_key(&server)],
-            )
-            .await?;
+            .await
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
             if let Some((flow_id, authorize_url)) = ctx
                 .oauth_flows
                 .mcp_started(&owner, &client_operation_id)
@@ -9141,7 +9293,7 @@ async fn handle_serialized_request_impl(
                 remote_operation,
             );
             let (flow, authorize_url) =
-                match crate::mcp::auth::begin_oauth_flow(&server, server_config, local_display)
+                match crate::mcp::auth::begin_oauth_flow(&server, &server_config, local_display)
                     .await
                 {
                     Ok(started) => started,
@@ -9434,8 +9586,9 @@ async fn handle_serialized_request_impl(
                 Ok(response) => response,
                 Err(error) => {
                     let _ = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
-                    finish_local_operation_error(
+                    fail_oauth_exchange(
                         ctx,
+                        flow_id,
                         owner,
                         client_operation_id,
                         request_hash,
@@ -9484,6 +9637,13 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
+            return terminalize_local_operation(
+                ctx,
+                owner.clone(),
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
+                async {
             let resolved_flow_id = ctx
                 .oauth_flows
                 .resolve_mcp_id(flow_id.as_deref(), &begin_client_operation_id, &owner)
@@ -9588,7 +9748,10 @@ async fn handle_serialized_request_impl(
                     ctx.oauth_flows.remove_terminal_mcp(flow_id, &owner).await;
                 }
             }
-            Ok(response)
+                    Ok(response)
+                },
+            )
+            .await;
         }
 
         Request::DeleteProviderCredential {
@@ -9638,9 +9801,6 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
-            if let Some(root) = project_root.as_deref() {
-                recover_provider_config_journals(ctx, root, Some(&provider_id)).await?;
-            }
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             // A CLI identifies a configured provider, never a hidden vault
             // record name. Resolve that reference only inside the daemon so a
@@ -9648,48 +9808,77 @@ async fn handle_serialized_request_impl(
             // direct (`project_root: None`) path is the owner-settings mirror
             // of `PutProviderCredential`: the owner supplies the raw vault
             // record id and receives a plain `Ack`.
-            let canonical_project_root = project_root
-                .as_deref()
-                .map(crate::secret_ownership::canonical_owner_root);
-            let (credential_record_id, changed) = if let Some(project_root) =
-                project_root.as_deref()
-            {
-                let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
-                let provider = config.providers.get(&provider_id).ok_or_else(|| {
-                    bad_request(format!("provider `{provider_id}` is not configured"))
-                })?;
-                if provider.auth != Some(crate::config::providers::AuthKind::OAuth) {
-                    return Err(bad_request(
-                        "provider credential logout is only available for OAuth providers",
-                    ));
+            let preflight = async {
+                if let Some(root) = project_root.as_deref() {
+                    recover_provider_config_journals(ctx, root, Some(&provider_id)).await?;
                 }
-                let credential_record_id = provider.credential_ref.clone().ok_or_else(|| {
-                    bad_request(format!("provider `{provider_id}` has no credential_ref"))
-                })?;
-                let credential_present = match ctx.secret_vault.get_item(
-                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                    &credential_record_id,
-                ) {
-                    Ok(_) => true,
-                    Err(crate::secure_key::SecureKeyError::NotFound(_)) => false,
-                    Err(error) => return Err(internal(anyhow::anyhow!(error))),
+                let canonical_project_root = project_root
+                    .as_deref()
+                    .map(crate::secret_ownership::canonical_owner_root);
+                let (credential_record_id, changed) = if let Some(project_root) =
+                    project_root.as_deref()
+                {
+                    let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
+                    let provider = config.providers.get(&provider_id).ok_or_else(|| {
+                        bad_request(format!("provider `{provider_id}` is not configured"))
+                    })?;
+                    if provider.auth != Some(crate::config::providers::AuthKind::OAuth) {
+                        return Err(bad_request(
+                            "provider credential logout is only available for OAuth providers",
+                        ));
+                    }
+                    let credential_record_id =
+                        provider.credential_ref.clone().ok_or_else(|| {
+                            bad_request(format!("provider `{provider_id}` has no credential_ref"))
+                        })?;
+                    let credential_present = match ctx.secret_vault.get_item(
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &credential_record_id,
+                    ) {
+                        Ok(_) => true,
+                        Err(crate::secure_key::SecureKeyError::NotFound(_)) => false,
+                        Err(error) => return Err(internal(anyhow::anyhow!(error))),
+                    };
+                    (credential_record_id, credential_present)
+                } else {
+                    let credential_present = match ctx.secret_vault.get_item(
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &provider_id,
+                    ) {
+                        Ok(_) => true,
+                        Err(crate::secure_key::SecureKeyError::NotFound(_)) => false,
+                        Err(error) => return Err(internal(anyhow::anyhow!(error))),
+                    };
+                    (provider_id.clone(), credential_present)
                 };
-                (credential_record_id, credential_present)
-            } else {
-                let credential_present = match ctx.secret_vault.get_item(
-                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                    &provider_id,
-                ) {
-                    Ok(_) => true,
-                    Err(crate::secure_key::SecureKeyError::NotFound(_)) => false,
-                    Err(error) => return Err(internal(anyhow::anyhow!(error))),
+                let consumed_vault_generation = ctx
+                    .secret_vault
+                    .current_inventory_generation()
+                    .map_err(|error| internal(anyhow::anyhow!(error)))?;
+                Ok::<_, ErrorPayload>((
+                    canonical_project_root,
+                    credential_record_id,
+                    changed,
+                    consumed_vault_generation,
+                ))
+            }
+            .await;
+            let (canonical_project_root, credential_record_id, changed, consumed_vault_generation) =
+                match preflight {
+                    Ok(preflight) => preflight,
+                    Err(error) => {
+                        finish_local_operation_error(
+                            ctx,
+                            settlement_owner,
+                            client_operation_id,
+                            request_hash,
+                            fencing_generation,
+                            &error,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
                 };
-                (provider_id.clone(), credential_present)
-            };
-            let consumed_vault_generation = ctx
-                .secret_vault
-                .current_inventory_generation()
-                .map_err(|error| internal(anyhow::anyhow!(error)))?;
             let owner_scope = canonical_project_root
                 .as_ref()
                 .map(|root| format!("project:{root}"))

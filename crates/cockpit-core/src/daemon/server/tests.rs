@@ -11193,10 +11193,12 @@ fn oauth_completion_receipts_and_cancel_race_are_secret_safe() {
 fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
     let source = include_str!("../agent_management.rs");
     assert!(source.contains("SealedEditorReplay"));
+    assert!(source.contains("SealedEditorCompletion"));
     assert!(source.contains("SecretVaultKind::SealedState"));
     assert!(source.contains("mutate_item_on_conn"));
     assert!(source.contains("AgentEditorSettlementStatus"));
     assert!(source.contains("flycockpit.agent-editor.completion.v2"));
+    assert!(source.contains("recoverable_agent_editor_completions"));
     assert!(source.contains("editor_lease_settlement"));
     assert!(
         !source.contains("snapshot_json"),
@@ -11211,9 +11213,73 @@ fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
     assert!(lease_table.contains("snapshot_handle"));
     assert!(lease_table.contains("snapshot_identity"));
     assert!(lease_table.contains("completion_operation_id"));
+    assert!(lease_table.contains("completion_handle"));
     assert!(!lease_table.contains("snapshot_digest"));
     assert!(!lease_table.contains("snapshot_json"));
     assert!(!lease_table.contains("markdown"));
+}
+
+#[test]
+fn reordered_local_operations_terminalize_every_post_admission_preflight_error() {
+    let source = include_str!("dispatch.rs");
+    for (branch, next, required) in [
+        (
+            "Request::BeginMcpOAuth",
+            "Request::CompleteMcpOAuth",
+            [
+                "let server_config = match async",
+                "finish_local_operation_error",
+            ],
+        ),
+        (
+            "Request::DeleteProviderCredential",
+            "Request::GetFlycockpitAccount",
+            ["let preflight = async", "finish_local_operation_error"],
+        ),
+    ] {
+        let body = source
+            .split(branch)
+            .nth(1)
+            .and_then(|tail| tail.split(next).next())
+            .unwrap_or_else(|| panic!("missing {branch} handler body"));
+        let admission = body
+            .find("begin_local_operation(")
+            .unwrap_or_else(|| panic!("{branch} must durably admit before mutable checks"));
+        let body = &body[admission..];
+        for marker in required {
+            assert!(body.contains(marker), "{branch} omitted {marker}");
+        }
+    }
+}
+
+#[test]
+fn oauth_exchange_failure_and_cancellation_have_atomic_receipt_cleanup() {
+    let source = include_str!("dispatch.rs");
+    let failure = source
+        .split("async fn fail_oauth_exchange")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("async fn recover_committed_oauth_settlements")
+                .next()
+        })
+        .expect("OAuth failure settlement helper must exist");
+    assert!(failure.contains("mutate_item_on_conn"));
+    assert!(failure.contains("UPDATE local_operation_receipts"));
+    assert!(failure.contains("AND state='executing'"));
+    let cancellation = source
+        .split("async fn commit_oauth_cancel")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn fail_oauth_exchange").next())
+        .expect("OAuth cancellation settlement helper must exist");
+    assert!(cancellation.contains("mutate_item_on_conn"));
+    assert!(cancellation.contains("UPDATE local_operation_receipts"));
+    for branch in ["Request::CancelProviderOAuth", "Request::CancelMcpOAuth"] {
+        let body = source
+            .split(branch)
+            .nth(1)
+            .expect("OAuth cancellation handler must exist");
+        assert!(body.contains("terminalize_local_operation("));
+    }
 }
 
 #[test]
@@ -11242,6 +11308,7 @@ fn authority_recovery_precedes_both_socket_binds() {
         "recover_extended_config_patch_journals",
         "recover_committed_oauth_settlements",
         "settle_interrupted_local_operations",
+        "recover_editor_leases_before_publish",
         "maintain_editor_leases",
     ] {
         assert!(recovery_body.contains(required), "missing {required}");

@@ -3746,6 +3746,10 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup agent reset journal recovery failed")?;
+    crate::daemon::agent_management::recover_editor_leases_before_publish(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup editor completion recovery failed")?;
     crate::daemon::agent_management::maintain_editor_leases(ctx)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))

@@ -20,8 +20,93 @@ struct SealedEditorReplay {
     snapshot: AgentEditSnapshot,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SealedEditorCompletion {
+    owner_digest: String,
+    client_operation_id: String,
+    project_root: String,
+    lease_id: String,
+    markdown: Option<String>,
+}
+
+impl zeroize::Zeroize for SealedEditorCompletion {
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.owner_digest);
+        zeroize::Zeroize::zeroize(&mut self.client_operation_id);
+        zeroize::Zeroize::zeroize(&mut self.project_root);
+        zeroize::Zeroize::zeroize(&mut self.lease_id);
+        zeroize::Zeroize::zeroize(&mut self.markdown);
+    }
+}
+
 fn editor_replay_handle(lease_id: &str) -> String {
     format!("agent-editor-lease:{lease_id}")
+}
+
+fn editor_completion_handle(completion_identity: [u8; 32]) -> String {
+    format!(
+        "agent-editor-completion:{}",
+        hex::encode(completion_identity)
+    )
+}
+
+fn load_editor_completion(
+    ctx: &DaemonContext,
+    row: &crate::db::agent_editor_leases::AgentEditorLeaseRow,
+) -> Result<zeroize::Zeroizing<SealedEditorCompletion>, ErrorPayload> {
+    let operation_id = row
+        .completion_operation_id
+        .as_deref()
+        .ok_or_else(|| internal("completing editor lease omitted its operation id"))?;
+    let expected_handle = editor_completion_handle(
+        row.completion_identity
+            .ok_or_else(|| internal("completing editor lease omitted its identity"))?,
+    );
+    let handle = row
+        .completion_handle
+        .as_deref()
+        .ok_or_else(|| internal("completing editor lease omitted its sealed payload"))?;
+    if handle != expected_handle {
+        return Err(internal("editor completion payload handle is corrupt"));
+    }
+    let plaintext = ctx
+        .secret_vault
+        .get_item(
+            cockpit_db::secret_vault::SecretVaultKind::SealedState,
+            handle,
+        )
+        .map_err(internal)?;
+    let payload: SealedEditorCompletion =
+        serde_json::from_slice(plaintext.as_slice()).map_err(internal)?;
+    if payload.owner_digest != row.owner_digest
+        || payload.client_operation_id != operation_id
+        || payload.project_root != row.project_root
+        || payload.lease_id != row.lease_id
+    {
+        return Err(internal(
+            "editor completion sealed payload binding mismatch",
+        ));
+    }
+    let identity_plaintext = zeroize::Zeroizing::new(
+        serde_json::to_vec(&(
+            "complete_agent_editor_lease",
+            &payload.client_operation_id,
+            &payload.project_root,
+            &payload.lease_id,
+            payload.markdown.as_deref(),
+        ))
+        .map_err(internal)?,
+    );
+    let identity = ctx.secret_vault.keyed_identity(
+        b"flycockpit.agent-editor.completion.v2",
+        identity_plaintext.as_slice(),
+    );
+    if row.completion_identity != Some(identity) {
+        return Err(internal(
+            "editor completion sealed payload identity mismatch",
+        ));
+    }
+    Ok(zeroize::Zeroizing::new(payload))
 }
 
 fn load_editor_replay(
@@ -109,6 +194,7 @@ async fn terminalize_editor_failure(
     let completion_operation_id = receipt.client_operation_id.clone();
     let lease_id = row.lease_id.clone();
     let replay_handle = editor_replay_handle(&lease_id);
+    let completion_handle = row.completion_handle.clone();
     let vault = ctx.secret_vault.clone();
     ctx.db
         .transaction(move |conn| {
@@ -120,6 +206,16 @@ async fn terminalize_editor_failure(
                     None,
                 )
                 .map_err(|error| anyhow::anyhow!(error))?;
+            if let Some(handle) = completion_handle.as_deref() {
+                vault
+                    .mutate_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                        handle,
+                        None,
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
             crate::db::agent_editor_leases::fail_agent_editor_completion_conn(
                 conn,
                 &lease_id,
@@ -131,38 +227,6 @@ async fn terminalize_editor_failure(
         .await
         .map_err(internal)?;
     Ok(receipt)
-}
-
-async fn clear_editor_replay_after_reservation(
-    ctx: &DaemonContext,
-    lease_id: &str,
-    completion_identity: [u8; 32],
-) -> Result<(), ErrorPayload> {
-    let lease_id = lease_id.to_owned();
-    let replay_handle = editor_replay_handle(&lease_id);
-    let vault = ctx.secret_vault.clone();
-    ctx.db
-        .transaction(move |conn| {
-            let changed = conn.execute(
-                "UPDATE agent_editor_leases SET snapshot_handle=NULL
-                  WHERE lease_id=?1 AND state='completing' AND completion_identity=?2",
-                rusqlite::params![&lease_id, completion_identity.as_slice()],
-            )?;
-            if changed != 1 {
-                anyhow::bail!("editor completion lost its replay-clear reservation");
-            }
-            vault
-                .mutate_item_on_conn(
-                    conn,
-                    cockpit_db::secret_vault::SecretVaultKind::SealedState,
-                    &replay_handle,
-                    None,
-                )
-                .map_err(|error| anyhow::anyhow!(error))?;
-            Ok(())
-        })
-        .await
-        .map_err(internal)
 }
 
 /// Boot/periodic maintenance for abandoned editor authority. Expired open
@@ -177,6 +241,82 @@ pub(crate) async fn maintain_editor_leases(ctx: &DaemonContext) -> Result<(), Er
         .map_err(internal)?;
     for row in expired {
         delete_editor_replay_and_row(ctx, row).await?;
+    }
+    let stale_before = chrono::Utc::now()
+        .timestamp_millis()
+        .saturating_sub(crate::db::agent_editor_leases::AGENT_EDITOR_COMPLETION_CLAIM_MS);
+    let completing = ctx
+        .db
+        .recoverable_agent_editor_completions(stale_before)
+        .await
+        .map_err(internal)?;
+    for row in completing {
+        let payload = match load_editor_completion(ctx, &row) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let identity = row
+                    .completion_identity
+                    .ok_or_else(|| internal("completing editor lease omitted its identity"))?;
+                terminalize_editor_failure(ctx, &row, &row.project_root, identity, &error).await?;
+                continue;
+            }
+        };
+        if let Err(error) = complete_editor_lease(
+            ctx,
+            payload.client_operation_id.clone(),
+            payload.project_root.clone(),
+            payload.lease_id.clone(),
+            payload.markdown.clone(),
+            payload.owner_digest.clone(),
+        )
+        .await
+        {
+            let identity = row
+                .completion_identity
+                .ok_or_else(|| internal("completing editor lease omitted its identity"))?;
+            terminalize_editor_failure(ctx, &row, &row.project_root, identity, &error).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The singleton daemon may reclaim every incomplete editor completion during
+/// pre-socket boot: no live predecessor can still own the in-memory claim.
+pub(crate) async fn recover_editor_leases_before_publish(
+    ctx: &DaemonContext,
+) -> Result<(), ErrorPayload> {
+    let completing = ctx
+        .db
+        .recoverable_agent_editor_completions(chrono::Utc::now().timestamp_millis())
+        .await
+        .map_err(internal)?;
+    for row in completing {
+        let payload = match load_editor_completion(ctx, &row) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let identity = row
+                    .completion_identity
+                    .ok_or_else(|| internal("completing editor lease omitted its identity"))?;
+                terminalize_editor_failure(ctx, &row, &row.project_root, identity, &error).await?;
+                continue;
+            }
+        };
+        if let Err(error) = complete_editor_lease_inner(
+            ctx,
+            payload.client_operation_id.clone(),
+            payload.project_root.clone(),
+            payload.lease_id.clone(),
+            payload.markdown.clone(),
+            payload.owner_digest.clone(),
+            true,
+        )
+        .await
+        {
+            let identity = row
+                .completion_identity
+                .ok_or_else(|| internal("completing editor lease omitted its identity"))?;
+            terminalize_editor_failure(ctx, &row, &row.project_root, identity, &error).await?;
+        }
     }
     Ok(())
 }
@@ -319,6 +459,7 @@ pub async fn begin_editor_lease(
         snapshot_identity,
         state: "open".into(),
         completion_identity: None,
+        completion_handle: None,
         completion_operation_id: None,
         terminal_result_json: None,
         terminal_error_json: None,
@@ -394,6 +535,27 @@ pub async fn complete_editor_lease(
     markdown: Option<String>,
     principal_digest: String,
 ) -> Result<Response, ErrorPayload> {
+    complete_editor_lease_inner(
+        ctx,
+        client_operation_id,
+        project_root,
+        lease_id,
+        markdown,
+        principal_digest,
+        false,
+    )
+    .await
+}
+
+async fn complete_editor_lease_inner(
+    ctx: &DaemonContext,
+    client_operation_id: String,
+    project_root: String,
+    lease_id: String,
+    markdown: Option<String>,
+    principal_digest: String,
+    force_reclaim: bool,
+) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
     Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
     let completion_plaintext = zeroize::Zeroizing::new(
@@ -432,18 +594,79 @@ pub async fn complete_editor_lease(
     if known_lease.state == "open" {
         load_editor_replay(ctx, &known_lease)?;
     }
+    if known_lease.state == "terminal" {
+        let json = known_lease
+            .terminal_result_json
+            .as_deref()
+            .or(known_lease.terminal_error_json.as_deref())
+            .ok_or_else(|| internal("terminal editor lease omitted its receipt"))?;
+        let result: AgentEditorCompletion = serde_json::from_str(json).map_err(internal)?;
+        if result.client_operation_id != client_operation_id {
+            return Err(conflict(
+                "agent editor lease was settled by a different client operation",
+            ));
+        }
+        return Ok(Response::AgentEditorLeaseCompleted(result));
+    }
     // Expiry prevents an unacknowledged Begin from being replayed as apparent
     // success forever; it must not make an already-issued capability
     // impossible to settle. Completion remains exact-hash and owner bound, so
     // a client can reconcile a commit whose response was lost after the TTL.
+    let completion_handle = editor_completion_handle(completion_identity);
+    let sealed_completion = zeroize::Zeroizing::new(
+        serde_json::to_vec(&SealedEditorCompletion {
+            owner_digest: principal_digest.clone(),
+            client_operation_id: client_operation_id.clone(),
+            project_root: root.to_string_lossy().into_owned(),
+            lease_id: lease_id.clone(),
+            markdown: markdown.clone(),
+        })
+        .map_err(internal)?,
+    );
+    let reservation_lease_id = lease_id.clone();
+    let reservation_owner = principal_digest.clone();
+    let reservation_operation = client_operation_id.clone();
+    let reservation_handle = completion_handle.clone();
+    let snapshot_handle = editor_replay_handle(&lease_id);
+    let vault = ctx.secret_vault.clone();
+    // Sealing the submitted bytes, removing the now-obsolete edit snapshot,
+    // and claiming completion authority are one SQLite transaction. There is
+    // therefore no crash window with a completing row but no replay evidence.
     let lease = ctx
         .db
-        .reserve_agent_editor_completion(
-            lease_id.clone(),
-            principal_digest.clone(),
-            completion_identity,
-            client_operation_id.clone(),
-        )
+        .transaction(move |conn| {
+            vault
+                .mutate_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                    &reservation_handle,
+                    Some(sealed_completion.as_slice()),
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let claim = crate::db::agent_editor_leases::reserve_agent_editor_completion_conn(
+                conn,
+                &reservation_lease_id,
+                &reservation_owner,
+                completion_identity,
+                &reservation_handle,
+                &reservation_operation,
+                force_reclaim,
+            )?;
+            if matches!(
+                claim,
+                crate::db::agent_editor_leases::AgentEditorCompletionClaim::Execute(_)
+            ) {
+                vault
+                    .mutate_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                        &snapshot_handle,
+                        None,
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            Ok(claim)
+        })
         .await
         .map_err(|error| conflict(error.to_string()))?;
     let lease = match lease {
@@ -465,17 +688,6 @@ pub async fn complete_editor_lease(
     if let Some(json) = lease.terminal_error_json.as_deref() {
         let result: AgentEditorCompletion = serde_json::from_str(&json).map_err(internal)?;
         return Ok(Response::AgentEditorLeaseCompleted(result));
-    }
-    if clear_editor_replay_after_reservation(ctx, &lease_id, completion_identity)
-        .await
-        .is_err()
-    {
-        return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
-            &lease,
-            &client_operation_id,
-            &project_root,
-            AgentEditorSettlementStatus::Pending,
-        )));
     }
     let completed_lease_id = lease_id.clone();
     let consumed_lease_revision = lease.consumed_revision.clone();
@@ -632,7 +844,7 @@ pub async fn complete_editor_lease(
         }
     };
     let vault = ctx.secret_vault.clone();
-    let replay_handle = editor_replay_handle(&lease_id);
+    let terminal_completion_handle = completion_handle;
     let settlement_operation_id = client_operation_id.clone();
     if let Err(error) = ctx
         .db
@@ -641,7 +853,7 @@ pub async fn complete_editor_lease(
                 .mutate_item_on_conn(
                     conn,
                     cockpit_db::secret_vault::SecretVaultKind::SealedState,
-                    &replay_handle,
+                    &terminal_completion_handle,
                     None,
                 )
                 .map_err(|error| anyhow::anyhow!(error))?;

@@ -1171,6 +1171,7 @@ impl AgentsPage {
                     revision: Some(expected_revision.clone()),
                 },
                 cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
+                    client_operation_id: uuid::Uuid::new_v4().to_string(),
                     project_root: cwd.to_string_lossy().into_owned(),
                     name: name.clone(),
                     expected_revision: expected_revision.clone(),
@@ -2376,6 +2377,7 @@ impl SettingsCx {
                 revision: Some(revision.clone()),
             },
             cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
+                client_operation_id: "editor-operation".into(),
                 project_root: cwd.to_string_lossy().into_owned(),
                 name: name.clone(),
                 expected_revision: revision.clone(),

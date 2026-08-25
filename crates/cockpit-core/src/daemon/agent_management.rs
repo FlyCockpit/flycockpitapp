@@ -1,10 +1,9 @@
 //! Daemon-owned agent discovery and mutation.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::daemon::proto::{
@@ -13,28 +12,7 @@ use crate::daemon::proto::{
 };
 use crate::daemon::server::DaemonContext;
 
-#[derive(Clone)]
-struct EditorLeaseState {
-    principal_digest: String,
-    root: PathBuf,
-    name: String,
-    revision: String,
-    expires_at: Instant,
-    completing: bool,
-    /// Terminal responses remain replayable until the lease TTL expires. This
-    /// lets a client resolve a lost completion response without repeating the
-    /// underlying file mutation.
-    terminal_result: Option<AgentMutationResult>,
-    terminal_markdown: Option<Option<String>>,
-}
-
 const EDITOR_LEASE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
-const MAX_EDITOR_LEASES: usize = 64;
-
-fn editor_leases() -> &'static Mutex<HashMap<Uuid, EditorLeaseState>> {
-    static LEASES: OnceLock<Mutex<HashMap<Uuid, EditorLeaseState>>> = OnceLock::new();
-    LEASES.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 pub async fn inventory(
     ctx: &DaemonContext,
@@ -82,12 +60,36 @@ pub async fn mutate(
 
 pub async fn begin_editor_lease(
     ctx: &DaemonContext,
+    client_operation_id: String,
     project_root: String,
     name: String,
     expected_revision: String,
     principal_digest: String,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
+    let root_text = root.to_string_lossy().into_owned();
+    if let Some(existing) = ctx
+        .db
+        .agent_editor_lease_by_operation(principal_digest.clone(), client_operation_id.clone())
+        .await
+        .map_err(internal)?
+    {
+        if existing.project_root != root_text
+            || existing.agent_name != name
+            || existing.consumed_revision != expected_revision
+        {
+            return Err(conflict(
+                "agent editor client operation was reused for a different request",
+            ));
+        }
+        let snapshot: AgentEditSnapshot =
+            serde_json::from_str(&existing.snapshot_json).map_err(internal)?;
+        return Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
+            lease_id: existing.lease_id,
+            expires_at_unix_ms: existing.expires_at_unix_ms,
+            snapshot,
+        }));
+    }
     let snapshot = tokio::task::spawn_blocking({
         let root = root.clone();
         let name = name.clone();
@@ -103,41 +105,57 @@ pub async fn begin_editor_lease(
     .await
     .map_err(join_error)??;
     ensure_revision(&snapshot.revision, Some(&expected_revision))?;
-    let lease_id = Uuid::new_v4();
-    let mut leases = editor_leases().lock().map_err(lock_poison)?;
-    let now = Instant::now();
-    leases.retain(|_, lease| lease.expires_at > now);
-    if leases
-        .values()
-        .filter(|lease| lease.terminal_result.is_none())
-        .count()
-        >= MAX_EDITOR_LEASES
-    {
-        return Err(ErrorPayload {
-            code: ErrorCode::Unavailable,
-            message:
-                "agent editor lease capacity is exhausted; complete or cancel an existing lease"
-                    .into(),
-        });
+    let lease_id = Uuid::new_v4().to_string();
+    let expires_at_unix_ms = chrono::Utc::now().timestamp_millis()
+        + i64::try_from(EDITOR_LEASE_TTL.as_millis()).unwrap_or(i64::MAX);
+    let snapshot_json = serde_json::to_string(&snapshot).map_err(internal)?;
+    let replay_owner = principal_digest.clone();
+    let replay_operation = client_operation_id.clone();
+    let replay_root = root_text.clone();
+    let replay_name = name.clone();
+    let replay_revision = expected_revision.clone();
+    let inserted = ctx
+        .db
+        .insert_agent_editor_lease(crate::db::agent_editor_leases::AgentEditorLeaseRow {
+            owner_digest: principal_digest,
+            client_operation_id,
+            lease_id: lease_id.clone(),
+            project_root: root_text,
+            agent_name: name,
+            consumed_revision: expected_revision,
+            snapshot_json,
+            state: "open".into(),
+            completion_hash: None,
+            terminal_result_json: None,
+            expires_at_unix_ms,
+        })
+        .await;
+    if let Err(insert_error) = inserted {
+        // A concurrent duplicate Begin can win the owner/operation unique key
+        // after our initial lookup. Replay only an exact binding; never turn a
+        // key collision into a second lease.
+        let existing = ctx
+            .db
+            .agent_editor_lease_by_operation(replay_owner, replay_operation)
+            .await
+            .map_err(internal)?;
+        if let Some(existing) = existing
+            && existing.project_root == replay_root
+            && existing.agent_name == replay_name
+            && existing.consumed_revision == replay_revision
+        {
+            let snapshot = serde_json::from_str(&existing.snapshot_json).map_err(internal)?;
+            return Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
+                lease_id: existing.lease_id,
+                expires_at_unix_ms: existing.expires_at_unix_ms,
+                snapshot,
+            }));
+        }
+        return Err(internal(insert_error));
     }
-    leases.insert(
-        lease_id,
-        EditorLeaseState {
-            principal_digest,
-            root,
-            name,
-            revision: expected_revision,
-            expires_at: now + EDITOR_LEASE_TTL,
-            completing: false,
-            terminal_result: None,
-            terminal_markdown: None,
-        },
-    );
-    drop(leases);
     Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
-        lease_id: lease_id.to_string(),
-        expires_at_unix_ms: chrono::Utc::now().timestamp_millis()
-            + i64::try_from(EDITOR_LEASE_TTL.as_millis()).unwrap_or(i64::MAX),
+        lease_id,
+        expires_at_unix_ms,
         snapshot,
     }))
 }
@@ -150,65 +168,94 @@ pub async fn complete_editor_lease(
     principal_digest: String,
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
-    let id = Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
-    // Reserve in place while holding the registry mutex. It continues to
-    // consume capacity until completion reaches a terminal state, so a failed
-    // save can always restore the same retryable token.
-    let lease = {
-        let mut leases = editor_leases().lock().map_err(lock_poison)?;
-        let now = Instant::now();
-        leases.retain(|_, lease| lease.expires_at > now);
-        let lease = leases
-            .get_mut(&id)
-            .ok_or_else(|| conflict("editor lease is absent, expired, or already completed"))?;
-        if let Some(result) = lease.terminal_result.clone() {
-            if lease.terminal_markdown.as_ref() != Some(&markdown) {
-                return Err(conflict(
-                    "editor lease was already settled with different content",
-                ));
-            }
-            return Ok(Response::AgentEditorLeaseCompleted(result));
-        }
-        if lease.completing {
-            return Err(conflict("editor lease completion is already in flight"));
-        }
-        lease.completing = true;
-        lease.clone()
-    };
-    if lease.root != root {
-        release_editor_lease_reservation(id)?;
-        return Err(bad_request("editor lease belongs to another workspace"));
-    }
-    if lease.principal_digest != principal_digest {
-        release_editor_lease_reservation(id)?;
+    Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
+    let completion_hash: [u8; 32] = Sha256::digest(match markdown.as_deref() {
+        Some(value) => value.as_bytes(),
+        None => b"\0cancel",
+    })
+    .into();
+    let known_lease = ctx
+        .db
+        .agent_editor_lease_by_id(lease_id.clone())
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| conflict("editor lease is absent or expired"))?;
+    if known_lease.owner_digest != principal_digest {
         return Err(ErrorPayload {
             code: ErrorCode::Authorization,
             message: "agent editor lease belongs to another client principal".into(),
         });
     }
-    let completed_lease_id = id.to_string();
-    let consumed_lease_revision = lease.revision.clone();
-    let settlement_markdown = markdown.clone();
+    if known_lease.expires_at_unix_ms < chrono::Utc::now().timestamp_millis()
+        && known_lease.state != "terminal"
+    {
+        return Err(conflict("editor lease is expired"));
+    }
+    let lease = ctx
+        .db
+        .reserve_agent_editor_completion(
+            lease_id.clone(),
+            principal_digest.clone(),
+            completion_hash,
+        )
+        .await
+        .map_err(|error| conflict(error.to_string()))?;
+    if lease.project_root != root.to_string_lossy() {
+        return Err(bad_request("editor lease belongs to another workspace"));
+    }
+    if let Some(json) = lease.terminal_result_json {
+        let result = serde_json::from_str(&json).map_err(internal)?;
+        return Ok(Response::AgentEditorLeaseCompleted(result));
+    }
+    let completed_lease_id = lease_id.clone();
+    let consumed_lease_revision = lease.consumed_revision.clone();
     let result = match markdown {
         Some(markdown) => {
-            match tokio::task::spawn_blocking(move || {
-                mutate_sync(
-                    &root,
-                    AgentMutation::SaveDefinition {
-                        name: lease.name,
-                        markdown,
-                    },
-                    Some(lease.revision),
-                )
+            // A prior daemon may have committed the file and crashed before
+            // recording its terminal receipt. Reconcile exact content before
+            // attempting the CAS again.
+            let current = tokio::task::spawn_blocking({
+                let root = root.clone();
+                let name = lease.agent_name.clone();
+                move || snapshot_sync(&root, &name)
             })
             .await
-            .map_err(join_error)
-            .and_then(|result| result)
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    release_editor_lease_reservation(id)?;
-                    return Err(error);
+            .map_err(join_error)??;
+            if current.markdown == markdown {
+                Response::AgentMutated(AgentMutationResult {
+                    changed: true,
+                    affected: 1,
+                    snapshot: Some(current),
+                    config_generation: crate::daemon::server::inventory::current_config_generation(
+                    ),
+                    inventory_revision: None,
+                    consumed_revision: Some(consumed_lease_revision.clone()),
+                    completed_lease_id: None,
+                    outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
+                })
+            } else {
+                match tokio::task::spawn_blocking(move || {
+                    mutate_sync(
+                        &root,
+                        AgentMutation::SaveDefinition {
+                            name: lease.agent_name,
+                            markdown,
+                        },
+                        Some(lease.consumed_revision),
+                    )
+                })
+                .await
+                .map_err(join_error)
+                .and_then(|result| result)
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        ctx.db
+                            .reopen_agent_editor_completion(lease_id, completion_hash)
+                            .await
+                            .map_err(internal)?;
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -227,25 +274,12 @@ pub async fn complete_editor_lease(
         unreachable!("agent mutation always returns AgentMutated")
     };
     result.completed_lease_id = Some(completed_lease_id);
-    {
-        let mut leases = editor_leases().lock().map_err(lock_poison)?;
-        let lease = leases
-            .get_mut(&id)
-            .ok_or_else(|| conflict("editor lease disappeared during completion"))?;
-        lease.completing = false;
-        lease.terminal_markdown = Some(settlement_markdown);
-        lease.terminal_result = Some(result.clone());
-    }
+    let result_json = serde_json::to_string(&result).map_err(internal)?;
+    ctx.db
+        .finish_agent_editor_completion(lease_id, completion_hash, result_json)
+        .await
+        .map_err(internal)?;
     Ok(Response::AgentEditorLeaseCompleted(result))
-}
-
-fn release_editor_lease_reservation(id: Uuid) -> Result<(), ErrorPayload> {
-    let mut leases = editor_leases().lock().map_err(lock_poison)?;
-    let lease = leases
-        .get_mut(&id)
-        .ok_or_else(|| conflict("editor lease reservation disappeared during completion"))?;
-    lease.completing = false;
-    Ok(())
 }
 
 async fn trusted_root(ctx: &DaemonContext, root: &str) -> Result<PathBuf, ErrorPayload> {
@@ -1197,8 +1231,4 @@ fn internal(error: impl std::fmt::Display) -> ErrorPayload {
 
 fn join_error(error: tokio::task::JoinError) -> ErrorPayload {
     internal(format!("agent management worker failed: {error}"))
-}
-
-fn lock_poison<T>(_: std::sync::PoisonError<T>) -> ErrorPayload {
-    internal("agent editor lease registry is unavailable")
 }

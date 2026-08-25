@@ -6288,6 +6288,107 @@ CREATE TABLE mcp_config_journals (
 CREATE INDEX mcp_config_journals_scope
 ON mcp_config_journals(project_root, created_at);
 
+-- Owner-scoped durable settlement ledger for local daemon mutations. Request
+-- bodies and secret material never enter this table: `request_hash` binds the
+-- authenticated owner/idempotency key to the exact request, while the terminal
+-- response is a deliberately secret-free protocol receipt. A prepared row is
+-- retained across restart so clients never receive permission to blindly
+-- repeat an operation whose response was lost.
+CREATE TABLE local_operation_receipts (
+    owner_digest        TEXT NOT NULL,
+    client_operation_id TEXT NOT NULL,
+    operation_kind      TEXT NOT NULL,
+    request_hash        BLOB NOT NULL
+        CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
+    state               TEXT NOT NULL CHECK (state IN ('prepared', 'terminal')),
+    terminal_response_json TEXT
+        CHECK (terminal_response_json IS NULL OR json_valid(terminal_response_json)),
+    created_at_unix_ms  INTEGER NOT NULL,
+    updated_at_unix_ms  INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    CHECK (length(trim(owner_digest)) > 0),
+    CHECK (length(trim(client_operation_id)) > 0),
+    CHECK (length(trim(operation_kind)) > 0),
+    CHECK ((state = 'terminal') = (terminal_response_json IS NOT NULL)),
+    CHECK (updated_at_unix_ms >= created_at_unix_ms)
+);
+CREATE INDEX local_operation_receipts_unsettled
+ON local_operation_receipts(updated_at_unix_ms)
+WHERE state = 'prepared';
+CREATE TRIGGER local_operation_receipts_identity_immutable
+BEFORE UPDATE ON local_operation_receipts
+WHEN NEW.owner_digest <> OLD.owner_digest
+  OR NEW.client_operation_id <> OLD.client_operation_id
+  OR NEW.operation_kind <> OLD.operation_kind
+  OR NEW.request_hash <> OLD.request_hash
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'local operation identity is immutable');
+END;
+CREATE TRIGGER local_operation_receipts_terminal_is_final
+BEFORE UPDATE ON local_operation_receipts
+WHEN OLD.state = 'terminal'
+BEGIN
+    SELECT RAISE(ABORT, 'local operation terminal receipt is final');
+END;
+
+-- External editor leases are durable authority, not frontend/UI state. The
+-- markdown is represented only by a digest; a retry must supply the same
+-- bytes. Snapshot/result JSON are redacted protocol DTOs and allow exact lost
+-- Begin/Complete responses to replay after daemon restart.
+CREATE TABLE agent_editor_leases (
+    owner_digest        TEXT NOT NULL,
+    client_operation_id TEXT NOT NULL,
+    lease_id            TEXT NOT NULL UNIQUE,
+    project_root        TEXT NOT NULL,
+    agent_name          TEXT NOT NULL,
+    consumed_revision   TEXT NOT NULL,
+    snapshot_json       TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+    state               TEXT NOT NULL CHECK (state IN ('open', 'completing', 'terminal')),
+    completion_hash     BLOB CHECK (
+        completion_hash IS NULL OR
+        (typeof(completion_hash) = 'blob' AND length(completion_hash) = 32)
+    ),
+    terminal_result_json TEXT CHECK (
+        terminal_result_json IS NULL OR json_valid(terminal_result_json)
+    ),
+    expires_at_unix_ms  INTEGER NOT NULL,
+    created_at_unix_ms  INTEGER NOT NULL,
+    updated_at_unix_ms  INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    CHECK (length(trim(owner_digest)) > 0),
+    CHECK (length(trim(client_operation_id)) > 0),
+    CHECK (length(trim(project_root)) > 0),
+    CHECK (length(trim(agent_name)) > 0),
+    CHECK (length(trim(consumed_revision)) > 0),
+    CHECK ((state = 'open') = (completion_hash IS NULL)),
+    CHECK ((state = 'terminal') = (terminal_result_json IS NOT NULL)),
+    CHECK (updated_at_unix_ms >= created_at_unix_ms)
+);
+CREATE INDEX agent_editor_leases_open
+ON agent_editor_leases(expires_at_unix_ms)
+WHERE state <> 'terminal';
+CREATE TRIGGER agent_editor_leases_identity_immutable
+BEFORE UPDATE ON agent_editor_leases
+WHEN NEW.owner_digest <> OLD.owner_digest
+  OR NEW.client_operation_id <> OLD.client_operation_id
+  OR NEW.lease_id <> OLD.lease_id
+  OR NEW.project_root <> OLD.project_root
+  OR NEW.agent_name <> OLD.agent_name
+  OR NEW.consumed_revision <> OLD.consumed_revision
+  OR NEW.snapshot_json <> OLD.snapshot_json
+  OR NEW.expires_at_unix_ms <> OLD.expires_at_unix_ms
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'agent editor lease identity is immutable');
+END;
+CREATE TRIGGER agent_editor_leases_terminal_is_final
+BEFORE UPDATE ON agent_editor_leases
+WHEN OLD.state = 'terminal'
+BEGIN
+    SELECT RAISE(ABORT, 'agent editor terminal receipt is final');
+END;
+
 -- Durable ownership claims for daemon-generated provider/MCP named secrets.
 -- Claims survive journal retirement so cleanup decisions do not depend on a
 -- pending write being present. Multiple roots may claim a shared reference;

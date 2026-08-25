@@ -9,7 +9,7 @@ use super::sessions_remote::{self, RemoteSessionLedger};
 use super::*;
 
 use crate::db::protected_leak_records::ProtectedLeakRecordRef;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 // The named-secret ownership guard primitives were factored into the shared
 // `crate::secret_ownership` funnel so policy import, `cockpit mcp add`,
 // credential refresh, and owner-scoped resolution reuse the SAME model. Re-export
@@ -5084,12 +5084,14 @@ async fn handle_serialized_request_impl(
         }
 
         Request::BeginAgentEditorLease {
+            client_operation_id,
             project_root,
             name,
             expected_revision,
         } => {
             crate::daemon::agent_management::begin_editor_lease(
                 ctx,
+                client_operation_id,
                 project_root,
                 name,
                 expected_revision,
@@ -7250,6 +7252,9 @@ async fn handle_serialized_request_impl(
             provider_id,
             record,
         } => {
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash =
+                local_operation_request_hash(&("put_provider_credential", &provider_id, &record))?;
             #[cfg(feature = "remote")]
             let request = Request::PutProviderCredential {
                 client_operation_id: client_operation_id.clone(),
@@ -7276,6 +7281,17 @@ async fn handle_serialized_request_impl(
                 bad_request("provider credential record is not valid JSON")
             })?;
             let record_bytes = serde_json::to_vec(&record_value).map_err(internal)?;
+            if let Some(replay) = begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "put_provider_credential",
+                request_hash,
+            )
+            .await?
+            {
+                return Ok(replay);
+            }
             let receipt = Response::ProviderCredentialCommitted {
                 client_operation_id,
                 provider_id: provider_id.clone(),
@@ -7286,8 +7302,8 @@ async fn handle_serialized_request_impl(
                 config_generation: inventory::current_config_generation(),
             };
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
-            #[cfg(feature = "remote")]
-            {
+            let result = {
+                #[cfg(feature = "remote")]
                 match remote_operation {
                     Some(operation) => {
                         mutate_owner_vault_item_with_remote_ledger(
@@ -7312,17 +7328,26 @@ async fn handle_serialized_request_impl(
                         Ok(receipt)
                     }
                 }
-            }
-            #[cfg(not(feature = "remote"))]
-            {
-                ctx.mutate_owner_vault_item(
-                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                    &provider_id,
-                    Some(&record_bytes),
-                )
-                .map_err(internal)?;
-                Ok(receipt)
-            }
+                #[cfg(not(feature = "remote"))]
+                {
+                    ctx.mutate_owner_vault_item(
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &provider_id,
+                        Some(&record_bytes),
+                    )
+                    .map_err(internal)?;
+                    Ok(receipt)
+                }
+            }?;
+            finish_local_operation(
+                ctx,
+                settlement_owner,
+                client_operation_id_from_response(&result)?,
+                request_hash,
+                &result,
+            )
+            .await?;
+            Ok(result)
         }
 
         Request::BeginProviderOAuth { provider_id } => {
@@ -7682,6 +7707,12 @@ async fn handle_serialized_request_impl(
             provider_id,
             project_root,
         } => {
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash = local_operation_request_hash(&(
+                "delete_provider_credential",
+                &provider_id,
+                &project_root,
+            ))?;
             #[cfg(feature = "remote")]
             let request = Request::DeleteProviderCredential {
                 client_operation_id: client_operation_id.clone(),
@@ -7757,8 +7788,19 @@ async fn handle_serialized_request_impl(
                 changed,
                 config_generation: inventory::current_config_generation(),
             };
-            #[cfg(feature = "remote")]
+            if let Some(replay) = begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "delete_provider_credential",
+                request_hash,
+            )
+            .await?
             {
+                return Ok(replay);
+            }
+            let result = {
+                #[cfg(feature = "remote")]
                 match remote_operation {
                     Some(operation) => {
                         mutate_owner_vault_item_with_remote_ledger(
@@ -7783,17 +7825,26 @@ async fn handle_serialized_request_impl(
                         Ok(response)
                     }
                 }
-            }
-            #[cfg(not(feature = "remote"))]
-            {
-                ctx.mutate_owner_vault_item(
-                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                    &credential_record_id,
-                    None,
-                )
-                .map_err(internal)?;
-                Ok(response)
-            }
+                #[cfg(not(feature = "remote"))]
+                {
+                    ctx.mutate_owner_vault_item(
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &credential_record_id,
+                        None,
+                    )
+                    .map_err(internal)?;
+                    Ok(response)
+                }
+            }?;
+            finish_local_operation(
+                ctx,
+                settlement_owner,
+                client_operation_id_from_response(&result)?,
+                request_hash,
+                &result,
+            )
+            .await?;
+            Ok(result)
         }
 
         #[cfg(feature = "remote")]
@@ -8012,6 +8063,20 @@ async fn handle_serialized_request_impl(
             project_root,
             provider_id,
         } => {
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash =
+                local_operation_request_hash(&("setup_copilot_auth", &project_root, &provider_id))?;
+            if let Some(replay) = begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "setup_copilot_auth",
+                request_hash,
+            )
+            .await?
+            {
+                return Ok(replay);
+            }
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept Copilot auth setup",
@@ -8056,9 +8121,21 @@ async fn handle_serialized_request_impl(
                 provider_id,
                 config_generation: inventory::current_config_generation(),
             });
-            finish_provider_mutation_future!(remote_operation, ctx, "setup_copilot_auth", async {
-                operation_result
-            })
+            let response = finish_provider_mutation_future!(
+                remote_operation,
+                ctx,
+                "setup_copilot_auth",
+                async { operation_result }
+            )?;
+            finish_local_operation(
+                ctx,
+                settlement_owner,
+                client_operation_id_from_response(&response)?,
+                request_hash,
+                &response,
+            )
+            .await?;
+            Ok(response)
         }
 
         Request::ApplySetupWizard {
@@ -8104,6 +8181,25 @@ async fn handle_serialized_request_impl(
             secret_values_json,
             cleanup_names_json,
         } => {
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash = local_operation_request_hash(&(
+                "save_mcp_config",
+                &project_root,
+                &config_json,
+                &secret_values_json,
+                &cleanup_names_json,
+            ))?;
+            if let Some(replay) = begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "save_mcp_config",
+                request_hash,
+            )
+            .await?
+            {
+                return Ok(replay);
+            }
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept MCP config writes",
@@ -8133,12 +8229,21 @@ async fn handle_serialized_request_impl(
                 &secret_values_json,
                 &cleanup_names_json,
             );
-            finish_provider_mutation_future!(
+            let response = finish_provider_mutation_future!(
                 remote_operation,
                 ctx,
                 "save_mcp_config",
                 operation_result
+            )?;
+            finish_local_operation(
+                ctx,
+                settlement_owner,
+                client_operation_id_from_response(&response)?,
+                request_hash,
+                &response,
             )
+            .await?;
+            Ok(response)
         }
 
         Request::DeleteProviderConfig {
@@ -10452,6 +10557,24 @@ async fn apply_provider_mutation(
     mutation: cockpit_proto::ProviderMutationBatch,
     capability_owner: String,
 ) -> std::result::Result<Response, ErrorPayload> {
+    let request_hash = local_operation_request_hash(&(
+        "apply_provider_mutation",
+        &snapshot_session_id,
+        &layer_id,
+        &expected_revision,
+        &mutation,
+    ))?;
+    if let Some(replay) = begin_local_operation(
+        ctx,
+        &capability_owner,
+        &client_operation_id,
+        "apply_provider_mutation",
+        request_hash,
+    )
+    .await?
+    {
+        return Ok(replay);
+    }
     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     let capability = {
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
@@ -10525,7 +10648,7 @@ async fn apply_provider_mutation(
             },
         );
     }
-    Ok(Response::ProviderMutationCommitted {
+    let response = Response::ProviderMutationCommitted {
         client_operation_id,
         snapshot_session_id,
         layer_id,
@@ -10535,7 +10658,94 @@ async fn apply_provider_mutation(
         config: crate::secret_ref::redact_provider_view(&committed),
         status: cockpit_proto::ConfigCommitStatus::Committed,
         publication: cockpit_proto::ConfigPublicationStatus::Published,
-    })
+    };
+    finish_local_operation(
+        ctx,
+        capability_owner,
+        client_operation_id_from_response(&response)?,
+        request_hash,
+        &response,
+    )
+    .await?;
+    Ok(response)
+}
+
+fn local_operation_request_hash<T: serde::Serialize>(
+    request: &T,
+) -> std::result::Result<[u8; 32], ErrorPayload> {
+    let encoded = serde_json::to_vec(request).map_err(internal)?;
+    Ok(Sha256::digest(encoded).into())
+}
+
+async fn begin_local_operation(
+    ctx: &DaemonContext,
+    owner: &str,
+    client_operation_id: &str,
+    kind: &str,
+    request_hash: [u8; 32],
+) -> std::result::Result<Option<Response>, ErrorPayload> {
+    match ctx
+        .db
+        .begin_local_operation(
+            owner.to_owned(),
+            client_operation_id.to_owned(),
+            kind.to_owned(),
+            request_hash,
+        )
+        .await
+        .map_err(|error| conflict(error.to_string()))?
+    {
+        crate::db::local_operation_receipts::LocalOperationBegin::Dispatch => Ok(None),
+        crate::db::local_operation_receipts::LocalOperationBegin::Terminal(json) => {
+            serde_json::from_str(&json).map(Some).map_err(internal)
+        }
+        crate::db::local_operation_receipts::LocalOperationBegin::Prepared => Err(ErrorPayload {
+            code: ErrorCode::Unavailable,
+            message: format!(
+                "settlement is unknown for {kind}; retry this exact client operation to query its terminal receipt"
+            ),
+        }),
+    }
+}
+
+async fn finish_local_operation(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    response: &Response,
+) -> std::result::Result<(), ErrorPayload> {
+    let response_json = serde_json::to_string(response).map_err(internal)?;
+    ctx.db
+        .finish_local_operation(owner, client_operation_id, request_hash, response_json)
+        .await
+        .map_err(internal)
+}
+
+fn client_operation_id_from_response(
+    response: &Response,
+) -> std::result::Result<String, ErrorPayload> {
+    match response {
+        Response::ProviderMutationCommitted {
+            client_operation_id,
+            ..
+        }
+        | Response::ProviderCredentialCommitted {
+            client_operation_id,
+            ..
+        }
+        | Response::McpConfigCommitted {
+            client_operation_id,
+            ..
+        }
+        | Response::CopilotAuthCommitted {
+            client_operation_id,
+            ..
+        } => Ok(client_operation_id.clone()),
+        _ => Err(internal(anyhow::anyhow!(
+            "local operation produced an unbound receipt"
+        ))),
+    }
 }
 
 fn validate_provider_edit_capability(

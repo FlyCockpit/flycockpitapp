@@ -729,7 +729,12 @@ async fn load_and_upload_images(
     client: &crate::daemon::client::DaemonClient,
     images: &[Vec<u8>],
 ) -> Result<Vec<proto::ImageAttachmentRef>> {
-    match crate::daemon::image_upload::upload_submission_images(client, images).await {
+    let typed = images
+        .iter()
+        .cloned()
+        .map(cockpit_core::engine::message::SubmissionImage::png)
+        .collect::<Vec<_>>();
+    match crate::daemon::image_upload::upload_submission_images(client, &typed).await {
         Ok(refs) => Ok(refs),
         Err(error) => Err(map_image_upload_error(error)),
     }

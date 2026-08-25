@@ -440,8 +440,10 @@ pub fn user_submission_wire_digest(
     digest.update(bytes);
     digest.update((images.len() as u64).to_le_bytes());
     for image in images {
-        digest.update((image.len() as u64).to_le_bytes());
-        digest.update(image);
+        let encoded = serde_json::to_vec(image)
+            .expect("submission image contains only infallibly serializable fields");
+        digest.update((encoded.len() as u64).to_le_bytes());
+        digest.update(encoded);
     }
     digest.finalize().into()
 }

@@ -1557,7 +1557,7 @@ impl crate::daemon::terminal::TerminalHost for TerminalHost {
                 .get(&operation_id)
                 .ok_or_else(invalid_ingress)?;
             if operation.state != TerminalIngressState::Committed
-                || operation.owner.principal_id != context.principal_id
+                || operation.owner != *context
                 || operation.session_id != session_id
                 || operation.created_at.elapsed() >= INGRESS_TTL
             {

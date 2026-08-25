@@ -27,13 +27,22 @@ async fn admit_image_ingress_via_daemon(
     source: cockpit_core::daemon::proto::ImageIngressSourceV1,
     admission_id: uuid::Uuid,
 ) -> Result<crate::tui::async_action::DaemonImagePathAdmission, String> {
-    let response = daemon
-        .request(cockpit_core::daemon::proto::Request::AdmitImageIngress {
-            session_id,
-            source,
-            admission_id,
-        })
-        .await?;
+    // Retry once with the exact same durable id and source binding. A lost
+    // response must recover the daemon receipt rather than minting a second
+    // charged attachment (and terminal capabilities are intentionally
+    // one-shot, so a retry with a fresh id could never be correct).
+    let request = || cockpit_core::daemon::proto::Request::AdmitImageIngress {
+        session_id,
+        source: source.clone(),
+        admission_id,
+    };
+    let response = match daemon.request(request()).await {
+        Ok(response) => response,
+        Err(first_error) => daemon
+            .request(request())
+            .await
+            .map_err(|second_error| format!("{first_error}; retry failed: {second_error}"))?,
+    };
     let cockpit_core::daemon::proto::Response::ImageIngressAdmitted(admission) = response else {
         return Err("daemon returned an unexpected image ingress response".into());
     };
@@ -4738,15 +4747,17 @@ fn cursor_on_last_line(text: &str, cursor: usize) -> bool {
     !after.contains('\n')
 }
 
-pub(super) fn validate_pasted_images_for_submit(images: &[Vec<u8>]) -> Result<(), String> {
+pub(super) fn validate_pasted_images_for_submit(
+    images: &[cockpit_core::engine::message::SubmissionImage],
+) -> Result<(), String> {
     if images.is_empty() {
         return Ok(());
     }
     validate_pasted_image_sizes(images)?;
-    for (idx, png) in images.iter().enumerate() {
-        if cockpit_core::daemon::proto::decode_retained_image_handle(png).is_some() {
+    for (idx, image) in images.iter().enumerate() {
+        let cockpit_core::engine::message::SubmissionImage::Png { bytes: png } = image else {
             continue;
-        }
+        };
         let display_idx = idx + 1;
         let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
             .map_err(|_| format!("Pasted image #{display_idx} is not a valid PNG."))?;
@@ -4764,7 +4775,9 @@ pub(super) fn validate_pasted_images_for_submit(images: &[Vec<u8>]) -> Result<()
     Ok(())
 }
 
-fn validate_pasted_image_sizes(images: &[Vec<u8>]) -> Result<(), String> {
+fn validate_pasted_image_sizes(
+    images: &[cockpit_core::engine::message::SubmissionImage],
+) -> Result<(), String> {
     if images.len() > cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE {
         return Err(format!(
             "Too many pasted images: {} exceeds the {} image limit.",
@@ -4773,10 +4786,10 @@ fn validate_pasted_image_sizes(images: &[Vec<u8>]) -> Result<(), String> {
         ));
     }
     let mut total = 0usize;
-    for (idx, png) in images.iter().enumerate() {
-        if cockpit_core::daemon::proto::decode_retained_image_handle(png).is_some() {
+    for (idx, image) in images.iter().enumerate() {
+        let cockpit_core::engine::message::SubmissionImage::Png { bytes: png } = image else {
             continue;
-        }
+        };
         let display_idx = idx + 1;
         if png.is_empty() {
             return Err(format!("Pasted image #{display_idx} is empty."));

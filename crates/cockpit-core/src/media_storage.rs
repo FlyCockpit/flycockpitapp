@@ -72,6 +72,7 @@ pub(crate) struct PublishIngressImageInput {
     pub session_id: Uuid,
     pub project_digest: String,
     pub reservation_id: String,
+    pub request_source_digest: String,
     pub bytes: Vec<u8>,
     pub sha256: String,
     pub width: u32,
@@ -264,15 +265,19 @@ impl MediaStorageRecovery {
         &self,
         admission_id: Uuid,
         session_id: Uuid,
+        request_source_digest: String,
     ) -> Result<Option<PublishedIngressImage>> {
         self.db.read(move |conn| {
             conn.query_row(
-                "SELECT attachment_id,attachment_version,availability_generation,reservation_id,normalized_sha256,normalized_byte_length,width,height FROM media_ingress_admission_receipts WHERE admission_id=?1 AND session_id=?2",
-                params![admission_id.to_string(),session_id.to_string()],
-                |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,u32>(6)?,row.get::<_,u32>(7)?)),
+                "SELECT attachment_id,attachment_version,availability_generation,reservation_id,normalized_sha256,normalized_byte_length,width,height,request_source_digest,session_id FROM media_ingress_admission_receipts WHERE admission_id=?1",
+                params![admission_id.to_string()],
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,u32>(6)?,row.get::<_,u32>(7)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?)),
             )
             .optional()?
-            .map(|row| Ok(PublishedIngressImage {
+            .map(|row| {
+                ensure!(row.8 == request_source_digest, "image ingress admission id was reused with a different source");
+                ensure!(row.9 == session_id.to_string(), "image ingress admission id belongs to a different session");
+                Ok(PublishedIngressImage {
                 admission_id,
                 session_id,
                 attachment_id: Uuid::parse_str(&row.0)?,
@@ -283,7 +288,8 @@ impl MediaStorageRecovery {
                 normalized_byte_length: row.5.parse()?,
                 width: row.6,
                 height: row.7,
-            }))
+                })
+            })
             .transpose()
         }).await
     }
@@ -1163,6 +1169,7 @@ impl MediaStorageRecovery {
             session_id,
             project_digest,
             reservation_id,
+            request_source_digest,
             bytes,
             sha256,
             width,
@@ -1183,11 +1190,12 @@ impl MediaStorageRecovery {
         let intent_reservation = reservation_id.clone();
         let intent_storage = storage_name.clone();
         let intent_sha = sha256.clone();
+        let intent_request_digest = request_source_digest.clone();
         self.db
             .transaction(move |conn| {
                 conn.execute(
-                    "INSERT INTO media_ingress_publication_intents(admission_id,session_id,reservation_id,storage_id,source_sha256,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",
-                    params![intent_admission,intent_session,intent_reservation,intent_storage,intent_sha,now_unix_ms],
+                    "INSERT INTO media_ingress_publication_intents(admission_id,session_id,reservation_id,storage_id,source_sha256,request_source_digest,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![intent_admission,intent_session,intent_reservation,intent_storage,intent_sha,intent_request_digest,now_unix_ms],
                 )?;
                 Ok(())
             })
@@ -1269,6 +1277,7 @@ impl MediaStorageRecovery {
         };
         let receipt_reservation = reservation_id.clone();
         let receipt_sha = sha256.clone();
+        let receipt_request_digest = request_source_digest;
         let transaction_reservation = reservation_id.clone();
         let commit = self
             .db
@@ -1281,8 +1290,8 @@ impl MediaStorageRecovery {
                 )?;
                 crate::media_reservation::settle_and_publish_conn(conn, &transaction_reservation)?;
                 conn.execute(
-                    "INSERT INTO media_ingress_admission_receipts(admission_id,session_id,attachment_id,attachment_version,availability_generation,reservation_id,normalized_sha256,normalized_byte_length,width,height,committed_at_unix_ms) VALUES(?1,?2,?3,'1','1',?4,?5,?6,?7,?8,?9)",
-                    params![admission_id.to_string(),session_id.to_string(),attachment_id.to_string(),receipt_reservation,receipt_sha,length.to_string(),width,height,now_unix_ms],
+                    "INSERT INTO media_ingress_admission_receipts(admission_id,session_id,attachment_id,attachment_version,availability_generation,reservation_id,normalized_sha256,request_source_digest,normalized_byte_length,width,height,committed_at_unix_ms) VALUES(?1,?2,?3,'1','1',?4,?5,?6,?7,?8,?9,?10)",
+                    params![admission_id.to_string(),session_id.to_string(),attachment_id.to_string(),receipt_reservation,receipt_sha,receipt_request_digest,length.to_string(),width,height,now_unix_ms],
                 )?;
                 ensure!(
                     conn.execute(

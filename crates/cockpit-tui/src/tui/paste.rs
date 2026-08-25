@@ -640,7 +640,11 @@ impl PasteRegistry {
     /// image part should appear; the caller splits on them to interleave
     /// text and image content parts. (For non-vision and reference cases
     /// no sentinel is emitted — those are pure text.)
-    pub fn build_wire(&self, buffer: &str, vision: bool) -> (String, Vec<Vec<u8>>) {
+    pub fn build_wire(
+        &self,
+        buffer: &str,
+        vision: bool,
+    ) -> (String, Vec<cockpit_core::engine::message::SubmissionImage>) {
         let mut images = Vec::new();
         let out = self.expand_blocks(buffer, |out, block| match &block.kind {
             PasteKind::Text { full, nonce, .. } => {
@@ -656,7 +660,9 @@ impl PasteRegistry {
                     out.push_str(&format!("[reference image #{}]", block.number));
                 } else {
                     out.push_str(IMAGE_PART_SENTINEL);
-                    images.push(png.clone());
+                    images.push(cockpit_core::engine::message::SubmissionImage::png(
+                        png.clone(),
+                    ));
                 }
             }
             PasteKind::ImageHandle {
@@ -673,8 +679,8 @@ impl PasteRegistry {
                     out.push_str(&format!("[reference image #{}]", block.number));
                 } else {
                     out.push_str(IMAGE_PART_SENTINEL);
-                    images.push(cockpit_core::daemon::proto::encode_retained_image_handle(
-                        image_ref,
+                    images.push(cockpit_core::engine::message::SubmissionImage::retained(
+                        image_ref.clone(),
                     ));
                 }
             }

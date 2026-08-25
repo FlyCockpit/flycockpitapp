@@ -54,9 +54,11 @@ pub struct UserSubmission {
     /// Structured `@`-tag expansion rows displayed after the user message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tag_expansions: Vec<crate::daemon::proto::TagExpansionMeta>,
-    /// PNG-encoded image bytes, one per real image part, in order.
+    /// Typed image sources, one per real image part, in source order. A
+    /// retained reference can never be mistaken for attacker-controlled PNG
+    /// bytes; the daemon dispatcher resolves it before prompt assembly.
     #[serde(default)]
-    pub images: Vec<Vec<u8>>,
+    pub images: Vec<SubmissionImage>,
     /// A user-issued skill slash command (`/<skill-name>` or
     /// `/skill <name>`): the exact skill name to invoke deterministically
     /// before this turn's inference (implementation note).
@@ -113,6 +115,27 @@ pub struct UserSubmission {
     /// `client_submission_id` or with unbounded interactive work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_invocation_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubmissionImage {
+    Png {
+        bytes: Vec<u8>,
+    },
+    Retained {
+        image_ref: crate::daemon::proto::ImageAttachmentRef,
+    },
+}
+
+impl SubmissionImage {
+    pub fn png(bytes: Vec<u8>) -> Self {
+        Self::Png { bytes }
+    }
+
+    pub fn retained(image_ref: crate::daemon::proto::ImageAttachmentRef) -> Self {
+        Self::Retained { image_ref }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingSubmissionTerminalDisposition {
@@ -1197,7 +1220,7 @@ impl UserSubmission {
             &serde_json::to_vec(&self.tag_expansions).unwrap_or_default(),
         );
         for image in &self.images {
-            part(&mut hasher, image);
+            part(&mut hasher, &serde_json::to_vec(image).unwrap_or_default());
         }
         optional_part(&mut hasher, self.forced_skill.as_deref());
         crate::intel::hex_lower(&hasher.finalize())
@@ -1233,6 +1256,9 @@ pub fn build_user_message(sub: UserSubmission) -> Message {
         if i + 1 < segments.len()
             && let Some(png) = imgs.next()
         {
+            let SubmissionImage::Png { bytes: png } = png else {
+                continue;
+            };
             let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
             parts.push(UserContent::image_base64(
                 b64,
@@ -1244,6 +1270,9 @@ pub fn build_user_message(sub: UserSubmission) -> Message {
     // Any images without a matching sentinel (defensive — shouldn't
     // happen) are appended so bytes are never silently dropped.
     for png in imgs {
+        let SubmissionImage::Png { bytes: png } = png else {
+            continue;
+        };
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
         parts.push(UserContent::image_base64(
             b64,

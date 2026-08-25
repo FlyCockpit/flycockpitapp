@@ -382,9 +382,11 @@ CREATE TABLE media_ingress_publication_intents (
     reservation_id TEXT NOT NULL UNIQUE REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT,
     storage_id TEXT NOT NULL UNIQUE,
     source_sha256 TEXT NOT NULL,
+    request_source_digest TEXT NOT NULL,
     created_at_unix_ms INTEGER NOT NULL,
     CHECK (length(admission_id) = 36),
-    CHECK (length(source_sha256) = 64 AND source_sha256 NOT GLOB '*[^0-9a-f]*')
+    CHECK (length(source_sha256) = 64 AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(request_source_digest) = 64 AND request_source_digest NOT GLOB '*[^0-9a-f]*')
 );
 
 CREATE TABLE media_ingress_admission_receipts (
@@ -395,6 +397,7 @@ CREATE TABLE media_ingress_admission_receipts (
     availability_generation TEXT NOT NULL,
     reservation_id TEXT NOT NULL UNIQUE REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT,
     normalized_sha256 TEXT NOT NULL,
+    request_source_digest TEXT NOT NULL,
     normalized_byte_length TEXT NOT NULL,
     width INTEGER NOT NULL,
     height INTEGER NOT NULL,
@@ -403,6 +406,7 @@ CREATE TABLE media_ingress_admission_receipts (
     CHECK (CAST(attachment_version AS INTEGER) > 0),
     CHECK (CAST(availability_generation AS INTEGER) > 0),
     CHECK (length(normalized_sha256) = 64 AND normalized_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(request_source_digest) = 64 AND request_source_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (CAST(normalized_byte_length AS INTEGER) > 0),
     CHECK (width > 0 AND height > 0)
 );

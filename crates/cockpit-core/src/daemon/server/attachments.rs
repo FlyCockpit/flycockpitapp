@@ -42,8 +42,38 @@ pub(super) async fn admit_image_ingress(
         .media_storage_recovery
         .as_ref()
         .ok_or_else(|| internal("durable media storage unavailable"))?;
+    // This digest is the durable idempotency binding. For terminal ingress it
+    // contains only a one-way digest of the opaque bearer, never the bearer or
+    // its host-retained path. Clipboard binding uses declared metadata so the
+    // (potentially large) payload need not be decoded before reserving.
+    let request_source_digest = match &source {
+        proto::ImageIngressSourceV1::PrivateTerminalCapability { capability } => {
+            if capability.len() != 26
+                || !capability
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            {
+                return Err(bad_request("image ingress source is unavailable"));
+            }
+            sha256_hex(format!("terminal-capability-v1:{capability}").as_bytes())
+        }
+        proto::ImageIngressSourceV1::ClipboardPng {
+            byte_length,
+            sha256,
+            ..
+        } => {
+            if *byte_length == 0
+                || *byte_length > IMAGE_INGRESS_MAX_INPUT_BYTES
+                || sha256.len() != 64
+                || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(bad_request("clipboard image is unavailable"));
+            }
+            sha256_hex(format!("clipboard-png-v1:{byte_length}:{sha256}").as_bytes())
+        }
+    };
     if let Some(published) = storage
-        .ingress_image_receipt(admission_id, session_id)
+        .ingress_image_receipt(admission_id, session_id, request_source_digest.clone())
         .await
         .map_err(internal)?
     {
@@ -71,44 +101,6 @@ pub(super) async fn admit_image_ingress(
         .load_effective_for_daemon(&root, &trust)
         .map_err(internal)?;
     let policy = extended.media_resources;
-    let (bytes, expected_format, source_sha256) = match source {
-        proto::ImageIngressSourceV1::PrivateTerminalCapability { capability } => {
-            let ingress = state.terminal_host.consume_private_image_ingress(
-                &state.terminal_context,
-                session_id,
-                &capability,
-            )?;
-            let format = match ingress.media_type {
-                proto::terminal::TerminalImageType::Png => image::ImageFormat::Png,
-                proto::terminal::TerminalImageType::Jpeg => image::ImageFormat::Jpeg,
-                proto::terminal::TerminalImageType::Gif => image::ImageFormat::Gif,
-                proto::terminal::TerminalImageType::Webp => image::ImageFormat::WebP,
-            };
-            (ingress.bytes, format, ingress.declared_sha256)
-        }
-        proto::ImageIngressSourceV1::ClipboardPng {
-            png_base64,
-            byte_length,
-            sha256,
-        } => {
-            if byte_length == 0 || byte_length > IMAGE_INGRESS_MAX_INPUT_BYTES {
-                return Err(bad_request("clipboard image is unavailable"));
-            }
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(png_base64.as_str())
-                .map_err(|_| bad_request("clipboard image is unavailable"))?;
-            if bytes.len() as u64 != byte_length || sha256_hex(&bytes) != sha256 {
-                return Err(bad_request("clipboard image integrity mismatch"));
-            }
-            (bytes, image::ImageFormat::Png, sha256)
-        }
-    };
-    if bytes.is_empty()
-        || bytes.len() as u64 > IMAGE_INGRESS_MAX_INPUT_BYTES
-        || sha256_hex(&bytes) != source_sha256
-    {
-        return Err(bad_request("image ingress source is unavailable"));
-    }
     let plans = [
         (MediaDimension::QueuedOperationsGlobal, 1),
         (MediaDimension::QueuedOperationsPerSession, 1),
@@ -182,6 +174,44 @@ pub(super) async fn admit_image_ingress(
         wall_ms,
         decode_worker: None,
     };
+    // The durable reservation and its cancellation guard exist before the
+    // one-shot host capability is consumed or untrusted clipboard bytes are
+    // decoded. Every subsequent early return therefore releases accounting.
+    let (bytes, expected_format, source_sha256) = match source {
+        proto::ImageIngressSourceV1::PrivateTerminalCapability { capability } => {
+            let ingress = state.terminal_host.consume_private_image_ingress(
+                &state.terminal_context,
+                session_id,
+                &capability,
+            )?;
+            let format = match ingress.media_type {
+                proto::terminal::TerminalImageType::Png => image::ImageFormat::Png,
+                proto::terminal::TerminalImageType::Jpeg => image::ImageFormat::Jpeg,
+                proto::terminal::TerminalImageType::Gif => image::ImageFormat::Gif,
+                proto::terminal::TerminalImageType::Webp => image::ImageFormat::WebP,
+            };
+            (ingress.bytes, format, ingress.declared_sha256)
+        }
+        proto::ImageIngressSourceV1::ClipboardPng {
+            png_base64,
+            byte_length,
+            sha256,
+        } => {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(png_base64.as_str())
+                .map_err(|_| bad_request("clipboard image is unavailable"))?;
+            if bytes.len() as u64 != byte_length || sha256_hex(&bytes) != sha256 {
+                return Err(bad_request("clipboard image integrity mismatch"));
+            }
+            (bytes, image::ImageFormat::Png, sha256)
+        }
+    };
+    if bytes.is_empty()
+        || bytes.len() as u64 > IMAGE_INGRESS_MAX_INPUT_BYTES
+        || sha256_hex(&bytes) != source_sha256
+    {
+        return Err(bad_request("image ingress source is unavailable"));
+    }
     ctx.media_ledger
         .mark_execution_ready(&reservation_id, wall_ms)
         .await
@@ -277,6 +307,7 @@ pub(super) async fn admit_image_ingress(
             session_id,
             project_digest,
             reservation_id: reservation_id.clone(),
+            request_source_digest,
             bytes: normalized.png,
             sha256: normalized.sha256.clone(),
             width,

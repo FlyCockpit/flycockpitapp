@@ -2325,12 +2325,14 @@ impl App {
                     existing_before + inserted,
                     match image {
                         crate::tui::structured_paste::PasteImageAdmission::Bytes(bytes) => {
-                            bytes.clone()
+                            cockpit_core::engine::message::SubmissionImage::png(bytes.clone())
                         }
                         crate::tui::structured_paste::PasteImageAdmission::Handle {
                             image_ref,
                             ..
-                        } => cockpit_core::daemon::proto::encode_retained_image_handle(image_ref),
+                        } => cockpit_core::engine::message::SubmissionImage::retained(
+                            image_ref.clone(),
+                        ),
                     },
                 );
             }
@@ -2349,11 +2351,13 @@ impl App {
                     .push_str(cockpit_core::daemon::proto::IMAGE_PART_SENTINEL);
                 deferred.submission.images.push(match image {
                     crate::tui::structured_paste::PasteImageAdmission::Bytes(bytes) => {
-                        bytes.clone()
+                        cockpit_core::engine::message::SubmissionImage::png(bytes.clone())
                     }
                     crate::tui::structured_paste::PasteImageAdmission::Handle {
                         image_ref, ..
-                    } => cockpit_core::daemon::proto::encode_retained_image_handle(image_ref),
+                    } => {
+                        cockpit_core::engine::message::SubmissionImage::retained(image_ref.clone())
+                    }
                 });
             }
         }

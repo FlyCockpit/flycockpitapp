@@ -1658,28 +1658,6 @@ pub struct ImageAttachmentRef {
     pub id: Uuid,
 }
 
-const RETAINED_IMAGE_HANDLE_MAGIC: &[u8; 4] = b"FCIH";
-
-/// Process-local composer representation for an already-retained image. It
-/// preserves ordered image slots without returning bytes to the TUI or adding
-/// a second upload. This representation is never accepted as image content by
-/// the daemon; the client dispatcher decodes it back into the typed ref.
-pub fn encode_retained_image_handle(image_ref: &ImageAttachmentRef) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(20);
-    encoded.extend_from_slice(RETAINED_IMAGE_HANDLE_MAGIC);
-    encoded.extend_from_slice(image_ref.id.as_bytes());
-    encoded
-}
-
-pub fn decode_retained_image_handle(bytes: &[u8]) -> Option<ImageAttachmentRef> {
-    if bytes.len() != 20 || bytes.get(..4) != Some(RETAINED_IMAGE_HANDLE_MAGIC.as_slice()) {
-        return None;
-    }
-    Some(ImageAttachmentRef {
-        id: Uuid::from_slice(&bytes[4..]).ok()?,
-    })
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationSteerStatus {

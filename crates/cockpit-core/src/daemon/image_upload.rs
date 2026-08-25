@@ -20,7 +20,7 @@ pub enum ImageUploadError {
 
 pub async fn upload_submission_images(
     client: &DaemonClient,
-    images: &[Vec<u8>],
+    images: &[crate::engine::message::SubmissionImage],
 ) -> Result<Vec<proto::ImageAttachmentRef>, ImageUploadError> {
     if images.is_empty() {
         return Ok(Vec::new());
@@ -34,8 +34,10 @@ pub async fn upload_submission_images(
     }
     let total: usize = images
         .iter()
-        .filter(|image| proto::decode_retained_image_handle(image).is_none())
-        .map(Vec::len)
+        .filter_map(|image| match image {
+            crate::engine::message::SubmissionImage::Png { bytes } => Some(bytes.len()),
+            crate::engine::message::SubmissionImage::Retained { .. } => None,
+        })
         .sum();
     if total > proto::MAX_TOTAL_IMAGE_BYTES {
         return Err(ImageUploadError::Usage(format!(
@@ -46,11 +48,14 @@ pub async fn upload_submission_images(
     }
 
     let mut refs = Vec::with_capacity(images.len());
-    for png in images {
-        if let Some(image_ref) = proto::decode_retained_image_handle(png) {
-            refs.push(image_ref);
-        } else {
-            refs.push(upload_one_image(client, png).await?);
+    for image in images {
+        match image {
+            crate::engine::message::SubmissionImage::Png { bytes } => {
+                refs.push(upload_one_image(client, bytes).await?);
+            }
+            crate::engine::message::SubmissionImage::Retained { image_ref } => {
+                refs.push(image_ref.clone());
+            }
         }
     }
     Ok(refs)

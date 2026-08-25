@@ -466,9 +466,9 @@ impl SettingsCx {
                     let flow_id = flow.flow_id.clone();
                     let client_operation_id = uuid::Uuid::new_v4().to_string();
                     let expected_request_hash = super::local_receipt_request_hash(&(
-                        "complete_mcp_oauth",
+                        "complete_mcp_oauth_receipt_v2",
+                        &client_operation_id,
                         &flow_id,
-                        &Some(input.as_str()),
                     ))
                     .unwrap_or_default();
                     self.queue_simple_secret_mutation(

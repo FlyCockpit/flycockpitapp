@@ -6363,9 +6363,10 @@ END;
 
 -- External editor leases are durable authority, not frontend/UI state. The
 -- markdown submitted at completion is represented only by a digest; a retry
--- must supply the same bytes. An open lease temporarily retains the redacted
--- edit snapshot so a lost Begin response can replay after daemon restart. The
--- snapshot is cleared atomically at terminal settlement; terminal rows retain
+-- must supply the same bytes. An open lease references an owner-bound AEAD
+-- payload in the secret vault by opaque handle; plaintext edit snapshots never
+-- enter this table. The handle is cleared atomically at terminal settlement;
+-- terminal rows retain
 -- only target/revision metadata, the completion digest, and a secret-free
 -- result receipt until bounded retention removes them.
 CREATE TABLE agent_editor_leases (
@@ -6375,8 +6376,9 @@ CREATE TABLE agent_editor_leases (
     project_root        TEXT NOT NULL,
     agent_name          TEXT NOT NULL,
     consumed_revision   TEXT NOT NULL,
-    snapshot_json       TEXT CHECK (
-        snapshot_json IS NULL OR json_valid(snapshot_json)
+    snapshot_handle     TEXT,
+    snapshot_digest     TEXT NOT NULL CHECK (
+        length(snapshot_digest) = 64 AND snapshot_digest = lower(snapshot_digest)
     ),
     state               TEXT NOT NULL CHECK (state IN ('open', 'completing', 'terminal')),
     completion_hash     BLOB CHECK (
@@ -6395,9 +6397,10 @@ CREATE TABLE agent_editor_leases (
     CHECK (length(trim(project_root)) > 0),
     CHECK (length(trim(agent_name)) > 0),
     CHECK (length(trim(consumed_revision)) > 0),
+    CHECK (snapshot_handle IS NULL OR length(trim(snapshot_handle)) > 0),
     CHECK ((state = 'open') = (completion_hash IS NULL)),
     CHECK ((state = 'terminal') = (terminal_result_json IS NOT NULL)),
-    CHECK ((state = 'open') = (snapshot_json IS NOT NULL)),
+    CHECK ((state <> 'terminal') = (snapshot_handle IS NOT NULL)),
     CHECK (updated_at_unix_ms >= created_at_unix_ms)
 );
 CREATE INDEX agent_editor_leases_open
@@ -6414,7 +6417,8 @@ WHEN NEW.owner_digest <> OLD.owner_digest
   OR NEW.project_root <> OLD.project_root
   OR NEW.agent_name <> OLD.agent_name
   OR NEW.consumed_revision <> OLD.consumed_revision
-  OR (NEW.snapshot_json IS NOT OLD.snapshot_json AND NEW.state = 'open')
+  OR NEW.snapshot_digest <> OLD.snapshot_digest
+  OR (NEW.snapshot_handle IS NOT OLD.snapshot_handle AND NEW.state <> 'terminal')
   OR NEW.expires_at_unix_ms <> OLD.expires_at_unix_ms
   OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
 BEGIN

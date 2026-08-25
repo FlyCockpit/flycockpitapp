@@ -357,6 +357,9 @@ pub enum Response {
     #[serde(rename = "provider_oauth_completed")]
     ProviderOAuthCompleted {
         client_operation_id: String,
+        /// Public correlation over the non-secret client operation id and
+        /// flow id. Callback/code bytes are bound only by the daemon's keyed
+        /// durable-operation identity and never have an offline verifier.
         request_hash: String,
         flow_id: String,
         logged_in: bool,
@@ -391,6 +394,7 @@ pub enum Response {
     #[serde(rename = "mcp_oauth_completed")]
     McpOAuthCompleted {
         client_operation_id: String,
+        /// Public correlation over non-secret request identifiers only.
         request_hash: String,
         flow_id: String,
         authenticated: bool,

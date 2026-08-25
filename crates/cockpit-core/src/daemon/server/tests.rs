@@ -11143,6 +11143,73 @@ async fn oauth_wire_shapes_carry_no_verifier_or_token() {
     }
 }
 
+#[test]
+fn oauth_completion_receipts_and_cancel_race_are_secret_safe() {
+    let source = include_str!("dispatch.rs");
+    assert!(
+        source.contains("complete_provider_oauth_receipt_v2")
+            && source.contains("complete_mcp_oauth_receipt_v2"),
+        "completion receipts must correlate only non-secret identifiers"
+    );
+    assert!(
+        !source.contains(
+            "local_operation_request_hash(&(\"complete_provider_oauth\", &flow_id, &input))"
+        ) && !source
+            .contains("local_operation_request_hash(&(\"complete_mcp_oauth\", &flow_id, &input))"),
+        "public/durable terminal responses must not retain an unkeyed verifier of OAuth input"
+    );
+    let provider_cancel_branch = source
+        .find("Request::CancelProviderOAuth")
+        .expect("provider cancellation request branch must exist");
+    let provider_source = &source[provider_cancel_branch..];
+    let provider_committed = provider_source
+        .find("Some(DurableOAuthFlow::ProviderCommitted")
+        .expect("provider cancel must inspect the durable committed marker");
+    let provider_terminal_remove = provider_source[provider_committed..]
+        .find("remove_terminal_provider")
+        .expect("provider cancel must clear stale memory without setting cancellation");
+    let provider_cancel = provider_source[provider_committed..]
+        .find("cancel_provider(flow_id")
+        .expect("provider nonterminal state must remain cancellable");
+    assert!(provider_terminal_remove < provider_cancel);
+    let mcp_cancel_branch = source
+        .find("Request::CancelMcpOAuth")
+        .expect("MCP cancellation request branch must exist");
+    let mcp_source = &source[mcp_cancel_branch..];
+    let mcp_committed = mcp_source
+        .find("Some(DurableOAuthFlow::McpCommitted")
+        .expect("MCP cancel must inspect the durable committed marker");
+    let mcp_terminal_remove = mcp_source[mcp_committed..]
+        .find("remove_terminal_mcp")
+        .expect("MCP cancel must clear stale memory without setting cancellation");
+    let mcp_cancel = mcp_source[mcp_committed..]
+        .find("remove_mcp(flow_id")
+        .expect("MCP nonterminal state must remain cancellable");
+    assert!(mcp_terminal_remove < mcp_cancel);
+}
+
+#[test]
+fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
+    let source = include_str!("../agent_management.rs");
+    assert!(source.contains("SealedEditorReplay"));
+    assert!(source.contains("SecretVaultKind::SealedState"));
+    assert!(source.contains("mutate_item_on_conn"));
+    assert!(source.contains("receipt_result.snapshot = None"));
+    assert!(
+        !source.contains("snapshot_json"),
+        "agent editor plaintext must never be assigned to a SQLite row"
+    );
+    let schema = include_str!("../../../../cockpit-db/src/db/migrations/0001_initial.sql");
+    let lease_table = schema
+        .split("CREATE TABLE agent_editor_leases")
+        .nth(1)
+        .and_then(|tail| tail.split("CREATE INDEX agent_editor_leases_open").next())
+        .expect("agent editor lease schema must exist");
+    assert!(lease_table.contains("snapshot_handle"));
+    assert!(lease_table.contains("snapshot_digest"));
+    assert!(!lease_table.contains("snapshot_json"));
+}
+
 #[tokio::test]
 #[cfg(feature = "remote")]
 async fn remote_owner_secret_redaction_failure_acknowledges_durable_outcome_then_poisons_daemon() {

@@ -812,6 +812,15 @@ Cockpit stores durable session data in
 see the exact resolved path). It includes session events and the full assembled
 post-redaction payload for model requests. Retention is disabled by default: no session payloads are pruned unless an operator explicitly configures a positive retention window.
 
+External-editor handoffs keep their replayable agent draft in the encrypted,
+owner-bound secret vault under an opaque lease handle. SQLite contains only the
+workspace/agent target, consumed revision, content digest, opaque handle, and
+settlement metadata—not the plaintext agent markdown. Completing or cancelling
+the lease deletes the sealed payload in the same database transaction that
+records terminal settlement. An expired open lease is likewise removed with
+its sealed payload when reconciliation observes it; retention never deletes an
+open lease row alone and leaves encrypted payload orphaned.
+
 Use `cockpit session delete <session>` to permanently remove one session and all local associated data. The command prompts by default and requires `--yes` when non-interactive. Use `cockpit session purge --before <YYYY-MM-DD|30d>` for ended sessions; start with `--dry-run`. Exporting is not deletion: exports are permanently redacted regardless of provider trust.
 
 ### Limits of the protections

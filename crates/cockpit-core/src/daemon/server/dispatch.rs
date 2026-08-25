@@ -648,6 +648,19 @@ impl OAuthFlowStore {
         self.cancel_provider(id, owner).await
     }
 
+    /// Remove an already-terminal flow without tripping its cancellation
+    /// fence. Callers must hold the owner commit lock and must have observed a
+    /// matching durable committed marker first.
+    async fn remove_terminal_provider(&self, id: &str, owner: &str) -> bool {
+        let mut flows = self.provider.lock().await;
+        flows
+            .get(id)
+            .is_some_and(|flow| flow.owner == owner)
+            .then(|| flows.remove(id))
+            .flatten()
+            .is_some()
+    }
+
     async fn insert_mcp(
         &self,
         id: String,
@@ -748,6 +761,16 @@ impl OAuthFlowStore {
             cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         flows.remove(id).is_some()
+    }
+
+    async fn remove_terminal_mcp(&self, id: &str, owner: &str) -> bool {
+        let mut flows = self.mcp.lock().await;
+        flows
+            .get(id)
+            .is_some_and(|flow| flow.owner == owner)
+            .then(|| flows.remove(id))
+            .flatten()
+            .is_some()
     }
 }
 
@@ -8320,8 +8343,15 @@ async fn handle_serialized_request_impl(
                 b"flycockpit/local-operation/provider-oauth/complete/v1\0",
                 &("complete_provider_oauth", &flow_id, &input),
             )?;
-            let receipt_request_hash =
-                local_operation_request_hash(&("complete_provider_oauth", &flow_id, &input))?;
+            // The public receipt correlation contains no callback/code-derived
+            // verifier. Secret-bearing request identity stays daemon-keyed in
+            // `request_hash`; the wire receipt is bound by the caller nonce and
+            // exact flow while owner binding is enforced by the receipt row.
+            let receipt_request_hash = local_operation_request_hash(&(
+                "complete_provider_oauth_receipt_v2",
+                &client_operation_id,
+                &flow_id,
+            ))?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -8643,15 +8673,36 @@ async fn handle_serialized_request_impl(
             // exact flow had already reached another terminal state.
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             let cancelled = if let Some(flow_id) = resolved_flow_id.as_deref() {
-                let in_memory = ctx.oauth_flows.cancel_provider(flow_id, &owner).await;
-                let durable_ready = matches!(
-                    load_oauth_flow(ctx, flow_id)?,
-                    Some(DurableOAuthFlow::Provider { .. })
-                );
-                if durable_ready {
-                    delete_oauth_flow(ctx, flow_id)?;
+                match load_oauth_flow(ctx, flow_id)? {
+                    Some(DurableOAuthFlow::ProviderCommitted {
+                        owner: durable_owner,
+                        begin_client_operation_id: durable_begin,
+                        ..
+                    }) if durable_owner == owner && durable_begin == begin_client_operation_id => {
+                        // A stale in-memory Completing entry cannot overturn a
+                        // commit. Clear it without setting the cancellation bit
+                        // while the same lock still fences the committer.
+                        ctx.oauth_flows
+                            .remove_terminal_provider(flow_id, &owner)
+                            .await;
+                        false
+                    }
+                    Some(DurableOAuthFlow::Provider {
+                        owner: durable_owner,
+                        begin_client_operation_id: durable_begin,
+                        ..
+                    })
+                    | Some(DurableOAuthFlow::ProviderExchanging {
+                        owner: durable_owner,
+                        begin_client_operation_id: durable_begin,
+                        ..
+                    }) if durable_owner == owner && durable_begin == begin_client_operation_id => {
+                        ctx.oauth_flows.cancel_provider(flow_id, &owner).await;
+                        delete_oauth_flow(ctx, flow_id)?;
+                        true
+                    }
+                    _ => false,
                 }
-                in_memory || durable_ready
             } else {
                 false
             };
@@ -8939,8 +8990,11 @@ async fn handle_serialized_request_impl(
                 b"flycockpit/local-operation/mcp-oauth/complete/v1\0",
                 &("complete_mcp_oauth", &flow_id, &input),
             )?;
-            let receipt_request_hash =
-                local_operation_request_hash(&("complete_mcp_oauth", &flow_id, &input))?;
+            let receipt_request_hash = local_operation_request_hash(&(
+                "complete_mcp_oauth_receipt_v2",
+                &client_operation_id,
+                &flow_id,
+            ))?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -9244,15 +9298,31 @@ async fn handle_serialized_request_impl(
             };
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             let cancelled = if let Some(flow_id) = resolved_flow_id.as_deref() {
-                let in_memory = ctx.oauth_flows.remove_mcp(flow_id, &owner).await;
-                let durable_ready = matches!(
-                    load_oauth_flow(ctx, flow_id)?,
-                    Some(DurableOAuthFlow::Mcp { .. })
-                );
-                if durable_ready {
-                    delete_oauth_flow(ctx, flow_id)?;
+                match load_oauth_flow(ctx, flow_id)? {
+                    Some(DurableOAuthFlow::McpCommitted {
+                        owner: durable_owner,
+                        begin_client_operation_id: durable_begin,
+                        ..
+                    }) if durable_owner == owner && durable_begin == begin_client_operation_id => {
+                        ctx.oauth_flows.remove_terminal_mcp(flow_id, &owner).await;
+                        false
+                    }
+                    Some(DurableOAuthFlow::Mcp {
+                        owner: durable_owner,
+                        begin_client_operation_id: durable_begin,
+                        ..
+                    })
+                    | Some(DurableOAuthFlow::McpExchanging {
+                        owner: durable_owner,
+                        begin_client_operation_id: durable_begin,
+                        ..
+                    }) if durable_owner == owner && durable_begin == begin_client_operation_id => {
+                        ctx.oauth_flows.remove_mcp(flow_id, &owner).await;
+                        delete_oauth_flow(ctx, flow_id)?;
+                        true
+                    }
+                    _ => false,
                 }
-                in_memory || durable_ready
             } else {
                 false
             };

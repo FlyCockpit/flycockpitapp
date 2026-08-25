@@ -159,8 +159,11 @@ async fn complete_provider_oauth(
     let client = crate::tui::settings::settings_daemon_client()
         .await
         .map_err(|e| e.to_string())?;
-    let expected_hash =
-        oauth_request_hash(&("complete_provider_oauth", &flow_id, input.as_deref()))?;
+    let expected_hash = oauth_request_hash(&(
+        "complete_provider_oauth_receipt_v2",
+        &client_operation_id,
+        &flow_id,
+    ))?;
     let request = cockpit_core::daemon::proto::Request::CompleteProviderOAuth {
         client_operation_id: client_operation_id.clone(),
         flow_id: flow_id.clone(),

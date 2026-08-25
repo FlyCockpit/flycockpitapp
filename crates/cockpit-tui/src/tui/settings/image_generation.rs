@@ -756,8 +756,7 @@ pub(super) struct BudgetEditorPage {
     pub(super) state: BudgetEditorState,
     pub(super) policy_version: Option<u64>,
     pub(super) project_epoch: Option<cockpit_config::config::image_spend::ProjectEpochPolicy>,
-    pub(super) loaded_settings:
-        Option<cockpit_config::config::image_spend::ImageSpendSettings>,
+    pub(super) loaded_settings: Option<cockpit_config::config::image_spend::ImageSpendSettings>,
     pub(super) viewport: GenerationViewportMode,
     /// Last save disposition surfaced to the user (owner-RPC result). Never
     /// carries a secret or path — only a stable outcome string.

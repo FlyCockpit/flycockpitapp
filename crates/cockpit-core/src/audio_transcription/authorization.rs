@@ -169,7 +169,10 @@ pub fn transcription_request_digest(
     // Scalars, each length-prefixed and in a fixed order.
     update_lp(&mut hasher, req.provider_id.as_bytes());
     update_lp(&mut hasher, req.model_id.as_bytes());
-    update_lp(&mut hasher, req.credential_fingerprint_digest.as_str().as_bytes());
+    update_lp(
+        &mut hasher,
+        req.credential_fingerprint_digest.as_str().as_bytes(),
+    );
     update_lp(&mut hasher, req.origin.as_bytes());
     update_lp(&mut hasher, req.resolved_location.as_bytes());
     update_lp(&mut hasher, req.project_digest.as_bytes());

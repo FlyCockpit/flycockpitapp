@@ -796,14 +796,17 @@ mod result_tests {
                 .is_err()
         );
         assert!(
-            serde_json::from_str::<DetectedLanguageV1>(r#"{"kind":"applied","code":"en"}"#).is_err()
+            serde_json::from_str::<DetectedLanguageV1>(r#"{"kind":"applied","code":"en"}"#)
+                .is_err()
         );
         // Missing tag, missing code, and unknown fields all reject.
         assert!(serde_json::from_str::<RequestedLanguageV1>(r#"{"code":"en"}"#).is_err());
         assert!(serde_json::from_str::<RequestedLanguageV1>(r#"{"kind":"requested"}"#).is_err());
         assert!(
-            serde_json::from_str::<RequestedLanguageV1>(r#"{"kind":"requested","code":"en","x":1}"#)
-                .is_err()
+            serde_json::from_str::<RequestedLanguageV1>(
+                r#"{"kind":"requested","code":"en","x":1}"#
+            )
+            .is_err()
         );
     }
 

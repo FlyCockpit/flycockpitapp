@@ -597,6 +597,10 @@ mod tests {
             "get_assistant",
             "diagnose_media_reservation",
             "get_doctor_snapshot",
+            "get_agent_inventory",
+            "get_agent_edit_snapshot",
+            "get_extended_config_snapshot",
+            "get_agent_editor_lease_settlement",
         ]);
         #[cfg(feature = "remote")]
         expected.extend(["get_connector_state", "get_org_sync_status"]);

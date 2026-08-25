@@ -313,12 +313,13 @@ fn injected_settings_transport_uses_production_receipt_and_reconciliation_path()
                 client_operation_id: "fixture-operation".into(),
                 request_hash: "aa".repeat(32),
                 mutation_intent_hash: "bb".repeat(32),
-                hash: "revision-2".into(),
+                hash: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243".into(),
                 config_generation: 8,
                 layer_id: layer_id.into(),
                 layer: cockpit_core::daemon::proto::CockpitConfigLayer::Project,
                 consumed_revision: "revision-1".into(),
-                result_revision: "revision-2".into(),
+                result_revision: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243"
+                    .into(),
                 status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
                 publication: cockpit_core::daemon::proto::ConfigPublicationStatus::Published,
                 denylist: Vec::new(),
@@ -330,7 +331,8 @@ fn injected_settings_transport_uses_production_receipt_and_reconciliation_path()
                     display_path: path.display().to_string(),
                     config: Box::new(config.clone()),
                     denylist: Vec::new(),
-                    revision: "revision-2".into(),
+                    revision: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243"
+                        .into(),
                     authored_paths: Vec::new(),
                 }],
                 config_generation: 8,
@@ -369,12 +371,13 @@ fn injected_settings_transport_rejects_wrong_consumed_revision() {
                 client_operation_id: "fixture-operation".into(),
                 request_hash: "aa".repeat(32),
                 mutation_intent_hash: "bb".repeat(32),
-                hash: "revision-2".into(),
+                hash: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243".into(),
                 config_generation: 8,
                 layer_id: "layer-capability".into(),
                 layer: cockpit_core::daemon::proto::CockpitConfigLayer::Project,
                 consumed_revision: "wrong-revision".into(),
-                result_revision: "revision-2".into(),
+                result_revision: "a3f1c2d4e5b6978081726354453627189a0b1c2d3e4f5a6b7c8d9e0f10213243"
+                    .into(),
                 status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
                 publication: cockpit_core::daemon::proto::ConfigPublicationStatus::Published,
                 denylist: Vec::new(),
@@ -7679,6 +7682,9 @@ fn root_children_restore_their_own_root_cursor() {
 fn pressing_a_on_picker_opens_scoped_create_dialog() {
     // The new affordance: `a` on Dialog::PickConfig opens the
     // "where should this config live?" sub-dialog.
+    // Isolate the home layers: discovery must see exactly this fixture, not
+    // whatever concurrent test processes leave under the shared real $HOME.
+    let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
     let tmp = TempDir::new().unwrap();
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();
@@ -7695,6 +7701,8 @@ fn pressing_a_on_picker_opens_scoped_create_dialog() {
 
 #[test]
 fn esc_from_scoped_create_returns_to_picker() {
+    // Hermetic home for the same reason as the sibling `a` test above.
+    let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
     let tmp = TempDir::new().unwrap();
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();

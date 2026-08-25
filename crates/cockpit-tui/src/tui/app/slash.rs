@@ -2725,6 +2725,9 @@ impl App {
     /// the minting session/epoch binding retained with the capability and
     /// awaits a typed spent/already-spent receipt before runner teardown.
     pub(super) async fn settle_known_sealed_capabilities_before_shutdown(&mut self) {
+        for pending in self.pending_sealed_operations.values() {
+            pending.invalidate();
+        }
         let overlay_capability = match std::mem::take(&mut self.overlay) {
             Overlay::Sealed(mut overlay) => overlay.take_pending_write_capability(),
             other => {

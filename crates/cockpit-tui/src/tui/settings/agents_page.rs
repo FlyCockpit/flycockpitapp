@@ -371,13 +371,6 @@ impl AgentsPage {
                         | PendingAgentOperation::CompleteLease { .. }
                 )
             })
-            || self.pending_operations.values().any(|pending| {
-                matches!(
-                    pending,
-                    PendingAgentOperation::BeginLease { .. }
-                        | PendingAgentOperation::CompleteLease { .. }
-                )
-            })
     }
 
     /// Build the page by discovering agents at `cwd`.

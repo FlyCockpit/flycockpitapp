@@ -3269,6 +3269,7 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "setup_copilot_auth"
                 | "put_subscription_ack"
                 | "apply_provider_mutation"
+                | "save_image_spend_policy"
                 | "begin_agent_editor_lease"
                 | "complete_agent_editor_lease"
                 | "get_agent_editor_lease_settlement" => 17,
@@ -3296,7 +3297,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "export_policy"
                 | "import_policy"
                 | "get_image_spend_policy"
-                | "save_image_spend_policy"
                 | "list_packages"
                 | "add_package"
                 | "import_package"
@@ -3366,6 +3366,7 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "mcp_config_committed"
                 | "provider_catalog_snapshot"
                 | "provider_mutation_committed"
+                | "image_spend_policy_saved"
                 | "agent_editor_lease_begun"
                 | "agent_editor_lease_completed"
                 | "extended_config_saved" => 17,
@@ -3380,7 +3381,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "policy_exported"
                 | "policy_imported"
                 | "image_spend_policy"
-                | "image_spend_policy_saved"
                 | "packages"
                 | "package_added"
                 | "package_imported"
@@ -6889,6 +6889,12 @@ mod tests {
                 begin_client_operation_id: "begin-mcp".into(),
                 flow_id: Some("flow".into()),
             },
+            Request::SaveImageSpendPolicy {
+                client_operation_id: "save-image-spend".into(),
+                project_key: "project".into(),
+                settings_json: "{}".into(),
+                expected_policy_version: None,
+            },
             Request::SetupCopilotAuth {
                 client_operation_id: "setup-copilot".into(),
                 project_root: "/tmp/project".into(),
@@ -6973,6 +6979,13 @@ mod tests {
                 result_revision: "11".repeat(32),
                 config_generation: 7,
                 credential_count: 0,
+            },
+            Response::ImageSpendPolicySaved {
+                client_operation_id: "save-image-spend".into(),
+                project_key: "project".into(),
+                request_hash: "99".repeat(32),
+                consumed_policy_version: None,
+                result_policy_version: 1,
             },
             Response::ProviderCredentialCommitted {
                 client_operation_id: "delete-provider".into(),

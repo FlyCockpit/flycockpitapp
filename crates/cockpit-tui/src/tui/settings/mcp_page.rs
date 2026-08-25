@@ -431,6 +431,17 @@ impl SettingsCx {
                     }
                     s.status = Some(format!("cancelled MCP OAuth for `{server}`"));
                 }
+                super::PendingMcpOAuth::AlreadyTerminal { server, flow_id } => {
+                    if s.oauth
+                        .as_ref()
+                        .is_some_and(|flow| flow.server == server && flow.flow_id == flow_id)
+                    {
+                        s.oauth = None;
+                    }
+                    s.status = Some(format!(
+                        "MCP OAuth for `{server}` was already terminal; credential inventory refreshed"
+                    ));
+                }
             }
         }
     }

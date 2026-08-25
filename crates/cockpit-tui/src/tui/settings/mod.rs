@@ -1153,12 +1153,6 @@ enum PendingSettingsOperation {
         project_key: String,
         page_instance_id: uuid::Uuid,
     },
-    BudgetPolicySavePrepare {
-        target: SettingsEffectTarget,
-        project_key: String,
-        settings: cockpit_config::config::image_spend::ImageSpendSettings,
-        page_instance_id: uuid::Uuid,
-    },
     ProviderMutation {
         target: SettingsEffectTarget,
         client_operation_id: String,
@@ -1233,7 +1227,6 @@ impl PendingSettingsOperation {
             Self::ExtendedRefresh { target, .. }
             | Self::ProjectShadowSnapshot { target, .. }
             | Self::ImageSpendLoad { target, .. }
-            | Self::BudgetPolicySavePrepare { target, .. }
             | Self::ProviderMutation { target, .. }
             | Self::Followup { target, .. }
             | Self::SimpleMutation { target, .. }
@@ -1468,13 +1461,14 @@ impl SettingsMutationAction {
                 Response::McpOAuthCancelled {
                     client_operation_id: returned_id,
                     request_hash,
-                    flow_id: Some(returned_flow),
-                    ..
+                    flow_id: returned_flow,
+                    cancelled,
                 },
             ) => {
                 returned_id == client_operation_id
                     && request_hash == expected_request_hash
-                    && returned_flow == flow_id
+                    && (returned_flow.as_deref() == Some(flow_id.as_str())
+                        || (!cancelled && returned_flow.is_none()))
             }
             (
                 Self::McpSave {
@@ -1703,6 +1697,10 @@ enum PendingMcpOAuth {
         flow_id: String,
     },
     Cancelled {
+        server: String,
+        flow_id: String,
+    },
+    AlreadyTerminal {
         server: String,
         flow_id: String,
     },
@@ -2906,34 +2904,6 @@ impl SettingsCx {
         );
     }
 
-    pub(super) fn queue_budget_policy_save(
-        &mut self,
-        project_key: String,
-        settings: cockpit_config::config::image_spend::ImageSpendSettings,
-        page_instance_id: uuid::Uuid,
-    ) {
-        let target = SettingsEffectTarget {
-            surface: "settings.budget-save-prepare",
-            owner: format!("{project_key}::{page_instance_id}"),
-            revision: None,
-        };
-        let operation_id = self.enqueue_daemon_effect(
-            target.clone(),
-            Request::GetImageSpendPolicy {
-                project_key: project_key.clone(),
-            },
-        );
-        self.pending_settings.insert(
-            operation_id,
-            PendingSettingsOperation::BudgetPolicySavePrepare {
-                target,
-                project_key,
-                settings,
-                page_instance_id,
-            },
-        );
-    }
-
     fn queue_image_spend_save(
         &mut self,
         project_key: String,
@@ -3608,50 +3578,6 @@ impl SettingsCx {
                     },
                 });
             }
-            PendingSettingsOperation::BudgetPolicySavePrepare {
-                target,
-                project_key,
-                mut settings,
-                page_instance_id,
-            } => {
-                if completion.target != target {
-                    return Ok(());
-                }
-                match completion.response {
-                    Ok(Response::ImageSpendPolicy {
-                        settings: current,
-                        policy_version,
-                    }) if current.is_some() == policy_version.is_some() => {
-                        // The compact budget editor owns only the three budget
-                        // scopes. Preserve the daemon-owned epoch policy from
-                        // the exact version consumed by this mutation.
-                        settings.project_epoch = current.and_then(|value| value.project_epoch);
-                        if let Err(error) = self.queue_image_spend_save(
-                            project_key,
-                            settings,
-                            policy_version,
-                            page_instance_id,
-                        ) {
-                            self.completed_image_spend = Some(ImageSpendCompletion::Failed {
-                                page_instance_id,
-                                message: error,
-                            });
-                        }
-                    }
-                    Ok(other) => {
-                        self.completed_image_spend = Some(ImageSpendCompletion::Failed {
-                            page_instance_id,
-                            message: format!("unexpected image spend read response: {other:?}"),
-                        });
-                    }
-                    Err(error) => {
-                        self.completed_image_spend = Some(ImageSpendCompletion::Failed {
-                            page_instance_id,
-                            message: error,
-                        });
-                    }
-                }
-            }
             PendingSettingsOperation::ProviderCatalog {
                 project_root,
                 provider_id,
@@ -4064,6 +3990,37 @@ impl SettingsCx {
                         self.pending_mcp_oauth =
                             Some(PendingMcpOAuth::Cancelled { server, flow_id });
                         Ok("MCP OAuth cancelled".to_string())
+                    }
+                    (
+                        SettingsMutationAction::McpOAuthCancel {
+                            server,
+                            flow_id,
+                            client_operation_id,
+                            expected_request_hash,
+                        },
+                        Ok(Response::McpOAuthCancelled {
+                            client_operation_id: returned_operation_id,
+                            request_hash,
+                            flow_id: returned_flow_id,
+                            cancelled: false,
+                            ..
+                        }),
+                    ) => {
+                        if returned_operation_id != client_operation_id
+                            || request_hash != expected_request_hash
+                            || returned_flow_id
+                                .as_deref()
+                                .is_some_and(|returned| returned != flow_id)
+                        {
+                            return Ok(());
+                        }
+                        // False is an authoritative terminal outcome, not a
+                        // failed cancellation. Drop the stale flow UI and
+                        // reconcile daemon-owned credential inventory.
+                        self.invalidate_secret_inventory();
+                        self.pending_mcp_oauth =
+                            Some(PendingMcpOAuth::AlreadyTerminal { server, flow_id });
+                        Ok("MCP OAuth was already terminal; refreshing inventory".to_string())
                     }
                     (
                         SettingsMutationAction::ProviderCredentialDelete {
@@ -7766,8 +7723,9 @@ impl SettingsCx {
     /// The image-generation session capability snapshot for the active session,
     /// from which the Generation node derives its [`GenerationPrincipal`]. The
     /// TUI settings dialog only runs for the LOCAL owner of this daemon (there
-    /// is no remote settings surface), so `local_owner` is a derived fact of
-    /// the host context rather than a hardcoded capability. The `active_project_id`
+    /// is no remote settings surface), but owner affordances are still withheld
+    /// until the app has attached a runner and received a daemon-issued host
+    /// capability generation. The `active_project_id`
     /// is the launch/session project root this dialog is scoped to; remote grant
     /// scopes and ceilings are left empty here and MUST be populated from the
     /// control-plane grant snapshot the day a remote settings surface exists.
@@ -7775,7 +7733,7 @@ impl SettingsCx {
         &self,
     ) -> image_generation::SessionCapabilitySnapshot {
         image_generation::SessionCapabilitySnapshot {
-            local_owner: true,
+            local_owner: self.daemon_attached && self.host_capabilities.generation > 0,
             image_admin_grant_project: None,
             active_project_id: self
                 .active_project_root

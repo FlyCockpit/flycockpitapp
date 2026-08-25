@@ -647,14 +647,6 @@ async fn complete_editor_lease_inner(
     let lease = ctx
         .db
         .transaction(move |conn| {
-            vault
-                .mutate_item_on_conn(
-                    conn,
-                    cockpit_db::secret_vault::SecretVaultKind::SealedState,
-                    &reservation_handle,
-                    Some(sealed_completion.as_slice()),
-                )
-                .map_err(|error| anyhow::anyhow!(error))?;
             let claim = crate::db::agent_editor_leases::reserve_agent_editor_completion_conn(
                 conn,
                 &reservation_lease_id,
@@ -668,6 +660,17 @@ async fn complete_editor_lease_inner(
                 claim,
                 crate::db::agent_editor_leases::AgentEditorCompletionClaim::Execute(_)
             ) {
+                // Only the transaction which wins executable ownership may
+                // publish replay material. A terminal/pending retry must not
+                // reinsert plaintext after another worker has settled it.
+                vault
+                    .mutate_item_on_conn(
+                        conn,
+                        cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                        &reservation_handle,
+                        Some(sealed_completion.as_slice()),
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
                 vault
                     .mutate_item_on_conn(
                         conn,

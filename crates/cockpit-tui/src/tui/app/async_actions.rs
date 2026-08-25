@@ -406,6 +406,11 @@ impl App {
                     self.apply_workspace_trust_completion(completion);
                 }
             }
+            AsyncActionKind::DaemonRpc("sealed.effect") => {
+                if let Ok(AsyncActionPayload::Sealed(completion)) = result.payload {
+                    self.apply_sealed_completion(completion);
+                }
+            }
             AsyncActionKind::DaemonRpc("sessions.list") => {
                 let mut live_ids = None;
                 let mut preview_request = None;

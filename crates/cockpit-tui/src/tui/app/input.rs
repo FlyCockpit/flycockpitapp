@@ -999,9 +999,9 @@ impl App {
                         capability_id,
                         literal,
                     } => {
-                        // Overlay closes (self.overlay is already None); send the
-                        // apply. The literal rides only the apply frame — never
-                        // the transcript, history, or an async payload.
+                        // Overlay closes (self.overlay is already None); move the
+                        // literal into the attached-binding effect. It remains
+                        // zeroizing and never enters transcript or history.
                         self.apply_sealed_write(&capability_id, literal, summary);
                     }
                     SealedOverlayOutcome::Cancel { capability_id } => {

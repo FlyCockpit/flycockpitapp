@@ -50,7 +50,7 @@ mod scrollback_page_in;
 mod session_services;
 mod side_conversation;
 mod skills_pane_actions;
-mod slash;
+pub(super) mod slash;
 mod startup_layout;
 mod subagent_view;
 mod terminal_controls;
@@ -1855,6 +1855,7 @@ pub struct App {
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
     pending_workspace_trust: Option<PendingWorkspaceTrust>,
+    pending_sealed_operations: HashMap<uuid::Uuid, slash::PendingSealedOperation>,
     exit_requested: bool,
     pub(super) active_model_state_generation: u64,
     /// Security disclosures must be fetched from the daemon before a session
@@ -3503,6 +3504,7 @@ impl App {
             launch,
             config_snapshot,
             pending_workspace_trust: None,
+            pending_sealed_operations: HashMap::new(),
             exit_requested: false,
             active_model_state_generation: 0,
             // Existing unit harnesses construct App without an event loop or

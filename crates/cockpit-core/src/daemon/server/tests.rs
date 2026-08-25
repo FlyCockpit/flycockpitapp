@@ -13553,7 +13553,7 @@ async fn retention_tick_runs_one_pass_without_sleep() {
     let session = db.create_session("p", "/x", "Build").await.unwrap();
     db.write(move |conn| {
         conn.execute(
-            "UPDATE sessions SET ended_at = 10, last_active_at = 10 WHERE session_id = ?1",
+            "UPDATE sessions SET started_at = 5, ended_at = 10, last_active_at = 10 WHERE session_id = ?1",
             [session.session_id.to_string()],
         )?;
         conn.execute(

@@ -235,6 +235,98 @@ fn obscured_authority_findings(source: &str) -> Vec<String> {
     visitor.0
 }
 
+/// Syntax-aware filesystem authority inventory. Fully-qualified call paths
+/// are classified by segments, so comments, string literals, whitespace, and
+/// substring tricks cannot hide or manufacture a mutation. Method calls are
+/// intentionally conservative because `OpenOptions`/`File` receivers lose
+/// their concrete type in the AST; reviewed host-I/O exceptions remain bound
+/// to an exact source line below.
+fn filesystem_authority_sites(source: &str) -> Vec<(usize, String)> {
+    const CALL_PATHS: &[&[&str]] = &[
+        &["std", "fs", "write"],
+        &["std", "fs", "remove_file"],
+        &["std", "fs", "remove_dir"],
+        &["std", "fs", "remove_dir_all"],
+        &["std", "fs", "rename"],
+        &["std", "fs", "copy"],
+        &["std", "fs", "hard_link"],
+        &["std", "fs", "create_dir"],
+        &["std", "fs", "create_dir_all"],
+        &["std", "fs", "set_permissions"],
+        &["std", "fs", "try_exists"],
+        &["std", "fs", "File", "create"],
+        &["std", "fs", "OpenOptions", "new"],
+        &["std", "os", "unix", "fs", "symlink"],
+        &["std", "os", "windows", "fs", "symlink_file"],
+        &["std", "os", "windows", "fs", "symlink_dir"],
+        &["tokio", "fs", "write"],
+        &["tokio", "fs", "remove_file"],
+        &["tokio", "fs", "remove_dir"],
+        &["tokio", "fs", "remove_dir_all"],
+        &["tokio", "fs", "rename"],
+        &["tokio", "fs", "copy"],
+        &["tokio", "fs", "hard_link"],
+        &["tokio", "fs", "create_dir"],
+        &["tokio", "fs", "create_dir_all"],
+        &["tokio", "fs", "set_permissions"],
+        &["tokio", "fs", "try_exists"],
+        &["tokio", "fs", "File", "create"],
+        &["tokio", "fs", "OpenOptions", "new"],
+        &["tokio", "fs", "symlink"],
+        &["tokio", "fs", "symlink_file"],
+        &["tokio", "fs", "symlink_dir"],
+        &["cockpit_config", "config", "write_config_bytes_atomic"],
+    ];
+    const SHORT_CALL_PATHS: &[&[&str]] = &[&["File", "create"], &["OpenOptions", "new"]];
+    const MUTATING_METHODS: &[&str] = &[
+        "write",
+        "write_all",
+        "set_len",
+        "append",
+        "truncate",
+        "create",
+        "create_new",
+    ];
+
+    struct Visitor(Vec<(usize, String)>);
+    impl<'ast> Visit<'ast> for Visitor {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref() {
+                let segments = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>();
+                if CALL_PATHS.iter().chain(SHORT_CALL_PATHS).any(|candidate| {
+                    segments.len() == candidate.len()
+                        && segments
+                            .iter()
+                            .zip(candidate.iter())
+                            .all(|(actual, expected)| actual.as_str() == *expected)
+                }) {
+                    self.0.push((call.span().start().line, segments.join("::")));
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            let method = call.method.to_string();
+            if MUTATING_METHODS.contains(&method.as_str()) && call.args.len() == 1 {
+                self.0
+                    .push((call.span().start().line, format!(".{method}")));
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+
+    let file = syn::parse_file(source).expect("production source remains parseable");
+    let mut visitor = Visitor(Vec::new());
+    visitor.visit_file(&file);
+    visitor.0
+}
+
 /// A `*_tests.rs` spelling is not evidence that a module is test-only. Accept
 /// the exclusion only when syn finds an owning `mod` item with `#[cfg(test)]`.
 fn is_explicit_cfg_test_module(path: &Path) -> bool {
@@ -525,8 +617,8 @@ fn blocking_daemon_transport_is_structurally_worker_owned() {
                 &authority,
                 path.ends_with("agent_runner.rs"),
             )
-                .into_iter()
-                .map(|finding| format!("{}: {finding}", path.display())),
+            .into_iter()
+            .map(|finding| format!("{}: {finding}", path.display())),
         );
     }
     assert!(
@@ -814,6 +906,21 @@ fn production_process_and_network_authority_is_exactly_allowlisted() {
             let source = fs::read_to_string(&path).unwrap();
             let production = production_source(&source);
             let relative = path.strip_prefix(repo_root()).unwrap().to_string_lossy();
+            let production_lines = production.lines().collect::<Vec<_>>();
+            for (line_number, authority) in filesystem_authority_sites(&production) {
+                let line = production_lines
+                    .get(line_number.saturating_sub(1))
+                    .copied()
+                    .unwrap_or_default();
+                let allowed = ALLOWED_LINES
+                    .iter()
+                    .any(|(file, exact)| relative == *file && line.trim() == *exact);
+                if !allowed {
+                    findings.push(format!(
+                        "{relative}:{line_number}: syntax-classified filesystem authority: {authority}"
+                    ));
+                }
+            }
             for (line_number, line) in production.lines().enumerate() {
                 for authority in AUTHORITY {
                     if !line.contains(authority) {
@@ -942,8 +1049,20 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         "lock.write(",
         "tokio::fs::write",
         "tokio::fs::remove_file",
+        "tokio::fs::remove_dir",
+        "tokio::fs::remove_dir_all",
+        "tokio::fs::rename",
+        "tokio::fs::copy",
+        "tokio::fs::hard_link",
+        "tokio::fs::create_dir",
         "tokio::fs::create_dir_all",
         "tokio::fs::set_permissions",
+        "tokio::fs::try_exists",
+        "tokio::fs::File::create",
+        "tokio::fs::OpenOptions",
+        "tokio::fs::symlink",
+        "tokio::fs::symlink_file",
+        "tokio::fs::symlink_dir",
         "cockpit_config::config::write_config_bytes_atomic",
         ".write_all(",
     ];
@@ -1101,10 +1220,19 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                         "write",
                         "remove_file",
                         "remove_dir",
+                        "remove_dir_all",
                         "rename",
+                        "copy",
+                        "hard_link",
                         "create_dir",
                         "create_dir_all",
                         "set_permissions",
+                        "try_exists",
+                        "symlink",
+                        "symlink_file",
+                        "symlink_dir",
+                        "File",
+                        "OpenOptions",
                     ]
                     .iter()
                     .any(|name| line.contains(name));
@@ -1132,10 +1260,18 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                     "write",
                     "remove_file",
                     "remove_dir",
+                    "remove_dir_all",
                     "rename",
+                    "copy",
+                    "hard_link",
                     "create_dir",
                     "create_dir_all",
                     "set_permissions",
+                    "try_exists",
+                    "symlink",
+                    "symlink_file",
+                    "symlink_dir",
+                    "File",
                     "OpenOptions",
                 ]
                 .iter()
@@ -1250,4 +1386,49 @@ fn syntax_aware_authority_filter_has_negative_fixtures() {
         );
     }
     assert!(obscured_authority_findings("use std::process::{Command, Stdio};").is_empty());
+}
+
+#[test]
+fn filesystem_authority_classifier_has_path_complete_negative_fixtures() {
+    let source = r#"
+        async fn forbidden(path: &std::path::Path) {
+            tokio::fs::rename(path, path).await.unwrap();
+            tokio::fs::copy(path, path).await.unwrap();
+            tokio::fs::create_dir(path).await.unwrap();
+            tokio::fs::remove_dir_all(path).await.unwrap();
+            tokio::fs::hard_link(path, path).await.unwrap();
+            tokio::fs::File::create(path).await.unwrap();
+            tokio::fs::OpenOptions::new().create(true).open(path).await.unwrap();
+            let _ = tokio::fs::try_exists(path).await.unwrap();
+            #[cfg(unix)] tokio::fs::symlink(path, path).await.unwrap();
+            #[cfg(windows)] tokio::fs::symlink_file(path, path).await.unwrap();
+        }
+        const DECOY: &str = "tokio::fs::remove_file";
+    "#;
+    let sites = filesystem_authority_sites(source);
+    for expected in [
+        "tokio::fs::rename",
+        "tokio::fs::copy",
+        "tokio::fs::create_dir",
+        "tokio::fs::remove_dir_all",
+        "tokio::fs::hard_link",
+        "tokio::fs::File::create",
+        "tokio::fs::OpenOptions::new",
+        "tokio::fs::try_exists",
+        "tokio::fs::symlink",
+        "tokio::fs::symlink_file",
+    ] {
+        assert!(
+            sites.iter().any(|(_, actual)| actual == expected),
+            "missing AST-classified negative fixture {expected}"
+        );
+    }
+    assert_eq!(
+        sites
+            .iter()
+            .filter(|(_, actual)| actual == "tokio::fs::remove_file")
+            .count(),
+        0,
+        "string literals must not manufacture an authority site"
+    );
 }

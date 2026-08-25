@@ -1037,57 +1037,85 @@ impl App {
                     self.apply_startup_guidance_estimate(cwd, active_model, estimate);
                 }
             }
-            AsyncActionKind::DaemonRpc("paste.image_path_admission") => match result.payload {
-                Ok(AsyncActionPayload::ImagePathProbe {
-                    request_id,
-                    request_generation,
-                    terminal_generation,
-                    original: _,
-                    source_draft_generation,
-                    cursor,
-                    admission: Some(admission),
-                }) if terminal_generation == self.terminal_input_generation => {
-                    self.settle_paste_probe(
+            AsyncActionKind::DaemonRpc("paste.image_path_admission") => {
+                let presentation_stale = result.presentation_stale;
+                let action_id = result.id;
+                match result.payload {
+                    Ok(AsyncActionPayload::ImagePathProbe {
                         request_id,
                         request_generation,
+                        terminal_generation,
+                        original: _,
                         source_draft_generation,
                         cursor,
-                        Some(admission),
-                        false,
-                    );
-                }
-                Ok(AsyncActionPayload::ImagePathProbe {
-                    request_id,
-                    request_generation,
-                    terminal_generation,
-                    original: _,
-                    source_draft_generation,
-                    cursor: _,
-                    admission: None,
-                }) if terminal_generation == self.terminal_input_generation => {
-                    self.settle_paste_probe(
+                        admission: Some(admission),
+                    }) if terminal_generation == self.terminal_input_generation => {
+                        self.settle_paste_probe(
+                            request_id,
+                            request_generation,
+                            source_draft_generation,
+                            cursor,
+                            Some(admission),
+                            false,
+                        );
+                    }
+                    Ok(AsyncActionPayload::ImagePathProbe {
                         request_id,
                         request_generation,
+                        terminal_generation,
+                        original: _,
                         source_draft_generation,
-                        0,
-                        None,
-                        true,
-                    );
-                }
-                Err(_) => {
-                    let caps = self.refresh_host_capabilities();
-                    let media = caps.feature(cockpit_core::host_capabilities::FEATURE_MEDIA_DECODE);
-                    if media.is_none_or(|row| !row.state.is_available()) {
-                        self.show_toast(
-                            crate::tui::capability_gate::media_decode_instruct(&caps).display(),
-                            ToastKind::Error,
+                        cursor: _,
+                        admission: None,
+                    }) if terminal_generation == self.terminal_input_generation => {
+                        self.settle_paste_probe(
+                            request_id,
+                            request_generation,
+                            source_draft_generation,
+                            0,
+                            None,
+                            true,
                         );
-                    } else {
-                        self.show_toast("Paste unavailable", ToastKind::Error);
                     }
+                    Err(_) => {
+                        if let Some((request_id, request_generation, source_draft_generation)) =
+                            self.pending_paste_probes
+                                .iter()
+                                .find_map(|(request_id, probe)| {
+                                    (probe.async_action_id == Some(action_id)).then_some((
+                                        *request_id,
+                                        probe.request.paste_generation,
+                                        probe.source_draft_generation,
+                                    ))
+                                })
+                        {
+                            self.settle_paste_probe(
+                                request_id,
+                                request_generation,
+                                source_draft_generation,
+                                0,
+                                None,
+                                true,
+                            );
+                        }
+                        if presentation_stale {
+                            return;
+                        }
+                        let caps = self.refresh_host_capabilities();
+                        let media =
+                            caps.feature(cockpit_core::host_capabilities::FEATURE_MEDIA_DECODE);
+                        if media.is_none_or(|row| !row.state.is_available()) {
+                            self.show_toast(
+                                crate::tui::capability_gate::media_decode_instruct(&caps).display(),
+                                ToastKind::Error,
+                            );
+                        } else {
+                            self.show_toast("Paste unavailable", ToastKind::Error);
+                        }
+                    }
+                    Ok(_) => {}
                 }
-                Ok(_) => {}
-            },
+            }
             AsyncActionKind::Internal("paste.native_image") => match result.payload {
                 Ok(AsyncActionPayload::NativeImagePaste {
                     request_id,

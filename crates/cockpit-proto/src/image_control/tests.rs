@@ -191,3 +191,55 @@ fn image_target_safe_projection_drops_source_urls() {
     let back: ImageTargetSafeV1 = serde_json::from_str(&wire).unwrap();
     assert_eq!(back, projection);
 }
+
+#[test]
+fn image_mutation_capability_debug_is_redacted() {
+    let secret = "ab".repeat(32);
+    let capability = ImageConfigMutationCapabilityV1::new(secret.clone());
+    let debug = format!("{capability:?}");
+    assert!(!debug.contains(&secret));
+    assert!(debug.contains("REDACTED"));
+    assert_eq!(
+        serde_json::to_string(&capability).unwrap(),
+        format!("\"{secret}\"")
+    );
+}
+
+#[test]
+fn image_mutation_capability_decode_requires_exact_lowercase_hex() {
+    assert!(serde_json::from_str::<ImageConfigMutationCapabilityV1>("\"short\"").is_err());
+    assert!(
+        serde_json::from_str::<ImageConfigMutationCapabilityV1>(&format!(
+            "\"{}\"",
+            "AA".repeat(32)
+        ))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_str::<ImageConfigMutationCapabilityV1>(&format!(
+            "\"{}\"",
+            "ab".repeat(32)
+        ))
+        .is_ok()
+    );
+}
+
+#[test]
+fn image_read_authority_fields_are_mandatory() {
+    let missing_capability = serde_json::json!({
+        "schemaVersion": 1,
+        "daemonInstanceId": "daemon",
+        "requestedProjectRoot": "/requested",
+        "canonicalProjectRoot": "/canonical",
+        "targetPath": "/canonical/config.json",
+        "targetRevision": "revision",
+        "configGeneration": 1,
+        "result": {
+            "type": "endpoint_page",
+            "items": [],
+            "nextCursor": null,
+            "snapshotGeneration": "1"
+        }
+    });
+    assert!(serde_json::from_value::<ImageControlReadResponseV1>(missing_capability).is_err());
+}

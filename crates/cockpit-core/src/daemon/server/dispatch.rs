@@ -3718,62 +3718,58 @@ async fn dispatch_image_control_read(
     let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
         .await
         .map_err(internal)?;
-    let (_, extended) = ctx
-        .config_source
-        .load_effective_for_daemon(&cwd, &trust_policy)
+    let layer = image_control_mutations::authoritative_image_layer(ctx, &cwd, &trust_policy)
         .map_err(internal)?;
-    let cfg = &extended.image_generation;
+    let cfg = &layer.registry;
     let config_generation = inventory::current_config_generation();
     let generation = config_generation.to_string();
-    let (target_path, config_revision) =
-        image_control_mutations::authoritative_target_revision(ctx, &cwd).map_err(internal)?;
     let daemon_instance_id = inventory::daemon_instance_id().to_string();
+    let canonical_project_root = cwd.to_string_lossy().into_owned();
+    let target_path = layer.target.to_string_lossy().into_owned();
+    let mutation_capability = image_control_mutations::mint_mutation_capability(
+        ctx,
+        &cwd,
+        &layer.target,
+        &layer.revision,
+        config_generation,
+    )
+    .map_err(internal)?;
+    let authority = image_control_reads::ImageControlReadAuthority {
+        daemon_instance_id,
+        requested_project_root: project_root.clone(),
+        canonical_project_root,
+        target_path,
+        target_revision: layer.revision.clone(),
+        mutation_capability,
+        config_generation,
+    };
     let response = match request {
         Request::ImageEndpointList { limit, cursor, .. } => image_control_reads::endpoint_list(
             cfg,
             &generation,
-            daemon_instance_id,
-            project_root,
+            &authority,
             limit,
             cursor.as_deref(),
         ),
-        Request::ImageEndpointGet { endpoint_id, .. } => image_control_reads::endpoint_get(
-            cfg,
-            &generation,
-            daemon_instance_id,
-            project_root,
-            &endpoint_id,
-        ),
-        Request::ImageTargetList { limit, cursor, .. } => image_control_reads::target_list(
-            cfg,
-            &generation,
-            daemon_instance_id,
-            project_root,
-            limit,
-            cursor.as_deref(),
-        ),
-        Request::ImageTargetGet { target_id, .. } => image_control_reads::target_get(
-            cfg,
-            &generation,
-            daemon_instance_id,
-            project_root,
-            &target_id,
-        ),
+        Request::ImageEndpointGet { endpoint_id, .. } => {
+            image_control_reads::endpoint_get(cfg, &generation, &authority, &endpoint_id)
+        }
+        Request::ImageTargetList { limit, cursor, .. } => {
+            image_control_reads::target_list(cfg, &generation, &authority, limit, cursor.as_deref())
+        }
+        Request::ImageTargetGet { target_id, .. } => {
+            image_control_reads::target_get(cfg, &generation, &authority, &target_id)
+        }
         Request::ImageWorkflowList { limit, cursor, .. } => image_control_reads::workflow_list(
             cfg,
             &generation,
-            daemon_instance_id,
-            project_root,
+            &authority,
             limit,
             cursor.as_deref(),
         ),
-        Request::ImageWorkflowGet { workflow_id, .. } => image_control_reads::workflow_get(
-            cfg,
-            &generation,
-            daemon_instance_id,
-            project_root,
-            &workflow_id,
-        ),
+        Request::ImageWorkflowGet { workflow_id, .. } => {
+            image_control_reads::workflow_get(cfg, &generation, &authority, &workflow_id)
+        }
         // The project_root pre-match already rejected any non-image-control
         // variant, so this arm is unreachable.
         other => {
@@ -3783,13 +3779,7 @@ async fn dispatch_image_control_read(
             )));
         }
     }?;
-    Ok(Response::ImageControlRead(
-        response.with_mutation_capability(
-            target_path.to_string_lossy().into_owned(),
-            config_revision,
-            config_generation,
-        ),
-    ))
+    Ok(Response::ImageControlRead(response))
 }
 
 async fn handle_serialized_request_impl(

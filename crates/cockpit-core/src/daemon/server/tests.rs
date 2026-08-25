@@ -10826,31 +10826,83 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
     trust_workspace_root(&ctx, project.path()).await;
     let project_root = project.path().to_string_lossy().into_owned();
 
-    let make_endpoint = |id: &str| {
-        serde_json::to_string(&ImageEndpoint {
-            id: id.to_string(),
-            adapter: ImageAdapterKind::OpenaiImages,
-            origin: "https://api.openai.com/".to_string(),
-            path_prefix: None,
-            credential_ref: Some("openai-key".to_string()),
-            headers: Vec::new(),
-            allow_insecure_transport: false,
-            location: ImageLocationClass::PublicCloud,
-            enabled: true,
-            route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
-            exclusive_server: false,
-        })
-        .unwrap()
+    let make_endpoint = |id: &str| ImageEndpoint {
+        id: id.to_string(),
+        adapter: ImageAdapterKind::OpenaiImages,
+        origin: "https://api.openai.com/".to_string(),
+        path_prefix: None,
+        credential_ref: Some("openai-key".to_string()),
+        headers: Vec::new(),
+        allow_insecure_transport: false,
+        location: ImageLocationClass::PublicCloud,
+        enabled: true,
+        route_profile_version: IMAGE_GENERATION_ROUTE_PROFILE_VERSION,
+        exclusive_server: false,
     };
+    let make_request =
+        |endpoint: ImageEndpoint,
+         generation: u64,
+         revision: String,
+         capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1| {
+            let change = cockpit_proto::image_control::ImageConfigChangeV1::EndpointUpserted {
+                entity_id: endpoint.id.clone(),
+                entity_generation: "intent".into(),
+                item: cockpit_proto::image_control::ImageEndpointSafeV1::project(
+                    &endpoint,
+                    "intent".into(),
+                ),
+            };
+            let mutation_intent_hash = cockpit_proto::image_control::ImageConfigMutationIntentV1 {
+                project_id: project_root.clone(),
+                expected_config_generation: generation,
+                expected_config_revision: revision.clone(),
+                changes: vec![change],
+            }
+            .sha256()
+            .unwrap();
+            Request::ImageEndpointCreate {
+                client_operation_id: uuid::Uuid::new_v4().to_string(),
+                mutation_intent_hash,
+                project_root: project_root.clone(),
+                endpoint_json: cockpit_proto::SensitiveWirePayload::new(
+                    serde_json::to_string(&endpoint).unwrap(),
+                ),
+                expected_config_generation: generation,
+                expected_config_revision: revision,
+                mutation_capability: capability,
+            }
+        };
 
     // 1) Author a registry through the dedicated RPC.
-    let created = crate::daemon::server::image_control_mutations::dispatch_image_control_mutation(
+    let trust_policy =
+        crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, project.path())
+            .await
+            .unwrap();
+    let layer = crate::daemon::server::image_control_mutations::authoritative_image_layer(
         &ctx,
-        Request::ImageEndpointCreate {
-            project_root: project_root.clone(),
-            endpoint_json: make_endpoint("openai-main"),
-            expected_config_generation: None,
-        },
+        project.path(),
+        &trust_policy,
+    )
+    .unwrap();
+    let generation = inventory::current_config_generation();
+    let capability = crate::daemon::server::image_control_mutations::mint_mutation_capability(
+        &ctx,
+        project.path(),
+        &layer.target,
+        &layer.revision,
+        generation,
+    )
+    .unwrap();
+    let mut state = owner_state();
+    let created = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        make_request(
+            make_endpoint("openai-main"),
+            generation,
+            layer.revision,
+            capability,
+        ),
     )
     .await
     .expect("endpoint create succeeds");
@@ -10886,13 +10938,30 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
     assert!(after_save.contains("Renamed Project"));
 
     // 3) The dedicated RPC still mutates the registry after the settings save.
-    let second = crate::daemon::server::image_control_mutations::dispatch_image_control_mutation(
+    let layer = crate::daemon::server::image_control_mutations::authoritative_image_layer(
         &ctx,
-        Request::ImageEndpointCreate {
-            project_root: project_root.clone(),
-            endpoint_json: make_endpoint("backup-openai"),
-            expected_config_generation: None,
-        },
+        project.path(),
+        &trust_policy,
+    )
+    .unwrap();
+    let generation = inventory::current_config_generation();
+    let capability = crate::daemon::server::image_control_mutations::mint_mutation_capability(
+        &ctx,
+        project.path(),
+        &layer.target,
+        &layer.revision,
+        generation,
+    )
+    .unwrap();
+    let second = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        make_request(
+            make_endpoint("backup-openai"),
+            generation,
+            layer.revision,
+            capability,
+        ),
     )
     .await
     .expect("second endpoint create succeeds after SaveExtendedConfig");
@@ -17495,57 +17564,117 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             workflow_id: "wf-authz".into(),
         },
         "image_endpoint_create" => Request::ImageEndpointCreate {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             endpoint_json: "not json".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_endpoint_update" => Request::ImageEndpointUpdate {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             endpoint_id: "ep-authz".into(),
             endpoint_json: "not json".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_endpoint_delete" => Request::ImageEndpointDelete {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             endpoint_id: "ep-authz".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_target_create" => Request::ImageTargetCreate {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             target_json: "not json".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_target_update" => Request::ImageTargetUpdate {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             target_id: "t-authz".into(),
             target_json: "not json".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_target_delete" => Request::ImageTargetDelete {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             target_id: "t-authz".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_target_set_default" => Request::ImageTargetSetDefault {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             target_id: "t-authz".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_workflow_upload" => Request::ImageWorkflowUpload {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             workflow_json: "not json".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_workflow_bind" => Request::ImageWorkflowBind {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             workflow_id: "wf-authz".into(),
             bindings_json: "not json".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "image_workflow_delete" => Request::ImageWorkflowDelete {
+            client_operation_id: "image-op".into(),
+            mutation_intent_hash: "aa".repeat(32),
             project_root: root.clone(),
             workflow_id: "wf-authz".into(),
-            expected_config_generation: None,
+            expected_config_generation: 1,
+            expected_config_revision: "bb".repeat(32),
+            mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new(
+                "cc".repeat(32),
+            ),
         },
         "save_image_spend_policy" => Request::SaveImageSpendPolicy {
             client_operation_id: "authz-image-save".into(),
@@ -24465,16 +24594,16 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::ImageTargetGet { project_root: "/tmp/project".into(), target_id: "t1".into() }, kind: "image_target_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImageWorkflowList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_workflow_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImageWorkflowGet { project_root: "/tmp/project".into(), workflow_id: "wf1".into() }, kind: "image_workflow_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
-        CommandMetadataCase { request: Request::ImageEndpointCreate { project_root: "/tmp/project".into(), endpoint_json: "{}".into(), expected_config_generation: None }, kind: "image_endpoint_create", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageEndpointUpdate { project_root: "/tmp/project".into(), endpoint_id: "ep1".into(), endpoint_json: "{}".into(), expected_config_generation: None }, kind: "image_endpoint_update", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageEndpointDelete { project_root: "/tmp/project".into(), endpoint_id: "ep1".into(), expected_config_generation: None }, kind: "image_endpoint_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageTargetCreate { project_root: "/tmp/project".into(), target_json: "{}".into(), expected_config_generation: None }, kind: "image_target_create", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageTargetUpdate { project_root: "/tmp/project".into(), target_id: "t1".into(), target_json: "{}".into(), expected_config_generation: None }, kind: "image_target_update", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageTargetDelete { project_root: "/tmp/project".into(), target_id: "t1".into(), expected_config_generation: None }, kind: "image_target_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageTargetSetDefault { project_root: "/tmp/project".into(), target_id: "t1".into(), expected_config_generation: None }, kind: "image_target_set_default", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageWorkflowUpload { project_root: "/tmp/project".into(), workflow_json: "{}".into(), expected_config_generation: None }, kind: "image_workflow_upload", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageWorkflowBind { project_root: "/tmp/project".into(), workflow_id: "wf1".into(), bindings_json: "{}".into(), expected_config_generation: None }, kind: "image_workflow_bind", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
-        CommandMetadataCase { request: Request::ImageWorkflowDelete { project_root: "/tmp/project".into(), workflow_id: "wf1".into(), expected_config_generation: None }, kind: "image_workflow_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageEndpointCreate { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), endpoint_json: "{}".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_endpoint_create", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageEndpointUpdate { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), endpoint_id: "ep1".into(), endpoint_json: "{}".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_endpoint_update", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageEndpointDelete { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), endpoint_id: "ep1".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_endpoint_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageTargetCreate { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), target_json: "{}".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_target_create", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageTargetUpdate { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), target_id: "t1".into(), target_json: "{}".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_target_update", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageTargetDelete { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), target_id: "t1".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_target_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageTargetSetDefault { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), target_id: "t1".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_target_set_default", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageWorkflowUpload { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), workflow_json: "{}".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_workflow_upload", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageWorkflowBind { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), workflow_id: "wf1".into(), bindings_json: "{}".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_workflow_bind", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::ImageWorkflowDelete { client_operation_id: "image-op".into(), mutation_intent_hash: "aa".repeat(32), project_root: "/tmp/project".into(), workflow_id: "wf1".into(), expected_config_generation: 1, expected_config_revision: "bb".repeat(32), mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)) }, kind: "image_workflow_delete", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ListPackages, kind: "list_packages", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::AddPackage { project_root: project_root.clone(), identifier: "pkg".into(), git: None, branch: None, local_path: None, deep: false }, kind: "add_package", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ImportPackage { project_root: project_root.clone(), dir: None, package: None, id: None, as_path: false }, kind: "import_package", session_id: None, audit_path: None, mutating: true },

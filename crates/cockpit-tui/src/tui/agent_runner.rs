@@ -6612,6 +6612,11 @@ mod tests {
             event: proto::image_control::ImageControlEventV1::config_changed(
                 "daemon".into(),
                 "project".into(),
+                "/canonical/project".into(),
+                "/canonical/project/config.json".into(),
+                "revision".into(),
+                proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)),
+                1,
                 proto::image_control::ImageConfigChangeSetSafeV1::new("1".into(), vec![]),
             ),
         };

@@ -222,6 +222,16 @@ where
     deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
 }
 
+fn deserialize_owner_sensitive_metadata_json<'de, D>(
+    deserializer: D,
+) -> std::result::Result<SensitiveWirePayload, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
+        .map(SensitiveWirePayload::new)
+}
+
 fn deserialize_owner_mcp_secret_json<'de, D>(
     deserializer: D,
 ) -> std::result::Result<SensitiveWirePayload, D::Error>
@@ -1941,10 +1951,11 @@ pub enum Request {
         mutation_intent_hash: String,
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
-        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
-        endpoint_json: String,
+        #[serde(deserialize_with = "deserialize_owner_sensitive_metadata_json")]
+        endpoint_json: SensitiveWirePayload,
         expected_config_generation: u64,
         expected_config_revision: String,
+        mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1,
     },
 
     /// LOCAL owner CONFIG MUTATION: replace an existing image endpoint by id
@@ -1956,10 +1967,11 @@ pub enum Request {
         project_root: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         endpoint_id: String,
-        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
-        endpoint_json: String,
+        #[serde(deserialize_with = "deserialize_owner_sensitive_metadata_json")]
+        endpoint_json: SensitiveWirePayload,
         expected_config_generation: u64,
         expected_config_revision: String,
+        mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1,
     },
 
     /// LOCAL owner CONFIG MUTATION: remove an image endpoint by id.
@@ -1972,6 +1984,7 @@ pub enum Request {
         endpoint_id: String,
         expected_config_generation: u64,
         expected_config_revision: String,
+        mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1,
     },
 
     /// LOCAL owner CONFIG MUTATION: append a new image target (opaque JSON).
@@ -1980,10 +1993,11 @@ pub enum Request {
         mutation_intent_hash: String,
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
-        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
-        target_json: String,
+        #[serde(deserialize_with = "deserialize_owner_sensitive_metadata_json")]
+        target_json: SensitiveWirePayload,
         expected_config_generation: u64,
         expected_config_revision: String,
+        mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1,
     },
 
     /// LOCAL owner CONFIG MUTATION: replace an existing image target by id.
@@ -1994,10 +2008,11 @@ pub enum Request {
         project_root: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         target_id: String,
-        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
-        target_json: String,
+        #[serde(deserialize_with = "deserialize_owner_sensitive_metadata_json")]
+        target_json: SensitiveWirePayload,
         expected_config_generation: u64,
         expected_config_revision: String,
+        mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1,
     },
 
     /// LOCAL owner CONFIG MUTATION: remove an image target by id.
@@ -2010,6 +2025,7 @@ pub enum Request {
         target_id: String,
         expected_config_generation: u64,
         expected_config_revision: String,
+        mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1,
     },
 
     /// LOCAL owner CONFIG MUTATION: make the target with `target_id` the single
@@ -2024,6 +2040,7 @@ pub enum Request {
         target_id: String,
         expected_config_generation: u64,
         expected_config_revision: String,
+        mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1,
     },
 
     /// LOCAL owner CONFIG MUTATION: register a new ComfyUI workflow. Owner-only,
@@ -2038,10 +2055,11 @@ pub enum Request {
         mutation_intent_hash: String,
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
-        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
-        workflow_json: String,
+        #[serde(deserialize_with = "deserialize_owner_sensitive_metadata_json")]
+        workflow_json: SensitiveWirePayload,
         expected_config_generation: u64,
         expected_config_revision: String,
+        mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1,
     },
 
     /// LOCAL owner CONFIG MUTATION: replace an existing workflow by id with the
@@ -2055,10 +2073,11 @@ pub enum Request {
         project_root: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         workflow_id: String,
-        #[serde(deserialize_with = "deserialize_owner_provider_metadata_json")]
-        bindings_json: String,
+        #[serde(deserialize_with = "deserialize_owner_sensitive_metadata_json")]
+        bindings_json: SensitiveWirePayload,
         expected_config_generation: u64,
         expected_config_revision: String,
+        mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1,
     },
 
     /// LOCAL owner CONFIG MUTATION: remove a workflow by id. Fails closed if a
@@ -2072,6 +2091,7 @@ pub enum Request {
         workflow_id: String,
         expected_config_generation: u64,
         expected_config_revision: String,
+        mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1,
     },
 
     /// Remove a provider entry through the daemon's trust-aware writer.
@@ -3169,6 +3189,7 @@ impl Request {
                 project_root,
                 expected_config_generation: _,
                 expected_config_revision,
+                mutation_capability,
                 ..
             }
             | Self::ImageEndpointUpdate {
@@ -3177,6 +3198,7 @@ impl Request {
                 project_root,
                 expected_config_generation: _,
                 expected_config_revision,
+                mutation_capability,
                 ..
             }
             | Self::ImageEndpointDelete {
@@ -3185,6 +3207,7 @@ impl Request {
                 project_root,
                 expected_config_generation: _,
                 expected_config_revision,
+                mutation_capability,
                 ..
             }
             | Self::ImageTargetCreate {
@@ -3193,6 +3216,7 @@ impl Request {
                 project_root,
                 expected_config_generation: _,
                 expected_config_revision,
+                mutation_capability,
                 ..
             }
             | Self::ImageTargetUpdate {
@@ -3201,6 +3225,7 @@ impl Request {
                 project_root,
                 expected_config_generation: _,
                 expected_config_revision,
+                mutation_capability,
                 ..
             }
             | Self::ImageTargetDelete {
@@ -3209,6 +3234,7 @@ impl Request {
                 project_root,
                 expected_config_generation: _,
                 expected_config_revision,
+                mutation_capability,
                 ..
             }
             | Self::ImageTargetSetDefault {
@@ -3217,6 +3243,7 @@ impl Request {
                 project_root,
                 expected_config_generation: _,
                 expected_config_revision,
+                mutation_capability,
                 ..
             }
             | Self::ImageWorkflowUpload {
@@ -3225,6 +3252,7 @@ impl Request {
                 project_root,
                 expected_config_generation: _,
                 expected_config_revision,
+                mutation_capability,
                 ..
             }
             | Self::ImageWorkflowBind {
@@ -3233,6 +3261,7 @@ impl Request {
                 project_root,
                 expected_config_generation: _,
                 expected_config_revision,
+                mutation_capability,
                 ..
             }
             | Self::ImageWorkflowDelete {
@@ -3241,6 +3270,7 @@ impl Request {
                 project_root,
                 expected_config_generation: _,
                 expected_config_revision,
+                mutation_capability,
                 ..
             } => {
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
@@ -3248,6 +3278,7 @@ impl Request {
                 for (label, value) in [
                     ("image mutation public intent hash", mutation_intent_hash),
                     ("image configuration revision", expected_config_revision),
+                    ("image mutation capability", &mutation_capability.0),
                 ] {
                     if value.len() != 64
                         || !value
@@ -3885,16 +3916,16 @@ macro_rules! command {
             (Request::ImageWorkflowList { project_root, limit, cursor }, "image_workflow_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
             (Request::ImageWorkflowGet { project_root, workflow_id }, "image_workflow_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|workflow_id:String", [project_root: String => project_root, workflow_id: String => param]);
             (Request::SaveImageSpendPolicy { client_operation_id, project_key, settings_json, expected_policy_version }, "save_image_spend_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|project_key:String|settings_json:String|expected_policy_version:Option<u64>", [client_operation_id: String => param, project_key: String => param, settings_json: String => param, expected_policy_version: Option<u64> => param]);
-            (Request::ImageEndpointCreate { client_operation_id, mutation_intent_hash, project_root, endpoint_json, expected_config_generation, expected_config_revision }, "image_endpoint_create", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_json:String|expected_config_generation:u64|expected_config_revision:String", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_json: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param]);
-            (Request::ImageEndpointUpdate { client_operation_id, mutation_intent_hash, project_root, endpoint_id, endpoint_json, expected_config_generation, expected_config_revision }, "image_endpoint_update", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_id:String|endpoint_json:String|expected_config_generation:u64|expected_config_revision:String", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_id: String => param, endpoint_json: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param]);
-            (Request::ImageEndpointDelete { client_operation_id, mutation_intent_hash, project_root, endpoint_id, expected_config_generation, expected_config_revision }, "image_endpoint_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_id:String|expected_config_generation:u64|expected_config_revision:String", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param]);
-            (Request::ImageTargetCreate { client_operation_id, mutation_intent_hash, project_root, target_json, expected_config_generation, expected_config_revision }, "image_target_create", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_json:String|expected_config_generation:u64|expected_config_revision:String", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_json: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param]);
-            (Request::ImageTargetUpdate { client_operation_id, mutation_intent_hash, project_root, target_id, target_json, expected_config_generation, expected_config_revision }, "image_target_update", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|target_json:String|expected_config_generation:u64|expected_config_revision:String", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, target_json: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param]);
-            (Request::ImageTargetDelete { client_operation_id, mutation_intent_hash, project_root, target_id, expected_config_generation, expected_config_revision }, "image_target_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|expected_config_generation:u64|expected_config_revision:String", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param]);
-            (Request::ImageTargetSetDefault { client_operation_id, mutation_intent_hash, project_root, target_id, expected_config_generation, expected_config_revision }, "image_target_set_default", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|expected_config_generation:u64|expected_config_revision:String", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param]);
-            (Request::ImageWorkflowUpload { client_operation_id, mutation_intent_hash, project_root, workflow_json, expected_config_generation, expected_config_revision }, "image_workflow_upload", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_json:String|expected_config_generation:u64|expected_config_revision:String", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_json: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param]);
-            (Request::ImageWorkflowBind { client_operation_id, mutation_intent_hash, project_root, workflow_id, bindings_json, expected_config_generation, expected_config_revision }, "image_workflow_bind", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|bindings_json:String|expected_config_generation:u64|expected_config_revision:String", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_id: String => param, bindings_json: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param]);
-            (Request::ImageWorkflowDelete { client_operation_id, mutation_intent_hash, project_root, workflow_id, expected_config_generation, expected_config_revision }, "image_workflow_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|expected_config_generation:u64|expected_config_revision:String", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param]);
+            (Request::ImageEndpointCreate { client_operation_id, mutation_intent_hash, project_root, endpoint_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_create", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageEndpointUpdate { client_operation_id, mutation_intent_hash, project_root, endpoint_id, endpoint_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_update", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_id:String|endpoint_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_id: String => param, endpoint_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageEndpointDelete { client_operation_id, mutation_intent_hash, project_root, endpoint_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageTargetCreate { client_operation_id, mutation_intent_hash, project_root, target_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_create", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageTargetUpdate { client_operation_id, mutation_intent_hash, project_root, target_id, target_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_update", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|target_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, target_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageTargetDelete { client_operation_id, mutation_intent_hash, project_root, target_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageTargetSetDefault { client_operation_id, mutation_intent_hash, project_root, target_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_set_default", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageWorkflowUpload { client_operation_id, mutation_intent_hash, project_root, workflow_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_upload", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageWorkflowBind { client_operation_id, mutation_intent_hash, project_root, workflow_id, bindings_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_bind", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|bindings_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_id: String => param, bindings_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageWorkflowDelete { client_operation_id, mutation_intent_hash, project_root, workflow_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
             (Request::DeleteProviderConfig { project_root, provider_id, delete_stored_secrets }, "delete_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|delete_stored_secrets:bool", [project_root: String => project_root, provider_id: String => param, delete_stored_secrets: bool => param]);
             (Request::SetProviderLayerMetadata { project_root, category_defaults_json, on_unlisted_models_fetch }, "set_provider_layer_metadata", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|category_defaults_json:String|on_unlisted_models_fetch:cockpit_config::config::providers::OnUnlistedModelsFetch", [project_root: String => project_root, category_defaults_json: String => param, on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch => param]);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-", []);
@@ -4268,6 +4299,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         // Secret-bearing JSON payloads contribute only a SHA-256 digest, never
         // plaintext, to FCOR's ordinary canonical byte buffer.
         "SensitiveWirePayload" => "sha256-redacted",
+        "crate::image_control::ImageConfigMutationCapabilityV1" => "sha256-redacted",
         "Uuid" => "uuid",
         "Vec<u8>" => "bytes",
         "Option<String>" => "option<string>",

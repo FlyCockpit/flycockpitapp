@@ -552,7 +552,9 @@ fn projection_identity(vault: &crate::secure_key::SecretVault, bytes: Option<&[u
         None => hasher.update(b"flycockpit.agent-projection.absent.v1"),
     }
     let material = hasher.finalize();
-    hex::encode(vault.keyed_identity(b"flycockpit.agent.projection.v1", material.as_slice()))
+    hex::encode(
+        vault.keyed_request_identity(b"flycockpit.agent.projection.v1", material.as_slice()),
+    )
 }
 
 fn agent_mutation_keyed_identity(
@@ -575,7 +577,7 @@ fn agent_mutation_keyed_identity(
     );
     Ok(ctx
         .secret_vault
-        .keyed_identity(b"flycockpit.agent-mutation.request.v1", encoded.as_slice()))
+        .keyed_request_identity(b"flycockpit.agent-mutation.request.v1", encoded.as_slice()))
 }
 
 fn prepare_mutation_plan_sync(
@@ -766,7 +768,7 @@ fn prepare_mutation_plan_sync(
 fn reset_all_projection_identity(vault: &crate::secure_key::SecretVault) -> String {
     let mut digest = Sha256::new();
     digest.update(b"flycockpit.agent-reset-all-targets.v1\0");
-    hex::encode(vault.keyed_identity(
+    hex::encode(vault.keyed_request_identity(
         b"flycockpit.agent.reset-all-projection.v1",
         digest.finalize().as_slice(),
     ))
@@ -804,7 +806,7 @@ fn reset_all_target_projection_identity(
             digest.update(&bytes);
         }
     }
-    Ok(hex::encode(vault.keyed_identity(
+    Ok(hex::encode(vault.keyed_request_identity(
         b"flycockpit.agent.reset-all-targets.v1",
         digest.finalize().as_slice(),
     )))

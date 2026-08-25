@@ -23,6 +23,9 @@ CREATE TABLE assistants (
         json_valid(config_json) AND json_type(config_json) = 'object'
         AND length(CAST(config_json AS BLOB)) <= 1048576
     ),
+    -- Historical column name retained inside the prerelease squash; values
+    -- are HMAC-SHA-256 identities under the installation vault DEK, never
+    -- unkeyed definition digests.
     content_hash TEXT    NOT NULL CHECK (
         length(content_hash) = 64
         AND content_hash = lower(content_hash)

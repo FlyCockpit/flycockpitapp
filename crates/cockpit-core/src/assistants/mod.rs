@@ -256,7 +256,7 @@ fn create_assistant_with_installation_id_sync(
         ..AssistantConfig::default()
     };
     let config_json = serde_json::to_string(&config)?;
-    let content_hash = sha256_hex(markdown.as_bytes());
+    let content_hash = markdown_content_identity(db, &markdown)?;
     let journal = AssistantCreationJournal {
         operation_id: Uuid::new_v4().to_string(),
         name: spec.name.clone(),
@@ -448,6 +448,22 @@ pub fn markdown_content_hash(markdown: &str) -> String {
     sha256_hex(markdown.as_bytes())
 }
 
+/// Stable installation/vault-keyed identity for assistant definition bytes.
+/// Unlike a plain digest this persisted registry token cannot be used as an
+/// offline oracle for guessed prompts.
+pub fn markdown_content_identity(db: &Db, markdown: &str) -> Result<String> {
+    assistant_content_identity(db, markdown.as_bytes())
+}
+
+fn assistant_content_identity(db: &Db, bytes: &[u8]) -> Result<String> {
+    let vault = crate::secure_key::open_for_db(db)
+        .context("opening the assistant content-identity vault")?;
+    Ok(crate::intel::hex_lower(&vault.keyed_request_identity(
+        b"flycockpit.assistant.registry-content.v1",
+        bytes,
+    )))
+}
+
 pub fn definition_revision(row: &AssistantRow, markdown: &str) -> String {
     crate::daemon::authority_token::mint(
         b"assistant-definition-revision/v1",
@@ -542,7 +558,7 @@ fn recover_creation_journal_locked(db: &Db, home: &Path) -> Result<()> {
     {
         bail!("assistant creation journal identity is invalid");
     }
-    if markdown_content_hash(&journal.markdown) != journal.content_hash {
+    if markdown_content_identity(db, &journal.markdown)? != journal.content_hash {
         bail!("assistant creation journal hash does not match exact markdown bytes");
     }
     let target = assistant_definition_path(home);
@@ -565,7 +581,7 @@ fn recover_creation_journal_locked(db: &Db, home: &Path) -> Result<()> {
             bail!("assistant creation journal conflicts with registry row");
         }
         match cockpit_config::config::read_config_file_nofollow(&target)? {
-            Some(bytes) if sha256_hex(&bytes) == journal.content_hash => {}
+            Some(bytes) if assistant_content_identity(db, &bytes)? == journal.content_hash => {}
             Some(_) => bail!("assistant creation target conflicts with journal bytes"),
             None => cockpit_config::config::write_config_bytes_atomic(
                 &target,
@@ -599,7 +615,7 @@ fn recover_creation_journal_locked(db: &Db, home: &Path) -> Result<()> {
     }
     let current = cockpit_config::config::read_config_file_nofollow(&target)?
         .context("assistant definition disappeared during creation recovery")?;
-    if sha256_hex(&current) != journal.content_hash {
+    if assistant_content_identity(db, &current)? != journal.content_hash {
         bail!("assistant creation target conflicts with journal bytes");
     }
     cockpit_config::config::remove_config_file_atomic(&journal_path)?;
@@ -621,8 +637,8 @@ fn recover_definition_journal_locked(db: &Db, row: &AssistantRow) -> Result<()> 
     {
         bail!("assistant definition journal identity no longer matches registry row");
     }
-    if markdown_content_hash(&journal.prior_markdown) != journal.prior_hash
-        || markdown_content_hash(&journal.next_markdown) != journal.next_hash
+    if markdown_content_identity(db, &journal.prior_markdown)? != journal.prior_hash
+        || markdown_content_identity(db, &journal.next_markdown)? != journal.next_hash
     {
         bail!("assistant definition journal hashes do not match exact stored bytes");
     }
@@ -634,7 +650,7 @@ fn recover_definition_journal_locked(db: &Db, row: &AssistantRow) -> Result<()> 
     let target = assistant_definition_path(home);
     let current = cockpit_config::config::read_config_file_nofollow(&target)?
         .context("assistant definition is missing during journal recovery")?;
-    let current_hash = sha256_hex(&current);
+    let current_hash = assistant_content_identity(db, &current)?;
     if current_hash != journal.prior_hash && current_hash != journal.next_hash {
         bail!("assistant definition bytes conflict with both journal versions");
     }
@@ -785,10 +801,10 @@ fn snapshot_from_row_sync(db: &Db, row: AssistantRow) -> Result<AssistantSnapsho
             ),
         ));
     }
-    if sha256_hex(&bytes) != row.content_hash {
+    if assistant_content_identity(db, &bytes)? != row.content_hash {
         return Ok(unavailable(
             row,
-            "assistant definition does not match the registry content hash".into(),
+            "assistant definition does not match the registry content identity".into(),
         ));
     }
     let markdown = match String::from_utf8(bytes) {
@@ -862,7 +878,7 @@ fn save_definition_cas_sync(
         .context("assistant definition is missing")?;
     let current = String::from_utf8(current).context("assistant definition is not valid UTF-8")?;
     if definition_revision(&row, &current) != expected_revision
-        || row.content_hash != markdown_content_hash(&current)
+        || row.content_hash != markdown_content_identity(db, &current)?
     {
         bail!("assistant definition or registry changed; reload before saving");
     }
@@ -871,7 +887,7 @@ fn save_definition_cas_sync(
     if current == markdown {
         return Ok(row);
     }
-    let next_hash = markdown_content_hash(&markdown);
+    let next_hash = markdown_content_identity(db, &markdown)?;
     let journal = DefinitionSaveJournal {
         name: row.name.clone(),
         home_dir: row.home_dir.clone(),

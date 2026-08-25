@@ -628,9 +628,9 @@ mod tests {
         // Drift guard: `write_assistant_home` duplicates the file-writing half
         // of `cockpit_core::assistants::create_assistant` (cockpit-core is out
         // of scope to refactor). Build a home both ways from the same spec and
-        // assert the on-disk definition BYTES and the content hash are
-        // identical, so a future core change to fields/ordering/format fails
-        // here instead of silently producing incompatible homes.
+        // assert the on-disk definition BYTES are identical and the registry
+        // identity is the vault-keyed identity of those bytes, so a future
+        // core change cannot silently restore an offline-verifiable digest.
         let temp = tempfile::tempdir().unwrap();
         let core_home = temp.path().join("core").join("helper-bot");
         let cli_home = temp.path().join("cli").join("helper-bot");
@@ -644,7 +644,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (_config_json, cli_hash) = write_assistant_home_with_installation_id(
+        let (_config_json, _legacy_cli_hash) = write_assistant_home_with_installation_id(
             &sample_spec(cli_home.clone()),
             installation_id,
         )
@@ -656,9 +656,16 @@ mod tests {
             core_md, cli_md,
             "assistant.md bytes must match cockpit-core's create_assistant"
         );
+        let markdown = std::str::from_utf8(&cli_md).unwrap();
         assert_eq!(
-            core_row.content_hash, cli_hash,
-            "content hash must match cockpit-core's create_assistant"
+            core_row.content_hash,
+            cockpit_core::assistants::markdown_content_identity(&db, markdown).unwrap(),
+            "persisted content identity must be vault-keyed over the exact assistant bytes"
+        );
+        assert_ne!(
+            core_row.content_hash,
+            markdown_content_hash(markdown),
+            "persisted content identity must not be an offline-verifiable markdown digest"
         );
     }
 

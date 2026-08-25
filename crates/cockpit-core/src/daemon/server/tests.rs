@@ -884,12 +884,14 @@ async fn upsert_assistant_rpc_creates_daemon_owned_definition() {
         panic!("expected assistant")
     };
     assert_eq!(assistant.name, "reviewer");
-    let expected_hash = crate::assistants::markdown_content_hash(
+    let expected_hash = crate::assistants::markdown_content_identity(
+        &ctx.db,
         assistant
             .definition_markdown
             .as_deref()
             .expect("daemon returns the authored assistant markdown"),
-    );
+    )
+    .unwrap();
     assert_eq!(
         ctx.db.list_assistants().await.unwrap()[0].content_hash,
         expected_hash

@@ -5896,7 +5896,7 @@ async fn handle_serialized_request_impl(
                 name.clone(),
                 "save",
                 expected_revision.clone(),
-                Some(ctx.secret_vault.keyed_identity(
+                Some(ctx.secret_vault.keyed_request_identity(
                     b"flycockpit.assistant.intended-markdown.v1",
                     markdown.as_bytes(),
                 )),
@@ -6357,10 +6357,11 @@ async fn handle_serialized_request_impl(
             }
             let tombstone_material =
                 zeroize::Zeroizing::new(format!("{name}\0{expected_revision}").into_bytes());
-            let result_revision = crate::intel::hex_lower(&ctx.secret_vault.keyed_identity(
-                b"flycockpit.assistant.delete-tombstone.v1",
-                tombstone_material.as_slice(),
-            ));
+            let result_revision =
+                crate::intel::hex_lower(&ctx.secret_vault.keyed_request_identity(
+                    b"flycockpit.assistant.delete-tombstone.v1",
+                    tombstone_material.as_slice(),
+                ));
             let result_config_generation = inventory::publish_committed_config_generation();
             let response = Response::AssistantDeleted {
                 client_operation_id: client_operation_id.clone(),
@@ -6872,7 +6873,7 @@ async fn handle_serialized_request_impl(
                 serde_json::to_vec(&(&project_root, &mutation, expected_revision.as_deref()))
                     .map_err(internal)?,
             );
-            let request_hash = ctx.secret_vault.keyed_identity(
+            let request_hash = ctx.secret_vault.keyed_request_identity(
                 b"flycockpit.agent-mutation.request.v2",
                 request_material.as_slice(),
             );
@@ -14377,7 +14378,7 @@ fn assistant_mutation_request_identity(
         ))
         .map_err(internal)?,
     );
-    Ok(ctx.secret_vault.keyed_identity(
+    Ok(ctx.secret_vault.keyed_request_identity(
         b"flycockpit.assistant-mutation.request.v2",
         encoded.as_slice(),
     ))
@@ -14644,7 +14645,7 @@ pub(super) async fn recover_assistant_mutation_journals(
             .as_ref()
             .and_then(|snapshot| snapshot.definition_markdown.as_deref())
             .map(|markdown| {
-                ctx.secret_vault.keyed_identity(
+                ctx.secret_vault.keyed_request_identity(
                     b"flycockpit.assistant.intended-markdown.v1",
                     markdown.as_bytes(),
                 )
@@ -14752,7 +14753,7 @@ pub(super) async fn recover_assistant_mutation_journals(
                         let material = zeroize::Zeroizing::new(
                             format!("{}\0{}", row.name, row.consumed_revision).into_bytes(),
                         );
-                        crate::intel::hex_lower(&ctx.secret_vault.keyed_identity(
+                        crate::intel::hex_lower(&ctx.secret_vault.keyed_request_identity(
                             b"flycockpit.assistant.delete-tombstone.v1",
                             material.as_slice(),
                         ))

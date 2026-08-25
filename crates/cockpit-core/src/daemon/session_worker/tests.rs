@@ -3033,7 +3033,7 @@ async fn assistant_session_root_agent_loads_assistant_definition() {
             name: "helper-bot".to_string(),
             description: "Helper bot".to_string(),
             prompt: "ASSISTANT_DEFINITION_MARKER".to_string(),
-            home_dir: tmp.path().join("assistants/helper-bot"),
+            home_dir: crate::assistants::default_home_dir("helper-bot").unwrap(),
         },
     )
     .await
@@ -4477,15 +4477,25 @@ async fn invalid_stored_tool_surface_override_falls_back() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let session = Session::create_for_test(
-        db,
+        db.clone(),
         tmp.path().to_path_buf(),
         "Build",
         crate::session::test_redaction_key_resolver(),
     )
     .unwrap();
-    session
-        .set_tool_surface_override_json(Some("not json".to_string()))
-        .unwrap();
+    // Bypass the CHECK constraint on tool_surface_override_json to simulate
+    // pre-migration invalid data that must fall back gracefully on read.
+    db.write(move |conn| {
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON")?;
+        conn.execute(
+            "UPDATE sessions SET tool_surface_override_json = 'not json' WHERE session_id = ?1",
+            [session.id.to_string()],
+        )?;
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
 
     assert_eq!(stored_tool_surface_override(&session), None);
 }

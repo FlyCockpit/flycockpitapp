@@ -2,7 +2,7 @@ use super::{
     App, FooterAgentPicker, FooterHitArea, FooterModePicker, FooterPickerKind, FooterPickerRowHit,
     HistoryEntry, Overlay,
 };
-use crate::tui::agent_runner::{AgentRunner, ClientTasks, ControlRequest, UsageCounts};
+use crate::tui::agent_runner::{AgentRunner, ControlRequest};
 use crate::tui::settings::Dialog;
 use cockpit_config::extended::LlmMode;
 use cockpit_core::daemon::proto::Request;
@@ -13,8 +13,6 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 use std::fs;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 fn press(code: KeyCode) -> KeyEvent {
@@ -42,56 +40,10 @@ fn app(tmp: &tempfile::TempDir) -> App {
     app
 }
 
-fn runner_with_control_tx(control_tx: mpsc::Sender<ControlRequest>) -> AgentRunner {
-    let (input_tx, _input_rx) = mpsc::channel::<crate::tui::agent_runner::RunnerInput>(8);
-    let (record_tx, _record_rx) = mpsc::channel(1);
-    let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
-    AgentRunner {
-        input_tx,
-        record_tx,
-        control_tx,
-        attached_request_tx,
-        events: Arc::new(Mutex::new(Vec::new())),
-        event_notify: Arc::new(tokio::sync::Notify::new()),
-        active_agent: Arc::new(Mutex::new("Build".to_string())),
-        active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
-        skill_inventory_names: Arc::new(Mutex::new(None)),
-        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
-        active_model_state: None,
-        session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
-        attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        submission_session_tx: tokio::sync::watch::channel(
-            crate::tui::agent_runner::SubmissionSessionBinding::unbound(),
-        )
-        .0,
-        awaiting_durable: Default::default(),
-        short_id: "abc123".to_string(),
-        project_id: "project".to_string(),
-        usage: UsageCounts::default(),
-        owns_daemon: false,
-        socket: PathBuf::from("/tmp/cockpit-test.sock"),
-        history: Vec::new(),
-        paused_work: Vec::new(),
-        repair_required: None,
-        btw_fork: None,
-        daemon_version: "test".to_string(),
-        daemon_compatible: true,
-        current_client: None,
-        attach_context: None,
-        last_applied_seq: None,
-        client_tasks: ClientTasks::default(),
-        #[cfg(test)]
-        test_session_switch_rx: Arc::new(Mutex::new(None)),
-        #[cfg(test)]
-        test_force_can_switch: false,
-        test_advance_epoch_when_switch_task_created: false,
-    }
-}
-
 fn app_with_runner(tmp: &tempfile::TempDir) -> (App, mpsc::Receiver<ControlRequest>) {
     let mut app = app(tmp);
     let (control_tx, control_rx) = mpsc::channel(8);
-    app.agent_runner = Some(Ok(runner_with_control_tx(control_tx)));
+    app.agent_runner = Some(Ok(AgentRunner::stub_with_control_tx(control_tx)));
     (app, control_rx)
 }
 

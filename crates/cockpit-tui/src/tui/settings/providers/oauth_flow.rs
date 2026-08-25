@@ -470,8 +470,8 @@ impl OAuthFlowState {
         self.logged_in = false;
         self.session = OAuthSession::Device {
             flow_id: self.flow_id.0.to_string(),
-            verification_uri: login.verification_uri,
-            user_code: login.user_code,
+            verification_uri: login.verification_uri.clone(),
+            user_code: login.user_code.clone(),
         };
     }
 

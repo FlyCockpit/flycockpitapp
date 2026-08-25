@@ -785,7 +785,7 @@ impl Approver {
         &self,
         facts: &ImageGenerationAuthzFacts<'_>,
     ) -> Result<Decision> {
-        let digest_prefix: String = facts.plan_digest.chars().take(12).collect();
+        let digest_prefix: String = facts.plan_digest.as_str().chars().take(12).collect();
         let destination_count = facts.destinations.len();
         // Disclose the redacted output write-authority identity so the human
         // sees WHERE artifacts will be written. It is a stable label/digest,

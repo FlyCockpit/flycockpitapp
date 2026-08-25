@@ -616,10 +616,39 @@ fn looks_like_raw_url(s: &str) -> bool {
 /// The projection is review-only and cannot edit the plan. Every
 /// authority-affecting mutation changes the digest; display rename
 /// alone does not.
-pub fn plan_projection_digest(projection: &ImageGenerationPlanProjection) -> Result<String> {
+/// The digest of an immutable image-generation plan projection, threaded into
+/// [`crate::approval::AuthorizationRequest::ImageGeneration`] to identify the
+/// exact plan under decision without carrying its prompt text or references.
+///
+/// The inner hex string is private and its ONLY production constructor is
+/// [`plan_projection_digest`]: raw/attacker-controlled strings can never be
+/// wrapped as a `PlanDigest` and reach the persisted interrupt-prompt sink
+/// (`approval/policy.rs`), which reads only [`PlanDigest::as_str`]. This is the
+/// type-safety half of the inc1-review hard constraint for real dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanDigest(String);
+
+impl PlanDigest {
+    /// The lowercase-hex digest string, for display/prefixing at the authz
+    /// boundary. Read-only: there is no public way to construct a `PlanDigest`
+    /// from an arbitrary string in production.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Test-only raw constructor. `#[cfg(test)]`-gated so production code cannot
+    /// bypass [`plan_projection_digest`]; tests may synthesize a digest without
+    /// assembling a full projection.
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+pub fn plan_projection_digest(projection: &ImageGenerationPlanProjection) -> Result<PlanDigest> {
     let bytes = serde_json::to_vec(projection)?;
     ensure!(!bytes.is_empty(), "plan projection must not be empty");
-    Ok(hex_lower(&Sha256::digest(&bytes)))
+    Ok(PlanDigest(hex_lower(&Sha256::digest(&bytes))))
 }
 
 /// Compute the risk tier for a generate-image request given the

@@ -269,8 +269,11 @@ pub enum AuthorizationRequest<'a> {
     /// this seam.
     ImageGeneration {
         /// Digest of the immutable plan projection under decision. Identifies
-        /// the exact plan without carrying its prompt text or references.
-        plan_digest: &'a str,
+        /// the exact plan without carrying its prompt text or references. The
+        /// [`crate::image_generation_agent_tools::PlanDigest`] newtype makes a
+        /// raw string unrepresentable here (its only prod constructor is the
+        /// projection-digest computation).
+        plan_digest: &'a crate::image_generation_agent_tools::PlanDigest,
         /// Redacted per-destination facts (target id, location class, adapter
         /// kind). No endpoint URLs, credentials, or workflow bytes.
         destinations: &'a [crate::image_generation_agent_tools::ProjectionDestination],
@@ -316,7 +319,7 @@ pub enum AuthorizationRequest<'a> {
 /// dispatch. Every field mirrors the variant's redacted contract — no prompt
 /// text, provider secret, or workflow bytes.
 pub(super) struct ImageGenerationAuthzFacts<'a> {
-    pub plan_digest: &'a str,
+    pub plan_digest: &'a crate::image_generation_agent_tools::PlanDigest,
     pub destinations: &'a [crate::image_generation_agent_tools::ProjectionDestination],
     pub fanout: u32,
     pub total_outputs: u32,
@@ -2329,7 +2332,7 @@ mod tests {
     /// input so a broken arm gives a different answer.
     struct ImgGenScenario {
         destinations: Vec<crate::image_generation_agent_tools::ProjectionDestination>,
-        plan_digest: String,
+        plan_digest: crate::image_generation_agent_tools::PlanDigest,
         output_path_authority: String,
         fanout: u32,
         total_outputs: u32,
@@ -2361,7 +2364,9 @@ mod tests {
                     adapter_kind: "openai_images".to_string(),
                 }],
                 // A non-empty digest prefix so the prompt copy is meaningful.
-                plan_digest: "0123456789abcdef0123".to_string(),
+                plan_digest: crate::image_generation_agent_tools::PlanDigest::from_raw_for_test(
+                    "0123456789abcdef0123",
+                ),
                 output_path_authority: "session-write-scope".to_string(),
                 fanout: 1,
                 total_outputs: 1,

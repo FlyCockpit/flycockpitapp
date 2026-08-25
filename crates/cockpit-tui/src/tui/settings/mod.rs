@@ -927,6 +927,16 @@ enum PendingSettingsOperation {
         target: SettingsEffectTarget,
         action: SettingsMutationAction,
     },
+    SettlementQuery {
+        target: SettingsEffectTarget,
+        client_operation_id: String,
+        original: Box<PendingSettingsOperation>,
+    },
+    SettlementUnknown {
+        target: SettingsEffectTarget,
+        client_operation_id: String,
+        original: Box<PendingSettingsOperation>,
+    },
     TypedDocumentEdit {
         target: SettingsEffectTarget,
         requested_path: String,
@@ -947,8 +957,8 @@ enum PendingSettingsOperation {
 }
 
 impl PendingSettingsOperation {
-    fn target_matches(&self, actual: &SettingsEffectTarget) -> bool {
-        let expected = match self {
+    fn target(&self) -> SettingsEffectTarget {
+        match self {
             Self::ExtendedLoad {
                 requested_path,
                 snapshot_session_id,
@@ -972,6 +982,8 @@ impl PendingSettingsOperation {
             | Self::ProviderMutation { target, .. }
             | Self::Followup { target, .. }
             | Self::SimpleMutation { target, .. }
+            | Self::SettlementQuery { target, .. }
+            | Self::SettlementUnknown { target, .. }
             | Self::TypedDocumentEdit { target, .. }
             | Self::CategoryExternalPrepare { target, .. }
             | Self::CategoryExternalRead { target, .. } => target.clone(),
@@ -989,8 +1001,11 @@ impl PendingSettingsOperation {
                 ),
                 revision: Some(snapshot_session_id.clone()),
             },
-        };
-        expected == *actual
+        }
+    }
+
+    fn target_matches(&self, actual: &SettingsEffectTarget) -> bool {
+        self.target() == *actual
     }
 }
 
@@ -1015,6 +1030,7 @@ enum TypedDocumentEditAction {
     RemoveProjectShadow(category::ShadowedGlobalPrompt),
 }
 
+#[derive(Clone)]
 enum SettingsMutationAction {
     McpSave {
         config: cockpit_core::mcp::config::McpConfig,
@@ -1050,6 +1066,104 @@ enum SettingsMutationAction {
         client_operation_id: String,
         project_root: String,
     },
+}
+
+impl SettingsMutationAction {
+    fn settlement_id(&self) -> Option<&str> {
+        match self {
+            Self::McpSave {
+                client_operation_id,
+                ..
+            }
+            | Self::ProviderCredentialDelete {
+                client_operation_id,
+                ..
+            }
+            | Self::ProviderCredentialPut {
+                client_operation_id,
+                ..
+            }
+            | Self::WebCredentialPut {
+                client_operation_id,
+                ..
+            }
+            | Self::CopilotSetup {
+                client_operation_id,
+                ..
+            } => Some(client_operation_id),
+            _ => None,
+        }
+    }
+
+    fn matches_durable_receipt(&self, response: &Response) -> bool {
+        match (self, response) {
+            (
+                Self::McpSave {
+                    client_operation_id,
+                    project_root,
+                    ..
+                },
+                Response::McpConfigCommitted {
+                    client_operation_id: returned_id,
+                    project_root: returned_root,
+                    ..
+                },
+            ) => returned_id == client_operation_id && returned_root == project_root,
+            (
+                Self::ProviderCredentialDelete {
+                    provider_id,
+                    client_operation_id,
+                    project_root,
+                },
+                Response::ProviderCredentialCommitted {
+                    client_operation_id: returned_id,
+                    provider_id: returned_provider,
+                    project_root: Some(returned_root),
+                    stored: false,
+                    ..
+                },
+            ) => {
+                returned_id == client_operation_id
+                    && returned_provider == provider_id
+                    && returned_root == project_root
+            }
+            (
+                Self::ProviderCredentialPut {
+                    provider_id,
+                    client_operation_id,
+                }
+                | Self::WebCredentialPut {
+                    provider_id,
+                    client_operation_id,
+                },
+                Response::ProviderCredentialCommitted {
+                    client_operation_id: returned_id,
+                    provider_id: returned_provider,
+                    project_root: None,
+                    stored: true,
+                    ..
+                },
+            ) => returned_id == client_operation_id && returned_provider == provider_id,
+            (
+                Self::CopilotSetup {
+                    provider_id,
+                    client_operation_id,
+                    project_root,
+                },
+                Response::CopilotAuthCommitted {
+                    client_operation_id: returned_id,
+                    provider_id: returned_provider,
+                    project_root: returned_root,
+                    ..
+                },
+            ) => {
+                returned_id == client_operation_id
+                    && returned_provider == provider_id
+                    && returned_root == project_root
+            }
+            _ => false,
+        }
+    }
 }
 
 enum CompletedProviderAuthMutation {
@@ -2220,6 +2334,52 @@ impl SettingsCx {
         operation_id
     }
 
+    fn queue_settlement_query(
+        &mut self,
+        client_operation_id: String,
+        original: PendingSettingsOperation,
+    ) {
+        let target = SettingsEffectTarget {
+            surface: "settings.settlement-query",
+            owner: client_operation_id.clone(),
+            revision: Some(client_operation_id.clone()),
+        };
+        let operation_id = self.enqueue_daemon_effect(
+            target.clone(),
+            Request::GetLocalOperationSettlement {
+                client_operation_id: client_operation_id.clone(),
+            },
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::SettlementQuery {
+                target,
+                client_operation_id,
+                original: Box::new(original),
+            },
+        );
+        self.extended_warnings =
+            vec!["operation settlement is unknown; querying the daemon receipt…".into()];
+    }
+
+    fn retry_unknown_settlement(&mut self) {
+        let unknown_id = self.pending_settings.iter().find_map(|(id, pending)| {
+            matches!(pending, PendingSettingsOperation::SettlementUnknown { .. }).then_some(*id)
+        });
+        let Some(unknown_id) = unknown_id else {
+            return;
+        };
+        let Some(PendingSettingsOperation::SettlementUnknown {
+            client_operation_id,
+            original,
+            ..
+        }) = self.pending_settings.remove(&unknown_id)
+        else {
+            return;
+        };
+        self.queue_settlement_query(client_operation_id, *original);
+    }
+
     fn enqueue_daemon_work(
         &mut self,
         target: SettingsEffectTarget,
@@ -2584,6 +2744,16 @@ impl SettingsCx {
                 if completion.target != target {
                     return Ok(());
                 }
+                let settlement_pending = PendingSettingsOperation::ProviderMutation {
+                    target: target.clone(),
+                    client_operation_id: client_operation_id.clone(),
+                    snapshot_session_id: snapshot_session_id.clone(),
+                    layer_id: layer_id.clone(),
+                    expected_revision: expected_revision.clone(),
+                    expected_generation,
+                    staged_default: staged_default.clone(),
+                    notice: notice.clone(),
+                };
                 match completion.response {
                     Ok(Response::ProviderMutationCommitted {
                         client_operation_id: returned_operation_id,
@@ -2630,21 +2800,12 @@ impl SettingsCx {
                         }
                     }
                     Ok(other) => {
-                        let error = format!("unexpected provider mutation response: {other:?}");
-                        self.extended_warnings = vec![error.clone()];
-                        self.completed_provider_mutation = Some(Err(error.clone()));
-                        self.pending_provider_mutation_navigation = None;
-                        if self.pending_provider_add.take().is_some() {
-                            self.completed_provider_add = Some(Err(error));
-                        }
+                        tracing::warn!(response = ?other, "provider mutation returned an unbound receipt; resolving durable settlement");
+                        self.queue_settlement_query(client_operation_id, settlement_pending);
                     }
                     Err(error) => {
-                        self.extended_warnings = vec![format!("provider save failed: {error}")];
-                        self.completed_provider_mutation = Some(Err(error.clone()));
-                        self.pending_provider_mutation_navigation = None;
-                        if self.pending_provider_add.take().is_some() {
-                            self.completed_provider_add = Some(Err(error));
-                        }
+                        tracing::warn!(%error, "provider mutation transport/daemon outcome is ambiguous; resolving durable settlement");
+                        self.queue_settlement_query(client_operation_id, settlement_pending);
                     }
                 }
             }
@@ -2882,6 +3043,18 @@ impl SettingsCx {
                 if completion.target != target {
                     return Ok(());
                 }
+                if let Some(client_operation_id) = action.settlement_id().map(str::to_owned)
+                    && completion
+                        .response
+                        .as_ref()
+                        .map_or(true, |response| !action.matches_durable_receipt(response))
+                {
+                    self.queue_settlement_query(
+                        client_operation_id,
+                        PendingSettingsOperation::SimpleMutation { target, action },
+                    );
+                    return Ok(());
+                }
                 let result = match (action, completion.response) {
                     (
                         SettingsMutationAction::McpSave {
@@ -3107,6 +3280,87 @@ impl SettingsCx {
                     Ok(status) => status,
                     Err(error) => format!("settings operation failed: {error}"),
                 }];
+            }
+            PendingSettingsOperation::SettlementQuery {
+                target,
+                client_operation_id,
+                original,
+            } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                match completion.response {
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id: returned_id,
+                        pending: false,
+                        response: Some(response),
+                    }) if returned_id == client_operation_id => {
+                        let original = *original;
+                        let original_target = original.target();
+                        self.pending_settings
+                            .insert(completion.operation_id, original);
+                        return self.apply_general_completion(SettingsDaemonEffectCompletion {
+                            dialog_id: completion.dialog_id,
+                            operation_id: completion.operation_id,
+                            target: original_target,
+                            response: Ok(*response),
+                            committed_refresh_needed: None,
+                        });
+                    }
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id: returned_id,
+                        pending: true,
+                        response: None,
+                    }) if returned_id == client_operation_id => {
+                        self.pending_settings.insert(
+                            completion.operation_id,
+                            PendingSettingsOperation::SettlementUnknown {
+                                target,
+                                client_operation_id,
+                                original,
+                            },
+                        );
+                        self.extended_warnings = vec![
+                            "operation remains unsettled; press any key to query the durable receipt again"
+                                .into(),
+                        ];
+                    }
+                    Ok(other) => {
+                        tracing::warn!(response = ?other, "ignored unbound local settlement query response");
+                        self.pending_settings.insert(
+                            completion.operation_id,
+                            PendingSettingsOperation::SettlementUnknown {
+                                target,
+                                client_operation_id,
+                                original,
+                            },
+                        );
+                        self.extended_warnings = vec![
+                            "settlement receipt was unbound; press any key to query again".into(),
+                        ];
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "local settlement query failed; retaining unknown state");
+                        self.pending_settings.insert(
+                            completion.operation_id,
+                            PendingSettingsOperation::SettlementUnknown {
+                                target,
+                                client_operation_id,
+                                original,
+                            },
+                        );
+                        self.extended_warnings = vec![
+                            "settlement query failed; press any key to retry without leaving this screen"
+                                .into(),
+                        ];
+                    }
+                }
+            }
+            PendingSettingsOperation::SettlementUnknown { .. } => {
+                // No daemon effect is associated with this retained state.
+                // `retry_unknown_settlement` replaces it before enqueueing the
+                // next owner-scoped query.
+                return Err(completion);
             }
             PendingSettingsOperation::TypedDocumentEdit {
                 target,
@@ -5538,6 +5792,7 @@ impl SettingsDialog {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        self.cx.retry_unknown_settlement();
         if self.authority_operation_pending() {
             // OAuth is the sole authority operation with an interactive
             // terminal settlement control. Route only plain Escape to the

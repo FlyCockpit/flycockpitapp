@@ -16827,14 +16827,20 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             name: "matrix-secret".into(),
         },
         "put_provider_credential" => Request::PutProviderCredential {
+            client_operation_id: "matrix-operation".into(),
             provider_id: "matrix-provider".into(),
             record: "{}".into(),
         },
+        "get_local_operation_settlement" => Request::GetLocalOperationSettlement {
+            client_operation_id: "matrix-operation".into(),
+        },
         "delete_provider_credential" => Request::DeleteProviderCredential {
+            client_operation_id: "matrix-operation".into(),
             provider_id: "matrix-provider".into(),
             project_root: None,
         },
         "save_mcp_config" => Request::SaveMcpConfig {
+            client_operation_id: "matrix-operation".into(),
             project_root: root.clone(),
             config_json: "{}".into(),
             secret_values_json: "{}".into(),
@@ -16943,6 +16949,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             base_hash: None,
         },
         "setup_copilot_auth" => Request::SetupCopilotAuth {
+            client_operation_id: "matrix-operation".into(),
             project_root: root.clone(),
             provider_id: "matrix-provider".into(),
         },
@@ -23814,6 +23821,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::CancelMcpOAuth { flow_id: "flow".into() }, kind: "cancel_mcp_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetProviderCatalogSnapshot { project_root: "/tmp/project".into(), provider_id: None, snapshot_session_id: "fixture-snapshot".into() }, kind: "get_provider_catalog_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ApplyProviderMutation { snapshot_session_id: "fixture-snapshot".into(), layer_id: "fixture-layer".into(), expected_revision: "fixture-revision".into(), client_operation_id: "fixture-operation".into(), mutation: cockpit_proto::ProviderMutationBatch { upserts: vec![cockpit_proto::ProviderMutationUpsert { provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }], deletes: Vec::new(), metadata: None } }, kind: "apply_provider_mutation", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::GetLocalOperationSettlement { client_operation_id: "fixture-operation".into() }, kind: "get_local_operation_settlement", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::FetchProviderModels { project_root: "/tmp/project".into(), provider_id: None, model_id: None, deep: false, on_unlisted: None, allow_fallback: false }, kind: "fetch_provider_models", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetProviderUsageSnapshot { project_root: "/tmp/project".into(), provider_id: None }, kind: "get_provider_usage_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::UpsertProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default() }, kind: "upsert_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
@@ -24058,6 +24066,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         PutSubscriptionAck,
         DeleteNamedSecret,
         PutProviderCredential,
+        GetLocalOperationSettlement,
         DeleteProviderCredential,
         BeginProviderOAuth,
         CompleteProviderOAuth,

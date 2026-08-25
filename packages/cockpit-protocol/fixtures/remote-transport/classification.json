@@ -1359,6 +1359,12 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
+        "tag": "get_local_operation_settlement"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
         "tag": "delete_provider_credential"
       },
       {
@@ -2502,6 +2508,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "provider_credential_committed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "local_operation_settlement"
       },
       {
         "class": "bounded_request_response",

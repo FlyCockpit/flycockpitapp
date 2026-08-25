@@ -2905,6 +2905,21 @@
     {
       "class": "read_only",
       "evidence": null,
+      "fcorCanonicalSchema": "client_operation_id:string",
+      "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "client_operation_id:String",
+      "strategy": "none",
+      "tag": "get_local_operation_settlement"
+    },
+    {
+      "class": "read_only",
+      "evidence": null,
       "fcorCanonicalSchema": "provider_id:string",
       "fcorRoles": [
         {

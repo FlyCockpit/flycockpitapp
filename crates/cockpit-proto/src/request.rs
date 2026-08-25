@@ -1463,6 +1463,13 @@ pub enum Request {
         record: String,
     },
 
+    /// Query an owner-scoped durable local mutation after its transport
+    /// outcome became unknown. The daemon never returns another owner's row.
+    GetLocalOperationSettlement {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        client_operation_id: String,
+    },
+
     /// Begin a daemon-owned provider OAuth exchange. The daemon retains PKCE,
     /// device-code polling state, and eventual tokens; the client receives
     /// only display-safe instructions and an opaque flow id.
@@ -2524,6 +2531,11 @@ impl Request {
                     return Err("provider credential record exceeds maximum length".to_string());
                 }
             }
+            Self::GetLocalOperationSettlement {
+                client_operation_id,
+            } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
+            }
             Self::BeginProviderOAuth { provider_id } => {
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
                 if !matches!(provider_id.as_str(), "grok-oauth" | "codex-oauth") {
@@ -3489,6 +3501,7 @@ macro_rules! command {
             (Request::PutSubscriptionAck { provider_id }, "put_subscription_ack", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "provider_id:String", [provider_id: String => param]);
             (Request::DeleteNamedSecret { name }, "delete_named_secret", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String", [name: String => param]);
             (Request::PutProviderCredential { client_operation_id, provider_id, record }, "put_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|provider_id:String|record:String", [client_operation_id: String => param, provider_id: String => param, record: String => param]);
+            (Request::GetLocalOperationSettlement { client_operation_id }, "get_local_operation_settlement", owner_only, none, false, local_only, none, serialized, none, "client_operation_id:String", [client_operation_id: String => param]);
             // OAuth handshakes retain daemon-process PKCE/device state. They
             // cannot be safely replayed through a remote durable ledger after
             // reconnect/restart; only the final vault mutation is durable.

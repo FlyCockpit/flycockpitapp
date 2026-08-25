@@ -7350,6 +7350,35 @@ async fn handle_serialized_request_impl(
             Ok(result)
         }
 
+        Request::GetLocalOperationSettlement {
+            client_operation_id,
+        } => {
+            let owner = settings_capability_owner(state);
+            let settlement = ctx
+                .db
+                .local_operation_settlement(owner, client_operation_id.clone())
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| bad_request("local operation settlement is unknown"))?;
+            match settlement {
+                crate::db::local_operation_receipts::LocalOperationSettlement::Pending => {
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id,
+                        pending: true,
+                        response: None,
+                    })
+                }
+                crate::db::local_operation_receipts::LocalOperationSettlement::Terminal(json) => {
+                    let response = serde_json::from_str(&json).map_err(internal)?;
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id,
+                        pending: false,
+                        response: Some(Box::new(response)),
+                    })
+                }
+            }
+        }
+
         Request::BeginProviderOAuth { provider_id } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
@@ -10699,12 +10728,11 @@ async fn begin_local_operation(
         crate::db::local_operation_receipts::LocalOperationBegin::Terminal(json) => {
             serde_json::from_str(&json).map(Some).map_err(internal)
         }
-        crate::db::local_operation_receipts::LocalOperationBegin::Prepared => Err(ErrorPayload {
-            code: ErrorCode::Unavailable,
-            message: format!(
-                "settlement is unknown for {kind}; retry this exact client operation to query its terminal receipt"
-            ),
-        }),
+        // These request kinds are serialized and their domain writes are
+        // idempotent/recoverable (vault replace/delete or config journals).
+        // An exact owner+hash retry is therefore the recovery entry point for
+        // a daemon that died after preparing intent but before its receipt.
+        crate::db::local_operation_receipts::LocalOperationBegin::Prepared => Ok(None),
     }
 }
 

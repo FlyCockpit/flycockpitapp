@@ -424,6 +424,14 @@ pub enum Response {
         changed: bool,
         config_generation: u64,
     },
+    /// Owner-scoped resolution of a transport-ambiguous local mutation.
+    /// `response` is present only after the durable terminal receipt commits.
+    LocalOperationSettlement {
+        client_operation_id: String,
+        pending: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response: Option<Box<Response>>,
+    },
     CopilotAuthCommitted {
         client_operation_id: String,
         project_root: String,
@@ -1251,6 +1259,7 @@ macro_rules! response_variants {
             (Response::AgentMutated(..), "agent_mutated");
             (Response::AgentEditorLeaseBegun(..), "agent_editor_lease_begun");
             (Response::AgentEditorLeaseCompleted(..), "agent_editor_lease_completed");
+            (Response::LocalOperationSettlement { .. }, "local_operation_settlement");
             (Response::SetupWizardApplied { .. }, "setup_wizard_applied");
             (Response::PolicyExported { .. }, "policy_exported");
             (Response::PolicyImported { .. }, "policy_imported");

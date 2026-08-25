@@ -8883,3 +8883,12 @@ fn runtime_sandbox_policy_reaches_settings_dependency_context() {
     };
     assert!(!settings.cx.sandbox_enabled);
 }
+
+#[test]
+fn durable_settings_mutations_retain_unknown_settlement_until_receipt() {
+    let source = include_str!("mod.rs");
+    assert!(source.contains("PendingSettingsOperation::SettlementQuery"));
+    assert!(source.contains("Request::GetLocalOperationSettlement"));
+    assert!(source.contains("operation settlement is unknown"));
+    assert!(source.contains("authority_operation_pending"));
+}

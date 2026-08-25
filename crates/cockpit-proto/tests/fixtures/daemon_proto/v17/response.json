@@ -2515,6 +2515,25 @@
       "outcome": {"status":"reconciled"}
     }
   },
+  "local_operation_settlement": {
+    "response": "local_operation_settlement",
+    "data": {
+      "client_operation_id": "11111111-1111-4111-8111-111111111111",
+      "pending": false,
+      "response": {
+        "response": "provider_credential_committed",
+        "data": {
+          "client_operation_id": "11111111-1111-4111-8111-111111111111",
+          "provider_id": "example",
+          "project_root": null,
+          "owner_root": null,
+          "stored": true,
+          "changed": true,
+          "config_generation": 8
+        }
+      }
+    }
+  },
   "extended_config_written": {
     "response": "extended_config_written",
     "data": {

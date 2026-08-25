@@ -12,7 +12,35 @@ pub enum LocalOperationBegin {
     Terminal(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalOperationSettlement {
+    Pending,
+    Terminal(String),
+}
+
 impl Db {
+    pub async fn local_operation_settlement(
+        &self,
+        owner_digest: String,
+        client_operation_id: String,
+    ) -> Result<Option<LocalOperationSettlement>> {
+        self.read(move |conn| {
+            let result: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT terminal_response_json FROM local_operation_receipts
+                 WHERE owner_digest=?1 AND client_operation_id=?2",
+                    params![owner_digest, client_operation_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(result.map(|response| match response {
+                Some(response) => LocalOperationSettlement::Terminal(response),
+                None => LocalOperationSettlement::Pending,
+            }))
+        })
+        .await
+    }
+
     pub async fn begin_local_operation(
         &self,
         owner_digest: String,

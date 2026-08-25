@@ -85,6 +85,7 @@ const PROVIDER_SKIPPED_KEYS: &[&str] = &[
     "subagent_invokable",
     "can_delegate",
     "computer_use",
+    "allow_computer_guidance_proposals",
     "embeddings",
     "availability",
     "wire_api",
@@ -503,6 +504,13 @@ pub struct ProviderEntry {
     /// until final resolution, where all-unset resolves to disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_use: Option<ComputerUseMode>,
+
+    /// Provider-layer opt-in for typed computer-use guidance proposals.
+    /// `absent | enabled | disabled`; missing is neutral during cross-layer
+    /// resolution (see
+    /// `cockpit_core::computer::guidance::resolve_enablement`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_computer_guidance_proposals: Option<bool>,
 
     /// Provider default legacy thinking mode for OpenAI-compatible models
     /// that expose `thinking_modes` but not typed reasoning-effort controls.
@@ -1089,6 +1097,12 @@ pub struct ModelEntry {
     /// provider policy within the catalog layer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_use: Option<ComputerUseMode>,
+    /// Model-layer opt-in for typed computer-use guidance proposals.
+    /// `absent | enabled | disabled`; missing is neutral during cross-layer
+    /// resolution (see
+    /// `cockpit_core::computer::guidance::resolve_enablement`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_computer_guidance_proposals: Option<bool>,
     /// Model-level default legacy thinking mode for OpenAI-compatible models.
     /// Active model selections still win at runtime; missing inherits the
     /// provider default and then falls back to no extra thinking params.

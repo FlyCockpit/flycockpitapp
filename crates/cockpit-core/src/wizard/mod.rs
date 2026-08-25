@@ -1763,6 +1763,7 @@ pub fn provider_entry_for_template(
         subagent_invokable: None,
         can_delegate: None,
         computer_use: None,
+        allow_computer_guidance_proposals: None,
         default_thinking_mode: None,
         embeddings: None,
         availability: Default::default(),

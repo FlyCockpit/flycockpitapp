@@ -68,6 +68,7 @@ impl Db {
     /// editor leases are deliberately excluded: ambiguous side effects remain
     /// inspectable until their owning recovery path reaches a terminal state.
     pub async fn prune_local_authority_receipts(&self, cutoff_unix_ms: i64) -> Result<u64> {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
         self.transaction(move |conn| {
             let receipts = conn.execute(
                 "DELETE FROM local_operation_receipts
@@ -77,8 +78,8 @@ impl Db {
             let editor = conn.execute(
                 "DELETE FROM agent_editor_leases
                  WHERE ((state = 'terminal' AND updated_at_unix_ms < ?1)
-                    OR (state = 'open' AND expires_at_unix_ms < ?1))",
-                params![cutoff_unix_ms],
+                    OR (state = 'open' AND expires_at_unix_ms < ?2))",
+                params![cutoff_unix_ms, now_unix_ms],
             )? as u64;
             Ok(receipts.saturating_add(editor))
         })

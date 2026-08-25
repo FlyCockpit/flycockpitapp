@@ -89,8 +89,18 @@ pub async fn begin_editor_lease(
                 "agent editor lease acquisition expired before it was acknowledged; start a new editor handoff",
             ));
         }
-        let snapshot: AgentEditSnapshot =
-            serde_json::from_str(&existing.snapshot_json).map_err(internal)?;
+        if existing.state == "terminal" {
+            return Err(conflict(
+                "agent editor lease acquisition was already settled; start a new editor handoff",
+            ));
+        }
+        let snapshot: AgentEditSnapshot = serde_json::from_str(
+            existing
+                .snapshot_json
+                .as_deref()
+                .ok_or_else(|| internal("active editor lease omitted its snapshot"))?,
+        )
+        .map_err(internal)?;
         return Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
             lease_id: existing.lease_id,
             expires_at_unix_ms: existing.expires_at_unix_ms,
@@ -130,7 +140,7 @@ pub async fn begin_editor_lease(
             project_root: root_text,
             agent_name: name,
             consumed_revision: expected_revision,
-            snapshot_json,
+            snapshot_json: Some(snapshot_json),
             state: "open".into(),
             completion_hash: None,
             terminal_result_json: None,
@@ -159,7 +169,18 @@ pub async fn begin_editor_lease(
                     "agent editor lease acquisition expired before it was acknowledged; start a new editor handoff",
                 ));
             }
-            let snapshot = serde_json::from_str(&existing.snapshot_json).map_err(internal)?;
+            if existing.state == "terminal" {
+                return Err(conflict(
+                    "agent editor lease acquisition was already settled; start a new editor handoff",
+                ));
+            }
+            let snapshot = serde_json::from_str(
+                existing
+                    .snapshot_json
+                    .as_deref()
+                    .ok_or_else(|| internal("active editor lease omitted its snapshot"))?,
+            )
+            .map_err(internal)?;
             return Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
                 lease_id: existing.lease_id,
                 expires_at_unix_ms: existing.expires_at_unix_ms,
@@ -212,7 +233,15 @@ pub async fn complete_editor_lease(
     if known_lease.project_root != root.to_string_lossy() {
         return Err(bad_request("editor lease belongs to another workspace"));
     }
-    serde_json::from_str::<AgentEditSnapshot>(&known_lease.snapshot_json).map_err(internal)?;
+    if known_lease.state == "open" {
+        serde_json::from_str::<AgentEditSnapshot>(
+            known_lease
+                .snapshot_json
+                .as_deref()
+                .ok_or_else(|| internal("open editor lease omitted its snapshot"))?,
+        )
+        .map_err(internal)?;
+    }
     // Expiry prevents an unacknowledged Begin from being replayed as apparent
     // success forever; it must not make an already-issued capability
     // impossible to settle. Completion remains exact-hash and owner bound, so

@@ -15,7 +15,9 @@ pub struct AgentEditorLeaseRow {
     pub project_root: String,
     pub agent_name: String,
     pub consumed_revision: String,
-    pub snapshot_json: String,
+    /// Present only while the lease is active. Terminal settlement clears the
+    /// full edit snapshot and retains the digest-bound result receipt.
+    pub snapshot_json: Option<String>,
     pub state: String,
     pub completion_hash: Option<[u8; 32]>,
     pub terminal_result_json: Option<String>,
@@ -93,7 +95,7 @@ impl Db {
                 "open" => {}
                 _ => bail!("agent editor lease has an invalid state"),
             }
-            let changed = conn.execute("UPDATE agent_editor_leases SET state='completing',completion_hash=?2,updated_at_unix_ms=?3 WHERE lease_id=?1 AND state='open'", params![lease_id, completion_hash.as_slice(), now_ms()])?;
+            let changed = conn.execute("UPDATE agent_editor_leases SET state='completing',snapshot_json=NULL,completion_hash=?2,updated_at_unix_ms=?3 WHERE lease_id=?1 AND state='open'", params![lease_id, completion_hash.as_slice(), now_ms()])?;
             if changed != 1 { return Ok(AgentEditorCompletionClaim::Pending); }
             Ok(AgentEditorCompletionClaim::Execute(by_id(conn, &lease_id)?.context("agent editor lease disappeared")?))
         }).await
@@ -106,7 +108,7 @@ impl Db {
         terminal_result_json: String,
     ) -> Result<()> {
         self.write(move |conn| {
-            let changed = conn.execute("UPDATE agent_editor_leases SET state='terminal',terminal_result_json=?3,updated_at_unix_ms=?4 WHERE lease_id=?1 AND state='completing' AND completion_hash=?2", params![lease_id, completion_hash.as_slice(), terminal_result_json, now_ms()])?;
+            let changed = conn.execute("UPDATE agent_editor_leases SET state='terminal',snapshot_json=NULL,terminal_result_json=?3,updated_at_unix_ms=?4 WHERE lease_id=?1 AND state='completing' AND completion_hash=?2", params![lease_id, completion_hash.as_slice(), terminal_result_json, now_ms()])?;
             if changed != 1 { bail!("agent editor lease completion lost its durable reservation"); }
             Ok(())
         }).await
@@ -118,7 +120,10 @@ impl Db {
         completion_hash: [u8; 32],
     ) -> Result<()> {
         self.write(move |conn| {
-            conn.execute("UPDATE agent_editor_leases SET state='open',completion_hash=NULL,updated_at_unix_ms=?3 WHERE lease_id=?1 AND state='completing' AND completion_hash=?2", params![lease_id, completion_hash.as_slice(), now_ms()])?;
+            // Keep the exact completion hash fenced. The claim becomes
+            // reclaimable after the short completion-claim timeout; the full
+            // edit snapshot was already cleared and is never restored.
+            conn.execute("UPDATE agent_editor_leases SET updated_at_unix_ms=?3 WHERE lease_id=?1 AND state='completing' AND completion_hash=?2", params![lease_id, completion_hash.as_slice(), now_ms()])?;
             Ok(())
         }).await
     }

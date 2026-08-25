@@ -1274,9 +1274,19 @@ impl AgentsPage {
                 return;
             }
         };
-        if lease.lease_id.is_empty() {
-            self.editing = Some(draft);
-            self.status = Some("daemon returned an empty editor lease ID".into());
+        if uuid::Uuid::parse_str(&lease.lease_id).is_err() {
+            self.uncertain_editor_settlement = Some(Box::new(PendingAgentOperation::BeginLease {
+                client_operation_id,
+                cwd,
+                name,
+                expected_revision,
+                authority_id,
+                draft,
+            }));
+            self.status = Some(
+                "editor lease acquisition is unknown after a malformed lease receipt; press Enter to query/retry"
+                    .into(),
+            );
             return;
         }
         let validation =

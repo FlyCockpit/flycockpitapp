@@ -1730,6 +1730,47 @@ pub enum GenerateImageDispatchOutcome {
     },
 }
 
+/// Redacted, session-safe outcome of
+/// [`ImageGenerationDispatchService::job_status`]. `NotFound` hides both a
+/// missing job and one owned by another session (existence-hiding). `Status`
+/// carries only the durable lifecycle state, plan slot count, cancellation flag,
+/// and — once terminal — the safe disjoint slot counts. It NEVER carries a
+/// prompt, path, cost, destination, credential, or artifact identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetImageJobStatusOutcome {
+    Status {
+        state: String,
+        slot_count: u32,
+        cancellation_requested: bool,
+        terminal: Option<ImageGenerationJobTerminalSummary>,
+    },
+    NotFound,
+}
+
+/// The safe, disjoint terminal slot counts of a finished job. Every count is a
+/// non-identifying integer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationJobTerminalSummary {
+    pub terminal_state: String,
+    pub published: u32,
+    pub failed: u32,
+    pub cancelled: u32,
+    pub late_published: u32,
+    pub late_quarantined: u32,
+    pub discarded: u32,
+}
+
+/// Redacted, idempotent outcome of
+/// [`ImageGenerationDispatchService::cancel_job`]. `NotFound` hides both a
+/// missing job and one owned by another session; `AlreadyTerminal` means the
+/// owned job has no cancellable slots left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelImageJobOutcome {
+    CancellationRequested,
+    NotFound,
+    AlreadyTerminal,
+}
+
 /// Session-scoped funnel that authorizes a `generate_image` tool call through the
 /// central [`Approver`] chokepoint and, on `Allow`, turns it into a durable
 /// `queued` [`ImageGenerationJobService`] job.
@@ -1980,6 +2021,139 @@ impl ImageGenerationDispatchService {
         // (7) Allow: reserve spend + media, resolve, and commit the queued job.
         self.commit_queued_job(session, args, &policy, &plan_digest, held)
             .await
+    }
+
+    /// Return the redacted, session-authorized status of an image-generation job.
+    ///
+    /// The live attached session's owner identity is derived exactly as
+    /// [`Self::commit_queued_job`] derives it (session id + principal, revalidated
+    /// against the durable session), then handed to the owner-scoped cockpit-db
+    /// reader. A job that does not exist, or that belongs to another session, is
+    /// reported as [`GetImageJobStatusOutcome::NotFound`] — the two are
+    /// indistinguishable (existence-hiding). An owner-context that cannot be
+    /// established for this session is likewise `NotFound`. No prompt, path, cost,
+    /// destination, credential, or artifact identity is ever surfaced, and no
+    /// content is opened.
+    pub async fn job_status(
+        &self,
+        session: &crate::session::Session,
+        job_id: Uuid,
+    ) -> Result<GetImageJobStatusOutcome> {
+        let principal = self.principal.clone();
+        let session_id = session.id;
+        let config_generation = self.config_generation;
+        let outcome = self
+            .db
+            .read(move |conn| {
+                let owner = match ImageGenerationOwnerContextAuthority::from_attached_session(
+                    conn,
+                    session_id,
+                    &principal,
+                    config_generation,
+                ) {
+                    Ok(owner) => owner,
+                    Err(_) => {
+                        return Ok(cockpit_db::db::image_generation::OwnedImageGenerationJobStatus::NotFound);
+                    }
+                };
+                let scope = cockpit_db::db::image_generation::ImageGenerationJobOwnerScope {
+                    owner_session_id: owner.session_id,
+                    owner_principal_digest: &owner.principal_digest,
+                    project_identity_digest: &owner.project_identity_digest,
+                    config_generation: owner.config_generation,
+                };
+                cockpit_db::Db::read_owned_image_generation_job_status_conn(conn, job_id, &scope)
+            })
+            .await?;
+        Ok(match outcome {
+            cockpit_db::db::image_generation::OwnedImageGenerationJobStatus::Status(safe) => {
+                GetImageJobStatusOutcome::Status {
+                    state: safe.state.as_str().to_string(),
+                    slot_count: safe.slot_count,
+                    cancellation_requested: safe.cancellation_requested,
+                    terminal: safe.terminal.map(|counts| ImageGenerationJobTerminalSummary {
+                        terminal_state: counts.terminal_state.as_str().to_string(),
+                        published: counts.published_count,
+                        failed: counts.failed_count,
+                        cancelled: counts.cancelled_count,
+                        late_published: counts.late_published_count,
+                        late_quarantined: counts.late_quarantined_count,
+                        discarded: counts.discarded_count,
+                    }),
+                }
+            }
+            cockpit_db::db::image_generation::OwnedImageGenerationJobStatus::NotFound => {
+                GetImageJobStatusOutcome::NotFound
+            }
+        })
+    }
+
+    /// Request idempotent, owner-checked cancellation of an image-generation job.
+    ///
+    /// Owner identity is derived from the live attached session exactly as
+    /// [`Self::job_status`], then handed to the owner-scoped cockpit-db cancel
+    /// wrapper (which verifies ownership before invoking the existing
+    /// cancellation CAS). A missing job, a job owned by another session, or an
+    /// owner-context that cannot be established is reported as
+    /// [`CancelImageJobOutcome::NotFound`] (existence-hiding);
+    /// `AlreadyTerminal` means the owned job has no cancellable slots. No prompt,
+    /// path, cost, or another session's data is surfaced.
+    pub async fn cancel_job(
+        &self,
+        session: &crate::session::Session,
+        job_id: Uuid,
+    ) -> Result<CancelImageJobOutcome> {
+        let principal = self.principal.clone();
+        let session_id = session.id;
+        let config_generation = self.config_generation;
+        let requested_at_unix_ms = i64::try_from(self.clock.now_ms()).unwrap_or(i64::MAX);
+        // A deterministic per-job operation id: the first cancellation of the job
+        // consumes it, and any later owner request is reported idempotently
+        // without re-invoking the CAS.
+        let request_operation_id = format!("agent-cancel:{job_id}");
+        let outcome = self
+            .db
+            .transaction(move |conn| {
+                let owner = match ImageGenerationOwnerContextAuthority::from_attached_session(
+                    conn,
+                    session_id,
+                    &principal,
+                    config_generation,
+                ) {
+                    Ok(owner) => owner,
+                    Err(_) => {
+                        return Ok(cockpit_db::db::image_generation::OwnedImageGenerationCancellation::NotFound);
+                    }
+                };
+                let scope = cockpit_db::db::image_generation::ImageGenerationJobOwnerScope {
+                    owner_session_id: owner.session_id,
+                    owner_principal_digest: &owner.principal_digest,
+                    project_identity_digest: &owner.project_identity_digest,
+                    config_generation: owner.config_generation,
+                };
+                cockpit_db::Db::request_owned_image_generation_cancellation_conn(
+                    conn,
+                    &cockpit_db::db::image_generation::OwnedImageGenerationCancellationRequest {
+                        job_id,
+                        scope,
+                        cancellation_version: 1,
+                        request_operation_id: &request_operation_id,
+                        requested_at_unix_ms,
+                    },
+                )
+            })
+            .await?;
+        Ok(match outcome {
+            cockpit_db::db::image_generation::OwnedImageGenerationCancellation::CancellationRequested => {
+                CancelImageJobOutcome::CancellationRequested
+            }
+            cockpit_db::db::image_generation::OwnedImageGenerationCancellation::NotFound => {
+                CancelImageJobOutcome::NotFound
+            }
+            cockpit_db::db::image_generation::OwnedImageGenerationCancellation::AlreadyTerminal => {
+                CancelImageJobOutcome::AlreadyTerminal
+            }
+        })
     }
 
     /// Resolve each requested target to its sealed [`ProjectionDestination`]

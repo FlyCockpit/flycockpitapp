@@ -906,6 +906,78 @@ pub struct RequestImageGenerationCancellation<'a> {
     pub requested_at_unix_ms: i64,
 }
 
+/// Redacted owner identity used to scope session-authorized image-generation job
+/// reads and cancellation. It carries ONLY the sealed plan's owner identity
+/// (session id + digests), never a raw path, prompt, credential, or cost. It is
+/// assembled in `cockpit-core` from the live attached session's
+/// `ImageGenerationOwnerContextAuthority` and compared against the persisted plan
+/// envelope. A mismatch (or an absent job) is reported as not-found, so a job
+/// owned by another session is indistinguishable from one that does not exist
+/// (existence-hiding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageGenerationJobOwnerScope<'a> {
+    pub owner_session_id: Uuid,
+    pub owner_principal_digest: &'a str,
+    pub project_identity_digest: &'a str,
+    pub config_generation: u64,
+}
+
+/// Session-safe, redacted status of an image-generation job the current session
+/// owns. `NotFound` is returned when the job does not exist OR belongs to another
+/// session — the two are indistinguishable to the caller (existence-hiding).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedImageGenerationJobStatus {
+    Status(ImageGenerationJobSafeStatus),
+    NotFound,
+}
+
+/// The only image-generation job fields ever surfaced to the model: the durable
+/// lifecycle state, the job version, the plan's slot count, whether a
+/// cancellation was requested, and — once terminal — the safe disjoint slot
+/// counts. It NEVER carries a prompt, path, cost, destination, credential, or
+/// artifact identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageGenerationJobSafeStatus {
+    pub state: ImageGenerationJobState,
+    pub job_version: u64,
+    pub slot_count: u32,
+    pub cancellation_requested: bool,
+    pub terminal: Option<ImageGenerationJobSafeTerminalCounts>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageGenerationJobSafeTerminalCounts {
+    pub terminal_state: ImageGenerationJobState,
+    pub published_count: u32,
+    pub failed_count: u32,
+    pub cancelled_count: u32,
+    pub late_published_count: u32,
+    pub late_quarantined_count: u32,
+    pub discarded_count: u32,
+}
+
+/// Owner-checked cancellation request. `cancellation_version` and
+/// `request_operation_id` are only consumed on the first cancellation of an owned
+/// job (a repeated request is reported idempotently without touching the CAS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnedImageGenerationCancellationRequest<'a> {
+    pub job_id: Uuid,
+    pub scope: ImageGenerationJobOwnerScope<'a>,
+    pub cancellation_version: u64,
+    pub request_operation_id: &'a str,
+    pub requested_at_unix_ms: i64,
+}
+
+/// Idempotent outcome of an owner-checked cancellation. `NotFound` hides both a
+/// missing job and one owned by another session; `AlreadyTerminal` means the
+/// owned job has no cancellable slots left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedImageGenerationCancellation {
+    CancellationRequested,
+    NotFound,
+    AlreadyTerminal,
+}
+
 pub struct PrepareImageGenerationDispatch<'a> {
     pub job_id: Uuid,
     pub slot_id: Uuid,
@@ -2425,6 +2497,140 @@ impl Db {
     ) -> Result<ImageGenerationCasOutcome> {
         atomic_conn(conn, "image_generation_cancel", || {
             Self::request_image_generation_cancellation_inner(conn, input)
+        })
+    }
+
+    /// Session-scoped ownership predicate for an image-generation job. Returns
+    /// `Ok(true)` only when the job exists AND the sealed plan envelope's owner
+    /// identity matches `scope` in every field; `Ok(false)` when the job is
+    /// absent OR owned by another session (existence-hiding). It reads only the
+    /// persisted plan envelope and opens no artifact or content.
+    fn image_generation_job_owner_matches_conn(
+        conn: &Connection,
+        job_id: Uuid,
+        scope: &ImageGenerationJobOwnerScope<'_>,
+    ) -> Result<bool> {
+        let stored: Option<(Vec<u8>, String)> = conn
+            .query_row(
+                "SELECT canonical_plan,plan_digest FROM image_generation_plans WHERE job_id=?1",
+                [job_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((canonical, plan_digest)) = stored else {
+            return Ok(false);
+        };
+        // A foreign job whose sealed plan fails to decode must be reported as a
+        // non-match (existence-hiding), never propagated as an error that would
+        // distinguish "exists but malformed" from "not found".
+        let Ok(plan) = ImageGenerationPlanV1::from_canonical(&canonical, &plan_digest) else {
+            return Ok(false);
+        };
+        Ok(plan.owner_session_id == scope.owner_session_id
+            && plan.owner_principal_digest == scope.owner_principal_digest
+            && plan.project_identity_digest == scope.project_identity_digest
+            && plan.config_generation == scope.config_generation)
+    }
+
+    /// Return the redacted, session-safe status of an image-generation job the
+    /// current session owns. It first enforces ownership (existence-hiding on a
+    /// mismatch or an absent job), then reads only the durable lifecycle state,
+    /// version, plan slot count, cancellation flag, and — once terminal — the
+    /// safe disjoint slot counts. It NEVER reveals a prompt, path, cost,
+    /// destination, credential, or artifact identity, and opens no content.
+    pub fn read_owned_image_generation_job_status_conn(
+        conn: &Connection,
+        job_id: Uuid,
+        scope: &ImageGenerationJobOwnerScope<'_>,
+    ) -> Result<OwnedImageGenerationJobStatus> {
+        if !Self::image_generation_job_owner_matches_conn(conn, job_id, scope)? {
+            return Ok(OwnedImageGenerationJobStatus::NotFound);
+        }
+        let (state_text, job_version, slot_count): (String, i64, i64) = conn.query_row(
+            "SELECT j.state,j.version,p.slot_count FROM image_generation_jobs j JOIN image_generation_plans p ON p.job_id=j.job_id WHERE j.job_id=?1",
+            [job_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let state = ImageGenerationJobState::parse(&state_text)
+            .context("image generation job state is unknown")?;
+        let cancellation_requested: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM image_generation_cancellation_facts WHERE job_id=?1)",
+            [job_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let terminal = Self::replay_image_generation_terminal_event_conn(conn, job_id)?.map(
+            |event| ImageGenerationJobSafeTerminalCounts {
+                terminal_state: event.terminal_state,
+                published_count: event.published_count,
+                failed_count: event.failed_count,
+                cancelled_count: event.cancelled_count,
+                late_published_count: event.late_published_count,
+                late_quarantined_count: event.late_quarantined_count,
+                discarded_count: event.discarded_count,
+            },
+        );
+        Ok(OwnedImageGenerationJobStatus::Status(
+            ImageGenerationJobSafeStatus {
+                state,
+                job_version: u64::try_from(job_version)?,
+                slot_count: u32::try_from(slot_count)?,
+                cancellation_requested,
+                terminal,
+            },
+        ))
+    }
+
+    /// Owner-checked, idempotent cancellation of an image-generation job the
+    /// current session owns. It enforces ownership first (existence-hiding on a
+    /// mismatch or an absent job), reports an already-recorded cancellation for
+    /// the owned job idempotently, reports `AlreadyTerminal` when no cancellable
+    /// slots remain, and otherwise routes through the existing
+    /// [`Self::request_image_generation_cancellation_conn`] CAS. It surfaces no
+    /// prompt, path, cost, or another session's data.
+    pub fn request_owned_image_generation_cancellation_conn(
+        conn: &Connection,
+        input: &OwnedImageGenerationCancellationRequest<'_>,
+    ) -> Result<OwnedImageGenerationCancellation> {
+        atomic_conn(conn, "image_generation_owned_cancel", || {
+            if !Self::image_generation_job_owner_matches_conn(conn, input.job_id, &input.scope)? {
+                return Ok(OwnedImageGenerationCancellation::NotFound);
+            }
+            // Idempotent: a cancellation already recorded for this owned job is
+            // reported as requested regardless of the requesting operation id, so
+            // a repeat call from the owner never trips the inner replay-identity
+            // guard.
+            let already_requested: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM image_generation_cancellation_facts WHERE job_id=?1)",
+                [input.job_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if already_requested {
+                return Ok(OwnedImageGenerationCancellation::CancellationRequested);
+            }
+            let cancellable_slots: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM image_generation_slots WHERE job_id=?1 AND state NOT IN ('published','failed','cancelled','discarded','late_quarantined')",
+                [input.job_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if cancellable_slots == 0 {
+                return Ok(OwnedImageGenerationCancellation::AlreadyTerminal);
+            }
+            match Self::request_image_generation_cancellation_conn(
+                conn,
+                &RequestImageGenerationCancellation {
+                    job_id: input.job_id,
+                    cancellation_version: input.cancellation_version,
+                    request_operation_id: input.request_operation_id,
+                    requested_at_unix_ms: input.requested_at_unix_ms,
+                },
+            )? {
+                ImageGenerationCasOutcome::Applied { .. } => {
+                    Ok(OwnedImageGenerationCancellation::CancellationRequested)
+                }
+                ImageGenerationCasOutcome::Conflict => {
+                    Ok(OwnedImageGenerationCancellation::AlreadyTerminal)
+                }
+            }
         })
     }
 

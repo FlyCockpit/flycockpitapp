@@ -43,6 +43,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::engine::tool::{Tool, ToolCtx, ToolEffect, ToolOutput, invalid_input};
 
@@ -1122,23 +1123,64 @@ impl Tool for GetImageGenerationJobTool {
         Some(image_generation_tool_schema(self.name()))
     }
 
-    async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let job_id = args
             .get("job_id")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_input("`job_id` is required"))?;
-        if job_id.trim().is_empty() {
-            return Err(invalid_input("`job_id` must not be empty"));
+        // Route through the session-scoped dispatch service, which owns the
+        // owner-checked cockpit-db reader. Only jobs owned by the current session
+        // are visible; a job that does not exist OR belongs to another session is
+        // reported identically (existence-hiding). No prompt, path, cost,
+        // destination, credential, or artifact byte is ever surfaced.
+        let Some(service) = ctx.image_generation_dispatch.as_ref() else {
+            return Ok(ToolOutput::text(
+                "Image-generation job status is not available in this session.".to_string(),
+            ));
+        };
+        // A job id that is not a valid identifier can match nothing; report it as
+        // not-available exactly like an unknown or foreign job (existence-hiding).
+        let Ok(parsed_job_id) = Uuid::parse_str(job_id.trim()) else {
+            return Ok(ToolOutput::text(format!(
+                "No image-generation job `{job_id}` is available to this session."
+            )));
+        };
+        match service.job_status(&ctx.session, parsed_job_id).await? {
+            crate::image_generation_job::GetImageJobStatusOutcome::Status {
+                state,
+                slot_count,
+                cancellation_requested,
+                terminal,
+            } => {
+                let mut text = format!(
+                    "Image-generation job `{job_id}`: state `{state}`, {slot_count} slot(s){}.",
+                    if cancellation_requested {
+                        ", cancellation requested"
+                    } else {
+                        ""
+                    }
+                );
+                if let Some(counts) = terminal {
+                    text.push_str(&format!(
+                        " Terminal `{}`: {} published, {} failed, {} cancelled, {} late-published, \
+                         {} late-quarantined, {} discarded.",
+                        counts.terminal_state,
+                        counts.published,
+                        counts.failed,
+                        counts.cancelled,
+                        counts.late_published,
+                        counts.late_quarantined,
+                        counts.discarded,
+                    ));
+                }
+                Ok(ToolOutput::text(text))
+            }
+            crate::image_generation_job::GetImageJobStatusOutcome::NotFound => {
+                Ok(ToolOutput::text(format!(
+                    "No image-generation job `{job_id}` is available to this session."
+                )))
+            }
         }
-        // The actual job lookup is handled by the job foundation; this tool
-        // enforces session authorization and returns safe metadata. Only
-        // jobs owned by the current session are accessible; this tool never
-        // reveals another session's prompt, references, cost, paths,
-        // destinations, or artifacts even if an ID leaks.
-        Ok(ToolOutput::text(format!(
-            "Job `{job_id}`: status lookup is pending the job foundation integration. \
-             This session may only query jobs it owns."
-        )))
     }
 }
 
@@ -1172,22 +1214,44 @@ impl Tool for CancelImageGenerationJobTool {
         Some(image_generation_tool_schema(self.name()))
     }
 
-    async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let job_id = args
             .get("job_id")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_input("`job_id` is required"))?;
-        if job_id.trim().is_empty() {
-            return Err(invalid_input("`job_id` must not be empty"));
+        // Route through the session-scoped dispatch service, which owns the
+        // owner-checked cancellation wrapper. Cancellation is idempotent; only
+        // jobs the current session controls can be cancelled; a missing or
+        // foreign job is reported identically (existence-hiding). Successful slots
+        // remain published on partial failure, and there is no mid-job
+        // substitution or unreserved retry.
+        let Some(service) = ctx.image_generation_dispatch.as_ref() else {
+            return Ok(ToolOutput::text(
+                "Image-generation cancellation is not available in this session.".to_string(),
+            ));
+        };
+        let Ok(parsed_job_id) = Uuid::parse_str(job_id.trim()) else {
+            return Ok(ToolOutput::text(format!(
+                "No image-generation job `{job_id}` is available to this session."
+            )));
+        };
+        match service.cancel_job(&ctx.session, parsed_job_id).await? {
+            crate::image_generation_job::CancelImageJobOutcome::CancellationRequested => {
+                Ok(ToolOutput::text(format!(
+                    "Cancellation requested for job `{job_id}`. The request is idempotent."
+                )))
+            }
+            crate::image_generation_job::CancelImageJobOutcome::AlreadyTerminal => {
+                Ok(ToolOutput::text(format!(
+                    "Image-generation job `{job_id}` has already finished; there is nothing to cancel."
+                )))
+            }
+            crate::image_generation_job::CancelImageJobOutcome::NotFound => {
+                Ok(ToolOutput::text(format!(
+                    "No image-generation job `{job_id}` is available to this session."
+                )))
+            }
         }
-        // Cancellation is idempotent: requesting it again has no additional
-        // effect. Only jobs the current session may control can be
-        // cancelled. After submission there is no new mid-job approval,
-        // hidden target substitution, or unreserved retry. Successful slots
-        // remain published on partial failure.
-        Ok(ToolOutput::text(format!(
-            "Cancellation requested for job `{job_id}`. The request is idempotent."
-        )))
     }
 }
 

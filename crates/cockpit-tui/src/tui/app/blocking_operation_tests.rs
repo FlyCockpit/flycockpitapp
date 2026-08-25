@@ -630,6 +630,7 @@ fn reducers_and_async_loop_do_not_reenter_daemon_runtime_synchronously() {
             include_str!("attach_lifecycle.rs"),
         ),
         ("app/model_controls.rs", include_str!("model_controls.rs")),
+        ("app/local_commands.rs", include_str!("local_commands.rs")),
         ("app/btw_pane.rs", include_str!("btw_pane.rs")),
         ("app/overlay_actions.rs", include_str!("overlay_actions.rs")),
         ("tools_pane.rs", include_str!("../tools_pane.rs")),
@@ -658,6 +659,35 @@ fn reducers_and_async_loop_do_not_reenter_daemon_runtime_synchronously() {
     // Worker-only blocking adapters are enforced structurally across every
     // production source file by `tests/tui_db_boundary.rs`; this reducer gate
     // deliberately owns only the synchronous event-loop spellings above.
+}
+
+#[test]
+fn mcp_local_commands_are_correlated_async_effects() {
+    let source = include_str!("local_commands.rs");
+    for required in [
+        "AsyncActionKind::DaemonRpc(\"mcp.local\")",
+        "McpLocalCompletion",
+        "pending_mcp_local",
+        "snapshot_session_id",
+        "client_operation_id",
+        "commit status is unknown",
+    ] {
+        assert!(
+            source.contains(required),
+            "MCP local command lifecycle must retain `{required}`"
+        );
+    }
+    for forbidden in [
+        "daemon_request_blocking",
+        "settings_daemon_request(",
+        "block_in_place",
+        ".block_on(",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "MCP local command reducers must not use `{forbidden}`"
+        );
+    }
 }
 
 #[test]

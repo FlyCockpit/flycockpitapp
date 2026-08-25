@@ -564,6 +564,11 @@ impl App {
         // buffers, order, and the cleared-view failure contract.
         let cancelled = self.async_actions.drain_cancelled();
         self.tombstone_cancelled_mouse_copies(&cancelled);
+        let mcp_local_cancellations = cancelled
+            .iter()
+            .filter(|result| matches!(result.kind, AsyncActionKind::DaemonRpc("mcp.local")))
+            .map(|result| result.id)
+            .collect::<Vec<_>>();
         let settings_blocking_cancellations = cancelled
             .iter()
             .filter(|result| {
@@ -594,7 +599,8 @@ impl App {
         results.extend(self.async_actions.drain_completed());
         let changed = !results.is_empty()
             || !session_switch_cancellations.is_empty()
-            || !settings_blocking_cancellations.is_empty();
+            || !settings_blocking_cancellations.is_empty()
+            || !mcp_local_cancellations.is_empty();
         let oauth_completed = results.iter().any(|result| {
             matches!(
                 result.kind,
@@ -606,6 +612,9 @@ impl App {
         }
         for result in settings_blocking_cancellations {
             self.apply_async_action_result(result);
+        }
+        for action_id in mcp_local_cancellations {
+            self.apply_mcp_local_cancellation(action_id);
         }
         for result in results {
             self.apply_async_action_result(result);
@@ -821,7 +830,7 @@ impl App {
                 AsyncActionKind::Internal(
                     "session.switch" | "session.resume" | "runner.attach" | "btw.runner.attach"
                 ) | AsyncActionKind::Blocking("paste.delivery_receipt")
-                    | AsyncActionKind::DaemonRpc("sealed.effect")
+                    | AsyncActionKind::DaemonRpc("sealed.effect" | "mcp.local")
             )
         {
             if matches!(
@@ -912,6 +921,13 @@ impl App {
             AsyncActionKind::DaemonRpc("sealed.effect") => {
                 if let Ok(AsyncActionPayload::Sealed(completion)) = result.payload {
                     self.apply_sealed_completion(completion);
+                }
+            }
+            AsyncActionKind::DaemonRpc("mcp.local") => {
+                if let Ok(AsyncActionPayload::McpLocal(completion)) = result.payload {
+                    self.apply_mcp_local_completion(result.id, completion);
+                } else {
+                    self.apply_mcp_local_cancellation(result.id);
                 }
             }
             AsyncActionKind::DaemonRpc("btw.resolve-interrupt") => match result.payload {

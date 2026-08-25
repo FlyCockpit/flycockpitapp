@@ -1813,9 +1813,9 @@ impl App {
         // once the daemon applies it.
     }
 
-    /// Handle `/mcp …` (GOALS §18a). Operates directly on the layered
-    /// `mcp.json` (server config is not daemon state); pushes result lines
-    /// into history.
+    /// Handle `/mcp …` (GOALS §18a). Reads and mutations are queued as
+    /// daemon-owned effects; completion lines arrive later through the
+    /// correlated async-action drain.
     pub(super) fn handle_mcp_command(&mut self, arg: &str) {
         match parse_mcp_action(arg) {
             McpAction::List => self.mcp_list(),

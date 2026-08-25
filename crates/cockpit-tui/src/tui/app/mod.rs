@@ -375,6 +375,48 @@ pub(crate) struct DeliveryUnconfirmedRecord {
     pub probe_exhausted: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum McpLocalIntent {
+    List,
+    SetEnabled {
+        server_id: Option<String>,
+        enabled: Option<bool>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum McpLocalPhase {
+    Snapshot {
+        snapshot_session_id: String,
+    },
+    Save,
+    Settlement,
+    Refresh {
+        snapshot_session_id: String,
+        result_revision: String,
+        config_generation: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct McpLocalCompletion {
+    pub operation_id: uuid::Uuid,
+    pub project_root: String,
+    pub intent: McpLocalIntent,
+    pub phase: McpLocalPhase,
+    pub response: Result<cockpit_core::daemon::proto::Response, String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingMcpLocal {
+    pub action_id: crate::tui::async_action::AsyncActionId,
+    pub operation_id: uuid::Uuid,
+    pub project_root: String,
+    pub intent: McpLocalIntent,
+    pub phase: McpLocalPhase,
+    pub config: Option<cockpit_core::mcp::config::McpConfig>,
+}
+
 pub(crate) struct ModelSelectionRetry {
     /// Durable session attachment that owns this retry. Retry payloads are
     /// never transferable between conversations, even while another session
@@ -1884,8 +1926,7 @@ pub struct App {
     /// Originating attached binding for every minted, still-live sealed
     /// capability. Session/epoch replacement must not redirect settlement to
     /// a newer runner.
-    sealed_capability_bindings:
-        HashMap<String, crate::tui::agent_runner::AttachedRequestBinding>,
+    sealed_capability_bindings: HashMap<String, crate::tui::agent_runner::AttachedRequestBinding>,
     exit_requested: bool,
     pub(super) active_model_state_generation: u64,
     /// Security disclosures must be fetched from the daemon before a session
@@ -2111,6 +2152,13 @@ pub struct App {
     /// blocking filesystem/subprocess probes can complete through this tick
     /// drain instead of freezing the event loop.
     pub(super) async_actions: AsyncActionRunner,
+    /// Exact owner and phase of the one active `/mcp` local command. A newer
+    /// command supersedes the old action; late or cancelled results cannot
+    /// mutate the cached projection or print a success line.
+    pub(super) pending_mcp_local: Option<PendingMcpLocal>,
+    /// Last daemon-published owner view. Slash-menu descriptions are purely
+    /// presentational and must never synchronously fetch it during rendering.
+    pub(super) mcp_local_snapshot: Option<cockpit_core::mcp::config::McpConfig>,
     /// Correlation metadata retained outside blocking workers so runner-level
     /// timeout/cancellation can still settle the exact settings operation.
     pub(super) settings_blocking_actions: std::collections::HashMap<
@@ -3613,6 +3661,8 @@ impl App {
             pending_leak_reveal: None,
             display_attach_backoff: DisplayAttachBackoff::default(),
             async_actions: AsyncActionRunner::default(),
+            pending_mcp_local: None,
+            mcp_local_snapshot: None,
             settings_blocking_actions: std::collections::HashMap::new(),
             _export_reaper_guard: crate::tui::async_action::ExportTempReaperGuard::new(),
             completed_async_actions: Vec::new(),
@@ -3995,7 +4045,8 @@ impl App {
         // capability over the still-live attached binding before the runner/daemon
         // teardown below, so a Ctrl-C×2 (or `/exit`) exit doesn't strand the
         // capability until its server-side expiry.
-        self.settle_known_sealed_capabilities_before_shutdown().await;
+        self.settle_known_sealed_capabilities_before_shutdown()
+            .await;
         // Prevent a leak-reveal worker from entering the sensitive channel
         // after the pane/application has surrendered its operation binding.
         // The worker owns the exact token and receipt-settles it on this path.

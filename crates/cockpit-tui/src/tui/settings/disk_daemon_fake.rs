@@ -111,13 +111,24 @@ impl SettingsDaemonEffect for DiskDaemonFake {
             Request::GetProviderCatalogSnapshot {
                 project_root,
                 provider_id,
-            } => provider_catalog_snapshot(Path::new(&project_root), provider_id.as_deref()),
+                snapshot_session_id,
+            } => provider_catalog_snapshot(
+                Path::new(&project_root),
+                provider_id.as_deref(),
+                &snapshot_session_id,
+            ),
             Request::SaveMcpConfig {
+                client_operation_id,
                 project_root,
                 config_json,
                 secret_values_json,
                 cleanup_names_json: _,
-            } => save_mcp_config(Path::new(&project_root), &config_json, &secret_values_json),
+            } => save_mcp_config(
+                &client_operation_id,
+                Path::new(&project_root),
+                &config_json,
+                &secret_values_json,
+            ),
             Request::GetAgentInventory { project_root } => {
                 agent_inventory(Path::new(&project_root))
             }
@@ -880,7 +891,11 @@ fn apply_extended_config_patch(
 /// replaced by occurrence markers as the daemon does; the fake has no secret
 /// store, so URLs and credential references keep their authored values instead
 /// of being rewritten by the daemon's owner-view redaction.
-fn provider_catalog_snapshot(root: &Path, provider_id: Option<&str>) -> Result<Response, String> {
+fn provider_catalog_snapshot(
+    root: &Path,
+    provider_id: Option<&str>,
+    snapshot_session_id: &str,
+) -> Result<Response, String> {
     let mut paths = cockpit_config::dirs::config_file_paths_for_load(root);
     // A fixture target under this root is its most specific layer, so it merges
     // last and wins — the same precedence the settings snapshot gives it.
@@ -946,7 +961,19 @@ fn provider_catalog_snapshot(root: &Path, provider_id: Option<&str>) -> Result<R
             // settings loads it through its own layer snapshot instead.
             extended_config_json: None,
         },
+        snapshot_session_id: snapshot_session_id.to_string(),
+        layer_id: mint(b"mcp-layer/v1", &[root.as_os_str().as_encoded_bytes()]),
+        owner_root: root.display().to_string(),
+        base_revision: mcp_revision(root),
+        config_generation: current_config_generation(),
     })
+}
+
+fn mcp_revision(root: &Path) -> String {
+    let config = cockpit_core::mcp::config::McpConfig::discover(root);
+    serde_json::to_vec(&config)
+        .map(|bytes| content_hash(&bytes))
+        .unwrap_or_else(|_| content_hash(b"invalid-mcp-projection"))
 }
 
 /// Disk-backed `SaveMcpConfig`. Runs the daemon's sentinel-restore contract
@@ -958,10 +985,12 @@ fn provider_catalog_snapshot(root: &Path, provider_id: Option<&str>) -> Result<R
 /// to credential references, and none of the ownership-claim, journal, or
 /// redaction-publication machinery runs.
 fn save_mcp_config(
+    client_operation_id: &str,
     root: &Path,
     config_json: &str,
     secret_values_json: &str,
 ) -> Result<Response, String> {
+    let consumed_revision = mcp_revision(root);
     let mut config = cockpit_core::mcp::config::McpConfig::parse(config_json)
         .map_err(|error| format!("invalid MCP config: {error}"))?;
     let secret_values: BTreeMap<String, String> = serde_json::from_str(secret_values_json)
@@ -980,7 +1009,17 @@ fn save_mcp_config(
         .chain(restored.keys())
         .collect::<std::collections::BTreeSet<_>>()
         .len();
-    Ok(Response::McpConfigSaved {
+    let config_generation = publish_config_generation();
+    Ok(Response::McpConfigCommitted {
+        client_operation_id: client_operation_id.to_string(),
+        request_hash: content_hash(config_json.as_bytes()),
+        mutation_intent_hash: content_hash(config_json.as_bytes()),
+        project_root: root.display().to_string(),
+        owner_root: root.display().to_string(),
+        config_path: path.display().to_string(),
+        consumed_revision,
+        result_revision: mcp_revision(root),
+        config_generation,
         credential_count: u32::try_from(credential_count).unwrap_or(u32::MAX),
     })
 }

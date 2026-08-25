@@ -101,6 +101,47 @@ pub(crate) async fn settings_daemon_client()
         .client)
 }
 
+/// A transport captured on the reducer thread and then owned by an async
+/// action. Tests retain their installed fake even when the action is polled on
+/// another runtime worker; production performs the request on the daemon's
+/// asynchronous client.
+pub(crate) struct CapturedSettingsDaemon {
+    #[cfg(test)]
+    effect: Arc<dyn SettingsDaemonEffect>,
+}
+
+pub(crate) fn capture_settings_daemon() -> CapturedSettingsDaemon {
+    #[cfg(test)]
+    {
+        let effect = TEST_SETTINGS_DAEMON_EFFECT
+            .with(|slot| slot.borrow().clone())
+            .unwrap_or_else(disk_daemon_fake::default_effect);
+        return CapturedSettingsDaemon { effect };
+    }
+    #[cfg(not(test))]
+    CapturedSettingsDaemon {}
+}
+
+impl CapturedSettingsDaemon {
+    pub(crate) async fn request(self, request: Request) -> Result<Response, String> {
+        #[cfg(test)]
+        {
+            self.effect.request(request)
+        }
+        #[cfg(not(test))]
+        {
+            let client = settings_daemon_client()
+                .await
+                .map_err(|error| error.to_string())?;
+            tokio::time::timeout(std::time::Duration::from_secs(15), client.request(request))
+                .await
+                .map_err(|_| "local daemon request timed out".to_string())?
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
 fn local_receipt_request_hash<T: serde::Serialize>(request: &T) -> Result<String, String> {
     use sha2::{Digest as _, Sha256};
 
@@ -8214,16 +8255,6 @@ fn config_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
         .and_then(std::path::Path::parent)
         .or_else(|| path.parent())
         .map(std::path::Path::to_path_buf)
-}
-
-/// The daemon-owned MCP projection for a project root. `None` means the
-/// daemon could not answer, which is distinct from "no servers configured".
-pub(crate) fn daemon_mcp_snapshot_for_root(
-    root: &std::path::Path,
-) -> Option<cockpit_core::mcp::config::McpConfig> {
-    daemon_provider_view_snapshot(root, None)
-        .and_then(|config| config.mcp_config_json)
-        .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
 }
 
 fn provider_entries_equal(left: &ProviderEntry, right: &ProviderEntry) -> bool {

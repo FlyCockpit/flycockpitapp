@@ -200,7 +200,7 @@ impl App {
                 };
                 let response = match disclosure_socket.as_deref() {
                     Some(socket) => agent_runner::daemon_request_at_blocking(socket, request),
-                    None => agent_runner::daemon_request_blocking(request),
+                    None => agent_runner::daemon_request_from_blocking_worker(request),
                 }?;
                 match response {
                     cockpit_core::daemon::proto::Response::StartupDisclosures {

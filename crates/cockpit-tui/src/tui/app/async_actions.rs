@@ -411,6 +411,11 @@ impl App {
                     self.apply_sealed_completion(completion);
                 }
             }
+            AsyncActionKind::DaemonRpc("btw.resolve-interrupt") => match result.payload {
+                Ok(AsyncActionPayload::Unit) => {}
+                Ok(_) => self.push_plain("question: unexpected daemon response".to_string()),
+                Err(error) => self.push_plain(format!("question: {error}")),
+            },
             AsyncActionKind::DaemonRpc("sessions.list") => {
                 let mut live_ids = None;
                 let mut preview_request = None;

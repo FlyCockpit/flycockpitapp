@@ -2943,18 +2943,6 @@ fn local_guidance_estimate(
     }
 }
 
-/// Run one request-response RPC over the runner's already-attached daemon
-/// client. Unlike socket helpers, this preserves daemon-side per-client
-/// attached session state.
-pub(crate) fn attached_request_tx_blocking(
-    binding: AttachedRequestBinding,
-    req: Request,
-) -> Result<Response, String> {
-    let runtime =
-        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
-    tokio::task::block_in_place(|| runtime.block_on(async move { binding.request(req).await }))
-}
-
 /// Run one blocking daemon request against an already-running daemon and
 /// return the typed response. Connects only — never spawns — so the
 /// `/sessions` browser degrades gracefully (no live data, no DB writes,
@@ -2982,6 +2970,16 @@ pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
     })
 }
 
+/// Blocking daemon transport for an [`AsyncActionRunner::start_blocking`]
+/// worker only. Naming this boundary distinctly lets source ratchets forbid
+/// accidental use from reducers and the async event-loop thread.
+///
+/// [`AsyncActionRunner::start_blocking`]: crate::tui::async_action::AsyncActionRunner::start_blocking
+pub(crate) fn daemon_request_from_blocking_worker(req: Request) -> Result<Response, String> {
+    daemon_request_blocking(req)
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum BlockingDaemonRequestError {
     Conflict(String),
@@ -2989,6 +2987,7 @@ pub(crate) enum BlockingDaemonRequestError {
 }
 
 /// Blocking request variant that preserves optimistic-concurrency conflicts.
+#[cfg(test)]
 pub(crate) fn daemon_request_blocking_classified(
     req: Request,
 ) -> Result<Response, BlockingDaemonRequestError> {
@@ -3045,25 +3044,6 @@ pub fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Respons
                 .map_err(|e| format!("daemon request: {e}"))
         })
     })
-}
-
-/// Run one request-response RPC over the *attached* session's persistent daemon
-/// connection, blocking the current thread until the reply arrives.
-///
-/// Unlike [`daemon_request_at_blocking`] (which opens a FRESH connection per
-/// call, and so is assigned a fresh `client_instance_id`), this reuses the one
-/// connection the attached runner already owns. The sealed-owner capability
-/// channel binds each capability to its minting connection's
-/// `client_instance_id`, so `begin`, `apply`, and `cancel` MUST all travel this
-/// same binding — a fresh-connection apply would be rejected fail-closed as
-/// "minted in a different session".
-pub(crate) fn attached_request_blocking(
-    binding: &AttachedRequestBinding,
-    req: Request,
-) -> Result<Response, String> {
-    let runtime =
-        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
-    tokio::task::block_in_place(|| runtime.block_on(async { binding.request(req).await }))
 }
 
 /// Reveal a leak secret over the sensitive local channel (in-process handoff or

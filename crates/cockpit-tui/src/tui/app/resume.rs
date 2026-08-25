@@ -26,9 +26,20 @@ impl App {
         let was_btw_dialog = self.question_dialog_btw;
         if was_btw_dialog {
             if let Some(Ok(runner)) = self.btw_pane.as_ref().and_then(|pane| pane.runner.as_ref()) {
-                let _ = agent_runner::attached_request_tx_blocking(
-                    runner.attached_request_binding(),
-                    request,
+                let binding = runner.attached_request_binding();
+                self.async_actions.start(
+                    AsyncActionKind::DaemonRpc("btw.resolve-interrupt"),
+                    AsyncActionPolicy::AllowConcurrent,
+                    async move {
+                        match binding.request(request).await? {
+                            cockpit_core::daemon::proto::Response::Ack => {
+                                Ok(AsyncActionPayload::Unit)
+                            }
+                            other => {
+                                Err(format!("unexpected resolve-interrupt response: {other:?}"))
+                            }
+                        }
+                    },
                 );
             }
         } else {

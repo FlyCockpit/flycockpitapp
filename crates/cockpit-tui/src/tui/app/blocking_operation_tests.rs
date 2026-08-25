@@ -620,6 +620,51 @@ fn handler_source_gate_rejects_bypasses() {
 }
 
 #[test]
+fn reducers_and_async_loop_do_not_reenter_daemon_runtime_synchronously() {
+    const RESPONSIVE_SOURCES: &[(&str, &str)] = &[
+        ("app/mod.rs", include_str!("mod.rs")),
+        ("app/input.rs", include_str!("input.rs")),
+        ("app/resume.rs", include_str!("resume.rs")),
+        ("tools_pane.rs", include_str!("../tools_pane.rs")),
+        (
+            "goal_settings_pane.rs",
+            include_str!("../goal_settings_pane.rs"),
+        ),
+    ];
+    const FORBIDDEN: &[&str] = &[
+        "daemon_request_blocking",
+        "daemon_request_blocking_classified",
+        "attached_request_tx_blocking",
+        "attached_request_blocking",
+        "block_in_place",
+        ".block_on(",
+    ];
+    for (name, source) in RESPONSIVE_SOURCES {
+        for forbidden in FORBIDDEN {
+            assert!(
+                !source.contains(forbidden),
+                "{name} must enqueue/await typed effects, not call `{forbidden}`"
+            );
+        }
+    }
+
+    // Slash/startup/subagent RPCs that intentionally retain blocking adapters
+    // run only inside AsyncActionRunner::start_blocking closures. The raw helper
+    // spelling is prohibited so a future reducer cannot bypass that ownership
+    // boundary without changing this exact ratchet.
+    for (name, source) in [
+        ("app/slash.rs", include_str!("slash.rs")),
+        ("app/startup_layout.rs", include_str!("startup_layout.rs")),
+        ("app/subagent_view.rs", include_str!("subagent_view.rs")),
+    ] {
+        assert!(
+            !source.contains("daemon_request_blocking("),
+            "{name} must use the explicitly worker-only transport adapter"
+        );
+    }
+}
+
+#[test]
 fn sealed_site_catalog_detects_a_deleted_manifest_row() {
     use super::blocking_operations::BLOCKING_OPERATION_MANIFEST;
     let declared = derive_production_sites().unwrap();

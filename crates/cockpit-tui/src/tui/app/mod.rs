@@ -3936,16 +3936,15 @@ impl App {
         if self.side_conversation.is_some() {
             self.end_side_conversation(false);
         }
-        if run_post_loop_btw_teardown(self.btw_pane.is_some(), || {
+        if self.btw_pane.is_some() {
             if let Some(Ok(runner)) = self.agent_runner.as_ref() {
-                let _ = agent_runner::attached_request_tx_blocking(
-                    runner.attached_request_binding(),
-                    cockpit_core::daemon::proto::Request::EndBtwFork {
+                let binding = runner.attached_request_binding();
+                let _ = binding
+                    .request(cockpit_core::daemon::proto::Request::EndBtwFork {
                         parent_session_id: runner.session_id(),
-                    },
-                );
+                    })
+                    .await;
             }
-        }) {
             self.close_btw_pane();
         }
         // Cancel-on-exit for a pending `/sealed` write: spend and drop any minted
@@ -4515,6 +4514,7 @@ impl App {
     }
 }
 
+#[cfg(test)]
 fn run_post_loop_btw_teardown(open: bool, teardown: impl FnOnce()) -> bool {
     if open {
         teardown();

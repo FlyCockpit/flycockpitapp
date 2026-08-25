@@ -2343,7 +2343,7 @@ impl App {
             self.async_actions.start_blocking(
                 AsyncActionKind::Internal("rename.auto"),
                 AsyncActionPolicy::AllowConcurrent,
-                move || match agent_runner::daemon_request_blocking(request)? {
+                move || match agent_runner::daemon_request_from_blocking_worker(request)? {
                     cockpit_core::daemon::proto::Response::AutoTitle { title, .. } => {
                         Ok(AsyncActionPayload::Text(title))
                     }
@@ -2362,7 +2362,8 @@ impl App {
             AsyncActionKind::DaemonRpc("rename"),
             AsyncActionPolicy::AllowConcurrent,
             move || {
-                agent_runner::daemon_request_blocking(req).map(|_| AsyncActionPayload::Text(title))
+                agent_runner::daemon_request_from_blocking_worker(req)
+                    .map(|_| AsyncActionPayload::Text(title))
             },
         );
     }
@@ -2440,7 +2441,7 @@ impl App {
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("note"),
             AsyncActionPolicy::AllowConcurrent,
-            move || match agent_runner::daemon_request_blocking(req) {
+            move || match agent_runner::daemon_request_from_blocking_worker(req) {
                 Ok(cockpit_core::daemon::proto::Response::NoteRecorded { .. }) => {
                     Ok(AsyncActionPayload::NoteRecorded { text })
                 }
@@ -2476,7 +2477,8 @@ impl App {
             AsyncActionKind::DaemonRpc(label),
             AsyncActionPolicy::AllowConcurrent,
             move || {
-                let text = leak_response_text(agent_runner::daemon_request_blocking(request));
+                let text =
+                    leak_response_text(agent_runner::daemon_request_from_blocking_worker(request));
                 Ok(AsyncActionPayload::Text(text))
             },
         );

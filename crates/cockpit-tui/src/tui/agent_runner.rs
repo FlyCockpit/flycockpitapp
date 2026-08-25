@@ -2965,7 +2965,7 @@ fn local_guidance_estimate(
 /// `AsyncActionRunner::start_blocking`/`spawn_blocking` worker; reducers and
 /// event handlers use typed async effects. `Err(String)` for any
 /// transport/typed failure.
-pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
+fn daemon_request_blocking(req: Request) -> Result<Response, String> {
     use cockpit_core::daemon::{DaemonStatus, discover};
     let runtime =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
@@ -3045,7 +3045,7 @@ pub(crate) fn daemon_request_blocking_classified(
 /// auto-spawn paths) whose socket env is set only in the daemon child, not
 /// in this client process. Connects only — never spawns. `Err(String)` on
 /// any transport/typed failure.
-pub fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Response, String> {
+pub(crate) fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Response, String> {
     let runtime =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
     let socket = socket.to_path_buf();
@@ -3066,7 +3066,7 @@ pub fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Respons
 /// the Unix peer-authenticated reveal socket, chosen off the control socket).
 /// Returns the revealed `Zeroizing` plaintext **directly** to the caller — it
 /// never rides an `AsyncActionPayload` or any ordinary daemon codec.
-pub fn daemon_reveal_leak_blocking(
+pub(crate) fn daemon_reveal_leak_blocking(
     control_socket: &Path,
     capability: &proto::LeakRevealToken,
 ) -> Result<
@@ -3273,7 +3273,7 @@ pub fn read_subagent_history_page_blocking(
     }
 }
 
-pub fn resource_snapshot_blocking() -> Result<proto::Response, String> {
+pub(crate) fn resource_snapshot_blocking() -> Result<proto::Response, String> {
     match daemon_request_blocking(Request::ResourceSnapshot)? {
         response @ Response::ResourceSnapshot { .. } => Ok(response),
         other => Err(format!("unexpected resource_snapshot response: {other:?}")),

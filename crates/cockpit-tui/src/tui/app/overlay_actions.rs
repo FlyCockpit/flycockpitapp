@@ -67,7 +67,7 @@ impl App {
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
             move || {
                 action
-                    .run()
+                    .run_blocking_rpc()
                     .map(crate::tui::async_action::AsyncActionPayload::NotesRpc)
                     .map_err(|e| e.to_string())
             },
@@ -96,7 +96,7 @@ impl App {
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
             move || {
                 action
-                    .run()
+                    .run_blocking_rpc()
                     .map(crate::tui::async_action::AsyncActionPayload::LeaksRpc)
             },
         );

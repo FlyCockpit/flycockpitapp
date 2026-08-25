@@ -923,6 +923,23 @@ mod tests {
     use crate::daemon::DaemonPaths;
     use tokio::net::UnixListener;
 
+    #[test]
+    fn ephemeral_spawn_arms_raii_before_the_first_wait() {
+        let source = include_str!("client.rs");
+        let spawn = source
+            .find("let pid = spawn_detached_ephemeral(&paths)?;")
+            .expect("ephemeral spawn funnel");
+        let arm = source[spawn..]
+            .find("EphemeralDaemonGuard::new")
+            .map(|offset| spawn + offset)
+            .expect("provisional owner armed after spawn");
+        let wait = source[spawn..]
+            .find("wait_for_daemon(&paths.socket).await")
+            .map(|offset| spawn + offset)
+            .expect("daemon readiness wait");
+        assert!(spawn < arm && arm < wait, "no cancellation window before RAII");
+    }
+
     fn lsp_event(text: impl Into<String>) -> proto::Event {
         proto::Event::LspNotice { text: text.into() }
     }

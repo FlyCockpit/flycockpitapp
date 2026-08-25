@@ -38,7 +38,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use uuid::Uuid;
 
-use crate::tui::agent_runner;
 use crate::tui::message_block::{MessageBlock, MessageBlockRole, render_markdown_message_block};
 use crate::tui::pane::{Pane, ScrollList};
 use crate::tui::pane_shared::{boxed_row, resolve_project_id, short_id};
@@ -526,10 +525,6 @@ impl SessionsPane {
     /// (Re)load the root level for the active scope, discarding any fork
     /// drill-in. Called at open and on a scope / archived-toggle change.
     fn load_root(&mut self) {
-        let pid = match self.scope {
-            Scope::Project => self.project_id.clone(),
-            Scope::All => None,
-        };
         if self.daemon_connected {
             self.loading = Some("Loading sessions...");
             self.levels = vec![Level {
@@ -539,10 +534,10 @@ impl SessionsPane {
             }];
             return;
         }
-        let cards = self.fetch_level(pid, None);
+        self.mark_disconnected_unavailable();
         self.levels = vec![Level {
             parent: None,
-            cards,
+            cards: Vec::new(),
             list: ScrollList::new(),
         }];
     }
@@ -613,59 +608,8 @@ impl SessionsPane {
         }
     }
 
-    /// Fetch + tier-sort one level: root sessions (`parent = None`) or the
-    /// direct forks of `parent`. Filters archived per the toggle and
-    /// attaches live status. Records (clears) the error on success.
-    ///
-    /// Data path: daemon-connected → the RPC list + per-session live
-    /// status; daemonless → a read-only direct DB read with live status
-    /// uniformly absent (every session degrades to its DB-derived tier).
-    fn fetch_level(
-        &mut self,
-        project_id: Option<String>,
-        parent: Option<Uuid>,
-    ) -> Vec<(SessionSummary, Tier)> {
-        let listed = if self.daemon_connected {
-            match self.daemon_socket.as_deref() {
-                Some(socket) => agent_runner::list_sessions_blocking(socket, project_id, parent),
-                None => Err("daemon socket unavailable for sessions.list".to_string()),
-            }
-        } else {
-            Err("Unavailable — reconnect to the daemon, then Retry".to_string())
-        };
-        match listed {
-            Ok(mut sessions) => {
-                self.error = None;
-                // Archive filter (GOALS §17h): hidden by default.
-                if !self.show_archived {
-                    sessions.retain(|s| s.archived_at.is_none());
-                }
-                // Live status only exists with a daemon. Daemonless, every
-                // session falls to its DB-derived tier (`None` live), which
-                // `classify` handles without error.
-                let live = if self.daemon_connected {
-                    let ids: Vec<Uuid> = sessions.iter().map(|s| s.session_id).collect();
-                    self.daemon_socket
-                        .as_deref()
-                        .map(|socket| agent_runner::session_live_status_blocking(socket, ids))
-                        .unwrap_or_default()
-                } else {
-                    std::collections::HashMap::new()
-                };
-                let pairs: Vec<_> = sessions
-                    .into_iter()
-                    .map(|s| {
-                        let l = live.get(&s.session_id).copied();
-                        (s, l)
-                    })
-                    .collect();
-                tier_sort(pairs)
-            }
-            Err(e) => {
-                self.error = Some(e);
-                Vec::new()
-            }
-        }
+    fn mark_disconnected_unavailable(&mut self) {
+        self.error = Some("Unavailable — reconnect to the daemon, then Retry".to_string());
     }
 
     /// Reload the current level in place, preserving scope/breadcrumb and
@@ -675,23 +619,9 @@ impl SessionsPane {
             self.mark_current_level_loading();
             return;
         }
-        let (pid, parent) = {
-            let depth = self.levels.len();
-            let level = self.levels.last().expect("at least the root level");
-            match (depth, &level.parent) {
-                (_, Some(p)) => (None, Some(p.session_id)),
-                _ => (
-                    match self.scope {
-                        Scope::Project => self.project_id.clone(),
-                        Scope::All => None,
-                    },
-                    None,
-                ),
-            }
-        };
-        let cards = self.fetch_level(pid, parent);
+        self.mark_disconnected_unavailable();
         if let Some(level) = self.levels.last_mut() {
-            level.cards = cards;
+            level.cards.clear();
             level.list.clamp_cursor(level.cards.len());
             level.list.set_scroll(0);
         }
@@ -1001,10 +931,10 @@ impl SessionsPane {
             });
             return true;
         }
-        let cards = self.fetch_level(None, Some(parent.session_id));
+        self.mark_disconnected_unavailable();
         self.levels.push(Level {
             parent: Some(parent),
-            cards,
+            cards: Vec::new(),
             list: ScrollList::new(),
         });
         false
@@ -1029,6 +959,12 @@ impl SessionsPane {
             self.notice = Some(DAEMONLESS_HINT.to_string());
             return;
         }
+        let live = self
+            .current()
+            .cards
+            .get(self.current().list.cursor())
+            .and_then(|(_, status)| *status)
+            .is_some_and(|(jobs, processing)| jobs || processing);
         let Some(s) = self.selected().cloned() else {
             return;
         };
@@ -1036,16 +972,8 @@ impl SessionsPane {
         // archive/delete (GOALS §17h) — carried on the summary, accurate
         // without an extra round-trip.
         let descendants = s.descendant_count;
-        // Live status drives the interrupt-first warning.
-        let live_map = self
-            .daemon_socket
-            .as_deref()
-            .map(|socket| agent_runner::session_live_status_blocking(socket, vec![s.session_id]))
-            .unwrap_or_default();
-        let live = live_map
-            .get(&s.session_id)
-            .map(|(j, p)| *j || *p)
-            .unwrap_or(false);
+        // Live status was fetched by the typed async list effect. Confirmation
+        // consumes that snapshot and never blocks the key reducer.
         let label = card_description(&s);
         self.step = Step::Confirm {
             session_id: s.session_id,
@@ -3388,8 +3316,8 @@ mod tests {
     #[test]
     fn disconnected_list_is_typed_unavailable() {
         let mut pane = test_pane_mode(vec![], false);
-        let cards = pane.fetch_level(Some("pid".into()), None);
-        assert!(cards.is_empty());
+        pane.mark_disconnected_unavailable();
+        assert!(pane.current().cards.is_empty());
         assert!(
             pane.error
                 .as_deref()

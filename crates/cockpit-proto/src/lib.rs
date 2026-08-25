@@ -2824,6 +2824,17 @@ mod sensitive_wire_literal_tests {
     }
 
     #[test]
+    fn leak_reveal_token_redacts_debug_and_keeps_zeroizing_ownership() {
+        let marker = "0123456789abcdef".repeat(4);
+        let token = LeakRevealToken::new(marker.clone());
+        let debug = format!("{token:?}");
+        assert!(!debug.contains(&marker));
+        assert!(debug.contains("REDACTED"));
+        let owned = token.into_zeroizing();
+        assert_eq!(owned.as_str(), marker);
+    }
+
+    #[test]
     fn sensitive_wire_literal_over_the_bound_fails_closed_on_deserialize() {
         let oversized = "x".repeat(MAX_SENSITIVE_FRAME_BYTES + 1);
         let json = serde_json::to_string(&oversized).unwrap();

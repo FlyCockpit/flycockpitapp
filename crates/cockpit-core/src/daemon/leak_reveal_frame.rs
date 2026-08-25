@@ -80,7 +80,7 @@ fn status_denied(status: u8) -> Option<LeakRevealDenied> {
 }
 
 /// Encode a reveal request. `capability_hex` must be exactly 64 chars.
-pub fn encode_request(req: &LeakRevealSocketRequest) -> Result<Vec<u8>, FrameError> {
+pub fn encode_request(req: &LeakRevealSocketRequest) -> Result<Zeroizing<Vec<u8>>, FrameError> {
     if req.capability_hex.len() != LEAK_REVEAL_CAPABILITY_HEX_LEN {
         return Err(FrameError);
     }
@@ -88,7 +88,7 @@ pub fn encode_request(req: &LeakRevealSocketRequest) -> Result<Vec<u8>, FrameErr
     buf.push(LEAK_REVEAL_FRAME_VERSION);
     buf.extend_from_slice(&(LEAK_REVEAL_CAPABILITY_HEX_LEN as u16).to_be_bytes());
     buf.extend_from_slice(req.capability_hex.as_str().as_bytes());
-    Ok(buf)
+    Ok(Zeroizing::new(buf))
 }
 
 /// Decode a reveal request. Rejects wrong version, `capability_len != 64`,

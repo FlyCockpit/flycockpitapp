@@ -21,6 +21,49 @@ use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
 #[test]
+fn client_teardown_quiesces_dispatch_before_capability_cancellation() {
+    let source = include_str!("mod.rs");
+    let socket = source
+        .split("async fn handle_client_transport_as")
+        .nth(1)
+        .expect("socket transport")
+        .split("async fn select_client_task")
+        .next()
+        .expect("socket teardown body");
+    let abort = socket.find("executor_task.abort()").expect("executor abort");
+    let join = socket[abort..]
+        .find("executor_task).await")
+        .map(|offset| abort + offset)
+        .expect("executor join");
+    let cancel = socket
+        .find(".cancel_for_session(client_instance_id)")
+        .expect("socket capability cancellation");
+    assert!(abort < join && join < cancel);
+
+    let in_process = source
+        .split("async fn run_in_process_client")
+        .nth(1)
+        .expect("in-process transport")
+        .split("struct PendingEventLag")
+        .next()
+        .expect("in-process teardown body");
+    let abort_all = in_process
+        .find("concurrent_tasks.abort_all()")
+        .expect("request abort");
+    let join_all = in_process[abort_all..]
+        .find("concurrent_tasks.join_next().await")
+        .map(|offset| abort_all + offset)
+        .expect("request join");
+    let attachments = in_process
+        .find("drain_client_attachment_ownership")
+        .expect("attachment drain");
+    let cancel = in_process
+        .find(".cancel_for_session(client_instance_id)")
+        .expect("in-process capability cancellation");
+    assert!(abort_all < join_all && join_all < attachments && attachments < cancel);
+}
+
+#[test]
 fn oversized_response_is_replaced_before_the_ndjson_writer() {
     let id = Uuid::new_v4();
     let envelope = bounded_response_envelope(

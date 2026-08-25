@@ -1606,7 +1606,7 @@ fn finalize_response_projections(response: &mut proto::Response) {
     fn assistant(value: &mut proto::AssistantSummary) {
         value.definition_presentation_hash = value.definition_markdown.as_ref().map(|markdown| {
             use sha2::Digest as _;
-            format!("{:x}", sha2::Sha256::digest(markdown.as_bytes()))
+            crate::computer::frame::hex::encode(&sha2::Sha256::digest(markdown.as_bytes()))
         });
         value.projection_digest = proto::assistant_projection_digest(value);
     }

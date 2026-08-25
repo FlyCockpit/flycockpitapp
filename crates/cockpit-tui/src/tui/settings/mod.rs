@@ -392,12 +392,12 @@ fn apply_settings_patch_via_daemon(
             let warning = (publication
                 == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded)
                 .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
-            (
+            Ok((
                 result_revision,
                 config_generation,
                 committed_denylist,
                 warning,
-            )
+            ))
         }
         Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
         Err(error) => Err(error.to_string()),
@@ -514,12 +514,12 @@ pub(super) fn apply_typed_settings_document_edit(
             let warning = (publication
                 == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded)
                 .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
-            (
+            Ok((
                 result_revision,
                 config_generation,
                 committed_denylist,
                 warning,
-            )
+            ))
         }
         Ok(other) => Err(format!("unexpected settings edit response: {other:?}")),
         Err(error) => Err(error.to_string()),
@@ -578,7 +578,10 @@ fn apply_json_merge_patch_local(target: &mut serde_json::Value, patch: serde_jso
         if value.is_null() {
             target.remove(&key);
         } else {
-            apply_json_merge_patch_local(target.entry(key).or_default(), value);
+            apply_json_merge_patch_local(
+                target.entry(key).or_insert(serde_json::Value::Null),
+                value,
+            );
         }
     }
 }

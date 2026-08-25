@@ -3474,15 +3474,16 @@ impl NativeResponseExtractor {
         live_frame: Option<&LiveComputerFrame>,
     ) -> NativeComputerContinuation {
         match outcome {
-            CoordinatedOutcome::Completed { .. }
-            | CoordinatedOutcome::BackendCompleted { .. } => NativeComputerContinuation::Anthropic {
-                tool_use_id: tool_use_id.to_string(),
-                variant,
-                // Attach the transient image block when the live frame was
-                // retained; otherwise text-only (no screenshot to send).
-                transient: live_frame
-                    .map(|frame| anthropic_transient_image_block(frame, tool_use_id, variant)),
-            },
+            CoordinatedOutcome::Completed { .. } | CoordinatedOutcome::BackendCompleted { .. } => {
+                NativeComputerContinuation::Anthropic {
+                    tool_use_id: tool_use_id.to_string(),
+                    variant,
+                    // Attach the transient image block when the live frame was
+                    // retained; otherwise text-only (no screenshot to send).
+                    transient: live_frame
+                        .map(|frame| anthropic_transient_image_block(frame, tool_use_id, variant)),
+                }
+            }
             CoordinatedOutcome::Failed { failure, .. } => NativeComputerContinuation::TextOnly {
                 call_id: tool_use_id.to_string(),
                 text: format!("computer action failed: {}", failure.error),
@@ -3764,7 +3765,10 @@ mod tests {
         match NativeResponseExtractor::build_continuation(&openai_call, &completed, Some(&frame)) {
             NativeComputerContinuation::OpenAi { call_id, transient } => {
                 assert_eq!(call_id, "call-frame");
-                assert!(transient.is_some(), "a retained live frame builds a transient");
+                assert!(
+                    transient.is_some(),
+                    "a retained live frame builds a transient"
+                );
             }
             other => panic!("expected OpenAi continuation with transient, got {other:?}"),
         }
@@ -3781,14 +3785,18 @@ mod tests {
             tool_use_id: "tool-frame".to_string(),
             action: Anthropic20251124ComputerAction::Screenshot,
         };
-        match NativeResponseExtractor::build_continuation(&anthropic_call, &completed, Some(&frame)) {
+        match NativeResponseExtractor::build_continuation(&anthropic_call, &completed, Some(&frame))
+        {
             NativeComputerContinuation::Anthropic {
                 tool_use_id,
                 transient,
                 ..
             } => {
                 assert_eq!(tool_use_id, "tool-frame");
-                assert!(transient.is_some(), "a retained live frame builds a transient");
+                assert!(
+                    transient.is_some(),
+                    "a retained live frame builds a transient"
+                );
             }
             other => panic!("expected Anthropic continuation with transient, got {other:?}"),
         }

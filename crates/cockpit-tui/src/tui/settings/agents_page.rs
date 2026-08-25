@@ -375,7 +375,7 @@ impl AgentsPage {
             super::pointer_actions::ExternalEditOutcome::Saved => {
                 let edited_markdown = read_agent_external_edit_staging(&pending);
                 let mut draft = pending.draft.take();
-                let commit = (|| -> Result<(), String> {
+                let commit = (|| -> Result<super::pointer_actions::AgentId, String> {
                     let markdown = edited_markdown
                         .as_ref()
                         .map_err(|error| format!("failed to read editor staging file: {error}"))?;
@@ -880,7 +880,8 @@ pub(crate) fn validate_agent_mutation_result(
             && result.changed != (snapshot.revision != prior)
         {
             return Err(
-                "daemon mutation change flag disagrees with its exact revision transition".into(),
+                "daemon mutation change flag disagrees with its exact revision transition"
+                    .to_string(),
             );
         }
         Ok(snapshot)

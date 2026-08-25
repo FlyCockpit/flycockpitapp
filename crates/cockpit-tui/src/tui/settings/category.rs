@@ -3506,9 +3506,9 @@ fn remove_project_shadow_path(
     let Some((last, parents)) = path.split_last() else {
         return Ok(false);
     };
-    let mut patch = serde_json::json!({ (last): null });
+    let mut patch = serde_json::json!({ (*last): null });
     for parent in parents.iter().rev() {
-        patch = serde_json::json!({ (parent): patch });
+        patch = serde_json::json!({ (*parent): patch });
     }
     match super::apply_typed_settings_document_edit(project_config, None, patch)? {
         super::SettingsPatchOutcome::Reconciled { .. } => {}

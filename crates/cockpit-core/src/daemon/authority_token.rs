@@ -7,7 +7,7 @@
 use std::sync::OnceLock;
 
 use hmac::{Hmac, KeyInit, Mac as _};
-use rand::Rng as _;
+use rand::RngExt;
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;

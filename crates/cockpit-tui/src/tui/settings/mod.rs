@@ -4978,6 +4978,10 @@ pub(super) enum Nav {
 // ── Dialog top-level ─────────────────────────────────────────────────────
 
 impl Dialog {
+    pub(crate) fn has_unsettled_local_authority(&self) -> bool {
+        matches!(self, Dialog::Settings(settings) if settings.authority_operation_pending())
+    }
+
     pub(crate) fn handle_settings_pointer(
         &mut self,
         mouse: MouseEvent,

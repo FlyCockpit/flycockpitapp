@@ -1395,6 +1395,16 @@ pub(super) enum Overlay {
 }
 
 impl Overlay {
+    pub(super) fn has_unsettled_local_authority(&self) -> bool {
+        match self {
+            Self::Sessions(pane) => pane.has_unsettled_local_authority(),
+            Self::Tools(pane) => pane.has_unsettled_local_authority(),
+            Self::GoalSettings(pane) => pane.has_unsettled_local_authority(),
+            Self::Sealed(overlay) => overlay.has_unsettled_local_authority(),
+            _ => false,
+        }
+    }
+
     pub(super) fn is_open(&self) -> bool {
         !matches!(self, Self::None)
     }

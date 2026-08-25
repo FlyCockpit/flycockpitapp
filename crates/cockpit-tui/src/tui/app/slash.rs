@@ -801,15 +801,7 @@ pub(super) fn hidden_slash_alias(query: &str) -> Option<SlashCommand> {
 }
 
 fn run_exit(app: &mut App, _: &str) -> bool {
-    if app.pending_mcp_local.is_some() {
-        app.push_plain(
-            "/mcp: exit is fenced until the pending mutation reaches a verified terminal state."
-                .to_string(),
-        );
-        false
-    } else {
-        true
-    }
+    app.request_guarded_exit()
 }
 
 fn run_editor(app: &mut App, args: &str) -> bool {

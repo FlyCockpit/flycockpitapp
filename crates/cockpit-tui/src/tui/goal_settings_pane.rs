@@ -250,6 +250,12 @@ pub(crate) struct GoalSettingsCompletion {
 }
 
 impl GoalSettingsPane {
+    /// A save owns durable agent authority until its exact receipt is known.
+    /// The initial snapshot load is deliberately excluded: it is read-only.
+    pub(crate) fn has_unsettled_local_authority(&self) -> bool {
+        matches!(self.in_flight, Some(GoalSettingsPending::SaveAgent { .. }))
+    }
+
     pub(crate) fn open(cwd: &Path, agent_name: &str, root_foreground: bool) -> Result<Self> {
         let operation_id = uuid::Uuid::new_v4();
         let project_root = cwd.to_string_lossy().into_owned();

@@ -410,6 +410,10 @@ pub struct SessionsPane {
 }
 
 impl SessionsPane {
+    pub(crate) fn has_unsettled_local_authority(&self) -> bool {
+        self.pending_mutation.is_some()
+    }
+
     /// The which-key descriptor for this pane (`crate::tui::keys_overlay`).
     /// Static + data-driven so the overlay never scrapes the help line.
     pub fn keybindings() -> crate::tui::keys_overlay::KeyGroup {

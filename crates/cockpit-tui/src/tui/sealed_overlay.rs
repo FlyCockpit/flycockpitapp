@@ -760,6 +760,12 @@ pub(crate) enum SealedOverlayOutcome {
 }
 
 impl SealedOverlay {
+    /// A write overlay owns a daemon-minted capability until apply/cancel has
+    /// produced an exact terminal receipt. It must survive an attempted exit.
+    pub(crate) fn has_unsettled_local_authority(&self) -> bool {
+        matches!(self, SealedOverlay::Write(_))
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> SealedOverlayOutcome {
         match self {
             SealedOverlay::Write(overlay) => overlay.handle_key(key),

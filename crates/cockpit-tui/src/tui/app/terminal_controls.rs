@@ -1,6 +1,89 @@
 use super::*;
 
 impl App {
+    /// One process-wide authority fence for every user-requested exit path.
+    /// Read-only projection loads are intentionally absent. Operations that
+    /// can have changed durable or host-published state remain represented by
+    /// their exact owner/correlation until a terminal receipt is applied.
+    pub(super) fn has_unsettled_local_authority(&self) -> bool {
+        self.pending_workspace_trust.is_some()
+            || self.dialog.has_unsettled_local_authority()
+            || self.overlay.has_unsettled_local_authority()
+            || self.pending_mcp_local.is_some()
+            || self.pending_leak_reveal.is_some()
+            || self.pending_runner_attach.is_some()
+            || self.pending_model_selection.is_some()
+            || self.pending_default_model_update_id.is_some()
+            || !self.pending_control_requests.is_empty()
+            || !self.pending_usage.is_empty()
+            || !self.settings_blocking_actions.is_empty()
+            || self.has_unsettled_authority_async_action()
+    }
+
+    fn has_unsettled_authority_async_action(&self) -> bool {
+        use crate::tui::async_action::AsyncActionKind::{Blocking, DaemonRpc, Internal};
+
+        [
+            Blocking("btw.teardown"),
+            Blocking("copy.file"),
+            Blocking("export.debug"),
+            Blocking("export.transcript"),
+            Blocking("local.command"),
+            Blocking("queue.edit"),
+            Blocking("settings.blocking-effect"),
+            DaemonRpc("btw.resolve-interrupt"),
+            DaemonRpc("fork.create"),
+            DaemonRpc("leaks-rotate"),
+            DaemonRpc("mcp.local"),
+            DaemonRpc("note"),
+            DaemonRpc("rename"),
+            DaemonRpc("resources.promote"),
+            DaemonRpc("sealed"),
+            DaemonRpc("sealed.effect"),
+            DaemonRpc("sessions.mutation"),
+            DaemonRpc("side.discard"),
+            DaemonRpc("side.start"),
+            DaemonRpc("subagent.steer"),
+            DaemonRpc("workspace-trust.effect"),
+            Internal("btw.runner.attach"),
+            Internal("leaks.rpc"),
+            Internal("notes.rpc"),
+            Internal("oauth.acknowledge"),
+            Internal("oauth.cancel"),
+            Internal("oauth.codex.begin"),
+            Internal("oauth.codex.poll"),
+            Internal("oauth.grok.begin"),
+            Internal("oauth.grok.complete"),
+            Internal("pins.pin"),
+            Internal("pins.toggle"),
+            Internal("pins.unpin"),
+            Internal("rename.auto"),
+            Internal("runner.attach"),
+            Internal("session.fork"),
+            Internal("session.resume"),
+            Internal("session.side"),
+            Internal("session.side.return"),
+            Internal("session.switch"),
+        ]
+        .iter()
+        .any(|kind| self.async_actions.has_pending_kind(kind))
+    }
+
+    /// Return true only when shutdown may surrender all local authority.
+    /// A blocked exit leaves every owner ID and lease in place for its normal
+    /// completion/reconciliation path.
+    pub(super) fn request_guarded_exit(&mut self) -> bool {
+        if self.has_unsettled_local_authority() {
+            self.show_toast(
+                "Exit is waiting for a local operation to reach a verified terminal state",
+                ToastKind::Info,
+            );
+            false
+        } else {
+            true
+        }
+    }
+
     /// Handle a ctrl+c press (GOALS §3a). Single press interrupts a
     /// running agent (never quits); a second press within
     /// [`CTRL_C_EXIT_WINDOW`] of the previous exits. Returns `true` to
@@ -17,17 +100,7 @@ impl App {
         );
         self.ctrl_c_armed_at = new_armed;
         match action {
-            CtrlCAction::Exit => {
-                if self.pending_mcp_local.is_some() {
-                    self.push_plain(
-                        "/mcp: exit is fenced until the pending mutation reaches a verified terminal state."
-                            .to_string(),
-                    );
-                    false
-                } else {
-                    true
-                }
-            }
+            CtrlCAction::Exit => self.request_guarded_exit(),
             CtrlCAction::ArmAndInterrupt => {
                 self.interrupt_agent();
                 self.end_working_span();

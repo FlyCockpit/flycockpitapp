@@ -415,7 +415,7 @@ impl App {
             && matches!(key.code, KeyCode::Char('d'))
         {
             return if self.ctrl_d_can_exit_immediately() {
-                true
+                self.request_guarded_exit()
             } else {
                 self.handle_ctrl_c()
             };
@@ -692,7 +692,7 @@ impl App {
                     self.maybe_open_add_provider_wizard();
                 }
                 Some(crate::tui::daemon_prompt::DaemonChoice::Exit) | None => {
-                    return true;
+                    return self.request_guarded_exit();
                 }
             }
             return false;

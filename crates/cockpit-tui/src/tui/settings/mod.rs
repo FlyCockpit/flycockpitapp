@@ -3161,10 +3161,9 @@ impl SettingsDialog {
         }
         #[cfg(not(test))]
         {
-            let revision = self
-                .extended_revision
-                .as_deref()
-                .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
+            let revision = self.extended_revision.as_deref().ok_or_else(|| {
+                "settings snapshot has no revision; reload before saving".to_string()
+            })?;
             let outcome = apply_settings_patch_via_daemon(
                 &self.extended_path,
                 self.active_project_root
@@ -3179,7 +3178,8 @@ impl SettingsDialog {
                     layer,
                     config_generation,
                 } => {
-                    let (extended, base, revision) = decode_extended_layer(layer, config_generation)?;
+                    let (extended, base, revision) =
+                        decode_extended_layer(layer, config_generation)?;
                     self.extended = extended;
                     self.extended_base = base;
                     self.extended_revision = Some(revision);
@@ -4393,10 +4393,9 @@ impl SettingsCx {
         }
         #[cfg(not(test))]
         {
-            let revision = self
-                .extended_revision
-                .as_deref()
-                .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
+            let revision = self.extended_revision.as_deref().ok_or_else(|| {
+                "settings snapshot has no revision; reload before saving".to_string()
+            })?;
             let outcome = apply_settings_patch_via_daemon(
                 &self.extended_path,
                 self.active_project_root
@@ -4411,7 +4410,8 @@ impl SettingsCx {
                     layer,
                     config_generation,
                 } => {
-                    let (extended, base, revision) = decode_extended_layer(layer, config_generation)?;
+                    let (extended, base, revision) =
+                        decode_extended_layer(layer, config_generation)?;
                     self.extended = extended;
                     self.extended_base = base;
                     self.extended_revision = Some(revision);

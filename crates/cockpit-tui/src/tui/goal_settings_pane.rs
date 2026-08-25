@@ -208,33 +208,34 @@ impl GoalSettingsPane {
         }
         #[cfg(not(test))]
         {
-        let response = crate::tui::agent_runner::daemon_request_blocking(
-            cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
-                project_root: cwd.to_string_lossy().into_owned(),
-                name: agent_name.to_string(),
-            },
-        )
-        .map_err(anyhow::Error::msg)?;
-        let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) = response else {
-            anyhow::bail!("daemon returned an unexpected agent snapshot");
-        };
-        super::settings::agents_page::validate_agent_snapshot(&snapshot, cwd, agent_name, None)
+            let response = crate::tui::agent_runner::daemon_request_blocking(
+                cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+                    project_root: cwd.to_string_lossy().into_owned(),
+                    name: agent_name.to_string(),
+                },
+            )
             .map_err(anyhow::Error::msg)?;
-        let draft = GoalSettingsDraft::from_json(snapshot.goal_supervision_json.as_deref())?;
-        let status = (!root_foreground).then(|| {
-            "Apply is disabled while an interactive subagent holds the foreground.".to_string()
-        });
-        Ok(Self {
-            agent_name: agent_name.to_string(),
-            cwd: cwd.to_path_buf(),
-            root_foreground,
-            revision: snapshot.revision,
-            supports_agent_save: snapshot.supports_goal_supervision,
-            draft,
-            cursor: 0,
-            status,
-            confirm: None,
-        })
+            let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) = response
+            else {
+                anyhow::bail!("daemon returned an unexpected agent snapshot");
+            };
+            super::settings::agents_page::validate_agent_snapshot(&snapshot, cwd, agent_name, None)
+                .map_err(anyhow::Error::msg)?;
+            let draft = GoalSettingsDraft::from_json(snapshot.goal_supervision_json.as_deref())?;
+            let status = (!root_foreground).then(|| {
+                "Apply is disabled while an interactive subagent holds the foreground.".to_string()
+            });
+            Ok(Self {
+                agent_name: agent_name.to_string(),
+                cwd: cwd.to_path_buf(),
+                root_foreground,
+                revision: snapshot.revision,
+                supports_agent_save: snapshot.supports_goal_supervision,
+                draft,
+                cursor: 0,
+                status,
+                confirm: None,
+            })
         }
     }
 
@@ -415,7 +416,9 @@ impl GoalSettingsPane {
             {
                 // Disk-based agent save: re-resolve, update goal_supervision, write.
                 let mut def = cockpit_core::agents::resolve(&self.cwd, &self.agent_name)?
-                    .ok_or_else(|| anyhow::anyhow!("agent `{}` could not be resolved", self.agent_name))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("agent `{}` could not be resolved", self.agent_name)
+                    })?;
                 let override_: cockpit_core::agents::GoalSettingsOverride = override_json
                     .as_deref()
                     .map(serde_json::from_str)
@@ -435,63 +438,63 @@ impl GoalSettingsPane {
             }
             #[cfg(not(test))]
             {
-            let prior_goal_json = if self.draft.original.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(&self.draft.original)?)
-            };
-            let goal_patch = cockpit_core::daemon::proto::GoalSupervisionPatch {
-                cold_skeptic_count: Some(self.draft.cold_skeptic_count),
-                cold_skeptic_model: Some(
-                    self.draft
-                        .cold_skeptic_model
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string),
-                ),
-                max_verification_attempts: Some(self.draft.max_verification_attempts),
-            };
-            let mutation = cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision {
-                name: self.agent_name.clone(),
-                patch: goal_patch.clone(),
-            };
-            let expected_revision = self.revision.clone();
-            let response = crate::tui::agent_runner::daemon_request_blocking(
-                cockpit_core::daemon::proto::Request::MutateAgent {
-                    project_root: self.cwd.to_string_lossy().into_owned(),
-                    mutation: mutation.clone(),
-                    expected_revision: Some(expected_revision.clone()),
-                },
-            )
-            .map_err(anyhow::Error::msg)?;
-            let cockpit_core::daemon::proto::Response::AgentMutated(result) = response else {
-                anyhow::bail!("daemon returned an unexpected goal-settings response");
-            };
-            super::settings::agents_page::validate_agent_mutation_result(
-                &result,
-                &self.cwd,
-                &mutation,
-                Some(&expected_revision),
-                None,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let snapshot = result
-                .snapshot
-                .ok_or_else(|| anyhow::anyhow!("daemon omitted the goal-settings snapshot"))?;
-            cockpit_proto::validate_goal_supervision_projection(
-                prior_goal_json.as_deref(),
-                &goal_patch,
-                snapshot.goal_supervision_json.as_deref(),
-            )
-            .map_err(anyhow::Error::msg)?;
-            self.revision = snapshot.revision;
-            self.draft.original = snapshot
-                .goal_supervision_json
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()?
-                .unwrap_or_default();
+                let prior_goal_json = if self.draft.original.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&self.draft.original)?)
+                };
+                let goal_patch = cockpit_core::daemon::proto::GoalSupervisionPatch {
+                    cold_skeptic_count: Some(self.draft.cold_skeptic_count),
+                    cold_skeptic_model: Some(
+                        self.draft
+                            .cold_skeptic_model
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string),
+                    ),
+                    max_verification_attempts: Some(self.draft.max_verification_attempts),
+                };
+                let mutation = cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision {
+                    name: self.agent_name.clone(),
+                    patch: goal_patch.clone(),
+                };
+                let expected_revision = self.revision.clone();
+                let response = crate::tui::agent_runner::daemon_request_blocking(
+                    cockpit_core::daemon::proto::Request::MutateAgent {
+                        project_root: self.cwd.to_string_lossy().into_owned(),
+                        mutation: mutation.clone(),
+                        expected_revision: Some(expected_revision.clone()),
+                    },
+                )
+                .map_err(anyhow::Error::msg)?;
+                let cockpit_core::daemon::proto::Response::AgentMutated(result) = response else {
+                    anyhow::bail!("daemon returned an unexpected goal-settings response");
+                };
+                super::settings::agents_page::validate_agent_mutation_result(
+                    &result,
+                    &self.cwd,
+                    &mutation,
+                    Some(&expected_revision),
+                    None,
+                )
+                .map_err(anyhow::Error::msg)?;
+                let snapshot = result
+                    .snapshot
+                    .ok_or_else(|| anyhow::anyhow!("daemon omitted the goal-settings snapshot"))?;
+                cockpit_proto::validate_goal_supervision_projection(
+                    prior_goal_json.as_deref(),
+                    &goal_patch,
+                    snapshot.goal_supervision_json.as_deref(),
+                )
+                .map_err(anyhow::Error::msg)?;
+                self.revision = snapshot.revision;
+                self.draft.original = snapshot
+                    .goal_supervision_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()?
+                    .unwrap_or_default();
             }
         }
         Ok(GoalSettingsOutcome::Apply {

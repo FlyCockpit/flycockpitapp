@@ -777,31 +777,31 @@ fn begin_agent_editor_lease(
     }
     #[cfg(not(test))]
     {
-    match crate::tui::agent_runner::daemon_request_blocking(
-        cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
-            project_root: cwd.to_string_lossy().into_owned(),
-            name: name.to_string(),
-            expected_revision: expected_revision.clone(),
-        },
-    )? {
-        cockpit_core::daemon::proto::Response::AgentEditorLeaseBegun(lease) => {
-            if lease.lease_id.is_empty() {
-                return Err("daemon returned an empty editor lease ID".into());
+        match crate::tui::agent_runner::daemon_request_blocking(
+            cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
+                project_root: cwd.to_string_lossy().into_owned(),
+                name: name.to_string(),
+                expected_revision: expected_revision.clone(),
+            },
+        )? {
+            cockpit_core::daemon::proto::Response::AgentEditorLeaseBegun(lease) => {
+                if lease.lease_id.is_empty() {
+                    return Err("daemon returned an empty editor lease ID".into());
+                }
+                validate_agent_snapshot(&lease.snapshot, cwd, name, None)?;
+                if lease.snapshot.revision != expected_revision {
+                    return Err("daemon editor lease was minted for a different revision".into());
+                }
+                if !lease.snapshot.editable
+                    || lease.snapshot.source_layer
+                        != cockpit_core::daemon::proto::AgentSourceLayer::Workspace
+                {
+                    return Err("daemon editor lease was minted for a non-workspace source".into());
+                }
+                Ok(lease)
             }
-            validate_agent_snapshot(&lease.snapshot, cwd, name, None)?;
-            if lease.snapshot.revision != expected_revision {
-                return Err("daemon editor lease was minted for a different revision".into());
-            }
-            if !lease.snapshot.editable
-                || lease.snapshot.source_layer
-                    != cockpit_core::daemon::proto::AgentSourceLayer::Workspace
-            {
-                return Err("daemon editor lease was minted for a non-workspace source".into());
-            }
-            Ok(lease)
+            other => Err(format!("unexpected editor lease response: {other:?}")),
         }
-        other => Err(format!("unexpected editor lease response: {other:?}")),
-    }
     }
 }
 
@@ -1203,8 +1203,8 @@ impl SettingsCx {
                     }
                     #[cfg(not(test))]
                     {
-                    let assistant_definition = editor.is_assistant_definition();
-                    let saved = match revision {
+                        let assistant_definition = editor.is_assistant_definition();
+                        let saved = match revision {
                         Some(revision) if assistant_definition => {
                             match crate::tui::agent_runner::daemon_request_blocking(
                                 cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
@@ -1242,15 +1242,15 @@ impl SettingsCx {
                                 .to_string(),
                         ),
                     };
-                    match saved {
-                        Ok(new_id) => {
-                            p.editing = None;
-                            p.refresh_after_edit(&cwd, Some(&new_id));
+                        match saved {
+                            Ok(new_id) => {
+                                p.editing = None;
+                                p.refresh_after_edit(&cwd, Some(&new_id));
+                            }
+                            Err(e) => {
+                                p.status = Some(format!("write failed: {e}"));
+                            }
                         }
-                        Err(e) => {
-                            p.status = Some(format!("write failed: {e}"));
-                        }
-                    }
                     }
                 }
                 EditorOutcome::ExternalEdit => {
@@ -1294,7 +1294,8 @@ impl SettingsCx {
                                     let path = entry.path();
                                     if path.extension().is_some_and(|ext| ext == "md") {
                                         // Only remove built-in override files, not custom agents.
-                                        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                                        let stem =
+                                            path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                                         if cockpit_core::agents::is_builtin_agent(stem) {
                                             if std::fs::remove_file(&path).is_ok() {
                                                 count += 1;
@@ -1304,27 +1305,24 @@ impl SettingsCx {
                                 }
                             }
                         }
-                        p.status = Some(format!(
-                            "reset {} built-in override(s) to default",
-                            count
-                        ));
+                        p.status = Some(format!("reset {} built-in override(s) to default", count));
                         p.rows = rows_for(&cwd).0;
                         p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
                         return Nav::Stay;
                     }
                     #[cfg(not(test))]
                     {
-                    let reset = agent_inventory_revision(&cwd).and_then(|revision| {
-                        mutate_agent(
-                            &cwd,
-                            cockpit_core::daemon::proto::AgentMutation::ResetAllBuiltins,
-                            Some(revision),
-                        )
-                    });
-                    let mut refresh_needed = false;
-                    match reset {
-                        Ok(result) => {
-                            p.status = Some(match result.outcome {
+                        let reset = agent_inventory_revision(&cwd).and_then(|revision| {
+                            mutate_agent(
+                                &cwd,
+                                cockpit_core::daemon::proto::AgentMutation::ResetAllBuiltins,
+                                Some(revision),
+                            )
+                        });
+                        let mut refresh_needed = false;
+                        match reset {
+                            Ok(result) => {
+                                p.status = Some(match result.outcome {
                                 cockpit_core::daemon::proto::AgentMutationOutcome::Reconciled => {
                                     format!(
                                         "reset {} built-in override(s) to default",
@@ -1336,19 +1334,19 @@ impl SettingsCx {
                                     format!("reset committed for {} built-in override(s); {warning}", result.affected)
                                 }
                             });
+                            }
+                            Err(e) => p.status = Some(format!("reset failed: {e}")),
                         }
-                        Err(e) => p.status = Some(format!("reset failed: {e}")),
-                    }
-                    if refresh_needed {
-                        // The mutation is committed. Drop every locally-held
-                        // authority projection so the action cannot be
-                        // accidentally retried against stale state.
-                        p.rows.clear();
-                        p.detail = None;
-                    } else {
-                        p.rows = rows_for(&cwd).0;
-                    }
-                    p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
+                        if refresh_needed {
+                            // The mutation is committed. Drop every locally-held
+                            // authority projection so the action cannot be
+                            // accidentally retried against stale state.
+                            p.rows.clear();
+                            p.detail = None;
+                        } else {
+                            p.rows = rows_for(&cwd).0;
+                        }
+                        p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
                     }
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -1645,134 +1643,135 @@ impl SettingsCx {
         }
         #[cfg(not(test))]
         {
-        if detail.revision.is_none() {
-            detail.status = Some("save failed: missing daemon-owned revision".into());
-            return;
-        }
-        detail.draft.write_to_def(&mut detail.def);
-        let cleanup_notice = detail
-            .status
-            .clone()
-            .filter(|status| status.starts_with("removed custom description"));
-        let markdown = match detail.def.to_markdown() {
-            Ok(markdown) => markdown,
-            Err(e) => {
-                detail.status = Some(format!("serialize failed: {e}"));
+            if detail.revision.is_none() {
+                detail.status = Some("save failed: missing daemon-owned revision".into());
                 return;
             }
-        };
-        let committed_id;
-        if let AgentRowSource::Assistant { .. } = &detail.source {
-            let Some(expected_revision) = detail.revision.clone() else {
-                detail.status = Some("save failed: missing assistant revision".into());
-                return;
+            detail.draft.write_to_def(&mut detail.def);
+            let cleanup_notice = detail
+                .status
+                .clone()
+                .filter(|status| status.starts_with("removed custom description"));
+            let markdown = match detail.def.to_markdown() {
+                Ok(markdown) => markdown,
+                Err(e) => {
+                    detail.status = Some(format!("serialize failed: {e}"));
+                    return;
+                }
             };
-            let response = crate::tui::agent_runner::daemon_request_blocking(
-                cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
-                    name: detail.name.clone(),
-                    markdown: markdown.clone(),
-                    expected_revision: expected_revision.clone(),
-                },
-            );
-            match response {
-                Ok(cockpit_core::daemon::proto::Response::AssistantDefinitionSaved {
-                    assistant,
-                    consumed_definition_revision,
-                }) => match coherent_assistant_save_revision(
-                    &assistant,
-                    &detail.name,
-                    &markdown,
-                    &consumed_definition_revision,
-                    &expected_revision,
+            let committed_id;
+            if let AgentRowSource::Assistant { .. } = &detail.source {
+                let Some(expected_revision) = detail.revision.clone() else {
+                    detail.status = Some("save failed: missing assistant revision".into());
+                    return;
+                };
+                let response = crate::tui::agent_runner::daemon_request_blocking(
+                    cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
+                        name: detail.name.clone(),
+                        markdown: markdown.clone(),
+                        expected_revision: expected_revision.clone(),
+                    },
+                );
+                match response {
+                    Ok(cockpit_core::daemon::proto::Response::AssistantDefinitionSaved {
+                        assistant,
+                        consumed_definition_revision,
+                    }) => match coherent_assistant_save_revision(
+                        &assistant,
+                        &detail.name,
+                        &markdown,
+                        &consumed_definition_revision,
+                        &expected_revision,
+                    ) {
+                        Ok(revision) => {
+                            detail.revision = Some(revision.clone());
+                            detail.source = AgentRowSource::Assistant {
+                                markdown: markdown.clone(),
+                                revision,
+                                registration_revision: assistant.registration_revision.clone(),
+                            };
+                            committed_id = super::pointer_actions::AgentId::assistant_occurrence(
+                                &detail.name,
+                                &assistant.registration_revision,
+                            );
+                        }
+                        Err(error) => {
+                            detail.status = Some(error);
+                            return;
+                        }
+                    },
+                    Ok(other) => {
+                        detail.status =
+                            Some(format!("unexpected assistant save response: {other:?}"));
+                        return;
+                    }
+                    Err(error) => {
+                        detail.status = Some(format!("save Unavailable — {error}; Retry"));
+                        return;
+                    }
+                }
+            } else if let Some(revision) = detail.revision.clone() {
+                match mutate_agent(
+                    &self.agents_cwd(),
+                    cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
+                        name: detail.name.clone(),
+                        markdown: markdown.clone(),
+                    },
+                    Some(revision),
                 ) {
-                    Ok(revision) => {
-                        detail.revision = Some(revision.clone());
-                        detail.source = AgentRowSource::Assistant {
-                            markdown: markdown.clone(),
-                            revision,
-                            registration_revision: assistant.registration_revision.clone(),
+                    Ok(result) => {
+                        let Some(snapshot) = result.snapshot else {
+                            detail.status = Some(
+                                "daemon returned a save result without a coherent revision".into(),
+                            );
+                            return;
                         };
-                        committed_id = super::pointer_actions::AgentId::assistant_occurrence(
+                        if snapshot.revision.is_empty() {
+                            detail.status =
+                                Some("daemon returned an empty committed agent revision".into());
+                            return;
+                        }
+                        detail.revision = Some(snapshot.revision.clone());
+                        detail.source = AgentRowSource::Agent {
+                            source_identity: snapshot.source_identity.clone(),
+                            revision: snapshot.revision.clone(),
+                        };
+                        committed_id = super::pointer_actions::AgentId::workspace_occurrence(
                             &detail.name,
-                            &assistant.registration_revision,
+                            &snapshot.source_identity,
+                            &snapshot.revision,
                         );
                     }
                     Err(error) => {
-                        detail.status = Some(error);
+                        detail.status = Some(format!("save failed: {error}"));
                         return;
                     }
-                },
-                Ok(other) => {
-                    detail.status = Some(format!("unexpected assistant save response: {other:?}"));
-                    return;
                 }
-                Err(error) => {
-                    detail.status = Some(format!("save Unavailable — {error}; Retry"));
-                    return;
-                }
+            } else {
+                detail.status = Some("save failed: missing daemon agent revision".into());
+                return;
             }
-        } else if let Some(revision) = detail.revision.clone() {
-            match mutate_agent(
-                &self.agents_cwd(),
-                cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
-                    name: detail.name.clone(),
-                    markdown: markdown.clone(),
-                },
-                Some(revision),
-            ) {
-                Ok(result) => {
-                    let Some(snapshot) = result.snapshot else {
-                        detail.status = Some(
-                            "daemon returned a save result without a coherent revision".into(),
-                        );
-                        return;
-                    };
-                    if snapshot.revision.is_empty() {
-                        detail.status =
-                            Some("daemon returned an empty committed agent revision".into());
-                        return;
-                    }
-                    detail.revision = Some(snapshot.revision.clone());
-                    detail.source = AgentRowSource::Agent {
-                        source_identity: snapshot.source_identity.clone(),
-                        revision: snapshot.revision.clone(),
-                    };
-                    committed_id = super::pointer_actions::AgentId::workspace_occurrence(
-                        &detail.name,
-                        &snapshot.source_identity,
-                        &snapshot.revision,
-                    );
-                }
-                Err(error) => {
-                    detail.status = Some(format!("save failed: {error}"));
-                    return;
-                }
+            detail.original_text = markdown;
+            detail.status = Some(match cleanup_notice {
+                Some(notice) => format!("saved `{}`; {notice}", detail.name),
+                None => format!("saved `{}`", detail.name),
+            });
+            let cwd = self.agents_cwd();
+            let (rows, status) = rows_for(&cwd);
+            let Some(cursor) = rows
+                .iter()
+                .position(|row| row_agent_id(&row.name, &row.source) == committed_id)
+            else {
+                detail.status = Some(
+                    "save committed, but refreshed inventory omitted the exact new identity".into(),
+                );
+                return;
+            };
+            p.rows = rows;
+            p.cursor = cursor;
+            if status.is_some() {
+                p.status = status;
             }
-        } else {
-            detail.status = Some("save failed: missing daemon agent revision".into());
-            return;
-        }
-        detail.original_text = markdown;
-        detail.status = Some(match cleanup_notice {
-            Some(notice) => format!("saved `{}`; {notice}", detail.name),
-            None => format!("saved `{}`", detail.name),
-        });
-        let cwd = self.agents_cwd();
-        let (rows, status) = rows_for(&cwd);
-        let Some(cursor) = rows
-            .iter()
-            .position(|row| row_agent_id(&row.name, &row.source) == committed_id)
-        else {
-            detail.status = Some(
-                "save committed, but refreshed inventory omitted the exact new identity".into(),
-            );
-            return;
-        };
-        p.rows = rows;
-        p.cursor = cursor;
-        if status.is_some() {
-            p.status = status;
-        }
         }
     }
 
@@ -2001,68 +2000,75 @@ impl SettingsCx {
         }
         #[cfg(not(test))]
         {
-        let result = match &row.source {
-            AgentRowSource::Assistant {
-                registration_revision,
-                ..
-            }
-            | AgentRowSource::AssistantUnavailable {
-                registration_revision,
-            } if registration_revision.is_empty() => Err(
-                "assistant cannot be unregistered because its registry revision is missing".into(),
-            ),
-            AgentRowSource::Assistant {
-                registration_revision,
-                ..
-            }
-            | AgentRowSource::AssistantUnavailable {
-                registration_revision,
-            } => crate::tui::agent_runner::daemon_request_blocking(
-                cockpit_core::daemon::proto::Request::DeleteAssistant {
-                    name: name.clone(),
-                    expected_revision: registration_revision.clone(),
-                },
-            )
-            .and_then(|response| match response {
-                cockpit_core::daemon::proto::Response::AssistantDeleted {
-                    name: deleted_name,
-                    consumed_registration_revision,
-                    deleted: true,
-                } if deleted_name.as_str() == name.as_str()
-                    && consumed_registration_revision.as_str()
-                        == registration_revision.as_str() =>
-                {
-                    Ok(())
+            let result = match &row.source {
+                AgentRowSource::Assistant {
+                    registration_revision,
+                    ..
                 }
-                other => Err(format!("unexpected assistant delete response: {other:?}")),
-            }),
-            AgentRowSource::Agent {
-                source_identity,
-                revision,
-            } => agent_snapshot(&cwd, &name).and_then(|snapshot| {
-                if snapshot.source_identity != *source_identity || snapshot.revision != *revision {
-                    return Err("agent source changed since the delete action was rendered".into());
+                | AgentRowSource::AssistantUnavailable {
+                    registration_revision,
+                } if registration_revision.is_empty() => Err(
+                    "assistant cannot be unregistered because its registry revision is missing"
+                        .into(),
+                ),
+                AgentRowSource::Assistant {
+                    registration_revision,
+                    ..
                 }
-                mutate_agent(
-                    &cwd,
-                    cockpit_core::daemon::proto::AgentMutation::DeleteCustom { name: name.clone() },
-                    Some(snapshot.revision),
+                | AgentRowSource::AssistantUnavailable {
+                    registration_revision,
+                } => crate::tui::agent_runner::daemon_request_blocking(
+                    cockpit_core::daemon::proto::Request::DeleteAssistant {
+                        name: name.clone(),
+                        expected_revision: registration_revision.clone(),
+                    },
                 )
-                .map(|_| ())
-            }),
-        };
-        let is_assistant = !matches!(&row.source, AgentRowSource::Agent { .. });
-        match result {
-            Ok(_) if is_assistant => {
-                p.status = Some(format!(
-                    "unregistered assistant `{name}`; its home was retained"
-                ))
+                .and_then(|response| match response {
+                    cockpit_core::daemon::proto::Response::AssistantDeleted {
+                        name: deleted_name,
+                        consumed_registration_revision,
+                        deleted: true,
+                    } if deleted_name.as_str() == name.as_str()
+                        && consumed_registration_revision.as_str()
+                            == registration_revision.as_str() =>
+                    {
+                        Ok(())
+                    }
+                    other => Err(format!("unexpected assistant delete response: {other:?}")),
+                }),
+                AgentRowSource::Agent {
+                    source_identity,
+                    revision,
+                } => agent_snapshot(&cwd, &name).and_then(|snapshot| {
+                    if snapshot.source_identity != *source_identity
+                        || snapshot.revision != *revision
+                    {
+                        return Err(
+                            "agent source changed since the delete action was rendered".into()
+                        );
+                    }
+                    mutate_agent(
+                        &cwd,
+                        cockpit_core::daemon::proto::AgentMutation::DeleteCustom {
+                            name: name.clone(),
+                        },
+                        Some(snapshot.revision),
+                    )
+                    .map(|_| ())
+                }),
+            };
+            let is_assistant = !matches!(&row.source, AgentRowSource::Agent { .. });
+            match result {
+                Ok(_) if is_assistant => {
+                    p.status = Some(format!(
+                        "unregistered assistant `{name}`; its home was retained"
+                    ))
+                }
+                Ok(_) => p.status = Some(format!("deleted custom agent `{name}`")),
+                Err(error) => p.status = Some(format!("delete failed: {error}")),
             }
-            Ok(_) => p.status = Some(format!("deleted custom agent `{name}`")),
-            Err(error) => p.status = Some(format!("delete failed: {error}")),
-        }
-        p.rows = rows_for(&cwd).0;
-        p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
+            p.rows = rows_for(&cwd).0;
+            p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
         }
     }
 
@@ -2101,27 +2107,27 @@ impl SettingsCx {
         }
         #[cfg(not(test))]
         {
-        let rendered_identity = row_agent_id(&name, &row.source);
-        match agent_snapshot(&cwd, &name).and_then(|snapshot| {
-            let refreshed_identity = super::pointer_actions::AgentId::workspace_occurrence(
-                &name,
-                &snapshot.source_identity,
-                &snapshot.revision,
-            );
-            if refreshed_identity != rendered_identity {
-                return Err("agent source changed since the reset action was rendered".into());
+            let rendered_identity = row_agent_id(&name, &row.source);
+            match agent_snapshot(&cwd, &name).and_then(|snapshot| {
+                let refreshed_identity = super::pointer_actions::AgentId::workspace_occurrence(
+                    &name,
+                    &snapshot.source_identity,
+                    &snapshot.revision,
+                );
+                if refreshed_identity != rendered_identity {
+                    return Err("agent source changed since the reset action was rendered".into());
+                }
+                mutate_agent(
+                    &cwd,
+                    cockpit_core::daemon::proto::AgentMutation::ResetBuiltin { name: name.clone() },
+                    Some(snapshot.revision),
+                )
+            }) {
+                Ok(_) => p.status = Some(format!("reset `{name}` to default")),
+                Err(error) => p.status = Some(format!("reset failed: {error}")),
             }
-            mutate_agent(
-                &cwd,
-                cockpit_core::daemon::proto::AgentMutation::ResetBuiltin { name: name.clone() },
-                Some(snapshot.revision),
-            )
-        }) {
-            Ok(_) => p.status = Some(format!("reset `{name}` to default")),
-            Err(error) => p.status = Some(format!("reset failed: {error}")),
-        }
-        p.rows = rows_for(&cwd).0;
-        p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
+            p.rows = rows_for(&cwd).0;
+            p.cursor = p.cursor.min(p.rows.len().saturating_sub(1));
         }
     }
 

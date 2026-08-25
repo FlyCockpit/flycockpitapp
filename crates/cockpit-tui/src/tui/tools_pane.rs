@@ -74,48 +74,52 @@ impl ToolsPane {
         }
         #[cfg(not(test))]
         {
-        let response = crate::tui::agent_runner::daemon_request_blocking(
-            cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
-                project_root: cwd.to_string_lossy().into_owned(),
-                name: agent_name.to_string(),
-            },
-        )
-        .map_err(anyhow::Error::msg)?;
-        let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) = response else {
-            anyhow::bail!("daemon returned an unexpected agent snapshot");
-        };
-        cockpit_proto::validate_agent_source_identity(&snapshot, cwd.to_string_lossy().as_ref())
+            let response = crate::tui::agent_runner::daemon_request_blocking(
+                cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+                    project_root: cwd.to_string_lossy().into_owned(),
+                    name: agent_name.to_string(),
+                },
+            )
             .map_err(anyhow::Error::msg)?;
-        if snapshot.name != agent_name
-            || snapshot.markdown.len() > cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES
-        {
-            anyhow::bail!("daemon returned a misrouted or oversized agent snapshot");
-        }
-        let def = cockpit_core::agents::parse_agent(
-            &snapshot.markdown,
-            agent_name,
-            PathBuf::from("<daemon-agent-snapshot>"),
-        )?;
-        let draft = ToolSurfaceDraft::from_def(&def);
-        let original = draft.selection().clone();
-        let status = (!root_foreground).then(|| {
-            "Apply is disabled while an interactive subagent holds the foreground.".to_string()
-        });
-        Ok(Self {
-            agent_name: agent_name.to_string(),
-            cwd: cwd.to_path_buf(),
-            root_foreground,
-            original,
-            def,
-            revision: snapshot.revision,
-            editable: snapshot.editable,
-            draft,
-            picker: ToolSurfacePicker::default(),
-            status,
-            row_errors: BTreeMap::new(),
-            confirm: None,
-            nudge_monty: true,
-        })
+            let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) = response
+            else {
+                anyhow::bail!("daemon returned an unexpected agent snapshot");
+            };
+            cockpit_proto::validate_agent_source_identity(
+                &snapshot,
+                cwd.to_string_lossy().as_ref(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            if snapshot.name != agent_name
+                || snapshot.markdown.len() > cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES
+            {
+                anyhow::bail!("daemon returned a misrouted or oversized agent snapshot");
+            }
+            let def = cockpit_core::agents::parse_agent(
+                &snapshot.markdown,
+                agent_name,
+                PathBuf::from("<daemon-agent-snapshot>"),
+            )?;
+            let draft = ToolSurfaceDraft::from_def(&def);
+            let original = draft.selection().clone();
+            let status = (!root_foreground).then(|| {
+                "Apply is disabled while an interactive subagent holds the foreground.".to_string()
+            });
+            Ok(Self {
+                agent_name: agent_name.to_string(),
+                cwd: cwd.to_path_buf(),
+                root_foreground,
+                original,
+                def,
+                revision: snapshot.revision,
+                editable: snapshot.editable,
+                draft,
+                picker: ToolSurfacePicker::default(),
+                status,
+                row_errors: BTreeMap::new(),
+                confirm: None,
+                nudge_monty: true,
+            })
         }
     }
 
@@ -284,37 +288,37 @@ impl ToolsPane {
         }
         #[cfg(not(test))]
         {
-        let markdown = def.to_markdown()?;
-        let prior_revision = self.revision.clone();
-        let mutation = cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
-            name: self.agent_name.clone(),
-            markdown,
-        };
-        let response = crate::tui::agent_runner::daemon_request_blocking(
-            cockpit_core::daemon::proto::Request::MutateAgent {
-                project_root: self.cwd.to_string_lossy().into_owned(),
-                mutation: mutation.clone(),
-                expected_revision: Some(prior_revision.clone()),
-            },
-        )
-        .map_err(anyhow::Error::msg)?;
-        let cockpit_core::daemon::proto::Response::AgentMutated(result) = response else {
-            anyhow::bail!("daemon returned an unexpected agent-save response");
-        };
-        crate::tui::settings::agents_page::validate_agent_mutation_result(
-            &result,
-            &self.cwd,
-            &mutation,
-            Some(&prior_revision),
-            None,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let snapshot = result
-            .snapshot
-            .ok_or_else(|| anyhow::anyhow!("daemon omitted the saved snapshot"))?;
-        self.revision = snapshot.revision;
-        self.editable = snapshot.editable;
-        Ok(())
+            let markdown = def.to_markdown()?;
+            let prior_revision = self.revision.clone();
+            let mutation = cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
+                name: self.agent_name.clone(),
+                markdown,
+            };
+            let response = crate::tui::agent_runner::daemon_request_blocking(
+                cockpit_core::daemon::proto::Request::MutateAgent {
+                    project_root: self.cwd.to_string_lossy().into_owned(),
+                    mutation: mutation.clone(),
+                    expected_revision: Some(prior_revision.clone()),
+                },
+            )
+            .map_err(anyhow::Error::msg)?;
+            let cockpit_core::daemon::proto::Response::AgentMutated(result) = response else {
+                anyhow::bail!("daemon returned an unexpected agent-save response");
+            };
+            crate::tui::settings::agents_page::validate_agent_mutation_result(
+                &result,
+                &self.cwd,
+                &mutation,
+                Some(&prior_revision),
+                None,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let snapshot = result
+                .snapshot
+                .ok_or_else(|| anyhow::anyhow!("daemon omitted the saved snapshot"))?;
+            self.revision = snapshot.revision;
+            self.editable = snapshot.editable;
+            Ok(())
         }
     }
 

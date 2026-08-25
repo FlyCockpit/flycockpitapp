@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::db::Db;
 use crate::db::agent_installations::{RedactedAgentProfileSnapshot, RedactedQuestionPolicy};
+use crate::db::wire::{InterruptQuestion, InterruptQuestionSet};
 
 /// Opaque authority required to terminalize a host-approval decision.
 ///
@@ -100,7 +101,11 @@ pub enum HostApprovalEffectFence {
 /// Durable phase of the daemon-owned host-capability refresh operation.  This
 /// is intentionally distinct from an AgentTree decision state: the decision
 /// answers whether the host may probe, while this row records whether the
-/// host actually crossed and completed that probe boundary.
+/// host actually crossed and completed that probe boundary. Its only forward
+/// edges are `pending -> allowed|failed|cancelled`, `allowed ->
+/// executing|failed|cancelled`, and `executing -> completed|failed|cancelled`.
+/// `completed`, `failed`, and `cancelled` are terminal; executing cancellation
+/// is the subtree/root authority that fences a result already in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostCapabilityRefreshOperationState {
     Pending,
@@ -3642,6 +3647,38 @@ impl Db {
         .await
     }
 
+    /// A terminal operation can outlive the worker that terminalized its
+    /// child but crashed before acknowledging the linked executing Attention
+    /// row. This scan is intentionally independent of the child lifecycle:
+    /// once the child is terminal it no longer appears in the nonterminal
+    /// recovery inventory, but its exact Attention acknowledgement still
+    /// needs the common terminal finalizer on the next boot.
+    pub async fn terminal_host_capability_refresh_interrupts_requiring_finalization(
+        &self,
+        _authority: HostCapabilityRefreshAuthority,
+        session_id: Uuid,
+    ) -> Result<Vec<Uuid>> {
+        self.read(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT operation.interrupt_id
+                   FROM host_capability_refresh_operations operation
+                   JOIN needs_attention attention
+                     ON attention.interrupt_id = operation.interrupt_id
+                    AND attention.session_id = operation.session_id
+                  WHERE operation.session_id = ?1
+                    AND operation.state IN ('completed', 'failed', 'cancelled')
+                    AND attention.state = 'executing'
+                  ORDER BY operation.created_at_unix_ms, operation.operation_id",
+            )?;
+            statement
+                .query_map([session_id.to_string()], |row| {
+                    parse_uuid(row.get::<_, String>(0)?)
+                })?
+                .collect()
+        })
+        .await
+    }
+
     /// Look up the one daemon-owned refresh operation bound to a real
     /// QuestionTool interrupt.  Recovery uses this to distinguish a typed
     /// host-operation continuation from a model/driver continuation: the
@@ -4039,6 +4076,10 @@ impl Db {
         .await
     }
 
+    /// Cancel a refresh before it crosses the local probe boundary. An
+    /// executing refresh is cancelled only by `cancel_owned_decisions_for_subtree`,
+    /// which atomically cancels its dedicated child and operation together;
+    /// this standalone API must not create half of that lifecycle outcome.
     pub async fn cancel_host_capability_refresh_operation(
         &self,
         _authority: HostCapabilityRefreshAuthority,
@@ -4160,35 +4201,40 @@ impl Db {
                     "startup initialization scan lost its exact initializing descriptor"
                 );
             }
-            // Current production binding is one transaction. Preserve the
-            // older exact-link repair for malformed/pre-release rows written
-            // by earlier builds, so startup still fails closed instead of
-            // leaving a pending legacy operation owner stranded.
-            let reconciled = conn.execute(
-                "UPDATE host_capability_refresh_operations
-                    SET decision_request_id = (
-                            SELECT n.decision_request_id
-                              FROM needs_attention n
+            // The current squashed schema has no split operation/decision
+            // state: the typed composition boundary binds both in one
+            // transaction. A pending operation whose real interrupt is
+            // already decision-owned is therefore corrupt imported durable
+            // state, not a recoverable earlier release shape. Do not infer or
+            // rewrite authority at startup.
+            let split_binding: Option<String> = conn
+                .query_row(
+                    "SELECT operation_id
+                       FROM host_capability_refresh_operations
+                      WHERE session_id = ?1 AND state = 'pending'
+                        AND decision_request_id IS NULL
+                        AND EXISTS (
+                            SELECT 1 FROM needs_attention n
                              WHERE n.interrupt_id = host_capability_refresh_operations.interrupt_id
                                AND n.session_id = host_capability_refresh_operations.session_id
-                        ),
-                        updated_at_unix_ms = ?1
-                  WHERE session_id = ?2 AND state = 'pending'
-                    AND decision_request_id IS NULL
-                    AND EXISTS (
-                        SELECT 1 FROM needs_attention n
-                         WHERE n.interrupt_id = host_capability_refresh_operations.interrupt_id
-                           AND n.session_id = host_capability_refresh_operations.session_id
-                           AND n.decision_request_id IS NOT NULL
-                    )",
-                params![now_unix_ms, session_id.to_string()],
-            )?;
+                               AND n.decision_request_id IS NOT NULL
+                        )
+                      LIMIT 1",
+                    params![session_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            ensure!(
+                split_binding.is_none(),
+                "host capability refresh operation has a malformed split decision binding"
+            );
             // There is no persisted decision contract before the decision
             // creation transaction. A process death in the earlier
             // reserve-only window therefore cannot be reconstructed safely;
             // close that operation rather than retaining an executable row
-            // whose option contract was never committed. Once Attention owns
-            // a decision id, the preceding repair handles it instead.
+            // whose option contract was never committed. A row whose
+            // Attention already owns a decision is rejected above rather than
+            // repaired.
             conn.execute(
                 "UPDATE host_capability_refresh_operations
                     SET state = 'cancelled',
@@ -4212,7 +4258,7 @@ impl Db {
                   WHERE session_id = ?2 AND state = 'executing'",
                 params![now_unix_ms, session_id.to_string()],
             )?;
-            Ok(initializing.len() + reconciled)
+            Ok(initializing.len())
         })
         .await
     }
@@ -5108,15 +5154,43 @@ impl Db {
             .as_deref()
             .map(redact_free_text_contract)
             .transpose()?;
+        // Storage owns the final persisted shape. A generic decision must
+        // remain answerable after an import or restart: cancellation only
+        // terminates an existing question and is never an answer channel.
+        // QuestionTool retains its distinct typed response contract, whose
+        // nonempty/answerable shape is revalidated here as well.
+        let public_option_ids =
+            validate_durable_decision_answer_contract(&options_json, free_text.as_deref())?;
+        let is_question_tool_contract = durable_decision_has_question_tool_contract(&options_json)?;
+        ensure!(
+            existing_interrupt_id.is_some() == is_question_tool_contract,
+            "QuestionTool durable contracts and existing question interrupts must be bound together"
+        );
         let recommendation = input
             .recommendation_json
             .as_deref()
             .map(|raw| {
-                redact_recommendation(raw, &private_option_mappings, &input.decision_class)
+                redact_recommendation(
+                    raw,
+                    &private_option_mappings,
+                    &input.decision_class,
+                    &input.rationale_redaction_class,
+                )
             })
             .transpose()?;
         if let Some(recommendation) = recommendation.as_deref() {
-            validate_recommendation_is_offered(&options_json, recommendation)?;
+            validate_durable_recommendation(
+                recommendation,
+                &input.decision_class,
+                &input.rationale_redaction_class,
+                &public_option_ids,
+                private_option_mappings.iter().map(|mapping| {
+                    (
+                        mapping.opaque_option_id.as_str(),
+                        mapping.continuation_option_id.as_str(),
+                    )
+                }),
+            )?;
         }
         let policy_receipt = redact_policy_receipt(&input.policy_receipt_json)?;
         let decision_request_id = Uuid::new_v4();
@@ -5161,6 +5235,45 @@ impl Db {
             }
             if let Some(workspace_ref) = agent.workspace_ref.as_deref() {
                 validate_daemon_opaque_reference(workspace_ref, "agent workspace reference")?;
+            }
+            if existing_interrupt_id.is_some() {
+                let (owner, question_json, questions_json): (
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                ) = conn
+                    .query_row(
+                        "SELECT agent_instance_id, question_json, questions_json
+                           FROM needs_attention
+                          WHERE interrupt_id = ?1 AND session_id = ?2
+                            AND state = 'open' AND decision_request_id IS NULL",
+                        params![attention_id.to_string(), input.session_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?
+                    .context("question interrupt is not an open unbound attention row")?;
+                let expected_owner = input.agent_instance_id.to_string();
+                ensure!(
+                    owner.as_deref() == Some(expected_owner.as_str()),
+                    "question interrupt owner does not match its decision agent"
+                );
+                validate_question_tool_contract_matches_interrupt(
+                    &options_json,
+                    private_option_mappings.iter().map(|mapping| {
+                        (
+                            mapping.opaque_option_id.as_str(),
+                            mapping.continuation_option_id.as_str(),
+                        )
+                    }),
+                    question_json.as_deref(),
+                    questions_json.as_deref(),
+                )?;
+                validate_raw_interrupt_approval_binding(
+                    &input.decision_class,
+                    input.host_approval_operation_id,
+                    question_json.as_deref(),
+                    questions_json.as_deref(),
+                )?;
             }
             let changed = conn.execute(
                 "UPDATE agent_instances SET state = ?1, revision = revision + 1, updated_at_unix_ms = ?2
@@ -5450,27 +5563,14 @@ impl Db {
         decision_request_id: Uuid,
     ) -> Result<Vec<DecisionPrivateOptionMapping>> {
         self.read(move |conn| {
-            let mut statement = conn.prepare(
-                "SELECT mapping.opaque_option_id, mapping.continuation_option_id
-                 FROM decision_private_option_mappings AS mapping
-                 JOIN decision_requests AS decision
-                   ON decision.decision_request_id = mapping.decision_request_id
-                  AND decision.session_id = mapping.session_id
-                 WHERE mapping.decision_request_id = ?1 AND mapping.session_id = ?2
-                 ORDER BY mapping.opaque_option_id",
-            )?;
-            statement
-                .query_map(
-                    params![decision_request_id.to_string(), session_id.to_string()],
-                    |row| {
-                        Ok(DecisionPrivateOptionMapping {
-                            opaque_option_id: row.get(0)?,
-                            continuation_option_id: row.get(1)?,
-                        })
-                    },
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(Into::into)
+            // `load_decision` proves the complete public contract and its
+            // exact private counterpart before this daemon-only API returns
+            // a continuation mapping.  Never turn a syntactically-safe row
+            // into a recovery input merely because the mapping query itself
+            // happened to succeed.
+            let _ = load_decision(conn, session_id, decision_request_id)?
+                .context("decision request is not authorized for this session")?;
+            load_private_decision_option_mappings_conn(conn, session_id, decision_request_id)
         })
         .await
     }
@@ -7111,7 +7211,7 @@ fn load_decision(
     session_id: Uuid,
     decision_id: Uuid,
 ) -> Result<Option<DecisionRequestRow>> {
-    conn.query_row(
+    let decision = conn.query_row(
         "SELECT decision_request_id, agent_instance_id, session_id, task_call_id_ref, workspace_ref,
                 options_contract_json,
                 free_text_contract_json, recommendation_json, rationale_redaction_class,
@@ -7121,7 +7221,7 @@ fn load_decision(
          FROM decision_requests WHERE decision_request_id = ?1 AND session_id = ?2",
         params![decision_id.to_string(), session_id.to_string()],
         |row| {
-            Ok(DecisionRequestRow {
+            let decision = DecisionRequestRow {
                 decision_request_id: parse_uuid(row.get::<_, String>(0)?)?,
                 agent_instance_id: parse_uuid(row.get::<_, String>(1)?)?,
                 session_id: parse_uuid(row.get::<_, String>(2)?)?,
@@ -7143,11 +7243,166 @@ fn load_decision(
                 revision: row.get(15)?,
                 created_at_unix_ms: row.get(16)?,
                 updated_at_unix_ms: row.get(17)?,
-            })
+            };
+            Ok(decision)
         },
     )
     .optional()
-    .context("loading authorized decision request")
+    .context("loading authorized decision request")?;
+    let Some(decision) = decision else {
+        return Ok(None);
+    };
+    validate_redaction_class(&decision.rationale_redaction_class)
+        .context("persisted decision rationale class is invalid")?;
+    validate_decision_class(&decision.decision_class).context("persisted decision class is invalid")?;
+    let public_option_ids = validate_durable_decision_answer_contract(
+        &decision.options_contract_json,
+        decision.free_text_contract_json.as_deref(),
+    )
+    .context("persisted decision answer contract is invalid")?;
+    let has_question_tool_contract = durable_decision_has_question_tool_contract(
+        &decision.options_contract_json,
+    )
+    .context("persisted decision QuestionTool binding is invalid")?;
+    let mappings = load_private_decision_option_mappings_conn(
+        conn,
+        decision.session_id,
+        decision.decision_request_id,
+    )
+    .context("persisted decision private option mappings are invalid")?;
+    validate_durable_private_option_mappings(
+        &public_option_ids,
+        mappings.iter().map(|mapping| {
+            (
+                mapping.opaque_option_id.as_str(),
+                mapping.continuation_option_id.as_str(),
+            )
+        }),
+    )
+    .context("persisted decision private option mappings are invalid")?;
+    let attention: Option<(Option<String>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT agent_instance_id, question_json, questions_json
+               FROM needs_attention
+              WHERE session_id = ?1 AND decision_request_id = ?2",
+            params![decision.session_id.to_string(), decision.decision_request_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (attention_owner, question_json, questions_json) = attention.context(
+        "persisted decision is missing its sole durable Attention projection",
+    )?;
+    let expected_owner = decision.agent_instance_id.to_string();
+    ensure!(
+        attention_owner.as_deref() == Some(expected_owner.as_str()),
+        "persisted decision Attention owner does not match its decision agent"
+    );
+    if has_question_tool_contract {
+        validate_question_tool_contract_matches_interrupt(
+            &decision.options_contract_json,
+            mappings.iter().map(|mapping| {
+                (
+                    mapping.opaque_option_id.as_str(),
+                    mapping.continuation_option_id.as_str(),
+                )
+            }),
+            question_json.as_deref(),
+            questions_json.as_deref(),
+        )
+        .context("persisted QuestionTool durable contract does not match its real interrupt")?;
+        validate_raw_interrupt_approval_binding(
+            &decision.decision_class,
+            decision.host_approval_operation_id,
+            question_json.as_deref(),
+            questions_json.as_deref(),
+        )
+        .context("persisted QuestionTool approval metadata does not match its decision class")?;
+    } else {
+        ensure!(
+            question_json.is_none() && questions_json.is_none(),
+            "persisted generic decision must not bind a real QuestionTool interrupt"
+        );
+    }
+    validate_persisted_host_approval_operation_binding(
+        conn,
+        &decision,
+        has_question_tool_contract,
+    )?;
+    match decision.recommendation_json.as_deref() {
+        Some(recommendation) => validate_durable_recommendation(
+            recommendation,
+            &decision.decision_class,
+            &decision.rationale_redaction_class,
+            &public_option_ids,
+            mappings.iter().map(|mapping| {
+                (
+                    mapping.opaque_option_id.as_str(),
+                    mapping.continuation_option_id.as_str(),
+                )
+            }),
+        )
+        .context("persisted decision recommendation is invalid")?,
+        None if decision.decision_class == "low_risk" => bail!(
+            "persisted low-risk durable decision is missing the approved host recommendation"
+        ),
+        None => {}
+    }
+    Ok(Some(decision))
+}
+
+fn load_private_decision_option_mappings_conn(
+    conn: &Connection,
+    session_id: Uuid,
+    decision_request_id: Uuid,
+) -> Result<Vec<DecisionPrivateOptionMapping>> {
+    let mut statement = conn.prepare(
+        "SELECT opaque_option_id, continuation_option_id
+         FROM decision_private_option_mappings
+         WHERE decision_request_id = ?1 AND session_id = ?2
+         ORDER BY opaque_option_id",
+    )?;
+    statement
+        .query_map(
+            params![decision_request_id.to_string(), session_id.to_string()],
+            |row| {
+                Ok(DecisionPrivateOptionMapping {
+                    opaque_option_id: row.get(0)?,
+                    continuation_option_id: row.get(1)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn validate_durable_private_option_mappings<'a>(
+    public_option_ids: &std::collections::BTreeSet<String>,
+    mappings: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    let mappings = mappings.into_iter().collect::<Vec<_>>();
+    ensure!(
+        mappings.len() == public_option_ids.len(),
+        "durable public option tokens and private continuation mappings have different cardinality"
+    );
+    let mut opaque_option_ids = std::collections::BTreeSet::new();
+    let mut continuation_option_ids = std::collections::BTreeSet::new();
+    for (opaque_option_id, continuation_option_id) in mappings {
+        validate_daemon_minted_public_option_id(opaque_option_id)?;
+        validate_safe_identifier(continuation_option_id, "private continuation option id")?;
+        ensure!(
+            opaque_option_ids.insert(opaque_option_id),
+            "durable private option mappings contain a duplicate public token"
+        );
+        ensure!(
+            continuation_option_ids.insert(continuation_option_id),
+            "durable private option mappings contain a duplicate continuation token"
+        );
+    }
+    ensure!(
+        opaque_option_ids == public_option_ids.iter().map(String::as_str).collect(),
+        "durable public option tokens do not have exact private continuation mappings"
+    );
+    Ok(())
 }
 
 fn load_late_user_steer(
@@ -7554,33 +7809,63 @@ fn cancel_live_descendants(
              JOIN descendants d ON a.parent_agent_instance_id = d.agent_instance_id
              WHERE a.session_id = ?2
          )
-         SELECT agent_instance_id, revision FROM agent_instances
-         WHERE agent_instance_id IN descendants
-           AND state NOT IN ('completed', 'failed', 'cancelled')
-         ORDER BY agent_instance_id",
+         SELECT child.agent_instance_id, child.revision, child.state, operation.state
+           FROM agent_instances child
+      LEFT JOIN host_capability_refresh_operations operation
+             ON operation.session_id = child.session_id
+            AND operation.agent_instance_id = child.agent_instance_id
+          WHERE child.agent_instance_id IN descendants
+            AND child.state NOT IN ('completed', 'failed', 'cancelled')
+          ORDER BY child.agent_instance_id",
     )?;
     let live = statement
         .query_map(
             params![root_id.to_string(), session_id.to_string()],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (agent_id, revision) in live {
+    for (agent_id, revision, current_state, operation_state) in live {
         let id = parse_uuid(agent_id)?;
+        let current_state = AgentInstanceState::parse(&current_state)?;
+        // The durable host operation is the only authority that may override
+        // a generic subtree-cancellation child state.  If it already reached
+        // a terminal outcome, preserve that exact outcome on its dedicated
+        // child instead of manufacturing a mismatched cancellation receipt.
+        // Any nonterminal operation here is a cancellation-ordering bug: the
+        // caller must first terminalize every operation in this subtree.
+        let target_state = match operation_state.as_deref() {
+            None => AgentInstanceState::Cancelled,
+            Some("completed") => AgentInstanceState::Completed,
+            Some("failed") => AgentInstanceState::Failed,
+            Some("cancelled") => AgentInstanceState::Cancelled,
+            Some(_) => bail!("subtree cancellation found a nonterminal host capability refresh operation"),
+        };
+        ensure!(
+            current_state.legal_transition(target_state),
+            "subtree cancellation cannot apply the host capability refresh terminal outcome to its child"
+        );
         let event_seq = insert_control_event(
             conn,
             session_id,
             "agent_transition",
             id,
-            AgentInstanceState::Cancelled.as_str(),
+            target_state.as_str(),
             now_unix_ms,
         )?;
         let changed = conn.execute(
-            "UPDATE agent_instances SET state = 'cancelled', revision = revision + 1,
-             updated_at_unix_ms = ?1
-             WHERE agent_instance_id = ?2 AND session_id = ?3 AND revision = ?4
+            "UPDATE agent_instances SET state = ?1, revision = revision + 1,
+             updated_at_unix_ms = ?2
+             WHERE agent_instance_id = ?3 AND session_id = ?4 AND revision = ?5
                AND state NOT IN ('completed', 'failed', 'cancelled')",
             params![
+                target_state.as_str(),
                 now_unix_ms,
                 id.to_string(),
                 session_id.to_string(),
@@ -7595,12 +7880,13 @@ fn cancel_live_descendants(
             "INSERT INTO agent_transition_receipts (
                  agent_instance_id, terminal_state, session_id, terminal_revision,
                  receipt_json, session_event_seq, created_at_unix_ms
-             ) VALUES (?1, 'cancelled', ?2, ?3, ?4, ?5, ?6)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 id.to_string(),
+                target_state.as_str(),
                 session_id.to_string(),
                 revision + 1,
-                redacted_marker("cascade cancellation"),
+                redacted_marker("cascade cancellation with durable host-operation terminal outcome"),
                 event_seq,
                 now_unix_ms,
             ],
@@ -7739,8 +8025,10 @@ fn cancel_owned_decisions_for_subtree(
     // subtree is cancelled. Close it in this same lifecycle transaction so a
     // later worker start cannot claim a probe for a tree that has already
     // produced its terminal receipts. `executing` has crossed the local probe
-    // boundary, so preserve that fact as a failure rather than relabelling it
-    // cancelled.
+    // boundary, but a subtree cancellation is still the terminal authority
+    // for this daemon-local, result-suppressed operation: fence the in-flight
+    // completion and give the operation and its child one coherent cancelled
+    // outcome rather than creating an unrecoverable failed/cancelled pair.
     conn.execute(
         "WITH RECURSIVE tree(agent_instance_id) AS (
              SELECT agent_instance_id FROM agent_instances
@@ -7769,7 +8057,7 @@ fn cancel_owned_decisions_for_subtree(
               WHERE child.session_id = ?2
          )
          UPDATE host_capability_refresh_operations
-            SET state = 'failed',
+            SET state = 'cancelled',
                 error_text = 'host capability refresh owner subtree was cancelled after probe began',
                 updated_at_unix_ms = ?3,
                 completed_at_unix_ms = ?3
@@ -7949,14 +8237,6 @@ fn interrupt_response_from_resume_payload(resume_payload_json: Option<&str>) -> 
             // syntactically valid but cannot wake a parked QuestionTool call.
             serde_json::from_value::<crate::db::wire::ResolveResponse>(response.clone()).ok()?;
             serde_json::to_string(&response).ok()
-        }
-        // Compatibility for terminal records created before the typed
-        // continuation envelope existed. New production writes never take
-        // this branch.
-        "free_text" => {
-            let response_json = payload.get("answer")?.as_str()?.to_string();
-            serde_json::from_str::<crate::db::wire::ResolveResponse>(&response_json).ok()?;
-            Some(response_json)
         }
         _ => None,
     }
@@ -8332,6 +8612,14 @@ pub fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
     Ok(canonical)
 }
 
+/// The durable decision boundary stores canonical JSON, not merely equivalent
+/// JSON.  This makes imports and SQLite corruption fail before a later reader
+/// can reinterpret a differently-shaped public projection.
+fn canonical_json_string(value: &serde_json::Value) -> Result<String> {
+    String::from_utf8(canonical_json_bytes(value)?)
+        .context("canonical JSON encoding is not valid UTF-8")
+}
+
 fn validate_resolver_route(value: &str) -> Result<()> {
     ensure!(
         matches!(
@@ -8378,63 +8666,56 @@ struct PrivateOptionMapping {
 fn redact_options_contract(raw: &str) -> Result<RedactedOptionsContract> {
     let raw: serde_json::Value =
         serde_json::from_str(raw).context("decision options contract must be valid JSON")?;
-    // New lifecycle callers use the public `{ "options": [...] }` shape so
-    // the durable contract and answer validation agree. Retain the bare-array
-    // form only for the pre-existing direct DB boundary, then normalize both
-    // forms to the one redacted persisted representation below.
-    let (values, interrupt_response_contract) = match raw {
-        // The pre-tree DB API accepted a bare option array. Keep that narrow
-        // compatibility shape readable while normalizing it to bounded,
-        // non-sensitive presentation text; production callers always provide
-        // the explicit metadata object above.
-        serde_json::Value::Array(values) => (
-            values,
-            None,
-        ),
-        serde_json::Value::Object(mut object) => {
-            ensure!(
-                object.keys().all(|key| {
-                    matches!(
-                        key.as_str(),
-                        "options" | "question" | "description" | "task_call_id" | "workspace_ref"
-                            | "interrupt_response_contract"
-                    )
-                }) && object.contains_key("options"),
-                "decision options contract contains an unapproved field"
-            );
-            let values = object
-                .remove("options")
-                .and_then(|value| value.as_array().cloned())
-                .context("decision options contract options must be a JSON array")?;
-            // `question`, `description`, and option labels are private
-            // continuation/UI material. They are accepted only so legacy
-            // callers can use the common constructor, then discarded at the
-            // one durable Attention boundary. A keyword deny-list is not a
-            // redaction system: arbitrary model text must never become a
-            // resolver or daemon-wire projection.
-            if let Some(question) = object.remove("question") {
-                ensure!(question.is_string(), "decision question must be a string");
-            }
-            if let Some(description) = object.remove("description") {
-                ensure!(description.is_string(), "decision description must be a string");
-            }
-            if let Some(task_call_id) = object.remove("task_call_id") {
-                ensure!(
-                    task_call_id.is_string(),
-                    "decision task id must be a string"
-                );
-            }
-            if let Some(workspace_ref) = object.remove("workspace_ref") {
-                ensure!(
-                    workspace_ref.is_string(),
-                    "decision workspace reference must be a string"
-                );
-            }
-            let interrupt_response_contract = object.remove("interrupt_response_contract");
-            (values, interrupt_response_contract)
-        }
-        _ => bail!("decision options contract must be a JSON array or options object"),
-    };
+    // One ingress object means one codec.  There is no bare-array legacy
+    // representation in the prerelease durable boundary: callers must name
+    // `options`, and the codec owns every persisted public marker.
+    let mut object = raw
+        .as_object()
+        .cloned()
+        .context("decision options contract must be a JSON object")?;
+    ensure!(
+        object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "options" | "question" | "description" | "task_call_id" | "workspace_ref"
+                    | "interrupt_response_contract"
+            )
+        }) && object.contains_key("options"),
+        "decision options contract contains an unapproved field"
+    );
+    let values = object
+        .remove("options")
+        .and_then(|value| value.as_array().cloned())
+        .context("decision options contract options must be a JSON array")?;
+    // `question`, `description`, and option labels are private
+    // continuation/UI material. They are accepted only at trusted ingress,
+    // then discarded at the one durable Attention boundary. A keyword
+    // deny-list is not a redaction system: arbitrary model text must never
+    // become a resolver or daemon-wire projection.
+    if let Some(question) = object.remove("question") {
+        ensure!(question.is_string(), "decision question must be a string");
+    }
+    if let Some(description) = object.remove("description") {
+        ensure!(description.is_string(), "decision description must be a string");
+    }
+    if let Some(task_call_id) = object.remove("task_call_id") {
+        ensure!(
+            task_call_id.is_null() || task_call_id.is_string(),
+            "decision task id must be a string"
+        );
+    }
+    if let Some(workspace_ref) = object.remove("workspace_ref") {
+        ensure!(
+            workspace_ref.is_null() || workspace_ref.is_string(),
+            "decision workspace reference must be a string"
+        );
+    }
+    // A generic lifecycle ingress may carry a `null` marker. `null` is not a
+    // QuestionTool contract; normalize it as absent before the typed
+    // redactor rather than treating key presence alone as the discriminator.
+    let interrupt_response_contract = object
+        .remove("interrupt_response_contract")
+        .filter(|value| !value.is_null());
     ensure!(
         values.len() <= 64,
         "decision options contract has too many options"
@@ -8486,7 +8767,7 @@ fn redact_options_contract(raw: &str) -> Result<RedactedOptionsContract> {
         .as_ref()
         .map(|raw| redact_interrupt_response_contract(raw, &mut private_option_mappings))
         .transpose()?;
-    let public_json = serde_json::to_string(&json!({
+    let public_json = canonical_json_string(&json!({
         "options": options,
         "question": "Decision required",
         "description": "An agent decision is waiting",
@@ -8498,8 +8779,7 @@ fn redact_options_contract(raw: &str) -> Result<RedactedOptionsContract> {
         "workspace_ref": serde_json::Value::Null,
         "interrupt_response_contract": interrupt_response_contract,
         "redacted": true,
-    }))
-    .context("serializing redacted decision options")?;
+    }))?;
     Ok(RedactedOptionsContract {
         public_json,
         private_option_mappings,
@@ -8595,6 +8875,14 @@ fn redact_interrupt_response_contract(
                     .get("allow_freetext")
                     .and_then(serde_json::Value::as_bool)
                     .context("QuestionTool choice contract is missing allow_freetext")?;
+                // Cancel is an interruption outcome, not an answer channel.
+                // A durable QuestionTool choice must therefore retain at
+                // least one selectable option or explicitly permit bounded
+                // free text after restart.
+                ensure!(
+                    !option_ids.is_empty() || allow_freetext,
+                    "QuestionTool choice contract must offer an option or allow free-text"
+                );
                 redacted_questions.push(json!({
                     "kind": kind,
                     "option_ids": option_ids,
@@ -8645,12 +8933,475 @@ fn redact_free_text_contract(raw: &str) -> Result<String> {
         (false, None) => {}
         (false, Some(_)) => bail!("disallowed free-text contract must not carry max_chars"),
     }
-    serde_json::to_string(&json!({
+    canonical_json_string(&json!({
         "allowed": allowed,
         "max_chars": max_chars,
         "redacted": true,
     }))
-    .context("serializing redacted free-text contract")
+}
+
+/// Validate the exact redacted contract stored in `decision_requests`.
+/// Creation invokes this before mutation and `load_decision` invokes it again
+/// before a row can reach recovery, replay, Attention, or an importer-backed
+/// read. That gives persisted data the same answerability invariant as the
+/// typed core ingress: a generic decision needs an option or bounded free
+/// text, while a QuestionTool owns a separately validated typed response set.
+fn validate_durable_decision_answer_contract(
+    options_contract_json: &str,
+    free_text_contract_json: Option<&str>,
+) -> Result<std::collections::BTreeSet<String>> {
+    let raw: serde_json::Value = serde_json::from_str(options_contract_json)
+        .context("durable decision options contract must be a JSON object")?;
+    let contract = raw
+        .as_object()
+        .context("durable decision options contract must be a JSON object")?;
+    const REQUIRED: [&str; 7] = [
+        "options",
+        "question",
+        "description",
+        "task_call_id",
+        "workspace_ref",
+        "interrupt_response_contract",
+        "redacted",
+    ];
+    ensure!(
+        contract.len() == REQUIRED.len() && REQUIRED.iter().all(|key| contract.contains_key(*key)),
+        "durable decision options contract does not have the exact canonical public shape"
+    );
+    ensure!(
+        contract.get("question").and_then(serde_json::Value::as_str) == Some("Decision required")
+            && contract.get("description").and_then(serde_json::Value::as_str)
+                == Some("An agent decision is waiting")
+            && contract.get("task_call_id") == Some(&serde_json::Value::Null)
+            && contract.get("workspace_ref") == Some(&serde_json::Value::Null)
+            && contract.get("redacted").and_then(serde_json::Value::as_bool) == Some(true),
+        "durable decision options contract is not the canonical redacted projection"
+    );
+    let options = contract
+        .get("options")
+        .and_then(serde_json::Value::as_array)
+        .context("durable decision options contract is missing its options array")?;
+    ensure!(options.len() <= 64, "durable decision options contract has too many options");
+    let mut option_ids = std::collections::BTreeSet::new();
+    for option in options {
+        let option = option
+            .as_object()
+            .context("durable decision option must be an object")?;
+        ensure!(
+            option.len() == 1 && option.contains_key("id"),
+            "durable decision option does not have the exact canonical public shape"
+        );
+        let id = option
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .context("durable decision option is missing its id")?;
+        validate_daemon_minted_public_option_id(id)?;
+        ensure!(option_ids.insert(id.to_owned()), "durable decision option ids must be unique");
+    }
+    let interrupt_response_contract = contract
+        .get("interrupt_response_contract")
+        .expect("required canonical interrupt response field");
+    let question_tool_option_ids = if interrupt_response_contract.is_null() {
+        std::collections::BTreeSet::new()
+    } else {
+        ensure!(
+            options.is_empty(),
+            "QuestionTool durable contract must not expose generic public options"
+        );
+        ensure!(
+            free_text_contract_json.is_none(),
+            "QuestionTool durable contract must not carry a generic free-text contract"
+        );
+        validate_durable_interrupt_response_contract(interrupt_response_contract)?
+    };
+    let public_option_ids = if interrupt_response_contract.is_null() {
+        let allows_free_text = match free_text_contract_json {
+            Some(raw) => validate_durable_free_text_contract(raw)?,
+            None => false,
+        };
+        ensure!(
+            !options.is_empty() || allows_free_text,
+            "generic decision must offer an option or allow bounded free-text"
+        );
+        option_ids
+    } else {
+        question_tool_option_ids
+    };
+    let canonical = canonical_json_string(&raw)?;
+    ensure!(
+        canonical == options_contract_json,
+        "durable decision options contract is not canonically encoded"
+    );
+    Ok(public_option_ids)
+}
+
+/// Returns whether a fully validated redacted decision contract carries the
+/// distinct QuestionTool answer shape.  The companion Attention row is the
+/// only durable proof of the real parked QuestionTool continuation, so both
+/// creation and loading require this discriminator to agree with that row.
+fn durable_decision_has_question_tool_contract(options_contract_json: &str) -> Result<bool> {
+    let contract: serde_json::Value = serde_json::from_str(options_contract_json)
+        .context("durable decision options contract must be JSON")?;
+    Ok(contract
+        .get("interrupt_response_contract")
+        .is_some_and(|value| !value.is_null()))
+}
+
+/// Prove that a redacted QuestionTool contract is the exact response-shaped
+/// projection of its real `needs_attention` row.  Prompt text and labels do
+/// not cross the decision boundary, but question kind, offered option IDs,
+/// free-text permission, cancellation behavior, and the private/public token
+/// correspondence are all continuation authority and must survive reload.
+fn validate_question_tool_contract_matches_interrupt<'a>(
+    options_contract_json: &str,
+    mappings: impl IntoIterator<Item = (&'a str, &'a str)>,
+    question_json: Option<&str>,
+    questions_json: Option<&str>,
+) -> Result<()> {
+    ensure!(
+        question_json.is_some() ^ questions_json.is_some(),
+        "QuestionTool decision must bind exactly one real interrupt question shape"
+    );
+    let contract: serde_json::Value = serde_json::from_str(options_contract_json)
+        .context("decoding durable QuestionTool decision contract")?;
+    let expected = contract
+        .get("interrupt_response_contract")
+        .filter(|value| !value.is_null())
+        .context("QuestionTool decision is missing its typed response contract")?;
+    let mappings = mappings.into_iter().collect::<Vec<_>>();
+    let questions = match (question_json, questions_json) {
+        (Some(raw), None) => vec![
+            serde_json::from_str::<InterruptQuestion>(raw)
+                .context("QuestionTool interrupt question is malformed")?,
+        ],
+        (None, Some(raw)) => serde_json::from_str::<InterruptQuestionSet>(raw)
+            .context("QuestionTool interrupt question set is malformed")?
+            .questions,
+        (None, None) | (Some(_), Some(_)) => unreachable!("exclusive shape was validated"),
+    };
+    ensure!(
+        !questions.is_empty() && questions.len() <= 16,
+        "QuestionTool interrupt has an invalid question count"
+    );
+    let mut projected = Vec::with_capacity(questions.len());
+    for question in questions {
+        match question {
+            InterruptQuestion::Single {
+                options,
+                allow_freetext,
+                ..
+            } => {
+                let option_ids = project_question_tool_option_ids(&options, &mappings)?;
+                ensure!(
+                    !option_ids.is_empty() || allow_freetext,
+                    "QuestionTool interrupt cannot make cancellation its only answer path"
+                );
+                projected.push(json!({
+                    "kind": "single",
+                    "option_ids": option_ids,
+                    "allow_freetext": allow_freetext,
+                }));
+            }
+            InterruptQuestion::Multi {
+                options,
+                allow_freetext,
+                ..
+            } => {
+                let option_ids = project_question_tool_option_ids(&options, &mappings)?;
+                ensure!(
+                    !option_ids.is_empty() || allow_freetext,
+                    "QuestionTool interrupt cannot make cancellation its only answer path"
+                );
+                projected.push(json!({
+                    "kind": "multi",
+                    "option_ids": option_ids,
+                    "allow_freetext": allow_freetext,
+                }));
+            }
+            InterruptQuestion::Freetext { .. } => {
+                projected.push(json!({"kind": "freetext"}));
+            }
+        }
+    }
+    let actual = json!({
+        "schema": "interrupt_question_set_v1",
+        "questions": projected,
+    });
+    ensure!(
+        canonical_json_string(expected)? == canonical_json_string(&actual)?,
+        "QuestionTool durable response contract does not exactly match its real interrupt"
+    );
+    Ok(())
+}
+
+fn project_question_tool_option_ids(
+    options: &[crate::db::wire::InterruptOption],
+    mappings: &[(&str, &str)],
+) -> Result<Vec<String>> {
+    ensure!(
+        options.len() <= 64,
+        "QuestionTool interrupt has too many options"
+    );
+    let mut option_ids = Vec::with_capacity(options.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for option in options {
+        ensure!(
+            seen.insert(option.id.as_str()),
+            "QuestionTool interrupt option ids must be unique"
+        );
+        let mapped = mappings
+            .iter()
+            .filter(|(_, continuation_option_id)| *continuation_option_id == option.id.as_str())
+            .map(|(opaque_option_id, _)| *opaque_option_id)
+            .collect::<Vec<_>>();
+        ensure!(
+            mapped.len() == 1,
+            "QuestionTool interrupt option lacks its exact private/public decision mapping"
+        );
+        option_ids.push(mapped[0].to_owned());
+    }
+    Ok(option_ids)
+}
+
+/// Approval metadata is authority owned by the real QuestionTool interrupt,
+/// not a decoration a generic AgentTree decision may borrow.  The redacted
+/// contract deliberately omits these raw host facts; this DB boundary keeps
+/// them attached to the final-operation path without projecting them to
+/// Attention or utility resolvers.
+fn validate_raw_interrupt_approval_binding(
+    decision_class: &str,
+    host_approval_operation_id: Option<Uuid>,
+    question_json: Option<&str>,
+    questions_json: Option<&str>,
+) -> Result<()> {
+    ensure!(
+        question_json.is_some() ^ questions_json.is_some(),
+        "QuestionTool approval binding requires exactly one raw question shape"
+    );
+    let questions = match (question_json, questions_json) {
+        (Some(raw), None) => vec![
+            serde_json::from_str::<InterruptQuestion>(raw)
+                .context("QuestionTool approval interrupt question is malformed")?,
+        ],
+        (None, Some(raw)) => serde_json::from_str::<InterruptQuestionSet>(raw)
+            .context("QuestionTool approval interrupt question set is malformed")?
+            .questions,
+        (None, None) | (Some(_), Some(_)) => unreachable!("exclusive shape was validated"),
+    };
+    let approval_questions = questions
+        .iter()
+        .filter_map(|question| match question {
+            InterruptQuestion::Single {
+                permission,
+                approval_class,
+                sandbox_escalation,
+                allow_freetext,
+                options,
+                ..
+            } if *permission || approval_class.is_some() || sandbox_escalation.is_some() => {
+                Some((allow_freetext, options))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if approval_questions.is_empty() {
+        ensure!(
+            decision_class != "host_approval" && host_approval_operation_id.is_none(),
+            "host approval decision must bind a raw approval-shaped QuestionTool interrupt"
+        );
+        return Ok(());
+    }
+    ensure!(
+        decision_class == "host_approval" && host_approval_operation_id.is_some(),
+        "raw approval-shaped QuestionTool interrupt may bind only a host approval final operation"
+    );
+    ensure!(
+        approval_questions.len() == 1 && questions.len() == 1,
+        "host approval interrupt must contain exactly one approval-shaped question"
+    );
+    let (allow_freetext, options) = approval_questions[0];
+    ensure!(
+        !*allow_freetext && !options.is_empty(),
+        "host approval interrupt must offer a nonempty non-free-text choice"
+    );
+    Ok(())
+}
+
+/// A host-approval decision can be recovered only when the exact final
+/// operation row still names this decision and its owning session/agent. The
+/// creation transaction establishes this edge; this load boundary makes an
+/// imported or corrupted row fail closed before recovery can issue a resume
+/// or effect handoff.
+fn validate_persisted_host_approval_operation_binding(
+    conn: &Connection,
+    decision: &DecisionRequestRow,
+    has_question_tool_contract: bool,
+) -> Result<()> {
+    match (decision.decision_class.as_str(), decision.host_approval_operation_id) {
+        ("host_approval", Some(operation_id)) => {
+            ensure!(
+                has_question_tool_contract,
+                "persisted host approval must bind a real QuestionTool interrupt"
+            );
+            ensure!(
+                !operation_id.is_nil(),
+                "persisted host approval operation id must not be nil"
+            );
+            let exact_binding: i64 = conn.query_row(
+                "SELECT EXISTS (
+                     SELECT 1
+                       FROM agent_host_approval_operations
+                      WHERE operation_id = ?1
+                        AND decision_request_id = ?2
+                        AND session_id = ?3
+                        AND agent_instance_id = ?4
+                 )",
+                params![
+                    operation_id.to_string(),
+                    decision.decision_request_id.to_string(),
+                    decision.session_id.to_string(),
+                    decision.agent_instance_id.to_string(),
+                ],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                exact_binding != 0,
+                "persisted host approval final operation is not bound to its exact decision owner"
+            );
+        }
+        ("host_approval", None) => {
+            bail!("persisted host approval is missing its final operation binding")
+        }
+        (_, Some(_)) => bail!("only persisted host approvals may bind a final operation"),
+        (_, None) => {}
+    }
+    Ok(())
+}
+
+fn validate_durable_free_text_contract(raw: &str) -> Result<bool> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .context("durable free-text contract must be a JSON object")?;
+    let object = value
+        .as_object()
+        .context("durable free-text contract must be a JSON object")?;
+    const REQUIRED: [&str; 3] = ["allowed", "max_chars", "redacted"];
+    ensure!(
+        object.len() == REQUIRED.len() && REQUIRED.iter().all(|key| object.contains_key(*key)),
+        "durable free-text contract does not have the exact canonical public shape"
+    );
+    ensure!(
+        object.get("redacted").and_then(serde_json::Value::as_bool) == Some(true),
+        "durable free-text contract is not a redacted projection"
+    );
+    let allowed = object
+        .get("allowed")
+        .and_then(serde_json::Value::as_bool)
+        .context("durable free-text contract is missing allowed")?;
+    let max_chars = object
+        .get("max_chars")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .context("durable free-text contract max_chars must be an unsigned integer")
+        })
+        .transpose()?;
+    let allows_free_text = match (allowed, max_chars) {
+        (true, Some(1..=10_000)) => true,
+        (true, Some(_)) => bail!("durable free-text contract max_chars must be between 1 and 10000"),
+        (true, None) => bail!("durable allowed free-text contract requires a bounded max_chars"),
+        (false, None) => false,
+        (false, Some(_)) => bail!("durable disallowed free-text contract must not carry max_chars"),
+    };
+    ensure!(
+        canonical_json_string(&value)? == raw,
+        "durable free-text contract is not canonically encoded"
+    );
+    Ok(allows_free_text)
+}
+
+fn validate_durable_interrupt_response_contract(
+    raw: &serde_json::Value,
+) -> Result<std::collections::BTreeSet<String>> {
+    let object = raw
+        .as_object()
+        .context("durable QuestionTool continuation contract must be an object")?;
+    ensure!(
+        object.len() == 2 && object.contains_key("schema") && object.contains_key("questions"),
+        "durable QuestionTool continuation contract does not have the exact canonical public shape"
+    );
+    ensure!(
+        object.get("schema").and_then(serde_json::Value::as_str)
+            == Some("interrupt_question_set_v1"),
+        "durable QuestionTool continuation contract has an unknown schema"
+    );
+    let questions = object
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .context("durable QuestionTool continuation questions must be an array")?;
+    ensure!(
+        !questions.is_empty() && questions.len() <= 16,
+        "durable QuestionTool continuation has an invalid question count"
+    );
+    let mut public_option_ids = std::collections::BTreeSet::new();
+    for question in questions {
+        let question = question
+            .as_object()
+            .context("durable QuestionTool continuation question must be an object")?;
+        let kind = question
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .context("durable QuestionTool continuation question is missing kind")?;
+        match kind {
+            "single" | "multi" => {
+                ensure!(
+                    question.len() == 3
+                        && question.contains_key("kind")
+                        && question.contains_key("option_ids")
+                        && question.contains_key("allow_freetext"),
+                    "durable QuestionTool choice contract does not have the exact canonical public shape"
+                );
+                let option_ids = question
+                    .get("option_ids")
+                    .and_then(serde_json::Value::as_array)
+                    .context("durable QuestionTool choice contract is missing option ids")?;
+                ensure!(
+                    option_ids.len() <= 64,
+                    "durable QuestionTool choice contract has too many options"
+                );
+                let mut unique = std::collections::BTreeSet::new();
+                for option_id in option_ids {
+                    let option_id = option_id
+                        .as_str()
+                        .context("durable QuestionTool option id must be a string")?;
+                    validate_daemon_minted_public_option_id(option_id)?;
+                    ensure!(
+                        unique.insert(option_id),
+                        "durable QuestionTool option ids must be unique"
+                    );
+                    // A multi-question QuestionTool may intentionally reuse
+                    // one local choice across questions.  It still has one
+                    // exact private mapping; the durable mapping validator
+                    // compares the set of public tokens to that table.
+                    public_option_ids.insert(option_id.to_owned());
+                }
+                let allow_freetext = question
+                    .get("allow_freetext")
+                    .and_then(serde_json::Value::as_bool)
+                    .context("durable QuestionTool choice contract is missing allow_freetext")?;
+                ensure!(
+                    !option_ids.is_empty() || allow_freetext,
+                    "QuestionTool choice contract must offer an option or allow free-text"
+                );
+            }
+            "freetext" => ensure!(
+                question.len() == 1 && question.contains_key("kind"),
+                "durable QuestionTool free-text contract does not have the exact canonical public shape"
+            ),
+            _ => bail!("durable QuestionTool continuation question kind is invalid"),
+        }
+    }
+    Ok(public_option_ids)
 }
 
 fn decision_attention_description(options_contract_json: &str) -> Result<String> {
@@ -8669,6 +9420,7 @@ fn redact_recommendation(
     raw: &str,
     private_option_mappings: &[PrivateOptionMapping],
     decision_class: &str,
+    expected_rationale_redaction_class: &str,
 ) -> Result<String> {
     let object: serde_json::Map<String, serde_json::Value> =
         serde_json::from_str(raw).context("decision recommendation must be a JSON object")?;
@@ -8705,12 +9457,16 @@ fn redact_recommendation(
         .get("rationale")
         .map(|value| value.as_str() == Some("redacted"))
         .unwrap_or(false);
-    let rationale_redaction_class = object
+    let supplied_rationale_redaction_class = object
         .get("rationale_redaction_class")
         .map(|value| value.as_str().context("decision rationale class must be a string"))
         .transpose()?;
-    if let Some(class) = rationale_redaction_class {
+    if let Some(class) = supplied_rationale_redaction_class {
         validate_redaction_class(class)?;
+        ensure!(
+            class == expected_rationale_redaction_class,
+            "decision recommendation rationale class must match its durable decision"
+        );
     }
     let host_action = object
         .get("host_action")
@@ -8728,14 +9484,13 @@ fn redact_recommendation(
             "host-owned recommendation action is not valid for this durable decision"
         );
     }
-    serde_json::to_string(&json!({
+    canonical_json_string(&json!({
         "option_id": option_id,
         "host_action": host_action,
         "rationale": rationale_is_redacted.then_some("redacted"),
-        "rationale_redaction_class": rationale_redaction_class,
+        "rationale_redaction_class": expected_rationale_redaction_class,
         "redacted": true,
     }))
-        .context("serializing redacted decision recommendation")
 }
 
 fn redact_policy_receipt(raw: &str) -> Result<String> {
@@ -8783,47 +9538,97 @@ fn redact_policy_receipt(raw: &str) -> Result<String> {
     .context("serializing redacted decision policy receipt")
 }
 
-fn validate_recommendation_is_offered(options: &str, recommendation: &str) -> Result<()> {
-    let options: serde_json::Value = serde_json::from_str(options)
-        .context("loading redacted options contract for recommendation validation")?;
-    let recommendation: serde_json::Value = serde_json::from_str(recommendation)
-        .context("loading redacted recommendation for validation")?;
-    let Some(option_id) = recommendation
+/// Validate the canonical public recommendation against both sides of the
+/// durable decision boundary.  A syntactically-safe option token is not
+/// enough: it must be offered by this contract *and* have one exact private
+/// continuation mapping for this decision/session.
+fn validate_durable_recommendation<'a>(
+    raw: &str,
+    decision_class: &str,
+    expected_rationale_redaction_class: &str,
+    public_option_ids: &std::collections::BTreeSet<String>,
+    mappings: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .context("durable decision recommendation must be a JSON object")?;
+    let object = value
+        .as_object()
+        .context("durable decision recommendation must be a JSON object")?;
+    const REQUIRED: [&str; 5] = [
+        "option_id",
+        "host_action",
+        "rationale",
+        "rationale_redaction_class",
+        "redacted",
+    ];
+    ensure!(
+        object.len() == REQUIRED.len() && REQUIRED.iter().all(|key| object.contains_key(*key)),
+        "durable decision recommendation does not have the exact canonical public shape"
+    );
+    ensure!(
+        object.get("redacted").and_then(serde_json::Value::as_bool) == Some(true),
+        "durable decision recommendation is not a redacted projection"
+    );
+    let option_id = object
         .get("option_id")
         .and_then(serde_json::Value::as_str)
-    else {
-        return Ok(());
-    };
-    // Ordinary decision contracts expose their offered opaque ids at the
-    // top level.  A linked QuestionTool continuation deliberately keeps that
-    // top-level list empty: its typed response contract is the sole
-    // authority for choice shape, including its opaque option ids.  Validate
-    // against both approved representations so a host-authored low-risk
-    // recommendation can target a real QuestionTool option without treating
-    // prompt text or private continuation ids as authority.
-    let top_level_offered = options["options"].as_array().is_some_and(|options| {
-        options.iter().any(|option| {
-            option.get("id").and_then(serde_json::Value::as_str) == Some(option_id)
-        })
-    });
-    let interrupt_offered = options
-        .get("interrupt_response_contract")
-        .filter(|contract| !contract.is_null())
-        .and_then(|contract| contract.get("questions"))
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|questions| {
-            questions.iter().any(|question| {
-                question
-                    .get("option_ids")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|option_ids| {
-                        option_ids.iter().any(|offered| offered.as_str() == Some(option_id))
-                    })
-            })
-        });
+        .context("durable decision recommendation must name an offered option")?;
+    validate_daemon_minted_public_option_id(option_id)?;
     ensure!(
-        top_level_offered || interrupt_offered,
-        "decision recommendation must name an offered option"
+        public_option_ids.contains(option_id),
+        "durable decision recommendation option is not offered by this contract"
+    );
+    let mappings = mappings.into_iter().collect::<Vec<_>>();
+    let mapped = mappings
+        .iter()
+        .filter(|(opaque_option_id, _)| *opaque_option_id == option_id)
+        .count();
+    ensure!(
+        mapped == 1,
+        "durable decision recommendation option lacks its exact private continuation mapping"
+    );
+    let rationale = object.get("rationale").expect("required canonical rationale field");
+    ensure!(
+        rationale.is_null() || rationale.as_str() == Some("redacted"),
+        "durable decision recommendation rationale is not redacted"
+    );
+    let rationale_redaction_class = object
+        .get("rationale_redaction_class")
+        .and_then(serde_json::Value::as_str)
+        .context("durable decision recommendation rationale class must be a string")?;
+    validate_redaction_class(rationale_redaction_class)?;
+    ensure!(
+        rationale_redaction_class == expected_rationale_redaction_class,
+        "durable decision recommendation rationale class does not match its decision"
+    );
+    let host_action = object.get("host_action").expect("required canonical host action field");
+    match (decision_class, host_action) {
+        ("low_risk", serde_json::Value::String(action))
+            if action == "refresh_local_host_capabilities" => {}
+        ("low_risk", _) => bail!(
+            "low-risk durable recommendation must carry the approved host action semantics"
+        ),
+        (_, serde_json::Value::Null) => {}
+        _ => bail!("durable recommendation carries an unapproved host action semantic"),
+    }
+    ensure!(
+        canonical_json_string(&value)? == raw,
+        "durable decision recommendation is not canonically encoded"
+    );
+    Ok(())
+}
+
+fn validate_daemon_minted_public_option_id(value: &str) -> Result<()> {
+    let Some(uuid_text) = value.strip_prefix("option:") else {
+        bail!("durable public option id is not daemon-minted");
+    };
+    let uuid = Uuid::parse_str(uuid_text).context("durable public option id has an invalid UUID")?;
+    ensure!(
+        !uuid.is_nil()
+            && uuid.get_version_num() == 7
+            && uuid.get_variant() == uuid::Variant::RFC4122
+            && uuid.to_string() == uuid_text,
+        "durable public option id is not a canonical UUIDv7 token"
     );
     Ok(())
 }
@@ -9540,7 +10345,7 @@ mod tests {
             agent_instance_id,
             expected_agent_revision,
             waiting_state: AgentInstanceState::WaitingForUser,
-            options_contract_json: r#"[{"id":"continue","label":"Continue"}]"#.into(),
+            options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
             free_text_contract_json: None,
             recommendation_json: Some(r#"{"option_id":"continue"}"#.into()),
             rationale_redaction_class: "public".into(),
@@ -9550,6 +10355,177 @@ mod tests {
             policy_receipt_json: r#"{"policy":"manual"}"#.into(),
             resolver_route: Some("user".into()),
         }
+    }
+
+    fn standard_question_tool_decision(
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        expected_agent_revision: i64,
+        option_id: &str,
+    ) -> NewDecisionRequest {
+        let mut input = standard_decision(session_id, agent_instance_id, expected_agent_revision);
+        input.options_contract_json = serde_json::to_string(&json!({
+            "options": [],
+            "interrupt_response_contract": {
+                "schema": "interrupt_question_set_v1",
+                "questions": [{
+                    "kind": "single",
+                    "option_ids": [option_id],
+                    "allow_freetext": false,
+                }],
+            },
+        }))
+        .expect("test QuestionTool contract serializes");
+        input.recommendation_json = None;
+        input
+    }
+
+    #[test]
+    fn canonical_question_tool_tokens_require_one_exact_private_mapping() {
+        let option_id = format!("option:{}", Uuid::now_v7());
+        let contract = canonical_json_string(&json!({
+            "options": [],
+            "question": "Decision required",
+            "description": "An agent decision is waiting",
+            "task_call_id": null,
+            "workspace_ref": null,
+            "interrupt_response_contract": {
+                "schema": "interrupt_question_set_v1",
+                "questions": [{
+                    "kind": "single",
+                    "option_ids": [option_id.clone()],
+                    "allow_freetext": false,
+                }],
+            },
+            "redacted": true,
+        }))
+        .unwrap();
+        let offered = validate_durable_decision_answer_contract(&contract, None).unwrap();
+        assert!(validate_durable_private_option_mappings(
+            &offered,
+            [(option_id.as_str(), "continue")],
+        )
+        .is_ok());
+        assert!(validate_durable_private_option_mappings(
+            &offered,
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .is_err());
+        assert!(validate_durable_private_option_mappings(
+            &offered,
+            [(option_id.as_str(), "continue"), (option_id.as_str(), "other")],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn imported_question_tool_contract_must_exactly_match_its_real_interrupt() {
+        let opaque = format!("option:{}", Uuid::now_v7());
+        let contract = canonical_json_string(&json!({
+            "options": [],
+            "question": "Decision required",
+            "description": "An agent decision is waiting",
+            "task_call_id": null,
+            "workspace_ref": null,
+            "interrupt_response_contract": {
+                "schema": "interrupt_question_set_v1",
+                "questions": [{
+                    "kind": "single",
+                    "option_ids": [opaque.clone()],
+                    "allow_freetext": false,
+                }],
+            },
+            "redacted": true,
+        }))
+        .unwrap();
+        let mapping = [(opaque.as_str(), "continue")];
+        let valid = InterruptQuestion::Single {
+            prompt: "Continue?".into(),
+            options: vec![InterruptOption {
+                id: "continue".into(),
+                label: "Continue".into(),
+                description: None,
+                secondary: false,
+            }],
+            allow_freetext: false,
+            command_detail: None,
+            permission: false,
+            approval_class: None,
+            sandbox_escalation: None,
+        };
+        let valid_json = serde_json::to_string(&valid).unwrap();
+        assert!(validate_question_tool_contract_matches_interrupt(
+            &contract,
+            mapping,
+            Some(&valid_json),
+            None,
+        )
+        .is_ok());
+
+        let shape_mismatch = InterruptQuestion::Multi {
+            prompt: "Continue?".into(),
+            options: vec![InterruptOption {
+                id: "continue".into(),
+                label: "Continue".into(),
+                description: None,
+                secondary: false,
+            }],
+            allow_freetext: false,
+        };
+        let shape_mismatch_json = serde_json::to_string(&shape_mismatch).unwrap();
+        assert!(validate_question_tool_contract_matches_interrupt(
+            &contract,
+            mapping,
+            Some(&shape_mismatch_json),
+            None,
+        )
+        .is_err());
+
+        let offered_option_mismatch = InterruptQuestion::Single {
+            prompt: "Continue?".into(),
+            options: vec![InterruptOption {
+                id: "different".into(),
+                label: "Different".into(),
+                description: None,
+                secondary: false,
+            }],
+            allow_freetext: false,
+            command_detail: None,
+            permission: false,
+            approval_class: None,
+            sandbox_escalation: None,
+        };
+        let offered_option_mismatch_json = serde_json::to_string(&offered_option_mismatch).unwrap();
+        assert!(validate_question_tool_contract_matches_interrupt(
+            &contract,
+            mapping,
+            Some(&offered_option_mismatch_json),
+            None,
+        )
+        .is_err());
+
+        let freetext_mismatch = InterruptQuestion::Single {
+            prompt: "Continue?".into(),
+            options: vec![InterruptOption {
+                id: "continue".into(),
+                label: "Continue".into(),
+                description: None,
+                secondary: false,
+            }],
+            allow_freetext: true,
+            command_detail: None,
+            permission: false,
+            approval_class: None,
+            sandbox_escalation: None,
+        };
+        let freetext_mismatch_json = serde_json::to_string(&freetext_mismatch).unwrap();
+        assert!(validate_question_tool_contract_matches_interrupt(
+            &contract,
+            mapping,
+            Some(&freetext_mismatch_json),
+            None,
+        )
+        .is_err());
     }
 
     async fn subject_notice_count(db: &Db, session_id: Uuid, subject_id: Uuid) -> i64 {
@@ -9727,6 +10703,108 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn startup_rejects_an_imported_split_host_refresh_operation_without_rebinding_it() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let agent = running_agent(&db, session.session_id, 1).await;
+        let question = InterruptQuestion::Single {
+            prompt: "Refresh?".into(),
+            options: vec![InterruptOption {
+                id: "refresh".into(),
+                label: "Refresh".into(),
+                description: None,
+                secondary: false,
+            }],
+            allow_freetext: false,
+            command_detail: None,
+            permission: false,
+            approval_class: None,
+            sandbox_escalation: None,
+        };
+        let interrupt_id = db
+            .raise_interrupt_with_agent_instance(
+                session.session_id,
+                "host-capability-refresh",
+                Some(agent.agent_instance_id),
+                "imported split refresh operation",
+                Some(&question),
+            )
+            .await
+            .unwrap();
+        let decision = db
+            .create_decision_request_for_interrupt(
+                standard_question_tool_decision(
+                    session.session_id,
+                    agent.agent_instance_id,
+                    agent.revision,
+                    "refresh",
+                ),
+                interrupt_id,
+                2,
+            )
+            .await
+            .unwrap();
+        let operation_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let session_id = session.session_id;
+        let agent_instance_id = agent.agent_instance_id;
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO host_capability_refresh_operations (
+                     operation_id, request_id, session_id, agent_instance_id,
+                     interrupt_id, decision_request_id, state,
+                     created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'pending', 3, 3)",
+                params![
+                    operation_id.to_string(),
+                    request_id.to_string(),
+                    session_id.to_string(),
+                    agent_instance_id.to_string(),
+                    interrupt_id.to_string(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let error = db
+            .reconcile_host_capability_refresh_operations(
+                host_capability_refresh_authority(),
+                session_id,
+                4,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("malformed split decision binding"),
+            "startup must reject rather than infer a missing operation-to-decision edge"
+        );
+        db.read(move |conn| {
+            let (state, decision_request_id): (String, Option<String>) = conn.query_row(
+                "SELECT state, decision_request_id
+                   FROM host_capability_refresh_operations
+                  WHERE operation_id = ?1 AND request_id = ?2",
+                params![operation_id.to_string(), request_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(state, "pending");
+            assert!(decision_request_id.is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            db.decision_request(session_id, decision.decision_request_id)
+                .await
+                .is_ok(),
+            "the malformed operation must not rewrite its separately valid decision"
+        );
+    }
+
     async fn allowed_host_capability_refresh(
         db: &Db,
         session_id: Uuid,
@@ -9749,9 +10827,10 @@ mod tests {
             sandbox_escalation: None,
         };
         let interrupt_id = db
-            .raise_interrupt(
+            .raise_interrupt_with_agent_instance(
                 session_id,
-                &agent.agent_instance_id.to_string(),
+                "host-capability-refresh",
+                Some(agent.agent_instance_id),
                 "host capability refresh",
                 Some(&question),
             )
@@ -9759,7 +10838,12 @@ mod tests {
             .unwrap();
         let decision = db
             .create_decision_request_for_interrupt(
-                standard_decision(session_id, agent.agent_instance_id, agent.revision),
+                standard_question_tool_decision(
+                    session_id,
+                    agent.agent_instance_id,
+                    agent.revision,
+                    "refresh",
+                ),
                 interrupt_id,
                 now + 1,
             )
@@ -9815,6 +10899,205 @@ mod tests {
             DecisionTransitionOutcome::Transitioned(_)
         ));
         operation_id
+    }
+
+    #[tokio::test]
+    async fn host_capability_refresh_operation_state_graph_allows_executing_cancellation_only_as_new_terminal_edge() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let agent = running_agent(&db, session.session_id, 10).await;
+
+        let cancelled =
+            allowed_host_capability_refresh(&db, session.session_id, &agent, 20).await;
+        let _cancelled_lease = match db
+            .claim_host_capability_refresh_execution(
+                host_capability_refresh_authority(),
+                session.session_id,
+                cancelled,
+                Uuid::new_v4(),
+                100,
+                40,
+            )
+            .await
+            .unwrap()
+        {
+            HostCapabilityRefreshExecutionClaim::Claimed { lease } => lease,
+            other => panic!("expected executing cancellation fixture, got {other:?}"),
+        };
+        let session_id = session.session_id;
+        assert_eq!(
+            db.transaction(move |conn| {
+                Ok(conn.execute(
+                    "UPDATE host_capability_refresh_operations
+                        SET state = 'cancelled',
+                            error_text = 'subtree cancellation won after probe began',
+                            updated_at_unix_ms = ?1, completed_at_unix_ms = ?1
+                      WHERE operation_id = ?2 AND session_id = ?3 AND state = 'executing'",
+                    params![41_i64, cancelled.to_string(), session_id.to_string()],
+                )?)
+            })
+            .await
+            .unwrap(),
+            1,
+            "executing -> cancelled is the one cancellation edge needed to fence an in-flight probe"
+        );
+        assert_eq!(
+            db.host_capability_refresh_operation_by_id(
+                host_capability_refresh_authority(),
+                session.session_id,
+                cancelled,
+            )
+            .await
+            .unwrap()
+            .expect("cancelled operation remains durable")
+            .state,
+            HostCapabilityRefreshOperationState::Cancelled
+        );
+        let cancelled_to_allowed = db
+            .transaction(move |conn| {
+                conn.execute(
+                    "UPDATE host_capability_refresh_operations
+                        SET state = 'allowed'
+                      WHERE operation_id = ?1 AND session_id = ?2",
+                    params![cancelled.to_string(), session_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            cancelled_to_allowed
+                .to_string()
+                .contains("state transition is invalid"),
+            "cancelled must remain terminal"
+        );
+
+        let invalid = allowed_host_capability_refresh(&db, session.session_id, &agent, 50).await;
+        let invalid_allowed_to_completed = db
+            .transaction(move |conn| {
+                conn.execute(
+                    "UPDATE host_capability_refresh_operations
+                        SET state = 'completed'
+                      WHERE operation_id = ?1 AND session_id = ?2",
+                    params![invalid.to_string(), session_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            invalid_allowed_to_completed
+                .to_string()
+                .contains("state transition is invalid"),
+            "the new executing cancellation edge must not open unrelated forward jumps"
+        );
+        assert!(db
+            .cancel_host_capability_refresh_operation(
+                host_capability_refresh_authority(),
+                session.session_id,
+                invalid,
+                "clearing invalid-edge fixture".to_string(),
+                51,
+            )
+            .await
+            .unwrap());
+
+        let failed = allowed_host_capability_refresh(&db, session.session_id, &agent, 60).await;
+        let failed_lease = match db
+            .claim_host_capability_refresh_execution(
+                host_capability_refresh_authority(),
+                session.session_id,
+                failed,
+                Uuid::new_v4(),
+                100,
+                61,
+            )
+            .await
+            .unwrap()
+        {
+            HostCapabilityRefreshExecutionClaim::Claimed { lease } => lease,
+            other => panic!("expected failed terminal fixture, got {other:?}"),
+        };
+        assert!(db
+            .fail_host_capability_refresh_execution(
+                host_capability_refresh_authority(),
+                session.session_id,
+                failed,
+                &failed_lease,
+                "probe failed".to_string(),
+                62,
+            )
+            .await
+            .unwrap());
+        let failed_to_cancelled = db
+            .transaction(move |conn| {
+                conn.execute(
+                    "UPDATE host_capability_refresh_operations
+                        SET state = 'cancelled'
+                      WHERE operation_id = ?1 AND session_id = ?2",
+                    params![failed.to_string(), session_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            failed_to_cancelled
+                .to_string()
+                .contains("state transition is invalid"),
+            "failed must remain terminal"
+        );
+
+        let completed =
+            allowed_host_capability_refresh(&db, session.session_id, &agent, 70).await;
+        let completed_lease = match db
+            .claim_host_capability_refresh_execution(
+                host_capability_refresh_authority(),
+                session.session_id,
+                completed,
+                Uuid::new_v4(),
+                100,
+                71,
+            )
+            .await
+            .unwrap()
+        {
+            HostCapabilityRefreshExecutionClaim::Claimed { lease } => lease,
+            other => panic!("expected completed terminal fixture, got {other:?}"),
+        };
+        let (receipt_json, receipt_digest) =
+            test_host_capability_receipt(completed_lease.snapshot_generation());
+        assert!(db
+            .complete_host_capability_refresh_execution(
+                host_capability_refresh_authority(),
+                session.session_id,
+                completed,
+                &completed_lease,
+                receipt_json,
+                completed_lease.snapshot_generation(),
+                receipt_digest,
+                72,
+            )
+            .await
+            .unwrap());
+        let completed_to_failed = db
+            .transaction(move |conn| {
+                conn.execute(
+                    "UPDATE host_capability_refresh_operations
+                        SET state = 'failed'
+                      WHERE operation_id = ?1 AND session_id = ?2",
+                    params![completed.to_string(), session_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            completed_to_failed
+                .to_string()
+                .contains("state transition is invalid"),
+            "completed must remain terminal"
+        );
     }
 
     #[tokio::test]
@@ -12659,7 +13942,7 @@ mod tests {
                     agent_instance_id: child.agent_instance_id,
                     expected_agent_revision: child.revision,
                     waiting_state: AgentInstanceState::WaitingForUser,
-                    options_contract_json: "[]".into(),
+                    options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
                     free_text_contract_json: None,
                     recommendation_json: None,
                     rationale_redaction_class: "public".into(),
@@ -12680,7 +13963,7 @@ mod tests {
                     agent_instance_id: root.agent_instance_id,
                     expected_agent_revision: root.revision,
                     waiting_state: AgentInstanceState::WaitingForApproval,
-                    options_contract_json: "[]".into(),
+                    options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
                     free_text_contract_json: None,
                     recommendation_json: None,
                     rationale_redaction_class: "public".into(),
@@ -12813,7 +14096,7 @@ mod tests {
                         agent_instance_id: agent.agent_instance_id,
                         expected_agent_revision: agent.revision,
                         waiting_state: AgentInstanceState::WaitingForUser,
-                        options_contract_json: "[]".into(),
+                        options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
                         free_text_contract_json: None,
                         recommendation_json: None,
                         rationale_redaction_class: "public".into(),
@@ -13034,7 +14317,7 @@ mod tests {
                         agent_instance_id: agent.agent_instance_id,
                         expected_agent_revision: agent.revision,
                         waiting_state: AgentInstanceState::WaitingForUser,
-                        options_contract_json: "[]".into(),
+                        options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
                         free_text_contract_json: None,
                         recommendation_json: None,
                         rationale_redaction_class: "public".into(),
@@ -13084,7 +14367,7 @@ mod tests {
                     agent_instance_id: agent.agent_instance_id,
                     expected_agent_revision: agent.revision,
                     waiting_state: AgentInstanceState::WaitingForApproval,
-                    options_contract_json: "[]".into(),
+                        options_contract_json: r#"{"options":[{"id":"continue","label":"Continue"}]}"#.into(),
                     free_text_contract_json: None,
                     recommendation_json: None,
                     rationale_redaction_class: "public".into(),
@@ -13598,6 +14881,40 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/workspace", "root").await.unwrap();
         let agent = running_agent(&db, session.session_id, 1).await;
+        let mut cancellation_only =
+            standard_decision(session.session_id, agent.agent_instance_id, agent.revision);
+        cancellation_only.options_contract_json = r#"{"options":[]}"#.into();
+        cancellation_only.free_text_contract_json = None;
+        let error = db
+            .create_decision_request(cancellation_only, 2)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generic decision must offer an option or allow bounded free-text"),
+            "a direct DB caller cannot persist a cancellation-only generic decision"
+        );
+        let mut cancellation_only_question_tool =
+            standard_decision(session.session_id, agent.agent_instance_id, agent.revision);
+        cancellation_only_question_tool.options_contract_json = r#"{
+            "options": [],
+            "interrupt_response_contract": {
+                "schema": "interrupt_question_set_v1",
+                "questions": [{"kind":"single","option_ids":[],"allow_freetext":false}]
+            }
+        }"#
+        .into();
+        let error = db
+            .create_decision_request(cancellation_only_question_tool, 2)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("QuestionTool choice contract must offer an option or allow free-text"),
+            "the direct DB boundary preserves QuestionTool's distinct nonempty response contract"
+        );
         let mut forged_auto_resolvable =
             standard_decision(session.session_id, agent.agent_instance_id, agent.revision);
         forged_auto_resolvable.decision_class = "low_risk".into();
@@ -13633,6 +14950,50 @@ mod tests {
                 .contains("automatically resolvable decision classes require"),
             "the generic interrupt-bound creation API cannot mint a low-risk decision either"
         );
+        let question_interrupt_id = db
+            .raise_interrupt_with_agent_instance(
+                session.session_id,
+                "agent-tree",
+                Some(agent.agent_instance_id),
+                "ordinary QuestionTool continuation",
+                Some(&InterruptQuestion::Single {
+                    prompt: "Continue?".into(),
+                    options: vec![InterruptOption {
+                        id: "continue".into(),
+                        label: "Continue".into(),
+                        description: None,
+                        secondary: false,
+                    }],
+                    allow_freetext: false,
+                    command_detail: None,
+                    permission: false,
+                    approval_class: None,
+                    sandbox_escalation: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let error = db
+            .create_decision_request_for_interrupt(
+                standard_decision(session.session_id, agent.agent_instance_id, agent.revision),
+                question_interrupt_id,
+                2,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("QuestionTool durable contracts and existing question interrupts must be bound together"),
+            "a generic decision can never claim a real QuestionTool interrupt"
+        );
+        assert!(
+            db.decision_request_for_interrupt(session.session_id, question_interrupt_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the rejected generic bind leaves the real QuestionTool continuation unclaimed"
+        );
         let error = db
             .create_decision_request(
                 NewDecisionRequest {
@@ -13641,7 +15002,7 @@ mod tests {
                     expected_agent_revision: agent.revision,
                     waiting_state: AgentInstanceState::WaitingForUser,
                     options_contract_json:
-                        r#"[{"id":"approve","label":"Approve","credential":"never-store"}]"#.into(),
+                        r#"{"options":[{"id":"approve","label":"Approve","credential":"never-store"}]}"#.into(),
                     free_text_contract_json: None,
                     recommendation_json: None,
                     rationale_redaction_class: "secret".into(),
@@ -13663,7 +15024,7 @@ mod tests {
                     agent_instance_id: agent.agent_instance_id,
                     expected_agent_revision: agent.revision,
                     waiting_state: AgentInstanceState::WaitingForUser,
-                    options_contract_json: r#"[{"id":"approve","label":"Approve"}]"#.into(),
+                    options_contract_json: r#"{"options":[{"id":"approve","label":"Approve"}]}"#.into(),
                     free_text_contract_json: Some(r#"{"allowed":true}"#.into()),
                     recommendation_json: None,
                     rationale_redaction_class: "public".into(),
@@ -13714,7 +15075,7 @@ mod tests {
                     agent_instance_id: agent.agent_instance_id,
                     expected_agent_revision: agent.revision,
                     waiting_state: AgentInstanceState::WaitingForUser,
-                    options_contract_json: r#"[{"id":"approve","label":"Approve"}]"#.into(),
+                    options_contract_json: r#"{"options":[{"id":"approve","label":"Approve"}]}"#.into(),
                     free_text_contract_json: None,
                     recommendation_json: None,
                     rationale_redaction_class: "public".into(),
@@ -13795,7 +15156,7 @@ mod tests {
                         agent_instance_id: agent.agent_instance_id,
                         expected_agent_revision: agent.revision,
                         waiting_state: AgentInstanceState::WaitingForUser,
-                        options_contract_json: r#"[{"id":"approve","label":"Approve"}]"#.into(),
+                        options_contract_json: r#"{"options":[{"id":"approve","label":"Approve"}]}"#.into(),
                         free_text_contract_json: Some(r#"{"allowed":true,"max_chars":120}"#.into()),
                         recommendation_json: Some(r#"{"option_id":"approve"}"#.into()),
                         rationale_redaction_class: "sensitive".into(),
@@ -13854,6 +15215,585 @@ mod tests {
         );
         assert!(decision.policy_receipt_json.contains("receipt-1"));
         assert!(!format!("{decision:?}").contains("credential"));
+    }
+
+    #[tokio::test]
+    async fn malformed_persisted_decision_contract_cannot_reach_replay_or_recovery() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let agent = running_agent(&db, session.session_id, 1).await;
+        let decision = db
+            .create_decision_request(
+                standard_decision(
+                    session.session_id,
+                    agent.agent_instance_id,
+                    agent.revision,
+                ),
+                2,
+            )
+            .await
+            .unwrap();
+        let decision_id = decision.decision_request_id;
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE decision_requests
+                 SET options_contract_json = ?1, free_text_contract_json = NULL
+                 WHERE decision_request_id = ?2",
+                params![
+                    r#"{"options":[],"question":"Decision required","description":"An agent decision is waiting","task_call_id":null,"workspace_ref":null,"interrupt_response_contract":null,"redacted":true}"#,
+                    decision_id.to_string(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let error = db
+            .decision_request(session.session_id, decision_id)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generic decision must offer an option or allow bounded free-text"),
+            "an imported/corrupted row must fail closed before normal replay can observe it"
+        );
+        let error = db
+            .recoverable_decision_requests_page(session.session_id, None, 10)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generic decision must offer an option or allow bounded free-text"),
+            "recovery cannot reintroduce an unsatisfiable persisted decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn imported_generic_decision_cannot_claim_a_question_tool_interrupt() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let agent = running_agent(&db, session.session_id, 1).await;
+        let decision = db
+            .create_decision_request(
+                standard_decision(
+                    session.session_id,
+                    agent.agent_instance_id,
+                    agent.revision,
+                ),
+                2,
+            )
+            .await
+            .unwrap();
+        let question_interrupt_id = db
+            .raise_interrupt_with_agent_instance(
+                session.session_id,
+                "agent-tree",
+                Some(agent.agent_instance_id),
+                "imported QuestionTool continuation",
+                Some(&InterruptQuestion::Single {
+                    prompt: "Continue?".into(),
+                    options: vec![InterruptOption {
+                        id: "continue".into(),
+                        label: "Continue".into(),
+                        description: None,
+                        secondary: false,
+                    }],
+                    allow_freetext: false,
+                    command_detail: None,
+                    permission: false,
+                    approval_class: None,
+                    sandbox_escalation: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let decision_id = decision.decision_request_id;
+        db.write(move |conn| {
+            conn.execute(
+                "DELETE FROM needs_attention WHERE session_id = ?1 AND decision_request_id = ?2",
+                params![session.session_id.to_string(), decision_id.to_string()],
+            )?;
+            conn.execute(
+                "UPDATE needs_attention SET decision_request_id = ?1 WHERE interrupt_id = ?2",
+                params![decision_id.to_string(), question_interrupt_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let error = db
+            .decision_request(session.session_id, decision_id)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("persisted QuestionTool durable contract and existing question interrupt must be bound together"),
+            "an imported generic decision must fail closed before it can claim a QuestionTool continuation"
+        );
+        let error = db
+            .recoverable_decision_requests_page(session.session_id, None, 10)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("persisted QuestionTool durable contract and existing question interrupt must be bound together"),
+            "recovery must not turn a malformed imported link into a QuestionTool replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn imported_question_tool_approval_metadata_and_final_operation_bindings_fail_closed() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let agent = running_agent(&db, session.session_id, 1).await;
+        let ordinary_question = InterruptQuestion::Single {
+            prompt: "Continue?".into(),
+            options: vec![InterruptOption {
+                id: "continue".into(),
+                label: "Continue".into(),
+                description: None,
+                secondary: false,
+            }],
+            allow_freetext: false,
+            command_detail: None,
+            permission: false,
+            approval_class: None,
+            sandbox_escalation: None,
+        };
+        let interrupt_id = db
+            .raise_interrupt_with_agent_instance(
+                session.session_id,
+                "agent-tree",
+                Some(agent.agent_instance_id),
+                "imported QuestionTool approval metadata",
+                Some(&ordinary_question),
+            )
+            .await
+            .unwrap();
+        let decision = db
+            .create_decision_request_for_interrupt(
+                standard_question_tool_decision(
+                    session.session_id,
+                    agent.agent_instance_id,
+                    agent.revision,
+                    "continue",
+                ),
+                interrupt_id,
+                2,
+            )
+            .await
+            .unwrap();
+        let decision_id = decision.decision_request_id;
+        let session_id = session.session_id;
+        let approval_question = InterruptQuestion::Single {
+            permission: true,
+            ..ordinary_question.clone()
+        };
+        let approval_interrupt_id = db
+            .raise_interrupt_with_agent_instance(
+                session_id,
+                "agent-tree",
+                Some(agent.agent_instance_id),
+                "imported approval-shaped QuestionTool continuation",
+                Some(&approval_question),
+            )
+            .await
+            .unwrap();
+        db.write(move |conn| {
+            conn.execute(
+                "DELETE FROM needs_attention WHERE session_id = ?1 AND decision_request_id = ?2",
+                params![session_id.to_string(), decision_id.to_string()],
+            )?;
+            conn.execute(
+                "UPDATE needs_attention SET decision_request_id = ?1 WHERE interrupt_id = ?2",
+                params![decision_id.to_string(), approval_interrupt_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = db
+            .decision_request(session_id, decision_id)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("raw approval-shaped QuestionTool interrupt"),
+            "a generic decision must not load after an imported raw approval metadata mutation"
+        );
+        let error = db
+            .recoverable_decision_requests_page(session_id, None, 10)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("raw approval-shaped QuestionTool interrupt"),
+            "recovery must not replay an imported generic-to-approval-shaped decision"
+        );
+
+        let operation_id = Uuid::new_v4();
+        let operation_input = canonical_json_string(&json!({
+            "candidate_effects": [{
+                "selection": "continue",
+                "execute": {"operation": "test"},
+            }],
+        }))
+        .unwrap();
+        let mut digest = Sha256::new();
+        digest.update(b"flycockpit.host-approval-input.v1\0");
+        digest.update(operation_input.as_bytes());
+        let input_digest = format!("{:x}", digest.finalize());
+        let decision_id_for_bind = decision_id.to_string();
+        let session_id_for_bind = session_id.to_string();
+        let agent_id_for_bind = agent.agent_instance_id.to_string();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO agent_host_approval_operations (
+                     operation_id, session_id, agent_instance_id, operation_kind,
+                     canonical_input_json, input_digest, decision_request_id, state,
+                     created_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, 'test', ?4, ?5, NULL, 'pending', 3)",
+                params![
+                    operation_id.to_string(),
+                    session_id_for_bind,
+                    agent_id_for_bind,
+                    operation_input.clone(),
+                    input_digest.clone(),
+                ],
+            )?;
+            conn.execute(
+                "UPDATE decision_requests
+                    SET decision_class = 'host_approval', host_approval_operation_id = ?1
+                  WHERE decision_request_id = ?2",
+                params![operation_id.to_string(), decision_id_for_bind],
+            )?;
+            conn.execute(
+                "UPDATE agent_host_approval_operations
+                    SET decision_request_id = ?1
+                  WHERE operation_id = ?2",
+                params![decision_id.to_string(), operation_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(
+            db.decision_request(session_id, decision_id).await.is_ok(),
+            "the fully bound host approval fixture must satisfy the common load boundary"
+        );
+
+        let ordinary_interrupt_id = db
+            .raise_interrupt_with_agent_instance(
+                session_id,
+                "agent-tree",
+                Some(agent.agent_instance_id),
+                "imported ordinary QuestionTool continuation",
+                Some(&ordinary_question),
+            )
+            .await
+            .unwrap();
+        let mismatched_operation_id = Uuid::new_v4();
+        db.write(move |conn| {
+            conn.execute(
+                "DELETE FROM needs_attention WHERE session_id = ?1 AND decision_request_id = ?2",
+                params![session_id.to_string(), decision_id.to_string()],
+            )?;
+            conn.execute(
+                "UPDATE needs_attention SET decision_request_id = ?1 WHERE interrupt_id = ?2",
+                params![decision_id.to_string(), ordinary_interrupt_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = db
+            .decision_request(session_id, decision_id)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("host approval decision must bind a raw approval-shaped"),
+            "a host approval must not load after its imported raw interrupt is made ordinary"
+        );
+        let error = db
+            .recoverable_decision_requests_page(session_id, None, 10)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("host approval decision must bind a raw approval-shaped"),
+            "recovery must not replay an imported host approval whose raw interrupt was made ordinary"
+        );
+
+        let restored_approval_interrupt_id = db
+            .raise_interrupt_with_agent_instance(
+                session_id,
+                "agent-tree",
+                Some(agent.agent_instance_id),
+                "restored imported approval QuestionTool continuation",
+                Some(&approval_question),
+            )
+            .await
+            .unwrap();
+        db.write(move |conn| {
+            conn.execute(
+                "DELETE FROM needs_attention WHERE session_id = ?1 AND decision_request_id = ?2",
+                params![session_id.to_string(), decision_id.to_string()],
+            )?;
+            conn.execute(
+                "UPDATE needs_attention SET decision_request_id = ?1 WHERE interrupt_id = ?2",
+                params![decision_id.to_string(), restored_approval_interrupt_id.to_string()],
+            )?;
+            conn.execute(
+                "DELETE FROM agent_host_approval_operations WHERE operation_id = ?1",
+                params![operation_id.to_string()],
+            )?;
+            conn.execute(
+                "INSERT INTO agent_host_approval_operations (
+                     operation_id, session_id, agent_instance_id, operation_kind,
+                     canonical_input_json, input_digest, decision_request_id, state,
+                     created_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, 'test', ?4, ?5, NULL, 'pending', 4)",
+                params![
+                    mismatched_operation_id.to_string(),
+                    session_id.to_string(),
+                    agent.agent_instance_id.to_string(),
+                    operation_input,
+                    input_digest,
+                ],
+            )?;
+            conn.execute(
+                "UPDATE decision_requests SET host_approval_operation_id = ?1
+                  WHERE decision_request_id = ?2",
+                params![mismatched_operation_id.to_string(), decision_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = db
+            .recoverable_decision_requests_page(session_id, None, 10)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("final operation is not bound to its exact decision owner"),
+            "recovery must reject an imported host approval whose final operation belongs to no decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn imported_or_corrupted_decision_fields_and_private_mappings_fail_before_attention() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let agent = running_agent(&db, session.session_id, 1).await;
+        let decision = db
+            .create_decision_request(
+                standard_decision(
+                    session.session_id,
+                    agent.agent_instance_id,
+                    agent.revision,
+                ),
+                2,
+            )
+            .await
+            .unwrap();
+        let decision_id = decision.decision_request_id;
+        let original_options = decision.options_contract_json.clone();
+        let original_recommendation = decision.recommendation_json.clone();
+        let original_free_text = decision.free_text_contract_json.clone();
+        let original_mappings = db
+            .private_decision_option_mappings(session.session_id, decision_id)
+            .await
+            .unwrap();
+
+        // Each mutation remains valid JSON and canonically encoded.  The
+        // load boundary must nevertheless reject every changed public field
+        // before an Attention projection or recovery worker can observe it.
+        for (field, replacement) in [
+            ("question", serde_json::Value::String("forged".into())),
+            ("description", serde_json::Value::String("forged".into())),
+            ("task_call_id", serde_json::Value::String("forged".into())),
+            ("workspace_ref", serde_json::Value::String("forged".into())),
+            (
+                "interrupt_response_contract",
+                json!({
+                    "schema": "interrupt_question_set_v1",
+                    "questions": [{"kind": "freetext"}],
+                }),
+            ),
+            ("redacted", serde_json::Value::Bool(false)),
+        ] {
+            let mut options: serde_json::Value = serde_json::from_str(&original_options).unwrap();
+            options[field] = replacement;
+            let malformed = canonical_json_string(&options).unwrap();
+            db.write({
+                let decision_id = decision_id;
+                move |conn| {
+                    conn.execute(
+                        "UPDATE decision_requests SET options_contract_json = ?1 WHERE decision_request_id = ?2",
+                        params![malformed, decision_id.to_string()],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                db.decision_attention_page(session.session_id, None, 10)
+                    .await
+                    .is_err(),
+                "malformed public {field} must not reach Attention"
+            );
+            db.write({
+                let decision_id = decision_id;
+                let original_options = original_options.clone();
+                move |conn| {
+                    conn.execute(
+                        "UPDATE decision_requests SET options_contract_json = ?1 WHERE decision_request_id = ?2",
+                        params![original_options, decision_id.to_string()],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        let mut options: serde_json::Value = serde_json::from_str(&original_options).unwrap();
+        options["options"][0]["id"] = serde_json::Value::String(
+            "option:00000000-0000-4000-8000-000000000001".into(),
+        );
+        let malformed_options = canonical_json_string(&options).unwrap();
+        db.write({
+            let decision_id = decision_id;
+            move |conn| {
+                conn.execute(
+                    "UPDATE decision_requests SET options_contract_json = ?1 WHERE decision_request_id = ?2",
+                    params![malformed_options, decision_id.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        assert!(db.decision_request(session.session_id, decision_id).await.is_err());
+        db.write({
+            let decision_id = decision_id;
+            let original_options = original_options.clone();
+            move |conn| {
+                conn.execute(
+                    "UPDATE decision_requests SET options_contract_json = ?1 WHERE decision_request_id = ?2",
+                    params![original_options, decision_id.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut recommendation: serde_json::Value =
+            serde_json::from_str(original_recommendation.as_deref().unwrap()).unwrap();
+        recommendation["option_id"] = serde_json::Value::String(
+            "option:018f47a2-7b3c-7def-8123-000000000001".into(),
+        );
+        let malformed_recommendation = canonical_json_string(&recommendation).unwrap();
+        db.write({
+            let decision_id = decision_id;
+            move |conn| {
+                conn.execute(
+                    "UPDATE decision_requests SET recommendation_json = ?1 WHERE decision_request_id = ?2",
+                    params![malformed_recommendation, decision_id.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        assert!(db.decision_request(session.session_id, decision_id).await.is_err());
+        db.write({
+            let decision_id = decision_id;
+            let original_recommendation = original_recommendation.clone();
+            move |conn| {
+                conn.execute(
+                    "UPDATE decision_requests SET recommendation_json = ?1 WHERE decision_request_id = ?2",
+                    params![original_recommendation, decision_id.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        db.write({
+            let decision_id = decision_id;
+            move |conn| {
+                conn.execute(
+                    "DELETE FROM decision_private_option_mappings WHERE decision_request_id = ?1",
+                    params![decision_id.to_string()],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        assert!(db.decision_request(session.session_id, decision_id).await.is_err());
+
+        db.write({
+            let decision_id = decision_id;
+            let session_id = session.session_id;
+            move |conn| {
+                for mapping in original_mappings {
+                    conn.execute(
+                        "INSERT INTO decision_private_option_mappings (
+                             decision_request_id, session_id, opaque_option_id, continuation_option_id
+                         ) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            decision_id.to_string(),
+                            session_id.to_string(),
+                            mapping.opaque_option_id,
+                            mapping.continuation_option_id,
+                        ],
+                    )?;
+                }
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        // This generic decision has no stored free-text capability. A forged
+        // malformed capability must be detected independently of the options
+        // and private-token validation above.
+        let forged_free_text = canonical_json_string(&json!({
+            "allowed": true,
+            "max_chars": 120,
+            "redacted": true,
+            "extra": false,
+        }))
+        .unwrap();
+        assert!(original_free_text.is_none());
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE decision_requests SET free_text_contract_json = ?1 WHERE decision_request_id = ?2",
+                params![forged_free_text, decision_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(db.decision_request(session.session_id, decision_id).await.is_err());
     }
 
     #[tokio::test]

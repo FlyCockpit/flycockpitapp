@@ -1701,7 +1701,10 @@ WHEN NOT (
     OLD.state = NEW.state
     OR (OLD.state = 'pending' AND NEW.state IN ('allowed', 'cancelled', 'failed'))
     OR (OLD.state = 'allowed' AND NEW.state IN ('executing', 'cancelled', 'failed'))
-    OR (OLD.state = 'executing' AND NEW.state IN ('completed', 'failed'))
+    -- Subtree/root cancellation remains the terminal authority even after a
+    -- daemon-local probe crossed its execution boundary. The cancelled row
+    -- fences that in-flight result and is paired atomically with the child.
+    OR (OLD.state = 'executing' AND NEW.state IN ('completed', 'failed', 'cancelled'))
 )
 BEGIN
     SELECT RAISE(ABORT, 'host capability refresh operation state transition is invalid');

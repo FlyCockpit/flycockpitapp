@@ -21951,16 +21951,16 @@ fn agent_attention_wire(
     }
 }
 
-fn agent_decision_answer_from_wire(answer: proto::AgentDecisionAnswer) -> crate::agent_tree::DecisionAnswer {
+fn agent_decision_answer_from_wire(answer: proto::AgentDecisionAnswer) -> crate::agent_tree::PublicDecisionAnswer {
     match answer {
         proto::AgentDecisionAnswer::Option { option_id } => {
-            crate::agent_tree::DecisionAnswer::option(option_id)
+            crate::agent_tree::PublicDecisionAnswer::option(option_id)
         }
         proto::AgentDecisionAnswer::FreeText { text } => {
-            crate::agent_tree::DecisionAnswer::FreeText { text }
+            crate::agent_tree::PublicDecisionAnswer::FreeText { text }
         }
         proto::AgentDecisionAnswer::InterruptResponse { response } => {
-            crate::agent_tree::DecisionAnswer::InterruptResponse {
+            crate::agent_tree::PublicDecisionAnswer::InterruptResponse {
                 response: agent_interrupt_response_from_wire(response),
             }
         }

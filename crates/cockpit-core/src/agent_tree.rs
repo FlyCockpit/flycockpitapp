@@ -15,6 +15,7 @@ mod tests {
         RedactedAgentProfileSnapshot, RedactedBindingEvidence, RedactedQuestionPolicy,
     };
     use crate::db::db::agent_tree_decisions::{AgentInstanceState, NewAgentInstance};
+    use crate::db::wire::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
     use sha2::{Digest, Sha256};
 
     fn digest(bytes: &[u8]) -> String {
@@ -102,6 +103,275 @@ mod tests {
             allowed: false,
             max_chars: None,
         })
+        .is_ok());
+    }
+
+    #[test]
+    fn public_free_text_answers_fail_closed_without_panicking_on_non_capabilities() {
+        let base = DecisionRequestRow {
+            decision_request_id: Uuid::new_v4(),
+            agent_instance_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            task_call_id: None,
+            workspace_ref: None,
+            options_contract_json: r#"{"options":[{"id":"option:018f47a2-7b3c-7def-8123-000000000001"}]}"#.into(),
+            free_text_contract_json: Some(r#"{"allowed":false,"max_chars":null}"#.into()),
+            recommendation_json: None,
+            rationale_redaction_class: "public".into(),
+            decision_class: "user_question".into(),
+            host_approval_operation_id: None,
+            deadline_unix_ms: None,
+            policy_receipt_json: "{}".into(),
+            resolver_route: None,
+            state: DecisionState::Pending,
+            revision: 0,
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+        let answer = PublicDecisionAnswer::FreeText { text: "no".into() };
+        assert!(
+            validate_answer(&base, &answer).is_err(),
+            "the public ResolveAgentDecision free-text variant must reject an explicit non-capability"
+        );
+
+        let malformed = DecisionRequestRow {
+            free_text_contract_json: Some(r#"{"allowed":true}"#.into()),
+            ..base
+        };
+        assert!(
+            validate_answer(&malformed, &answer).is_err(),
+            "a malformed persisted free-text capability must return an error rather than panic the session worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_decisions_require_an_answer_channel_at_typed_and_lifecycle_ingress() {
+        let presentation = DecisionPresentation {
+            question: "Choose an action".into(),
+            description: "One answer is required".into(),
+            task_call_id: None,
+            workspace_ref: None,
+            recommendation_rationale: None,
+        };
+        assert!(
+            NewDecisionContract::user_question(
+                Uuid::new_v4(),
+                0,
+                Vec::new(),
+                None,
+                None,
+                "public".into(),
+                presentation.clone(),
+            )
+            .is_err(),
+            "a cancellation-only generic question is not answerable"
+        );
+        assert!(NewDecisionContract::user_question(
+            Uuid::new_v4(),
+            0,
+            Vec::new(),
+            Some(FreeTextContract {
+                allowed: true,
+                max_chars: Some(120),
+            }),
+            None,
+            "public".into(),
+            presentation.clone(),
+        )
+        .is_ok());
+
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("project", "/repo", "tree").await.unwrap();
+        let agent = running_agent(&db, session.session_id, false).await;
+        let lifecycle = AgentTreeLifecycle::new(db.clone());
+        // Direct construction is available inside this crate for trusted host
+        // composition. The lifecycle must preserve the constructor invariant
+        // so a malformed internal/import adapter cannot park this agent.
+        let invalid = NewDecisionContract {
+            agent_instance_id: agent.agent_instance_id,
+            expected_agent_revision: agent.revision,
+            options: Vec::new(),
+            free_text: None,
+            recommended_option_id: None,
+            rationale_redaction_class: "public".into(),
+            presentation,
+            interrupt_response_contract: None,
+            decision_subject: HostDecisionSubject::UserQuestion,
+            host_approval_authority: None,
+        };
+        let error = lifecycle
+            .request_decision(session.session_id, invalid, 100)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("generic decision must offer an option or allow bounded free-text")
+        );
+        let after = db
+            .agent_instance(session.session_id, agent.agent_instance_id)
+            .await
+            .unwrap()
+            .expect("decision owner remains durable");
+        assert_eq!(after.state, AgentInstanceState::Running);
+        assert_eq!(after.revision, agent.revision);
+    }
+
+    #[tokio::test]
+    async fn generic_lifecycle_decision_round_trips_the_canonical_null_question_tool_marker() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("project", "/repo", "tree").await.unwrap();
+        let agent = running_agent(&db, session.session_id, false).await;
+        let lifecycle = AgentTreeLifecycle::new(db.clone());
+        let decision = lifecycle
+            .request_decision(
+                session.session_id,
+                NewDecisionContract::user_question(
+                    agent.agent_instance_id,
+                    agent.revision,
+                    vec![DecisionOption {
+                        id: "continue".into(),
+                        label: "Continue".into(),
+                    }],
+                    Some(FreeTextContract {
+                        allowed: true,
+                        max_chars: Some(120),
+                    }),
+                    Some("continue".into()),
+                    "public".into(),
+                    DecisionPresentation {
+                        question: "Continue?".into(),
+                        description: "A bounded generic decision is waiting".into(),
+                        task_call_id: None,
+                        workspace_ref: None,
+                        recommendation_rationale: None,
+                    },
+                )
+                .unwrap(),
+                100,
+            )
+            .await
+            .expect("generic None must not be decoded as a QuestionTool contract");
+        let recovered = db
+            .decision_request(session.session_id, decision.decision_request_id)
+            .await
+            .unwrap()
+            .expect("generic lifecycle decision survives durable reload");
+        let public: serde_json::Value =
+            serde_json::from_str(&recovered.options_contract_json).unwrap();
+        assert_eq!(public["interrupt_response_contract"], serde_json::Value::Null);
+        assert_eq!(public["question"], "Decision required");
+        assert_eq!(public["description"], "An agent decision is waiting");
+        assert!(recovered.free_text_contract_json.is_some());
+    }
+
+    #[tokio::test]
+    async fn public_answer_boundary_requires_opaque_tokens_and_private_continuations_translate_exactly() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("project", "/repo", "tree").await.unwrap();
+        let lifecycle = AgentTreeLifecycle::new(db.clone());
+        let agent = running_agent(&db, session.session_id, false).await;
+        let public_decision = lifecycle
+            .request_decision(session.session_id, contract(&agent), 100)
+            .await
+            .unwrap();
+        let public_option = only_public_option_id(&public_decision.options_contract_json);
+
+        // The public AgentTree route cannot accept a caller/model-owned
+        // continuation ID even when it is a real private mapping.
+        assert!(lifecycle
+            .resolve_user_answer(
+                session.session_id,
+                public_decision.decision_request_id,
+                PublicDecisionAnswer::option("refresh"),
+                101,
+            )
+            .await
+            .is_err());
+        assert!(matches!(
+            lifecycle
+                .resolve_user_answer(
+                    session.session_id,
+                    public_decision.decision_request_id,
+                    PublicDecisionAnswer::option(public_option),
+                    102,
+                )
+                .await
+                .unwrap(),
+            DecisionSettlement::Resolved(DecisionState::Answered)
+        ));
+
+        // The only private-ID path is a separate crate-private continuation
+        // API. It translates through the exact durable mapping before it can
+        // reach the public validator or a persisted receipt.
+        let running = db
+            .agent_instance(session.session_id, agent.agent_instance_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let private_decision = lifecycle
+            .request_decision(session.session_id, contract(&running), 103)
+            .await
+            .unwrap();
+        assert!(matches!(
+            lifecycle
+                .resolve_trusted_private_continuation_answer(
+                    session.session_id,
+                    private_decision.decision_request_id,
+                    PrivateDecisionContinuationAnswer::option("refresh"),
+                    104,
+                )
+                .await
+                .unwrap(),
+            DecisionSettlement::Resolved(DecisionState::Answered)
+        ));
+    }
+
+    #[test]
+    fn question_tool_contract_requires_a_nonempty_typed_answer_channel() {
+        let empty_choice = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Choose".into(),
+                options: Vec::new(),
+                allow_freetext: false,
+                command_detail: None,
+                permission: false,
+                approval_class: None,
+                sandbox_escalation: None,
+            }],
+        };
+        assert!(
+            NewDecisionContract::user_question_interrupt(
+                Uuid::new_v4(),
+                0,
+                &empty_choice,
+                None,
+            )
+            .is_err(),
+            "QuestionTool cancellation cannot be its only answer path"
+        );
+        let valid_choice = InterruptQuestionSet {
+            questions: vec![InterruptQuestion::Single {
+                prompt: "Choose".into(),
+                options: vec![InterruptOption {
+                    id: "continue".into(),
+                    label: "Continue".into(),
+                    description: None,
+                    secondary: false,
+                }],
+                allow_freetext: false,
+                command_detail: None,
+                permission: false,
+                approval_class: None,
+                sandbox_escalation: None,
+            }],
+        };
+        assert!(NewDecisionContract::user_question_interrupt(
+            Uuid::new_v4(),
+            0,
+            &valid_choice,
+            None,
+        )
         .is_ok());
     }
 
@@ -488,6 +758,40 @@ mod tests {
                 bail!("warm parent disappeared before delivery acknowledgement");
             }
             Ok(())
+        }
+    }
+
+    struct RecordingResolverDelivery {
+        accepted: std::sync::Mutex<Vec<(Uuid, DecisionResolverRoute)>>,
+        succeeds: bool,
+    }
+
+    impl RecordingResolverDelivery {
+        fn succeeding() -> Self {
+            Self {
+                accepted: std::sync::Mutex::new(Vec::new()),
+                succeeds: true,
+            }
+        }
+
+    }
+
+    impl DecisionResolverDelivery for RecordingResolverDelivery {
+        fn accept(
+            &self,
+            _session_id: Uuid,
+            route: DecisionResolverRoute,
+            packet: RedactedDecisionPacket,
+        ) -> Result<()> {
+            self.accepted
+                .lock()
+                .expect("recording resolver delivery lock")
+                .push((packet.decision_request_id, route));
+            if self.succeeds {
+                Ok(())
+            } else {
+                bail!("deterministic resolver delivery rejection")
+            }
         }
     }
 
@@ -1135,10 +1439,10 @@ mod tests {
         );
         assert_eq!(
             runtime
-                .resolve_user_answer(
+                .resolve_trusted_private_continuation_answer(
                     session.session_id,
                     decision.decision_request_id,
-                    DecisionAnswer::option("refresh"),
+                    PrivateDecisionContinuationAnswer::option("refresh"),
                 )
                 .await
                 .unwrap(),
@@ -1157,10 +1461,10 @@ mod tests {
         owner_live.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(matches!(
             runtime
-                .resolve_user_answer(
+                .resolve_trusted_private_continuation_answer(
                     session.session_id,
                     decision.decision_request_id,
-                    DecisionAnswer::option("refresh"),
+                    PrivateDecisionContinuationAnswer::option("refresh"),
                 )
                 .await
                 .unwrap(),
@@ -1278,6 +1582,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_refresh_resolving_claim_redelivers_once_after_typed_restart_attachment() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("project", "/repo", "tree").await.unwrap();
+        let lifecycle = AgentTreeLifecycle::new(db.clone());
+        let parent = running_agent(&db, session.session_id, false).await;
+        let child = running_child(&db, session.session_id, &parent, true).await;
+        let decision = host_capability_refresh_decision(
+            &lifecycle,
+            &db,
+            session.session_id,
+            &child,
+            20,
+        )
+        .await;
+        let interrupt_id = db
+            .interrupt_for_decision_request(session.session_id, decision.decision_request_id)
+            .await
+            .unwrap()
+            .expect("host refresh decision owns one real interrupt");
+        let operation = db
+            .host_capability_refresh_operation_for_interrupt(
+                daemon_host_capability_refresh_authority(),
+                session.session_id,
+                interrupt_id,
+            )
+            .await
+            .unwrap()
+            .expect("host refresh decision has one typed operation binding");
+        assert_eq!(operation.agent_instance_id, child.agent_instance_id);
+        assert_eq!(operation.decision_request_id, Some(decision.decision_request_id));
+
+        // The old worker has claimed utility routing but dies before its
+        // resolver reports completion. This is the precise `pending ->
+        // resolving` crash window that a replacement worker must recover.
+        assert!(matches!(
+            lifecycle
+                .begin_auto_resolution(
+                    session.session_id,
+                    decision.decision_request_id,
+                    &TestResolvers {
+                        parent_warm: false,
+                        utility_compatible: true,
+                    },
+                    21,
+                )
+                .await
+                .unwrap(),
+            AutoResolutionBegin::Claimed {
+                route: DecisionResolverRoute::Utility,
+                ..
+            }
+        ));
+        assert_eq!(
+            db.decision_request(session.session_id, decision.decision_request_id)
+                .await
+                .unwrap()
+                .expect("crash-window decision remains durable")
+                .state,
+            DecisionState::Resolving
+        );
+
+        let recovery_epoch = Uuid::new_v4();
+        let recovery = lifecycle
+            .recover_session(session.session_id, recovery_epoch, 22)
+            .await
+            .unwrap();
+        assert!(
+            recovery.claimed_agents.contains(&child.agent_instance_id),
+            "the daemon-owned refresh child requires an exact restart claim"
+        );
+        assert!(
+            recovery.pending_decisions.contains(&decision.decision_request_id),
+            "the unresolved typed refresh decision is recoverable"
+        );
+        let child_after_claim = db
+            .agent_instance(session.session_id, child.agent_instance_id)
+            .await
+            .unwrap()
+            .expect("refresh child still exists for its typed reattachment");
+        assert!(
+            db.consume_agent_resume_claims_atomically(
+                session.session_id,
+                vec![(child.agent_instance_id, child_after_claim.revision)],
+                recovery_epoch,
+                23,
+            )
+            .await
+            .unwrap(),
+            "a replacement worker installs the typed endpoint before it consumes the child claim"
+        );
+
+        // This is the filtered worker handoff: only the reattached typed
+        // host-operation decision enters `resume_recovered_decisions`.
+        let recovered_handoff = AgentTreeRecovery {
+            claimed_agents: vec![child.agent_instance_id],
+            pending_decisions: vec![decision.decision_request_id],
+            claimed_late_user_steers: Vec::new(),
+            accepted_late_user_steers: Vec::new(),
+        };
+        let delivery = Arc::new(RecordingResolverDelivery::succeeding());
+        let runtime = AgentTreeRuntime::new(
+            lifecycle,
+            Arc::new(FixedClock(24)),
+            Arc::new(TestResolvers {
+                parent_warm: false,
+                utility_compatible: true,
+            }),
+            Arc::new(NoopDeadlines),
+        )
+        .with_resolver_delivery(delivery.clone());
+        assert!(
+            runtime
+                .resume_recovered_decisions(session.session_id, &recovered_handoff)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            delivery
+                .accepted
+                .lock()
+                .expect("recorded restart delivery")
+                .as_slice(),
+            &[(decision.decision_request_id, DecisionResolverRoute::Utility)],
+            "the replacement worker redelivers the stranded resolving claim exactly once"
+        );
+
+        // Completion of the recovered delivery wins the durable terminal CAS;
+        // replaying the same recovery handoff after it has a receipt cannot
+        // deliver it again.
+        let public_option = only_public_option_id(
+            &db.decision_request(session.session_id, decision.decision_request_id)
+                .await
+                .unwrap()
+                .expect("redelivered decision remains durable")
+                .options_contract_json,
+        );
+        assert!(matches!(
+            runtime
+                .accept_resolver_result(
+                    session.session_id,
+                    decision.decision_request_id,
+                    DecisionResolverRoute::Utility,
+                    PublicDecisionAnswer::option(public_option),
+                )
+                .await
+                .unwrap(),
+            DecisionSettlement::Resolved(DecisionState::AutoResolved)
+        ));
+        runtime
+            .resume_recovered_decisions(session.session_id, &recovered_handoff)
+            .await
+            .unwrap();
+        assert_eq!(
+            delivery
+                .accepted
+                .lock()
+                .expect("recorded terminal restart delivery")
+                .len(),
+            1,
+            "the terminal receipt makes a duplicate restart redelivery impossible"
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_routes_post_auto_host_child_answer_to_live_parent_after_child_detaches_once() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("project", "/repo", "tree").await.unwrap();
@@ -1312,7 +1781,7 @@ mod tests {
             AutoResolutionBegin::Claimed { route, packet } => (route, packet),
             other => panic!("expected automatic host refresh claim, got {other:?}"),
         };
-        let answer = DecisionAnswer::option(only_public_option_id(&packet.options_contract_json));
+        let answer = PublicDecisionAnswer::option(only_public_option_id(&packet.options_contract_json));
         assert!(matches!(
             runtime
                 .accept_resolver_result(
@@ -1491,6 +1960,7 @@ mod tests {
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].continuation_option_id, "continue");
         assert!(mappings[0].opaque_option_id.starts_with("option:"));
+        let public_option_id = mappings[0].opaque_option_id.clone();
 
         assert!(matches!(
             lifecycle
@@ -1511,7 +1981,7 @@ mod tests {
             .resolve_user_answer(
                 session.session_id,
                 decision.decision_request_id,
-                DecisionAnswer::Option {
+                PublicDecisionAnswer::Option {
                     id: "continue".into()
                 },
                 22,
@@ -1522,7 +1992,7 @@ mod tests {
             .resolve_user_answer(
                 session.session_id,
                 decision.decision_request_id,
-                DecisionAnswer::InterruptResponse {
+                PublicDecisionAnswer::InterruptResponse {
                     response: ResolveResponse::Single {
                         selected_id: "foreign".into(),
                     },
@@ -1536,9 +2006,9 @@ mod tests {
                 .resolve_user_answer(
                     session.session_id,
                     decision.decision_request_id,
-                    DecisionAnswer::InterruptResponse {
+                    PublicDecisionAnswer::InterruptResponse {
                         response: ResolveResponse::Single {
-                            selected_id: "continue".into(),
+                            selected_id: public_option_id,
                         },
                     },
                     24,
@@ -1777,7 +2247,7 @@ mod tests {
                     session.session_id,
                     packet.decision_request_id,
                     DecisionResolverRoute::Utility,
-                    DecisionAnswer::option(&public_option_id),
+                    PublicDecisionAnswer::option(&public_option_id),
                     23,
                 )
                 .await
@@ -1790,7 +2260,7 @@ mod tests {
                     session.session_id,
                     packet.decision_request_id,
                     DecisionResolverRoute::Utility,
-                    DecisionAnswer::option(&public_option_id),
+                    PublicDecisionAnswer::option(&public_option_id),
                     24,
                 )
                 .await
@@ -1860,7 +2330,7 @@ mod tests {
                     session.session_id,
                     decision.decision_request_id,
                     DecisionResolverRoute::Utility,
-                    DecisionAnswer::option(&public_option_id),
+                    PublicDecisionAnswer::option(&public_option_id),
                     22,
                 )
                 .await
@@ -1872,7 +2342,7 @@ mod tests {
                 .resolve_user_answer(
                     session.session_id,
                     decision.decision_request_id,
-                    DecisionAnswer::option(&public_option_id),
+                    PublicDecisionAnswer::option(&public_option_id),
                     23,
                 )
                 .await
@@ -2049,7 +2519,7 @@ mod tests {
                     session.session_id,
                     decision.decision_request_id,
                     DecisionResolverRoute::Utility,
-                    DecisionAnswer::option(&public_option_id),
+                    PublicDecisionAnswer::option(&public_option_id),
                     22,
                 )
                 .await
@@ -2061,7 +2531,7 @@ mod tests {
                 .resolve_user_answer(
                     session.session_id,
                     decision.decision_request_id,
-                    DecisionAnswer::option(&public_option_id),
+                    PublicDecisionAnswer::option(&public_option_id),
                     23,
                 )
                 .await
@@ -2077,7 +2547,7 @@ mod tests {
                 .resolve_user_answer(
                     session.session_id,
                     decision.decision_request_id,
-                    DecisionAnswer::option(&public_option_id),
+                    PublicDecisionAnswer::option(&public_option_id),
                     24,
                 )
                 .await
@@ -2234,7 +2704,7 @@ mod tests {
                 .resolve_user_answer(
                     session.session_id,
                     decision.decision_request_id,
-                    DecisionAnswer::option(public_option_id),
+                    PublicDecisionAnswer::option(public_option_id),
                     23,
                 )
                 .await
@@ -2578,11 +3048,6 @@ mod tests {
             }),
         )
         .unwrap();
-        let mut request = contract(&agent).with_host_approval_subject(
-            operation,
-            HostApprovalAuthority::trusted_host(),
-        );
-        request.rationale_redaction_class = "secret".into();
         let approval_question = crate::db::wire::InterruptQuestion::Single {
             prompt: "Approve the final host operation?".into(),
             options: vec![crate::db::wire::InterruptOption {
@@ -2597,6 +3062,18 @@ mod tests {
             approval_class: None,
             sandbox_escalation: None,
         };
+        let approval_questions = InterruptQuestionSet {
+            questions: vec![approval_question.clone()],
+        };
+        let mut request = NewDecisionContract::user_question_interrupt(
+            agent.agent_instance_id,
+            agent.revision,
+            &approval_questions,
+            agent.workspace_ref.clone(),
+        )
+        .unwrap()
+        .with_host_approval_subject(operation, HostApprovalAuthority::trusted_host());
+        request.rationale_redaction_class = "secret".into();
         let interrupt_id = db
             .raise_interrupt_with_agent_instance(
                 session.session_id,
@@ -2655,7 +3132,7 @@ mod tests {
             .resolve_user_answer(
                 session.session_id,
                 decision.decision_request_id,
-                DecisionAnswer::option("continue"),
+                PublicDecisionAnswer::option("continue"),
                 21,
             )
             .await
@@ -2888,10 +3365,16 @@ mod tests {
         let decision = lifecycle
             .request_decision_for_interrupt(
                 session.session_id,
-                contract(&agent).with_host_approval_subject(
-                    operation,
-                    HostApprovalAuthority::trusted_host(),
-                ),
+                NewDecisionContract::user_question_interrupt(
+                    agent.agent_instance_id,
+                    agent.revision,
+                    &InterruptQuestionSet {
+                        questions: vec![question.clone()],
+                    },
+                    agent.workspace_ref.clone(),
+                )
+                .unwrap()
+                .with_host_approval_subject(operation, HostApprovalAuthority::trusted_host()),
                 interrupt_id,
                 10,
             )
@@ -3696,8 +4179,9 @@ impl NewDecisionContract {
         recommended_option_id: Option<String>,
         rationale_redaction_class: String,
         presentation: DecisionPresentation,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        validate_generic_decision_answer_channels(&options, free_text.as_ref())?;
+        Ok(Self {
             agent_instance_id,
             expected_agent_revision,
             options,
@@ -3708,7 +4192,7 @@ impl NewDecisionContract {
             interrupt_response_contract: None,
             decision_subject: HostDecisionSubject::UserQuestion,
             host_approval_authority: None,
-        }
+        })
     }
 
     /// Construct the one durable contract for a real QuestionTool interrupt.
@@ -3721,7 +4205,7 @@ impl NewDecisionContract {
         questions: &InterruptQuestionSet,
         workspace_ref: Option<String>,
     ) -> Result<Self> {
-        Ok(Self {
+        let contract = Self {
             agent_instance_id,
             expected_agent_revision,
             options: Vec::new(),
@@ -3738,7 +4222,9 @@ impl NewDecisionContract {
             interrupt_response_contract: Some(RedactedInterruptQuestionSet::from_questions(questions)?),
             decision_subject: HostDecisionSubject::UserQuestion,
             host_approval_authority: None,
-        })
+        };
+        validate_new_decision_contract_answer_channels(&contract)?;
+        Ok(contract)
     }
 
     pub(crate) fn with_host_subject(mut self, subject: HostDecisionSubject) -> Self {
@@ -3818,10 +4304,31 @@ impl RedactedInterruptQuestionSet {
                 InterruptQuestion::Freetext { .. } => Ok(RedactedInterruptQuestion::Freetext),
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
+        let contract = Self {
             schema: "interrupt_question_set_v1".to_string(),
             questions,
-        })
+        };
+        contract.validate_contract()?;
+        Ok(contract)
+    }
+
+    /// A QuestionTool has its own typed response envelope, but it still must
+    /// expose a real answer channel. `Cancel` aborts an existing interaction;
+    /// it is not an answer channel that can make an otherwise empty question
+    /// satisfiable.
+    fn validate_contract(&self) -> Result<()> {
+        ensure!(
+            self.schema == "interrupt_question_set_v1",
+            "unknown QuestionTool continuation contract schema"
+        );
+        ensure!(
+            !self.questions.is_empty() && self.questions.len() <= 16,
+            "QuestionTool continuation must contain between one and sixteen questions"
+        );
+        for question in &self.questions {
+            question.validate_answer_channel()?;
+        }
+        Ok(())
     }
 
     fn validate_response(&self, response: &ResolveResponse) -> Result<()> {
@@ -3853,6 +4360,23 @@ impl RedactedInterruptQuestionSet {
 }
 
 impl RedactedInterruptQuestion {
+    fn validate_answer_channel(&self) -> Result<()> {
+        match self {
+            Self::Single {
+                option_ids,
+                allow_freetext,
+            }
+            | Self::Multi {
+                option_ids,
+                allow_freetext,
+            } => ensure!(
+                !option_ids.is_empty() || *allow_freetext,
+                "QuestionTool choice contract must offer an option or allow free-text"
+            ),
+            Self::Freetext => Ok(()),
+        }
+    }
+
     fn validate_response(&self, response: &ResolveResponse) -> Result<()> {
         match (self, response) {
             (_, ResolveResponse::Cancel) => Ok(()),
@@ -4525,7 +5049,7 @@ impl AgentTreeRuntime {
         session_id: Uuid,
         decision_request_id: Uuid,
         route: DecisionResolverRoute,
-        answer: DecisionAnswer,
+        answer: PublicDecisionAnswer,
     ) -> Result<DecisionSettlement> {
         if !self
             .decision_owner_is_live(session_id, decision_request_id)
@@ -4557,7 +5081,7 @@ impl AgentTreeRuntime {
         &self,
         session_id: Uuid,
         decision_request_id: Uuid,
-        answer: DecisionAnswer,
+        answer: PublicDecisionAnswer,
     ) -> Result<DecisionSettlement> {
         let Some(decision) = self
             .lifecycle
@@ -4585,6 +5109,47 @@ impl AgentTreeRuntime {
         let settlement = self
             .lifecycle
             .resolve_user_answer(
+                session_id,
+                decision_request_id,
+                answer,
+                self.clock.now_unix_ms(),
+            )
+            .await?;
+        if settlement.is_terminal() {
+            self.deadlines.cancel(session_id, decision_request_id);
+        }
+        Ok(settlement)
+    }
+
+    /// Resolve an answer that the daemon has obtained from the exact linked
+    /// private continuation. This is intentionally crate-private: public
+    /// clients must use [`Self::resolve_user_answer`] with opaque tokens from
+    /// the Attention projection, while the legacy QuestionTool path keeps its
+    /// raw IDs confined to the parked continuation boundary.
+    pub(crate) async fn resolve_trusted_private_continuation_answer(
+        &self,
+        session_id: Uuid,
+        decision_request_id: Uuid,
+        answer: PrivateDecisionContinuationAnswer,
+    ) -> Result<DecisionSettlement> {
+        let Some(decision) = self
+            .lifecycle
+            .db
+            .decision_request(session_id, decision_request_id)
+            .await?
+        else {
+            return Ok(DecisionSettlement::Retry);
+        };
+        if !is_terminal(decision.state)
+            && !self
+                .resolvers
+                .exact_owner_executor_is_live(session_id, decision.agent_instance_id)
+        {
+            return Ok(DecisionSettlement::Retry);
+        }
+        let settlement = self
+            .lifecycle
+            .resolve_trusted_private_continuation_answer(
                 session_id,
                 decision_request_id,
                 answer,
@@ -4699,8 +5264,11 @@ pub enum AutoResolutionBegin {
     Retry,
 }
 
+/// An answer received from the public AgentTree daemon boundary. Option IDs
+/// are daemon-minted opaque capabilities from the redacted Attention
+/// contract, never the original QuestionTool continuation IDs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DecisionAnswer {
+pub enum PublicDecisionAnswer {
     Option { id: String },
     FreeText { text: String },
     /// A real QuestionTool continuation. This is deliberately distinct from
@@ -4710,9 +5278,33 @@ pub enum DecisionAnswer {
     InterruptResponse { response: ResolveResponse },
 }
 
-impl DecisionAnswer {
+impl PublicDecisionAnswer {
     pub fn option(id: impl Into<String>) -> Self {
         Self::Option { id: id.into() }
+    }
+}
+
+/// The private answer shape understood by a parked QuestionTool continuation.
+///
+/// This is deliberately distinct from [`PublicDecisionAnswer`].  A raw
+/// continuation ID can be meaningful only after a daemon-owned continuation
+/// boundary has selected the exact linked decision and translated it through
+/// its private mapping.  In particular, this type has no daemon-wire decoder
+/// and the public `ResolveAgentDecision` route cannot construct it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrivateDecisionContinuationAnswer {
+    Option { id: String },
+    FreeText { text: String },
+    InterruptResponse { response: ResolveResponse },
+}
+
+impl PrivateDecisionContinuationAnswer {
+    pub(crate) fn option(id: impl Into<String>) -> Self {
+        Self::Option { id: id.into() }
+    }
+
+    pub(crate) fn interrupt_response(response: ResolveResponse) -> Self {
+        Self::InterruptResponse { response }
     }
 }
 
@@ -5132,6 +5724,11 @@ impl AgentTreeLifecycle {
         interrupt_id: Option<Uuid>,
         now_unix_ms: i64,
     ) -> Result<DecisionRequestRow> {
+        // `NewDecisionContract` is a typed ingress, but tests and future
+        // in-crate composition code can construct it directly. Recheck the
+        // answer-channel invariant before deriving any deadline or touching
+        // durable state so an empty generic decision can never park an agent.
+        validate_new_decision_contract_answer_channels(&contract)?;
         let decision_class = contract.decision_subject.decision_class();
         let host_approval_operation_id = contract.decision_subject.host_approval_operation_id();
         let host_approval_authority = contract.host_approval_authority;
@@ -5155,19 +5752,36 @@ impl AgentTreeLifecycle {
         // Keep the ingress and persisted shape aligned: the DB allowlists and
         // normalizes this object, and answer validation reads its `options`
         // member after recovery. Do not serialize a bare array here.
-        let options_contract_json = serde_json::to_string(&serde_json::json!({
-            "options": contract.options,
-            "question": contract.presentation.question,
-            "description": contract.presentation.description,
-            // Presentation selectors are caller/model supplied context, not
-            // lineage authority.  Do not even pass them through the durable
-            // contract encoder; `create_decision_request_with_attention`
-            // derives the separately typed opaque references from the exact
-            // daemon-owned agent row in its lifecycle CAS.
-            "task_call_id": serde_json::Value::Null,
-            "workspace_ref": serde_json::Value::Null,
-            "interrupt_response_contract": contract.interrupt_response_contract,
-        }))?;
+        // Do not serialize `None` as a JSON `null` at this ingress.  The
+        // storage codec treats an interrupt-response object as the one
+        // QuestionTool discriminator, while `null` has no semantic value at
+        // all.  Omitting it here keeps generic and QuestionTool ingress
+        // unambiguous; the one persistence codec below emits the canonical
+        // public `null` marker for a generic durable row.
+        let mut options_contract = serde_json::Map::new();
+        options_contract.insert("options".to_string(), serde_json::to_value(contract.options)?);
+        options_contract.insert(
+            "question".to_string(),
+            serde_json::Value::String(contract.presentation.question),
+        );
+        options_contract.insert(
+            "description".to_string(),
+            serde_json::Value::String(contract.presentation.description),
+        );
+        // Presentation selectors are caller/model supplied context, not
+        // lineage authority.  Do not even pass them through the durable
+        // contract encoder; `create_decision_request_with_attention` derives
+        // the separately typed opaque references from the exact daemon-owned
+        // agent row in its lifecycle CAS.
+        options_contract.insert("task_call_id".to_string(), serde_json::Value::Null);
+        options_contract.insert("workspace_ref".to_string(), serde_json::Value::Null);
+        if let Some(interrupt_response_contract) = contract.interrupt_response_contract {
+            options_contract.insert(
+                "interrupt_response_contract".to_string(),
+                serde_json::to_value(interrupt_response_contract)?,
+            );
+        }
+        let options_contract_json = serde_json::to_string(&options_contract)?;
         let free_text_contract_json = contract
             .free_text
             .map(|contract| {
@@ -5392,19 +6006,20 @@ impl AgentTreeLifecycle {
         &self,
         session_id: Uuid,
         decision_request_id: Uuid,
-        answer: DecisionAnswer,
+        answer: PublicDecisionAnswer,
         now_unix_ms: i64,
     ) -> Result<DecisionSettlement> {
+        validate_public_answer_option_tokens(&answer)?;
         let decision = self
             .db
             .decision_request(session_id, decision_request_id)
             .await?
             .context("decision request is not authorized for this session")?;
         if decision.state == DecisionState::AutoResolved {
-            let (public_answer, private_answer) = self
-                .public_and_private_continuation_answers(session_id, decision_request_id, &answer)
+            let private_answer = self
+                .private_continuation_answer_for_public_answer(session_id, decision_request_id, &answer)
                 .await?;
-            validate_answer(&decision, &public_answer)?;
+            validate_answer(&decision, &answer)?;
             let steer = self
                 .db
                 .record_late_user_decision_steer(
@@ -5439,16 +6054,42 @@ impl AgentTreeLifecycle {
             owner.state == AgentInstanceState::WaitingForUser,
             "user answer does not own this decision state"
         );
-        let (public_answer, private_answer) = self
-            .public_and_private_continuation_answers(session_id, decision_request_id, &answer)
+        let private_answer = self
+            .private_continuation_answer_for_public_answer(session_id, decision_request_id, &answer)
             .await?;
-        validate_answer(&decision, &public_answer)?;
+        validate_answer(&decision, &answer)?;
         self.settle(
             session_id,
             decision,
             DecisionState::Answered,
-            &answer_receipt("user", &public_answer),
+            &answer_receipt("user", &answer),
             Some(answer_resume_payload("user", &private_answer)),
+            now_unix_ms,
+        )
+        .await
+    }
+
+    /// Resolve a response supplied by an already-authenticated private
+    /// continuation boundary. The private IDs are translated *exactly* to
+    /// daemon-minted public tokens before the normal public-answer path is
+    /// reached; neither the daemon RPC nor resolver packets can select this
+    /// route.
+    pub(crate) async fn resolve_trusted_private_continuation_answer(
+        &self,
+        session_id: Uuid,
+        decision_request_id: Uuid,
+        answer: PrivateDecisionContinuationAnswer,
+        now_unix_ms: i64,
+    ) -> Result<DecisionSettlement> {
+        let mappings = self
+            .db
+            .private_decision_option_mappings(session_id, decision_request_id)
+            .await?;
+        let public_answer = public_decision_answer_from_private_continuation(&answer, &mappings)?;
+        self.resolve_user_answer(
+            session_id,
+            decision_request_id,
+            public_answer,
             now_unix_ms,
         )
         .await
@@ -5459,9 +6100,10 @@ impl AgentTreeLifecycle {
         session_id: Uuid,
         decision_request_id: Uuid,
         route: DecisionResolverRoute,
-        answer: DecisionAnswer,
+        answer: PublicDecisionAnswer,
         now_unix_ms: i64,
     ) -> Result<DecisionSettlement> {
+        validate_public_answer_option_tokens(&answer)?;
         let decision = match self
             .load_decision_for_settlement(session_id, decision_request_id)
             .await?
@@ -5483,10 +6125,10 @@ impl AgentTreeLifecycle {
             decision.resolver_route.as_deref() == Some(route.as_str()),
             "automatic result does not match the durable resolver claim"
         );
-        let (public_answer, private_answer) = self
-            .public_and_private_continuation_answers(session_id, decision_request_id, &answer)
+        let private_answer = self
+            .private_continuation_answer_for_public_answer(session_id, decision_request_id, &answer)
             .await?;
-        validate_answer(&decision, &public_answer)?;
+        validate_answer(&decision, &answer)?;
         let source = match route {
             DecisionResolverRoute::WarmParent => "warm_parent",
             DecisionResolverRoute::Utility => "utility",
@@ -5495,29 +6137,27 @@ impl AgentTreeLifecycle {
             session_id,
             decision,
             DecisionState::AutoResolved,
-            &answer_receipt(source, &public_answer),
+            &answer_receipt(source, &answer),
             Some(answer_resume_payload(source, &private_answer)),
             now_unix_ms,
         )
         .await
     }
 
-    /// Normalize a local QuestionTool response to its public opaque form and
-    /// separately recover the original private continuation response. Public
-    /// option tokens remain in receipts and every Attention/resolver packet.
-    async fn public_and_private_continuation_answers(
+    /// Recover the original continuation IDs only after the caller has used
+    /// the public opaque answer API. Public tokens remain in receipts and
+    /// every Attention/resolver packet.
+    async fn private_continuation_answer_for_public_answer(
         &self,
         session_id: Uuid,
         decision_request_id: Uuid,
-        answer: &DecisionAnswer,
-    ) -> Result<(DecisionAnswer, DecisionAnswer)> {
+        answer: &PublicDecisionAnswer,
+    ) -> Result<PrivateDecisionContinuationAnswer> {
         let mappings = self
             .db
             .private_decision_option_mappings(session_id, decision_request_id)
             .await?;
-        let public_answer = public_decision_answer_from_input(answer, &mappings)?;
-        let private_answer = private_decision_continuation_answer(&public_answer, &mappings)?;
-        Ok((public_answer, private_answer))
+        private_decision_continuation_answer_from_public(answer, &mappings)
     }
 
     async fn abandon_auto_resolution(
@@ -5612,7 +6252,7 @@ impl AgentTreeLifecycle {
                 &serde_json::json!({ "source": "host_approval" }).to_string(),
                 &answer_resume_payload(
                     "user",
-                    &DecisionAnswer::InterruptResponse {
+                    &PrivateDecisionContinuationAnswer::InterruptResponse {
                         response,
                     },
                 ),
@@ -5712,7 +6352,7 @@ impl AgentTreeLifecycle {
             &serde_json::json!({ "source": "host_approval_declined" }).to_string(),
             Some(answer_resume_payload(
                 "user",
-                &DecisionAnswer::InterruptResponse {
+                &PrivateDecisionContinuationAnswer::InterruptResponse {
                     response: canonical_response,
                 },
             )),
@@ -6071,7 +6711,7 @@ fn packet_from_decision(
     })
 }
 
-fn validate_answer(decision: &DecisionRequestRow, answer: &DecisionAnswer) -> Result<()> {
+fn validate_answer(decision: &DecisionRequestRow, answer: &PublicDecisionAnswer) -> Result<()> {
     let contract: serde_json::Value = serde_json::from_str(&decision.options_contract_json)
         .context("decoding durable decision options")?;
     let interrupt_contract = contract
@@ -6083,7 +6723,7 @@ fn validate_answer(decision: &DecisionRequestRow, answer: &DecisionAnswer) -> Re
         })
         .transpose()?;
     if let Some(interrupt_contract) = interrupt_contract {
-        let DecisionAnswer::InterruptResponse { response } = answer else {
+        let PublicDecisionAnswer::InterruptResponse { response } = answer else {
             bail!("QuestionTool continuation requires a typed daemon response envelope");
         };
         ensure!(
@@ -6093,7 +6733,7 @@ fn validate_answer(decision: &DecisionRequestRow, answer: &DecisionAnswer) -> Re
         return interrupt_contract.validate_response(response);
     }
     match answer {
-        DecisionAnswer::Option { id } => {
+        PublicDecisionAnswer::Option { id } => {
             ensure!(is_safe_option_id(id), "decision option id is invalid");
             ensure!(
                 contract["options"].as_array().is_some_and(|options| options.iter().any(|option| {
@@ -6102,7 +6742,7 @@ fn validate_answer(decision: &DecisionRequestRow, answer: &DecisionAnswer) -> Re
                 "decision answer is not an offered option"
             );
         }
-        DecisionAnswer::FreeText { text } => {
+        PublicDecisionAnswer::FreeText { text } => {
             let Some(raw) = decision.free_text_contract_json.as_deref() else {
                 bail!("decision does not permit free-text answers");
             };
@@ -6110,15 +6750,19 @@ fn validate_answer(decision: &DecisionRequestRow, answer: &DecisionAnswer) -> Re
                 .context("decoding durable free-text decision contract")?;
             validate_bounded_free_text_contract(&contract)?;
             ensure!(
-                text.chars().count()
-                    <= contract
-                        .max_chars
-                        .expect("validated allowed free-text contract has a bound") as usize,
+                contract.allowed,
+                "decision does not permit free-text answers"
+            );
+            let max_chars = contract
+                .max_chars
+                .context("allowed free-text decision is missing its bounded maximum")?;
+            ensure!(
+                text.chars().count() <= max_chars as usize,
                 "free-text decision answer exceeds its durable contract"
             );
             ensure!(!text.contains('\0'), "free-text decision answer contains NUL");
         }
-        DecisionAnswer::InterruptResponse { .. } => {
+        PublicDecisionAnswer::InterruptResponse { .. } => {
             bail!("decision does not own a QuestionTool continuation");
         }
     }
@@ -6142,60 +6786,113 @@ fn validate_bounded_free_text_contract(contract: &FreeTextContract) -> Result<()
     }
 }
 
-/// A QuestionTool's real interrupt still carries its local option IDs to the
-/// parked continuation. Before validating that local response against the
-/// public decision contract, translate only known private IDs to their
-/// daemon-minted opaque counterparts. A resolver already returns the opaque
-/// form and therefore passes through unchanged.
-fn public_decision_answer_from_input(
-    answer: &DecisionAnswer,
-    mappings: &[crate::db::agent_tree_decisions::DecisionPrivateOptionMapping],
-) -> Result<DecisionAnswer> {
-    match answer {
-        DecisionAnswer::Option { id } => Ok(DecisionAnswer::Option { id: id.clone() }),
-        DecisionAnswer::FreeText { text } => Ok(DecisionAnswer::FreeText { text: text.clone() }),
-        DecisionAnswer::InterruptResponse { response } => Ok(DecisionAnswer::InterruptResponse {
-            response: public_interrupt_response_from_input(response, mappings)?,
-        }),
+/// Generic decisions are answerable only through their bounded options or an
+/// explicitly bounded free-text capability. Cancellation ends an already
+/// valid interaction; it cannot make an empty generic decision answerable.
+fn validate_generic_decision_answer_channels(
+    options: &[DecisionOption],
+    free_text: Option<&FreeTextContract>,
+) -> Result<()> {
+    ensure!(
+        options.len() <= 64,
+        "generic decision has too many options"
+    );
+    for option in options {
+        ensure!(
+            is_safe_option_id(&option.id),
+            "generic decision option id is not a safe bounded identifier"
+        );
+    }
+    if let Some(contract) = free_text {
+        validate_bounded_free_text_contract(contract)?;
+    }
+    ensure!(
+        !options.is_empty() || free_text.is_some_and(|contract| contract.allowed),
+        "generic decision must offer an option or allow bounded free-text"
+    );
+    Ok(())
+}
+
+fn validate_new_decision_contract_answer_channels(contract: &NewDecisionContract) -> Result<()> {
+    match contract.interrupt_response_contract.as_ref() {
+        Some(interrupt_contract) => {
+            ensure!(
+                contract.free_text.is_none(),
+                "QuestionTool continuation must not carry a generic free-text contract"
+            );
+            interrupt_contract.validate_contract()
+        }
+        None => validate_generic_decision_answer_channels(&contract.options, contract.free_text.as_ref()),
     }
 }
 
-fn public_interrupt_response_from_input(
+/// Translate a response from the exact private continuation into the public
+/// opaque contract. Every private option ID must have a mapping: this is a
+/// trusted internal boundary, not a permissive compatibility parser.
+fn public_decision_answer_from_private_continuation(
+    answer: &PrivateDecisionContinuationAnswer,
+    mappings: &[crate::db::agent_tree_decisions::DecisionPrivateOptionMapping],
+) -> Result<PublicDecisionAnswer> {
+    match answer {
+        PrivateDecisionContinuationAnswer::Option { id } => Ok(PublicDecisionAnswer::Option {
+            id: private_option_to_public(id, mappings)?,
+        }),
+        PrivateDecisionContinuationAnswer::FreeText { text } => {
+            Ok(PublicDecisionAnswer::FreeText { text: text.clone() })
+        }
+        PrivateDecisionContinuationAnswer::InterruptResponse { response } => {
+            Ok(PublicDecisionAnswer::InterruptResponse {
+                response: public_interrupt_response_from_private_continuation(response, mappings)?,
+            })
+        }
+    }
+}
+
+fn private_option_to_public(
+    private_option_id: &str,
+    mappings: &[crate::db::agent_tree_decisions::DecisionPrivateOptionMapping],
+) -> Result<String> {
+    mappings
+        .iter()
+        .find(|mapping| mapping.continuation_option_id == private_option_id)
+        .map(|mapping| mapping.opaque_option_id.clone())
+        .context("private continuation option has no public opaque mapping")
+}
+
+fn public_interrupt_response_from_private_continuation(
     response: &ResolveResponse,
     mappings: &[crate::db::agent_tree_decisions::DecisionPrivateOptionMapping],
 ) -> Result<ResolveResponse> {
-    let to_public = |id: &str| {
-        mappings
-            .iter()
-            .find(|mapping| mapping.continuation_option_id == id)
-            .map(|mapping| mapping.opaque_option_id.clone())
-            .unwrap_or_else(|| id.to_owned())
-    };
+    let to_public = |id: &str| private_option_to_public(id, mappings);
     Ok(match response {
         ResolveResponse::Single { selected_id } => ResolveResponse::Single {
-            selected_id: to_public(selected_id),
+            selected_id: to_public(selected_id)?,
         },
         ResolveResponse::Multi { selected_ids } => ResolveResponse::Multi {
-            selected_ids: selected_ids.iter().map(|id| to_public(id)).collect(),
+            selected_ids: selected_ids
+                .iter()
+                .map(|id| to_public(id))
+                .collect::<Result<Vec<_>>>()?,
         },
         ResolveResponse::Freetext { text } => ResolveResponse::Freetext { text: text.clone() },
         ResolveResponse::Batch { responses } => ResolveResponse::Batch {
             responses: responses
                 .iter()
-                .map(|response| public_interrupt_response_from_input(response, mappings))
+                .map(|response| public_interrupt_response_from_private_continuation(response, mappings))
                 .collect::<Result<Vec<_>>>()?,
         },
         ResolveResponse::Cancel => ResolveResponse::Cancel,
     })
 }
 
-/// After public validation, recover the original local IDs only for the
-/// private durable continuation. Unknown opaque IDs are an invariant failure:
-/// they cannot be an offered public option without a matching private row.
-fn private_decision_continuation_answer(
-    answer: &DecisionAnswer,
+/// After validation of a public opaque answer, recover the original local IDs
+/// only for the private durable continuation. Unknown opaque IDs are an
+/// invariant failure: they cannot be an offered public option without a
+/// matching private row.
+fn private_decision_continuation_answer_from_public(
+    answer: &PublicDecisionAnswer,
     mappings: &[crate::db::agent_tree_decisions::DecisionPrivateOptionMapping],
-) -> Result<DecisionAnswer> {
+) -> Result<PrivateDecisionContinuationAnswer> {
     let to_private = |opaque_option_id: &str| {
         mappings
             .iter()
@@ -6204,13 +6901,17 @@ fn private_decision_continuation_answer(
             .context("decision option has no private continuation mapping")
     };
     match answer {
-        DecisionAnswer::Option { id } => Ok(DecisionAnswer::Option {
+        PublicDecisionAnswer::Option { id } => Ok(PrivateDecisionContinuationAnswer::Option {
             id: to_private(id)?,
         }),
-        DecisionAnswer::FreeText { text } => Ok(DecisionAnswer::FreeText { text: text.clone() }),
-        DecisionAnswer::InterruptResponse { response } => Ok(DecisionAnswer::InterruptResponse {
+        PublicDecisionAnswer::FreeText { text } => {
+            Ok(PrivateDecisionContinuationAnswer::FreeText { text: text.clone() })
+        }
+        PublicDecisionAnswer::InterruptResponse { response } => {
+            Ok(PrivateDecisionContinuationAnswer::InterruptResponse {
             response: private_interrupt_response_for_continuation(response, mappings)?,
-        }),
+            })
+        }
     }
 }
 
@@ -6246,24 +6947,24 @@ fn private_interrupt_response_for_continuation(
     })
 }
 
-fn answer_receipt(source: &str, answer: &DecisionAnswer) -> String {
+fn answer_receipt(source: &str, answer: &PublicDecisionAnswer) -> String {
     // The DB reduces this to a non-reversible marker before its transaction
     // begins. Keeping the source/shape here lets audit code distinguish user,
     // parent, and utility winners without persisting resolver context.
     match answer {
-        DecisionAnswer::Option { id } => serde_json::json!({
+        PublicDecisionAnswer::Option { id } => serde_json::json!({
             "source": source,
             "answer_kind": "option",
             "option_id": id,
         })
         .to_string(),
-        DecisionAnswer::FreeText { text } => serde_json::json!({
+        PublicDecisionAnswer::FreeText { text } => serde_json::json!({
             "source": source,
             "answer_kind": "free_text",
             "answer": text,
         })
         .to_string(),
-        DecisionAnswer::InterruptResponse { response } => serde_json::json!({
+        PublicDecisionAnswer::InterruptResponse { response } => serde_json::json!({
             "source": source,
             "answer_kind": "interrupt_response",
             "response_kind": response_kind(response),
@@ -6272,24 +6973,24 @@ fn answer_receipt(source: &str, answer: &DecisionAnswer) -> String {
     }
 }
 
-fn answer_resume_payload(source: &str, answer: &DecisionAnswer) -> String {
+fn answer_resume_payload(source: &str, answer: &PrivateDecisionContinuationAnswer) -> String {
     // Unlike the public receipt marker, this is daemon-private continuation
     // data. It is validated and retained so an answered decision can resume
     // the requesting agent after a process crash.
     match answer {
-        DecisionAnswer::Option { id } => serde_json::json!({
+        PrivateDecisionContinuationAnswer::Option { id } => serde_json::json!({
             "source": source,
             "answer_kind": "option",
             "option_id": id,
         })
         .to_string(),
-        DecisionAnswer::FreeText { text } => serde_json::json!({
+        PrivateDecisionContinuationAnswer::FreeText { text } => serde_json::json!({
             "source": source,
             "answer_kind": "free_text",
             "answer": text,
         })
         .to_string(),
-        DecisionAnswer::InterruptResponse { response } => serde_json::json!({
+        PrivateDecisionContinuationAnswer::InterruptResponse { response } => serde_json::json!({
             "source": source,
             "answer_kind": "interrupt_response",
             "answer": response,
@@ -6324,4 +7025,52 @@ fn is_safe_option_id(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
         })
+}
+
+/// The AgentTree daemon endpoint exposes only opaque option capabilities.
+/// Validate their canonical form before looking up the durable contract, so a
+/// private continuation identifier cannot accidentally be accepted through a
+/// future broader matching rule.
+fn validate_public_answer_option_tokens(answer: &PublicDecisionAnswer) -> Result<()> {
+    match answer {
+        PublicDecisionAnswer::Option { id } => validate_public_option_token(id),
+        PublicDecisionAnswer::FreeText { .. } => Ok(()),
+        PublicDecisionAnswer::InterruptResponse { response } => {
+            validate_public_interrupt_response_option_tokens(response)
+        }
+    }
+}
+
+fn validate_public_interrupt_response_option_tokens(response: &ResolveResponse) -> Result<()> {
+    match response {
+        ResolveResponse::Single { selected_id } => validate_public_option_token(selected_id),
+        ResolveResponse::Multi { selected_ids } => {
+            for selected_id in selected_ids {
+                validate_public_option_token(selected_id)?;
+            }
+            Ok(())
+        }
+        ResolveResponse::Freetext { .. } | ResolveResponse::Cancel => Ok(()),
+        ResolveResponse::Batch { responses } => {
+            for response in responses {
+                validate_public_interrupt_response_option_tokens(response)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_public_option_token(value: &str) -> Result<()> {
+    let uuid_text = value
+        .strip_prefix("option:")
+        .context("public decision option id is not an opaque daemon token")?;
+    let uuid = Uuid::parse_str(uuid_text).context("public decision option id has an invalid UUID")?;
+    ensure!(
+        !uuid.is_nil()
+            && uuid.get_version_num() == 7
+            && uuid.get_variant() == uuid::Variant::RFC4122
+            && uuid.to_string() == uuid_text,
+        "public decision option id is not a canonical UUIDv7 token"
+    );
+    Ok(())
 }

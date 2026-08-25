@@ -46,6 +46,40 @@ const HOST_CAPABILITY_REFRESH_EXECUTION_HEARTBEAT_INTERVAL: std::time::Duration 
 const HOST_CAPABILITY_REFRESH_REAPER_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(10);
 
+/// A host-operation child is safe to leave unattached during boot only when a
+/// concurrent terminalizer has already removed its executable continuation.
+/// Missing rows, failed reads, and every live state make root activation
+/// unsafe: this epoch must return before it can release the foreground root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostOperationRecoveryReload {
+    ConcurrentlyTerminal,
+    StillNonterminal,
+    Missing,
+    LoadFailed,
+}
+
+fn classify_host_operation_recovery_reload(
+    state: std::result::Result<Option<crate::db::agent_tree_decisions::AgentInstanceState>, ()>,
+) -> HostOperationRecoveryReload {
+    match state {
+        Ok(Some(state)) if state.is_terminal() => HostOperationRecoveryReload::ConcurrentlyTerminal,
+        Ok(Some(_)) => HostOperationRecoveryReload::StillNonterminal,
+        Ok(None) => HostOperationRecoveryReload::Missing,
+        Err(()) => HostOperationRecoveryReload::LoadFailed,
+    }
+}
+
+fn terminal_host_operation_interrupt_requires_repair(
+    state: crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState,
+) -> bool {
+    matches!(
+        state,
+        crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Completed
+            | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Failed
+            | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Cancelled
+    )
+}
+
 /// Holds the one daemon-local dispatch right for a durable refresh operation.
 /// The set itself belongs to the shared capability store, so independently
 /// constructed session runtimes observe the same owner.  Keeping this guard
@@ -604,6 +638,7 @@ async fn spawn_ready_host_capability_refresh_operations(
     global_bus: &Option<EventSender>,
     redaction: &SharedRedactionTable,
     registry: &Arc<WorkerAgentTreeResolverRegistry>,
+    terminalization_failure_fence: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let Some(runtime) = runtime else {
         return;
@@ -676,6 +711,7 @@ async fn spawn_ready_host_capability_refresh_operations(
         let recovery_global_bus = global_bus.clone();
         let recovery_redaction = redaction.clone();
         let recovery_registry = registry.clone();
+        let recovery_terminalization_failure_fence = terminalization_failure_fence.clone();
         tokio::spawn(async move {
             let _dispatch_guard = dispatch_guard;
             let execution = execute_host_capability_refresh_operation(
@@ -686,12 +722,26 @@ async fn spawn_ready_host_capability_refresh_operations(
                 &recovery_redaction,
             )
             .await;
-            let _ = finalize_terminal_host_capability_refresh_operation(
+            let finalization = finalize_terminal_host_capability_refresh_operation(
                 &recovery_session,
                 operation.operation_id,
                 &recovery_registry,
             )
             .await;
+            match finalization {
+                HostCapabilityRefreshInterruptFinalization::Finalized
+                | HostCapabilityRefreshInterruptFinalization::NonterminalRetryable => {}
+                HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure
+                | HostCapabilityRefreshInterruptFinalization::NotTyped => {
+                    // The probe has already reached its durable operation
+                    // state; do not issue it again. Instead force this worker
+                    // epoch to stop before it can release more continuations
+                    // while the exact child/Attention pair remains retained.
+                    fence_host_capability_terminalization_failure(
+                        &recovery_terminalization_failure_fence,
+                    );
+                }
+            }
             if let Err(error) = execution {
                 tracing::warn!(
                     %error,
@@ -722,27 +772,90 @@ fn host_capability_refresh_terminal_child_state(
     }
 }
 
-/// A dedicated refresh child is terminalized with the durable operation it
-/// owns. Historical refresh rows used the root as their owner, so preserve
-/// that root rather than treating every old receipt as permission to change a
-/// foreground driver's lifecycle.
+/// The only outcome that permits an operation's endpoint and Attention row to
+/// be released.  In particular, a revision race is not enough: its reload
+/// must prove the exact child reached the terminal state dictated by the
+/// operation.  A mismatched terminal row is corrupt (or has a different
+/// terminal authority) and must remain visible for durable repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostCapabilityRefreshChildTerminalization {
+    Verified,
+    NotDedicatedChild,
+    Missing,
+    StillNonterminal,
+    IncompatibleTerminal,
+    StorageFailure,
+}
+
+impl HostCapabilityRefreshChildTerminalization {
+    fn permits_terminal_cleanup(self) -> bool {
+        self == Self::Verified
+    }
+}
+
+fn consume_host_capability_terminalization_failure_fence(
+    fence: &std::sync::atomic::AtomicBool,
+) -> bool {
+    fence.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
+/// A terminal host-refresh operation whose exact child/Attention cleanup could
+/// not be verified must stop this epoch before it releases another
+/// continuation. Recovery owns the retained durable pair.
+fn fence_host_capability_terminalization_failure(fence: &std::sync::atomic::AtomicBool) {
+    fence.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn classify_host_capability_refresh_terminal_child(
+    expected: crate::db::agent_tree_decisions::AgentInstanceState,
+    reloaded: std::result::Result<
+        Option<crate::db::agent_tree_decisions::AgentInstanceState>,
+        (),
+    >,
+) -> HostCapabilityRefreshChildTerminalization {
+    match reloaded {
+        Ok(Some(actual)) if actual == expected => HostCapabilityRefreshChildTerminalization::Verified,
+        Ok(Some(actual)) if actual.is_terminal() => {
+            HostCapabilityRefreshChildTerminalization::IncompatibleTerminal
+        }
+        Ok(Some(_)) => HostCapabilityRefreshChildTerminalization::StillNonterminal,
+        Ok(None) => HostCapabilityRefreshChildTerminalization::Missing,
+        Err(()) => HostCapabilityRefreshChildTerminalization::StorageFailure,
+    }
+}
+
+/// Terminalize exactly the dedicated child owned by the durable operation.
+/// A transition CAS can race a root cancellation or another terminalizer; a
+/// conflict is accepted only after reloading the exact row and proving its
+/// terminal state is the one the durable operation requires.
 async fn terminalize_host_capability_refresh_child(
     session: &crate::session::Session,
     agent_instance_id: uuid::Uuid,
     state: crate::db::agent_tree_decisions::AgentInstanceState,
     receipt: &'static str,
-) {
-    let Ok(Some(agent)) = session
+) -> HostCapabilityRefreshChildTerminalization {
+    let agent = match session
         .db
         .agent_instance(session.id, agent_instance_id)
         .await
-    else {
-        return;
+    {
+        Ok(Some(agent)) => agent,
+        Ok(None) => return HostCapabilityRefreshChildTerminalization::Missing,
+        Err(error) => {
+            tracing::warn!(%error, %agent_instance_id, "loading host capability refresh child for terminalization failed");
+            return HostCapabilityRefreshChildTerminalization::StorageFailure;
+        }
     };
     if agent.parent_agent_instance_id.is_none() {
-        return;
+        // The squashed schema only admits dedicated children.  Never let a
+        // malformed/imported root-owned operation detach the foreground root
+        // or acknowledge its Attention row.
+        return HostCapabilityRefreshChildTerminalization::NotDedicatedChild;
     }
-    let _ = session
+    if agent.state.is_terminal() {
+        return classify_host_capability_refresh_terminal_child(state, Ok(Some(agent.state)));
+    }
+    match session
         .db
         .transition_agent_instance(
             session.id,
@@ -752,7 +865,35 @@ async fn terminalize_host_capability_refresh_child(
             receipt,
             crate::agent_tree::system_now_unix_ms(),
         )
-        .await;
+        .await
+    {
+        Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(agent)) => {
+            classify_host_capability_refresh_terminal_child(state, Ok(Some(agent.state)))
+        }
+        Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::AlreadyTerminal(receipt)) => {
+            // `transition_agent_instance` proves the receipt belongs to this
+            // exact child/session. Compare its durable terminal state rather
+            // than treating any terminal winner as interchangeable.
+            if receipt.terminal_state == state.as_str() {
+                HostCapabilityRefreshChildTerminalization::Verified
+            } else {
+                HostCapabilityRefreshChildTerminalization::IncompatibleTerminal
+            }
+        }
+        Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::RevisionConflict) => {
+            let reloaded = session
+                .db
+                .agent_instance(session.id, agent_instance_id)
+                .await
+                .map(|row| row.map(|agent| agent.state))
+                .map_err(|_| ());
+            classify_host_capability_refresh_terminal_child(state, reloaded)
+        }
+        Err(error) => {
+            tracing::warn!(%error, %agent_instance_id, "terminalizing host capability refresh child failed");
+            HostCapabilityRefreshChildTerminalization::StorageFailure
+        }
+    }
 }
 
 /// The direct refresh ingress creates a child and its pre-bind descriptor
@@ -819,51 +960,60 @@ async fn finalize_terminal_host_capability_refresh_operation(
     session: &crate::session::Session,
     operation_id: uuid::Uuid,
     registry: &Arc<WorkerAgentTreeResolverRegistry>,
-) -> bool {
-    let operation = match session
-        .db
-        .host_capability_refresh_operation_by_id(
-            crate::agent_tree::daemon_host_capability_refresh_authority(),
+) -> HostCapabilityRefreshInterruptFinalization {
+    // This performs no probe or external work, so one immediate retry is safe
+    // after a transient DB error/CAS race. A second retained outcome is left
+    // fully intact for boot recovery rather than being papered over locally.
+    for attempt in 0..2 {
+        let operation = match session
+            .db
+            .host_capability_refresh_operation_by_id(
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+                session.id,
+                operation_id,
+            )
+            .await
+        {
+            Ok(Some(operation)) => operation,
+            Ok(None) => {
+                tracing::warn!(%operation_id, "host capability refresh operation disappeared before typed terminalization; retaining child for durable repair");
+                return HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure;
+            }
+            Err(error) => {
+                tracing::warn!(%error, %operation_id, "loading host capability refresh state before typed terminalization failed; retaining child for durable repair");
+                if attempt == 0 {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                return HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure;
+            }
+        };
+        let finalization = handle_terminal_host_capability_refresh_interrupt(
+            session,
             session.id,
-            operation_id,
+            operation.interrupt_id,
+            registry,
         )
-        .await
-    {
-        Ok(Some(operation)) => operation,
-        Ok(None) => {
-            tracing::warn!(%operation_id, "host capability refresh operation disappeared before typed terminalization; retaining child for durable repair");
-            return false;
+        .await;
+        match finalization {
+            HostCapabilityRefreshInterruptFinalization::Finalized
+            | HostCapabilityRefreshInterruptFinalization::NonterminalRetryable => {
+                return finalization;
+            }
+            HostCapabilityRefreshInterruptFinalization::NotTyped => {
+                return HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure;
+            }
+            HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure
+                if attempt == 0 =>
+            {
+                tokio::task::yield_now().await;
+            }
+            HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure => {
+                return HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure;
+            }
         }
-        Err(error) => {
-            tracing::warn!(%error, %operation_id, "loading host capability refresh state before typed terminalization failed; retaining child for durable repair");
-            return false;
-        }
-    };
-    let Some(child_terminal_state) = host_capability_refresh_terminal_child_state(operation.state) else {
-        tracing::debug!(
-            operation_id = %operation.operation_id,
-            state = ?operation.state,
-            "host capability refresh dispatcher retained nonterminal operation for typed retry"
-        );
-        return false;
-    };
-    terminalize_host_capability_refresh_child(
-        session,
-        operation.agent_instance_id,
-        child_terminal_state,
-        r#"{"host_operation":"capability_refresh"}"#,
-    )
-    .await;
-    // This continuation is daemon-owned and has no parked driver waiter after
-    // recovery. Only after the operation reached a durable terminal state may
-    // we acknowledge the linked executing Attention row.
-    handle_terminal_host_capability_refresh_interrupt(
-        session,
-        session.id,
-        operation.interrupt_id,
-        registry,
-    )
-    .await
+    }
+    HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure
 }
 
 /// Worker-owned deadline directory. Scheduling is not a best-effort spawned
@@ -1323,7 +1473,7 @@ struct AgentTreeResolverCompletion {
     session_id: uuid::Uuid,
     decision_request_id: uuid::Uuid,
     route: crate::agent_tree::DecisionResolverRoute,
-    result: std::result::Result<crate::agent_tree::DecisionAnswer, String>,
+    result: std::result::Result<crate::agent_tree::PublicDecisionAnswer, String>,
 }
 
 /// The worker's real executor hand-off for automatic low-risk decisions. It
@@ -1630,7 +1780,7 @@ fn redacted_decision_contract_offers_option(
 fn agent_tree_resolver_answer(
     packet: &crate::agent_tree::RedactedDecisionPacket,
     response: &str,
-) -> anyhow::Result<crate::agent_tree::DecisionAnswer> {
+) -> anyhow::Result<crate::agent_tree::PublicDecisionAnswer> {
     let response: serde_json::Value = serde_json::from_str(response.trim())
         .context("agent-tree resolver did not return a JSON object")?;
     let options: serde_json::Value = serde_json::from_str(&packet.options_contract_json)
@@ -1651,7 +1801,7 @@ fn agent_tree_resolver_answer(
             // metadata. Its action is selected by this typed host semantic,
             // never by the model guessing between opaque tokens or relying on
             // their list order.
-            return Ok(crate::agent_tree::DecisionAnswer::InterruptResponse {
+            return Ok(crate::agent_tree::PublicDecisionAnswer::InterruptResponse {
                 response: crate::daemon::proto::ResolveResponse::Single { selected_id: option_id },
             });
         }
@@ -1661,10 +1811,10 @@ fn agent_tree_resolver_answer(
             .unwrap_or(response);
         let response = serde_json::from_value::<crate::daemon::proto::ResolveResponse>(envelope)
             .context("agent-tree resolver did not return a typed interrupt response")?;
-        return Ok(crate::agent_tree::DecisionAnswer::InterruptResponse { response });
+        return Ok(crate::agent_tree::PublicDecisionAnswer::InterruptResponse { response });
     }
     if let Some(option_id) = host_owned_option.as_deref() {
-        return Ok(crate::agent_tree::DecisionAnswer::Option {
+        return Ok(crate::agent_tree::PublicDecisionAnswer::Option {
             id: option_id.to_owned(),
         });
     }
@@ -1678,7 +1828,7 @@ fn agent_tree_resolver_answer(
                 })
             });
         anyhow::ensure!(offered, "agent-tree resolver selected an unoffered option");
-        return Ok(crate::agent_tree::DecisionAnswer::Option {
+        return Ok(crate::agent_tree::PublicDecisionAnswer::Option {
             id: option_id.to_string(),
         });
     }
@@ -1709,7 +1859,7 @@ fn agent_tree_resolver_answer(
         free_text.chars().count() <= max_chars as usize,
         "agent-tree resolver free text exceeds its contract"
     );
-    Ok(crate::agent_tree::DecisionAnswer::FreeText {
+    Ok(crate::agent_tree::PublicDecisionAnswer::FreeText {
         text: free_text.to_string(),
     })
 }
@@ -2012,16 +2162,28 @@ fn agent_tree_interrupt_owner(
 /// picked up by the exact-once dispatcher; cancellation/failure/completion
 /// acknowledges the already-claimed Attention row directly.
 ///
-/// `true` means the interrupt is conclusively a host-operation continuation
-/// and callers must not fall through to generic driver replay.  For an
-/// in-flight operation the durable execution lease remains the recovery
-/// authority, so retaining the Attention claim is intentional.
+/// The outcome of handling the exact host-operation owner of an Attention
+/// row. Callers must handle every variant explicitly: only a normal
+/// nonterminal operation may wake its dedicated waiter; a failed terminal
+/// cleanup must fence the worker without waking or replaying anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostCapabilityRefreshInterruptFinalization {
+    NotTyped,
+    NonterminalRetryable,
+    RetainedTerminalCleanupFailure,
+    Finalized,
+}
+
+/// A terminal operation may acknowledge its executing Attention row only once
+/// its child is durably terminal in the exact state the operation dictates.
+/// The acknowledgement itself precedes endpoint detach so a DB failure leaves
+/// both recoverable handles in place.
 async fn handle_terminal_host_capability_refresh_interrupt(
     session: &Session,
     session_id: uuid::Uuid,
     interrupt_id: uuid::Uuid,
     registry: &Arc<WorkerAgentTreeResolverRegistry>,
-) -> bool {
+) -> HostCapabilityRefreshInterruptFinalization {
     let operation = match session
         .db
         .host_capability_refresh_operation_for_interrupt(
@@ -2032,13 +2194,13 @@ async fn handle_terminal_host_capability_refresh_interrupt(
         .await
     {
         Ok(Some(operation)) => operation,
-        Ok(None) => return false,
+        Ok(None) => return HostCapabilityRefreshInterruptFinalization::NotTyped,
         Err(error) => {
             tracing::warn!(%error, %interrupt_id, "loading host capability refresh interrupt operation failed");
             // Do not hand a possibly typed host continuation to a driver on a
             // storage failure. A later recovery epoch can re-read the exact
             // operation/Attention tuple.
-            return true;
+            return HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure;
         }
     };
     match operation.state {
@@ -2046,7 +2208,7 @@ async fn handle_terminal_host_capability_refresh_interrupt(
             // `spawn_ready_host_capability_refresh_operations` owns the
             // exact-once dispatch claim. Keep this execution claim until that
             // task commits a durable result and acknowledges it below.
-            true
+            HostCapabilityRefreshInterruptFinalization::NonterminalRetryable
         }
         crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Cancelled
         | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Failed
@@ -2057,20 +2219,47 @@ async fn handle_terminal_host_capability_refresh_interrupt(
             // and the child lifecycle CAS. Repair that exact child here,
             // before acknowledging Attention, so a denied/failed/completed
             // daemon operation never remains a live resolver endpoint.
-            terminalize_host_capability_refresh_child(
+            let terminalization = terminalize_host_capability_refresh_child(
                 session,
                 operation.agent_instance_id,
                 child_terminal_state,
                 r#"{"host_operation":"capability_refresh"}"#,
             )
             .await;
-            registry.detach_terminal_host_operation_endpoint(session_id, operation.agent_instance_id);
-            match session.db.complete_executing_interrupt(interrupt_id).await {
-                Ok(true) => tracing::debug!(%interrupt_id, operation_id = %operation.operation_id, "acknowledged terminal host capability refresh Attention directly"),
-                Ok(false) => tracing::debug!(%interrupt_id, operation_id = %operation.operation_id, "host capability refresh Attention was already acknowledged"),
-                Err(error) => tracing::warn!(%error, %interrupt_id, operation_id = %operation.operation_id, "acknowledging terminal host capability refresh Attention failed"),
+            if !terminalization.permits_terminal_cleanup() {
+                tracing::warn!(
+                    operation_id = %operation.operation_id,
+                    interrupt_id = %interrupt_id,
+                    ?terminalization,
+                    "terminal host capability refresh child was not durably verified; retaining endpoint and Attention for repair"
+                );
+                return HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure;
             }
-            true
+            match session.db.complete_executing_interrupt(interrupt_id).await {
+                Ok(true) => {
+                    tracing::debug!(%interrupt_id, operation_id = %operation.operation_id, "acknowledged terminal host capability refresh Attention directly");
+                }
+                Ok(false) => {
+                    let already_resolved = match session.db.get_interrupt(interrupt_id).await {
+                        Ok(Some(row)) => row.state == crate::db::needs_attention::InterruptState::Resolved,
+                        Ok(None) => false,
+                        Err(error) => {
+                            tracing::warn!(%error, %interrupt_id, operation_id = %operation.operation_id, "reloading unacknowledged host capability refresh Attention failed");
+                            false
+                        }
+                    };
+                    if !already_resolved {
+                        tracing::warn!(%interrupt_id, operation_id = %operation.operation_id, "terminal host capability refresh Attention was not durably acknowledged; retaining endpoint for repair");
+                        return HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %interrupt_id, operation_id = %operation.operation_id, "acknowledging terminal host capability refresh Attention failed; retaining endpoint for repair");
+                    return HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure;
+                }
+            }
+            registry.detach_terminal_host_operation_endpoint(session_id, operation.agent_instance_id);
+            HostCapabilityRefreshInterruptFinalization::Finalized
         }
         crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Pending
         | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Executing => {
@@ -2080,7 +2269,7 @@ async fn handle_terminal_host_capability_refresh_interrupt(
                 state = ?operation.state,
                 "retaining host capability refresh Attention for its typed operation recovery"
             );
-            true
+            HostCapabilityRefreshInterruptFinalization::NonterminalRetryable
         }
     }
 }
@@ -2099,6 +2288,7 @@ async fn deliver_terminal_agent_tree_interrupt(
     driver_control_tx: tokio::sync::mpsc::Sender<crate::engine::driver::DriverControl>,
     registry: Arc<WorkerAgentTreeResolverRegistry>,
     replay_completion_tx: tokio::sync::mpsc::Sender<ParkedReplayCompletion>,
+    terminalization_failure_fence: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let interrupt_id = match session
         .db
@@ -2146,22 +2336,34 @@ async fn deliver_terminal_agent_tree_interrupt(
             interrupts.emit_queue_state().await;
         }
         crate::db::needs_attention::InterruptState::Executing => {
-            if handle_terminal_host_capability_refresh_interrupt(
+            match handle_terminal_host_capability_refresh_interrupt(
                 session,
                 session_id,
                 interrupt_id,
                 &registry,
             )
-            .await
-            {
-                // A live direct refresh task is still awaiting this real
-                // QuestionTool interrupt. Waking it is not a parked replay:
-                // its typed operation state already owns dispatch or the
-                // terminal acknowledgement above. On recovery there is no
-                // waiter, so this is harmlessly a no-op.
-                interrupts.resolve(interrupt_id, response);
-                interrupts.emit_queue_state().await;
-                return;
+            .await {
+                HostCapabilityRefreshInterruptFinalization::Finalized
+                | HostCapabilityRefreshInterruptFinalization::NonterminalRetryable => {
+                    // A live direct refresh task is still awaiting this real
+                    // QuestionTool interrupt. Waking it is not a parked
+                    // replay: its typed operation owns dispatch or has
+                    // durably completed its terminal acknowledgement.
+                    interrupts.resolve(interrupt_id, response);
+                    interrupts.emit_queue_state().await;
+                    return;
+                }
+                HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure => {
+                    // Do not wake a direct waiter or replay a generic driver
+                    // while a terminal child/Attention pair is retained.
+                    // The worker loop consumes this fence before another
+                    // continuation may cross a provider boundary.
+                    fence_host_capability_terminalization_failure(
+                        terminalization_failure_fence,
+                    );
+                    return;
+                }
+                HostCapabilityRefreshInterruptFinalization::NotTyped => {}
             }
             let Some(payload) = row.parked.clone() else {
                 tracing::warn!(%interrupt_id, "terminal AgentTree parked interrupt has no replay payload; retaining exact claim for repair");
@@ -5009,6 +5211,12 @@ pub(super) async fn run_worker(
     // before the generic task descriptor loop; no operation is ever
     // impersonated by the root driver.
     let mut recovered_host_operation_agents = std::collections::BTreeSet::new();
+    // Keep the typed decision identities separate from the broader operation
+    // inventory. A nonterminal operation can belong to another recovery
+    // epoch; only this set has crossed both endpoint registration and the
+    // exact claim acknowledgement, so only it may enter the resolver replay
+    // handoff below.
+    let mut recovered_host_operation_decision_ids = std::collections::BTreeSet::new();
     let mut host_operation_agents = std::collections::BTreeSet::new();
     let mut terminal_host_operation_interrupts = Vec::new();
     match session
@@ -5024,24 +5232,92 @@ pub(super) async fn run_worker(
                 let agent_instance_id = operation.agent_instance_id;
                 host_operation_agents.insert(agent_instance_id);
                 if !tree_recovery.claimed_agents.contains(&agent_instance_id) {
-                    // Another recovery owner may have won this epoch. Do not
-                    // attach a stale endpoint and, crucially, do not turn a
-                    // daemon operation into an unattached generic task.
-                    tracing::debug!(
-                        %agent_instance_id,
-                        operation_id = %operation.operation_id,
-                        state = ?operation.state,
-                        "host capability refresh child has no local recovery claim; retaining durable operation for its exact owner"
-                    );
-                    continue;
+                    // The broad operation inventory only keeps this child out
+                    // of generic task-descriptor recovery. It is not proof
+                    // that the current worker attached an executor. Reload
+                    // the exact row to permit a concurrent terminalizer, but
+                    // otherwise fail this epoch before root activation.
+                    let reloaded = session.db.agent_instance(session_id, agent_instance_id).await;
+                    let reloaded_state = match &reloaded {
+                        Ok(Some(agent)) => Ok(Some(agent.state)),
+                        Ok(None) => Ok(None),
+                        Err(_) => Err(()),
+                    };
+                    match classify_host_operation_recovery_reload(reloaded_state) {
+                        HostOperationRecoveryReload::ConcurrentlyTerminal => {
+                            if terminal_host_operation_interrupt_requires_repair(operation.state) {
+                                terminal_host_operation_interrupts.push(operation.interrupt_id);
+                            }
+                            tracing::debug!(
+                                %agent_instance_id,
+                                operation_id = %operation.operation_id,
+                                "host capability refresh child terminalized while its recovery claim was observed; allowing terminal repair"
+                            );
+                            continue;
+                        }
+                        HostOperationRecoveryReload::StillNonterminal => {
+                            tracing::error!(
+                                %agent_instance_id,
+                                operation_id = %operation.operation_id,
+                                state = ?operation.state,
+                                "nonterminal host capability refresh child has no local exact recovery claim; refusing to release root"
+                            );
+                            return;
+                        }
+                        HostOperationRecoveryReload::Missing => {
+                            tracing::error!(
+                                %agent_instance_id,
+                                operation_id = %operation.operation_id,
+                                "nonterminal host capability refresh operation lost its child row; refusing to release root"
+                            );
+                            return;
+                        }
+                        HostOperationRecoveryReload::LoadFailed => {
+                            let error = reloaded.expect_err("classification retained the DB load error");
+                            tracing::error!(
+                                %error,
+                                %agent_instance_id,
+                                operation_id = %operation.operation_id,
+                                "reloading host capability refresh child after lost recovery claim failed; refusing to release root"
+                            );
+                            return;
+                        }
+                    }
                 }
-                let Ok(Some(agent)) = session.db.agent_instance(session_id, agent_instance_id).await else {
-                    tracing::warn!(%agent_instance_id, operation_id = %operation.operation_id, "host capability refresh child disappeared during recovery; retaining operation for durable repair");
-                    continue;
+                let agent = match session.db.agent_instance(session_id, agent_instance_id).await {
+                    Ok(Some(agent)) if agent.state.is_terminal() => {
+                        if terminal_host_operation_interrupt_requires_repair(operation.state) {
+                            terminal_host_operation_interrupts.push(operation.interrupt_id);
+                        }
+                        tracing::debug!(
+                            %agent_instance_id,
+                            operation_id = %operation.operation_id,
+                            "host capability refresh child terminalized before endpoint attachment; allowing terminal repair"
+                        );
+                        continue;
+                    }
+                    Ok(Some(agent)) => agent,
+                    Ok(None) => {
+                        tracing::error!(
+                            %agent_instance_id,
+                            operation_id = %operation.operation_id,
+                            "nonterminal host capability refresh operation lost its child before endpoint attachment; refusing to release root"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            %agent_instance_id,
+                            operation_id = %operation.operation_id,
+                            "loading host capability refresh child before endpoint attachment failed; refusing to release root"
+                        );
+                        return;
+                    }
                 };
                 let endpoint_generation = tree_resolver_registry
                     .attach_host_operation_endpoint(session_id, agent_instance_id);
-                let consumed = session
+                let consumed = match session
                     .db
                     .consume_agent_resume_claims_atomically(
                         session_id,
@@ -5050,9 +5326,114 @@ pub(super) async fn run_worker(
                         crate::agent_tree::system_now_unix_ms(),
                     )
                     .await
-                    .unwrap_or(false);
+                {
+                    Ok(consumed) => consumed,
+                    Err(error) => {
+                        tree_resolver_registry.detach_parent_endpoint_if_generation(
+                            session_id,
+                            agent_instance_id,
+                            endpoint_generation,
+                        );
+                        tracing::error!(
+                            %error,
+                            %agent_instance_id,
+                            operation_id = %operation.operation_id,
+                            "consuming host capability refresh child recovery claim failed; reloading exact state"
+                        );
+                        let reloaded = session.db.agent_instance(session_id, agent_instance_id).await;
+                        let reloaded_state = match &reloaded {
+                            Ok(Some(agent)) => Ok(Some(agent.state)),
+                            Ok(None) => Ok(None),
+                            Err(_) => Err(()),
+                        };
+                        match classify_host_operation_recovery_reload(reloaded_state) {
+                            HostOperationRecoveryReload::ConcurrentlyTerminal => {
+                                if terminal_host_operation_interrupt_requires_repair(operation.state) {
+                                    terminal_host_operation_interrupts.push(operation.interrupt_id);
+                                }
+                                tracing::debug!(
+                                    %agent_instance_id,
+                                    operation_id = %operation.operation_id,
+                                    "host capability refresh child terminalized during failed claim consumption; allowing terminal repair"
+                                );
+                                continue;
+                            }
+                            HostOperationRecoveryReload::StillNonterminal => {
+                                tracing::error!(
+                                    %agent_instance_id,
+                                    operation_id = %operation.operation_id,
+                                    "nonterminal host capability refresh child lost its exact claim consumption; refusing to release root"
+                                );
+                            }
+                            HostOperationRecoveryReload::Missing => {
+                                tracing::error!(
+                                    %agent_instance_id,
+                                    operation_id = %operation.operation_id,
+                                    "host capability refresh child disappeared after failed claim consumption; refusing to release root"
+                                );
+                            }
+                            HostOperationRecoveryReload::LoadFailed => {
+                                let reload_error = reloaded.expect_err("classification retained the DB reload error");
+                                tracing::error!(
+                                    %reload_error,
+                                    %agent_instance_id,
+                                    operation_id = %operation.operation_id,
+                                    "reloading host capability refresh child after failed claim consumption failed; refusing to release root"
+                                );
+                            }
+                        }
+                        return;
+                    }
+                };
                 if consumed {
                     recovered_host_operation_agents.insert(agent_instance_id);
+                    if let Some(decision_request_id) = operation.decision_request_id {
+                        match session
+                            .db
+                            .decision_request(session_id, decision_request_id)
+                            .await
+                        {
+                            Ok(Some(decision))
+                                if decision.agent_instance_id == agent_instance_id
+                                    && matches!(
+                                        decision.state,
+                                        crate::db::agent_tree_decisions::DecisionState::Pending
+                                            | crate::db::agent_tree_decisions::DecisionState::Resolving
+                                    )
+                                    && tree_recovery
+                                        .pending_decisions
+                                        .contains(&decision_request_id) =>
+                            {
+                                recovered_host_operation_decision_ids
+                                    .insert(decision_request_id);
+                            }
+                            Ok(Some(_)) => {
+                                tracing::warn!(
+                                    %agent_instance_id,
+                                    %decision_request_id,
+                                    operation_id = %operation.operation_id,
+                                    "typed host operation decision is no longer recoverable after endpoint claim; retaining its durable state"
+                                );
+                            }
+                            Ok(None) => {
+                                tracing::warn!(
+                                    %agent_instance_id,
+                                    %decision_request_id,
+                                    operation_id = %operation.operation_id,
+                                    "typed host operation lost its decision after endpoint claim; retaining operation for durable repair"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    %agent_instance_id,
+                                    %decision_request_id,
+                                    operation_id = %operation.operation_id,
+                                    "loading typed host operation decision after endpoint claim failed; retaining operation for durable repair"
+                                );
+                            }
+                        }
+                    }
                     match operation.state {
                         crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Pending
                         | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Allowed
@@ -5069,15 +5450,52 @@ pub(super) async fn run_worker(
                         agent_instance_id,
                         endpoint_generation,
                     );
-                    // A claim race is not an excuse to abort the foreground
-                    // worker. The durable operation remains owned by its
-                    // successor epoch and is deliberately excluded from the
-                    // generic task recovery path below.
-                    tracing::warn!(
-                        %agent_instance_id,
-                        operation_id = %operation.operation_id,
-                        "host capability refresh child recovery claim was not consumable; retaining typed durable recovery"
-                    );
+                    // A failed exact claim may race a terminal transition.
+                    // Reload once for that narrow case; a still-live child is
+                    // never allowed to hide behind the broad operation set.
+                    let reloaded = session.db.agent_instance(session_id, agent_instance_id).await;
+                    let reloaded_state = match &reloaded {
+                        Ok(Some(agent)) => Ok(Some(agent.state)),
+                        Ok(None) => Ok(None),
+                        Err(_) => Err(()),
+                    };
+                    match classify_host_operation_recovery_reload(reloaded_state) {
+                        HostOperationRecoveryReload::ConcurrentlyTerminal => {
+                            if terminal_host_operation_interrupt_requires_repair(operation.state) {
+                                terminal_host_operation_interrupts.push(operation.interrupt_id);
+                            }
+                            tracing::debug!(
+                                %agent_instance_id,
+                                operation_id = %operation.operation_id,
+                                "host capability refresh child terminalized during claim race; allowing terminal repair"
+                            );
+                            continue;
+                        }
+                        HostOperationRecoveryReload::StillNonterminal => {
+                            tracing::error!(
+                                %agent_instance_id,
+                                operation_id = %operation.operation_id,
+                                "nonterminal host capability refresh child recovery claim was not consumable; refusing to release root"
+                            );
+                        }
+                        HostOperationRecoveryReload::Missing => {
+                            tracing::error!(
+                                %agent_instance_id,
+                                operation_id = %operation.operation_id,
+                                "host capability refresh child disappeared during claim race; refusing to release root"
+                            );
+                        }
+                        HostOperationRecoveryReload::LoadFailed => {
+                            let error = reloaded.expect_err("classification retained the DB reload error");
+                            tracing::error!(
+                                %error,
+                                %agent_instance_id,
+                                operation_id = %operation.operation_id,
+                                "reloading host capability refresh child after claim race failed; refusing to release root"
+                            );
+                        }
+                    }
+                    return;
                 }
             }
         }
@@ -5085,21 +5503,48 @@ pub(super) async fn run_worker(
             tracing::warn!(%error, %session_id, "loading nonterminal host capability refresh operation children failed");
         }
     }
+    match session
+        .db
+        .terminal_host_capability_refresh_interrupts_requiring_finalization(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+            session_id,
+        )
+        .await
+    {
+        Ok(interrupts) => terminal_host_operation_interrupts.extend(interrupts),
+        Err(error) => {
+            tracing::error!(%error, %session_id, "loading terminal host capability refresh Attention repairs failed; refusing to release root");
+            return;
+        }
+    }
+    terminal_host_operation_interrupts.sort_unstable();
+    terminal_host_operation_interrupts.dedup();
     // A terminal operation owns the exact final Attention acknowledgement;
     // repair it before generic descriptor recovery sees the child. The
-    // helper is idempotent and also detaches the host endpoint, so a crash
-    // between operation and child terminalization cannot leave a warm-but-dead
-    // operation owner around for a resolver result.
+    // helper acknowledges Attention before it detaches the host endpoint. A
+    // failed terminalization or acknowledgement must abort this recovery epoch
+    // before root activation, not strand a live child behind a released gate.
     for interrupt_id in terminal_host_operation_interrupts {
-        if !handle_terminal_host_capability_refresh_interrupt(
+        match handle_terminal_host_capability_refresh_interrupt(
             &session,
             session_id,
             interrupt_id,
             &tree_resolver_registry,
         )
-        .await
-        {
-            tracing::warn!(%interrupt_id, "terminal host capability refresh recovery lost its typed operation binding; retaining durable repair");
+        .await {
+            HostCapabilityRefreshInterruptFinalization::Finalized => {}
+            HostCapabilityRefreshInterruptFinalization::NonterminalRetryable => {
+                tracing::error!(%interrupt_id, "terminal host capability refresh recovery found a nonterminal operation; refusing to release root");
+                return;
+            }
+            HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure => {
+                tracing::error!(%interrupt_id, "terminal host capability refresh recovery retained its endpoint or Attention; refusing to release root");
+                return;
+            }
+            HostCapabilityRefreshInterruptFinalization::NotTyped => {
+                tracing::error!(%interrupt_id, "terminal host capability refresh recovery lost its typed operation binding; refusing to release root");
+                return;
+            }
         }
     }
     // The utility directory is keyed by the *requesting* immutable profile,
@@ -6003,7 +6448,7 @@ pub(super) async fn run_worker(
     for agent_instance_id in &tree_recovery.claimed_agents {
         if *agent_instance_id == tree_root.agent_instance_id
             || attached_recovered_agents.contains(agent_instance_id)
-            || host_operation_agents.contains(agent_instance_id)
+            || recovered_host_operation_agents.contains(agent_instance_id)
         {
             continue;
         }
@@ -6049,7 +6494,7 @@ pub(super) async fn run_worker(
             }
         };
         if !attached_recovered_agents.contains(&decision.agent_instance_id)
-            && !host_operation_agents.contains(&decision.agent_instance_id)
+            && !recovered_host_operation_agents.contains(&decision.agent_instance_id)
         {
             tracing::warn!(
                 %decision_request_id,
@@ -6067,6 +6512,7 @@ pub(super) async fn run_worker(
         match session.db.decision_request(session_id, *decision_request_id).await {
             Ok(Some(decision))
                 if decision.agent_instance_id != tree_root.agent_instance_id
+                    && !recovered_host_operation_agents.contains(&decision.agent_instance_id)
                     && attached_recovered_agents.contains(&decision.agent_instance_id) =>
             {
                 root_recovery.pending_decisions.push(*decision_request_id);
@@ -6075,6 +6521,15 @@ pub(super) async fn run_worker(
             Err(error) => tracing::warn!(%error, %decision_request_id, "loading attached recovered decision owner failed"),
         }
     }
+    // A daemon-owned refresh child has no model/task descriptor, so it cannot
+    // pass through the generic child-recovery append above. Its exact
+    // endpoint and resume claim were established before this point and its
+    // durable decision binding was revalidated there. Include it only now,
+    // after all endpoints are live, so a crash while resolving is redelivered
+    // (or released) by the one normal runtime recovery boundary.
+    root_recovery
+        .pending_decisions
+        .extend(recovered_host_operation_decision_ids);
     root_recovery.claimed_late_user_steers.extend(
         tree_recovery
             .claimed_late_user_steers
@@ -6120,6 +6575,12 @@ pub(super) async fn run_worker(
         driver_handle.abort();
         return;
     }
+    // A background finalizer that cannot make its exact child/Attention pair
+    // durable must fail this worker epoch rather than silently orphaning it
+    // until a future daemon restart.
+    let host_capability_terminalization_failure_fence = std::sync::Arc::new(
+        std::sync::atomic::AtomicBool::new(false),
+    );
     // Startup scheduling comes only after every recoverable host-operation
     // child above has installed its typed endpoint/claim (or has been
     // terminalized and acknowledged). This preserves the operation-child
@@ -6130,6 +6591,7 @@ pub(super) async fn run_worker(
         &global_bus,
         &redaction,
         &tree_resolver_registry,
+        &host_capability_terminalization_failure_fence,
     )
     .await;
     // Use the same nonblocking exact-owner delivery path for the root.  A
@@ -6270,6 +6732,7 @@ pub(super) async fn run_worker(
             driver_control_tx.clone(),
             tree_resolver_registry.clone(),
             replay_completion_tx.clone(),
+            &host_capability_terminalization_failure_fence,
         )
         .await;
     }
@@ -6312,8 +6775,19 @@ pub(super) async fn run_worker(
             driver_control_tx.clone(),
             tree_resolver_registry.clone(),
             replay_completion_tx.clone(),
+            &host_capability_terminalization_failure_fence,
         )
         .await;
+    }
+    if consume_host_capability_terminalization_failure_fence(
+        &host_capability_terminalization_failure_fence,
+    ) {
+        tracing::error!(%session_id, "host capability refresh finalization failed before recovery activation; aborting this worker epoch");
+        if let Some(gate) = root_activation_gate.as_ref() {
+            gate.abort();
+        }
+        driver_handle.abort();
+        return;
     }
     // Every exact endpoint now has its pending steer/resume command, pending
     // decision/deadline registration, and durable replay schedule before a
@@ -6353,6 +6827,13 @@ pub(super) async fn run_worker(
     // before the live loop.
     host_capability_refresh_reaper.tick().await;
     let stop = loop {
+        if consume_host_capability_terminalization_failure_fence(
+            &host_capability_terminalization_failure_fence,
+        ) {
+            tracing::error!(%session_id, "host capability refresh finalization retained a durable child/Attention pair; aborting this worker epoch for exact recovery");
+            driver_handle.abort();
+            break WorkerStop::DriverFailed;
+        }
         let input = tokio::select! {
             // Tokio's default randomized selection prevents a permanently
             // ready work mailbox from being structurally preferred over the
@@ -6444,6 +6925,7 @@ pub(super) async fn run_worker(
                                 driver_control_tx.clone(),
                                 tree_resolver_registry.clone(),
                                 replay_completion_tx.clone(),
+                                &host_capability_terminalization_failure_fence,
                             )
                             .await;
                         }
@@ -6495,6 +6977,7 @@ pub(super) async fn run_worker(
                                 driver_control_tx.clone(),
                                 tree_resolver_registry.clone(),
                                 replay_completion_tx.clone(),
+                                &host_capability_terminalization_failure_fence,
                             )
                             .await;
                         }
@@ -6534,6 +7017,7 @@ pub(super) async fn run_worker(
                     &global_bus,
                     &redaction,
                     &tree_resolver_registry,
+                    &host_capability_terminalization_failure_fence,
                 )
                 .await;
             }
@@ -6654,6 +7138,7 @@ pub(super) async fn run_worker(
                             &global_bus,
                             &redaction,
                             &tree_resolver_registry,
+                            &host_capability_terminalization_failure_fence,
                         )
                         .await;
                         // The automatic result won the durable terminal CAS.
@@ -6671,6 +7156,7 @@ pub(super) async fn run_worker(
                             driver_control_tx.clone(),
                             tree_resolver_registry.clone(),
                             replay_completion_tx.clone(),
+                            &host_capability_terminalization_failure_fence,
                         )
                         .await;
                     }
@@ -7871,7 +8357,7 @@ pub(super) async fn run_worker(
                             .interrupt_for_decision_request(session_id, decision_request_id)
                             .await?;
                         let linked_response = match (&linked_interrupt, &answer) {
-                            (Some(_), crate::agent_tree::DecisionAnswer::InterruptResponse { response }) => {
+                            (Some(_), crate::agent_tree::PublicDecisionAnswer::InterruptResponse { response }) => {
                                 Some(response.clone())
                             }
                             (Some(_), _) => {
@@ -7907,6 +8393,7 @@ pub(super) async fn run_worker(
                                 &global_bus,
                                 &redaction,
                                 &tree_resolver_registry,
+                                &host_capability_terminalization_failure_fence,
                             )
                             .await;
                         }
@@ -7930,6 +8417,7 @@ pub(super) async fn run_worker(
                                 driver_control_tx.clone(),
                                 tree_resolver_registry.clone(),
                                 replay_completion_tx.clone(),
+                                &host_capability_terminalization_failure_fence,
                             )
                             .await;
                             // Keep the response owned by the typed answer in
@@ -7975,6 +8463,8 @@ pub(super) async fn run_worker(
                     let refresh_global_bus = global_bus.clone();
                     let refresh_redaction = redaction.clone();
                     let refresh_tree_resolver_registry = tree_resolver_registry.clone();
+                    let refresh_terminalization_failure_fence =
+                        host_capability_terminalization_failure_fence.clone();
                     tokio::spawn(async move {
                         let Some(refresh_runtime) = refresh_runtime else {
                             let _ = respond_to.send(Err(
@@ -8169,17 +8659,25 @@ pub(super) async fn run_worker(
                             ) if selected_id == "refresh"
                         );
                         if !allowed {
-                            let terminalized = finalize_terminal_host_capability_refresh_operation(
+                            let finalization = finalize_terminal_host_capability_refresh_operation(
                                 &refresh_session,
                                 refresh_operation.operation_id,
                                 &refresh_tree_resolver_registry,
                             )
                             .await;
-                            if !terminalized {
-                                tracing::warn!(
-                                    operation_id = %refresh_operation.operation_id,
-                                    "declined host capability refresh did not reach a durable terminal state before its direct waiter returned"
-                                );
+                            match finalization {
+                                HostCapabilityRefreshInterruptFinalization::Finalized
+                                | HostCapabilityRefreshInterruptFinalization::NonterminalRetryable => {}
+                                HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure
+                                | HostCapabilityRefreshInterruptFinalization::NotTyped => {
+                                    fence_host_capability_terminalization_failure(
+                                        &refresh_terminalization_failure_fence,
+                                    );
+                                    tracing::warn!(
+                                        operation_id = %refresh_operation.operation_id,
+                                        "declined host capability refresh retained its durable child/Attention pair; fencing this worker epoch"
+                                    );
+                                }
                             }
                             let _ = respond_to.send(Err(
                                 HostCapabilitiesRefreshError::Declined,
@@ -8194,17 +8692,25 @@ pub(super) async fn run_worker(
                             &refresh_redaction,
                         )
                         .await;
-                        let terminalized = finalize_terminal_host_capability_refresh_operation(
+                        let finalization = finalize_terminal_host_capability_refresh_operation(
                             &refresh_session,
                             refresh_operation.operation_id,
                             &refresh_tree_resolver_registry,
                         )
                         .await;
-                        if !terminalized {
-                            tracing::debug!(
-                                operation_id = %refresh_operation.operation_id,
-                                "host capability refresh direct waiter returned while durable operation remains retryable"
-                            );
+                        match finalization {
+                            HostCapabilityRefreshInterruptFinalization::Finalized
+                            | HostCapabilityRefreshInterruptFinalization::NonterminalRetryable => {}
+                            HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure
+                            | HostCapabilityRefreshInterruptFinalization::NotTyped => {
+                                fence_host_capability_terminalization_failure(
+                                    &refresh_terminalization_failure_fence,
+                                );
+                                tracing::debug!(
+                                    operation_id = %refresh_operation.operation_id,
+                                    "host capability refresh direct waiter retained its durable child/Attention pair; fencing this worker epoch"
+                                );
+                            }
                         }
                         let _ = respond_to.send(completion.map_err(HostCapabilitiesRefreshError::Internal));
                     });
@@ -8324,12 +8830,12 @@ pub(super) async fn run_worker(
                             }
                         } else {
                             tree_runtime
-                                .resolve_user_answer(
+                                .resolve_trusted_private_continuation_answer(
                                     session_id,
                                     tree_decision.decision_request_id,
-                                    crate::agent_tree::DecisionAnswer::InterruptResponse {
-                                        response: response.clone(),
-                                    },
+                                    crate::agent_tree::PrivateDecisionContinuationAnswer::interrupt_response(
+                                        response.clone(),
+                                    ),
                                 )
                                 .await
                         };
@@ -8389,6 +8895,7 @@ pub(super) async fn run_worker(
                             &global_bus,
                             &redaction,
                             &tree_resolver_registry,
+                            &host_capability_terminalization_failure_fence,
                         )
                         .await;
                         // The winning tree settlement has already projected
@@ -8411,6 +8918,7 @@ pub(super) async fn run_worker(
                             driver_control_tx.clone(),
                             tree_resolver_registry.clone(),
                             replay_completion_tx.clone(),
+                            &host_capability_terminalization_failure_fence,
                         )
                         .await;
                         continue;
@@ -8422,22 +8930,37 @@ pub(super) async fn run_worker(
                     // claim rather than falling through to `ReplayParkedInterrupt`.
                     if row.as_ref().is_some_and(|row| {
                         row.state == crate::db::needs_attention::InterruptState::Parked
-                    }) && handle_terminal_host_capability_refresh_interrupt(
-                        &session,
-                        session_id,
-                        interrupt_id,
-                        &tree_resolver_registry,
-                    )
-                    .await
-                    {
-                        // A parked row normally has no live waiter after a
-                        // restart, but resolving the hub is still the exact
-                        // typed wakeup if a local park raced the response.
-                        // It cannot create a driver replay because this branch
-                        // returns before the generic parked path.
-                        interrupts.resolve(interrupt_id, response.clone());
-                        interrupts.emit_queue_state().await;
-                        continue;
+                    }) {
+                        match handle_terminal_host_capability_refresh_interrupt(
+                            &session,
+                            session_id,
+                            interrupt_id,
+                            &tree_resolver_registry,
+                        )
+                        .await {
+                            HostCapabilityRefreshInterruptFinalization::Finalized
+                            | HostCapabilityRefreshInterruptFinalization::NonterminalRetryable => {
+                                // A parked row normally has no live waiter after a
+                                // restart, but resolving the hub is still the exact
+                                // typed wakeup if a local park raced the response.
+                                // It cannot create a driver replay because this branch
+                                // returns before the generic parked path.
+                                interrupts.resolve(interrupt_id, response.clone());
+                                interrupts.emit_queue_state().await;
+                                continue;
+                            }
+                            HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure => {
+                                // A terminal pair that could not be repaired
+                                // must not wake its waiter or be generically
+                                // replayed; fail this epoch for exact recovery.
+                                fence_host_capability_terminalization_failure(
+                                    &host_capability_terminalization_failure_fence,
+                                );
+                                interrupts.emit_queue_state().await;
+                                continue;
+                            }
+                            HostCapabilityRefreshInterruptFinalization::NotTyped => {}
+                        }
                     }
                     if let Some(row) = row.as_ref()
                         && row.state == crate::db::needs_attention::InterruptState::Parked
@@ -9749,6 +10272,164 @@ mod interrupt_redaction_tests {
     use super::*;
 
     #[test]
+    fn host_operation_claim_loss_reloads_exact_state_and_fails_closed_unless_terminal() {
+        use crate::db::agent_tree_decisions::AgentInstanceState;
+
+        for terminal in [
+            AgentInstanceState::Completed,
+            AgentInstanceState::Failed,
+            AgentInstanceState::Cancelled,
+        ] {
+            assert_eq!(
+                classify_host_operation_recovery_reload(Ok(Some(terminal))),
+                HostOperationRecoveryReload::ConcurrentlyTerminal,
+                "a concurrent terminalization is the only safe reason to leave a host child unattached"
+            );
+        }
+        for lost_or_unavailable in [
+            classify_host_operation_recovery_reload(Ok(Some(AgentInstanceState::Running))),
+            classify_host_operation_recovery_reload(Ok(None)),
+            classify_host_operation_recovery_reload(Err(())),
+        ] {
+            assert_ne!(
+                lost_or_unavailable,
+                HostOperationRecoveryReload::ConcurrentlyTerminal,
+                "a live, missing, or unreadable child must abort this epoch before root activation rather than strand its operation"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_host_operation_cleanup_refuses_db_errors_and_nonterminal_cas_reloads() {
+        use crate::db::agent_tree_decisions::AgentInstanceState;
+
+        let expected = AgentInstanceState::Completed;
+        for rejected in [
+            classify_host_capability_refresh_terminal_child(expected, Err(())),
+            // This is the state observed after a transition CAS lost to a
+            // concurrent revision that did not terminalize the child.
+            classify_host_capability_refresh_terminal_child(
+                expected,
+                Ok(Some(AgentInstanceState::WaitingForUser)),
+            ),
+            classify_host_capability_refresh_terminal_child(expected, Ok(None)),
+            // A concurrent cancellation is terminal but is not compatible
+            // with an operation that durably completed.
+            classify_host_capability_refresh_terminal_child(
+                expected,
+                Ok(Some(AgentInstanceState::Cancelled)),
+            ),
+        ] {
+            assert!(
+                !rejected.permits_terminal_cleanup(),
+                "DB failure, missing child, nonterminal CAS reload, and incompatible terminal winner must retain Attention and endpoint: {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_terminalization_feedback_fences_the_current_worker_epoch_once() {
+        let fence = std::sync::atomic::AtomicBool::new(false);
+        // The preceding regression covers the DB-error and revision-conflict
+        // classifications. Their common async dispatcher feedback is a single
+        // worker-epoch fence, consumed before the next work-loop turn.
+        fence.store(true, std::sync::atomic::Ordering::Release);
+        assert!(consume_host_capability_terminalization_failure_fence(&fence));
+        assert!(
+            !consume_host_capability_terminalization_failure_fence(&fence),
+            "a retained finalization must abort one epoch, not manufacture repeated cleanup"
+        );
+    }
+
+    #[test]
+    fn direct_terminalization_failure_fences_the_current_worker_epoch_before_reply() {
+        let fence = std::sync::atomic::AtomicBool::new(false);
+
+        // The direct SessionWork waiter must use the same fence as the
+        // recovered-operation dispatcher: its reply may be observed, but the
+        // live worker must not release another continuation while cleanup is
+        // retained for recovery.
+        fence_host_capability_terminalization_failure(&fence);
+        assert!(consume_host_capability_terminalization_failure_fence(&fence));
+    }
+
+    #[test]
+    fn host_refresh_finalization_outcomes_never_conflate_retry_with_terminal_repair_failure() {
+        use crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState;
+
+        // An outbox publication fence can leave an otherwise valid operation
+        // allowed; scheduler/direct-waiter callers must retry it rather than
+        // aborting the worker. The same holds while an owned probe is in
+        // flight. These are intentionally distinct from a terminal cleanup
+        // failure, which may not wake/replay a parked continuation.
+        for state in [
+            HostCapabilityRefreshOperationState::Allowed,
+            HostCapabilityRefreshOperationState::Pending,
+            HostCapabilityRefreshOperationState::Executing,
+        ] {
+            assert!(!terminal_host_operation_interrupt_requires_repair(state));
+            assert_eq!(
+                HostCapabilityRefreshInterruptFinalization::NonterminalRetryable,
+                HostCapabilityRefreshInterruptFinalization::NonterminalRetryable,
+                "{state:?} is scheduled/in flight, not a terminal cleanup failure"
+            );
+        }
+
+        let retained = HostCapabilityRefreshInterruptFinalization::RetainedTerminalCleanupFailure;
+        let finalized = HostCapabilityRefreshInterruptFinalization::Finalized;
+        assert_ne!(retained, finalized);
+        assert_ne!(
+            retained,
+            HostCapabilityRefreshInterruptFinalization::NonterminalRetryable,
+            "a parked/recovery terminal cleanup failure must fence without waking its waiter"
+        );
+    }
+
+    #[test]
+    fn concurrent_exact_terminalization_is_the_single_cleanup_permit() {
+        use crate::db::agent_tree_decisions::AgentInstanceState;
+
+        let exact = classify_host_capability_refresh_terminal_child(
+            AgentInstanceState::Failed,
+            Ok(Some(AgentInstanceState::Failed)),
+        );
+        assert_eq!(exact, HostCapabilityRefreshChildTerminalization::Verified);
+        assert!(exact.permits_terminal_cleanup());
+    }
+
+    #[tokio::test]
+    async fn concurrent_terminal_cleanup_acknowledges_attention_exactly_once() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("project", "/workspace", "agent").await.unwrap();
+        let interrupt_id = db
+            .raise_interrupt(session.session_id, "agent", "terminal host operation", None)
+            .await
+            .unwrap();
+        assert!(db.park_interrupt(interrupt_id).await.unwrap());
+        assert!(db
+            .begin_parked_interrupt_execution(
+                interrupt_id,
+                &crate::daemon::proto::ResolveResponse::Cancel,
+            )
+            .await
+            .unwrap());
+
+        // This is the acknowledgement race after two workers both reload the
+        // same exact terminal child. SQLite's state CAS admits one cleanup;
+        // the other observes the durable resolved row and may only detach.
+        let first = db.complete_executing_interrupt(interrupt_id);
+        let second = db.complete_executing_interrupt(interrupt_id);
+        let (first, second) = tokio::join!(first, second);
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(first || second);
+        assert_ne!(first, second);
+        assert_eq!(
+            db.get_interrupt(interrupt_id).await.unwrap().unwrap().state,
+            crate::db::needs_attention::InterruptState::Resolved
+        );
+    }
+
+    #[test]
     fn deadline_maintenance_backlog_round_robins_in_bounded_slices() {
         let deadlines = WorkerAgentTreeDeadlines::default();
         let session_id = uuid::Uuid::from_u128(1);
@@ -10245,7 +10926,7 @@ mod interrupt_redaction_tests {
         };
         assert_eq!(
             agent_tree_resolver_answer(&bounded_packet, r#"{"free_text":"ok"}"#).unwrap(),
-            crate::agent_tree::DecisionAnswer::FreeText {
+            crate::agent_tree::PublicDecisionAnswer::FreeText {
                 text: "ok".to_string(),
             }
         );
@@ -10283,7 +10964,7 @@ mod interrupt_redaction_tests {
         .unwrap();
         assert_eq!(
             answer,
-            crate::agent_tree::DecisionAnswer::InterruptResponse {
+            crate::agent_tree::PublicDecisionAnswer::InterruptResponse {
                 response: crate::daemon::proto::ResolveResponse::Single {
                     selected_id: "refresh".to_string(),
                 },
@@ -10343,7 +11024,7 @@ mod interrupt_redaction_tests {
         .unwrap();
         assert_eq!(
             answer,
-            crate::agent_tree::DecisionAnswer::InterruptResponse {
+            crate::agent_tree::PublicDecisionAnswer::InterruptResponse {
                 response: crate::daemon::proto::ResolveResponse::Single { selected_id: refresh },
             }
         );

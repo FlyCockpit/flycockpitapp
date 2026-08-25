@@ -1653,7 +1653,7 @@ pub enum SessionWork {
     /// any fresh recovery executor share one serialization point.
     ResolveAgentDecision {
         decision_request_id: Uuid,
-        answer: crate::agent_tree::DecisionAnswer,
+        answer: crate::agent_tree::PublicDecisionAnswer,
         respond_to: oneshot::Sender<std::result::Result<crate::agent_tree::DecisionSettlement, String>>,
     },
     /// Request the one daemon-classified low-risk host effect through the

@@ -1885,6 +1885,8 @@
   },
   "provider_oauth_started": {
     "data": {
+      "client_operation_id": "begin-provider",
+      "request_hash": "0000000000000000000000000000000000000000000000000000000000000000",
       "flow_id": "flow-fixture",
       "authorize_url": "https://example.test/authorize"
     },

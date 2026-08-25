@@ -683,10 +683,11 @@ impl OAuthFlowStore {
 }
 
 fn oauth_owner(state: &MutableClientState) -> String {
-    state
-        .principal
-        .tag()
-        .unwrap_or_else(|| "local-owner".to_string())
+    // OAuth and the rest of owner-scoped settings must share one durable
+    // settlement namespace.  A connection-local/tag spelling made a lost
+    // OAuth response unqueryable after reconnect even though the authenticated
+    // principal was unchanged.
+    stable_authenticated_principal(state)
 }
 
 /// Authentic "this request may perform LOCAL-HOST actions" signal for handlers
@@ -7842,17 +7843,18 @@ async fn handle_serialized_request_impl(
                         .await
                     }
                     None => {
-                        if changed {
-                            ctx.mutate_owner_vault_item(
-                                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                                &provider_id,
-                                Some(&record_bytes),
-                            )
-                            .map_err(internal)
-                            .map(|_| receipt)
-                        } else {
-                            Ok(receipt)
-                        }
+                        commit_local_provider_credential(
+                            ctx,
+                            settlement_owner.clone(),
+                            client_operation_id.clone(),
+                            request_hash,
+                            fencing_generation,
+                            provider_id.clone(),
+                            None,
+                            provider_id.clone(),
+                            Some(record_bytes),
+                        )
+                        .await
                     }
                 }
                 #[cfg(not(feature = "remote"))]
@@ -7885,16 +7887,21 @@ async fn handle_serialized_request_impl(
                     return Err(error);
                 }
             };
+            // The local helper commits the mutation and receipt together. A
+            // remote operation has its own atomic replay ledger but still
+            // closes this owner-scoped local receipt here.
             #[cfg(feature = "remote")]
-            finish_local_operation(
-                ctx,
-                settlement_owner,
-                client_operation_id_from_response(&result)?,
-                request_hash,
-                fencing_generation,
-                &result,
-            )
-            .await?;
+            if remote_operation.is_some() {
+                finish_local_operation(
+                    ctx,
+                    settlement_owner,
+                    client_operation_id_from_response(&result)?,
+                    request_hash,
+                    fencing_generation,
+                    &result,
+                )
+                .await?;
+            }
             Ok(result)
         }
 
@@ -8414,7 +8421,7 @@ async fn handle_serialized_request_impl(
                 client_operation_id,
                 request_hash,
                 fencing_generation,
-                &receipt,
+                &response,
             )
             .await?;
             delete_oauth_flow(ctx, &flow_id)?;
@@ -9238,17 +9245,18 @@ async fn handle_serialized_request_impl(
                         .await
                     }
                     None => {
-                        if changed {
-                            ctx.mutate_owner_vault_item(
-                                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                                &credential_record_id,
-                                None,
-                            )
-                            .map_err(internal)
-                            .map(|_| response)
-                        } else {
-                            Ok(response)
-                        }
+                        commit_local_provider_credential(
+                            ctx,
+                            settlement_owner.clone(),
+                            client_operation_id.clone(),
+                            request_hash,
+                            fencing_generation,
+                            provider_id.clone(),
+                            project_root.clone(),
+                            credential_record_id.clone(),
+                            None,
+                        )
+                        .await
                     }
                 }
                 #[cfg(not(feature = "remote"))]
@@ -9282,15 +9290,17 @@ async fn handle_serialized_request_impl(
                 }
             };
             #[cfg(feature = "remote")]
-            finish_local_operation(
-                ctx,
-                settlement_owner,
-                client_operation_id_from_response(&result)?,
-                request_hash,
-                fencing_generation,
-                &result,
-            )
-            .await?;
+            if remote_operation.is_some() {
+                finish_local_operation(
+                    ctx,
+                    settlement_owner,
+                    client_operation_id_from_response(&result)?,
+                    request_hash,
+                    fencing_generation,
+                    &result,
+                )
+                .await?;
+            }
             Ok(result)
         }
 
@@ -9525,86 +9535,88 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
-            if ctx.paths.ephemeral {
-                return Err(bad_request(
-                    "ephemeral daemons do not accept Copilot auth setup",
-                ));
-            }
-            #[cfg(feature = "remote")]
-            let request = Request::SetupCopilotAuth {
-                client_operation_id: client_operation_id.clone(),
-                project_root: project_root.clone(),
-                provider_id: provider_id.clone(),
-            };
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) =
-                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
-                        .await?
-            {
-                return Ok(response);
-            }
-            // A local unix-socket owner (`ClientPrincipal::Owner`, no
-            // remote-operation ledger context) may adopt the host's ambient
-            // GitHub token; any remote caller is failed closed inside
-            // `setup_copilot_auth`. `is_local_owner` is derived only from
-            // daemon-assigned signals — see `is_local_owner_action`.
-            let is_local_owner = is_local_owner_action(
-                state,
+            let operation = async {
+                if ctx.paths.ephemeral {
+                    return Err(bad_request(
+                        "ephemeral daemons do not accept Copilot auth setup",
+                    ));
+                }
                 #[cfg(feature = "remote")]
-                remote_operation,
-            );
-            let _secret_lock = SECRET_OWNER_RPC_LOCK.lock().await;
-            let consumed_vault_generation = ctx
-                .secret_vault
-                .current_inventory_generation()
-                .map_err(|error| internal(anyhow::anyhow!(error)))?;
-            let operation_result = setup_copilot_auth(
-                ctx,
-                &project_root,
-                &provider_id,
-                provider_env_snapshot(ctx, state),
-                is_local_owner,
-            )
-            .await;
-            let operation_result = operation_result.and_then(|_| {
-                let result_vault_generation = ctx
+                let request = Request::SetupCopilotAuth {
+                    client_operation_id: client_operation_id.clone(),
+                    project_root: project_root.clone(),
+                    provider_id: provider_id.clone(),
+                };
+                #[cfg(feature = "remote")]
+                if let Some(operation) = remote_operation
+                    && let Some(response) =
+                        begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                            .await?
+                {
+                    return Ok(response);
+                }
+                // A local unix-socket owner (`ClientPrincipal::Owner`, no
+                // remote-operation ledger context) may adopt the host's ambient
+                // GitHub token; any remote caller is failed closed inside
+                // `setup_copilot_auth`. `is_local_owner` is derived only from
+                // daemon-assigned signals — see `is_local_owner_action`.
+                let is_local_owner = is_local_owner_action(
+                    state,
+                    #[cfg(feature = "remote")]
+                    remote_operation,
+                );
+                let _secret_lock = SECRET_OWNER_RPC_LOCK.lock().await;
+                let consumed_vault_generation = ctx
                     .secret_vault
                     .current_inventory_generation()
                     .map_err(|error| internal(anyhow::anyhow!(error)))?;
-                let owner_root = crate::secret_ownership::canonical_owner_root(&project_root);
-                if result_vault_generation <= consumed_vault_generation {
-                    return Err(internal(anyhow::anyhow!(
-                        "Copilot auth completed without advancing vault generation"
-                    )));
-                }
-                Ok(Response::CopilotAuthCommitted {
-                    client_operation_id,
-                    owner_scope: format!("project:{owner_root}"),
-                    owner_root,
-                    project_root,
-                    provider_id,
-                    consumed_vault_generation,
-                    result_vault_generation,
-                    config_generation: inventory::current_config_generation(),
-                })
-            });
-            let response = finish_provider_mutation_future!(
-                remote_operation,
+                let operation_result = setup_copilot_auth(
+                    ctx,
+                    &project_root,
+                    &provider_id,
+                    provider_env_snapshot(ctx, state),
+                    is_local_owner,
+                )
+                .await;
+                let operation_result = operation_result.and_then(|_| {
+                    let result_vault_generation =
+                        ctx.secret_vault
+                            .current_inventory_generation()
+                            .map_err(|error| internal(anyhow::anyhow!(error)))?;
+                    let owner_root = crate::secret_ownership::canonical_owner_root(&project_root);
+                    if result_vault_generation <= consumed_vault_generation {
+                        return Err(internal(anyhow::anyhow!(
+                            "Copilot auth completed without advancing vault generation"
+                        )));
+                    }
+                    Ok(Response::CopilotAuthCommitted {
+                        client_operation_id: client_operation_id.clone(),
+                        owner_scope: format!("project:{owner_root}"),
+                        owner_root,
+                        project_root: project_root.clone(),
+                        provider_id: provider_id.clone(),
+                        consumed_vault_generation,
+                        result_vault_generation,
+                        config_generation: inventory::current_config_generation(),
+                    })
+                });
+                let response = finish_provider_mutation_future!(
+                    remote_operation,
+                    ctx,
+                    "setup_copilot_auth",
+                    async { operation_result }
+                )?;
+                Ok(response)
+            };
+            terminalize_local_operation(
                 ctx,
-                "setup_copilot_auth",
-                async { operation_result }
-            )?;
-            finish_local_operation(
-                ctx,
-                settlement_owner,
-                client_operation_id_from_response(&response)?,
+                settlement_owner.clone(),
+                client_operation_id.clone(),
                 request_hash,
                 fencing_generation,
-                &response,
+                operation,
             )
-            .await?;
-            Ok(response)
+            .await
         }
 
         Request::ApplySetupWizard {
@@ -9651,13 +9663,17 @@ async fn handle_serialized_request_impl(
             cleanup_names_json,
         } => {
             let settlement_owner = settings_capability_owner(state);
-            let request_hash = local_operation_request_hash(&(
-                "save_mcp_config",
-                &project_root,
-                &config_json,
-                &secret_values_json,
-                &cleanup_names_json,
-            ))?;
+            let request_hash = local_operation_secret_request_hash(
+                ctx,
+                b"flycockpit/local-operation/mcp-config-save/v1\0",
+                &(
+                    "save_mcp_config",
+                    &project_root,
+                    &config_json,
+                    &secret_values_json,
+                    &cleanup_names_json,
+                ),
+            )?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &settlement_owner,
@@ -9670,51 +9686,53 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
-            if ctx.paths.ephemeral {
-                return Err(bad_request(
-                    "ephemeral daemons do not accept MCP config writes",
-                ));
-            }
-            #[cfg(feature = "remote")]
-            let request = Request::SaveMcpConfig {
-                client_operation_id: client_operation_id.clone(),
-                project_root: project_root.clone(),
-                config_json: config_json.clone(),
-                secret_values_json: secret_values_json.clone(),
-                cleanup_names_json: cleanup_names_json.clone(),
+            let operation = async {
+                if ctx.paths.ephemeral {
+                    return Err(bad_request(
+                        "ephemeral daemons do not accept MCP config writes",
+                    ));
+                }
+                #[cfg(feature = "remote")]
+                let request = Request::SaveMcpConfig {
+                    client_operation_id: client_operation_id.clone(),
+                    project_root: project_root.clone(),
+                    config_json: config_json.clone(),
+                    secret_values_json: secret_values_json.clone(),
+                    cleanup_names_json: cleanup_names_json.clone(),
+                };
+                #[cfg(feature = "remote")]
+                if let Some(operation) = remote_operation
+                    && let Some(response) =
+                        begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
+                            .await?
+                {
+                    return Ok(response);
+                }
+                let operation_result = save_mcp_config(
+                    ctx,
+                    &client_operation_id,
+                    &project_root,
+                    &config_json,
+                    &secret_values_json,
+                    &cleanup_names_json,
+                );
+                let response = finish_provider_mutation_future!(
+                    remote_operation,
+                    ctx,
+                    "save_mcp_config",
+                    operation_result
+                )?;
+                Ok(response)
             };
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) =
-                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
-                        .await?
-            {
-                return Ok(response);
-            }
-            let operation_result = save_mcp_config(
+            terminalize_local_operation(
                 ctx,
-                &client_operation_id,
-                &project_root,
-                &config_json,
-                &secret_values_json,
-                &cleanup_names_json,
-            );
-            let response = finish_provider_mutation_future!(
-                remote_operation,
-                ctx,
-                "save_mcp_config",
-                operation_result
-            )?;
-            finish_local_operation(
-                ctx,
-                settlement_owner,
-                client_operation_id_from_response(&response)?,
+                settlement_owner.clone(),
+                client_operation_id.clone(),
                 request_hash,
                 fencing_generation,
-                &response,
+                operation,
             )
-            .await?;
-            Ok(response)
+            .await
         }
 
         Request::DeleteProviderConfig {
@@ -12028,13 +12046,17 @@ async fn apply_provider_mutation(
     mutation: cockpit_proto::ProviderMutationBatch,
     capability_owner: String,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let request_hash = local_operation_request_hash(&(
-        "apply_provider_mutation",
-        &snapshot_session_id,
-        &layer_id,
-        &expected_revision,
-        &mutation,
-    ))?;
+    let request_hash = local_operation_secret_request_hash(
+        ctx,
+        b"flycockpit/local-operation/provider-mutation/v1\0",
+        &(
+            "apply_provider_mutation",
+            &snapshot_session_id,
+            &layer_id,
+            &expected_revision,
+            &mutation,
+        ),
+    )?;
     let fencing_generation = match begin_local_operation(
         ctx,
         &capability_owner,
@@ -12047,100 +12069,115 @@ async fn apply_provider_mutation(
         LocalOperationStart::Replay(response) => return Ok(response),
         LocalOperationStart::Execute(generation) => generation,
     };
-    let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
-    let capability = {
-        let mut capabilities = PROVIDER_EDIT_CAPABILITIES
-            .lock()
-            .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
-        let now = Instant::now();
-        capabilities.retain(|_, capability| capability.expires_at > now);
-        capabilities
-            .get(&snapshot_session_id)
-            .cloned()
-            .ok_or_else(|| bad_request("provider edit capability is absent or expired"))?
-    };
-    recover_provider_config_journals(ctx, &capability.project_root, None).await?;
-    let (_, _, current) = daemon_provider_config(ctx, &capability.project_root).await?;
-    let observed_revision = provider_config_revision(&current)?;
-    validate_provider_edit_capability(
-        &capability,
-        &capability_owner,
-        &layer_id,
-        &expected_revision,
-        inventory::current_config_generation(),
-        &observed_revision,
-    )?;
+    let result = async {
+        let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+        let capability = {
+            let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+                .lock()
+                .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
+            let now = Instant::now();
+            capabilities.retain(|_, capability| capability.expires_at > now);
+            capabilities
+                .get(&snapshot_session_id)
+                .cloned()
+                .ok_or_else(|| bad_request("provider edit capability is absent or expired"))?
+        };
+        recover_provider_config_journals(ctx, &capability.project_root, None).await?;
+        let (_, _, current) = daemon_provider_config(ctx, &capability.project_root).await?;
+        let observed_revision = provider_config_revision(&current)?;
+        validate_provider_edit_capability(
+            &capability,
+            &capability_owner,
+            &layer_id,
+            &expected_revision,
+            inventory::current_config_generation(),
+            &observed_revision,
+        )?;
 
-    // Validate the entire intent before the first durable side effect. This is
-    // also defense in depth for typed in-process callers that bypass decoding.
-    let mut ids = std::collections::BTreeSet::new();
-    for upsert in &mutation.upserts {
-        if !ids.insert(upsert.provider_id.as_str()) {
-            return Err(bad_request("provider mutation contains duplicate ids"));
+        // Validate the entire intent before the first durable side effect. This is
+        // also defense in depth for typed in-process callers that bypass decoding.
+        let mut ids = std::collections::BTreeSet::new();
+        for upsert in &mutation.upserts {
+            if !ids.insert(upsert.provider_id.as_str()) {
+                return Err(bad_request("provider mutation contains duplicate ids"));
+            }
+            validate_daemon_provider_url(&upsert.entry.url)?;
+            validate_unique_provider_header_names(&upsert.entry.headers)?;
+            if upsert.header_secrets.len() != upsert.entry.headers.len() {
+                return Err(bad_request(
+                    "provider header secret count does not match headers",
+                ));
+            }
         }
-        validate_daemon_provider_url(&upsert.entry.url)?;
-        validate_unique_provider_header_names(&upsert.entry.headers)?;
-        if upsert.header_secrets.len() != upsert.entry.headers.len() {
-            return Err(bad_request(
-                "provider header secret count does not match headers",
-            ));
+        for delete in &mutation.deletes {
+            if !ids.insert(delete.provider_id.as_str()) {
+                return Err(bad_request("provider mutation contains duplicate ids"));
+            }
         }
-    }
-    for delete in &mutation.deletes {
-        if !ids.insert(delete.provider_id.as_str()) {
-            return Err(bad_request("provider mutation contains duplicate ids"));
-        }
-    }
 
-    stage_and_recover_provider_batch(
-        ctx,
-        &capability.project_root,
-        &capability.target_path,
-        mutation,
-    )
-    .await?;
+        stage_and_recover_provider_batch(
+            ctx,
+            &capability.project_root,
+            &capability.target_path,
+            mutation,
+        )
+        .await?;
 
-    let (_, _, committed) = daemon_provider_config(ctx, &capability.project_root).await?;
-    let result_revision = provider_config_revision(&committed)?;
-    let config_generation = inventory::publish_committed_config_generation();
-    {
-        let mut capabilities = PROVIDER_EDIT_CAPABILITIES
-            .lock()
-            .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
-        capabilities.insert(
-            snapshot_session_id.clone(),
-            ProviderEditCapability {
-                owner: capability.owner,
-                project_root: capability.project_root,
-                target_path: capability.target_path,
-                layer_id: layer_id.clone(),
-                revision: result_revision.clone(),
-                config_generation,
-                expires_at: Instant::now() + PROVIDER_EDIT_CAPABILITY_TTL,
-            },
-        );
+        let (_, _, committed) = daemon_provider_config(ctx, &capability.project_root).await?;
+        let result_revision = provider_config_revision(&committed)?;
+        let config_generation = inventory::publish_committed_config_generation();
+        {
+            let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+                .lock()
+                .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
+            capabilities.insert(
+                snapshot_session_id.clone(),
+                ProviderEditCapability {
+                    owner: capability.owner,
+                    project_root: capability.project_root,
+                    target_path: capability.target_path,
+                    layer_id: layer_id.clone(),
+                    revision: result_revision.clone(),
+                    config_generation,
+                    expires_at: Instant::now() + PROVIDER_EDIT_CAPABILITY_TTL,
+                },
+            );
+        }
+        let response = Response::ProviderMutationCommitted {
+            client_operation_id: client_operation_id.clone(),
+            snapshot_session_id,
+            layer_id,
+            consumed_revision: expected_revision,
+            result_revision,
+            config_generation,
+            config: crate::secret_ref::redact_provider_view(&committed),
+            status: cockpit_proto::ConfigCommitStatus::Committed,
+            publication: cockpit_proto::ConfigPublicationStatus::Published,
+        };
+        finish_local_operation(
+            ctx,
+            capability_owner.clone(),
+            client_operation_id.clone(),
+            request_hash,
+            fencing_generation,
+            &response,
+        )
+        .await?;
+        Ok(response)
     }
-    let response = Response::ProviderMutationCommitted {
-        client_operation_id,
-        snapshot_session_id,
-        layer_id,
-        consumed_revision: expected_revision,
-        result_revision,
-        config_generation,
-        config: crate::secret_ref::redact_provider_view(&committed),
-        status: cockpit_proto::ConfigCommitStatus::Committed,
-        publication: cockpit_proto::ConfigPublicationStatus::Published,
-    };
-    finish_local_operation(
-        ctx,
-        capability_owner,
-        client_operation_id_from_response(&response)?,
-        request_hash,
-        fencing_generation,
-        &response,
-    )
-    .await?;
-    Ok(response)
+    .await;
+    if let Err(error) = &result {
+        finish_local_operation_error(
+            ctx,
+            capability_owner,
+            client_operation_id,
+            request_hash,
+            fencing_generation,
+            error,
+        )
+        .await?;
+    }
+    result
 }
 
 fn local_operation_request_hash<T: serde::Serialize>(
@@ -12248,6 +12285,65 @@ async fn finish_local_operation_error(
         )
         .await
         .map_err(internal)
+}
+
+/// Close every admitted local operation in the current process.  Handler
+/// bodies intentionally live inside this future so validation, remote-ledger
+/// admission, publication, and response construction cannot escape through a
+/// `?` while leaving an executing receipt behind.
+async fn terminalize_local_operation<F>(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    operation: F,
+) -> std::result::Result<Response, ErrorPayload>
+where
+    F: std::future::Future<Output = std::result::Result<Response, ErrorPayload>>,
+{
+    match operation.await {
+        Ok(response) => {
+            let response_operation_id = client_operation_id_from_response(&response)?;
+            if response_operation_id != client_operation_id {
+                let error = internal(anyhow::anyhow!(
+                    "local operation produced a receipt for a different operation"
+                ));
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            finish_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(error) => {
+            finish_local_operation_error(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &error,
+            )
+            .await?;
+            Err(error)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

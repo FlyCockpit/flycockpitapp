@@ -779,6 +779,27 @@ impl PasteRegistry {
             .collect()
     }
 
+    /// Exact daemon-admitted handles emitted as retained image parts by
+    /// `build_wire`. Reference-only duplicate placeholders remain text and
+    /// therefore must keep frontend disposal ownership.
+    pub fn wire_image_ingress_drafts(&self, vision: bool) -> Vec<ImageIngressDraftAuthority> {
+        if !vision {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        self.blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                PasteKind::ImageHandle {
+                    draft,
+                    reference: false,
+                    ..
+                } if seen.insert(draft.admission_id) => Some(draft.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Parse editor-returned text into a normal composer buffer plus a fresh
     /// registry. Well-formed `<user_paste id="...">...</user_paste id="...">`
     /// regions become condensed text blocks. Surviving image placeholders

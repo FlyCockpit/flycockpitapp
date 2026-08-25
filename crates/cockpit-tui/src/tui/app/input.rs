@@ -2680,11 +2680,7 @@ impl App {
         // Only handles embedded in the wire submission cross the reference
         // boundary. On a no-vision model the registry renders text notes, so
         // those admitted drafts remain disposal-owned by the frontend.
-        let retained_drafts = if vision {
-            self.paste_registry.image_ingress_drafts()
-        } else {
-            Vec::new()
-        };
+        let retained_drafts = self.paste_registry.wire_image_ingress_drafts(vision);
 
         let captured_model = self.active_model_selection.clone().unwrap_or_else(|| {
             cockpit_config::providers::ActiveModelRef {

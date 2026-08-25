@@ -17,13 +17,14 @@
 //!    funnel, which enforces every invariant (unique ids, enabled-target →
 //!    enabled-endpoint, exactly-one-default). A registry that fails validation
 //!    is NEVER persisted — the mutation fails closed with `BadRequest`;
-//! 3. fences the daemon config generation with
-//!    [`inventory::compare_and_bump_config_generation`]: an expected-generation
-//!    mismatch or a concurrently-moved generation fails closed with `Conflict`
-//!    and performs NO write;
-//! 4. persists the new registry atomically via [`ExtendedConfigDoc::write`]
-//!    (which takes the `ConfigMutationLock` file lock);
-//! 5. emits a `config_changed`
+//! 3. requires both the config generation and exact authoritative target-layer
+//!    content revision, with no optional freshness bypass;
+//! 4. writes a secret-safe SQLite recovery intent bound to the owner, operation,
+//!    public redacted intent, request identity, and execution fence;
+//! 5. patches only `image_generation` in the raw target-layer document under
+//!    the shared publication/file fences, preserving unknown and secret-bearing
+//!    sibling keys, then publishes the process generation after atomic commit;
+//! 6. settles a replayable fenced local-operation receipt and emits a `config_changed`
 //!    [`ImageControlEventV1`](cockpit_proto::image_control::ImageControlEventV1)
 //!    carrying only SAFE projections (never a raw credential/header/graph blob).
 //!
@@ -32,28 +33,22 @@
 //! owner socket. The reply and event carry only the redacting SafeV1
 //! projections.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cockpit_config::config::extended::{ExtendedConfig, ExtendedConfigDoc};
 use cockpit_config::config::image_generation::{
     ImageAdapterKind, ImageEndpoint, ImageGenerationConfig, ImageGenerationConfigError,
     ImageGenerationTarget, ImageTargetIdentity, RegisteredComfyWorkflow,
 };
 use cockpit_proto::image_control::{
-    ImageConfigChangeSetSafeV1, ImageConfigChangeV1, ImageControlEventV1,
-    ImageControlMutationResponseV1, ImageEndpointSafeV1, ImageTargetSafeV1, ImageWorkflowSafeV1,
+    ImageConfigChangeSetSafeV1, ImageConfigChangeV1, ImageConfigMutationIntentV1,
+    ImageControlEventV1, ImageControlMutationResponseV1, ImageEndpointSafeV1, ImageTargetSafeV1,
+    ImageWorkflowSafeV1,
 };
 
 use crate::daemon::proto::{ErrorCode, ErrorPayload, Request, Response};
 use crate::daemon::server::sessions::internal;
 use crate::daemon::server::{DaemonContext, inventory};
-
-/// Serializes image-config mutations among themselves so the read → apply →
-/// generation-CAS → write sequence is atomic w.r.t. sibling image mutations
-/// (mirrors `WORKSPACE_TRUST_RPC_LOCK`). Cross-RPC bumps by other config
-/// writers are still caught by the generation CAS and fail closed.
-static IMAGE_CONFIG_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn bad_request(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
@@ -446,134 +441,289 @@ fn project_changes(
     changes
 }
 
+fn amend_response_generation(response: &mut Response, generation: u64) {
+    let Response::ImageControlMutated(receipt) = response else {
+        return;
+    };
+    let generation = generation.to_string();
+    receipt.config_generation.clone_from(&generation);
+    receipt.change_set.config_generation.clone_from(&generation);
+    for change in &mut receipt.change_set.changes {
+        match change {
+            ImageConfigChangeV1::EndpointUpserted {
+                entity_generation,
+                item,
+                ..
+            } => {
+                entity_generation.clone_from(&generation);
+                item.entity_generation.clone_from(&generation);
+            }
+            ImageConfigChangeV1::EndpointDeleted {
+                entity_generation, ..
+            }
+            | ImageConfigChangeV1::TargetDeleted {
+                entity_generation, ..
+            }
+            | ImageConfigChangeV1::WorkflowDeleted {
+                entity_generation, ..
+            } => entity_generation.clone_from(&generation),
+            ImageConfigChangeV1::TargetUpserted {
+                entity_generation,
+                item,
+                ..
+            } => {
+                entity_generation.clone_from(&generation);
+                item.entity_generation.clone_from(&generation);
+            }
+            ImageConfigChangeV1::WorkflowUpserted {
+                entity_generation,
+                item,
+                ..
+            } => {
+                entity_generation.clone_from(&generation);
+                item.entity_generation.clone_from(&generation);
+            }
+        }
+    }
+}
+
 /// Persist the new registry to the most-specific existing `config.json` on the
 /// discovered layer path (scaffolding one in the project `.cockpit/` when none
 /// exists), preserving unknown/sibling keys. `image_generation` is an atomic
 /// registry, so `ExtendedConfigDoc::write` whole-replaces it under the
 /// `ConfigMutationLock`.
-fn persist_registry(
-    project_root: &Path,
-    loaded: &ExtendedConfig,
-    new_registry: &ImageGenerationConfig,
-) -> anyhow::Result<()> {
+fn target_path(project_root: &Path) -> PathBuf {
     use crate::config::dirs::{CONFIG_FILE, discover_config_dirs};
-    let target = discover_config_dirs(project_root)
+    discover_config_dirs(project_root)
         .into_iter()
         .map(|dir| dir.path.join(CONFIG_FILE))
         .find(|path| path.exists())
-        .unwrap_or_else(|| project_root.join(".cockpit").join(CONFIG_FILE));
-    let mut doc = ExtendedConfigDoc::load(&target)?;
-    // Start from the effective config we loaded so sibling typed fields the doc
-    // does not itself set are not resurrected as defaults; only the atomic
-    // `image_generation` registry is the value under change.
-    let mut cfg = loaded.clone();
-    cfg.image_generation = new_registry.clone();
-    doc.write(&cfg)?;
-    Ok(())
+        .unwrap_or_else(|| project_root.join(".cockpit").join(CONFIG_FILE))
 }
 
-fn extract(request: &Request) -> Result<(String, Option<u64>, Edit), ErrorPayload> {
-    let (project_root, expected, edit) = match request {
+fn digest_hex(digest: impl AsRef<[u8]>) -> String {
+    let digest = digest.as_ref();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn content_revision(ctx: &DaemonContext, bytes: &[u8]) -> String {
+    digest_hex(
+        ctx.secret_vault
+            .keyed_request_identity(b"flycockpit.image-config.target-revision.v1\0", bytes),
+    )
+}
+
+fn read_document(path: &Path) -> anyhow::Result<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(b"{}".to_vec()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn authoritative_target_revision(
+    ctx: &DaemonContext,
+    project_root: &Path,
+) -> anyhow::Result<(PathBuf, String)> {
+    let target = target_path(project_root);
+    let revision = content_revision(ctx, &read_document(&target)?);
+    Ok((target, revision))
+}
+
+fn render_registry_patch(
+    raw: &[u8],
+    registry: &ImageGenerationConfig,
+) -> Result<Vec<u8>, ErrorPayload> {
+    let mut document: serde_json::Value = serde_json::from_slice(raw)
+        .map_err(|error| bad_request(format!("invalid authoritative config document: {error}")))?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| bad_request("authoritative config root must be an object"))?;
+    object.insert(
+        "image_generation".into(),
+        serde_json::to_value(registry).map_err(internal)?,
+    );
+    serde_json::to_vec_pretty(&document).map_err(internal)
+}
+
+struct ExtractedMutation {
+    client_operation_id: String,
+    mutation_intent_hash: String,
+    project_root: String,
+    expected_generation: u64,
+    expected_revision: String,
+    edit: Edit,
+}
+
+fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
+    let (
+        client_operation_id,
+        mutation_intent_hash,
+        project_root,
+        expected,
+        expected_revision,
+        edit,
+    ) = match request {
         Request::ImageEndpointCreate {
+            client_operation_id,
+            mutation_intent_hash,
             project_root,
             endpoint_json,
             expected_config_generation,
+            expected_config_revision,
         } => (
+            client_operation_id.clone(),
+            mutation_intent_hash.clone(),
             project_root.clone(),
             *expected_config_generation,
+            expected_config_revision.clone(),
             Edit::EndpointCreate(endpoint_json.clone()),
         ),
         Request::ImageEndpointUpdate {
+            client_operation_id,
+            mutation_intent_hash,
             project_root,
             endpoint_id,
             endpoint_json,
             expected_config_generation,
+            expected_config_revision,
         } => (
+            client_operation_id.clone(),
+            mutation_intent_hash.clone(),
             project_root.clone(),
             *expected_config_generation,
+            expected_config_revision.clone(),
             Edit::EndpointUpdate {
                 endpoint_id: endpoint_id.clone(),
                 json: endpoint_json.clone(),
             },
         ),
         Request::ImageEndpointDelete {
+            client_operation_id,
+            mutation_intent_hash,
             project_root,
             endpoint_id,
             expected_config_generation,
+            expected_config_revision,
         } => (
+            client_operation_id.clone(),
+            mutation_intent_hash.clone(),
             project_root.clone(),
             *expected_config_generation,
+            expected_config_revision.clone(),
             Edit::EndpointDelete(endpoint_id.clone()),
         ),
         Request::ImageTargetCreate {
+            client_operation_id,
+            mutation_intent_hash,
             project_root,
             target_json,
             expected_config_generation,
+            expected_config_revision,
         } => (
+            client_operation_id.clone(),
+            mutation_intent_hash.clone(),
             project_root.clone(),
             *expected_config_generation,
+            expected_config_revision.clone(),
             Edit::TargetCreate(target_json.clone()),
         ),
         Request::ImageTargetUpdate {
+            client_operation_id,
+            mutation_intent_hash,
             project_root,
             target_id,
             target_json,
             expected_config_generation,
+            expected_config_revision,
         } => (
+            client_operation_id.clone(),
+            mutation_intent_hash.clone(),
             project_root.clone(),
             *expected_config_generation,
+            expected_config_revision.clone(),
             Edit::TargetUpdate {
                 target_id: target_id.clone(),
                 json: target_json.clone(),
             },
         ),
         Request::ImageTargetDelete {
+            client_operation_id,
+            mutation_intent_hash,
             project_root,
             target_id,
             expected_config_generation,
+            expected_config_revision,
         } => (
+            client_operation_id.clone(),
+            mutation_intent_hash.clone(),
             project_root.clone(),
             *expected_config_generation,
+            expected_config_revision.clone(),
             Edit::TargetDelete(target_id.clone()),
         ),
         Request::ImageTargetSetDefault {
+            client_operation_id,
+            mutation_intent_hash,
             project_root,
             target_id,
             expected_config_generation,
+            expected_config_revision,
         } => (
+            client_operation_id.clone(),
+            mutation_intent_hash.clone(),
             project_root.clone(),
             *expected_config_generation,
+            expected_config_revision.clone(),
             Edit::TargetSetDefault(target_id.clone()),
         ),
         Request::ImageWorkflowUpload {
+            client_operation_id,
+            mutation_intent_hash,
             project_root,
             workflow_json,
             expected_config_generation,
+            expected_config_revision,
         } => (
+            client_operation_id.clone(),
+            mutation_intent_hash.clone(),
             project_root.clone(),
             *expected_config_generation,
+            expected_config_revision.clone(),
             Edit::WorkflowUpload(workflow_json.clone()),
         ),
         Request::ImageWorkflowBind {
+            client_operation_id,
+            mutation_intent_hash,
             project_root,
             workflow_id,
             bindings_json,
             expected_config_generation,
+            expected_config_revision,
         } => (
+            client_operation_id.clone(),
+            mutation_intent_hash.clone(),
             project_root.clone(),
             *expected_config_generation,
+            expected_config_revision.clone(),
             Edit::WorkflowBind {
                 workflow_id: workflow_id.clone(),
                 json: bindings_json.clone(),
             },
         ),
         Request::ImageWorkflowDelete {
+            client_operation_id,
+            mutation_intent_hash,
             project_root,
             workflow_id,
             expected_config_generation,
+            expected_config_revision,
         } => (
+            client_operation_id.clone(),
+            mutation_intent_hash.clone(),
             project_root.clone(),
             *expected_config_generation,
+            expected_config_revision.clone(),
             Edit::WorkflowDelete(workflow_id.clone()),
         ),
         other => {
@@ -586,7 +736,28 @@ fn extract(request: &Request) -> Result<(String, Option<u64>, Edit), ErrorPayloa
     if project_root.trim().is_empty() {
         return Err(bad_request("project_root must not be empty"));
     }
-    Ok((project_root, expected, edit))
+    if client_operation_id.trim().is_empty()
+        || mutation_intent_hash.len() != 64
+        || !mutation_intent_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || expected_revision.len() != 64
+        || !expected_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(bad_request(
+            "image mutation operation, intent, or revision identity is invalid",
+        ));
+    }
+    Ok(ExtractedMutation {
+        client_operation_id,
+        mutation_intent_hash,
+        project_root,
+        expected_generation: expected,
+        expected_revision,
+        edit,
+    })
 }
 
 /// LOCAL owner image-config mutation dispatch. Declared
@@ -595,25 +766,35 @@ fn extract(request: &Request) -> Result<(String, Option<u64>, Edit), ErrorPayloa
 pub(crate) async fn dispatch_image_control_mutation(
     ctx: &Arc<DaemonContext>,
     request: Request,
+    owner: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let (project_root, expected, edit) = extract(&request)?;
+    let extracted = extract(&request)?;
+    let ExtractedMutation {
+        client_operation_id,
+        mutation_intent_hash,
+        project_root,
+        expected_generation,
+        expected_revision,
+        edit,
+    } = extracted;
 
     // Serialize image mutations so the read → CAS → write is atomic among them.
-    let _guard = IMAGE_CONFIG_MUTATION_LOCK.lock().await;
+    let _guard = super::dispatch::CONFIG_PUBLICATION_RPC_LOCK.lock().await;
 
     // Read the current generation FIRST, then load the registry, so a config
     // write that lands between the two makes the generation CAS below fail
     // closed rather than persisting an edit built on a stale registry.
     let current = inventory::current_config_generation();
-    if let Some(expected) = expected
-        && expected != current
-    {
+    if expected_generation != current {
         return Err(conflict(format!(
-            "image config generation is {current}, expected {expected}"
+            "image config generation is {current}, expected {expected_generation}"
         )));
     }
 
-    let cwd = std::path::PathBuf::from(&project_root);
+    let cwd = std::fs::canonicalize(&project_root)
+        .map_err(|_| bad_request("project_root must identify an existing canonical workspace"))?;
     let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
         .await
         .map_err(internal)?;
@@ -626,20 +807,140 @@ pub(crate) async fn dispatch_image_control_mutation(
     // An invalid result returns here — nothing is written or bumped.
     let (new_registry, pending) = apply_edit(&extended.image_generation, edit)?;
 
-    // Fence the daemon config generation. If it moved since `current`, fail
-    // closed with NO write.
-    let new_generation = inventory::compare_and_bump_config_generation(current)
-        .ok_or_else(|| conflict("image config generation changed concurrently"))?;
-    let generation = new_generation.to_string();
+    // The public mutation identity is derived exclusively from redacted safe
+    // projections. Endpoint credentials/headers and workflow graph bytes can
+    // influence the vault-keyed request identity, but never this public hash.
+    let public_changes = project_changes(&new_registry, &pending, "intent");
+    let computed_intent = ImageConfigMutationIntentV1 {
+        project_id: project_root.clone(),
+        expected_config_generation: expected_generation,
+        expected_config_revision: expected_revision.clone(),
+        changes: public_changes,
+    }
+    .sha256()
+    .map_err(internal)?;
+    if computed_intent != mutation_intent_hash {
+        return Err(conflict(
+            "image mutation public intent hash does not match the redacted request",
+        ));
+    }
 
-    // Persist the validated registry atomically. Only reached after the CAS.
-    persist_registry(&cwd, &extended, &new_registry).map_err(internal)?;
+    let target = target_path(&cwd);
+    let target_display = target.to_string_lossy().into_owned();
+    let publication_guard =
+        cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
+    let consumed = read_document(&target).map_err(internal)?;
+    let consumed_revision = content_revision(ctx, &consumed);
+    if consumed_revision != expected_revision {
+        return Err(conflict(
+            "image configuration document changed; reload before mutating",
+        ));
+    }
+    let intended = render_registry_patch(&consumed, &new_registry)?;
+    let result_revision = content_revision(ctx, &intended);
+    let predicted_generation =
+        current.saturating_add(u64::from(result_revision != consumed_revision));
+    let generation = predicted_generation.to_string();
 
     let change_set = ImageConfigChangeSetSafeV1::new(
         generation.clone(),
         project_changes(&new_registry, &pending, &generation),
     );
     let daemon_instance_id = inventory::daemon_instance_id().to_string();
+    let mut response = Response::ImageControlMutated(ImageControlMutationResponseV1::new(
+        client_operation_id.clone(),
+        mutation_intent_hash.clone(),
+        daemon_instance_id.clone(),
+        project_root.clone(),
+        target_display.clone(),
+        consumed_revision.clone(),
+        result_revision.clone(),
+        current,
+        change_set,
+    ));
+    let mut terminal_response_json = serde_json::to_string(&response).map_err(internal)?;
+    drop(publication_guard);
+
+    let journal_owner = owner.clone();
+    let journal_operation = client_operation_id.clone();
+    let journal_project = project_root.clone();
+    let journal_target = target_display.clone();
+    let journal_consumed = consumed_revision.clone();
+    let journal_intended = result_revision.clone();
+    let journal_intent = mutation_intent_hash.clone();
+    let journal_response = terminal_response_json.clone();
+    ctx.db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO image_config_mutation_journals
+             (owner_digest,client_operation_id,request_hash,fencing_generation,
+              mutation_intent_hash,project_root,target_path,consumed_revision,
+              intended_revision,consumed_generation,terminal_response_json,created_at_unix_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                rusqlite::params![
+                    journal_owner,
+                    journal_operation,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    journal_intent,
+                    journal_project,
+                    journal_target,
+                    journal_consumed,
+                    journal_intended,
+                    current,
+                    journal_response,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
+
+    let publication_guard =
+        cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
+    let precommit = read_document(&target).map_err(internal)?;
+    if content_revision(ctx, &precommit) != consumed_revision {
+        return Err(conflict(
+            "image configuration target changed immediately before commit",
+        ));
+    }
+    let published_generation = if result_revision != consumed_revision {
+        cockpit_config::config::write_config_bytes_atomic(&target, &intended).map_err(internal)?;
+        inventory::publish_committed_config_generation()
+    } else {
+        current
+    };
+    drop(publication_guard);
+
+    if published_generation != predicted_generation {
+        amend_response_generation(&mut response, published_generation);
+        terminal_response_json = serde_json::to_string(&response).map_err(internal)?;
+        let amend_owner = owner.clone();
+        let amend_operation = client_operation_id.clone();
+        let amend_response = terminal_response_json;
+        ctx.db
+            .write(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE image_config_mutation_journals SET terminal_response_json=?3
+                 WHERE owner_digest=?1 AND client_operation_id=?2",
+                    rusqlite::params![amend_owner, amend_operation, amend_response],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!(
+                        "image mutation recovery intent disappeared before generation amendment"
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .map_err(internal)?;
+    }
+
+    let change_set = match &response {
+        Response::ImageControlMutated(receipt) => receipt.change_set.clone(),
+        _ => unreachable!(),
+    };
 
     // Emit the redacted `config_changed` replay event (safe projections only).
     ctx.broadcast_global(crate::daemon::proto::Event::ImageControlConfigChanged {
@@ -650,9 +951,127 @@ pub(crate) async fn dispatch_image_control_mutation(
         ),
     });
 
-    Ok(Response::ImageControlMutated(
-        ImageControlMutationResponseV1::new(daemon_instance_id, project_root, change_set),
-    ))
+    Ok(response)
+}
+
+/// Resolve secret-safe image publication journals before socket publication.
+/// An intended hash proves the atomic file commit; a consumed hash proves no
+/// commit. Any third value is external divergence and fails boot closed.
+pub(crate) async fn recover_image_config_mutation_journals(
+    ctx: &Arc<DaemonContext>,
+) -> std::result::Result<u64, ErrorPayload> {
+    type Row = (
+        String,
+        String,
+        Vec<u8>,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+    );
+    let rows: Vec<Row> = ctx
+        .db
+        .read(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT journal.owner_digest,journal.client_operation_id,journal.request_hash,
+                    journal.fencing_generation,journal.target_path,journal.consumed_revision,
+                    journal.intended_revision,journal.terminal_response_json,receipt.state
+               FROM image_config_mutation_journals journal
+               JOIN local_operation_receipts receipt
+                 ON receipt.owner_digest=journal.owner_digest
+                AND receipt.client_operation_id=journal.client_operation_id
+              ORDER BY journal.created_at_unix_ms",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(internal)?;
+    let mut recovered = 0_u64;
+    for (
+        owner,
+        operation,
+        request_hash,
+        fence,
+        target,
+        consumed,
+        intended,
+        response_json,
+        receipt_state,
+    ) in rows
+    {
+        let hash: [u8; 32] = request_hash
+            .try_into()
+            .map_err(|_| internal("image mutation journal request hash is malformed"))?;
+        if receipt_state.starts_with("terminal_") {
+            ctx.db.write(move |conn| {
+                conn.execute(
+                    "DELETE FROM image_config_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2",
+                    rusqlite::params![owner, operation],
+                )?;
+                Ok(())
+            }).await.map_err(internal)?;
+            recovered = recovered.saturating_add(1);
+            continue;
+        }
+        let actual = content_revision(ctx, &read_document(Path::new(&target)).map_err(internal)?);
+        if actual == intended {
+            let mut response: Response = serde_json::from_str(&response_json).map_err(internal)?;
+            let published = inventory::publish_committed_config_generation();
+            amend_response_generation(&mut response, published);
+            let terminal = serde_json::to_string(&response).map_err(internal)?;
+            ctx.db.transaction(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE local_operation_receipts SET state='terminal_success',terminal_outcome_json=?5,execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                     WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4 AND state='executing'",
+                    rusqlite::params![owner,operation,hash.as_slice(),fence,terminal,chrono::Utc::now().timestamp_millis()],
+                )?;
+                if changed != 1 { anyhow::bail!("image mutation recovery lost its executing receipt"); }
+                conn.execute("DELETE FROM image_config_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2", rusqlite::params![owner,operation])?;
+                Ok(())
+            }).await.map_err(internal)?;
+        } else if actual == consumed {
+            let error = ErrorPayload {
+                code: ErrorCode::Conflict,
+                message:
+                    "the daemon restarted before the image configuration commit; reload and retry"
+                        .into(),
+            };
+            let terminal = serde_json::to_string(&error).map_err(internal)?;
+            ctx.db.transaction(move |conn| {
+                let changed = conn.execute(
+                    "UPDATE local_operation_receipts SET state='terminal_cancelled',terminal_outcome_json=?5,execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                     WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4 AND state='executing'",
+                    rusqlite::params![owner,operation,hash.as_slice(),fence,terminal,chrono::Utc::now().timestamp_millis()],
+                )?;
+                if changed != 1 { anyhow::bail!("image mutation recovery lost its executing receipt"); }
+                conn.execute("DELETE FROM image_config_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2", rusqlite::params![owner,operation])?;
+                Ok(())
+            }).await.map_err(internal)?;
+        } else {
+            return Err(conflict(
+                "image configuration diverged from both consumed and intended revisions during recovery",
+            ));
+        }
+        recovered = recovered.saturating_add(1);
+    }
+    Ok(recovered)
 }
 
 #[cfg(test)]

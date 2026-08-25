@@ -2064,6 +2064,9 @@
       "schemaVersion": 1,
       "daemonInstanceId": "11111111-1111-4111-8111-111111111111",
       "projectId": "/tmp/project",
+      "configRevision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "targetPath": "/tmp/project/.cockpit/config.json",
+      "configGeneration": 3,
       "result": {
         "type": "endpoint_page",
         "items": [
@@ -2091,9 +2094,17 @@
   "image_control_mutated": {
     "data": {
       "schemaVersion": 1,
+      "clientOperationId": "image-endpoint-create-op",
+      "mutationIntentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "daemonInstanceId": "11111111-1111-4111-8111-111111111111",
       "projectId": "/tmp/project",
+      "targetPath": "/tmp/project/.cockpit/config.json",
+      "consumedRevision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "resultRevision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "consumedConfigGeneration": 3,
       "configGeneration": "4",
+      "status": "committed",
+      "publication": "published",
       "changeSet": {
         "schemaVersion": 1,
         "configGeneration": "4",

@@ -565,3 +565,55 @@ fn workflow_change_set_and_event_carry_no_graph_json() {
         other => panic!("expected workflow upsert, got {other:?}"),
     }
 }
+
+#[test]
+fn registry_patch_preserves_raw_unknown_and_secret_bearing_siblings() {
+    let raw = br#"{
+      "unknown_future_key": {"opaque": "keep-me"},
+      "providers": {"private": {"api_key": "named-secret-reference"}},
+      "image_generation": {"endpoints": [], "targets": [], "workflows": []}
+    }"#;
+    let rendered = render_registry_patch(raw, &base()).expect("typed image patch renders");
+    let document: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
+    assert_eq!(
+        document.pointer("/unknown_future_key/opaque"),
+        Some(&serde_json::json!("keep-me"))
+    );
+    assert_eq!(
+        document.pointer("/providers/private/api_key"),
+        Some(&serde_json::json!("named-secret-reference"))
+    );
+    assert!(document.get("image_generation").is_some());
+}
+
+#[test]
+fn durability_source_ratchet_requires_exact_cas_journal_and_post_commit_publication() {
+    let source = include_str!("../image_control_mutations.rs");
+    for required in [
+        "expected_config_revision",
+        "image_config_mutation_journals",
+        "local_operation_receipts",
+        "write_config_bytes_atomic",
+        "publish_committed_config_generation",
+        "recover_image_config_mutation_journals",
+        "CONFIG_PUBLICATION_RPC_LOCK",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing durability fence {required}"
+        );
+    }
+    let write = source.find("write_config_bytes_atomic").unwrap();
+    let publish = source[write..]
+        .find("publish_committed_config_generation")
+        .map(|offset| write + offset)
+        .unwrap();
+    assert!(
+        write < publish,
+        "generation publication must follow atomic commit"
+    );
+    assert!(
+        !source.contains("let mut cfg = loaded.clone()"),
+        "dedicated writer must never serialize the effective layered config"
+    );
+}

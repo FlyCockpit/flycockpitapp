@@ -69,6 +69,7 @@ fn authority_journals_bind_exact_fenced_terminal_receipts() {
         "provider_config_journals",
         "mcp_config_journals",
         "extended_config_patch_journals",
+        "image_config_mutation_journals",
         "agent_mutation_journals",
     ] {
         let declaration = sql

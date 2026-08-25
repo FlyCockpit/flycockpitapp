@@ -6613,6 +6613,50 @@ CREATE TABLE extended_config_patch_journals (
 CREATE INDEX extended_config_patch_journals_created
 ON extended_config_patch_journals(created_at_unix_ms);
 
+-- Secret-safe recovery intent for the dedicated image-generation registry
+-- writer. The registry can contain credential references, headers, signed
+-- evidence URLs, and opaque workflow graphs, so SQLite retains hashes and the
+-- redacted terminal receipt only; raw intended configuration stays solely in
+-- the atomically-published config document.
+CREATE TABLE image_config_mutation_journals (
+    owner_digest           TEXT NOT NULL,
+    client_operation_id    TEXT NOT NULL,
+    request_hash           BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
+    fencing_generation     INTEGER NOT NULL CHECK (fencing_generation > 0),
+    mutation_intent_hash   TEXT NOT NULL CHECK (length(mutation_intent_hash) = 64 AND mutation_intent_hash = lower(mutation_intent_hash)),
+    project_root           TEXT NOT NULL,
+    target_path            TEXT NOT NULL,
+    consumed_revision      TEXT NOT NULL CHECK (length(consumed_revision) = 64 AND consumed_revision = lower(consumed_revision)),
+    intended_revision      TEXT NOT NULL CHECK (length(intended_revision) = 64 AND intended_revision = lower(intended_revision)),
+    consumed_generation    INTEGER NOT NULL CHECK (consumed_generation >= 0),
+    terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
+    created_at_unix_ms     INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    FOREIGN KEY (owner_digest, client_operation_id)
+        REFERENCES local_operation_receipts(owner_digest, client_operation_id)
+        ON DELETE CASCADE,
+    CHECK (length(trim(project_root)) > 0),
+    CHECK (length(trim(target_path)) > 0)
+);
+CREATE INDEX image_config_mutation_journals_created
+ON image_config_mutation_journals(created_at_unix_ms);
+CREATE TRIGGER image_config_mutation_journals_identity_immutable
+BEFORE UPDATE ON image_config_mutation_journals
+WHEN NEW.owner_digest <> OLD.owner_digest
+  OR NEW.client_operation_id <> OLD.client_operation_id
+  OR NEW.request_hash <> OLD.request_hash
+  OR NEW.fencing_generation <> OLD.fencing_generation
+  OR NEW.mutation_intent_hash <> OLD.mutation_intent_hash
+  OR NEW.project_root <> OLD.project_root
+  OR NEW.target_path <> OLD.target_path
+  OR NEW.consumed_revision <> OLD.consumed_revision
+  OR NEW.intended_revision <> OLD.intended_revision
+  OR NEW.consumed_generation <> OLD.consumed_generation
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'image config mutation journal is immutable');
+END;
+
 -- Durable ownership claims for daemon-generated provider/MCP named secrets.
 -- Claims survive journal retirement so cleanup decisions do not depend on a
 -- pending write being present. Multiple roots may claim a shared reference;

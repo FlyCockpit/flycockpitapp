@@ -23,6 +23,7 @@
 //! config generation, which advances on every config mutation.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use cockpit_config::config::image_generation::{
     ImageAdapterKind, ImageBillableUnit, ImageDimensionDescriptor, ImageEndpoint, ImageFormat,
@@ -303,6 +304,15 @@ pub struct ImageControlReadResponseV1 {
     pub schema_version: u8,
     pub daemon_instance_id: String,
     pub project_id: String,
+    /// Opaque daemon-keyed identity of the exact authoritative target-layer
+    /// document consumed by a subsequent mutation. It is not a public hash of
+    /// the secret-bearing bytes and not an effective-config hash.
+    #[serde(default)]
+    pub config_revision: String,
+    #[serde(default)]
+    pub target_path: String,
+    #[serde(default)]
+    pub config_generation: u64,
     pub result: ImageControlReadResultV1,
 }
 
@@ -316,8 +326,23 @@ impl ImageControlReadResponseV1 {
             schema_version: IMAGE_CONTROL_SCHEMA_VERSION,
             daemon_instance_id,
             project_id,
+            config_revision: String::new(),
+            target_path: String::new(),
+            config_generation: 0,
             result,
         }
+    }
+
+    pub fn with_mutation_capability(
+        mut self,
+        target_path: String,
+        config_revision: String,
+        config_generation: u64,
+    ) -> Self {
+        self.target_path = target_path;
+        self.config_revision = config_revision;
+        self.config_generation = config_generation;
+        self
     }
 }
 
@@ -378,6 +403,33 @@ pub struct ImageConfigChangeSetSafeV1 {
     pub changes: Vec<ImageConfigChangeV1>,
 }
 
+/// Canonical, secret-free identity of one image registry mutation. Clients and
+/// the daemon use the same typed projection so the public receipt hash cannot
+/// accidentally absorb endpoint credentials, headers, evidence URLs, or raw
+/// workflow graph bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageConfigMutationIntentV1 {
+    pub project_id: String,
+    pub expected_config_generation: u64,
+    pub expected_config_revision: String,
+    pub changes: Vec<ImageConfigChangeV1>,
+}
+
+impl ImageConfigMutationIntentV1 {
+    pub fn sha256(&self) -> Result<String, serde_json::Error> {
+        let encoded = serde_json::to_vec(&(
+            "image_config_mutation_v1",
+            &self.project_id,
+            self.expected_config_generation,
+            &self.expected_config_revision,
+            &self.changes,
+        ))?;
+        let digest = Sha256::digest(encoded);
+        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+}
+
 impl ImageConfigChangeSetSafeV1 {
     pub fn new(config_generation: String, changes: Vec<ImageConfigChangeV1>) -> Self {
         Self {
@@ -433,23 +485,47 @@ impl ImageControlEventV1 {
 #[serde(rename_all = "camelCase")]
 pub struct ImageControlMutationResponseV1 {
     pub schema_version: u8,
+    pub client_operation_id: String,
+    /// Hash of the public, redacted mutation intent. Secret-bearing endpoint
+    /// headers, credential references, and workflow graph bytes are excluded.
+    pub mutation_intent_hash: String,
     pub daemon_instance_id: String,
     pub project_id: String,
+    pub target_path: String,
+    pub consumed_revision: String,
+    pub result_revision: String,
+    pub consumed_config_generation: u64,
     pub config_generation: String,
+    pub status: crate::ConfigCommitStatus,
+    pub publication: crate::ConfigPublicationStatus,
     pub change_set: ImageConfigChangeSetSafeV1,
 }
 
 impl ImageControlMutationResponseV1 {
     pub fn new(
+        client_operation_id: String,
+        mutation_intent_hash: String,
         daemon_instance_id: String,
         project_id: String,
+        target_path: String,
+        consumed_revision: String,
+        result_revision: String,
+        consumed_config_generation: u64,
         change_set: ImageConfigChangeSetSafeV1,
     ) -> Self {
         Self {
             schema_version: IMAGE_CONTROL_SCHEMA_VERSION,
+            client_operation_id,
+            mutation_intent_hash,
             daemon_instance_id,
             project_id,
+            target_path,
+            consumed_revision,
+            result_revision,
+            consumed_config_generation,
             config_generation: change_set.config_generation.clone(),
+            status: crate::ConfigCommitStatus::Committed,
+            publication: crate::ConfigPublicationStatus::Published,
             change_set,
         }
     }

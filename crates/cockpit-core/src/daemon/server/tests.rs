@@ -11535,6 +11535,7 @@ fn authority_recovery_precedes_both_socket_binds() {
         "recover_all_provider_config_journals",
         "recover_all_mcp_config_journals",
         "recover_extended_config_patch_journals",
+        "recover_image_config_mutation_journals",
         "recover_agent_mutation_journals",
         "recover_committed_oauth_settlements",
         "recover_assistant_mutation_journals",

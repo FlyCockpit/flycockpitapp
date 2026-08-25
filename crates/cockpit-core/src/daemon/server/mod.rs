@@ -3756,6 +3756,17 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup typed-settings journal recovery failed")?;
+    let recovered_image_config =
+        image_control_mutations::recover_image_config_mutation_journals(ctx)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))
+            .context("startup image-config mutation journal recovery failed")?;
+    if recovered_image_config > 0 {
+        tracing::info!(
+            count = recovered_image_config,
+            "reconciled committed image configuration before socket publication"
+        );
+    }
     crate::daemon::agent_management::recover_known_workspace_resets(ctx)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))

@@ -74,7 +74,8 @@ const FLYCOCKPIT_REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// races between clients in one daemon while the file lock covers peers.
 /// Serialize every provider/MCP config publication, reference scan, and
 /// cleanup. They share the named-secret vault namespace.
-static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
 struct ProviderEditCapability {
@@ -3711,7 +3712,9 @@ async fn dispatch_image_control_read(
     if project_root.trim().is_empty() {
         return Err(bad_request("project_root must not be empty"));
     }
-    let cwd = std::path::PathBuf::from(&project_root);
+    let _publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    let cwd = std::fs::canonicalize(&project_root)
+        .map_err(|_| bad_request("project_root must identify an existing canonical workspace"))?;
     let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
         .await
         .map_err(internal)?;
@@ -3720,9 +3723,12 @@ async fn dispatch_image_control_read(
         .load_effective_for_daemon(&cwd, &trust_policy)
         .map_err(internal)?;
     let cfg = &extended.image_generation;
-    let generation = inventory::current_config_generation().to_string();
+    let config_generation = inventory::current_config_generation();
+    let generation = config_generation.to_string();
+    let (target_path, config_revision) =
+        image_control_mutations::authoritative_target_revision(ctx, &cwd).map_err(internal)?;
     let daemon_instance_id = inventory::daemon_instance_id().to_string();
-    match request {
+    let response = match request {
         Request::ImageEndpointList { limit, cursor, .. } => image_control_reads::endpoint_list(
             cfg,
             &generation,
@@ -3730,16 +3736,14 @@ async fn dispatch_image_control_read(
             project_root,
             limit,
             cursor.as_deref(),
-        )
-        .map(Response::ImageControlRead),
+        ),
         Request::ImageEndpointGet { endpoint_id, .. } => image_control_reads::endpoint_get(
             cfg,
             &generation,
             daemon_instance_id,
             project_root,
             &endpoint_id,
-        )
-        .map(Response::ImageControlRead),
+        ),
         Request::ImageTargetList { limit, cursor, .. } => image_control_reads::target_list(
             cfg,
             &generation,
@@ -3747,16 +3751,14 @@ async fn dispatch_image_control_read(
             project_root,
             limit,
             cursor.as_deref(),
-        )
-        .map(Response::ImageControlRead),
+        ),
         Request::ImageTargetGet { target_id, .. } => image_control_reads::target_get(
             cfg,
             &generation,
             daemon_instance_id,
             project_root,
             &target_id,
-        )
-        .map(Response::ImageControlRead),
+        ),
         Request::ImageWorkflowList { limit, cursor, .. } => image_control_reads::workflow_list(
             cfg,
             &generation,
@@ -3764,23 +3766,30 @@ async fn dispatch_image_control_read(
             project_root,
             limit,
             cursor.as_deref(),
-        )
-        .map(Response::ImageControlRead),
+        ),
         Request::ImageWorkflowGet { workflow_id, .. } => image_control_reads::workflow_get(
             cfg,
             &generation,
             daemon_instance_id,
             project_root,
             &workflow_id,
-        )
-        .map(Response::ImageControlRead),
+        ),
         // The project_root pre-match already rejected any non-image-control
         // variant, so this arm is unreachable.
-        other => Err(internal(format!(
-            "dispatch_image_control_read called with non-image-control request `{}`",
-            principal::request_kind(&other)
-        ))),
-    }
+        other => {
+            return Err(internal(format!(
+                "dispatch_image_control_read called with non-image-control request `{}`",
+                principal::request_kind(&other)
+            )));
+        }
+    }?;
+    Ok(Response::ImageControlRead(
+        response.with_mutation_capability(
+            target_path.to_string_lossy().into_owned(),
+            config_revision,
+            config_generation,
+        ),
+    ))
 }
 
 async fn handle_serialized_request_impl(
@@ -7180,7 +7189,93 @@ async fn handle_serialized_request_impl(
         | Request::ImageWorkflowUpload { .. }
         | Request::ImageWorkflowBind { .. }
         | Request::ImageWorkflowDelete { .. } => {
-            image_control_mutations::dispatch_image_control_mutation(ctx, request).await
+            let client_operation_id = match &request {
+                Request::ImageEndpointCreate {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageEndpointUpdate {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageEndpointDelete {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageTargetCreate {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageTargetUpdate {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageTargetDelete {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageTargetSetDefault {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageWorkflowUpload {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageWorkflowBind {
+                    client_operation_id,
+                    ..
+                }
+                | Request::ImageWorkflowDelete {
+                    client_operation_id,
+                    ..
+                } => client_operation_id.clone(),
+                _ => unreachable!(),
+            };
+            let owner = settings_capability_owner(state);
+            let request_hash = local_operation_secret_request_hash(
+                ctx,
+                b"flycockpit/local-operation/image-config-mutation/v1\0",
+                &request,
+            )?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "image_config_mutation",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let operation = image_control_mutations::dispatch_image_control_mutation(
+                ctx,
+                request,
+                owner.clone(),
+                request_hash,
+                fencing_generation,
+            );
+            let result = terminalize_local_operation(
+                ctx,
+                owner.clone(),
+                client_operation_id.clone(),
+                request_hash,
+                fencing_generation,
+                operation,
+            )
+            .await;
+            if result.is_ok() {
+                ctx.db.write(move |conn| {
+                    conn.execute(
+                        "DELETE FROM image_config_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2",
+                        rusqlite::params![owner, client_operation_id],
+                    )?;
+                    Ok(())
+                }).await.map_err(internal)?;
+            }
+            result
         }
 
         Request::SaveImageSpendPolicy {
@@ -14876,6 +14971,9 @@ async fn finish_local_operation_error(
                     SELECT 1 FROM extended_config_patch_journals
                      WHERE owner_digest=?1 AND client_operation_id=?2
                     UNION ALL
+                    SELECT 1 FROM image_config_mutation_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                    UNION ALL
                     SELECT 1 FROM agent_mutation_journals
                      WHERE owner_digest=?1 AND client_operation_id=?2
                     UNION ALL
@@ -15166,6 +15264,12 @@ fn client_operation_id_from_response(
             client_operation_id,
             ..
         }
+        | Response::ImageControlMutated(
+            cockpit_proto::image_control::ImageControlMutationResponseV1 {
+                client_operation_id,
+                ..
+            },
+        )
         | Response::AgentMutated(AgentMutationResult {
             client_operation_id,
             ..

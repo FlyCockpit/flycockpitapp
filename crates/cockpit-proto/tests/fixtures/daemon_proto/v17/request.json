@@ -1701,84 +1701,114 @@
   },
   "image_endpoint_create": {
     "params": {
+      "client_operation_id": "image-endpoint-create-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "project_root": "/tmp/project",
       "endpoint_json": "{\"id\":\"ep1\"}",
-      "expected_config_generation": 3
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "request": "image_endpoint_create"
   },
   "image_endpoint_update": {
     "params": {
+      "client_operation_id": "image-endpoint-update-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "project_root": "/tmp/project",
       "endpoint_id": "ep1",
       "endpoint_json": "{\"id\":\"ep1\"}",
-      "expected_config_generation": 3
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "request": "image_endpoint_update"
   },
   "image_endpoint_delete": {
     "params": {
+      "client_operation_id": "image-endpoint-delete-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "project_root": "/tmp/project",
       "endpoint_id": "ep1",
-      "expected_config_generation": 3
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "request": "image_endpoint_delete"
   },
   "image_target_create": {
     "params": {
+      "client_operation_id": "image-target-create-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "project_root": "/tmp/project",
       "target_json": "{\"id\":\"t1\"}",
-      "expected_config_generation": 3
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "request": "image_target_create"
   },
   "image_target_update": {
     "params": {
+      "client_operation_id": "image-target-update-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "project_root": "/tmp/project",
       "target_id": "t1",
       "target_json": "{\"id\":\"t1\"}",
-      "expected_config_generation": 3
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "request": "image_target_update"
   },
   "image_target_delete": {
     "params": {
+      "client_operation_id": "image-target-delete-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "project_root": "/tmp/project",
       "target_id": "t1",
-      "expected_config_generation": 3
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "request": "image_target_delete"
   },
   "image_target_set_default": {
     "params": {
+      "client_operation_id": "image-target-default-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "project_root": "/tmp/project",
       "target_id": "t1",
-      "expected_config_generation": 3
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "request": "image_target_set_default"
   },
   "image_workflow_upload": {
     "params": {
+      "client_operation_id": "image-workflow-upload-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "project_root": "/tmp/project",
       "workflow_json": "{\"id\":\"wf1\"}",
-      "expected_config_generation": 3
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "request": "image_workflow_upload"
   },
   "image_workflow_bind": {
     "params": {
+      "client_operation_id": "image-workflow-bind-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "project_root": "/tmp/project",
       "workflow_id": "wf1",
       "bindings_json": "{\"id\":\"wf1\"}",
-      "expected_config_generation": 3
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "request": "image_workflow_bind"
   },
   "image_workflow_delete": {
     "params": {
+      "client_operation_id": "image-workflow-delete-op",
+      "mutation_intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "project_root": "/tmp/project",
       "workflow_id": "wf1",
-      "expected_config_generation": 3
+      "expected_config_generation": 3,
+      "expected_config_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "request": "image_workflow_delete"
   },

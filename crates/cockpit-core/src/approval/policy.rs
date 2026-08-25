@@ -790,7 +790,7 @@ impl Approver {
         // Disclose the redacted output write-authority identity so the human
         // sees WHERE artifacts will be written. It is a stable label/digest,
         // never a raw path or secret.
-        let authority = facts.output_path_authority;
+        let authority = facts.output_path_authority.as_str();
         let prompt = format!(
             "Approve image generation to {destination_count} destination(s) writing under `{authority}` (plan {digest_prefix})?"
         );

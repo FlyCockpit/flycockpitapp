@@ -308,8 +308,11 @@ pub enum AuthorizationRequest<'a> {
         /// destinations.
         insecure_transport_allowed: bool,
         /// Redacted identity of the output-path write authority (a stable
-        /// label/digest — never a raw absolute path or secret).
-        output_path_authority: &'a str,
+        /// label/digest — never a raw absolute path or secret). The
+        /// [`crate::image_generation_job::OutputPathAuthorityId`] newtype makes a
+        /// raw path unrepresentable here (its only prod constructor is the
+        /// verified output-directory digest).
+        output_path_authority: &'a crate::image_generation_job::OutputPathAuthorityId,
     },
 }
 
@@ -334,7 +337,7 @@ pub(super) struct ImageGenerationAuthzFacts<'a> {
     pub destination_enabled: bool,
     pub capability_fresh: bool,
     pub insecure_transport_allowed: bool,
-    pub output_path_authority: &'a str,
+    pub output_path_authority: &'a crate::image_generation_job::OutputPathAuthorityId,
 }
 
 pub struct Approver {
@@ -2333,7 +2336,7 @@ mod tests {
     struct ImgGenScenario {
         destinations: Vec<crate::image_generation_agent_tools::ProjectionDestination>,
         plan_digest: crate::image_generation_agent_tools::PlanDigest,
-        output_path_authority: String,
+        output_path_authority: crate::image_generation_job::OutputPathAuthorityId,
         fanout: u32,
         total_outputs: u32,
         cost_maximum: Option<u64>,
@@ -2367,7 +2370,10 @@ mod tests {
                 plan_digest: crate::image_generation_agent_tools::PlanDigest::from_raw_for_test(
                     "0123456789abcdef0123",
                 ),
-                output_path_authority: "session-write-scope".to_string(),
+                output_path_authority:
+                    crate::image_generation_job::OutputPathAuthorityId::from_raw_for_test(
+                        "session-write-scope",
+                    ),
                 fanout: 1,
                 total_outputs: 1,
                 cost_maximum: Some(100_000),

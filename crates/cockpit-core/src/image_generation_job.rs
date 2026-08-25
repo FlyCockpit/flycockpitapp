@@ -1743,6 +1743,38 @@ pub enum GenerateImageDispatchOutcome {
 /// `Approver::authorize(AuthorizationRequest::ImageGeneration { .. })`) ->
 /// spend/media reservation -> job creation. Every fallible real call uses `?`;
 /// no `unwrap`/`expect` on a fallible call. Refusal copy is always redacted.
+///
+/// Redacted identity of the output-path write authority, threaded into
+/// [`crate::approval::AuthorizationRequest::ImageGeneration`]. Its private inner
+/// string is the opened directory's canonical-destination digest; the ONLY
+/// production constructor is [`OutputPathAuthorityId::from_verified_output_directory`],
+/// so a raw absolute path can never be wrapped as an authority id and reach the
+/// persisted interrupt-prompt sink (`approval/policy.rs`), which reads only
+/// [`OutputPathAuthorityId::as_str`]. This is the second half of the inc1-review
+/// hard constraint (the first is [`crate::image_generation_agent_tools::PlanDigest`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputPathAuthorityId(String);
+
+impl OutputPathAuthorityId {
+    /// The sole production constructor: the opened, verified output directory's
+    /// canonical-destination digest — never a raw path.
+    pub(crate) fn from_verified_output_directory(authority: &VerifiedOutputDirectoryAuthority) -> Self {
+        Self(authority.0.canonical_destination_digest.clone())
+    }
+
+    /// The redacted authority digest, for display at the authz boundary.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Test-only raw constructor. `#[cfg(test)]`-gated so production cannot
+    /// bypass [`Self::from_verified_output_directory`].
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
 #[derive(Clone)]
 pub struct ImageGenerationDispatchService {
     db: cockpit_db::Db,
@@ -1813,6 +1845,8 @@ impl ImageGenerationDispatchService {
             }
         };
         let output_path_authority = held.authority().0.canonical_destination_digest.clone();
+        let output_path_authority_id =
+            OutputPathAuthorityId::from_verified_output_directory(held.authority());
         let output_write_authorized = true;
         // Local-path references are not read-authorized at this seam yet; an
         // attachment-only reference set needs no local read authority.
@@ -1932,7 +1966,7 @@ impl ImageGenerationDispatchService {
                 destination_enabled,
                 capability_fresh,
                 insecure_transport_allowed,
-                output_path_authority: output_path_authority.as_str(),
+                output_path_authority: &output_path_authority_id,
             })
             .await?;
         if !matches!(decision, Decision::Allow { .. }) {

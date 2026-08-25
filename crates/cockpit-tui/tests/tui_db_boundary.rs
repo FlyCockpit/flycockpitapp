@@ -393,6 +393,14 @@ fn production_uses_cockpit_proto_directly() {
     }
 
     fn visit(path: &Path, findings: &mut Vec<String>) {
+        struct ImportVisitor(Vec<String>);
+        impl<'ast> Visit<'ast> for ImportVisitor {
+            fn visit_item_use(&mut self, import: &'ast syn::ItemUse) {
+                use_paths(&import.tree, &mut Vec::new(), &mut self.0);
+                syn::visit::visit_item_use(self, import);
+            }
+        }
+
         for entry in fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
@@ -417,21 +425,17 @@ fn production_uses_cockpit_proto_directly() {
                 ));
             }
             let parsed = syn::parse_file(&source).expect("production TUI source must parse");
-            for item in parsed.items {
-                if let syn::Item::Use(import) = item {
-                    let mut paths = Vec::new();
-                    use_paths(&import.tree, &mut Vec::new(), &mut paths);
-                    for imported in paths {
-                        if imported == "cockpit_core::daemon"
-                            || imported == "cockpit_core::daemon::proto"
-                            || imported.starts_with("cockpit_core::daemon::proto::")
-                        {
-                            findings.push(format!(
-                                "{}: protocol import must use cockpit_proto directly: {imported}",
-                                path.display()
-                            ));
-                        }
-                    }
+            let mut imports = ImportVisitor(Vec::new());
+            imports.visit_file(&parsed);
+            for imported in imports.0 {
+                if imported == "cockpit_core::daemon"
+                    || imported == "cockpit_core::daemon::proto"
+                    || imported.starts_with("cockpit_core::daemon::proto::")
+                {
+                    findings.push(format!(
+                        "{}: protocol import must use cockpit_proto directly: {imported}",
+                        path.display()
+                    ));
                 }
             }
         }

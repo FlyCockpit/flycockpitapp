@@ -700,9 +700,16 @@ pub enum Request {
 
     UpsertAssistant {
         name: String,
-        home_dir: String,
-        config_json: String,
-        content_hash: String,
+        description: String,
+        prompt: String,
+    },
+
+    /// Validate, CAS-write, and update the assistant registry as one daemon
+    /// operation. Clients never combine generic FsWrite with registry upsert.
+    SaveAssistantDefinition {
+        name: String,
+        markdown: String,
+        expected_revision: String,
     },
 
     /// Create a new assistant session through the daemon registry. The
@@ -1623,6 +1630,68 @@ pub enum Request {
         cleanup_names_json: String,
     },
 
+    /// Discover the effective daemon-owned agent inventory for a workspace.
+    GetAgentInventory {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+    },
+
+    /// Resolve one agent to a safe editable projection and opaque revision.
+    GetAgentEditSnapshot {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        name: String,
+    },
+
+    /// Apply one typed agent mutation. `expected_revision` is mandatory for
+    /// mutations of one existing document and omitted only for reset-all.
+    MutateAgent {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        mutation: crate::AgentMutation,
+        #[serde(deserialize_with = "deserialize_optional_nonempty_string")]
+        expected_revision: Option<String>,
+    },
+
+    /// Acquire a daemon-side lease before handing an agent draft to an
+    /// external editor. The editor works on a host-owned staging file, never
+    /// the authoritative agent path.
+    BeginAgentEditorLease {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        name: String,
+        expected_revision: String,
+    },
+
+    /// Complete or cancel an external-editor lease. On commit the daemon
+    /// validates and CAS-publishes the returned markdown.
+    CompleteAgentEditorLease {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        lease_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        markdown: Option<String>,
+    },
+
+    /// Read a daemon-redacted settings layer and its opaque on-disk revision.
+    GetExtendedConfigSnapshot {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        /// Client-generated opaque lifetime for one settings pane. Refreshing
+        /// this same session atomically replaces its earlier capabilities.
+        snapshot_session_id: String,
+    },
+
+    /// Apply a typed field patch to the authoritative daemon-selected layer.
+    ApplyExtendedConfigPatch {
+        #[serde(deserialize_with = "deserialize_owner_project_root")]
+        project_root: String,
+        layer_id: String,
+        patch: crate::ExtendedConfigPatch,
+        expected_revision: String,
+        snapshot_session_id: String,
+    },
+
     /// Atomically persist a rendered extended settings layer. The daemon
     /// validates the target as a config.json layer, reloads it under the
     /// config mutation lock, and rejects stale `base_hash` writes.
@@ -2057,6 +2126,10 @@ pub enum Request {
     /// Delete an assistant registry row by name (home dir left intact).
     DeleteAssistant {
         name: String,
+        /// Revision returned by `GetAssistant`, covering the registry row and
+        /// exact daemon-read definition bytes.
+        #[serde(default)]
+        expected_revision: String,
     },
 
     /// Diagnose a media reservation accounting scope (owner-remoted read).
@@ -2604,6 +2677,122 @@ impl Request {
                     }
                 }
             }
+            Self::GetAgentInventory { project_root } => {
+                validate_owner_project_root(project_root)?;
+            }
+            Self::GetAgentEditSnapshot { project_root, name } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("agent name", name, crate::MAX_AGENT_NAME_BYTES)?;
+            }
+            Self::MutateAgent {
+                project_root,
+                mutation,
+                expected_revision,
+            } => {
+                validate_owner_project_root(project_root)?;
+                let name = match mutation {
+                    crate::AgentMutation::EjectBuiltin { name }
+                    | crate::AgentMutation::SaveDefinition { name, .. }
+                    | crate::AgentMutation::CreateDefinition { name, .. }
+                    | crate::AgentMutation::DeleteCustom { name }
+                    | crate::AgentMutation::ResetBuiltin { name }
+                    | crate::AgentMutation::SaveGoalSupervision { name, .. } => Some(name),
+                    crate::AgentMutation::ResetAllBuiltins => None,
+                };
+                if let Some(name) = name {
+                    validate_owner_identifier("agent name", name, crate::MAX_AGENT_NAME_BYTES)?;
+                }
+                let markdown = match mutation {
+                    crate::AgentMutation::SaveDefinition { markdown, .. }
+                    | crate::AgentMutation::CreateDefinition { markdown, .. } => Some(markdown),
+                    _ => None,
+                };
+                if markdown.is_some_and(|markdown| markdown.len() > crate::MAX_AGENT_MARKDOWN_BYTES)
+                {
+                    return Err("agent markdown exceeds maximum length".to_string());
+                }
+                if expected_revision
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 128)
+                {
+                    return Err("agent revision exceeds maximum length".to_string());
+                }
+            }
+            Self::BeginAgentEditorLease {
+                project_root,
+                name,
+                expected_revision,
+            } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("agent name", name, crate::MAX_AGENT_NAME_BYTES)?;
+                if expected_revision.is_empty() || expected_revision.len() > 128 {
+                    return Err("agent revision is invalid".to_string());
+                }
+            }
+            Self::CompleteAgentEditorLease {
+                project_root,
+                lease_id,
+                markdown,
+            } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("agent editor lease", lease_id, 128)?;
+                if markdown
+                    .as_ref()
+                    .is_some_and(|value| value.len() > crate::MAX_AGENT_MARKDOWN_BYTES)
+                {
+                    return Err("agent markdown exceeds maximum length".to_string());
+                }
+            }
+            Self::GetExtendedConfigSnapshot {
+                project_root,
+                snapshot_session_id,
+            } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("settings snapshot session", snapshot_session_id, 128)?;
+            }
+            Self::ApplyExtendedConfigPatch {
+                project_root,
+                layer_id,
+                patch,
+                expected_revision,
+                snapshot_session_id,
+            } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("settings layer capability", layer_id, 128)?;
+                validate_owner_identifier("settings snapshot session", snapshot_session_id, 128)?;
+                let encoded = serde_json::to_vec(patch)
+                    .map_err(|error| format!("extended config patch is invalid: {error}"))?;
+                if encoded.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
+                    return Err("extended config patch exceeds maximum length".to_string());
+                }
+                if patch.operations.len() > 128
+                    || (patch.operations.is_empty()
+                        && patch.denylist.is_empty()
+                        && patch.redacted_mutations.is_empty()
+                        && !patch.materialize)
+                {
+                    return Err("extended config patch operation count is invalid".to_string());
+                }
+                let mut paths = std::collections::HashSet::new();
+                for operation in &patch.operations {
+                    let path = operation.path();
+                    if path.is_empty()
+                        || path.len() > 16
+                        || path.iter().any(|part| {
+                            part.is_empty()
+                                || part.len() > 128
+                                || part.contains('\0')
+                                || part.contains("__cockpit_redacted_setting_v1_")
+                        })
+                        || !paths.insert(path)
+                    {
+                        return Err("extended config patch path is invalid or repeated".to_string());
+                    }
+                }
+                if expected_revision.is_empty() || expected_revision.len() > 128 {
+                    return Err("extended config revision is invalid".to_string());
+                }
+            }
             Self::SaveExtendedConfig {
                 project_root,
                 path,
@@ -2765,6 +2954,7 @@ macro_rules! request_variants {
             (Request::ResolveAssistantSession { .. }, "resolve_assistant_session");
             (Request::ListAssistants, "list_assistants");
             (Request::UpsertAssistant { .. }, "upsert_assistant");
+            (Request::SaveAssistantDefinition { .. }, "save_assistant_definition");
             (Request::CreateAssistantSession { .. }, "create_assistant_session");
             (Request::AutoTitle { .. }, "auto_title");
             (Request::ExportSessionData { .. }, "export_session_data");
@@ -2870,6 +3060,13 @@ macro_rules! request_variants {
             (Request::SetupCopilotAuth { .. }, "setup_copilot_auth");
             (Request::ApplySetupWizard { .. }, "apply_setup_wizard");
             (Request::SaveMcpConfig { .. }, "save_mcp_config");
+            (Request::GetAgentInventory { .. }, "get_agent_inventory");
+            (Request::GetAgentEditSnapshot { .. }, "get_agent_edit_snapshot");
+            (Request::MutateAgent { .. }, "mutate_agent");
+            (Request::BeginAgentEditorLease { .. }, "begin_agent_editor_lease");
+            (Request::CompleteAgentEditorLease { .. }, "complete_agent_editor_lease");
+            (Request::GetExtendedConfigSnapshot { .. }, "get_extended_config_snapshot");
+            (Request::ApplyExtendedConfigPatch { .. }, "apply_extended_config_patch");
             (Request::SaveExtendedConfig { .. }, "save_extended_config");
             (Request::ExportPolicy { .. }, "export_policy");
             (Request::ImportPolicy { .. }, "import_policy");
@@ -3034,7 +3231,8 @@ macro_rules! command {
             (Request::MarkAppFlagSeen { key, expected_version }, "mark_app_flag_seen", owner_only, none, true, local_only, none, serialized, none, "key:AppFlagKey|expected_version:u64", [key: AppFlagKey => param, expected_version: u64 => param]);
             (Request::ResolveAssistantSession { assistant_id, project_root, mode }, "resolve_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, path(project_root), "assistant_id:String|project_root:String|mode:AssistantSessionResolutionMode", [assistant_id: String => param, project_root: String => project_root, mode: AssistantSessionResolutionMode => param]);
             (Request::ListAssistants, "list_assistants", owner_only, none, false, read_only, none, concurrent, none, "-", []);
-            (Request::UpsertAssistant { name, home_dir, config_json, content_hash }, "upsert_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|home_dir:String|config_json:String|content_hash:String", [name: String => param, home_dir: String => param, config_json: String => param, content_hash: String => param]);
+            (Request::UpsertAssistant { name, description, prompt }, "upsert_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|description:String|prompt:String", [name: String => param, description: String => param, prompt: String => param]);
+            (Request::SaveAssistantDefinition { name, markdown, expected_revision }, "save_assistant_definition", owner_only, none, true, local_only, none, serialized, none, "name:String|markdown:String|expected_revision:String", [name: String => param, markdown: String => param, expected_revision: String => param]);
             (Request::CreateAssistantSession { name, project_root, initial_model, no_sandbox, env_snapshot }, "create_assistant_session", owner_only, none, true, transactional_mutation, sql_transaction, serialized, none, "name:String|project_root:String|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|env_snapshot:Option<EnvSnapshotWire>", [name: String => param, project_root: String => project_root, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, env_snapshot: Option<EnvSnapshotWire> => param]);
             (Request::AutoTitle { session_id }, "auto_title", session_row_writer(session_id), field(session_id), true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ExportSessionData { session_id, kind, include_generated_artifacts, include_sensitive }, "export_session_data", owner_only, field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|kind:ExportSessionKind|include_generated_artifacts:bool|include_sensitive:bool", [session_id: Uuid => session, kind: ExportSessionKind => param, include_generated_artifacts: bool => param, include_sensitive: bool => param]);
@@ -3158,6 +3356,13 @@ macro_rules! command {
             // before dispatch. The daemon's journal + staged vault commit
             // makes the nonrepeatable outcome replay-safe.
             (Request::SaveMcpConfig { project_root, config_json, secret_values_json, cleanup_names_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|config_json:String|secret_values_json:String|cleanup_names_json:String", [project_root: String => project_root, config_json: String => param, secret_values_json: String => param, cleanup_names_json: String => param]);
+            (Request::GetAgentInventory { project_root }, "get_agent_inventory", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
+            (Request::GetAgentEditSnapshot { project_root, name }, "get_agent_edit_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|name:String", [project_root: String => project_root, name: String => param]);
+            (Request::MutateAgent { project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [project_root: String => project_root, mutation: crate::AgentMutation => param, expected_revision: Option<String> => param]);
+            (Request::BeginAgentEditorLease { project_root, name, expected_revision }, "begin_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|name:String|expected_revision:String", [project_root: String => project_root, name: String => param, expected_revision: String => param]);
+            (Request::CompleteAgentEditorLease { project_root, lease_id, markdown }, "complete_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|lease_id:String|markdown:Option<String>", [project_root: String => project_root, lease_id: String => param, markdown: Option<String> => param]);
+            (Request::GetExtendedConfigSnapshot { project_root, snapshot_session_id }, "get_extended_config_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|snapshot_session_id:String", [project_root: String => project_root, snapshot_session_id: String => param]);
+            (Request::ApplyExtendedConfigPatch { project_root, layer_id, patch, expected_revision, snapshot_session_id }, "apply_extended_config_patch", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|layer_id:String|patch:crate::ExtendedConfigPatch|expected_revision:String|snapshot_session_id:String", [project_root: String => project_root, layer_id: String => param, patch: crate::ExtendedConfigPatch => param, expected_revision: String => param, snapshot_session_id: String => param]);
             (Request::SaveExtendedConfig { project_root, path, content, base_hash }, "save_extended_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => param, content: String => param, base_hash: Option<String> => param]);
             (Request::ExportPolicy { project_root }, "export_policy", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::ImportPolicy { project_root, bundle_json, replace }, "import_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|bundle_json:String|replace:bool", [project_root: String => project_root, bundle_json: String => param, replace: bool => param]);
@@ -3217,7 +3422,7 @@ macro_rules! command {
             (Request::GetSessionCompactions { session_id }, "get_session_compactions", owner_only, none, false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => param]);
             (Request::PurgeEndedSessions { before }, "purge_ended_sessions", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "before:i64", [before: i64 => param]);
             (Request::GetAssistant { name }, "get_assistant", owner_only, none, false, read_only, none, concurrent, none, "name:String", [name: String => param]);
-            (Request::DeleteAssistant { name }, "delete_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String", [name: String => param]);
+            (Request::DeleteAssistant { name, expected_revision }, "delete_assistant", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|expected_revision:String", [name: String => param, expected_revision: String => param]);
             (Request::DiagnoseMediaReservation { scope, id }, "diagnose_media_reservation", owner_only, none, false, read_only, none, concurrent, none, "scope:String|id:String", [scope: String => param, id: String => param]);
             (Request::RepairMediaReservation { scope, id, expected_block_generation, repair_plan_digest, idempotency_key }, "repair_media_reservation", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "scope:String|id:String|expected_block_generation:u64|repair_plan_digest:String|idempotency_key:String", [scope: String => param, id: String => param, expected_block_generation: u64 => param, repair_plan_digest: String => param, idempotency_key: String => param]);
             (Request::GetDoctorSnapshot { project_root, no_sandbox, offline }, "get_doctor_snapshot", owner_only, none, false, read_only, none, concurrent, none, "project_root:Option<String>|no_sandbox:bool|offline:bool", [project_root: Option<String> => param, no_sandbox: bool => param, offline: bool => param]);
@@ -4783,9 +4988,8 @@ mod tests {
     fn upsert_assistant_rpc_is_registered_in_both_macro_tables() {
         let request = Request::UpsertAssistant {
             name: "a".into(),
-            home_dir: "/a".into(),
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "assistant".into(),
+            prompt: "help".into(),
         };
         assert_eq!(request.wire_tag(), "upsert_assistant");
         assert!(crate::command!(command_tags).contains(&request.wire_tag()));

@@ -3,7 +3,8 @@
 //! The editing engine is the shared [`crate::tui::vim_editor::VimEditor`]
 //! component, which wraps the prompt composer's vim-capable buffer and key
 //! dispatch. This page owns only the agent-file metadata and save/cancel
-//! interpretation.
+//! interpretation. Authoritative bytes are committed only by daemon RPCs;
+//! `$EDITOR` receives a private host staging file under a daemon lease.
 
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
@@ -16,8 +17,16 @@ use crate::tui::vim_editor::{VimEditor, VimEditorOutcome};
 pub(super) struct AgentEditor {
     /// The agent name being edited (for the editor header / re-parse).
     pub(super) name: String,
-    /// The on-disk file the buffer will be written back to.
+    /// Presentation/staging path metadata. This is never an authoritative
+    /// agent or assistant destination written by the editor.
     pub(super) path: std::path::PathBuf,
+    /// Opaque daemon revision captured with the editable snapshot. Both agent
+    /// files and daemon-local assistant definitions require one to save; the
+    /// `assistant_definition` bit selects their distinct typed mutation RPCs.
+    pub(super) revision: Option<String>,
+    pub(super) authority_id: super::pointer_actions::AgentId,
+    assistant_definition: bool,
+    vim_enabled: bool,
     editor: VimEditor,
 }
 
@@ -25,13 +34,12 @@ pub(super) struct AgentEditor {
 pub(super) enum EditorOutcome {
     /// Stay in the editor; the keystroke was consumed (or ignored).
     Stay,
-    /// Save and close: write the buffer back to disk. The page re-reads +
-    /// re-parses afterwards.
+    /// Save and close through the source-specific revisioned daemon RPC.
     Save,
     /// Cancel without writing.
     Cancel,
-    /// Defer to `$EDITOR` for the same file after preserving the current
-    /// buffer to disk.
+    /// Defer a workspace-agent draft to `$EDITOR` through a private,
+    /// identity-checked staging directory and daemon lease.
     ExternalEdit,
 }
 
@@ -44,16 +52,50 @@ impl AgentEditor {
         path: std::path::PathBuf,
         text: &str,
         vim_enabled: bool,
+        revision: Option<String>,
     ) -> Self {
         Self {
+            authority_id: super::pointer_actions::AgentId::workspace(&name),
             name,
             path,
+            revision,
+            assistant_definition: false,
+            vim_enabled,
             editor: VimEditor::new(text, vim_enabled),
         }
     }
 
+    pub(super) fn new_assistant(
+        name: String,
+        path: std::path::PathBuf,
+        text: &str,
+        vim_enabled: bool,
+        revision: String,
+    ) -> Self {
+        let mut editor = Self::new(name, path, text, vim_enabled, Some(revision));
+        editor.assistant_definition = true;
+        editor.authority_id = super::pointer_actions::AgentId::assistant(&editor.name);
+        editor
+    }
+
+    pub(super) fn is_assistant_definition(&self) -> bool {
+        self.assistant_definition
+    }
+
+    pub(super) fn with_authority_id(
+        mut self,
+        authority_id: super::pointer_actions::AgentId,
+    ) -> Self {
+        self.authority_id = authority_id;
+        self
+    }
+
     pub(super) fn text(&self) -> &str {
         self.editor.text()
+    }
+
+    pub(super) fn replace_with_recovery_text(&mut self, text: &str) {
+        self.editor = VimEditor::new(text, self.vim_enabled);
     }
 
     /// Insert pasted text at the cursor. This is a full-file multiline
@@ -68,7 +110,8 @@ impl AgentEditor {
 
     /// Apply a key. Save/cancel chords:
     ///   - Ctrl+S saves and closes from any mode.
-    ///   - Ctrl+G asks the host to hand the current file to `$EDITOR`.
+    ///   - Ctrl+G asks the host to hand a leased workspace-agent staging file
+    ///     to `$EDITOR`; assistant definitions deliberately do not support it.
     ///   - In plain mode, Esc cancels.
     ///   - In vim mode, Esc leaves the active editing mode first; Esc from
     ///     normal mode cancels.
@@ -77,18 +120,20 @@ impl AgentEditor {
             VimEditorOutcome::Stay => EditorOutcome::Stay,
             VimEditorOutcome::Save => EditorOutcome::Save,
             VimEditorOutcome::Cancel => EditorOutcome::Cancel,
+            VimEditorOutcome::ExternalEdit if self.assistant_definition => EditorOutcome::Stay,
             VimEditorOutcome::ExternalEdit => EditorOutcome::ExternalEdit,
         }
     }
 
     /// Render the editor with a real terminal cursor and scroll-follow.
     pub(super) fn render(&self, frame: &mut Frame, area: Rect) {
-        self.editor.render(
-            frame,
-            area,
-            format!("editing {}", self.name),
-            "ctrl+s: save  ctrl+g: editor  enter: newline  esc: cancel",
-        );
+        let help = if self.assistant_definition {
+            "ctrl+s: save  enter: newline  esc: cancel"
+        } else {
+            "ctrl+s: save  ctrl+g: editor  enter: newline  esc: cancel"
+        };
+        self.editor
+            .render(frame, area, format!("editing {}", self.name), help);
     }
 }
 
@@ -124,6 +169,7 @@ mod tests {
             std::path::PathBuf::from("builder.md"),
             text,
             vim,
+            None,
         )
     }
 

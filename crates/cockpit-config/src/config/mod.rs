@@ -68,6 +68,20 @@ pub fn write_config_bytes_atomic(path: &std::path::Path, bytes: &[u8]) -> anyhow
     files::atomic_write(path, bytes)
 }
 
+/// Durably remove one configuration file without following a final symlink.
+/// Callers must hold [`hold_config_mutation_lock`] while resolving and
+/// removing the target.
+pub fn remove_config_file_atomic(path: &std::path::Path) -> anyhow::Result<()> {
+    files::remove_file_nofollow(path)
+}
+
+/// Durably commit directory-entry changes without following a symlink at the
+/// directory itself. Multi-file daemon journals use this after each rename or
+/// unlink so their persisted phase never gets ahead of filesystem metadata.
+pub fn sync_directory_nofollow(path: &std::path::Path) -> anyhow::Result<()> {
+    files::fsync_dir(path)
+}
+
 /// Reuse the audited component-relative/no-follow private-file primitive for
 /// short-lived terminal ingress. Callers must still enforce their own root,
 /// filename, media, and lifecycle policy.
@@ -76,7 +90,7 @@ pub fn write_terminal_ingress_private_file(
     bytes: &[u8],
 ) -> anyhow::Result<TerminalIngressFileIdentity> {
     files::prepare_atomic_write(path, bytes)?.commit_noreplace()?;
-    let (_, _, identity) = files::read_file_nofollow_with_identity(path, false)?
+    let (_, _, identity) = files::read_file_nofollow_with_identity(path, false, true)?
         .ok_or_else(|| anyhow::anyhow!("published terminal ingress file disappeared"))?;
     Ok(identity)
 }
@@ -124,21 +138,75 @@ impl Drop for VerifiedTerminalIngressFile {
 pub fn read_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<(Vec<u8>, TerminalIngressFileIdentity)>> {
-    Ok(files::read_file_nofollow_with_identity(path, false)?
+    Ok(files::read_file_nofollow_with_identity(path, false, true)?
         .map(|(_, bytes, identity)| (bytes, identity)))
+}
+
+/// Read an authority-bearing configuration file without following a planted
+/// path component. Missing files are reported as `None`.
+pub fn read_config_file_nofollow(path: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
+    files::read_file_nofollow(path)
+}
+
+/// Read a configuration target through the audited retained-parent,
+/// component-relative no-follow primitive and return its stable filesystem
+/// identity. Daemon capabilities use this to reject same-content pathname
+/// substitution between snapshot and commit.
+pub fn read_config_file_nofollow_with_identity(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<(Vec<u8>, TerminalIngressFileIdentity)>> {
+    Ok(files::read_file_nofollow_with_identity(path, false, false)?
+        .map(|(_, bytes, identity)| (bytes, identity)))
+}
+
+/// Retain an existing directory without following any path component.
+pub fn open_config_directory_nofollow(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    files::open_directory_handle_nofollow(path)
+}
+
+/// Read one bounded regular-file leaf relative to a retained directory.
+/// Path replacement after the directory was opened cannot redirect this read.
+pub fn read_config_leaf_from_retained_directory(
+    directory: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    files::read_leaf_from_directory_handle(directory, leaf, max_bytes)
+}
+
+/// Snapshot every visible Markdown document below an existing directory using
+/// component-relative, no-follow handles. Symlinks/reparse points and identity
+/// ambiguity fail the entire snapshot; callers never mix trusted and untrusted
+/// descendants.
+pub fn snapshot_markdown_tree_nofollow(
+    root: &std::path::Path,
+    max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> anyhow::Result<Vec<(std::path::PathBuf, String)>> {
+    files::snapshot_markdown_tree_nofollow(
+        root,
+        max_files,
+        max_entries,
+        max_depth,
+        max_file_bytes,
+        max_total_bytes,
+    )
 }
 
 pub fn hold_terminal_ingress_file_verified(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<VerifiedTerminalIngressFile>> {
     Ok(
-        files::read_file_nofollow_with_identity(path, true)?.map(|(file, bytes, identity)| {
-            VerifiedTerminalIngressFile {
+        files::read_file_nofollow_with_identity(path, true, true)?.map(
+            |(file, bytes, identity)| VerifiedTerminalIngressFile {
                 file,
                 bytes,
                 identity,
-            }
-        }),
+            },
+        ),
     )
 }
 
@@ -146,6 +214,35 @@ pub fn hold_terminal_ingress_file_verified(
 /// retained-parent platform primitive.
 pub fn remove_terminal_ingress_file_nofollow(path: &std::path::Path) -> anyhow::Result<()> {
     files::remove_file_nofollow(path)
+}
+
+/// Move an authority-bearing regular file between two retained, no-follow
+/// parent directory handles. Both parent identities and the source entry are
+/// checked immediately before the move. The required cross-process mutation
+/// guard serializes cooperating Flycockpit writers; it is not a reentrant lock
+/// and does not exclude a malicious same-UID process. Unix therefore performs
+/// a post-operation identity proof and reports an explicitly recoverable
+/// two-name/namespace state if a noncooperating substitution is detected.
+/// Windows moves the already-open source handle relative to a retained
+/// destination handle. Callers cannot accidentally perform a bare pathname
+/// check/rename sequence, but must retain their durable journal until this
+/// function returns success.
+pub fn rename_config_file_nofollow(
+    _mutation_lock: &HeldConfigMutationLock,
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> anyhow::Result<()> {
+    files::rename_file_nofollow(source, destination)
+}
+
+/// Compare two regular no-follow entries by stable filesystem identity.
+/// Used only to reconcile the recoverable two-name state of a link/unlink
+/// no-replace fallback.
+pub fn same_config_file_identity_nofollow(
+    left: &std::path::Path,
+    right: &std::path::Path,
+) -> anyhow::Result<bool> {
+    files::same_file_identity_nofollow(left, right)
 }
 
 #[cfg(all(test, unix))]

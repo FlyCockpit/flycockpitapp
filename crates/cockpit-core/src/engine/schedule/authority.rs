@@ -1442,7 +1442,11 @@ mod tests {
         // Cancel frees the slot synchronously (tied to the row removal), even if
         // the runner's own terminal is aborted or lost under backpressure.
         assert!(auth.cancel("swarm-cancelled"));
-        assert_eq!(auth.running_swarm(), 0, "cancel frees the slot exactly once");
+        assert_eq!(
+            auth.running_swarm(),
+            0,
+            "cancel frees the slot exactly once"
+        );
 
         // The runner's racing terminal now arrives as a duplicate: `mark_completed`
         // finds no row and returns `false`, so the driver skips `swarm_completed`

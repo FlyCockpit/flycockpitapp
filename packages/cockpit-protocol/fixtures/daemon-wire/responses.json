@@ -3,7 +3,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "ack",
-    "v": 12
+    "v": 14
   },
   "app_flag": {
     "data": {
@@ -14,7 +14,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "app_flag",
-    "v": 12
+    "v": 14
   },
   "app_flag_seen": {
     "data": {
@@ -25,7 +25,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "app_flag_seen",
-    "v": 12
+    "v": 14
   },
   "assistant_session_resolved": {
     "data": {
@@ -52,7 +52,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "assistant_session_resolved",
-    "v": 12
+    "v": 14
   },
   "attached": {
     "data": {
@@ -157,7 +157,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "attached",
-    "v": 12
+    "v": 14
   },
   "bulk_transfer_chunk": {
     "data": {
@@ -168,7 +168,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "bulk_transfer_chunk",
-    "v": 12
+    "v": 14
   },
   "bulk_transfer_chunk_accepted": {
     "data": {
@@ -180,7 +180,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "bulk_transfer_chunk_accepted",
-    "v": 12
+    "v": 14
   },
   "config_refreshed": {
     "data": {
@@ -190,7 +190,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "config_refreshed",
-    "v": 12
+    "v": 14
   },
   "export_session_data": {
     "data": {
@@ -212,7 +212,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "export_session_data",
-    "v": 12
+    "v": 14
   },
   "forked": {
     "data": {
@@ -224,7 +224,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "forked",
-    "v": 12
+    "v": 14
   },
   "fs_list": {
     "data": {
@@ -245,7 +245,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_list",
-    "v": 12
+    "v": 14
   },
   "fs_read": {
     "data": {
@@ -257,7 +257,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_read",
-    "v": 12
+    "v": 14
   },
   "fs_stat": {
     "data": {
@@ -275,7 +275,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_stat",
-    "v": 12
+    "v": 14
   },
   "fs_write": {
     "data": {
@@ -284,7 +284,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "fs_write",
-    "v": 12
+    "v": 14
   },
   "git_diff_file": {
     "data": {
@@ -294,7 +294,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_diff_file",
-    "v": 12
+    "v": 14
   },
   "git_status": {
     "data": {
@@ -307,7 +307,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "git_status",
-    "v": 12
+    "v": 14
   },
   "history_page": {
     "data": {
@@ -326,7 +326,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "history_page",
-    "v": 12
+    "v": 14
   },
   "inventory_bundle": {
     "data": {
@@ -375,7 +375,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "inventory_bundle",
-    "v": 12
+    "v": 14
   },
   "restart_decision": {
     "data": {
@@ -385,7 +385,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "restart_decision",
-    "v": 12
+    "v": 14
   },
   "run_invocation_cancel_result": {
     "data": {
@@ -400,7 +400,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "run_invocation_cancel_result",
-    "v": 12
+    "v": 14
   },
   "run_invocation_status": {
     "data": {
@@ -419,7 +419,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "run_invocation_status",
-    "v": 12
+    "v": 14
   },
   "session_messages": {
     "data": {
@@ -437,7 +437,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "session_messages",
-    "v": 12
+    "v": 14
   },
   "sessions": {
     "data": {
@@ -469,7 +469,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "sessions",
-    "v": 12
+    "v": 14
   },
   "startup_disclosures": {
     "data": {
@@ -486,7 +486,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "startup_disclosures",
-    "v": 12
+    "v": 14
   },
   "stats_rollup": {
     "data": {
@@ -592,7 +592,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "stats_rollup",
-    "v": 12
+    "v": 14
   },
   "subagent_history_page": {
     "data": {
@@ -613,7 +613,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "subagent_history_page",
-    "v": 12
+    "v": 14
   },
   "user_message_queued": {
     "data": {
@@ -647,7 +647,7 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "user_message_queued",
-    "v": 12
+    "v": 14
   },
   "workspace_trust_set": {
     "data": {
@@ -656,6 +656,6 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "kind": "res",
     "response": "workspace_trust_set",
-    "v": 12
+    "v": 14
   }
 }

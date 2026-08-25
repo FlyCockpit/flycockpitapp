@@ -25,7 +25,9 @@
 //! refuse envelopes whose `v` is outside the supported range.
 
 pub mod agent_installation;
+pub mod agent_management;
 pub mod capability_ceiling;
+pub mod config_management;
 #[cfg(feature = "remote")]
 pub mod es256;
 pub use agent_installation::{
@@ -35,6 +37,21 @@ pub use agent_installation::{
     AgentInstallationReceiptStatusV1, AgentInstallationRecordV1, AgentInstallationResultV1,
     AgentInstallationScopeWire, AgentInstallationSlotBindingStateV1, AgentInstallationSlotStatusV1,
     AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
+};
+pub use agent_management::{
+    AgentEditSnapshot, AgentEditorLease, AgentEntryKind, AgentInventoryEntry, AgentMutation,
+    AgentMutationOutcome, AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES,
+    MAX_AGENT_NAME_BYTES, MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES,
+    MAX_ASSISTANT_HOME_BYTES, agent_edit_projection_digest,
+    agent_inventory_entry_projection_digest, validate_agent_edit_snapshot,
+    validate_agent_mutation_envelope, validate_agent_source_identity,
+    validate_goal_supervision_projection,
+};
+pub use config_management::{
+    CockpitConfigLayer, CommittedDenylistEntry, ConfigCommitStatus, ConfigPublicationStatus,
+    DesiredDenylistEntry, ExtendedConfigField, ExtendedConfigLayerSnapshot, ExtendedConfigPatch,
+    ExtendedConfigPathMutation, OPAQUE_AUTHORITY_TOKEN_BYTES, REDACTED_DENYLIST_MASK,
+    RedactedDenylistEntry, RedactedOccurrenceMutation, is_opaque_authority_token,
 };
 pub mod bulk_transfer;
 pub mod host_capabilities;
@@ -1003,16 +1020,16 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version.
-///
-/// Current wire schema version. v12 adds daemon-owned agent installation RPCs.
+/// Current wire schema version. v14 adds exact identity-bearing settings,
+/// workspace-agent, and assistant-definition authority RPCs, including
+/// occurrence-bound denylist edits with nonce-bound committed receipts.
 /// (`assistant_display_*`) the live chip/stream path and retires the v9/v10
-/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 12.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 14.
+pub const PROTOCOL_VERSION: u32 = 14;
 
-/// Oldest wire schema version this binary accepts. v12 is current-only: the
+/// Oldest wire schema version this binary accepts. v14 is current-only: the
 /// display-event breaking change has no v9/v10-compatible fallback.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 12;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 14;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1027,6 +1044,14 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// escaping) fits comfortably in the remaining 349,524 bytes. 1 MiB is the
 /// smallest clean power-of-two bound with that headroom.
 pub const MAX_NDJSON_FRAME_BYTES: usize = 1_048_576;
+/// Maximum serialized daemon response envelope, including its trailing NDJSON
+/// newline. This deliberately leaves transport headroom beneath the codec's
+/// hard frame ceiling for escaping and envelope metadata.
+pub const MAX_SERIALIZED_RESPONSE_BYTES: usize = 900 * 1024;
+pub const MAX_AGENT_INVENTORY_ENTRIES: usize = 1_024;
+pub const MAX_ASSISTANT_SUMMARIES: usize = 512;
+pub const MAX_EXTENDED_CONFIG_LAYERS: usize = 32;
+pub const MAX_EXTENDED_CONFIG_SOURCE_BYTES: usize = 512 * 1024;
 
 /// Bounds for owner-only secret-management RPC fields. These are deliberately
 /// below the NDJSON frame limit so a single request cannot consume the whole
@@ -2176,13 +2201,138 @@ pub struct GoalSummary {
     pub updated_at: i64,
 }
 
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssistantSummary {
     pub name: String,
     pub created_at: i64,
     pub home_dir: String,
     pub config_json: String,
-    pub content_hash: String,
+    /// Digest of the already-redacted definition presentation. This is a UI
+    /// integrity hint only, never the daemon's raw file-integrity hash.
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub definition_presentation_hash: Option<String>,
+    /// Opaque CAS token for the raw registry binding itself. It is request-bound
+    /// through projection and consumed-revision receipts and is deliberately
+    /// not recomputable from this potentially redacted summary.
+    pub registration_revision: String,
+    /// Daemon-read exact authored definition; absent when the registered file
+    /// cannot be safely opened or parsed.
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub definition_markdown: Option<String>,
+    /// Opaque CAS token for the raw definition authority. Clients validate its
+    /// format and receipt binding, not equality to redacted presentation bytes.
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub definition_revision: Option<String>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub definition_diagnostic: Option<String>,
+    /// Digest over the exact already-redacted presentation returned to this
+    /// client. Authority revisions above remain opaque CAS tokens.
+    pub projection_digest: String,
+}
+
+/// Validate the self-contained invariants of a daemon assistant snapshot.
+/// Parsing the agent markdown remains an application-layer responsibility,
+/// but every client can enforce revision/diagnostic coherence and the exact
+/// redacted presentation digest without depending on `cockpit-core`.
+pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'static str> {
+    fn lower_hex_digest(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    }
+    if summary.name.is_empty()
+        || summary.name.len() > MAX_AGENT_NAME_BYTES
+        || summary.home_dir.len() > MAX_ASSISTANT_HOME_BYTES
+        || summary.config_json.len() > MAX_ASSISTANT_CONFIG_BYTES
+        || !lower_hex_digest(&summary.registration_revision)
+    {
+        return Err("assistant summary has no name or registration revision");
+    }
+    if !serde_json::from_str::<serde_json::Value>(&summary.config_json)
+        .is_ok_and(|value| value.is_object())
+    {
+        return Err("assistant config projection is not a JSON object");
+    }
+    if summary
+        .definition_markdown
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_AGENT_MARKDOWN_BYTES)
+        || summary
+            .definition_diagnostic
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > MAX_ASSISTANT_DIAGNOSTIC_BYTES)
+        || summary
+            .definition_presentation_hash
+            .as_deref()
+            .is_some_and(|value| !lower_hex_digest(value))
+    {
+        return Err("assistant definition projection exceeds its wire bounds");
+    }
+    match (
+        summary.definition_markdown.as_deref(),
+        summary.definition_revision.as_deref(),
+        summary.definition_diagnostic.as_deref(),
+    ) {
+        (Some(_), Some(revision), None)
+            if lower_hex_digest(revision) && summary.definition_presentation_hash.is_some() => {}
+        (None, None, Some(diagnostic))
+            if !diagnostic.trim().is_empty() && summary.definition_presentation_hash.is_none() => {}
+        _ => return Err("assistant definition snapshot is incoherent"),
+    }
+    if let (Some(markdown), Some(presentation_hash)) = (
+        summary.definition_markdown.as_deref(),
+        summary.definition_presentation_hash.as_deref(),
+    ) {
+        use sha2::Digest as _;
+        if format!("{:x}", sha2::Sha256::digest(markdown.as_bytes())) != presentation_hash {
+            return Err("assistant definition presentation hash is invalid");
+        }
+    }
+    if summary.projection_digest != assistant_projection_digest(summary) {
+        return Err("assistant projection digest is invalid");
+    }
+    Ok(())
+}
+
+pub fn assistant_projection_digest(summary: &AssistantSummary) -> String {
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"cockpit-assistant-projection-v1\0");
+    digest.update(summary.created_at.to_le_bytes());
+    for value in [
+        Some(summary.name.as_str()),
+        Some(summary.home_dir.as_str()),
+        Some(summary.config_json.as_str()),
+        summary.definition_presentation_hash.as_deref(),
+        Some(summary.registration_revision.as_str()),
+        summary.definition_markdown.as_deref(),
+        summary.definition_revision.as_deref(),
+        summary.definition_diagnostic.as_deref(),
+    ] {
+        match value {
+            Some(value) => {
+                digest.update([1]);
+                assistant_revision_field(&mut digest, value);
+            }
+            None => digest.update([0]),
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn assistant_revision_field(digest: &mut sha2::Sha256, value: &str) {
+    use sha2::Digest as _;
+    digest.update((value.len() as u64).to_le_bytes());
+    digest.update(value.as_bytes());
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2910,6 +3060,13 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "cancel_mcp_oauth"
                 | "setup_copilot_auth"
                 | "apply_setup_wizard"
+                | "get_agent_inventory"
+                | "get_agent_edit_snapshot"
+                | "mutate_agent"
+                | "begin_agent_editor_lease"
+                | "complete_agent_editor_lease"
+                | "get_extended_config_snapshot"
+                | "apply_extended_config_patch"
                 | "save_extended_config"
                 | "export_policy"
                 | "import_policy"
@@ -3340,7 +3497,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[12];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[14];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -3422,6 +3580,7 @@ mod proto_fixture_tests {
     fn frozen_fixture_supported_version_list_matches_directories() {
         let listed = SUPPORTED_PROTOCOL_VERSIONS
             .iter()
+            .chain(ARCHIVED_PROTOCOL_VERSIONS)
             .copied()
             .collect::<BTreeSet<_>>();
         assert!(
@@ -6415,6 +6574,7 @@ mod tests {
             },
             Request::DeleteAssistant {
                 name: "helper-bot".into(),
+                expected_revision: "revision".into(),
             },
             Request::DiagnoseMediaReservation {
                 scope: "session".into(),
@@ -6485,7 +6645,11 @@ mod tests {
                 session_ids_json: "[]".into(),
             },
             Response::Assistant { assistant: None },
-            Response::AssistantDeleted { deleted: true },
+            Response::AssistantDeleted {
+                name: "helper".into(),
+                consumed_registration_revision: "revision".into(),
+                deleted: true,
+            },
             Response::MediaReservationDiagnosis {
                 diagnosis_json: "{}".into(),
             },
@@ -6745,7 +6909,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v12_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v14_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -6796,13 +6960,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 12);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 12);
-        let fixture = proto_fixture_files::read_fixture_for(12, "response.json");
+        assert_eq!(PROTOCOL_VERSION, 14);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 14);
+        let fixture = proto_fixture_tests::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("v12 config_refreshed fixture")
+                .expect("current v14 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -6817,20 +6981,73 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 12);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 12);
-        let fixture = proto_fixture_files::read_fixture_for(12, "response.json");
+        assert_eq!(PROTOCOL_VERSION, 14);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 14);
+        let fixture = proto_fixture_tests::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("v12 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v14 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "v12 {response_name} must freeze the inclusive verification cap"
+                "current v14 {response_name} must freeze the inclusive verification cap"
             );
-            serde_json::from_value::<Response>(response.clone())
-                .unwrap_or_else(|error| panic!("v12 {response_name} must deserialize: {error}"));
+            serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
+                panic!("current v14 {response_name} must deserialize: {error}")
+            });
+        }
+    }
+
+    #[test]
+    fn assistant_registration_revision_is_present_in_current_response_fixtures() {
+        let fixture = proto_fixture_tests::read_fixture("response.json");
+        for response_name in ["assistant_upserted", "assistant_definition_saved"] {
+            let summary: AssistantSummary =
+                serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
+                    .unwrap();
+            validate_assistant_summary(&summary).unwrap_or_else(|error| {
+                panic!("current v14 {response_name} assistant identity is invalid: {error}")
+            });
+        }
+        let summary: AssistantSummary =
+            serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
+        validate_assistant_summary(&summary)
+            .expect("current v14 assistant inventory must carry bounded opaque revisions");
+    }
+
+    #[test]
+    fn authority_commit_receipts_are_frozen_in_current_response_fixtures() {
+        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let denylist = &fixture["extended_config_saved"]["data"]["denylist"];
+        assert_eq!(
+            denylist[0]["consumed_entry_id"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert!(denylist[0]["client_nonce"].is_null());
+        assert!(denylist[1]["consumed_entry_id"].is_null());
+        assert_eq!(
+            denylist[1]["client_nonce"],
+            "33333333-3333-4333-8333-333333333333"
+        );
+        assert_eq!(
+            fixture["agent_mutated"]["data"]["outcome"]["status"],
+            "reconciled"
+        );
+        assert_eq!(
+            fixture["agent_editor_lease_completed"]["data"]["outcome"]["status"],
+            "reconciled"
+        );
+    }
+
+    #[test]
+    fn archived_fixtures_are_retained_but_not_in_the_live_compatibility_window() {
+        for version in [12, 13] {
+            assert!(!is_protocol_compatible(version));
+            let archived = proto_fixture_tests::read_fixture_for(version, "response.json");
+            assert!(archived.contains_key("config_refreshed"));
+            assert!(archived.contains_key("goal_status"));
+            assert!(archived.contains_key("goal_updated"));
         }
     }
 }

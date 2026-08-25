@@ -338,16 +338,13 @@ fn learn_driver(
     // to keep `skill_manage` enabled through the rebuild is to use a name
     // not in the disabled-by-default list.  The `cockpit` publisher prefix
     // is reserved for binary-owned definitions, so change the vNext agentId.
-    let mut build_def = crate::agents::embedded_default("Build")
-        .expect("known built-in");
+    let mut build_def = crate::agents::embedded_default("Build").expect("known built-in");
     if let Some(vnext) = &mut build_def.vnext {
         vnext.agent_id = "authored/learnbuild".to_string();
     }
     std::fs::write(
         agents_dir.join("LearnBuild.md"),
-        build_def
-            .to_markdown()
-            .expect("v2 bundled override"),
+        build_def.to_markdown().expect("v2 bundled override"),
     )
     .unwrap();
     let mut providers = BTreeMap::new();

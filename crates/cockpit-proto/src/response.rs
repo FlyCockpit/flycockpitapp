@@ -423,6 +423,11 @@ pub enum Response {
         assistant: AssistantSummary,
     },
 
+    AssistantDefinitionSaved {
+        assistant: AssistantSummary,
+        consumed_definition_revision: String,
+    },
+
     AssistantSessionCreated {
         session: AssistantSessionCreated,
     },
@@ -553,11 +558,48 @@ pub enum Response {
     },
 
     /// Result of a daemon-owned extended config mutation. The target path is
-    /// intentionally not echoed; callers only receive the committed content
-    /// hash and can reload their own safe view.
+    /// intentionally not echoed; callers receive only an opaque committed
+    /// revision and can reload their own safe view.
     ExtendedConfigSaved {
         hash: String,
+        config_generation: u64,
+        layer_id: String,
+        layer: crate::CockpitConfigLayer,
+        consumed_revision: String,
+        result_revision: String,
+        status: crate::ConfigCommitStatus,
+        publication: crate::ConfigPublicationStatus,
+        /// Exact safe post-commit order. New occurrence nonces bind assigned
+        /// IDs to this request; no value-derived digest or literal is exposed.
+        denylist: Vec<crate::CommittedDenylistEntry>,
     },
+
+    /// Legacy whole-document writer receipt. Daemon-connected settings UI
+    /// never uses this unscoped path.
+    ExtendedConfigWritten {
+        hash: String,
+        config_generation: u64,
+    },
+
+    ExtendedConfigSnapshot {
+        layers: Vec<crate::ExtendedConfigLayerSnapshot>,
+        config_generation: u64,
+    },
+
+    AgentInventory {
+        entries: Vec<crate::AgentInventoryEntry>,
+        /// Opaque revision covering the resettable workspace inventory.
+        inventory_revision: String,
+        config_generation: u64,
+    },
+
+    AgentEditSnapshot(crate::AgentEditSnapshot),
+
+    AgentMutated(crate::AgentMutationResult),
+
+    AgentEditorLeaseBegun(crate::AgentEditorLease),
+
+    AgentEditorLeaseCompleted(crate::AgentMutationResult),
 
     /// Safe outcome of a daemon-owned setup wizard mutation.
     SetupWizardApplied {
@@ -806,6 +848,8 @@ pub enum Response {
     },
     /// Result of deleting an assistant registry row.
     AssistantDeleted {
+        name: String,
+        consumed_registration_revision: String,
         deleted: bool,
     },
     /// Media reservation accounting diagnosis as JSON.
@@ -1136,6 +1180,7 @@ macro_rules! response_variants {
             (Response::AssistantSessionResolved { .. }, "assistant_session_resolved");
             (Response::Assistants { .. }, "assistants");
             (Response::AssistantUpserted { .. }, "assistant_upserted");
+            (Response::AssistantDefinitionSaved { .. }, "assistant_definition_saved");
             (Response::AssistantSessionCreated { .. }, "assistant_session_created");
             (Response::AutoTitle { .. }, "auto_title");
             (Response::ExportSessionData { .. }, "export_session_data");
@@ -1158,6 +1203,13 @@ macro_rules! response_variants {
             (Response::FsRead { .. }, "fs_read");
             (Response::FsWrite { .. }, "fs_write");
             (Response::ExtendedConfigSaved { .. }, "extended_config_saved");
+            (Response::ExtendedConfigWritten { .. }, "extended_config_written");
+            (Response::ExtendedConfigSnapshot { .. }, "extended_config_snapshot");
+            (Response::AgentInventory { .. }, "agent_inventory");
+            (Response::AgentEditSnapshot(..), "agent_edit_snapshot");
+            (Response::AgentMutated(..), "agent_mutated");
+            (Response::AgentEditorLeaseBegun(..), "agent_editor_lease_begun");
+            (Response::AgentEditorLeaseCompleted(..), "agent_editor_lease_completed");
             (Response::SetupWizardApplied { .. }, "setup_wizard_applied");
             (Response::PolicyExported { .. }, "policy_exported");
             (Response::PolicyImported { .. }, "policy_imported");

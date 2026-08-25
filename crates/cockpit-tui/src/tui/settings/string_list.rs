@@ -290,7 +290,12 @@ impl SettingsCx {
         let glob = glob.trim();
         if !glob.is_empty() && !self.extended.gitignore_allow.iter().any(|g| g == glob) {
             self.extended.gitignore_allow.push(glob.to_string());
-            let _ = self.save_extended();
+            match self.save_extended() {
+                Ok(super::SettingsSaveOutcome::Saved) => {}
+                Ok(super::SettingsSaveOutcome::CommittedRefreshNeeded(warning)) | Err(warning) => {
+                    self.extended_warnings = vec![warning];
+                }
+            }
         }
     }
 

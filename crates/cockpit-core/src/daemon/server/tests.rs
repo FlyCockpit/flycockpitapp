@@ -8,9 +8,9 @@ use super::*;
 use crate::daemon::session_worker::{SessionWork, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownPhase;
 use crate::session::Session;
-use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "remote")]
 use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 // Brings the `Write` trait methods (`write_all`) into scope for the
 // `zip::ZipWriter` calls below without binding a name (so it neither shadows the
@@ -19,6 +19,21 @@ use std::io::Write as _;
 use std::sync::Mutex as StdMutex;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
+
+#[test]
+fn oversized_response_is_replaced_before_the_ndjson_writer() {
+    let id = Uuid::new_v4();
+    let envelope = bounded_response_envelope(
+        id,
+        Response::PolicyExported {
+            bundle_json: "x".repeat(proto::MAX_SERIALIZED_RESPONSE_BYTES),
+        },
+    );
+    assert!(matches!(&envelope.body, proto::Body::Error { .. }));
+    assert!(
+        serde_json::to_vec(&envelope).unwrap().len() + 1 <= proto::MAX_SERIALIZED_RESPONSE_BYTES
+    );
+}
 
 fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::WorkspaceTrustPolicy {
     crate::config::trust::WorkspaceTrustPolicy {
@@ -804,7 +819,7 @@ async fn project_note_list_preserves_sidebar_order() {
 }
 
 #[tokio::test]
-async fn upsert_assistant_rpc_parity_with_direct_db_call() {
+async fn upsert_assistant_rpc_creates_daemon_owned_definition() {
     // `upsert_assistant` is now an owner-remoted persistent mutation, so it is
     // dispatched against a persistent (non-ephemeral) daemon.
     let ctx = persistent_test_ctx();
@@ -812,9 +827,8 @@ async fn upsert_assistant_rpc_parity_with_direct_db_call() {
     let response = handle_request(
         Request::UpsertAssistant {
             name: "reviewer".into(),
-            home_dir: "/tmp/reviewer".into(),
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "reviewer".into(),
+            prompt: "review".into(),
         },
         &mut state,
         &ctx,
@@ -825,9 +839,15 @@ async fn upsert_assistant_rpc_parity_with_direct_db_call() {
         panic!("expected assistant")
     };
     assert_eq!(assistant.name, "reviewer");
+    let expected_hash = crate::assistants::markdown_content_hash(
+        assistant
+            .definition_markdown
+            .as_deref()
+            .expect("daemon returns the authored assistant markdown"),
+    );
     assert_eq!(
         ctx.db.list_assistants().await.unwrap()[0].content_hash,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        expected_hash
     );
 }
 
@@ -966,6 +986,7 @@ async fn ephemeral_daemon_rejects_new_persistent_mutations() {
         Request::PurgeEndedSessions { before: 0 },
         Request::DeleteAssistant {
             name: "helper-bot".into(),
+            expected_revision: "revision".into(),
         },
         Request::RepairMediaReservation {
             scope: "session".into(),
@@ -976,9 +997,8 @@ async fn ephemeral_daemon_rejects_new_persistent_mutations() {
         },
         Request::UpsertAssistant {
             name: "helper-bot".into(),
-            home_dir: "/tmp/helper".into(),
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "helper".into(),
+            prompt: "help".into(),
         },
     ];
     for request in mutations {
@@ -1406,9 +1426,8 @@ async fn upsert_assistant_rejects_non_owner_principal() {
     let error = handle_request(
         Request::UpsertAssistant {
             name: "reviewer".into(),
-            home_dir: "/tmp/reviewer".into(),
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "reviewer".into(),
+            prompt: "review".into(),
         },
         &mut state,
         &ctx,
@@ -13062,8 +13081,8 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
     // upgrade the fixture's AgentReadonly scope to Agent for this session's
     // project root. The actor binding still carries the authenticated device
     // identity that the FCM2 admission must stamp.
-    remote_identity.authorization = principal::RemoteAuthorization::LegacyRelayScopes(vec![
-        principal::PrincipalGrant {
+    remote_identity.authorization =
+        principal::RemoteAuthorization::LegacyRelayScopes(vec![principal::PrincipalGrant {
             scope: principal::PrincipalScope::Agent,
             project_root: Some(
                 project
@@ -13073,8 +13092,7 @@ async fn remote_bulk_ingress_uses_the_authenticated_actor_owner() {
                     .to_string_lossy()
                     .into_owned(),
             ),
-        },
-    ]);
+        }]);
     remote_identity.actor_binding = Some(crate::daemon::principal::ClientActorBindingV1 {
         schema_version: 1,
         device_id: operation.authenticated_device_id,
@@ -13853,7 +13871,6 @@ fn dispatch_matrix_class_for_command(
         | ("read_subagent_history_page", "custom", false)
         | ("session_live_status", "public_read", false)
         | ("get_run_invocation_status", "public_read", false)
-        | ("operation_status", "public_read", false)
         | ("goal_status", "session_row_reader", false)
         | ("get_inventory_bundle", "session_row_reader", false)
         | ("daemon_status", "public_read", false)
@@ -13862,6 +13879,8 @@ fn dispatch_matrix_class_for_command(
         | ("get_media_attachment_status", "public_read", false)
         | ("get_media_attachment_preview", "public_read", false)
         | ("get_media_upload_status", "public_read", false) => DispatchMatrixClass::Readonly,
+        #[cfg(feature = "remote")]
+        ("operation_status", "public_read", false) => DispatchMatrixClass::Readonly,
         ("attach_terminal", "terminal", false)
         | ("terminal_input", "terminal", false)
         | ("terminal_resize", "terminal", false)
@@ -14441,11 +14460,13 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
             effect_class: DriverForwarded,
             observation: "SessionWork::Pin delivered to attached worker",
         },
+        #[cfg(feature = "remote")]
         MutatingDispatchCase {
             kind: "store_flycockpit_credential",
             effect_class: Durable,
             observation: "credential file is written",
         },
+        #[cfg(feature = "remote")]
         MutatingDispatchCase {
             kind: "clear_flycockpit_credential",
             effect_class: Durable,
@@ -14507,6 +14528,7 @@ fn mutating_dispatch_case_list() -> Vec<MutatingDispatchCase> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AuthzExpectation {
     Allow(AuthzAllowedOutcome),
+    #[cfg(feature = "remote")]
     Deny(ErrorCode),
 }
 
@@ -14519,19 +14541,26 @@ enum AuthzAllowedOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthzLevel {
     Owner,
+    #[cfg(feature = "remote")]
     Writer,
+    #[cfg(feature = "remote")]
     Readonly,
+    #[cfg(feature = "remote")]
     NoAccess,
 }
 
 impl AuthzLevel {
+    #[cfg(feature = "remote")]
     const ALL: [Self; 4] = [Self::Owner, Self::Writer, Self::Readonly, Self::NoAccess];
 
     fn label(self) -> &'static str {
         match self {
             Self::Owner => "owner",
+            #[cfg(feature = "remote")]
             Self::Writer => "writer",
+            #[cfg(feature = "remote")]
             Self::Readonly => "readonly",
+            #[cfg(feature = "remote")]
             Self::NoAccess => "no_access",
         }
     }
@@ -14541,12 +14570,17 @@ impl AuthzLevel {
 struct AuthzDispatchCase {
     kind: &'static str,
     owner: AuthzExpectation,
+    #[cfg(feature = "remote")]
     writer: AuthzExpectation,
+    #[cfg(feature = "remote")]
     readonly: AuthzExpectation,
+    #[cfg(feature = "remote")]
     no_access: AuthzExpectation,
+    #[cfg(feature = "remote")]
     known_holes: &'static [AuthzKnownHole],
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug, Clone)]
 struct AuthzKnownHole {
     marker: &'static str,
@@ -14559,8 +14593,11 @@ impl AuthzDispatchCase {
     fn expectation(&self, level: AuthzLevel) -> AuthzExpectation {
         match level {
             AuthzLevel::Owner => self.owner.clone(),
+            #[cfg(feature = "remote")]
             AuthzLevel::Writer => self.writer.clone(),
+            #[cfg(feature = "remote")]
             AuthzLevel::Readonly => self.readonly.clone(),
+            #[cfg(feature = "remote")]
             AuthzLevel::NoAccess => self.no_access.clone(),
         }
     }
@@ -14570,15 +14607,28 @@ fn authz_owner_only(kind: &'static str) -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind,
         owner: authz_allow(kind),
+        #[cfg(feature = "remote")]
         writer: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         readonly: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
 
+#[cfg(feature = "remote")]
 fn authz_session_writer(kind: &'static str) -> AuthzDispatchCase {
     authz_session_writer_with_known_holes(kind, &[])
+}
+
+#[cfg(not(feature = "remote"))]
+fn authz_session_writer(kind: &'static str) -> AuthzDispatchCase {
+    AuthzDispatchCase {
+        kind,
+        owner: authz_allow(kind),
+    }
 }
 
 /// Bulk message bytes are bound to an authenticated remote operation, rather
@@ -14591,9 +14641,13 @@ fn authz_bulk_user_message() -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind: "send_user_message_bulk",
         owner: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::BadRequest)),
+        #[cfg(feature = "remote")]
         writer: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::Authorization)),
+        #[cfg(feature = "remote")]
         readonly: AuthzExpectation::Deny(ErrorCode::ReadOnly),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
@@ -14608,13 +14662,18 @@ fn authz_bulk_transfer_chunk() -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind: "write_bulk_transfer_chunk",
         owner: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::BadRequest)),
+        #[cfg(feature = "remote")]
         writer: AuthzExpectation::Allow(AuthzAllowedOutcome::Error(ErrorCode::BadRequest)),
+        #[cfg(feature = "remote")]
         readonly: AuthzExpectation::Deny(ErrorCode::ReadOnly),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
 
+#[cfg(feature = "remote")]
 fn authz_session_writer_with_known_holes(
     kind: &'static str,
     known_holes: &'static [AuthzKnownHole],
@@ -14633,9 +14692,13 @@ fn authz_session_reader(kind: &'static str) -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind,
         owner: authz_allow(kind),
+        #[cfg(feature = "remote")]
         writer: authz_allow(kind),
+        #[cfg(feature = "remote")]
         readonly: authz_allow(kind),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
@@ -14644,9 +14707,13 @@ fn authz_project_files(kind: &'static str) -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind,
         owner: authz_allow(kind),
+        #[cfg(feature = "remote")]
         writer: authz_allow(kind),
+        #[cfg(feature = "remote")]
         readonly: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
@@ -14655,9 +14722,13 @@ fn authz_project_read(kind: &'static str) -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind,
         owner: authz_allow(kind),
+        #[cfg(feature = "remote")]
         writer: authz_allow(kind),
+        #[cfg(feature = "remote")]
         readonly: authz_allow(kind),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
@@ -14666,9 +14737,13 @@ fn authz_terminal(kind: &'static str) -> AuthzDispatchCase {
     AuthzDispatchCase {
         kind,
         owner: authz_allow(kind),
+        #[cfg(feature = "remote")]
         writer: authz_allow(kind),
+        #[cfg(feature = "remote")]
         readonly: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         no_access: AuthzExpectation::Deny(ErrorCode::Authorization),
+        #[cfg(feature = "remote")]
         known_holes: &[],
     }
 }
@@ -15616,7 +15691,59 @@ async fn authz_dispatch_matrix_covers_every_controlled_kind() {
     }
 }
 
+// Keep an owner-principal traversal in the default local profile. The full
+// remote role matrix below is feature-gated because its principals do not
+// exist in a local build, but every default controlled command must still pass
+// through the same socket transport and central authorization path. The
+// readonly/mutating matrix tests above retain the corresponding malformed and
+// invalid-state traversal for every dispatchable command.
 #[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
+    assert_dispatch_matrix_coverage_complete();
+    for case in authz_dispatch_cases() {
+        let ctx = test_ctx();
+        let tmp = tempfile::tempdir().unwrap();
+        let (session_id, work_rx) = live_worker_with_receiver(&ctx, tmp.path()).await;
+        ctx.db
+            .set_session_shared_with_collaborators(session_id, true)
+            .await
+            .unwrap();
+        ctx.db
+            .insert_session_event(
+                session_id,
+                crate::db::session_log::SessionEventKind::UserMessage,
+                Some("Build"),
+                None,
+                &serde_json::json!({"text": "local owner authz matrix"}),
+            )
+            .await
+            .unwrap();
+
+        let needs_attached = authz_kind_needs_attached_state(case.kind, AuthzLevel::Owner);
+        let prelude = if needs_attached {
+            vec![attach_existing_request(session_id, tmp.path())]
+        } else {
+            Vec::new()
+        };
+        let worker_rx_to_drop_after_prelude = needs_attached.then_some(work_rx);
+        let result = dispatch_authz_request_after(
+            &ctx,
+            ClientPrincipal::owner(),
+            prelude,
+            None,
+            worker_rx_to_drop_after_prelude,
+            authz_matrix_request(case.kind, session_id, tmp.path()),
+        )
+        .await;
+        let AuthzExpectation::Allow(expected) = case.expectation(AuthzLevel::Owner) else {
+            panic!("{} must authorize the local owner", case.kind);
+        };
+        assert_authz_allowed_outcome(case.kind, AuthzLevel::Owner, expected, result);
+    }
+}
+
+#[cfg(all(unix, feature = "remote"))]
 struct AuthzSocketScenario {
     ctx: Arc<DaemonContext>,
     principal: ClientPrincipal,
@@ -15628,7 +15755,7 @@ struct AuthzSocketScenario {
     _tmp: tempfile::TempDir,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "remote"))]
 fn assert_authz_matrix_result(
     case: &AuthzDispatchCase,
     level: AuthzLevel,
@@ -16113,9 +16240,8 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         "list_assistants" => Request::ListAssistants,
         "upsert_assistant" => Request::UpsertAssistant {
             name: "a".into(),
-            home_dir: root,
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "assistant".into(),
+            prompt: root,
         },
         "resolve_assistant_session" => Request::ResolveAssistantSession {
             assistant_id: "missing-assistant".into(),
@@ -16813,6 +16939,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         },
         "delete_assistant" => Request::DeleteAssistant {
             name: "helper-bot".into(),
+            expected_revision: "revision".into(),
         },
         "diagnose_media_reservation" => Request::DiagnoseMediaReservation {
             scope: "session".into(),
@@ -20452,9 +20579,8 @@ async fn assert_new_daemon_rpc_mutating_happy(kind: &str) {
         },
         "upsert_assistant" => Request::UpsertAssistant {
             name: "a".into(),
-            home_dir: "/repo".into(),
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "assistant".into(),
+            prompt: "help".into(),
         },
         _ => unreachable!(),
     };
@@ -20498,9 +20624,8 @@ async fn assert_new_daemon_rpc_mutating_malformed(kind: &str) {
         },
         "upsert_assistant" => Request::UpsertAssistant {
             name: "a".into(),
-            home_dir: "/repo".into(),
-            config_json: "{}".into(),
-            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            description: "assistant".into(),
+            prompt: "help".into(),
         },
         _ => unreachable!(),
     };
@@ -21727,7 +21852,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
             (*ordering == principal::RequestOrdering::Concurrent).then_some(*kind)
         })
         .collect();
-    let mut expected = BTreeSet::from([
+    let expected_base = [
         "agent_installation_inspect",
         "agent_installation_list",
         "daemon_status",
@@ -21778,9 +21903,14 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "get_assistant",
         "diagnose_media_reservation",
         "get_doctor_snapshot",
-    ]);
+    ];
+    #[cfg(not(feature = "remote"))]
+    let expected = BTreeSet::from(expected_base);
     #[cfg(feature = "remote")]
-    expected.extend(["get_connector_state", "get_org_sync_status"]);
+    let expected = expected_base
+        .into_iter()
+        .chain(["get_connector_state", "get_org_sync_status"])
+        .collect();
     assert_eq!(actual, expected);
     for serialized in [
         "attach",
@@ -21828,7 +21958,6 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
     }
 }
 
-#[cfg(feature = "remote")]
 #[tokio::test]
 async fn command_table_metadata_is_exhaustive_and_stable() {
     struct CommandMetadataCase {
@@ -21973,6 +22102,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             audit_path: None,
             mutating: false,
         },
+        #[cfg(feature = "remote")]
         CommandMetadataCase {
             request: Request::OperationStatus {
                 operation_id: Uuid::from_u128(99),
@@ -22849,6 +22979,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             audit_path: None,
             mutating: true,
         },
+        #[cfg(feature = "remote")]
         CommandMetadataCase {
             request: Request::StoreFlycockpitCredential {
                 credential: flycockpit_credential(),
@@ -22859,6 +22990,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             audit_path: None,
             mutating: true,
         },
+        #[cfg(feature = "remote")]
         CommandMetadataCase {
             request: Request::ClearFlycockpitCredential,
             kind: "clear_flycockpit_credential",
@@ -22915,6 +23047,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             audit_path: None,
             mutating: true,
         },
+        #[cfg(feature = "remote")]
         CommandMetadataCase {
             request: Request::GetFlycockpitAccount,
             kind: "get_flycockpit_account",
@@ -23340,9 +23473,8 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase {
             request: Request::UpsertAssistant {
                 name: "a".into(),
-                home_dir: "/tmp".into(),
-                config_json: "{}".into(),
-                content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                description: "assistant".into(),
+                prompt: "help".into(),
             },
             kind: "upsert_assistant",
             session_id: None,
@@ -23589,8 +23721,11 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             audit_path: None,
             mutating: true,
         },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::SetFlycockpitConnectorEnabled { enabled: true }, kind: "set_flycockpit_connector_enabled", session_id: None, audit_path: None, mutating: true },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::SyncFlycockpitOrgPolicy, kind: "sync_flycockpit_org_policy", session_id: None, audit_path: None, mutating: true },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::EnrollFlycockpitOrgSync { org_id: "org-fixture".into() }, kind: "enroll_flycockpit_org_sync", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::PutSubscriptionAck { provider_id: "codex-oauth".into() }, kind: "put_subscription_ack", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::BeginProviderOAuth { provider_id: "example".into() }, kind: "begin_provider_oauth", session_id: None, audit_path: None, mutating: false },
@@ -23634,13 +23769,15 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::ImportPackage { project_root: project_root.clone(), dir: None, package: None, id: None, as_path: false }, kind: "import_package", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::PrunePackages { project_root: project_root.clone(), days: 30, dry_run: false }, kind: "prune_packages", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ImportKclPackages { project_root: project_root.clone() }, kind: "import_kcl_packages", session_id: None, audit_path: None, mutating: true },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::GetConnectorState, kind: "get_connector_state", session_id: None, audit_path: None, mutating: false },
+        #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::GetOrgSyncStatus, kind: "get_org_sync_status", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::ListFailedToolCalls { since_epoch: 0, tool: None, model: None, project_id: None, include_recovered: false, limit: 20 }, kind: "list_failed_tool_calls", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::GetSessionCompactions { session_id }, kind: "get_session_compactions", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::PurgeEndedSessions { before: 0 }, kind: "purge_ended_sessions", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetAssistant { name: "a".into() }, kind: "get_assistant", session_id: None, audit_path: None, mutating: false },
-        CommandMetadataCase { request: Request::DeleteAssistant { name: "a".into() }, kind: "delete_assistant", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::DeleteAssistant { name: "a".into(), expected_revision: "revision".into() }, kind: "delete_assistant", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::DiagnoseMediaReservation { scope: "s".into(), id: "i".into() }, kind: "diagnose_media_reservation", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::RepairMediaReservation { scope: "s".into(), id: "i".into(), expected_block_generation: 0, repair_plan_digest: "d".into(), idempotency_key: "k".into() }, kind: "repair_media_reservation", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetDoctorSnapshot { project_root: None, no_sandbox: false, offline: false }, kind: "get_doctor_snapshot", session_id: None, audit_path: None, mutating: false },
@@ -23658,7 +23795,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
     // expected-coverage set, so there is no hand-bumped count literal to
     // go stale.
     macro_rules! request_variants {
-            ($($variant:ident),* $(,)?) => {
+            ($($(#[$variant_attr:meta])* $variant:ident),* $(,)?) => {
                 fn request_variant_name(request: &Request) -> &'static str {
                     match request {
                         Request::RecoverSecurityBlockedMedia(..) => "RecoverSecurityBlockedMedia",
@@ -23676,7 +23813,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                         Request::AgentInstallationSubmitChoice(..) => "AgentInstallationSubmitChoice",
                         Request::AgentInstallationList(..) => "AgentInstallationList",
                         Request::AgentInstallationInspect(..) => "AgentInstallationInspect",
-                        $(Request::$variant { .. } => stringify!($variant),)*
+                        #[cfg(feature = "remote")]
+                        Request::OperationStatus { .. } => "OperationStatus",
+                        $($(#[$variant_attr])* Request::$variant { .. } => stringify!($variant),)*
                         Request::Unknown => "Unknown",
                     }
                 }
@@ -23687,7 +23826,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
                     "FinalizeMediaUpload", "DiscardUnreferencedMediaAttachment",
                     "AgentInstallationBegin", "AgentInstallationSubmitChoice",
                     "AgentInstallationList", "AgentInstallationInspect",
-                    $(stringify!($variant)),*, "Unknown"
+                    #[cfg(feature = "remote")]
+                    "OperationStatus",
+                    $($(#[$variant_attr])* stringify!($variant)),*, "Unknown"
                 ];
             };
         }
@@ -23700,7 +23841,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         SendUserMessage,
         SendUserMessageBulk,
         GetRunInvocationStatus,
-        OperationStatus,
         CancelRunInvocation,
         SteerDelegation,
         BeginAttachmentUpload,
@@ -23822,10 +23962,15 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         Prune,
         Compact,
         Pin,
+        #[cfg(feature = "remote")]
         StoreFlycockpitCredential,
+        #[cfg(feature = "remote")]
         ClearFlycockpitCredential,
+        #[cfg(feature = "remote")]
         SetFlycockpitConnectorEnabled,
+        #[cfg(feature = "remote")]
         SyncFlycockpitOrgPolicy,
+        #[cfg(feature = "remote")]
         EnrollFlycockpitOrgSync,
         ListSecretInventory,
         PutNamedSecret,
@@ -23838,6 +23983,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         BeginMcpOAuth,
         CompleteMcpOAuth,
         CancelMcpOAuth,
+        #[cfg(feature = "remote")]
         GetFlycockpitAccount,
         GetProviderCatalogSnapshot,
         FetchProviderModels,
@@ -23887,7 +24033,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         ImportPackage,
         PrunePackages,
         ImportKclPackages,
+        #[cfg(feature = "remote")]
         GetConnectorState,
+        #[cfg(feature = "remote")]
         GetOrgSyncStatus,
         ListFailedToolCalls,
         GetSessionCompactions,
@@ -27556,6 +27704,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         upload_accounting: base.upload_accounting.clone(),
         #[cfg(feature = "remote")]
         connector_wake: base.connector_wake.clone(),
+        #[cfg(feature = "remote")]
+        remote_operation_locks: base.remote_operation_locks.clone(),
         scheduler: base.scheduler.clone(),
         image_generation_boot_id: base.image_generation_boot_id,
         _image_generation_worker: None,
@@ -27768,6 +27918,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         upload_accounting: base.upload_accounting.clone(),
         #[cfg(feature = "remote")]
         connector_wake: base.connector_wake.clone(),
+        #[cfg(feature = "remote")]
+        remote_operation_locks: base.remote_operation_locks.clone(),
         scheduler: base.scheduler.clone(),
         image_generation_boot_id: base.image_generation_boot_id,
         _image_generation_worker: None,

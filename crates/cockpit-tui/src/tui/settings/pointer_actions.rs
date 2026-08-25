@@ -24,7 +24,50 @@ pub(super) enum GenerationNodeId {
     Jobs,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct AgentId(pub String);
+pub(super) struct AgentId {
+    name: String,
+    occurrence: String,
+}
+impl AgentId {
+    pub(super) fn workspace(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            occurrence: "workspace:unbound".into(),
+        }
+    }
+
+    pub(super) fn workspace_occurrence(name: &str, source_identity: &str, revision: &str) -> Self {
+        Self {
+            name: name.into(),
+            occurrence: format!("workspace:{source_identity}:{revision}"),
+        }
+    }
+
+    pub(super) fn assistant(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            occurrence: "assistant:unbound".into(),
+        }
+    }
+
+    pub(super) fn assistant_occurrence(name: &str, registration_revision: &str) -> Self {
+        Self {
+            name: name.into(),
+            occurrence: format!("assistant:{registration_revision}"),
+        }
+    }
+
+    pub(super) fn reset_all() -> Self {
+        Self {
+            name: "reset-all".into(),
+            occurrence: "action:reset-all".into(),
+        }
+    }
+
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ProviderId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

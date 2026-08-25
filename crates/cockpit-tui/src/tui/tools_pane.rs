@@ -5,7 +5,7 @@ use crate::tui::tool_surface_picker::{
     ToolSurfaceDraft, ToolSurfaceEditOutcome, ToolSurfacePicker, ToolSurfaceRender,
     tool_surface_lines,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use cockpit_core::agents::{AgentDef, ToolSurfaceSelection, ToolTier};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -35,6 +35,8 @@ pub(crate) struct ToolsPane {
     root_foreground: bool,
     original: ToolSurfaceSelection,
     def: AgentDef,
+    revision: String,
+    editable: bool,
     draft: ToolSurfaceDraft,
     picker: ToolSurfacePicker,
     status: Option<String>,
@@ -45,8 +47,28 @@ pub(crate) struct ToolsPane {
 
 impl ToolsPane {
     pub(crate) fn open(cwd: &Path, agent_name: &str, root_foreground: bool) -> Result<Self> {
-        let def = cockpit_core::agents::resolve(cwd, agent_name)?
-            .ok_or_else(|| anyhow::anyhow!("agent `{agent_name}` could not be resolved"))?;
+        let response = crate::tui::agent_runner::daemon_request_blocking(
+            cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+                project_root: cwd.to_string_lossy().into_owned(),
+                name: agent_name.to_string(),
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) = response else {
+            anyhow::bail!("daemon returned an unexpected agent snapshot");
+        };
+        cockpit_proto::validate_agent_source_identity(&snapshot, cwd.to_string_lossy().as_ref())
+            .map_err(anyhow::Error::msg)?;
+        if snapshot.name != agent_name
+            || snapshot.markdown.len() > cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES
+        {
+            anyhow::bail!("daemon returned a misrouted or oversized agent snapshot");
+        }
+        let def = cockpit_core::agents::parse_agent(
+            &snapshot.markdown,
+            agent_name,
+            PathBuf::from("<daemon-agent-snapshot>"),
+        )?;
         let draft = ToolSurfaceDraft::from_def(&def);
         let original = draft.selection().clone();
         let status = (!root_foreground).then(|| {
@@ -58,6 +80,8 @@ impl ToolsPane {
             root_foreground,
             original,
             def,
+            revision: snapshot.revision,
+            editable: snapshot.editable,
             draft,
             picker: ToolSurfacePicker::default(),
             status,
@@ -137,7 +161,7 @@ impl ToolsPane {
                 }
                 None
             }
-            KeyCode::Enter | KeyCode::Char('y') => Some(self.confirmed_save()),
+            KeyCode::Enter | KeyCode::Char('y') => self.confirmed_save(),
             _ => None,
         }
     }
@@ -161,25 +185,25 @@ impl ToolsPane {
         self.status = Some(parts.join(" | "));
     }
 
-    fn confirmed_save(&mut self) -> ToolsOutcome {
+    fn confirmed_save(&mut self) -> Option<ToolsOutcome> {
         if !self.root_foreground {
             self.confirm = None;
             self.status = Some(
                 "Tool surface changes were refused because an interactive subagent holds the foreground."
                     .to_string(),
             );
-            return ToolsOutcome::Close;
+            return None;
         }
         let target = self.confirm.take().unwrap_or(ToolsSaveTarget::Session);
         match self.build_save(target) {
-            Ok(outcome) => outcome,
+            Ok(outcome) => Some(outcome),
             Err(error) => {
                 let message = error.to_string();
                 if let Some(tool) = backticked_tool(&message) {
                     self.row_errors.insert(tool, message.clone());
                 }
                 self.status = Some(message);
-                ToolsOutcome::Close
+                None
             }
         }
     }
@@ -212,10 +236,37 @@ impl ToolsPane {
         })
     }
 
-    fn write_agent_def(&self, def: &AgentDef) -> Result<()> {
-        let path = agent_edit_path(&self.cwd, &self.agent_name)?;
+    fn write_agent_def(&mut self, def: &AgentDef) -> Result<()> {
         let markdown = def.to_markdown()?;
-        std::fs::write(&path, markdown).with_context(|| format!("writing {}", path.display()))?;
+        let prior_revision = self.revision.clone();
+        let mutation = cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
+            name: self.agent_name.clone(),
+            markdown,
+        };
+        let response = crate::tui::agent_runner::daemon_request_blocking(
+            cockpit_core::daemon::proto::Request::MutateAgent {
+                project_root: self.cwd.to_string_lossy().into_owned(),
+                mutation: mutation.clone(),
+                expected_revision: Some(prior_revision.clone()),
+            },
+        )
+        .map_err(anyhow::Error::msg)?;
+        let cockpit_core::daemon::proto::Response::AgentMutated(result) = response else {
+            anyhow::bail!("daemon returned an unexpected agent-save response");
+        };
+        crate::tui::settings::agents_page::validate_agent_mutation_result(
+            &result,
+            &self.cwd,
+            &mutation,
+            Some(&prior_revision),
+            None,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let snapshot = result
+            .snapshot
+            .ok_or_else(|| anyhow::anyhow!("daemon omitted the saved snapshot"))?;
+        self.revision = snapshot.revision;
+        self.editable = snapshot.editable;
         Ok(())
     }
 
@@ -273,17 +324,6 @@ impl ToolsPane {
             parts.push(format!("monty tools disabled: {}", disabled.join(", ")));
         }
         (!parts.is_empty()).then(|| parts.join("; "))
-    }
-}
-
-fn agent_edit_path(cwd: &Path, name: &str) -> Result<PathBuf> {
-    if cockpit_core::agents::is_builtin_agent(name) {
-        let config_dir = cwd.join(".cockpit");
-        let (path, _newly) = cockpit_core::agents::eject_builtin(cwd, &config_dir, name)?;
-        Ok(path)
-    } else {
-        cockpit_core::agents::find_override(cwd, name)
-            .ok_or_else(|| anyhow::anyhow!("custom agent `{name}` has no on-disk file"))
     }
 }
 
@@ -369,6 +409,8 @@ mod tests {
             root_foreground: true,
             original: draft.selection().clone(),
             def,
+            revision: "test-revision".into(),
+            editable: true,
             draft,
             picker: ToolSurfacePicker::default(),
             status: None,
@@ -454,10 +496,10 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            ToolsOutcome::Apply {
+            Some(ToolsOutcome::Apply {
                 persist_session: true,
                 ..
-            }
+            })
         ));
         assert!(
             !tmp.path()
@@ -479,7 +521,7 @@ mod tests {
 
         let outcome = pane.confirmed_save();
 
-        assert_eq!(outcome, ToolsOutcome::Close);
+        assert_eq!(outcome, None);
         let status = pane.status.as_deref();
         assert!(
             status.is_some_and(|message| message.contains("unavailable for vNext agents")),

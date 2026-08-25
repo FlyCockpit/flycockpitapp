@@ -38,7 +38,7 @@
 //! background task writes into and the event loop reads on each tick.
 
 mod agent_editor;
-mod agents_page;
+pub(crate) mod agents_page;
 mod auth;
 mod category;
 mod dependencies_page;
@@ -81,17 +81,11 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-#[cfg(test)]
-use cockpit_config::dirs::scaffold_config_dir;
 use cockpit_config::dirs::{
     CONFIG_FILE, ConfigDir, ConfigDirKind, config_write_target_for_provider, creatable_config_dirs,
     cwd_scoped_creatable_dirs, discover_config_dirs,
 };
 use cockpit_config::extended::ExtendedConfig;
-#[cfg(test)]
-use cockpit_config::extended::ExtendedConfigDoc;
-#[cfg(test)]
-use cockpit_config::providers::ConfigDoc;
 use cockpit_config::providers::{OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig};
 
 /// Settings-side operations that need provider secrets must use the persistent
@@ -134,52 +128,674 @@ fn run_settings_daemon<T>(
     Err("settings daemon RPC requires the application runtime".to_string())
 }
 
-fn write_settings_text_via_daemon(
+/// Injectable transport boundary for settings daemon effects.  Both the real
+/// client and tests feed responses through the same snapshot/patch/receipt
+/// validation below; a test double may replace only transport, never config
+/// loading or persistence.
+trait SettingsDaemonEffect: Send + Sync {
+    fn request(&self, request: Request) -> Result<Response, String>;
+}
+
+struct ProductionSettingsDaemonEffect;
+
+impl SettingsDaemonEffect for ProductionSettingsDaemonEffect {
+    fn request(&self, request: Request) -> Result<Response, String> {
+        run_settings_daemon(async move {
+            let client = settings_daemon_client()
+                .await
+                .map_err(|error| error.to_string())?;
+            client
+                .request(request)
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SETTINGS_DAEMON_EFFECT: std::cell::RefCell<Option<Arc<dyn SettingsDaemonEffect>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn settings_daemon_request(request: Request) -> Result<Response, String> {
+    #[cfg(test)]
+    if let Some(effect) = TEST_SETTINGS_DAEMON_EFFECT.with(|slot| slot.borrow().clone()) {
+        return effect.request(request);
+    }
+    ProductionSettingsDaemonEffect.request(request)
+}
+
+#[cfg(test)]
+fn with_settings_daemon_effect<T>(
+    effect: Arc<dyn SettingsDaemonEffect>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<Arc<dyn SettingsDaemonEffect>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SETTINGS_DAEMON_EFFECT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = TEST_SETTINGS_DAEMON_EFFECT.with(|slot| slot.replace(Some(effect)));
+    let _reset = Reset(previous);
+    operation()
+}
+
+fn config_layer_request(
+    _path: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+) -> Result<String, String> {
+    let cwd = std::env::current_dir().ok();
+    let request_root = project_root.or(cwd.as_deref());
+    request_root
+        .map(|root| root.display().to_string())
+        .ok_or_else(|| "settings request has no workspace root".to_string())
+}
+
+fn settings_snapshot_session_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+const DENYLIST_EXISTING_DRAFT_PREFIX: &str = "__cockpit_existing_denylist_occurrence_v1:";
+
+enum DenylistDraftEntry<'a> {
+    Existing(&'a str),
+    New(&'a str),
+}
+
+fn denylist_draft_entry(value: &str) -> Result<DenylistDraftEntry<'_>, String> {
+    match value.strip_prefix(DENYLIST_EXISTING_DRAFT_PREFIX) {
+        Some("") => Err("denylist draft contains an empty occurrence token".into()),
+        Some(entry_id) => Ok(DenylistDraftEntry::Existing(entry_id)),
+        None => Ok(DenylistDraftEntry::New(value)),
+    }
+}
+
+fn existing_denylist_draft(entry_id: &str) -> String {
+    format!("{DENYLIST_EXISTING_DRAFT_PREFIX}{entry_id}")
+}
+
+fn extended_config_layer_snapshot(
     path: &std::path::Path,
     project_root: Option<&std::path::Path>,
-    content: String,
-) -> Result<(), String> {
-    let (root, relative) = project_root
-        .filter(|root| path.starts_with(root))
-        .and_then(|root| {
-            path.strip_prefix(root)
-                .ok()
-                .map(|relative| (root, relative))
-        })
-        .or_else(|| {
-            path.parent().and_then(|root| {
-                path.file_name()
-                    .map(|name| (root, std::path::Path::new(name)))
-            })
-        })
-        .ok_or_else(|| "settings write target has no parent".to_string())?;
-    let project_root = root.display().to_string();
-    let relative = relative.display().to_string();
-    // The daemon owns the target and performs the freshness check. The TUI
-    // must not read config.json merely to compute a hash: legacy layers can
-    // contain literal secrets before daemon redaction.
-    let base_hash = None;
-    run_settings_daemon(async move {
-        let client = settings_daemon_client()
-            .await
-            .map_err(|error| error.to_string())?;
-        match client
-            .request(Request::SaveExtendedConfig {
-                project_root,
-                path: relative,
-                content,
-                base_hash,
-            })
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            Ok(Response::ExtendedConfigSaved { .. }) => Ok(()),
-            Ok(other) => Err(format!(
-                "unexpected settings file-write response: {other:?}"
-            )),
-            Err(error) => Err(error.to_string()),
+) -> Result<(ExtendedConfig, serde_json::Value, String), String> {
+    let project_root = config_layer_request(path, project_root)?;
+    let requested_path = path.display().to_string();
+    match settings_daemon_request(Request::GetExtendedConfigSnapshot {
+        project_root,
+        snapshot_session_id: settings_snapshot_session_id().to_owned(),
+    })? {
+        Response::ExtendedConfigSnapshot {
+            layers,
+            config_generation,
+        } => {
+            let layer = layers
+                .into_iter()
+                .find(|layer| layer.display_path == requested_path)
+                .ok_or_else(|| "settings target is not a daemon-discovered layer".to_string())?;
+            decode_extended_layer(layer, config_generation)
         }
-    })
+        other => Err(format!("unexpected settings snapshot response: {other:?}")),
+    }
+}
+
+fn decode_extended_layer(
+    layer: cockpit_core::daemon::proto::ExtendedConfigLayerSnapshot,
+    config_generation: u64,
+) -> Result<(ExtendedConfig, serde_json::Value, String), String> {
+    let layer_uuid = uuid::Uuid::parse_str(&layer.layer_id)
+        .map_err(|_| "settings layer capability is malformed".to_string())?;
+    if layer_uuid.to_string() != layer.layer_id
+        || !cockpit_proto::is_opaque_authority_token(&layer.revision)
+    {
+        return Err("settings layer authority tokens are malformed".into());
+    }
+    let mut denylist_ids = std::collections::HashSet::new();
+    if layer.denylist.iter().any(|entry| {
+        !cockpit_proto::is_opaque_authority_token(&entry.entry_id)
+            || entry.display_mask != cockpit_proto::REDACTED_DENYLIST_MASK
+            || !denylist_ids.insert(entry.entry_id.as_str())
+    }) {
+        return Err("settings denylist snapshot contains invalid occurrence tokens".into());
+    }
+    let mut config = *layer.config;
+    let denylist = layer.denylist;
+    let revision = layer.revision;
+    let authored_paths = layer.authored_paths;
+    config.redact.denylist = denylist
+        .iter()
+        .map(|entry| existing_denylist_draft(&entry.entry_id))
+        .collect();
+    let mut value = serde_json::to_value(&config).map_err(|error| error.to_string())?;
+    value
+        .as_object_mut()
+        .expect("ExtendedConfig serializes as object")
+        .insert(
+            "__cockpit_denylist_entries".into(),
+            serde_json::to_value(denylist).map_err(|error| error.to_string())?,
+        );
+    value
+        .as_object_mut()
+        .expect("ExtendedConfig serializes as object")
+        .insert(
+            "__cockpit_settings_authored_paths".into(),
+            serde_json::to_value(authored_paths).map_err(|error| error.to_string())?,
+        );
+    value
+        .as_object_mut()
+        .expect("ExtendedConfig serializes as object")
+        .insert(
+            "__cockpit_settings_layer_kind".into(),
+            serde_json::to_value(layer.kind).map_err(|error| error.to_string())?,
+        );
+    value
+        .as_object_mut()
+        .expect("ExtendedConfig serializes as object")
+        .insert(
+            "__cockpit_settings_generation".into(),
+            serde_json::Value::Number(config_generation.into()),
+        );
+    value
+        .as_object_mut()
+        .expect("ExtendedConfig serializes as object")
+        .insert(
+            "__cockpit_settings_layer_id".into(),
+            serde_json::Value::String(layer.layer_id),
+        );
+    Ok((config, value, revision))
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum SettingsPatchOutcome {
+    Reconciled {
+        layer: cockpit_core::daemon::proto::ExtendedConfigLayerSnapshot,
+        config_generation: u64,
+    },
+    CommittedRefreshNeeded {
+        result_revision: String,
+        config_generation: u64,
+        warning: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SettingsSaveOutcome {
+    Saved,
+    CommittedRefreshNeeded(String),
+}
+
+fn apply_settings_patch_via_daemon(
+    path: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+    base: &serde_json::Value,
+    desired: &ExtendedConfig,
+    revision: &str,
+) -> Result<SettingsPatchOutcome, String> {
+    let desired_value = serde_json::to_value(desired).map_err(|error| error.to_string())?;
+    let operations = changed_extended_paths(base, &desired_value)?;
+    let denylist = denylist_mutations(base, &desired.redact.denylist)?;
+    let denylist_receipt_plan = denylist.clone();
+    let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+        operations: operations.clone(),
+        materialize: false,
+        denylist,
+        redacted_mutations: Vec::new(),
+    };
+    let project_root = config_layer_request(path, project_root)?;
+    let layer_id = base
+        .get("__cockpit_settings_layer_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "settings snapshot omitted its layer capability".to_string())?
+        .to_owned();
+    let expected_revision = revision.to_string();
+    let expected_layer = serde_json::from_value(
+        base.get("__cockpit_settings_layer_kind")
+            .cloned()
+            .ok_or_else(|| "settings snapshot omitted its layer kind".to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let expected_generation = base
+        .get("__cockpit_settings_generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
+    let requested_path = path.display().to_string();
+    let response = settings_daemon_request(Request::ApplyExtendedConfigPatch {
+        project_root: project_root.clone(),
+        layer_id: layer_id.clone(),
+        patch,
+        expected_revision: expected_revision.clone(),
+        snapshot_session_id: settings_snapshot_session_id().to_owned(),
+    });
+    let (result_revision, result_generation, committed_denylist, warning) = match response {
+        Ok(Response::ExtendedConfigSaved {
+            hash,
+            config_generation,
+            layer_id: returned_layer_id,
+            layer,
+            consumed_revision,
+            result_revision,
+            status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+            publication,
+            denylist: committed_denylist,
+        }) if returned_layer_id == layer_id
+            && layer == expected_layer
+            && consumed_revision == expected_revision
+            && hash == result_revision
+            && cockpit_proto::is_opaque_authority_token(&result_revision)
+            && validate_committed_denylist(&denylist_receipt_plan, &committed_denylist).is_ok()
+            && (config_generation == expected_generation
+                || config_generation == expected_generation.saturating_add(1)) =>
+        {
+            let warning = (publication
+                == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded)
+                .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
+            (
+                result_revision,
+                config_generation,
+                committed_denylist,
+                warning,
+            )
+        }
+        Ok(other) => Err(format!("unexpected settings patch response: {other:?}")),
+        Err(error) => Err(error.to_string()),
+    }?;
+    let refresh = settings_daemon_request(Request::GetExtendedConfigSnapshot {
+        project_root,
+        snapshot_session_id: settings_snapshot_session_id().to_owned(),
+    });
+    match refresh {
+        Ok(Response::ExtendedConfigSnapshot {
+            layers,
+            config_generation,
+        }) if warning.is_none()
+            && config_generation == result_generation =>
+        {
+            let layer = layers.into_iter().find(|layer| {
+                layer.display_path == requested_path
+                    && layer.kind == expected_layer
+                    && layer.revision == result_revision
+                    && same_denylist_occurrences(&layer.denylist, &committed_denylist)
+                    && validate_settings_operations(
+                        &operations,
+                        &serde_json::to_value(&layer.config).unwrap_or(serde_json::Value::Null),
+                        &layer.authored_paths,
+                    ).is_ok()
+            });
+            match layer {
+                Some(layer) => Ok(SettingsPatchOutcome::Reconciled { layer, config_generation }),
+                None => Ok(SettingsPatchOutcome::CommittedRefreshNeeded {
+                    result_revision,
+                    config_generation: result_generation,
+                    warning: "settings committed, but the authoritative refresh did not contain the exact committed layer; reload before editing again".into(),
+                }),
+            }
+        }
+        other => Ok(SettingsPatchOutcome::CommittedRefreshNeeded {
+            result_revision,
+            config_generation: result_generation,
+            warning: warning.unwrap_or_else(|| format!(
+                "settings committed at generation {result_generation}, but the authoritative refresh did not reconcile ({other:?}); reload before editing again"
+            )),
+        }),
+    }
+}
+
+pub(super) fn apply_typed_settings_document_edit(
+    path: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+    patch: serde_json::Value,
+) -> Result<SettingsPatchOutcome, String> {
+    let (_, mut document, revision) = extended_config_layer_snapshot(path, project_root)?;
+    let authority_base = document.clone();
+    apply_json_merge_patch_local(&mut document, patch);
+    let desired: ExtendedConfig = serde_json::from_value(document)
+        .map_err(|error| format!("invalid typed settings edit: {error}"))?;
+    let desired_value = serde_json::to_value(&desired).map_err(|error| error.to_string())?;
+    // Derive authority operations from the actual RFC 7396 result. In
+    // particular an empty object is a no-op when the authored value is
+    // already an object; it is never serialized as a destructive Set({}).
+    let operations = changed_extended_paths(&authority_base, &desired_value)?;
+    let denylist = denylist_mutations(&authority_base, &desired.redact.denylist)?;
+    let denylist_receipt_plan = denylist.clone();
+    let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+        operations: operations.clone(),
+        materialize: true,
+        denylist,
+        redacted_mutations: Vec::new(),
+    };
+    let project_root = config_layer_request(path, project_root)?;
+    let layer_id = authority_base
+        .get("__cockpit_settings_layer_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "settings snapshot omitted its layer capability".to_string())?
+        .to_owned();
+    let expected_layer = serde_json::from_value(
+        authority_base
+            .get("__cockpit_settings_layer_kind")
+            .cloned()
+            .ok_or_else(|| "settings snapshot omitted its layer kind".to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let expected_generation = authority_base
+        .get("__cockpit_settings_generation")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "settings snapshot omitted its config generation".to_string())?;
+    let requested_path = path.display().to_string();
+    let response = settings_daemon_request(Request::ApplyExtendedConfigPatch {
+        project_root: project_root.clone(),
+        layer_id: layer_id.clone(),
+        patch,
+        expected_revision: revision.clone(),
+        snapshot_session_id: settings_snapshot_session_id().to_owned(),
+    });
+    let (result_revision, result_generation, committed_denylist, warning) = match response {
+        Ok(Response::ExtendedConfigSaved {
+            hash,
+            config_generation,
+            layer_id: returned_layer_id,
+            layer,
+            consumed_revision,
+            result_revision,
+            status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+            publication,
+            denylist: committed_denylist,
+        }) if returned_layer_id == layer_id
+            && layer == expected_layer
+            && consumed_revision == revision
+            && hash == result_revision
+            && cockpit_proto::is_opaque_authority_token(&result_revision)
+            && validate_committed_denylist(&denylist_receipt_plan, &committed_denylist).is_ok()
+            && (config_generation == expected_generation
+                || config_generation == expected_generation.saturating_add(1)) =>
+        {
+            let warning = (publication
+                == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded)
+                .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
+            (
+                result_revision,
+                config_generation,
+                committed_denylist,
+                warning,
+            )
+        }
+        Ok(other) => Err(format!("unexpected settings edit response: {other:?}")),
+        Err(error) => Err(error.to_string()),
+    }?;
+    let refresh = settings_daemon_request(Request::GetExtendedConfigSnapshot {
+        project_root,
+        snapshot_session_id: settings_snapshot_session_id().to_owned(),
+    });
+    match refresh {
+        Ok(Response::ExtendedConfigSnapshot {
+            layers,
+            config_generation,
+        }) if warning.is_none()
+            && config_generation == result_generation => {
+            let layer = layers.into_iter().find(|layer| {
+                layer.display_path == requested_path
+                    && layer.kind == expected_layer
+                    && layer.revision == result_revision
+                    && same_denylist_occurrences(&layer.denylist, &committed_denylist)
+                    && validate_settings_operations(
+                        &operations,
+                        &serde_json::to_value(&layer.config).unwrap_or(serde_json::Value::Null),
+                        &layer.authored_paths,
+                    )
+                    .is_ok()
+            });
+            match layer {
+                Some(layer) => Ok(SettingsPatchOutcome::Reconciled { layer, config_generation }),
+                None => Ok(SettingsPatchOutcome::CommittedRefreshNeeded {
+                    result_revision,
+                    config_generation: result_generation,
+                    warning: "settings committed, but the authoritative refresh did not contain the exact committed layer; reload before editing again".into(),
+                }),
+            }
+        }
+        other => Ok(SettingsPatchOutcome::CommittedRefreshNeeded {
+            result_revision,
+            config_generation: result_generation,
+            warning: warning.unwrap_or_else(|| format!(
+                "settings committed at generation {result_generation}, but the authoritative refresh did not reconcile ({other:?}); reload before editing again"
+            )),
+        }),
+    }
+}
+
+fn apply_json_merge_patch_local(target: &mut serde_json::Value, patch: serde_json::Value) {
+    let serde_json::Value::Object(patch) = patch else {
+        *target = patch;
+        return;
+    };
+    if !target.is_object() {
+        *target = serde_json::json!({});
+    }
+    let target = target.as_object_mut().expect("normalized object");
+    for (key, value) in patch {
+        if value.is_null() {
+            target.remove(&key);
+        } else {
+            apply_json_merge_patch_local(target.entry(key).or_default(), value);
+        }
+    }
+}
+
+fn changed_extended_paths(
+    base: &serde_json::Value,
+    desired: &serde_json::Value,
+) -> Result<Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>, String> {
+    use cockpit_core::daemon::proto::{ExtendedConfigField, ExtendedConfigPathMutation as M};
+    let base = base
+        .as_object()
+        .ok_or_else(|| "settings base is not an object".to_string())?;
+    let desired = desired
+        .as_object()
+        .ok_or_else(|| "settings candidate is not an object".to_string())?;
+    fn diff(
+        base: Option<&serde_json::Value>,
+        desired: Option<&serde_json::Value>,
+        path: &mut Vec<String>,
+        out: &mut Vec<M>,
+    ) {
+        if base == desired {
+            return;
+        }
+        match (base, desired) {
+            (_, None) => out.push(M::Unset { path: path.clone() }),
+            (Some(serde_json::Value::Object(left)), Some(serde_json::Value::Object(right))) => {
+                let mut keys = left.keys().chain(right.keys()).cloned().collect::<Vec<_>>();
+                keys.sort();
+                keys.dedup();
+                for key in keys {
+                    if path.len() == 1 && path[0] == "redact" && key == "denylist" {
+                        continue;
+                    }
+                    path.push(key.clone());
+                    diff(left.get(&key), right.get(&key), path, out);
+                    path.pop();
+                }
+            }
+            (_, Some(value)) => out.push(M::Set {
+                path: path.clone(),
+                value: value.clone(),
+            }),
+        }
+    }
+    let mut operations = Vec::new();
+    let mut keys = base
+        .keys()
+        .chain(desired.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        let Some(field) = ExtendedConfigField::from_json_key(&key) else {
+            continue;
+        };
+        if field == ExtendedConfigField::ImageGeneration {
+            continue;
+        }
+        let mut path = vec![key.clone()];
+        diff(
+            base.get(&key),
+            desired.get(&key),
+            &mut path,
+            &mut operations,
+        );
+    }
+    Ok(operations)
+}
+
+fn validate_settings_operations(
+    operations: &[cockpit_core::daemon::proto::ExtendedConfigPathMutation],
+    snapshot: &serde_json::Value,
+    authored_paths: &[Vec<String>],
+) -> Result<(), String> {
+    fn at_path<'a>(value: &'a serde_json::Value, path: &[String]) -> Option<&'a serde_json::Value> {
+        path.iter()
+            .try_fold(value, |value, key| value.as_object()?.get(key))
+    }
+    fn coherent(expected: &serde_json::Value, actual: &serde_json::Value) -> bool {
+        match (expected, actual) {
+            (serde_json::Value::String(expected), serde_json::Value::String(actual))
+                if expected.contains("__cockpit_redacted_setting_v1_") =>
+            {
+                actual.contains("__cockpit_redacted_setting_v1_")
+            }
+            (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
+                expected.len() == actual.len()
+                    && expected.iter().zip(actual).all(|(a, b)| coherent(a, b))
+            }
+            (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => expected
+                .iter()
+                .all(|(key, value)| actual.get(key).is_some_and(|other| coherent(value, other))),
+            _ => expected == actual,
+        }
+    }
+    for operation in operations {
+        match operation {
+            cockpit_core::daemon::proto::ExtendedConfigPathMutation::Set { path, value } => {
+                if !authored_paths
+                    .iter()
+                    .any(|authored| authored == path || authored.starts_with(path))
+                    || !at_path(snapshot, path).is_some_and(|actual| coherent(value, actual))
+                {
+                    return Err(
+                        "authoritative settings snapshot did not preserve an exact Set".into(),
+                    );
+                }
+            }
+            cockpit_core::daemon::proto::ExtendedConfigPathMutation::Unset { path } => {
+                if authored_paths
+                    .iter()
+                    .any(|authored| authored == path || authored.starts_with(path))
+                {
+                    return Err(
+                        "authoritative settings snapshot still authors an Unset path".into(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn denylist_mutations(
+    base: &serde_json::Value,
+    desired: &[String],
+) -> Result<Vec<cockpit_core::daemon::proto::DesiredDenylistEntry>, String> {
+    use cockpit_core::daemon::proto::{DesiredDenylistEntry as D, RedactedDenylistEntry};
+    let entries: Vec<RedactedDenylistEntry> = serde_json::from_value(
+        base.get("__cockpit_denylist_entries")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    )
+    .map_err(|error| error.to_string())?;
+    let by_id = entries
+        .iter()
+        .map(|entry| (entry.entry_id.as_str(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut used = std::collections::HashSet::new();
+    let mut target = Vec::new();
+    for value in desired {
+        match denylist_draft_entry(value)? {
+            DenylistDraftEntry::Existing(entry_id) => {
+                if !cockpit_proto::is_opaque_authority_token(entry_id)
+                    || !by_id.contains_key(entry_id)
+                    || !used.insert(entry_id)
+                {
+                    return Err("denylist draft contains a missing or duplicated occurrence".into());
+                }
+                target.push(D::Existing {
+                    entry_id: entry_id.to_owned(),
+                });
+            }
+            DenylistDraftEntry::New(value) => {
+                if value == cockpit_proto::REDACTED_DENYLIST_MASK {
+                    return Err(
+                        "denylist display masks are reserved and cannot be literal values".into(),
+                    );
+                }
+                target.push(D::New {
+                    client_nonce: uuid::Uuid::new_v4().to_string(),
+                    literal: value.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(target)
+}
+
+fn validate_committed_denylist(
+    planned: &[cockpit_core::daemon::proto::DesiredDenylistEntry],
+    committed: &[cockpit_core::daemon::proto::CommittedDenylistEntry],
+) -> Result<(), String> {
+    if planned.len() != committed.len() {
+        return Err("denylist receipt has the wrong length".into());
+    }
+    let mut ids = std::collections::HashSet::new();
+    for (planned, committed) in planned.iter().zip(committed) {
+        if !cockpit_proto::is_opaque_authority_token(&committed.entry_id)
+            || committed.display_mask != cockpit_proto::REDACTED_DENYLIST_MASK
+            || !ids.insert(committed.entry_id.as_str())
+        {
+            return Err(
+                "denylist receipt contains an invalid or duplicated occurrence token".into(),
+            );
+        }
+        match planned {
+            cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
+                if committed.client_nonce.is_none()
+                    && committed.consumed_entry_id.as_ref() == Some(entry_id) => {}
+            cockpit_core::daemon::proto::DesiredDenylistEntry::New {
+                client_nonce,
+                literal: _,
+            } if committed.client_nonce.as_ref() == Some(client_nonce)
+                && committed.consumed_entry_id.is_none()
+                && uuid::Uuid::parse_str(client_nonce)
+                    .is_ok_and(|nonce| nonce.to_string() == *client_nonce) => {}
+            _ => {
+                return Err("denylist receipt reordered or replaced an existing occurrence".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn same_denylist_occurrences(
+    authoritative: &[cockpit_core::daemon::proto::RedactedDenylistEntry],
+    receipt: &[cockpit_core::daemon::proto::CommittedDenylistEntry],
+) -> bool {
+    authoritative.len() == receipt.len()
+        && authoritative.iter().zip(receipt).all(|(left, right)| {
+            left.entry_id == right.entry_id
+                && left.display_mask == right.display_mask
+                && right.display_mask == cockpit_proto::REDACTED_DENYLIST_MASK
+        })
 }
 
 /// Search the complete metadata-only secret inventory.  Inventory pages are
@@ -716,15 +1332,24 @@ pub struct SettingsCx {
     /// Cached config state; reloaded on entry into the Providers list
     /// and after each successful save.
     pub(super) config: ProvidersConfig,
-    /// Snapshot loaded when the dialog opened or last saved. Used to merge only
-    /// keys this dialog changed over a fresh disk read.
+    /// Daemon-redacted snapshot loaded when the dialog opened or last saved.
+    /// Every secret placeholder is a unique, location-bound occurrence under
+    /// the opaque revisioned capability. The daemon rejects moved, duplicated,
+    /// altered, or unselected removals before merging selected typed fields
+    /// into the authoritative raw document.
     original_config: ProvidersConfig,
-    /// Cached cockpit-only `config.json` state. Read by the UI page and the
-    /// Tools page; written back on each edit.
+    /// Cached secret-free cockpit-only settings projection. Read by the UI and
+    /// Tools pages; mutations are committed only by the daemon.
     pub(super) extended: ExtendedConfig,
-    /// Malformed known extended-config fields skipped during the most
-    /// recent load. Unknown raw keys are preserved separately by
-    /// [`ExtendedConfigDoc`].
+    /// Safe daemon snapshot used to calculate a minimal typed set/unset patch;
+    /// serde-omitted optional/default fields are cleared only when named in
+    /// the explicit unset list.
+    extended_base: serde_json::Value,
+    /// Opaque revision of the raw authoritative layer corresponding to
+    /// `extended_base`.
+    extended_revision: Option<String>,
+    /// Malformed known extended-config fields reported by the daemon during
+    /// the most recent authoritative load.
     pub(super) extended_warnings: Vec<String>,
     /// Daemon-redacted MCP snapshot. MCP config is never read from disk by
     /// the TUI; saves replace this cache only after the owner RPC succeeds.
@@ -1448,12 +2073,6 @@ impl Dialog {
     /// first-run flow to auto-route into the Add wizard after the
     /// daemon prompt resolves.
     pub fn has_no_providers(cwd: &std::path::Path) -> bool {
-        #[cfg(test)]
-        {
-            let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
-            ConfigDoc::providers_from_paths(&paths).providers.is_empty()
-        }
-        #[cfg(not(test))]
         daemon_provider_snapshot(cwd, None).is_none_or(|config| config.providers.is_empty())
     }
 
@@ -1617,12 +2236,6 @@ impl Dialog {
     /// Open the existing provider-model editor directly for one configured provider.
     /// This is the canonical add-model surface used by scoped model recovery.
     pub fn open_provider_models(cwd: &std::path::Path, provider_id: &str) -> Self {
-        #[cfg(test)]
-        let cfg = {
-            let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
-            ConfigDoc::providers_from_paths(&paths)
-        };
-        #[cfg(not(test))]
         let Some(cfg) = daemon_provider_snapshot(cwd, None) else {
             return Self::open(cwd);
         };
@@ -2350,17 +2963,11 @@ impl SettingsDialog {
 
 impl SettingsDialog {
     pub fn open(config_path: PathBuf) -> Self {
-        #[cfg(test)]
-        let config = ConfigDoc::load(&config_path)
-            .map(|document| document.providers())
-            .unwrap_or_default();
-        #[cfg(not(test))]
         let project_root = config_path
             .parent()
             .and_then(std::path::Path::parent)
             .or_else(|| config_path.parent())
             .unwrap_or_else(|| std::path::Path::new("."));
-        #[cfg(not(test))]
         let config = daemon_provider_snapshot(project_root, None).unwrap_or_default();
         Self::open_with_config(config_path, config)
     }
@@ -2372,26 +2979,18 @@ impl SettingsDialog {
         // The cockpit-only keys live in the same `config.json` as the
         // layer-wide provider metadata (GOALS §2a).
         let extended_path = config_path.clone();
-        #[cfg(test)]
-        let (mut extended, extended_warnings) = ExtendedConfigDoc::load(&extended_path)
-            .map(|d| d.config_with_warnings())
-            .unwrap_or_default();
-        #[cfg(not(test))]
-        let (extended, extended_warnings) = config_cwd(&extended_path)
-            .and_then(|cwd| daemon_extended_snapshot(&cwd))
-            .map(|config| (config, Vec::new()))
-            .unwrap_or_default();
+        let (extended, extended_base, extended_revision, extended_warnings) =
+            extended_config_layer_snapshot(&extended_path, None)
+                .map(|(config, value, revision)| (config, value, Some(revision), Vec::new()))
+                .unwrap_or_else(|_| {
+                    let config = ExtendedConfig::default();
+                    let value = serde_json::to_value(&config).unwrap_or_default();
+                    (config, value, None, Vec::new())
+                });
         // Fresh install (no config at this location yet): seed the
         // skills scan-dir list with the defaults so they show as ordinary
         // editable rows. Materialization-only — an existing config whose
         // `scan_dirs` is absent/empty stays empty (clean break).
-        #[cfg(test)]
-        if !extended_path.exists() {
-            extended.skills.scan_dirs = cockpit_config::extended::SEEDED_SCAN_DIRS
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-        }
         let mcp_config = daemon_mcp_snapshot(&config_path).unwrap_or_default();
         Self {
             page: root_page(0),
@@ -2404,6 +3003,8 @@ impl SettingsDialog {
                 original_config: config.clone(),
                 config,
                 extended,
+                extended_base,
+                extended_revision,
                 extended_warnings,
                 mcp_config,
                 picker_cwd: None,
@@ -2440,22 +3041,10 @@ impl SettingsDialog {
     /// Same as [`Self::open`] but records the cwd of the picker that
     /// opened this dialog so Root's back keybind can reopen it.
     pub fn open_from_picker(config_path: PathBuf, cwd: PathBuf) -> Self {
-        #[cfg(test)]
-        let config = ConfigDoc::load(&config_path)
-            .map(|document| document.providers())
-            .unwrap_or_default();
-        #[cfg(not(test))]
         let config = daemon_provider_snapshot(&cwd, None).unwrap_or_default();
         let mut s = Self::open_with_config(config_path, config);
         s.picker_cwd = Some(cwd.clone());
         s.active_project_root = Some(cwd);
-        #[cfg(test)]
-        {
-            s.cx.mcp_config = cockpit_core::mcp::config::McpConfig::discover(
-                s.active_project_root.as_deref().expect("picker cwd"),
-            );
-        }
-        #[cfg(not(test))]
         if let Some(snapshot) = s
             .active_project_root
             .as_deref()
@@ -2465,52 +3054,65 @@ impl SettingsDialog {
         {
             s.cx.mcp_config = snapshot;
         }
-        #[cfg(not(test))]
-        if let Some(extended) =
-            daemon_extended_snapshot(s.active_project_root.as_deref().expect("picker root"))
-        {
-            s.cx.extended = extended;
-            s.cx.extended_warnings.clear();
-        }
+        // `open_with_config` already loaded the exact selected layer together
+        // with its opaque revision. Do not replace it with the layered
+        // effective projection here: doing so would materialize inherited
+        // values into this layer and detach `extended_base` from the revision.
         s
     }
 
-    /// Reload extended-config from disk. Used after saving so the
-    /// cached view stays in sync.
+    /// Reload the authoritative extended-config snapshot after saving.
     fn reload_extended(&mut self) {
-        #[cfg(test)]
-        if let Ok(doc) = ExtendedConfigDoc::load(&self.extended_path) {
-            let (extended, warnings) = doc.config_with_warnings();
-            self.extended = extended;
-            self.extended_warnings = warnings;
-        }
-        #[cfg(not(test))]
-        if let Some(extended) =
-            config_cwd(&self.extended_path).and_then(|cwd| daemon_extended_snapshot(&cwd))
-        {
-            self.extended = extended;
-            self.extended_warnings.clear();
-        }
-    }
-
-    /// Persist the cached extended-config to disk.
-    pub(super) fn save_extended(&mut self) -> Result<(), String> {
-        #[cfg(test)]
-        let doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
-        #[cfg(test)]
-        {
-            let mut doc = doc;
-            doc.write(&self.extended).map_err(|e| e.to_string())?;
-        }
-        #[cfg(not(test))]
-        write_settings_text_via_daemon(
+        if let Ok((extended, base, revision)) = extended_config_layer_snapshot(
             &self.extended_path,
             self.active_project_root
                 .as_deref()
                 .or(self.picker_cwd.as_deref()),
-            serde_json::to_string_pretty(&self.extended).map_err(|e| e.to_string())?,
+        ) {
+            self.extended = extended;
+            self.extended_base = base;
+            self.extended_revision = Some(revision);
+            self.extended_warnings.clear();
+        }
+    }
+
+    /// Persist the cached extended-config through daemon authority.
+    pub(super) fn save_extended(&mut self) -> Result<SettingsSaveOutcome, String> {
+        let revision = self
+            .extended_revision
+            .as_deref()
+            .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
+        let outcome = apply_settings_patch_via_daemon(
+            &self.extended_path,
+            self.active_project_root
+                .as_deref()
+                .or(self.picker_cwd.as_deref()),
+            &self.extended_base,
+            &self.extended,
+            revision,
         )?;
-        Ok(())
+        match outcome {
+            SettingsPatchOutcome::Reconciled {
+                layer,
+                config_generation,
+            } => {
+                let (extended, base, revision) = decode_extended_layer(layer, config_generation)?;
+                self.extended = extended;
+                self.extended_base = base;
+                self.extended_revision = Some(revision);
+                self.extended_warnings.clear();
+                return Ok(SettingsSaveOutcome::Saved);
+            }
+            SettingsPatchOutcome::CommittedRefreshNeeded {
+                result_revision: _,
+                config_generation: _,
+                warning,
+            } => {
+                self.extended_revision = None;
+                self.extended_warnings = vec![warning.clone()];
+                return Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning));
+            }
+        }
     }
 
     #[cfg(test)]
@@ -3509,9 +4111,30 @@ struct NavNode {
     description: &'static str,
 }
 
-pub(super) fn save_status(r: Result<(), String>) -> Option<String> {
+pub(super) trait SaveStatusValue {
+    fn status(self) -> String;
+}
+
+impl SaveStatusValue for () {
+    fn status(self) -> String {
+        "saved".into()
+    }
+}
+
+impl SaveStatusValue for SettingsSaveOutcome {
+    fn status(self) -> String {
+        match self {
+            SettingsSaveOutcome::Saved => "saved".into(),
+            SettingsSaveOutcome::CommittedRefreshNeeded(warning) => {
+                format!("committed; refresh needed: {warning}")
+            }
+        }
+    }
+}
+
+pub(super) fn save_status<T: SaveStatusValue>(r: Result<T, String>) -> Option<String> {
     match r {
-        Ok(()) => Some("saved".into()),
+        Ok(value) => Some(value.status()),
         Err(e) => Some(format!("save failed: {e}")),
     }
 }
@@ -3654,38 +4277,55 @@ impl SettingsCx {
     }
 
     fn reload_extended(&mut self) {
-        #[cfg(test)]
-        if let Ok(doc) = ExtendedConfigDoc::load(&self.extended_path) {
-            let (extended, warnings) = doc.config_with_warnings();
-            self.extended = extended;
-            self.extended_warnings = warnings;
-        }
-        #[cfg(not(test))]
-        if let Some(extended) =
-            config_cwd(&self.extended_path).and_then(|cwd| daemon_extended_snapshot(&cwd))
-        {
-            self.extended = extended;
-            self.extended_warnings.clear();
-        }
-    }
-
-    pub(super) fn save_extended(&mut self) -> Result<(), String> {
-        #[cfg(test)]
-        let doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
-        #[cfg(test)]
-        {
-            let mut doc = doc;
-            doc.write(&self.extended).map_err(|e| e.to_string())?;
-        }
-        #[cfg(not(test))]
-        write_settings_text_via_daemon(
+        if let Ok((extended, base, revision)) = extended_config_layer_snapshot(
             &self.extended_path,
             self.active_project_root
                 .as_deref()
                 .or(self.picker_cwd.as_deref()),
-            serde_json::to_string_pretty(&self.extended).map_err(|e| e.to_string())?,
+        ) {
+            self.extended = extended;
+            self.extended_base = base;
+            self.extended_revision = Some(revision);
+            self.extended_warnings.clear();
+        }
+    }
+
+    pub(super) fn save_extended(&mut self) -> Result<SettingsSaveOutcome, String> {
+        let revision = self
+            .extended_revision
+            .as_deref()
+            .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
+        let outcome = apply_settings_patch_via_daemon(
+            &self.extended_path,
+            self.active_project_root
+                .as_deref()
+                .or(self.picker_cwd.as_deref()),
+            &self.extended_base,
+            &self.extended,
+            revision,
         )?;
-        Ok(())
+        match outcome {
+            SettingsPatchOutcome::Reconciled {
+                layer,
+                config_generation,
+            } => {
+                let (extended, base, revision) = decode_extended_layer(layer, config_generation)?;
+                self.extended = extended;
+                self.extended_base = base;
+                self.extended_revision = Some(revision);
+                self.extended_warnings.clear();
+                return Ok(SettingsSaveOutcome::Saved);
+            }
+            SettingsPatchOutcome::CommittedRefreshNeeded {
+                result_revision: _,
+                config_generation: _,
+                warning,
+            } => {
+                self.extended_revision = None;
+                self.extended_warnings = vec![warning.clone()];
+                return Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning));
+            }
+        }
     }
 
     fn protect_provider_literal_headers(
@@ -4008,26 +4648,20 @@ fn daemon_provider_view_snapshot_inner(
     project_root: String,
     provider_id: Option<String>,
 ) -> Option<cockpit_core::daemon::proto::ProviderConfigView> {
-    run_settings_daemon(async move {
-        let client = settings_daemon_client()
-            .await
-            .map_err(|error| error.to_string())?;
-        match client
-            .request(Request::GetProviderCatalogSnapshot {
-                project_root,
-                provider_id,
-            })
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            Ok(Response::ProviderCatalogSnapshot { config }) => Ok(config),
-            Ok(other) => Err(format!(
-                "unexpected daemon provider snapshot response: {other:?}"
-            )),
-            Err(error) => Err(error.to_string()),
+    match settings_daemon_request(Request::GetProviderCatalogSnapshot {
+        project_root,
+        provider_id,
+    }) {
+        Ok(Response::ProviderCatalogSnapshot { config }) => Some(config),
+        Ok(other) => {
+            tracing::warn!(response = ?other, "unexpected daemon provider snapshot response");
+            None
         }
-    })
-    .ok()
+        Err(error) => {
+            tracing::warn!(%error, "daemon provider snapshot failed");
+            None
+        }
+    }
 }
 
 fn config_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -4035,12 +4669,6 @@ fn config_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
         .and_then(std::path::Path::parent)
         .or_else(|| path.parent())
         .map(std::path::Path::to_path_buf)
-}
-
-fn daemon_extended_snapshot(cwd: &std::path::Path) -> Option<ExtendedConfig> {
-    daemon_provider_view_snapshot(cwd, None)
-        .and_then(|config| config.extended_config_json)
-        .and_then(|raw| serde_json::from_str(&raw).ok())
 }
 
 fn daemon_mcp_snapshot(
@@ -4051,11 +4679,6 @@ fn daemon_mcp_snapshot(
         .and_then(std::path::Path::parent)
         .or_else(|| config_path.parent())
         .unwrap_or_else(|| std::path::Path::new("."));
-    #[cfg(test)]
-    {
-        Some(cockpit_core::mcp::config::McpConfig::discover(cwd))
-    }
-    #[cfg(not(test))]
     daemon_provider_view_snapshot(cwd, None)
         .and_then(|config| config.mcp_config_json)
         .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
@@ -4922,20 +5545,18 @@ fn nearest_project_config_path(cwd: &std::path::Path) -> PathBuf {
 }
 
 fn scaffold_config_dir_owned(dir: &std::path::Path) -> Result<PathBuf, String> {
-    #[cfg(test)]
-    {
-        scaffold_config_dir(dir).map_err(|error| error.to_string())
+    let config_path = dir.join(CONFIG_FILE);
+    match apply_typed_settings_document_edit(
+        &config_path,
+        None,
+        serde_json::json!({ "agents": {}, "tools": {} }),
+    )? {
+        SettingsPatchOutcome::Reconciled { .. } => {}
+        SettingsPatchOutcome::CommittedRefreshNeeded { warning, .. } => {
+            return Err(format!("committed; refresh needed: {warning}"));
+        }
     }
-    #[cfg(not(test))]
-    {
-        let config_path = dir.join(CONFIG_FILE);
-        write_settings_text_via_daemon(
-            &config_path,
-            None,
-            "{\n  \"agents\": {},\n  \"tools\": {}\n}\n".to_string(),
-        )?;
-        Ok(config_path)
-    }
+    Ok(config_path)
 }
 
 fn scaffold_error(path: &std::path::Path, error: &dyn std::fmt::Display) -> String {

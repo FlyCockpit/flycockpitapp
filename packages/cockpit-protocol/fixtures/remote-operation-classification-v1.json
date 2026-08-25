@@ -4295,15 +4295,20 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "name:string",
+      "fcorCanonicalSchema": "name:string|expected_revision:string",
       "fcorRoles": [
         {
           "field": "name",
           "role": "param",
           "type": "String"
+        },
+        {
+          "field": "expected_revision",
+          "role": "param",
+          "type": "String"
         }
       ],
-      "fcorSchema": "name:String",
+      "fcorSchema": "name:String|expected_revision:String",
       "strategy": "nonrepeatable_dispatch",
       "tag": "delete_assistant"
     },

@@ -3144,7 +3144,7 @@ impl SettingsCx {
 
     fn finish_category_save(&mut self, id: SettingId, p: &mut CategoryPage) {
         match self.save_extended() {
-            Ok(()) => {
+            Ok(super::SettingsSaveOutcome::Saved) => {
                 if id == SettingId::SandboxEscalationEnabled {
                     self.pending_daemon_request =
                         Some(cockpit_core::daemon::proto::Request::SetSandboxEscalation {
@@ -3161,6 +3161,9 @@ impl SettingsCx {
                     p.status = Some("saved".into());
                 }
             }
+            Ok(super::SettingsSaveOutcome::CommittedRefreshNeeded(warning)) => {
+                p.status = Some(format!("committed; refresh needed: {warning}"));
+            }
             Err(e) => p.status = Some(format!("save failed: {e}")),
         }
     }
@@ -3172,8 +3175,15 @@ impl SettingsCx {
         if self.config_path == project_config {
             return None;
         }
-        let doc = cockpit_config::extended::ExtendedConfigDoc::load(&project_config).ok()?;
-        if !doc.raw_has_path(path) {
+        let (_, snapshot, _) =
+            super::extended_config_layer_snapshot(&project_config, Some(project_root)).ok()?;
+        let authored_paths: Vec<Vec<String>> =
+            serde_json::from_value(snapshot.get("__cockpit_settings_authored_paths")?.clone())
+                .ok()?;
+        if !authored_paths
+            .iter()
+            .any(|authored| authored.iter().map(String::as_str).eq(path.iter().copied()))
+        {
             return None;
         }
         Some(ShadowedGlobalPrompt {
@@ -3493,23 +3503,20 @@ fn remove_project_shadow_path(
     project_config: &std::path::Path,
     path: &[&str],
 ) -> Result<bool, String> {
-    let mut doc = cockpit_config::extended::ExtendedConfigDoc::load(project_config)
-        .map_err(|e| e.to_string())?;
-    #[cfg(test)]
-    {
-        doc.remove_raw_path_and_save(path)
-            .map_err(|e| e.to_string())
+    let Some((last, parents)) = path.split_last() else {
+        return Ok(false);
+    };
+    let mut patch = serde_json::json!({ (last): null });
+    for parent in parents.iter().rev() {
+        patch = serde_json::json!({ (parent): patch });
     }
-    #[cfg(not(test))]
-    {
-        let (removed, rendered) = doc
-            .remove_raw_path_rendered(path)
-            .map_err(|e| e.to_string())?;
-        if removed {
-            super::write_settings_text_via_daemon(project_config, None, rendered)?;
+    match super::apply_typed_settings_document_edit(project_config, None, patch)? {
+        super::SettingsPatchOutcome::Reconciled { .. } => {}
+        super::SettingsPatchOutcome::CommittedRefreshNeeded { warning, .. } => {
+            return Err(format!("committed; refresh needed: {warning}"));
         }
-        Ok(removed)
     }
+    Ok(true)
 }
 
 fn setting_json_path(id: SettingId) -> Option<&'static [&'static str]> {

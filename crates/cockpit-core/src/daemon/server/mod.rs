@@ -266,7 +266,8 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             terminal_generation: _,
         }
         | proto::Response::FsWrite { hash: _ }
-        | proto::Response::ExtendedConfigSaved { hash: _ }
+        | proto::Response::ExtendedConfigSaved { .. }
+        | proto::Response::ExtendedConfigWritten { .. }
         | proto::Response::SetupWizardApplied { .. }
         | proto::Response::UsageCounts {
             models: _,
@@ -475,6 +476,44 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             truncated: _,
             kind: _,
         } => scrub_option_string(content, redact),
+        proto::Response::ExtendedConfigSnapshot {
+            layers,
+            config_generation: _,
+        } => {
+            for layer in layers {
+                scrub_string(&mut layer.display_path, redact);
+                // The authority source already returns a typed, secret-free
+                // snapshot (denylist literals and image credentials are
+                // replaced before this response is built).  Mutating its
+                // strings generically can invalidate enums and typed command
+                // structures, so preserve it byte-semantically here.  Opaque
+                // capability and revision fields must also remain exact.
+                // Fixed display masks and opaque authority fields are protocol
+                // constants/capabilities, not free text. Preserve them exact.
+            }
+        }
+        proto::Response::AgentInventory {
+            entries,
+            inventory_revision,
+            config_generation: _,
+        } => {
+            for entry in entries {
+                scrub_agent_inventory_entry(entry, redact);
+            }
+            let _ = inventory_revision;
+        }
+        proto::Response::AgentEditSnapshot(snapshot) => {
+            scrub_agent_edit_snapshot(snapshot, redact);
+        }
+        proto::Response::AgentMutated(result)
+        | proto::Response::AgentEditorLeaseCompleted(result) => {
+            if let Some(snapshot) = &mut result.snapshot {
+                scrub_agent_edit_snapshot(snapshot, redact);
+            }
+        }
+        proto::Response::AgentEditorLeaseBegun(lease) => {
+            scrub_agent_edit_snapshot(&mut lease.snapshot, redact);
+        }
         proto::Response::GitStatus { entries } => {
             for entry in entries {
                 scrub_string(&mut entry.raw, redact);
@@ -624,7 +663,8 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         } => {
             scrub_session_summary(session, redact);
         }
-        proto::Response::AssistantUpserted { assistant } => {
+        proto::Response::AssistantUpserted { assistant }
+        | proto::Response::AssistantDefinitionSaved { assistant, .. } => {
             scrub_assistant_summary(assistant, redact)
         }
         proto::Response::ImportSessionArchive { .. } => {}
@@ -1509,16 +1549,94 @@ fn scrub_goal_summary(goal: &mut proto::GoalSummary, redact: &RedactionTable) {
 
 fn scrub_assistant_summary(assistant: &mut proto::AssistantSummary, redact: &RedactionTable) {
     let proto::AssistantSummary {
-        name,
+        name: _,
         created_at: _,
         home_dir,
         config_json,
-        content_hash,
+        definition_presentation_hash: _,
+        registration_revision: _,
+        definition_markdown,
+        definition_revision: _,
+        definition_diagnostic,
+        projection_digest: _,
     } = assistant;
-    scrub_string(name, redact);
     scrub_string(home_dir, redact);
-    scrub_string(config_json, redact);
-    scrub_string(content_hash, redact);
+    if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(config_json) {
+        fn scrub_json(value: &mut serde_json::Value, redact: &RedactionTable) {
+            match value {
+                serde_json::Value::String(value) => scrub_string(value, redact),
+                serde_json::Value::Array(values) => {
+                    values
+                        .iter_mut()
+                        .for_each(|value| scrub_json(value, redact));
+                }
+                serde_json::Value::Object(values) => {
+                    values
+                        .values_mut()
+                        .for_each(|value| scrub_json(value, redact));
+                }
+                _ => {}
+            }
+        }
+        scrub_json(&mut config, redact);
+        if let Ok(redacted) = serde_json::to_string(&config) {
+            *config_json = redacted;
+        }
+    }
+    scrub_option_string(definition_markdown, redact);
+    scrub_option_string(definition_diagnostic, redact);
+}
+
+fn scrub_agent_inventory_entry(entry: &mut proto::AgentInventoryEntry, redact: &RedactionTable) {
+    scrub_option_string(&mut entry.description, redact);
+    scrub_option_string(&mut entry.model, redact);
+    scrub_option_string(&mut entry.diagnostic, redact);
+}
+
+fn scrub_agent_edit_snapshot(snapshot: &mut proto::AgentEditSnapshot, redact: &RedactionTable) {
+    scrub_string(&mut snapshot.markdown, redact);
+    scrub_string(&mut snapshot.canonical_preview, redact);
+    scrub_option_string(&mut snapshot.goal_supervision_json, redact);
+}
+
+/// Mint presentation digests only after the final socket-bound redaction
+/// pass. This is infallible and therefore cannot turn a committed mutation
+/// into a post-commit response error.
+fn finalize_response_projections(response: &mut proto::Response) {
+    fn assistant(value: &mut proto::AssistantSummary) {
+        value.definition_presentation_hash = value.definition_markdown.as_ref().map(|markdown| {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(markdown.as_bytes()))
+        });
+        value.projection_digest = proto::assistant_projection_digest(value);
+    }
+    fn agent(value: &mut proto::AgentEditSnapshot) {
+        value.projection_digest = proto::agent_edit_projection_digest(value);
+    }
+    match response {
+        proto::Response::Assistant {
+            assistant: Some(value),
+        } => assistant(value),
+        proto::Response::Assistants { assistants } => assistants.iter_mut().for_each(assistant),
+        proto::Response::AssistantUpserted { assistant: value }
+        | proto::Response::AssistantDefinitionSaved {
+            assistant: value, ..
+        } => assistant(value),
+        proto::Response::AgentInventory { entries, .. } => {
+            for entry in entries {
+                entry.projection_digest = proto::agent_inventory_entry_projection_digest(entry);
+            }
+        }
+        proto::Response::AgentEditSnapshot(value) => agent(value),
+        proto::Response::AgentMutated(result)
+        | proto::Response::AgentEditorLeaseCompleted(result) => {
+            if let Some(value) = &mut result.snapshot {
+                agent(value);
+            }
+        }
+        proto::Response::AgentEditorLeaseBegun(lease) => agent(&mut lease.snapshot),
+        _ => {}
+    }
 }
 
 fn scrub_assistant_session_created(
@@ -2156,6 +2274,9 @@ pub(crate) fn test_context_for_daemon_modules() -> Arc<DaemonContext> {
 }
 
 impl DaemonContext {
+    pub(crate) fn current_global_redaction(&self) -> Arc<RedactionTable> {
+        current_redaction(&self.global_redaction)
+    }
     fn caffeinate_state_event(&self) -> proto::Event {
         let snap = self.caffeinate.snapshot();
         proto::Event::CaffeinateState {
@@ -3560,6 +3681,13 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
         if let Err(error) = dispatch::recover_all_mcp_config_journals(&ctx).await {
             tracing::error!(%error, "startup MCP-config journal recovery failed; MCP requests will retry it");
         }
+        crate::assistants::recover_definition_journals(&ctx.db)
+            .await
+            .context("startup assistant-definition journal recovery failed")?;
+        crate::daemon::agent_management::recover_known_workspace_resets(&ctx)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))
+            .context("startup agent reset journal recovery failed")?;
         match crate::daemon::effective_default_recovery::recover_effective_default_journals(
             &ctx.db, &cwd, None,
         )
@@ -3769,6 +3897,7 @@ struct MutableClientState {
 #[derive(Clone)]
 pub(super) struct SharedClientState {
     principal: ClientPrincipal,
+    capability_owner: String,
     #[allow(dead_code)]
     upload_accounting: Arc<StdMutex<UploadAccounting>>,
     #[allow(dead_code)]
@@ -3889,6 +4018,11 @@ impl MutableClientState {
     fn shared_snapshot(&self) -> Arc<SharedClientState> {
         Arc::new(SharedClientState {
             principal: self.principal.clone(),
+            // Capabilities survive the settings client's short transport
+            // reconnects. Root, layer, identity and revision remain bound in
+            // the capability itself; the owner is the stable authenticated
+            // principal used by the serialized Apply path.
+            capability_owner: run_invocation::principal_digest(&self.principal),
             upload_accounting: self.upload_accounting.clone(),
             terminal_host: self.terminal_host.clone(),
             terminal_views: self.terminal_views.clone(),
@@ -5282,8 +5416,11 @@ fn response_envelope_for_shared(
                 Some(response)
             };
             match response {
-                Some(response) => Envelope::response(id, response),
-                None => Envelope::error(
+                Some(mut response) => {
+                    finalize_response_projections(&mut response);
+                    bounded_response_envelope(id, response)
+                }
+                None => bounded_error_envelope(
                     Some(id),
                     ErrorPayload {
                         code: ErrorCode::Internal,
@@ -5292,7 +5429,127 @@ fn response_envelope_for_shared(
                 ),
             }
         }
-        Err(err) => Envelope::error(Some(id), err),
+        Err(err) => bounded_error_envelope(Some(id), err),
+    }
+}
+
+fn bounded_response_envelope(id: Uuid, response: proto::Response) -> Envelope {
+    if !local_authority_response_within_bounds(&response) {
+        return bounded_error_envelope(
+            Some(id),
+            ErrorPayload {
+                code: ErrorCode::Internal,
+                message: "daemon authority projection exceeds its safe local response bounds; reduce the local inventory or authored file size".into(),
+            },
+        );
+    }
+    let envelope = Envelope::response(id, response);
+    if serde_json::to_vec(&envelope)
+        .is_ok_and(|bytes| bytes.len().saturating_add(1) <= proto::MAX_SERIALIZED_RESPONSE_BYTES)
+    {
+        envelope
+    } else {
+        bounded_error_envelope(
+            Some(id),
+            ErrorPayload {
+                code: ErrorCode::Internal,
+                message: "response exceeds the safe local protocol budget; narrow the request or reduce the local inventory".into(),
+            },
+        )
+    }
+}
+
+fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
+    let assistant =
+        |summary: &proto::AssistantSummary| proto::validate_assistant_summary(summary).is_ok();
+    let agent_snapshot =
+        |snapshot: &proto::AgentEditSnapshot| proto::validate_agent_edit_snapshot(snapshot).is_ok();
+    let inventory_entry = |entry: &proto::AgentInventoryEntry| {
+        entry.name.len() <= proto::MAX_AGENT_NAME_BYTES
+            && [
+                entry.description.as_deref(),
+                entry.model.as_deref(),
+                entry.diagnostic.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .all(|value| value.len() <= proto::MAX_AGENT_METADATA_BYTES)
+            && proto::is_opaque_authority_token(&entry.source_identity)
+            && proto::is_opaque_authority_token(&entry.revision)
+            && entry.projection_digest == proto::agent_inventory_entry_projection_digest(entry)
+    };
+    match response {
+        proto::Response::Assistant { assistant: value } => value.as_ref().is_none_or(assistant),
+        proto::Response::Assistants { assistants } => {
+            assistants.len() <= proto::MAX_ASSISTANT_SUMMARIES && assistants.iter().all(assistant)
+        }
+        proto::Response::AssistantUpserted { assistant: value }
+        | proto::Response::AssistantDefinitionSaved {
+            assistant: value, ..
+        } => assistant(value),
+        proto::Response::ExtendedConfigSnapshot { layers, .. } => {
+            layers.len() <= proto::MAX_EXTENDED_CONFIG_LAYERS
+                && layers.iter().all(|layer| {
+                    layer.display_path.len() <= proto::MAX_AGENT_METADATA_BYTES
+                        && layer.denylist.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                        && serde_json::to_vec(layer).is_ok_and(|bytes| {
+                            bytes.len() <= proto::MAX_EXTENDED_CONFIG_SOURCE_BYTES
+                        })
+                })
+        }
+        proto::Response::ExtendedConfigSaved { denylist, .. } => {
+            let mut result_ids = std::collections::HashSet::new();
+            let mut consumed_ids = std::collections::HashSet::new();
+            let mut nonces = std::collections::HashSet::new();
+            denylist.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && denylist.iter().all(|entry| {
+                    proto::is_opaque_authority_token(&entry.entry_id)
+                        && result_ids.insert(entry.entry_id.as_str())
+                        && entry.display_mask == proto::REDACTED_DENYLIST_MASK
+                        && match (&entry.consumed_entry_id, &entry.client_nonce) {
+                            (Some(consumed), None) => {
+                                proto::is_opaque_authority_token(consumed)
+                                    && consumed_ids.insert(consumed.as_str())
+                            }
+                            (None, Some(nonce)) => {
+                                uuid::Uuid::parse_str(nonce)
+                                    .is_ok_and(|parsed| parsed.to_string() == *nonce)
+                                    && nonces.insert(nonce.as_str())
+                            }
+                            _ => false,
+                        }
+                })
+        }
+        proto::Response::AgentInventory { entries, .. } => {
+            entries.len() <= proto::MAX_AGENT_INVENTORY_ENTRIES
+                && entries.iter().all(inventory_entry)
+        }
+        proto::Response::AgentEditSnapshot(value) => agent_snapshot(value),
+        proto::Response::AgentMutated(result)
+        | proto::Response::AgentEditorLeaseCompleted(result) => {
+            result.snapshot.as_ref().is_none_or(agent_snapshot)
+        }
+        proto::Response::AgentEditorLeaseBegun(lease) => agent_snapshot(&lease.snapshot),
+        _ => true,
+    }
+}
+
+fn bounded_error_envelope(id: Option<Uuid>, error: ErrorPayload) -> Envelope {
+    let envelope = Envelope::error(id, error);
+    if serde_json::to_vec(&envelope)
+        .is_ok_and(|bytes| bytes.len().saturating_add(1) <= proto::MAX_SERIALIZED_RESPONSE_BYTES)
+    {
+        envelope
+    } else {
+        Envelope::error(
+            id,
+            ErrorPayload {
+                code: ErrorCode::Internal,
+                message:
+                    "daemon response could not be represented within the local protocol budget"
+                        .into(),
+            },
+        )
     }
 }
 

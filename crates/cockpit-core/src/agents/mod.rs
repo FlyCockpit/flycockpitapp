@@ -293,6 +293,11 @@ pub struct GoalSettingsOverride {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_verification_attempts: Option<u32>,
+    /// Forward-compatible keys that this daemon does not interpret. Agent
+    /// settings mutations preserve them byte-semantically instead of
+    /// rebuilding the object from only the three fields exposed by the TUI.
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl GoalSettingsOverride {
@@ -304,6 +309,7 @@ impl GoalSettingsOverride {
             && self.cold_skeptic_count.is_none()
             && self.cold_skeptic_model.is_none()
             && self.max_verification_attempts.is_none()
+            && self.extra.is_empty()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -1163,6 +1169,19 @@ pub fn load_daemon_local_named_from_file(path: &Path, name: &str) -> Result<Agen
     Ok(def)
 }
 
+/// Validate exact markdown bytes for a daemon-owned assistant definition
+/// without requiring a client-visible or temporary authoritative path.
+pub fn parse_daemon_local_markdown(text: &str, name: &str) -> Result<AgentDef> {
+    let def = parse_agent_with_scope(
+        text,
+        name,
+        PathBuf::from("<daemon-assistant-definition>"),
+        DefinitionScope::DaemonLocal,
+    )?;
+    validate_invariants(&def)?;
+    Ok(def)
+}
+
 /// Load exactly the daemon-owned path recorded for one selected installation
 /// into the profile catalog.  This deliberately takes the installation UUID
 /// and observation receipt from the installation service: display names are
@@ -1500,10 +1519,9 @@ async fn resolve_assistant_agent_from_db(
     db: &crate::db::Db,
     name: &str,
 ) -> Result<Option<AgentDef>> {
-    let Some(row) = db.get_assistant(name).await? else {
-        return Ok(None);
-    };
-    Ok(Some(crate::assistants::load_from_row(&row)?.agent))
+    Ok(crate::assistants::load_verified(db, name)
+        .await?
+        .map(|assistant| assistant.agent))
 }
 
 /// Discover every agent visible at `cwd`: each built-in (overridden when

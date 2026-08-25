@@ -77,6 +77,30 @@ impl Db {
         .await
     }
 
+    /// Delete exactly the registry generation represented by `expected`.
+    /// Every mutable row field participates so a concurrent update cannot be
+    /// erased after a client confirmed an older snapshot.
+    pub async fn delete_assistant_if_unchanged(&self, expected: AssistantRow) -> Result<bool> {
+        self.write(move |conn| {
+            let changed = conn
+                .execute(
+                    "DELETE FROM assistants
+                     WHERE name = ?1 AND created_at = ?2 AND home_dir = ?3
+                       AND config_json = ?4 AND content_hash = ?5",
+                    params![
+                        expected.name,
+                        expected.created_at,
+                        expected.home_dir,
+                        expected.config_json,
+                        expected.content_hash,
+                    ],
+                )
+                .context("conditionally deleting assistant")?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
     pub async fn update_assistant_config(&self, name: &str, config_json: &str) -> Result<()> {
         let name = name.to_string();
         let config_json = config_json.to_string();
@@ -93,6 +117,69 @@ impl Db {
             Ok(())
         })
         .await
+    }
+
+    /// Update only the identity-file digests when every authority-bearing row
+    /// field still matches the snapshot used to read those files.
+    pub async fn update_assistant_identity_hashes_cas(
+        &self,
+        expected: AssistantRow,
+        config_json: &str,
+    ) -> Result<AssistantRow> {
+        let config_json = config_json.to_string();
+        serde_json::from_str::<serde_json::Value>(&config_json)
+            .context("assistant config must be valid JSON")?;
+        self.write(move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE assistants SET config_json = ?6
+                     WHERE name = ?1 AND created_at = ?2 AND home_dir = ?3
+                       AND config_json = ?4 AND content_hash = ?5",
+                    params![
+                        expected.name,
+                        expected.created_at,
+                        expected.home_dir,
+                        expected.config_json,
+                        expected.content_hash,
+                        config_json,
+                    ],
+                )
+                .context("compare-and-swap assistant identity hashes")?;
+            if changed != 1 {
+                anyhow::bail!("assistant registry changed while identity files were read");
+            }
+            Db::get_assistant_conn(conn, &expected.name)?
+                .ok_or_else(|| anyhow::anyhow!("assistant disappeared after identity update"))
+        })
+        .await
+    }
+
+    pub async fn update_assistant_content_hash_cas(
+        &self,
+        name: &str,
+        home_dir: &str,
+        config_json: &str,
+        expected_hash: &str,
+        next_hash: &str,
+    ) -> Result<AssistantRow> {
+        validate_content_hash(expected_hash)?;
+        validate_content_hash(next_hash)?;
+        let name = name.to_string();
+        let home_dir = home_dir.to_string();
+        let config_json = config_json.to_string();
+        let expected_hash = expected_hash.to_string();
+        let next_hash = next_hash.to_string();
+        self.write(move |conn| {
+            let changed = conn.execute(
+                "UPDATE assistants SET content_hash=?5 WHERE name=?1 AND home_dir=?2 AND config_json=?3 AND content_hash=?4",
+                params![name, home_dir, config_json, expected_hash, next_hash],
+            ).context("compare-and-swap assistant definition revision")?;
+            if changed != 1 {
+                anyhow::bail!("assistant registry changed before definition commit");
+            }
+            Db::get_assistant_conn(conn, &name)?
+                .ok_or_else(|| anyhow::anyhow!("assistant `{name}` disappeared after update"))
+        }).await
     }
 
     pub fn upsert_assistant_conn(

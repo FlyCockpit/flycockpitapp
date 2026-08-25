@@ -85,6 +85,15 @@ pub fn compare_and_bump_config_generation(expected: u64) -> Option<u64> {
     Some(next)
 }
 
+/// Publish a configuration change only after its durable commit succeeds.
+/// This operation cannot fail due to an unrelated concurrent publisher: each
+/// successful commit receives a distinct monotonically increasing generation.
+pub fn publish_committed_config_generation() -> u64 {
+    let generation = CONFIG_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    bump_inventory_generation();
+    generation
+}
+
 #[cfg(test)]
 pub fn install_inventory_barriers(
     after_acquire: Option<Box<dyn Fn() + Send + Sync>>,

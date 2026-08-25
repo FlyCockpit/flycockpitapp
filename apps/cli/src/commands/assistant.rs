@@ -1,15 +1,17 @@
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+#[cfg(test)]
 use uuid::Uuid;
 
+#[cfg(test)]
 use crate::agents::{AgentDef, GoalSettingsOverride};
+#[cfg(test)]
 use crate::assistants::{
-    AssistantConfig, CreateAssistantSpec, assistant_definition_path, default_home_dir, identity,
-    markdown_content_hash, spec_from_wizard,
+    AssistantConfig, assistant_definition_path, identity, markdown_content_hash,
 };
+use crate::assistants::{CreateAssistantSpec, default_home_dir, spec_from_wizard};
 use crate::cli::{
     AssistantCommand, AssistantDeleteArgs, AssistantMediaCommand, AssistantNewArgs,
     MediaAccountingCommand,
@@ -139,6 +141,7 @@ async fn new(args: AssistantNewArgs) -> Result<()> {
 /// `cockpit_core::assistants::create_assistant` (the DB persist is remoted).
 /// Pure local IO — no daemon — so a parity test can compare its output against
 /// the canonical `create_assistant` and fail if the two ever drift.
+#[cfg(test)]
 fn write_assistant_home(spec: &CreateAssistantSpec) -> Result<(String, String)> {
     write_assistant_home_with_installation_id(spec, Uuid::new_v4())
 }
@@ -147,6 +150,7 @@ fn write_assistant_home(spec: &CreateAssistantSpec) -> Result<(String, String)> 
 ///
 /// Keeping identity allocation explicit here allows the caller to use the
 /// exact same identity in the definition and persisted registry config.
+#[cfg(test)]
 fn write_assistant_home_with_installation_id(
     spec: &CreateAssistantSpec,
     installation_id: Uuid,
@@ -203,8 +207,6 @@ fn write_assistant_home_with_installation_id(
 /// persist is remoted so the CLI never opens SQLite. Returns the persisted
 /// (name, home_dir) for the wizard's confirmation line.
 async fn persist_new_assistant(spec: CreateAssistantSpec) -> Result<(String, String)> {
-    let (config_json, content_hash) = write_assistant_home(&spec)?;
-
     let daemon = ensure_persistent_daemon()
         .await
         .context("starting persistent daemon for assistant persist")?;
@@ -212,9 +214,8 @@ async fn persist_new_assistant(spec: CreateAssistantSpec) -> Result<(String, Str
         .client
         .request(Request::UpsertAssistant {
             name: spec.name.clone(),
-            home_dir: spec.home_dir.to_string_lossy().into_owned(),
-            config_json,
-            content_hash,
+            description: spec.description,
+            prompt: spec.prompt,
         })
         .await
         .context("requesting assistant persist from daemon")?
@@ -244,15 +245,9 @@ async fn list() -> Result<()> {
         return Ok(());
     }
     for assistant in assistants {
-        // The proto AssistantSummary carries name/home_dir but not the
-        // description (which lives in the assistant definition file).
-        // Load it from disk to preserve the CLI output format.
-        let description = crate::assistants::load_from_home(
-            &assistant.name,
-            std::path::Path::new(&assistant.home_dir),
-        )
-        .map(|def| def.description)
-        .unwrap_or_else(|_| "<invalid>".to_string());
+        let description = verified_assistant_definition(&assistant)
+            .map(|def| def.description)
+            .unwrap_or_else(|error| format!("<invalid: {error:#}>"));
         println!(
             "{}\t{}\t{}",
             assistant.name, description, assistant.home_dir
@@ -268,14 +263,14 @@ async fn show(name: &str) -> Result<()> {
     let assistant = fetch_assistant(&daemon, name)
         .await?
         .ok_or_else(|| anyhow::anyhow!("assistant `{name}` not found"))?;
-    // The registry row carries name/home_dir/content_hash; the description,
-    // description lives in the on-disk schemaVersion 2 definition file.
-    let def = crate::assistants::load_from_home(&assistant.name, Path::new(&assistant.home_dir))?;
+    let def = verified_assistant_definition(&assistant)?;
     println!("name: {}", def.name);
     println!("description: {}", def.description);
     println!("home_dir: {}", def.home_dir.display());
     println!("definition: {}", def.agent.source.display());
-    println!("content_hash: {}", assistant.content_hash);
+    if let Some(hash) = &assistant.definition_presentation_hash {
+        println!("presentation_hash: {hash}");
+    }
     println!(
         "agent_id: {}",
         def.agent.vnext.as_ref().map_or("<legacy>", |v| &v.agent_id)
@@ -288,6 +283,39 @@ async fn show(name: &str) -> Result<()> {
     };
     println!("execution_kind: {execution_kind}");
     Ok(())
+}
+
+/// Consume only the daemon-coordinated registry/definition snapshot. The CLI
+/// must never reopen the private assistant pathname after the daemon has
+/// validated it: doing so would split authority and reintroduce a TOCTOU read.
+fn verified_assistant_definition(
+    assistant: &crate::daemon::proto::AssistantSummary,
+) -> Result<cockpit_core::agents::AgentDef> {
+    cockpit_proto::validate_assistant_summary(assistant)
+        .map_err(|error| anyhow::anyhow!("assistant `{}`: {error}", assistant.name))?;
+    let markdown = assistant.definition_markdown.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "assistant `{}` definition is unavailable: {}",
+            assistant.name,
+            assistant
+                .definition_diagnostic
+                .as_deref()
+                .unwrap_or("daemon returned an incoherent definition snapshot")
+        )
+    })?;
+    if assistant.definition_diagnostic.is_some()
+        || assistant
+            .definition_revision
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        bail!(
+            "assistant `{}` definition snapshot is incoherent",
+            assistant.name
+        );
+    }
+    cockpit_core::agents::parse_daemon_local_markdown(markdown, &assistant.name)
+        .with_context(|| format!("parsing daemon snapshot for assistant `{}`", assistant.name))
 }
 
 async fn delete(args: AssistantDeleteArgs) -> Result<()> {
@@ -310,15 +338,27 @@ async fn delete(args: AssistantDeleteArgs) -> Result<()> {
             return Ok(());
         }
     }
+    let expected_revision = assistant.registration_revision.clone();
+    if expected_revision.is_empty() {
+        bail!("assistant registration has no deletion revision");
+    }
     let response = daemon
         .client
-        .request(delete_assistant_request(&args.name))
+        .request(delete_assistant_request(&args.name, &expected_revision))
         .await
         .context("requesting assistant delete from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected assistant delete: {error}"))?;
-    let Response::AssistantDeleted { .. } = response else {
+    let Response::AssistantDeleted {
+        name,
+        consumed_registration_revision,
+        deleted: true,
+    } = response
+    else {
         bail!("daemon returned unexpected response to assistant delete: {response:?}");
     };
+    if name != args.name || consumed_registration_revision != expected_revision {
+        bail!("daemon returned an incoherent assistant deletion receipt");
+    }
     println!(
         "deleted assistant `{}`; home directory left intact: {}",
         args.name, assistant.home_dir
@@ -334,9 +374,10 @@ fn get_assistant_request(name: &str) -> Request {
 }
 
 /// Assemble the owner-remoted `DeleteAssistant` mutation.
-fn delete_assistant_request(name: &str) -> Request {
+fn delete_assistant_request(name: &str, expected_revision: &str) -> Request {
     Request::DeleteAssistant {
         name: name.to_string(),
+        expected_revision: expected_revision.to_string(),
     }
 }
 
@@ -489,10 +530,15 @@ mod tests {
             panic!("show/delete must resolve through GetAssistant");
         };
         assert_eq!(name, "helper-bot");
-        let Request::DeleteAssistant { name } = delete_assistant_request("helper-bot") else {
+        let Request::DeleteAssistant {
+            name,
+            expected_revision,
+        } = delete_assistant_request("helper-bot", "rev-1")
+        else {
             panic!("delete must remove through DeleteAssistant");
         };
         assert_eq!(name, "helper-bot");
+        assert_eq!(expected_revision, "rev-1");
     }
 
     #[tokio::test]

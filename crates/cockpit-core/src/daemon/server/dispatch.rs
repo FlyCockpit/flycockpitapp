@@ -4168,16 +4168,34 @@ async fn handle_serialized_request_impl(
             project_root,
             mode: proto::AssistantSessionResolutionMode::MostRecentOrCreate,
         } => {
+            let verified = crate::assistants::snapshot(&ctx.db, &assistant_id)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| bad_request(format!("assistant `{assistant_id}` not found")))?;
+            let verified_revision = crate::assistants::registration_revision(&verified.row);
+            if verified.definition_markdown.is_none()
+                || verified
+                    .definition_revision
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || verified.definition_diagnostic.is_some()
+            {
+                return Err(bad_request(format!(
+                    "assistant `{assistant_id}` definition snapshot is incoherent"
+                )));
+            }
             let assistant_for_db = assistant_id.clone();
             let project_root_for_db = project_root.clone();
             let (session, created) = ctx
                 .db
                 .write(move |conn| {
-                    let assistant = crate::db::Db::get_assistant_conn(conn, &assistant_for_db)?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("assistant `{assistant_for_db}` not found")
-                        })?;
-                    crate::assistants::load_from_row(&assistant)?;
+                    let current = crate::db::Db::get_assistant_conn(conn, &assistant_for_db)?
+                        .ok_or_else(|| anyhow::anyhow!("assistant `{assistant_for_db}` not found"))?;
+                    if crate::assistants::registration_revision(&current) != verified_revision {
+                        anyhow::bail!(
+                            "assistant `{assistant_for_db}` registration changed during session resolution"
+                        );
+                    }
                     let (row, created) =
                         match crate::db::Db::most_recent_session_for_assistant_conn(
                             conn,
@@ -4213,29 +4231,20 @@ async fn handle_serialized_request_impl(
             Ok(Response::AssistantSessionResolved { session, created })
         }
 
-        Request::ListAssistants => {
-            let assistants = ctx
-                .db
-                .list_assistants()
-                .await
-                .map_err(internal)?
-                .into_iter()
-                .map(assistant_to_proto)
-                .collect();
-            Ok(Response::Assistants { assistants })
-        }
+        Request::ListAssistants => Err(ErrorPayload {
+            code: ErrorCode::Internal,
+            message: "concurrent request `list_assistants` reached serialized dispatch".to_string(),
+        }),
         Request::UpsertAssistant {
             name,
-            home_dir,
-            config_json,
-            content_hash,
+            description,
+            prompt,
         } => {
             #[cfg(feature = "remote")]
             let request = Request::UpsertAssistant {
                 name: name.clone(),
-                home_dir: home_dir.clone(),
-                config_json: config_json.clone(),
-                content_hash: content_hash.clone(),
+                description: description.clone(),
+                prompt: prompt.clone(),
             };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
@@ -4250,15 +4259,63 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let row = ctx
-                .db
-                .upsert_assistant(&name, &home_dir, &config_json, &content_hash)
-                .await
+            let home_dir = crate::assistants::default_home_dir(&name)
                 .map_err(|error| bad_request(error.to_string()))?;
+            crate::assistants::create_assistant(
+                &ctx.db,
+                crate::assistants::CreateAssistantSpec {
+                    name: name.clone(),
+                    description,
+                    prompt,
+                    home_dir,
+                },
+            )
+            .await
+            .map_err(|error| bad_request(error.to_string()))?;
+            let snapshot = crate::assistants::snapshot(&ctx.db, &name)
+                .await
+                .map_err(internal)?
+                .context("assistant disappeared after creation")?;
             let response = Response::AssistantUpserted {
-                assistant: assistant_to_proto(row),
+                assistant: assistant_snapshot_to_proto(snapshot),
             };
             finish_nonrepeatable_response!(remote_operation, ctx, "upsert_assistant", response)
+        }
+        Request::SaveAssistantDefinition {
+            name,
+            markdown,
+            expected_revision,
+        } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept persistent assistant writes",
+                ));
+            }
+            crate::assistants::validate_assistant_name(&name)
+                .map_err(|error| bad_request(error.to_string()))?;
+            if markdown.len() > proto::MAX_AGENT_MARKDOWN_BYTES {
+                return Err(bad_request("assistant markdown exceeds maximum length"));
+            }
+            let row = ctx
+                .db
+                .get_assistant(&name)
+                .await
+                .map_err(internal)?
+                .ok_or_else(|| bad_request(format!("assistant `{name}` was not found")))?;
+            crate::assistants::save_definition_cas(&ctx.db, row, markdown, &expected_revision)
+                .await
+                .map_err(|error| ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: format!("assistant definition save rejected: {error:#}"),
+                })?;
+            let assistant = crate::assistants::snapshot(&ctx.db, &name)
+                .await
+                .map_err(internal)?
+                .context("assistant disappeared after definition save")?;
+            Ok(Response::AssistantDefinitionSaved {
+                assistant: assistant_snapshot_to_proto(assistant),
+                consumed_definition_revision: expected_revision,
+            })
         }
 
         Request::AddPackage {
@@ -4497,9 +4554,15 @@ async fn handle_serialized_request_impl(
             finish_nonrepeatable_response!(remote_operation, ctx, "purge_ended_sessions", response)
         }
 
-        Request::DeleteAssistant { name } => {
+        Request::DeleteAssistant {
+            name,
+            expected_revision,
+        } => {
             #[cfg(feature = "remote")]
-            let request = Request::DeleteAssistant { name: name.clone() };
+            let request = Request::DeleteAssistant {
+                name: name.clone(),
+                expected_revision: expected_revision.clone(),
+            };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent assistant writes",
@@ -4513,8 +4576,18 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let deleted = ctx.db.delete_assistant(&name).await.map_err(internal)?;
-            let response = Response::AssistantDeleted { deleted };
+            let deleted =
+                crate::assistants::delete_registration(&ctx.db, &name, &expected_revision)
+                    .await
+                    .map_err(|error| conflict(format!("assistant deletion rejected: {error:#}")))?;
+            if !deleted {
+                return Err(conflict("assistant changed or no longer exists"));
+            }
+            let response = Response::AssistantDeleted {
+                name,
+                consumed_registration_revision: expected_revision,
+                deleted,
+            };
             finish_nonrepeatable_response!(remote_operation, ctx, "delete_assistant", response)
         }
 
@@ -4974,6 +5047,85 @@ async fn handle_serialized_request_impl(
             }
             crate::daemon::fs_api::fs_write(ctx.clone(), project_root, path, content, base_hash)
                 .await
+        }
+
+        Request::GetAgentInventory { project_root } => {
+            crate::daemon::agent_management::inventory(ctx, project_root).await
+        }
+
+        Request::GetAgentEditSnapshot { project_root, name } => {
+            crate::daemon::agent_management::edit_snapshot(ctx, project_root, name).await
+        }
+
+        Request::MutateAgent {
+            project_root,
+            mutation,
+            expected_revision,
+        } => {
+            crate::daemon::agent_management::mutate(ctx, project_root, mutation, expected_revision)
+                .await
+        }
+
+        Request::BeginAgentEditorLease {
+            project_root,
+            name,
+            expected_revision,
+        } => {
+            crate::daemon::agent_management::begin_editor_lease(
+                ctx,
+                project_root,
+                name,
+                expected_revision,
+                agent_editor_lease_owner(state),
+            )
+            .await
+        }
+
+        Request::CompleteAgentEditorLease {
+            project_root,
+            lease_id,
+            markdown,
+        } => {
+            crate::daemon::agent_management::complete_editor_lease(
+                ctx,
+                project_root,
+                lease_id,
+                markdown,
+                agent_editor_lease_owner(state),
+            )
+            .await
+        }
+
+        Request::GetExtendedConfigSnapshot {
+            project_root,
+            snapshot_session_id,
+        } => {
+            crate::daemon::fs_api::get_extended_config_snapshot(
+                ctx,
+                project_root,
+                settings_capability_owner(state),
+                snapshot_session_id,
+            )
+            .await
+        }
+
+        Request::ApplyExtendedConfigPatch {
+            project_root,
+            layer_id,
+            patch,
+            expected_revision,
+            snapshot_session_id,
+        } => {
+            crate::daemon::fs_api::apply_extended_config_patch(
+                ctx,
+                project_root,
+                layer_id,
+                patch,
+                expected_revision,
+                settings_capability_owner(state),
+                snapshot_session_id,
+            )
+            .await
         }
 
         Request::SaveExtendedConfig {
@@ -8879,6 +9031,26 @@ async fn handle_serialized_request_impl(
     }
 }
 
+fn agent_editor_lease_owner(state: &MutableClientState) -> String {
+    // Editor leases intentionally survive a transport reconnect.  The opaque
+    // lease remains additionally bound to its canonical workspace, agent and
+    // exact revision in the daemon registry; this stable authenticated
+    // principal digest prevents another principal from claiming it without
+    // tying it to one short-lived socket connection.
+    stable_authenticated_principal(state)
+}
+
+fn settings_capability_owner(state: &MutableClientState) -> String {
+    // Settings dialogs use short-lived daemon connections.  Bind the
+    // unguessable capability to the authenticated principal, while the
+    // capability record itself binds root, target identity and revision.
+    stable_authenticated_principal(state)
+}
+
+fn stable_authenticated_principal(state: &MutableClientState) -> String {
+    principal_digest(&state.principal)
+}
+
 #[cfg(feature = "remote")]
 pub(super) async fn handle_serialized_request_with_remote_operation(
     request: Request,
@@ -9229,17 +9401,6 @@ async fn handle_concurrent_request_impl(
                 label,
                 history,
             })
-        }
-        Request::ListAssistants => {
-            let assistants = ctx
-                .db
-                .list_assistants()
-                .await
-                .map_err(internal)?
-                .into_iter()
-                .map(assistant_to_proto)
-                .collect();
-            Ok(Response::Assistants { assistants })
         }
         Request::CountPinnedMessages { session_id } => ctx
             .db
@@ -9699,6 +9860,24 @@ async fn handle_concurrent_request_impl(
             .map_err(internal)?;
             Ok(Response::PolicyExported { bundle_json })
         }
+        Request::GetAgentInventory { project_root } => {
+            crate::daemon::agent_management::inventory(&ctx, project_root).await
+        }
+        Request::GetAgentEditSnapshot { project_root, name } => {
+            crate::daemon::agent_management::edit_snapshot(&ctx, project_root, name).await
+        }
+        Request::GetExtendedConfigSnapshot {
+            project_root,
+            snapshot_session_id,
+        } => {
+            crate::daemon::fs_api::get_extended_config_snapshot(
+                &ctx,
+                project_root,
+                shared.capability_owner.clone(),
+                snapshot_session_id,
+            )
+            .await
+        }
         Request::GetImageSpendPolicy { project_key } => {
             let current = ctx
                 .db
@@ -9756,6 +9935,39 @@ async fn handle_concurrent_request_impl(
             get_session_compactions_response(&ctx, session_id).await
         }
         Request::GetAssistant { name } => get_assistant_response(&ctx, name).await,
+        Request::ListAssistants => {
+            let snapshots = crate::assistants::snapshots(&ctx.db)
+                .await
+                .map_err(internal)?;
+            if snapshots.len() > proto::MAX_ASSISTANT_SUMMARIES {
+                return Err(bad_request(format!(
+                    "assistant inventory exceeds the {}-entry local response limit; remove unused assistants",
+                    proto::MAX_ASSISTANT_SUMMARIES
+                )));
+            }
+            if snapshots.iter().any(|snapshot| {
+                snapshot.row.name.len() > proto::MAX_AGENT_NAME_BYTES
+                    || snapshot.row.home_dir.len() > proto::MAX_ASSISTANT_HOME_BYTES
+                    || snapshot.row.config_json.len() > proto::MAX_ASSISTANT_CONFIG_BYTES
+                    || snapshot
+                        .definition_markdown
+                        .as_ref()
+                        .is_some_and(|value| value.len() > proto::MAX_AGENT_MARKDOWN_BYTES)
+                    || snapshot
+                        .definition_diagnostic
+                        .as_ref()
+                        .is_some_and(|value| value.len() > proto::MAX_ASSISTANT_DIAGNOSTIC_BYTES)
+            }) {
+                return Err(bad_request(
+                    "an assistant projection exceeds the safe local response bounds; repair or remove the assistant",
+                ));
+            }
+            let assistants = snapshots
+                .into_iter()
+                .map(assistant_snapshot_to_proto)
+                .collect();
+            Ok(Response::Assistants { assistants })
+        }
         Request::DiagnoseMediaReservation { scope, id } => {
             diagnose_media_reservation_response(&ctx, scope, id).await
         }
@@ -13595,12 +13807,27 @@ pub(super) fn assistant_to_proto(
     row: crate::db::assistants::AssistantRow,
 ) -> proto::AssistantSummary {
     proto::AssistantSummary {
+        registration_revision: crate::assistants::registration_revision(&row),
         name: row.name,
         created_at: row.created_at,
         home_dir: row.home_dir,
         config_json: row.config_json,
-        content_hash: row.content_hash,
+        definition_presentation_hash: None,
+        definition_markdown: None,
+        definition_revision: None,
+        definition_diagnostic: None,
+        projection_digest: String::new(),
     }
+}
+
+fn assistant_snapshot_to_proto(
+    snapshot: crate::assistants::AssistantSnapshot,
+) -> proto::AssistantSummary {
+    let mut summary = assistant_to_proto(snapshot.row);
+    summary.definition_markdown = snapshot.definition_markdown;
+    summary.definition_revision = snapshot.definition_revision;
+    summary.definition_diagnostic = snapshot.definition_diagnostic;
+    summary
 }
 
 /// Non-secret JSON projection of a registered package row for the
@@ -13838,10 +14065,11 @@ async fn get_assistant_response(
     ctx: &Arc<DaemonContext>,
     name: String,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let row = ctx.db.get_assistant(&name).await.map_err(internal)?;
-    Ok(Response::Assistant {
-        assistant: row.map(assistant_to_proto),
-    })
+    let assistant = crate::assistants::snapshot(&ctx.db, &name)
+        .await
+        .map_err(internal)?
+        .map(assistant_snapshot_to_proto);
+    Ok(Response::Assistant { assistant })
 }
 
 async fn diagnose_media_reservation_response(

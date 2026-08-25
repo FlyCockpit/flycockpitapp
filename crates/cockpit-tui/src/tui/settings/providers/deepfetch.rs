@@ -4,9 +4,8 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cockpit_config::providers::ConfigDoc;
 #[cfg(test)]
-use cockpit_config::providers::ProvidersConfig;
+use cockpit_config::providers::{ConfigDoc, ProvidersConfig};
 use cockpit_core::providers::deepfetch::{
     DeepfetchPlan, DeepfetchScope, DeepfetchTarget, collect_deepfetch_targets,
     deepfetch_confirmation_body, plan_deepfetch,
@@ -47,6 +46,7 @@ pub(in crate::tui::settings) struct DeepFetchState {
 }
 
 impl DeepFetchState {
+    #[cfg(test)]
     pub(super) fn prepare(
         config_path: &std::path::Path,
         provider_id: &str,

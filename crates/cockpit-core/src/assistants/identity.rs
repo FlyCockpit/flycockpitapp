@@ -73,28 +73,58 @@ pub fn seed_identity_files(home_dir: &Path) -> Result<()> {
 }
 
 fn seed_file(path: &Path, body: &str) -> Result<()> {
-    if path.exists() {
+    if crate::private_fs::read_private_file(path, "assistant identity")?.is_some() {
         return Ok(());
     }
-    std::fs::write(path, body).with_context(|| format!("seeding {}", path.display()))
+    match crate::private_fs::write_private_file_exclusive(path, body.as_bytes()) {
+        Ok(()) => Ok(()),
+        // Another creator may have won the exclusive publish. Accept only an
+        // audited no-follow re-open of the resulting private regular file.
+        Err(error)
+            if crate::private_fs::read_private_file(path, "assistant identity")?.is_some() =>
+        {
+            tracing::debug!(path = %path.display(), %error, "identity seed already published");
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("seeding {}", path.display())),
+    }
 }
 
 pub fn hash_optional_file(path: &Path) -> Result<Option<String>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(crate::assistants::sha256_hex(&bytes))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err).with_context(|| format!("hashing {}", path.display())),
-    }
+    Ok(
+        crate::private_fs::read_private_file(path, "assistant identity")?
+            .map(|bytes| crate::assistants::sha256_hex(&bytes)),
+    )
 }
 
 pub async fn load_for_session(db: &Db, row: &AssistantRow) -> Result<IdentityLoad> {
-    let home_dir = Path::new(&row.home_dir);
-    let mut config: crate::assistants::AssistantConfig =
-        serde_json::from_str(&row.config_json).unwrap_or_default();
+    let db = db.clone();
+    let row = row.clone();
+    tokio::task::spawn_blocking(move || load_for_session_sync(&db, &row))
+        .await
+        .context("assistant identity coordinator joined")?
+}
+
+fn load_for_session_sync(db: &Db, requested: &AssistantRow) -> Result<IdentityLoad> {
+    let home_dir = crate::assistants::validate_row_home(requested)?;
+    let definition = crate::assistants::assistant_definition_path(&home_dir);
+    let _guard = cockpit_config::config::hold_config_mutation_lock(&definition)?;
+    super::recover_creation_journal_locked(db, &home_dir)?;
+    let row = super::get_assistant_blocking(db, &requested.name)?
+        .with_context(|| format!("assistant `{}` disappeared", requested.name))?;
+    crate::assistants::validate_row_home(&row)?;
+    super::recover_definition_journal_locked(db, &row)?;
+    let row = super::get_assistant_blocking(db, &row.name)?
+        .with_context(|| format!("assistant `{}` disappeared during recovery", row.name))?;
+    crate::assistants::validate_row_home(&row)?;
+    let original_config: crate::assistants::AssistantConfig =
+        serde_json::from_str(&row.config_json)
+            .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
+    let mut config = original_config.clone();
     let max_tokens = config.identity_max_tokens.max(1);
 
-    let soul = load_piece(&soul_path(home_dir), "SOUL.md", max_tokens)?;
-    let user = load_piece(&user_path(home_dir), "USER.md", max_tokens)?;
+    let soul = load_piece(&soul_path(&home_dir), "SOUL.md", max_tokens)?;
+    let user = load_piece(&user_path(&home_dir), "USER.md", max_tokens)?;
 
     let mut notices = Vec::new();
     if config.soul_hash.as_ref() != soul.hash.as_ref() {
@@ -125,19 +155,11 @@ pub async fn load_for_session(db: &Db, row: &AssistantRow) -> Result<IdentityLoa
         }
     }
 
-    if !notices.is_empty()
-        || config.soul_hash
-            != serde_json::from_str::<crate::assistants::AssistantConfig>(&row.config_json)
-                .unwrap_or_default()
-                .soul_hash
-        || config.user_hash
-            != serde_json::from_str::<crate::assistants::AssistantConfig>(&row.config_json)
-                .unwrap_or_default()
-                .user_hash
+    if config.soul_hash != original_config.soul_hash
+        || config.user_hash != original_config.user_hash
     {
         let config_json = serde_json::to_string(&config)?;
-        db.update_assistant_config(&row.name, &config_json)
-            .await
+        update_identity_hashes_cas_blocking(db, row.clone(), config_json)
             .with_context(|| format!("updating identity hashes for assistant `{}`", row.name))?;
     }
 
@@ -151,6 +173,35 @@ pub async fn load_for_session(db: &Db, row: &AssistantRow) -> Result<IdentityLoa
     Ok(IdentityLoad {
         system_prefix,
         notices,
+    })
+}
+
+fn update_identity_hashes_cas_blocking(
+    db: &Db,
+    expected: AssistantRow,
+    config_json: String,
+) -> Result<AssistantRow> {
+    serde_json::from_str::<serde_json::Value>(&config_json)
+        .context("assistant config must be valid JSON")?;
+    db.write_blocking(move |conn| {
+        let changed = conn.execute(
+            "UPDATE assistants SET config_json = ?6
+             WHERE name = ?1 AND created_at = ?2 AND home_dir = ?3
+               AND config_json = ?4 AND content_hash = ?5",
+            rusqlite::params![
+                expected.name,
+                expected.created_at,
+                expected.home_dir,
+                expected.config_json,
+                expected.content_hash,
+                config_json,
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("assistant registry changed while identity files were read");
+        }
+        crate::db::Db::get_assistant_conn(conn, &expected.name)?
+            .context("assistant disappeared after identity hash update")
     })
 }
 
@@ -174,11 +225,8 @@ struct IdentityPiece {
 }
 
 fn load_piece(path: &Path, label: &'static str, max_tokens: usize) -> Result<IdentityPiece> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
-    };
+    let bytes =
+        crate::private_fs::read_private_file(path, "assistant identity")?.unwrap_or_default();
     let hash = if bytes.is_empty() {
         None
     } else {
@@ -274,8 +322,13 @@ pub async fn check_identity_write(ctx: &ToolCtx, path: &Path) -> Result<Identity
             preauthorized: false,
         });
     };
-    let config: crate::assistants::AssistantConfig =
-        serde_json::from_str(&row.config_json).unwrap_or_default();
+    let config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
+        .with_context(|| {
+            format!(
+                "assistant `{}` has malformed durable configuration; refusing identity write",
+                row.name
+            )
+        })?;
     match config.soul_edit_mode {
         SoulEditMode::HumanOnly => Ok(IdentityWriteGate::Refuse(format!(
             "Refused: `{}` is an assistant identity file ({identity_file}); soul_edit_mode=human_only requires the human to edit SOUL.md/USER.md outside model tools.",
@@ -328,18 +381,47 @@ pub async fn record_identity_write(ctx: &ToolCtx, path: &Path) -> Result<()> {
     let Some((row, identity_file)) = identity_target(ctx, path).await? else {
         return Ok(());
     };
-    let mut config: crate::assistants::AssistantConfig =
-        serde_json::from_str(&row.config_json).unwrap_or_default();
+    let db = ctx.session.db.clone();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || record_identity_write_sync(&db, row, identity_file, &path))
+        .await
+        .context("assistant identity write coordinator joined")?
+}
+
+fn record_identity_write_sync(
+    db: &Db,
+    requested: AssistantRow,
+    identity_file: &'static str,
+    path: &Path,
+) -> Result<()> {
+    let home = crate::assistants::validate_row_home(&requested)?;
+    let definition = crate::assistants::assistant_definition_path(&home);
+    let _guard = cockpit_config::config::hold_config_mutation_lock(&definition)?;
+    super::recover_creation_journal_locked(db, &home)?;
+    let row = super::get_assistant_blocking(db, &requested.name)?
+        .context("assistant disappeared while recording identity write")?;
+    crate::assistants::validate_row_home(&row)?;
+    super::recover_definition_journal_locked(db, &row)?;
+    let row = super::get_assistant_blocking(db, &row.name)?
+        .context("assistant disappeared during identity recovery")?;
+    crate::assistants::validate_row_home(&row)?;
+    let expected_path = match identity_file {
+        SOUL_FILE => soul_path(&home),
+        USER_FILE => user_path(&home),
+        _ => anyhow::bail!("unsupported assistant identity file"),
+    };
+    if !same_path(path, &expected_path) {
+        anyhow::bail!("identity path changed before hash publication");
+    }
+    let mut config: crate::assistants::AssistantConfig = serde_json::from_str(&row.config_json)
+        .with_context(|| format!("parsing assistant config for `{}`", row.name))?;
     match identity_file {
         SOUL_FILE => config.soul_hash = hash_optional_file(path)?,
         USER_FILE => config.user_hash = hash_optional_file(path)?,
         _ => {}
     }
     let config_json = serde_json::to_string(&config)?;
-    ctx.session
-        .db
-        .update_assistant_config(&row.name, &config_json)
-        .await?;
+    update_identity_hashes_cas_blocking(db, row, config_json)?;
     Ok(())
 }
 
@@ -353,9 +435,9 @@ async fn identity_target(
     let Some(row) = ctx.session.db.get_assistant(name).await? else {
         return Ok(None);
     };
-    let home = Path::new(&row.home_dir);
-    let soul = soul_path(home);
-    let user = user_path(home);
+    let home = crate::assistants::validate_row_home(&row)?;
+    let soul = soul_path(&home);
+    let user = user_path(&home);
     if same_path(path, &soul) {
         Ok(Some((row, SOUL_FILE)))
     } else if same_path(path, &user) {

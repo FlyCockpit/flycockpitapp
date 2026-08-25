@@ -3255,18 +3255,32 @@ impl Driver {
         let Some(assistant_name) = self.session.assistant_name.clone() else {
             return false;
         };
-        let interval = self
-            .session
-            .db
-            .get_assistant(&assistant_name)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|row| {
-                serde_json::from_str::<crate::assistants::AssistantConfig>(&row.config_json).ok()
-            })
-            .map(|config| config.skill_review_interval)
-            .unwrap_or(crate::assistants::self_improvement::DEFAULT_SKILL_REVIEW_INTERVAL);
+        let interval = match crate::assistants::snapshot(&self.session.db, &assistant_name).await {
+            Ok(Some(snapshot)) => {
+                match serde_json::from_str::<crate::assistants::AssistantConfig>(
+                    &snapshot.row.config_json,
+                ) {
+                    Ok(config) => config.skill_review_interval,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            assistant = %assistant_name,
+                            "refusing self-improvement review for malformed durable assistant configuration"
+                        );
+                        return false;
+                    }
+                }
+            }
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    assistant = %assistant_name,
+                    "refusing self-improvement review because assistant authority validation failed"
+                );
+                return false;
+            }
+        };
         if !self
             .self_improvement_schedule
             .record_idle_boundary(&assistant_name, interval)

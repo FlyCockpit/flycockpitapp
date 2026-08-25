@@ -1,12 +1,14 @@
-//! OKF v0.1 knowledge bundles and disposable per-bundle retrieval indexes.
+//! OKF v0.1 knowledge bundles and disposable retrieval indexes.
 //!
 //! Cockpit treats the markdown bundle as the source of truth. The SQLite file
-//! inside each bundle is a derived cache: delete it and it rebuilds from the
-//! markdown. The cache is intentionally per-bundle so embeddings and vector
-//! tables never enter the main `cockpit.db`.
+//! is a derived cache: delete it and it rebuilds from markdown. Assistant
+//! bundles are securely snapshotted as read-only input and indexed in the
+//! daemon's private state; project bundles retain their existing colocated
+//! disposable cache. Embeddings and vector tables never enter `cockpit.db`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_char;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,6 +35,11 @@ const CHUNK_TARGET_TOKENS: usize = 400;
 const CHUNK_OVERLAP_TOKENS: usize = 80;
 const DEFAULT_SEARCH_LIMIT: usize = 6;
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
+const MAX_KNOWLEDGE_FILES: usize = 4096;
+const MAX_KNOWLEDGE_ENTRIES: usize = 8192;
+const MAX_KNOWLEDGE_DEPTH: usize = 32;
+const MAX_KNOWLEDGE_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_KNOWLEDGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 #[cfg(test)]
 pub(crate) fn runtime_attached_tool_names() -> &'static [&'static str] {
@@ -93,10 +100,14 @@ pub(crate) struct IndexStats {
     pub indexed_files: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct AttachedBundle {
     pub scope: BundleScope,
     pub root: PathBuf,
+    /// Assistant bundles are immutable, identity-bound in-memory snapshots.
+    /// Project bundles remain path-based under explicit workspace trust.
+    snapshot: Option<KnowledgeBundle>,
+    sidecar_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,14 +141,63 @@ struct EmbeddedConcept {
 
 pub(crate) fn parse_bundle(root: impl AsRef<Path>) -> Result<KnowledgeBundle> {
     let root = root.as_ref().to_path_buf();
+    if !root.exists() {
+        return Ok(KnowledgeBundle {
+            root,
+            index_md: None,
+            log_md: None,
+            concepts: Vec::new(),
+        });
+    }
+    let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
+        &root,
+        MAX_KNOWLEDGE_FILES,
+        MAX_KNOWLEDGE_ENTRIES,
+        MAX_KNOWLEDGE_DEPTH,
+        MAX_KNOWLEDGE_FILE_BYTES,
+        MAX_KNOWLEDGE_TOTAL_BYTES,
+    )?;
+    parse_bundle_snapshot(root, documents)
+}
+
+fn validate_unique_concept_ids(root: &Path, concepts: &[KnowledgeConcept]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    for concept in concepts {
+        if !ids.insert(concept.id.as_str()) {
+            bail!(
+                "knowledge bundle {} contains duplicate concept ID `{}`",
+                root.display(),
+                concept.id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn finish_bundle(
+    root: PathBuf,
+    index_md: Option<String>,
+    log_md: Option<String>,
+    mut concepts: Vec<KnowledgeConcept>,
+) -> Result<KnowledgeBundle> {
+    concepts.sort_by(|a, b| a.path.cmp(&b.path));
+    validate_unique_concept_ids(&root, &concepts)?;
+    Ok(KnowledgeBundle {
+        root,
+        index_md,
+        log_md,
+        concepts,
+    })
+}
+
+fn parse_bundle_snapshot(
+    root: PathBuf,
+    documents: Vec<(PathBuf, String)>,
+) -> Result<KnowledgeBundle> {
     let mut index_md = None;
     let mut log_md = None;
     let mut concepts = Vec::new();
-
-    for path in markdown_files(&root)? {
-        let rel = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
-        let body = fs::read_to_string(&path)
-            .with_context(|| format!("reading knowledge file {}", path.display()))?;
+    for (rel, body) in documents {
         match rel.to_string_lossy().as_ref() {
             "index.md" => index_md = Some(body),
             "log.md" => log_md = Some(body),
@@ -148,14 +208,7 @@ pub(crate) fn parse_bundle(root: impl AsRef<Path>) -> Result<KnowledgeBundle> {
             }
         }
     }
-
-    concepts.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(KnowledgeBundle {
-        root,
-        index_md,
-        log_md,
-        concepts,
-    })
+    finish_bundle(root, index_md, log_md, concepts)
 }
 
 pub(crate) fn serialize_concept(concept: &KnowledgeConcept) -> String {
@@ -203,33 +256,6 @@ pub(crate) fn serialize_concept(concept: &KnowledgeConcept) -> String {
         }
     }
     out
-}
-
-fn markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    collect_markdown_files(root, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn collect_markdown_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') {
-            continue;
-        }
-        if path.is_dir() {
-            collect_markdown_files(&path, out)?;
-        } else if path.extension().is_some_and(|ext| ext == "md") {
-            out.push(path);
-        }
-    }
-    Ok(())
 }
 
 fn parse_concept(root: &Path, rel: PathBuf, raw: &str) -> Result<Option<KnowledgeConcept>> {
@@ -375,11 +401,11 @@ async fn embedding_dimensions_probe(embedder: &dyn Embedder) -> Result<usize> {
     Ok(dimensions)
 }
 
-fn sidecar_vec_table_exists(root: &Path) -> Result<bool> {
-    if !root.join(SIDE_CAR_FILE).exists() {
+fn sidecar_vec_table_exists(sidecar: &Path) -> Result<bool> {
+    if !sidecar.exists() {
         return Ok(false);
     }
-    let conn = open_sidecar_connection(root)?;
+    let conn = open_sidecar_connection(sidecar)?;
     table_exists(&conn, "vec_chunks")
 }
 
@@ -395,10 +421,19 @@ impl KnowledgeIndex {
         embedder: Arc<dyn Embedder>,
     ) -> Result<(Self, IndexStats)> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root)
-            .with_context(|| format!("creating knowledge bundle {}", root.display()))?;
+        if !root.exists() {
+            bail!("knowledge bundle does not exist: {}", root.display());
+        }
         let bundle = parse_bundle(&root)?;
-        let conn = open_sidecar_connection(&root)?;
+        Self::open_snapshot(bundle, root.join(SIDE_CAR_FILE), embedder).await
+    }
+
+    async fn open_snapshot(
+        bundle: KnowledgeBundle,
+        sidecar_path: PathBuf,
+        embedder: Arc<dyn Embedder>,
+    ) -> Result<(Self, IndexStats)> {
+        let conn = open_sidecar_connection(&sidecar_path)?;
         ensure_schema(&conn)?;
         let mut plan = plan_reindex(&conn, &bundle)?;
         drop(conn);
@@ -408,7 +443,7 @@ impl KnowledgeIndex {
                 .stored_dimensions
                 .is_some_and(|stored| stored != current_dimensions);
             let dimensions_missing_for_existing_table =
-                plan.stored_dimensions.is_none() && sidecar_vec_table_exists(&root)?;
+                plan.stored_dimensions.is_none() && sidecar_vec_table_exists(&sidecar_path)?;
             if dimensions_changed || dimensions_missing_for_existing_table {
                 plan.concepts = bundle.concepts.clone();
                 plan.stats.reused_files = 0;
@@ -418,7 +453,7 @@ impl KnowledgeIndex {
         }
         let (embedded, embedded_chunks) =
             embed_planned_concepts(&plan.concepts, embedder.as_ref()).await?;
-        let conn = open_sidecar_connection(&root)?;
+        let conn = open_sidecar_connection(&sidecar_path)?;
         ensure_schema(&conn)?;
         if plan.force_clear_before_apply {
             clear_index(&conn)?;
@@ -461,9 +496,24 @@ impl KnowledgeIndex {
     }
 }
 
-fn open_sidecar_connection(root: &Path) -> Result<Connection> {
-    let conn = Connection::open(root.join(SIDE_CAR_FILE))
-        .with_context(|| format!("opening knowledge sidecar in {}", root.display()))?;
+fn open_sidecar_connection(sidecar: &Path) -> Result<Connection> {
+    if !sidecar.exists() {
+        match crate::private_fs::write_private_file_exclusive(sidecar, b"") {
+            Ok(()) => {}
+            Err(error) if sidecar.exists() => {
+                crate::private_fs::repair_private_file(sidecar, "knowledge sidecar")
+                    .map_err(anyhow::Error::from)
+                    .context("securing concurrently-created knowledge sidecar")?;
+                tracing::debug!(%error, "knowledge sidecar was created concurrently");
+            }
+            Err(error) => return Err(error).context("creating private knowledge sidecar"),
+        }
+    } else {
+        crate::private_fs::repair_private_file(sidecar, "knowledge sidecar")
+            .map_err(anyhow::Error::from)?;
+    }
+    let conn = Connection::open(sidecar)
+        .with_context(|| format!("opening knowledge sidecar {}", sidecar.display()))?;
     load_sqlite_vec_for_sidecar(&conn)?;
     Ok(conn)
 }
@@ -1000,7 +1050,13 @@ pub(crate) async fn inject_knowledge_for_turn(
     redact: Arc<RedactionTable>,
 ) {
     let extended = config.extended();
-    let bundles = attached_bundles(session, cwd, &extended).await;
+    let bundles = match attached_bundles(session, cwd, &extended).await {
+        Ok(bundles) => bundles,
+        Err(error) => {
+            tracing::warn!(%error, "refusing knowledge injection because assistant authority validation failed");
+            return;
+        }
+    };
     if bundles.is_empty() {
         return;
     }
@@ -1063,7 +1119,17 @@ async fn search_bundles(
         .context("embedding query returned no vector")?;
     let mut all = Vec::new();
     for bundle in bundles {
-        let (index, _) = KnowledgeIndex::open(&bundle.root, embedder.clone()).await?;
+        let (index, _) = match &bundle.snapshot {
+            Some(snapshot) => {
+                KnowledgeIndex::open_snapshot(
+                    snapshot.clone(),
+                    bundle.sidecar_path.clone(),
+                    embedder.clone(),
+                )
+                .await?
+            }
+            None => KnowledgeIndex::open(&bundle.root, embedder.clone()).await?,
+        };
         all.extend(index.search_with_vector(&query_vector, query, limit)?);
     }
     all.sort_by(|a, b| {
@@ -1081,24 +1147,46 @@ pub(crate) async fn attached_bundles_available(
     config: &crate::daemon::session_worker::SessionConfigHandle,
 ) -> bool {
     let extended = config.extended();
-    !attached_bundles(session, cwd, &extended).await.is_empty()
+    match attached_bundles(session, cwd, &extended).await {
+        Ok(bundles) => !bundles.is_empty(),
+        Err(error) => {
+            tracing::warn!(%error, "assistant knowledge availability check failed closed");
+            false
+        }
+    }
 }
 
 pub(crate) async fn attached_bundles(
     session: &Session,
     cwd: &Path,
     extended: &ExtendedConfig,
-) -> Vec<AttachedBundle> {
+) -> Result<Vec<AttachedBundle>> {
     let mut bundles = Vec::new();
-    if let Some(name) = &session.assistant_name
-        && let Ok(Some(row)) = session.db.get_assistant(name).await
-    {
-        let root = Path::new(&row.home_dir).join("knowledge");
-        if root.exists() {
-            bundles.push(AttachedBundle {
-                scope: BundleScope::Assistant,
-                root,
-            });
+    if let Some(name) = &session.assistant_name {
+        let snapshot = crate::assistants::snapshot(&session.db, name)
+            .await
+            .with_context(|| format!("validating assistant `{name}` knowledge root"))?;
+        if let Some(snapshot) = snapshot {
+            // `snapshot` validates the persisted row's canonical home and
+            // definition identity through the unified assistant coordinator.
+            let root = crate::assistants::validate_row_home(&snapshot.row)?.join("knowledge");
+            if let Some(bundle_snapshot) = assistant_knowledge_snapshot(&snapshot.row, &root)? {
+                let config: crate::assistants::AssistantConfig =
+                    serde_json::from_str(&snapshot.row.config_json)
+                        .context("parsing assistant identity for knowledge cache")?;
+                if config.installation_id.is_nil() {
+                    bail!("assistant knowledge has no installation identity");
+                }
+                let cache_root =
+                    crate::config::resolve::cockpit_data_dir()?.join("knowledge-indexes");
+                crate::private_fs::ensure_private_dir(&cache_root)?;
+                bundles.push(AttachedBundle {
+                    scope: BundleScope::Assistant,
+                    root,
+                    snapshot: Some(bundle_snapshot),
+                    sidecar_path: cache_root.join(format!("{}.sqlite", config.installation_id)),
+                });
+            }
         }
     }
 
@@ -1106,10 +1194,50 @@ pub(crate) async fn attached_bundles(
     if extended.project_knowledge && project_bundle_trusted() && project_root.exists() {
         bundles.push(AttachedBundle {
             scope: BundleScope::Project,
+            sidecar_path: project_root.join(SIDE_CAR_FILE),
             root: project_root,
+            snapshot: None,
         });
     }
-    bundles
+    Ok(bundles)
+}
+
+fn assistant_knowledge_snapshot(
+    row: &crate::db::assistants::AssistantRow,
+    diagnostic_root: &Path,
+) -> Result<Option<KnowledgeBundle>> {
+    let handle = match cockpit_config::config::open_config_directory_nofollow(diagnostic_root) {
+        Ok(handle) => handle,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "opening assistant knowledge root {}",
+                    diagnostic_root.display()
+                )
+            });
+        }
+    };
+    drop(handle);
+    let documents = cockpit_config::config::snapshot_markdown_tree_nofollow(
+        diagnostic_root,
+        MAX_KNOWLEDGE_FILES,
+        MAX_KNOWLEDGE_ENTRIES,
+        MAX_KNOWLEDGE_DEPTH,
+        MAX_KNOWLEDGE_FILE_BYTES,
+        MAX_KNOWLEDGE_TOTAL_BYTES,
+    )?;
+    parse_bundle_snapshot(
+        PathBuf::from(format!("assistant://{}/knowledge", row.name)),
+        documents,
+    )
+    .map(Some)
 }
 
 fn project_bundle_trusted() -> bool {
@@ -1174,7 +1302,7 @@ impl Tool for MemorySearchTool {
             return Err(invalid_input("memory_search query must not be empty"));
         }
         let extended = ctx.config.extended();
-        let bundles = attached_bundles(&ctx.session, &ctx.cwd, &extended).await;
+        let bundles = attached_bundles(&ctx.session, &ctx.cwd, &extended).await?;
         if bundles.is_empty() {
             return Ok(ToolOutput::text(
                 "No attached knowledge bundles are available.",
@@ -1557,6 +1685,7 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         assert!(
             attached_bundles(&session, tmp.path(), &extended)
                 .await
+                .unwrap()
                 .is_empty()
         );
         crate::config::trust::set_runtime_policy(
@@ -1566,12 +1695,14 @@ If workers emit E_CONNRESET-7749, rotate the relay token before retrying.
         assert!(
             attached_bundles(&session, tmp.path(), &extended)
                 .await
+                .unwrap()
                 .is_empty()
         );
         crate::config::trust::set_runtime_policy(trust_root(tmp.path()), WorkspaceTrustMode::Trust);
         assert_eq!(
             attached_bundles(&session, tmp.path(), &extended)
                 .await
+                .unwrap()
                 .len(),
             1
         );

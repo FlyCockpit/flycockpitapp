@@ -559,6 +559,7 @@ pub(crate) fn read_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
 pub(crate) fn read_file_nofollow_with_identity(
     path: &Path,
     writable: bool,
+    enforce_private: bool,
 ) -> Result<Option<(std::fs::File, Vec<u8>, super::TerminalIngressFileIdentity)>> {
     #[cfg(unix)]
     let (parent, file_name) = match open_parent_directory_nofollow(path) {
@@ -615,9 +616,10 @@ pub(crate) fn read_file_nofollow_with_identity(
     #[cfg(unix)]
     let identity = {
         use std::os::unix::fs::MetadataExt as _;
-        if before.uid() != unsafe { libc::geteuid() }
-            || before.mode() & 0o777 != 0o600
-            || before.nlink() != 1
+        if enforce_private
+            && (before.uid() != unsafe { libc::geteuid() }
+                || before.mode() & 0o777 != 0o600
+                || before.nlink() != 1)
         {
             anyhow::bail!("terminal ingress file ownership, mode, or link count changed");
         }
@@ -637,7 +639,9 @@ pub(crate) fn read_file_nofollow_with_identity(
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        verify_windows_protected_dacl(&file)?;
+        if enforce_private {
+            verify_windows_protected_dacl(&file)?;
+        }
         super::TerminalIngressFileIdentity {
             volume: u64::from(info.dwVolumeSerialNumber),
             file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
@@ -645,7 +649,7 @@ pub(crate) fn read_file_nofollow_with_identity(
         }
     };
     #[cfg(windows)]
-    if identity.links != 1 {
+    if enforce_private && identity.links != 1 {
         anyhow::bail!("terminal ingress file link count changed");
     }
     #[cfg(all(not(unix), not(windows)))]
@@ -657,6 +661,402 @@ pub(crate) fn read_file_nofollow_with_identity(
     let mut file = file;
     let bytes = read_all(&mut file, path)?;
     Ok(Some((file, bytes, identity)))
+}
+
+pub(crate) fn open_directory_handle_nofollow(path: &Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        return open_directory_nofollow(path, false, false);
+    }
+    #[cfg(windows)]
+    {
+        return open_windows_directory_nofollow(path, false);
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!("refusing non-directory or symlink {}", path.display());
+        }
+        return std::fs::File::open(path).map_err(Into::into);
+    }
+}
+
+pub(crate) fn read_leaf_from_directory_handle(
+    directory: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if Path::new(leaf).components().count() != 1
+        || matches!(
+            Path::new(leaf).components().next(),
+            None | Some(std::path::Component::CurDir)
+                | Some(std::path::Component::ParentDir)
+                | Some(std::path::Component::RootDir)
+                | Some(std::path::Component::Prefix(_))
+        )
+    {
+        anyhow::bail!("retained-directory read requires one normal leaf component");
+    }
+    #[cfg(unix)]
+    let file = open_file_at_nofollow(
+        directory,
+        leaf,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    #[cfg(windows)]
+    let file = {
+        use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, SYNCHRONIZE,
+        };
+        open_windows_relative_nofollow(
+            directory,
+            leaf,
+            false,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+        )?
+    };
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (directory, leaf, max_bytes);
+        anyhow::bail!("retained-directory reads are unsupported on this platform");
+    }
+    #[cfg(any(unix, windows))]
+    {
+        use std::io::Read as _;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > max_bytes as u64 {
+            anyhow::bail!("retained-directory leaf is not a bounded regular file");
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > max_bytes {
+            anyhow::bail!("retained-directory leaf exceeds the byte limit");
+        }
+        Ok(bytes)
+    }
+}
+
+pub(crate) fn snapshot_markdown_tree_nofollow(
+    root: &Path,
+    max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<Vec<(PathBuf, String)>> {
+    let root_handle = open_directory_handle_nofollow(root)?;
+    let mut output = Vec::new();
+    let mut total = 0usize;
+    let mut entries = 0usize;
+    snapshot_markdown_directory(
+        &root_handle,
+        Path::new(""),
+        &mut output,
+        &mut total,
+        &mut entries,
+        0,
+        max_files,
+        max_entries,
+        max_depth,
+        max_file_bytes,
+        max_total_bytes,
+    )?;
+    output.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(output)
+}
+
+fn accept_markdown_document(
+    relative: PathBuf,
+    mut file: std::fs::File,
+    output: &mut Vec<(PathBuf, String)>,
+    total: &mut usize,
+    max_files: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<()> {
+    use std::io::{Read as _, Seek as _};
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() > max_file_bytes as u64 || output.len() >= max_files {
+        anyhow::bail!("knowledge document exceeds the retained snapshot bounds");
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    (&mut file)
+        .take(max_file_bytes as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    file.rewind()?;
+    let mut verification = Vec::with_capacity(bytes.len());
+    (&mut file)
+        .take(max_file_bytes as u64 + 1)
+        .read_to_end(&mut verification)?;
+    let after = file.metadata()?;
+    if bytes.len() > max_file_bytes
+        || bytes != verification
+        || before.len() != after.len()
+        || before.modified()? != after.modified()?
+    {
+        anyhow::bail!("knowledge document changed during retained snapshot");
+    }
+    *total = total
+        .checked_add(bytes.len())
+        .filter(|total| *total <= max_total_bytes)
+        .ok_or_else(|| anyhow::anyhow!("knowledge snapshot exceeds its aggregate byte limit"))?;
+    output.push((
+        relative,
+        String::from_utf8(bytes).context("knowledge document is not valid UTF-8")?,
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn snapshot_markdown_directory(
+    directory: &std::fs::File,
+    relative: &Path,
+    output: &mut Vec<(PathBuf, String)>,
+    total: &mut usize,
+    entries: &mut usize,
+    depth: usize,
+    max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<()> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    if depth > max_depth {
+        anyhow::bail!("knowledge snapshot exceeds its directory depth limit");
+    }
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error()).context("duplicating knowledge directory");
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(std::io::Error::last_os_error()).context("enumerating knowledge directory");
+    }
+    let mut names = Vec::new();
+    loop {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        #[cfg(not(target_os = "macos"))]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            #[cfg(target_os = "macos")]
+            let errno_code = unsafe { *libc::__error() };
+            #[cfg(not(target_os = "macos"))]
+            let errno_code = unsafe { *libc::__errno_location() };
+            unsafe { libc::closedir(stream) };
+            if errno_code != 0 {
+                return Err(std::io::Error::from_raw_os_error(errno_code))
+                    .context("reading retained knowledge directory");
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." || name.starts_with(b".") {
+            continue;
+        }
+        names.push(OsStr::from_bytes(name).to_os_string());
+    }
+    names.sort();
+    for name in names {
+        *entries = entries
+            .checked_add(1)
+            .filter(|entries| *entries <= max_entries)
+            .ok_or_else(|| anyhow::anyhow!("knowledge snapshot exceeds its entry limit"))?;
+        let component = path_component_cstring(&name)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("opening retained knowledge descendant {name:?}"));
+        }
+        let child = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = child.metadata()?;
+        let child_relative = relative.join(&name);
+        if metadata.is_dir() {
+            snapshot_markdown_directory(
+                &child,
+                &child_relative,
+                output,
+                total,
+                entries,
+                depth + 1,
+                max_files,
+                max_entries,
+                max_depth,
+                max_file_bytes,
+                max_total_bytes,
+            )?;
+        } else if metadata.is_file() && child_relative.extension().is_some_and(|ext| ext == "md") {
+            accept_markdown_document(
+                child_relative,
+                child,
+                output,
+                total,
+                max_files,
+                max_file_bytes,
+                max_total_bytes,
+            )?;
+        } else if metadata.file_type().is_symlink() {
+            anyhow::bail!("knowledge snapshot refused a symbolic link");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn snapshot_markdown_directory(
+    directory: &std::fs::File,
+    relative: &Path,
+    output: &mut Vec<(PathBuf, String)>,
+    total: &mut usize,
+    entries: &mut usize,
+    depth: usize,
+    max_files: usize,
+    max_entries: usize,
+    max_depth: usize,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<()> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ID_BOTH_DIR_INFO, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+        FILE_TRAVERSE, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
+        GetFileInformationByHandleEx, SYNCHRONIZE,
+    };
+
+    if depth > max_depth {
+        anyhow::bail!("knowledge snapshot exceeds its directory depth limit");
+    }
+    let mut names = Vec::new();
+    let mut restart = true;
+    loop {
+        let mut buffer = vec![0u8; 64 * 1024];
+        let class = if restart {
+            FileIdBothDirectoryRestartInfo
+        } else {
+            FileIdBothDirectoryInfo
+        };
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                directory.as_raw_handle(),
+                class,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+            )
+        };
+        restart = false;
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                break;
+            }
+            return Err(error).context("enumerating retained Windows knowledge directory");
+        }
+        let mut offset = 0usize;
+        loop {
+            let info = unsafe { &*(buffer.as_ptr().add(offset).cast::<FILE_ID_BOTH_DIR_INFO>()) };
+            let length = info.FileNameLength as usize / 2;
+            let name = std::ffi::OsString::from_wide(unsafe {
+                std::slice::from_raw_parts(info.FileName.as_ptr(), length)
+            });
+            if name != "." && name != ".." && !name.to_string_lossy().starts_with('.') {
+                names.push((name, info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0));
+            }
+            if info.NextEntryOffset == 0 {
+                break;
+            }
+            offset = offset
+                .checked_add(info.NextEntryOffset as usize)
+                .filter(|offset| *offset < buffer.len())
+                .ok_or_else(|| anyhow::anyhow!("invalid Windows directory enumeration offset"))?;
+        }
+    }
+    names.sort_by(|left, right| left.0.cmp(&right.0));
+    for (name, directory_hint) in names {
+        *entries = entries
+            .checked_add(1)
+            .filter(|entries| *entries <= max_entries)
+            .ok_or_else(|| anyhow::anyhow!("knowledge snapshot exceeds its entry limit"))?;
+        let child_relative = relative.join(&name);
+        let child = open_windows_relative_nofollow(
+            directory,
+            &name,
+            false,
+            if directory_hint {
+                FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+            } else {
+                FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+            },
+            FILE_OPEN,
+        )?;
+        reject_windows_reparse_handle(&child, &child_relative)?;
+        let metadata = child.metadata()?;
+        if metadata.is_dir() {
+            snapshot_markdown_directory(
+                &child,
+                &child_relative,
+                output,
+                total,
+                entries,
+                depth + 1,
+                max_files,
+                max_entries,
+                max_depth,
+                max_file_bytes,
+                max_total_bytes,
+            )?;
+        } else if metadata.is_file() && child_relative.extension().is_some_and(|ext| ext == "md") {
+            accept_markdown_document(
+                child_relative,
+                child,
+                output,
+                total,
+                max_files,
+                max_file_bytes,
+                max_total_bytes,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn snapshot_markdown_directory(
+    _: &std::fs::File,
+    _: &Path,
+    _: &mut Vec<(PathBuf, String)>,
+    _: &mut usize,
+    _: &mut usize,
+    _: usize,
+    _: usize,
+    _: usize,
+    _: usize,
+    _: usize,
+    _: usize,
+) -> Result<()> {
+    anyhow::bail!("retained knowledge snapshots are unsupported on this platform")
 }
 
 #[cfg(windows)]
@@ -1653,6 +2053,208 @@ fn remove_open_file_on_windows(file: &std::fs::File) -> std::io::Result<()> {
 
 pub(crate) fn remove_file_nofollow(path: &Path) -> Result<()> {
     prepare_file_removal(path)?.commit()
+}
+
+#[cfg(unix)]
+fn link_unlink_noreplace(
+    source_parent: &std::fs::File,
+    source_name: &std::ffi::CStr,
+    destination_parent: &std::fs::File,
+    destination_name: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: all descriptors and component strings remain live. linkat
+    // atomically fails when the destination already exists.
+    let linked = unsafe {
+        libc::linkat(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            0,
+        )
+    };
+    if linked != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    destination_parent.sync_all()?;
+    // SAFETY: the retained source parent and component remain live.
+    let unlinked = unsafe { libc::unlinkat(source_parent.as_raw_fd(), source_name.as_ptr(), 0) };
+    if unlinked != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn rename_file_nofollow(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let Some((held_source, _, expected_identity)) =
+            read_file_nofollow_with_identity(source, false, false)?
+        else {
+            anyhow::bail!("rename source disappeared: {}", source.display());
+        };
+        let (source_parent, source_name) = open_parent_directory_nofollow(source)?;
+        let (destination_parent, destination_name) = open_parent_directory_nofollow(destination)?;
+        let source_name_c = path_component_cstring(&source_name)?;
+        let destination_name_c = path_component_cstring(&destination_name)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the retained parent descriptor and component string remain
+        // live; AT_SYMLINK_NOFOLLOW makes this an entry-kind proof.
+        let stated = unsafe {
+            libc::fstatat(
+                source_parent.as_raw_fd(),
+                source_name_c.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stated != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("stating rename source {}", source.display()));
+        }
+        // SAFETY: fstatat initialized the record on success.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            anyhow::bail!(
+                "refusing to rename non-regular config file {}",
+                source.display()
+            );
+        }
+        let entry_identity = super::TerminalIngressFileIdentity {
+            volume: stat.st_dev as u64,
+            file: stat.st_ino as u64,
+            links: stat.st_nlink.try_into().unwrap_or(u32::MAX),
+        };
+        if entry_identity != expected_identity {
+            anyhow::bail!(
+                "rename source identity changed after its parent was retained: {}",
+                source.display()
+            );
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // SAFETY: both retained directory descriptors and component
+            // strings remain live. RENAME_NOREPLACE makes destination
+            // existence an atomic conflict rather than overwriting it.
+            let renamed = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    source_parent.as_raw_fd(),
+                    source_name_c.as_ptr(),
+                    destination_parent.as_raw_fd(),
+                    destination_name_c.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if renamed != 0 {
+                let error = std::io::Error::last_os_error();
+                if matches!(
+                    error.raw_os_error(),
+                    Some(code) if code == libc::ENOSYS || code == libc::EINVAL
+                ) {
+                    link_unlink_noreplace(
+                        &source_parent,
+                        &source_name_c,
+                        &destination_parent,
+                        &destination_name_c,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "linking without replacement {} to {} after renameat2 was unavailable",
+                            source.display(),
+                            destination.display()
+                        )
+                    })?;
+                } else {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "renaming without replacement {} to {}",
+                            source.display(),
+                            destination.display()
+                        )
+                    });
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            // Portable retained-directory fallback: linkat publishes the
+            // destination only when absent, then unlinkat removes the source.
+            // If unlink fails both names safely reference the same inode and
+            // recovery reports a conflict instead of losing either file.
+            link_unlink_noreplace(
+                &source_parent,
+                &source_name_c,
+                &destination_parent,
+                &destination_name_c,
+            )
+            .with_context(|| {
+                format!(
+                    "linking without replacement {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+        }
+        source_parent.sync_all()?;
+        destination_parent.sync_all()?;
+        let Some((destination_file, _, actual_identity)) =
+            read_file_nofollow_with_identity(destination, false, false)?
+        else {
+            anyhow::bail!(
+                "rename destination disappeared before identity verification: {}",
+                destination.display()
+            );
+        };
+        if actual_identity != expected_identity {
+            anyhow::bail!(
+                "rename namespace changed during no-replace move from {} to {}; durable caller recovery must reconcile both names",
+                source.display(),
+                destination.display()
+            );
+        }
+        // Keep both handles alive through the post-move identity proof. This
+        // binds the accepted destination to the exact regular file validated
+        // before any namespace operation.
+        drop(destination_file);
+        drop(held_source);
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let (source_parent, source_name) = open_windows_parent_directory_nofollow(source, false)?;
+        let source_file = open_windows_child_nofollow(&source_parent, &source_name, false, true)
+            .with_context(|| format!("opening rename source {}", source.display()))?;
+        reject_windows_reparse_handle(&source_file, source)?;
+        let (destination_parent, destination_name) =
+            open_windows_parent_directory_for_rename_nofollow(destination, false)?;
+        rename_open_file_on_windows(&source_file, &destination_parent, &destination_name, false)
+            .with_context(|| {
+                format!("renaming {} to {}", source.display(), destination.display())
+            })?;
+        source_parent.sync_all()?;
+        destination_parent.sync_all()?;
+        return Ok(());
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (source, destination);
+        anyhow::bail!("identity-bound config rename is unsupported on this platform")
+    }
+}
+
+pub(crate) fn same_file_identity_nofollow(left: &Path, right: &Path) -> Result<bool> {
+    let Some((_, _, left_identity)) = read_file_nofollow_with_identity(left, false, false)? else {
+        return Ok(false);
+    };
+    let Some((_, _, right_identity)) = read_file_nofollow_with_identity(right, false, false)?
+    else {
+        return Ok(false);
+    };
+    Ok(left_identity == right_identity)
 }
 
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {

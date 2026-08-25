@@ -7432,7 +7432,7 @@ fn pending_oauth_accepts_only_correlated_cancel_and_unlocks_on_terminal_result()
         "the surface remains locked until cancellation settles"
     );
     assert!(state.accepts_result(cancel.client_flow_id, cancel.operation_id));
-    state.apply_cancel(Ok(()));
+    state.apply_cancel(Ok(true));
     assert!(!state.polling);
     assert!(!state.pending);
 }

@@ -825,7 +825,7 @@ impl CopilotSetupState {
             return;
         }
         let operation_id = self.operation.begin();
-        let project_root = project_root.display().to_string();
+        let project_root = super::canonical_project_root(project_root);
         let provider_id = provider_id.to_string();
         let client_operation_id = operation_id.0.to_string();
         cx.queue_simple_mutation(
@@ -1863,9 +1863,8 @@ impl SettingsCx {
             .as_deref()
             .or(self.picker_cwd.as_deref())
             .or_else(|| self.config_path.parent())
-            .ok_or_else(|| "resolving provider logout workspace: no project context".to_string())?
-            .display()
-            .to_string();
+            .ok_or_else(|| "resolving provider logout workspace: no project context".to_string())?;
+        let project_root = super::canonical_project_root(project_root);
         let client_operation_id = uuid::Uuid::new_v4().to_string();
         self.queue_simple_mutation(
             super::SettingsEffectTarget {

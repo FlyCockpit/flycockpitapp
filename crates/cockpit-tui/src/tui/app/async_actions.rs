@@ -4,6 +4,29 @@ const OAUTH_BEGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const OAUTH_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 const OAUTH_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const OAUTH_HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const OAUTH_SETTLEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+async fn oauth_settlement(
+    client: &cockpit_core::daemon::client::DaemonClient,
+    client_operation_id: String,
+) -> anyhow::Result<
+    Result<cockpit_core::daemon::proto::Response, cockpit_core::daemon::proto::ErrorPayload>,
+> {
+    tokio::time::timeout(
+        OAUTH_SETTLEMENT_TIMEOUT,
+        client.request(
+            cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                client_operation_id,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "OAuth settlement query timed out; the exact operation remains unsettled and must be retried"
+        )
+    })?
+}
 
 fn oauth_payload(
     client_flow_id: crate::tui::settings::pointer_actions::OAuthFlowId,
@@ -48,13 +71,8 @@ async fn begin_provider_oauth(
     )
     .await;
     let response = match response {
-        Ok(response) => response,
-        Err(_) => client
-            .request(
-                cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
-                    client_operation_id: client_operation_id.clone(),
-                },
-            )
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) | Err(_) => oauth_settlement(&client, client_operation_id.clone())
             .await
             .map_err(|error| error.to_string())?,
     };
@@ -116,13 +134,8 @@ async fn complete_provider_oauth(
     };
     let response = tokio::time::timeout(OAUTH_COMPLETE_TIMEOUT, client.request(request)).await;
     let response = match response {
-        Ok(response) => response,
-        Err(_) => client
-            .request(
-                cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
-                    client_operation_id: client_operation_id.clone(),
-                },
-            )
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) | Err(_) => oauth_settlement(&client, client_operation_id.clone())
             .await
             .map_err(|error| error.to_string())?,
     };
@@ -188,13 +201,8 @@ async fn cancel_provider_oauth(
     )
     .await;
     let response = match response {
-        Ok(response) => response.map_err(|error| error.to_string())?,
-        Err(_) => client
-            .request(
-                cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
-                    client_operation_id: client_operation_id.clone(),
-                },
-            )
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) | Err(_) => oauth_settlement(&client, client_operation_id.clone())
             .await
             .map_err(|error| error.to_string())?,
     };
@@ -216,9 +224,16 @@ async fn cancel_provider_oauth(
                 Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
             }
             cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+                client_operation_id: receipt_operation_id,
+                request_hash,
+                flow_id: receipt_flow_id,
                 cancelled: false,
-                ..
-            } => Err("OAuth flow had already reached another terminal outcome".into()),
+            } if receipt_operation_id == client_operation_id
+                && request_hash == expected_hash
+                && (flow_id.is_none() || receipt_flow_id == flow_id) =>
+            {
+                Ok(crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal)
+            }
             other => Err(format!(
                 "unexpected OAuth cancellation settlement: {other:?}"
             )),
@@ -235,9 +250,16 @@ async fn cancel_provider_oauth(
             Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
         }
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+            client_operation_id: receipt_operation_id,
+            request_hash,
+            flow_id: receipt_flow_id,
             cancelled: false,
-            ..
-        }) => Err("OAuth flow had already reached another terminal outcome".into()),
+        }) if receipt_operation_id == client_operation_id
+            && request_hash == expected_hash
+            && (flow_id.is_none() || receipt_flow_id == flow_id) =>
+        {
+            Ok(crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal)
+        }
         Ok(other) => Err(format!(
             "unexpected provider OAuth cancel response: {other:?}"
         )),
@@ -1867,7 +1889,8 @@ impl App {
                     && let Some(provider) = self.dialog.oauth_provider()
                 {
                     let outcome = match result {
-                        crate::tui::async_action::OAuthAsyncResult::Cancelled => Ok(()),
+                        crate::tui::async_action::OAuthAsyncResult::Cancelled => Ok(true),
+                        crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal => Ok(false),
                         crate::tui::async_action::OAuthAsyncResult::Failed(error) => Err(error),
                         _ => Err("unexpected OAuth cancellation result".into()),
                     };
@@ -2565,5 +2588,17 @@ mod startup_disclosure_generation_tests {
             identity("/repo", 8, socket, None, current),
             completed,
         ));
+    }
+}
+
+#[cfg(test)]
+mod oauth_settlement_source_tests {
+    #[test]
+    fn oauth_fallbacks_are_bounded_and_already_terminal_is_not_called_cancelled() {
+        let source = include_str!("async_actions.rs");
+        assert!(source.contains("OAUTH_SETTLEMENT_TIMEOUT"));
+        assert!(source.contains("oauth_settlement(&client"));
+        assert!(source.contains("OAuthAsyncResult::AlreadyTerminal"));
+        assert!(source.contains("OAuthAsyncResult::AlreadyTerminal => Ok(false)"));
     }
 }

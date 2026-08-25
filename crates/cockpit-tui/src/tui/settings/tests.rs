@@ -8890,6 +8890,21 @@ fn durable_settings_mutations_retain_unknown_settlement_until_receipt() {
     let source = include_str!("mod.rs");
     assert!(source.contains("PendingSettingsOperation::SettlementQuery"));
     assert!(source.contains("Request::GetLocalOperationSettlement"));
+    assert!(source.contains("SettingsDaemonEffectWork::SettlementQuery"));
+    assert!(source.contains("local operation settlement query timed out"));
     assert!(source.contains("operation settlement is unknown"));
     assert!(source.contains("authority_operation_pending"));
+}
+
+#[test]
+fn oauth_and_project_receipts_are_bound_to_exact_authority_targets() {
+    let source = include_str!("mod.rs");
+    let mcp = include_str!("mcp_page.rs");
+    let providers = include_str!("providers/mod.rs");
+
+    assert!(source.contains("expected_request_hash"));
+    assert!(source.contains("request_hash == expected_request_hash"));
+    assert!(source.contains("owner_root == project_root"));
+    assert!(mcp.contains("local_receipt_request_hash"));
+    assert!(providers.contains("canonical_project_root"));
 }

@@ -343,6 +343,10 @@ pub enum Response {
     #[serde(rename = "provider_oauth_started")]
     ProviderOAuthStarted {
         client_operation_id: String,
+        /// Unkeyed SHA-256 of the canonical request tuple. The daemon uses a
+        /// separate keyed identity for durable idempotency; this wire value is
+        /// deliberately client-computable so direct and recovered receipts
+        /// can be bound to the exact request.
         request_hash: String,
         flow_id: String,
         authorize_url: String,
@@ -377,6 +381,8 @@ pub enum Response {
     #[serde(rename = "mcp_oauth_started")]
     McpOAuthStarted {
         client_operation_id: String,
+        /// Client-computable canonical request hash; never the daemon's keyed
+        /// durable-operation identity.
         request_hash: String,
         flow_id: String,
         authorize_url: String,

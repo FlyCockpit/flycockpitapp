@@ -631,16 +631,20 @@ impl OAuthFlowState {
         })
     }
 
-    pub(crate) fn apply_cancel(&mut self, result: Result<(), String>) {
+    pub(crate) fn apply_cancel(&mut self, result: Result<bool, String>) {
         match result {
-            Ok(()) => {
+            Ok(cancelled) => {
                 self.pending = false;
                 self.polling = false;
                 self.paste_focused = false;
                 self.focus_paste_after_begin = false;
                 self.manual_input.set("");
                 self.session = OAuthSession::None;
-                self.status = Some(Ok("OAuth login cancelled".to_string()));
+                self.status = Some(Ok(if cancelled {
+                    "OAuth login cancelled".to_string()
+                } else {
+                    "OAuth login had already reached a terminal outcome".to_string()
+                }));
             }
             Err(error) => {
                 // Lost/ambiguous cancellation must retain surface ownership.

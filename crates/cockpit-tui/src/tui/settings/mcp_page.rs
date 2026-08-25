@@ -417,6 +417,12 @@ impl SettingsCx {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     let flow_id = flow.flow_id.clone();
                     let client_operation_id = uuid::Uuid::new_v4().to_string();
+                    let expected_request_hash = super::local_receipt_request_hash(&(
+                        "cancel_mcp_oauth",
+                        &flow.begin_client_operation_id,
+                        &Some(flow_id.clone()),
+                    ))
+                    .unwrap_or_default();
                     self.queue_simple_mutation(
                         super::SettingsEffectTarget {
                             surface: "settings.mcp-oauth-cancel",
@@ -432,6 +438,7 @@ impl SettingsCx {
                             server: flow.server.clone(),
                             flow_id,
                             client_operation_id,
+                            expected_request_hash,
                         },
                     );
                     s.oauth = Some(flow);
@@ -448,6 +455,12 @@ impl SettingsCx {
                     }
                     let flow_id = flow.flow_id.clone();
                     let client_operation_id = uuid::Uuid::new_v4().to_string();
+                    let expected_request_hash = super::local_receipt_request_hash(&(
+                        "complete_mcp_oauth",
+                        &flow_id,
+                        &Some(input.as_str()),
+                    ))
+                    .unwrap_or_default();
                     self.queue_simple_secret_mutation(
                         super::SettingsEffectTarget {
                             surface: "settings.mcp-oauth-complete",
@@ -463,6 +476,7 @@ impl SettingsCx {
                             server: flow.server.clone(),
                             flow_id,
                             client_operation_id,
+                            expected_request_hash,
                         },
                     );
                     flow.status = Some("completing authentication…".into());
@@ -526,6 +540,13 @@ impl SettingsCx {
                             .clone()
                             .or_else(|| std::env::current_dir().ok())
                             .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let project_root = super::canonical_project_root(&project_root);
+                        let expected_request_hash = super::local_receipt_request_hash(&(
+                            "begin_mcp_oauth",
+                            &project_root,
+                            &name,
+                        ))
+                        .unwrap_or_default();
                         self.queue_simple_mutation(
                             super::SettingsEffectTarget {
                                 surface: "settings.mcp-oauth-begin",
@@ -534,12 +555,13 @@ impl SettingsCx {
                             },
                             cockpit_core::daemon::proto::Request::BeginMcpOAuth {
                                 client_operation_id: client_operation_id.clone(),
-                                project_root: project_root.display().to_string(),
+                                project_root,
                                 server: name.clone(),
                             },
                             super::SettingsMutationAction::McpOAuthBegin {
                                 server: name,
                                 client_operation_id,
+                                expected_request_hash,
                             },
                         );
                         s.status = Some("starting MCP OAuth…".into());

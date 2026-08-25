@@ -297,6 +297,10 @@ pub enum OAuthAsyncResult {
     },
     Presented(crate::tui::settings::providers::OAuthPresentationResult),
     Cancelled,
+    /// The exact daemon flow was proven terminal before cancellation won.
+    /// This is terminal for navigation but deliberately distinct from a
+    /// cancellation receipt so the UI never claims that it fenced a commit.
+    AlreadyTerminal,
 }
 
 #[derive(Debug)]

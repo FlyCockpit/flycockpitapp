@@ -99,6 +99,24 @@ pub(crate) async fn settings_daemon_client()
         .client)
 }
 
+fn local_receipt_request_hash<T: serde::Serialize>(request: &T) -> Result<String, String> {
+    use sha2::{Digest as _, Sha256};
+
+    let encoded =
+        zeroize::Zeroizing::new(serde_json::to_vec(request).map_err(|error| error.to_string())?);
+    Ok(Sha256::digest(encoded.as_slice())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn canonical_project_root(project_root: &std::path::Path) -> String {
+    // Launch/session project roots are daemon-resolved before entering the
+    // settings surface. Preserve that authority identity without performing
+    // filesystem discovery in the synchronous reducer.
+    project_root.to_string_lossy().to_string()
+}
+
 /// A daemon request emitted by a synchronous settings reducer. The target is
 /// explicit authority context rather than display text, allowing the
 /// completion reducer to reject stale results before interpreting the body.
@@ -254,6 +272,7 @@ pub(crate) fn execute_settings_blocking_work(
 
 pub(crate) enum SettingsDaemonEffectWork {
     Request(Request),
+    SettlementQuery(Request),
     ProviderCredentialPut {
         client_operation_id: String,
         provider_id: String,
@@ -297,6 +316,7 @@ impl std::fmt::Debug for SettingsDaemonEffectWork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Request(_) => f.write_str("Request([REDACTED BODY])"),
+            Self::SettlementQuery(_) => f.write_str("SettlementQuery([REDACTED BODY])"),
             Self::ProviderCredentialPut { provider_id, .. } => f
                 .debug_struct("ProviderCredentialPut")
                 .field("provider_id", provider_id)
@@ -397,6 +417,18 @@ pub(crate) async fn execute_settings_daemon_work(
                 .map_err(|error| error.to_string()),
             committed_refresh_needed: None,
         }),
+        SettingsDaemonEffectWork::SettlementQuery(request) => {
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(15), client.request(request))
+                    .await
+                    .map_err(|_| "local operation settlement query timed out".to_string())?
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string());
+            Ok(SettingsDaemonWorkOutcome {
+                response,
+                committed_refresh_needed: None,
+            })
+        }
         SettingsDaemonEffectWork::ProviderCredentialPut {
             client_operation_id,
             provider_id,
@@ -1046,16 +1078,19 @@ enum SettingsMutationAction {
     McpOAuthBegin {
         server: String,
         client_operation_id: String,
+        expected_request_hash: String,
     },
     McpOAuthComplete {
         server: String,
         flow_id: String,
         client_operation_id: String,
+        expected_request_hash: String,
     },
     McpOAuthCancel {
         server: String,
         flow_id: String,
         client_operation_id: String,
+        expected_request_hash: String,
     },
     ProviderCredentialDelete {
         provider_id: String,
@@ -1121,37 +1156,51 @@ impl SettingsMutationAction {
             (
                 Self::McpOAuthBegin {
                     client_operation_id,
+                    expected_request_hash,
                     ..
                 },
                 Response::McpOAuthStarted {
                     client_operation_id: returned_id,
+                    request_hash,
                     ..
                 },
-            ) => returned_id == client_operation_id,
+            ) => returned_id == client_operation_id && request_hash == expected_request_hash,
             (
                 Self::McpOAuthComplete {
                     client_operation_id,
                     flow_id,
+                    expected_request_hash,
                     ..
                 },
                 Response::McpOAuthCompleted {
                     client_operation_id: returned_id,
+                    request_hash,
                     flow_id: returned_flow,
                     ..
                 },
-            ) => returned_id == client_operation_id && returned_flow == flow_id,
+            ) => {
+                returned_id == client_operation_id
+                    && request_hash == expected_request_hash
+                    && returned_flow == flow_id
+            }
             (
                 Self::McpOAuthCancel {
                     client_operation_id,
                     flow_id,
+                    expected_request_hash,
                     ..
                 },
                 Response::McpOAuthCancelled {
                     client_operation_id: returned_id,
+                    request_hash,
                     flow_id: Some(returned_flow),
                     ..
                 },
-            ) => returned_id == client_operation_id && returned_flow == flow_id,
+            ) => {
+                returned_id == client_operation_id
+                    && request_hash == expected_request_hash
+                    && returned_flow == flow_id
+            }
             (
                 Self::McpSave {
                     client_operation_id,
@@ -1180,13 +1229,16 @@ impl SettingsMutationAction {
                     changed,
                     consumed_vault_generation,
                     result_vault_generation,
+                    config_generation,
                     ..
                 },
             ) => {
                 returned_id == client_operation_id
                     && returned_provider == provider_id
                     && returned_root == project_root
+                    && owner_root == project_root
                     && owner_scope == &format!("project:{owner_root}")
+                    && *config_generation > 0
                     && valid_vault_freshness(
                         *consumed_vault_generation,
                         *result_vault_generation,
@@ -1206,17 +1258,20 @@ impl SettingsMutationAction {
                     client_operation_id: returned_id,
                     provider_id: returned_provider,
                     project_root: None,
+                    owner_root: None,
                     owner_scope,
                     stored: true,
                     changed,
                     consumed_vault_generation,
                     result_vault_generation,
+                    config_generation,
                     ..
                 },
             ) => {
                 returned_id == client_operation_id
                     && returned_provider == provider_id
                     && owner_scope == "global"
+                    && *config_generation > 0
                     && valid_vault_freshness(
                         *consumed_vault_generation,
                         *result_vault_generation,
@@ -1237,13 +1292,16 @@ impl SettingsMutationAction {
                     owner_scope,
                     consumed_vault_generation,
                     result_vault_generation,
+                    config_generation,
                     ..
                 },
             ) => {
                 returned_id == client_operation_id
                     && returned_provider == provider_id
                     && returned_root == project_root
+                    && owner_root == project_root
                     && owner_scope == &format!("project:{owner_root}")
+                    && *config_generation > 0
                     && *result_vault_generation > *consumed_vault_generation
                     && *result_vault_generation > 0
             }
@@ -1264,11 +1322,11 @@ fn valid_vault_freshness(consumed: u64, result: u64, changed: bool) -> bool {
 enum CompletedProviderAuthMutation {
     Logout {
         provider_id: String,
-        result: Result<(), String>,
+        result: Result<bool, String>,
     },
     Copilot {
         provider_id: String,
-        result: Result<(), String>,
+        result: Result<bool, String>,
     },
 }
 
@@ -2430,6 +2488,21 @@ impl SettingsCx {
         operation_id
     }
 
+    fn enqueue_settlement_effect(
+        &mut self,
+        target: SettingsEffectTarget,
+        request: Request,
+    ) -> uuid::Uuid {
+        let operation_id = uuid::Uuid::new_v4();
+        self.daemon_effects.push_back(SettingsDaemonEffectRequest {
+            dialog_id: self.dialog_id,
+            operation_id,
+            target,
+            work: SettingsDaemonEffectWork::SettlementQuery(request),
+        });
+        operation_id
+    }
+
     fn queue_settlement_query(
         &mut self,
         client_operation_id: String,
@@ -2440,7 +2513,7 @@ impl SettingsCx {
             owner: client_operation_id.clone(),
             revision: Some(client_operation_id.clone()),
         };
-        let operation_id = self.enqueue_daemon_effect(
+        let operation_id = self.enqueue_settlement_effect(
             target.clone(),
             Request::GetLocalOperationSettlement {
                 client_operation_id: client_operation_id.clone(),
@@ -3185,14 +3258,18 @@ impl SettingsCx {
                         SettingsMutationAction::McpOAuthBegin {
                             server,
                             client_operation_id,
+                            expected_request_hash,
                         },
                         Ok(Response::McpOAuthStarted {
                             client_operation_id: returned_operation_id,
+                            request_hash,
                             flow_id,
                             authorize_url,
                             ..
                         }),
-                    ) if returned_operation_id == client_operation_id => {
+                    ) if returned_operation_id == client_operation_id
+                        && request_hash == expected_request_hash =>
+                    {
                         self.pending_mcp_oauth = Some(PendingMcpOAuth::Started {
                             server,
                             begin_client_operation_id: client_operation_id,
@@ -3206,14 +3283,17 @@ impl SettingsCx {
                             server,
                             flow_id,
                             client_operation_id,
+                            expected_request_hash,
                         },
                         Ok(Response::McpOAuthCompleted {
                             client_operation_id: returned_operation_id,
+                            request_hash,
                             flow_id: returned_flow_id,
                             authenticated: true,
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
+                        && request_hash == expected_request_hash
                         && returned_flow_id == flow_id =>
                     {
                         self.invalidate_secret_inventory();
@@ -3226,15 +3306,18 @@ impl SettingsCx {
                             server,
                             flow_id,
                             client_operation_id,
+                            expected_request_hash,
                         },
                         Ok(Response::McpOAuthCancelled {
                             client_operation_id: returned_operation_id,
+                            request_hash,
                             flow_id: Some(returned_flow_id),
                             cancelled: true,
                             ..
                         }),
                     ) => {
                         if returned_operation_id != client_operation_id
+                            || request_hash != expected_request_hash
                             || returned_flow_id != flow_id
                         {
                             return Ok(());
@@ -3259,12 +3342,15 @@ impl SettingsCx {
                             changed,
                             consumed_vault_generation,
                             result_vault_generation,
+                            config_generation,
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
                         && returned_provider_id == provider_id
                         && returned_root == project_root
+                        && owner_root == project_root
                         && owner_scope == format!("project:{owner_root}")
+                        && config_generation > 0
                         && valid_vault_freshness(
                             consumed_vault_generation,
                             result_vault_generation,
@@ -3294,11 +3380,13 @@ impl SettingsCx {
                             changed,
                             consumed_vault_generation,
                             result_vault_generation,
+                            config_generation,
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
                         && returned_provider_id == provider_id
                         && owner_scope == "global"
+                        && config_generation > 0
                         && valid_vault_freshness(
                             consumed_vault_generation,
                             result_vault_generation,
@@ -3328,11 +3416,13 @@ impl SettingsCx {
                             changed,
                             consumed_vault_generation,
                             result_vault_generation,
+                            config_generation,
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
                         && returned_provider_id == provider_id
                         && owner_scope == "global"
+                        && config_generation > 0
                         && valid_vault_freshness(
                             consumed_vault_generation,
                             result_vault_generation,
@@ -3371,12 +3461,15 @@ impl SettingsCx {
                             provider_id: returned_provider_id,
                             consumed_vault_generation,
                             result_vault_generation,
+                            config_generation,
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
                         && returned_provider_id == provider_id
                         && returned_root == project_root
+                        && owner_root == project_root
                         && owner_scope == format!("project:{owner_root}")
+                        && config_generation > 0
                         && result_vault_generation > consumed_vault_generation
                         && result_vault_generation > 0 =>
                     {

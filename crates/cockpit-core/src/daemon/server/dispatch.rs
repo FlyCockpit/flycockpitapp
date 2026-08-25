@@ -7952,6 +7952,13 @@ async fn handle_serialized_request_impl(
                 b"flycockpit/local-operation/provider-oauth/begin/v1\0",
                 &("begin_provider_oauth", &provider_id),
             )?;
+            // The durable idempotency key remains daemon-keyed, but the wire
+            // receipt must be independently predictable by the owner client.
+            // This lets a direct response and a later settlement be checked
+            // against the exact submitted request instead of merely against
+            // each other.
+            let receipt_request_hash =
+                local_operation_request_hash(&("begin_provider_oauth", &provider_id))?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -7993,14 +8000,14 @@ async fn handle_serialized_request_impl(
             {
                 let response = Response::ProviderOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id,
                     authorize_url,
                     user_code,
                 };
                 let receipt = Response::ProviderOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id: match &response {
                         Response::ProviderOAuthStarted { flow_id, .. } => flow_id.clone(),
                         _ => unreachable!(),
@@ -8041,14 +8048,14 @@ async fn handle_serialized_request_impl(
                     .await;
                 let response = Response::ProviderOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id: flow_id.clone(),
                     authorize_url,
                     user_code,
                 };
                 let receipt = Response::ProviderOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id,
                     authorize_url: String::new(),
                     user_code: None,
@@ -8157,14 +8164,14 @@ async fn handle_serialized_request_impl(
                 .await;
             let response = Response::ProviderOAuthStarted {
                 client_operation_id: client_operation_id.clone(),
-                request_hash: local_operation_request_hash_hex(&request_hash),
+                request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                 flow_id,
                 authorize_url,
                 user_code,
             };
             let receipt = Response::ProviderOAuthStarted {
                 client_operation_id: client_operation_id.clone(),
-                request_hash: local_operation_request_hash_hex(&request_hash),
+                request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                 flow_id: match &response {
                     Response::ProviderOAuthStarted { flow_id, .. } => flow_id.clone(),
                     _ => unreachable!(),
@@ -8200,6 +8207,8 @@ async fn handle_serialized_request_impl(
                 b"flycockpit/local-operation/provider-oauth/complete/v1\0",
                 &("complete_provider_oauth", &flow_id, &input),
             )?;
+            let receipt_request_hash =
+                local_operation_request_hash(&("complete_provider_oauth", &flow_id, &input))?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -8223,7 +8232,7 @@ async fn handle_serialized_request_impl(
                 {
                     return Ok(Response::ProviderOAuthCompleted {
                         client_operation_id: client_operation_id.clone(),
-                        request_hash: local_operation_request_hash_hex(&request_hash),
+                        request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                         flow_id: flow_id.clone(),
                         logged_in: provider_id == crate::auth::xai_oauth::CREDENTIAL_KEY
                             || provider_id == crate::auth::codex_oauth::CREDENTIAL_KEY,
@@ -8377,7 +8386,7 @@ async fn handle_serialized_request_impl(
                 ctx.oauth_flows.remove_provider(&flow_id, &owner).await;
                 Ok(Response::ProviderOAuthCompleted {
                     client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id: flow_id.clone(),
                     logged_in: true,
                     retry_after_seconds: None,
@@ -8423,6 +8432,7 @@ async fn handle_serialized_request_impl(
                 &begin_client_operation_id,
                 &flow_id,
             ))?;
+            let receipt_request_hash = request_hash;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -8507,7 +8517,7 @@ async fn handle_serialized_request_impl(
             };
             let response = Response::ProviderOAuthCancelled {
                 client_operation_id: client_operation_id.clone(),
-                request_hash: local_operation_request_hash_hex(&request_hash),
+                request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                 flow_id: resolved_flow_id,
                 cancelled,
             };
@@ -8544,6 +8554,8 @@ async fn handle_serialized_request_impl(
                 b"flycockpit/local-operation/mcp-oauth/begin/v1\0",
                 &("begin_mcp_oauth", &project_root, &server),
             )?;
+            let receipt_request_hash =
+                local_operation_request_hash(&("begin_mcp_oauth", &project_root, &server))?;
             let cwd = std::path::PathBuf::from(&project_root);
             let trust_policy =
                 crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
@@ -8603,13 +8615,13 @@ async fn handle_serialized_request_impl(
             {
                 let response = Response::McpOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id,
                     authorize_url,
                 };
                 let receipt = Response::McpOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id: match &response {
                         Response::McpOAuthStarted { flow_id, .. } => flow_id.clone(),
                         _ => unreachable!(),
@@ -8647,13 +8659,13 @@ async fn handle_serialized_request_impl(
                     .await;
                 let response = Response::McpOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id: flow_id.clone(),
                     authorize_url,
                 };
                 let receipt = Response::McpOAuthStarted {
                     client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id,
                     authorize_url: String::new(),
                 };
@@ -8746,13 +8758,13 @@ async fn handle_serialized_request_impl(
                 .await;
             let response = Response::McpOAuthStarted {
                 client_operation_id: client_operation_id.clone(),
-                request_hash: local_operation_request_hash_hex(&request_hash),
+                request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                 flow_id,
                 authorize_url,
             };
             let receipt = Response::McpOAuthStarted {
                 client_operation_id: client_operation_id.clone(),
-                request_hash: local_operation_request_hash_hex(&request_hash),
+                request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                 flow_id: match &response {
                     Response::McpOAuthStarted { flow_id, .. } => flow_id.clone(),
                     _ => unreachable!(),
@@ -8787,6 +8799,8 @@ async fn handle_serialized_request_impl(
                 b"flycockpit/local-operation/mcp-oauth/complete/v1\0",
                 &("complete_mcp_oauth", &flow_id, &input),
             )?;
+            let receipt_request_hash =
+                local_operation_request_hash(&("complete_mcp_oauth", &flow_id, &input))?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -8809,7 +8823,7 @@ async fn handle_serialized_request_impl(
                 {
                     return Ok(Response::McpOAuthCompleted {
                         client_operation_id: client_operation_id.clone(),
-                        request_hash: local_operation_request_hash_hex(&request_hash),
+                        request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                         flow_id: flow_id.clone(),
                         authenticated: true,
                     });
@@ -8949,7 +8963,7 @@ async fn handle_serialized_request_impl(
                 }
                 Ok(Response::McpOAuthCompleted {
                     client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                     flow_id: flow_id.clone(),
                     authenticated: true,
                 })
@@ -8995,6 +9009,7 @@ async fn handle_serialized_request_impl(
                 &begin_client_operation_id,
                 &flow_id,
             ))?;
+            let receipt_request_hash = request_hash;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -9076,7 +9091,7 @@ async fn handle_serialized_request_impl(
             };
             let response = Response::McpOAuthCancelled {
                 client_operation_id: client_operation_id.clone(),
-                request_hash: local_operation_request_hash_hex(&request_hash),
+                request_hash: local_operation_request_hash_hex(&receipt_request_hash),
                 flow_id: resolved_flow_id,
                 cancelled,
             };

@@ -3033,7 +3033,7 @@ async fn assistant_session_root_agent_loads_assistant_definition() {
             name: "helper-bot".to_string(),
             description: "Helper bot".to_string(),
             prompt: "ASSISTANT_DEFINITION_MARKER".to_string(),
-            home_dir: tmp.path().join("assistants/helper-bot"),
+            home_dir: crate::assistants::default_home_dir("helper-bot").unwrap(),
         },
     )
     .await

@@ -110,11 +110,56 @@ pub(crate) struct SettingsDaemonEffectRequest {
     pub(crate) work: SettingsDaemonEffectWork,
 }
 
-#[derive(Debug)]
 pub(crate) enum SettingsDaemonEffectWork {
     Request(Request),
+    ProviderCredentialPut {
+        provider_id: String,
+        record: SecretPayload,
+    },
+    McpOAuthComplete {
+        flow_id: String,
+        input: SecretPayload,
+    },
     ProviderMutation(ProviderMutationPlan),
     TypedDocumentEdit(TypedDocumentEditPlan),
+}
+
+pub(crate) struct SecretPayload(zeroize::Zeroizing<String>);
+
+impl SecretPayload {
+    pub(crate) fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    fn take(mut self) -> String {
+        std::mem::take(&mut *self.0)
+    }
+}
+
+impl std::fmt::Debug for SecretPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretPayload([REDACTED])")
+    }
+}
+
+impl std::fmt::Debug for SettingsDaemonEffectWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(_) => f.write_str("Request([REDACTED BODY])"),
+            Self::ProviderCredentialPut { provider_id, .. } => f
+                .debug_struct("ProviderCredentialPut")
+                .field("provider_id", provider_id)
+                .field("record", &"[REDACTED]")
+                .finish(),
+            Self::McpOAuthComplete { flow_id, .. } => f
+                .debug_struct("McpOAuthComplete")
+                .field("flow_id", flow_id)
+                .field("input", &"[REDACTED]")
+                .finish(),
+            Self::ProviderMutation(_) => f.write_str("ProviderMutation([REDACTED SECRETS])"),
+            Self::TypedDocumentEdit(_) => f.write_str("TypedDocumentEdit([REDACTED PATCH])"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -164,6 +209,33 @@ pub(crate) async fn execute_settings_daemon_work(
                 .map_err(|error| error.to_string()),
             committed_refresh_needed: None,
         }),
+        SettingsDaemonEffectWork::ProviderCredentialPut {
+            provider_id,
+            record,
+        } => Ok(SettingsDaemonWorkOutcome {
+            response: client
+                .request(Request::PutProviderCredential {
+                    provider_id,
+                    record: record.take(),
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string()),
+            committed_refresh_needed: None,
+        }),
+        SettingsDaemonEffectWork::McpOAuthComplete { flow_id, input } => {
+            Ok(SettingsDaemonWorkOutcome {
+                response: client
+                    .request(Request::CompleteMcpOAuth {
+                        flow_id,
+                        input: Some(input.take()),
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string()),
+                committed_refresh_needed: None,
+            })
+        }
         SettingsDaemonEffectWork::ProviderMutation(plan) => {
             let mut final_response = None;
             for (provider_id, entry, header_secrets) in plan.saves {
@@ -705,7 +777,19 @@ enum SettingsMutationAction {
     McpOAuthCancel { server: String, flow_id: String },
     ProviderCredentialDelete { provider_id: String },
     ProviderCredentialPut { provider_id: String },
+    WebCredentialPut { provider_id: String },
     CopilotSetup { provider_id: String },
+}
+
+enum CompletedProviderAuthMutation {
+    Logout {
+        provider_id: String,
+        result: Result<(), String>,
+    },
+    Copilot {
+        provider_id: String,
+        result: Result<(), String>,
+    },
 }
 
 enum PendingMcpOAuth {
@@ -1724,6 +1808,13 @@ pub struct SettingsCx {
     daemon_effects: VecDeque<SettingsDaemonEffectRequest>,
     pending_settings: BTreeMap<uuid::Uuid, PendingSettingsOperation>,
     pending_mcp_oauth: Option<PendingMcpOAuth>,
+    pending_mcp_navigation: Option<(String, bool)>,
+    completed_mcp_navigation: Option<(String, bool, Result<(), String>)>,
+    completed_web_credential: Option<(String, Result<(), String>)>,
+    completed_provider_auth: Option<CompletedProviderAuthMutation>,
+    pending_provider_add: Option<(String, ProviderEntry, bool)>,
+    completed_provider_add: Option<Result<(String, ProviderEntry, bool), String>>,
+    completed_provider_mutation: Option<Result<(), String>>,
     completed_shadow_removal: Option<category::ShadowedGlobalPrompt>,
     pending_shadow_prompt: Option<category::ShadowedGlobalPrompt>,
     completed_provider_navigation: Option<(ProviderNavigation, ProvidersConfig)>,
@@ -1869,6 +1960,20 @@ impl SettingsCx {
         action: SettingsMutationAction,
     ) -> uuid::Uuid {
         let operation_id = self.enqueue_daemon_effect(target.clone(), request);
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::SimpleMutation { target, action },
+        );
+        operation_id
+    }
+
+    fn queue_simple_secret_mutation(
+        &mut self,
+        target: SettingsEffectTarget,
+        work: SettingsDaemonEffectWork,
+        action: SettingsMutationAction,
+    ) -> uuid::Uuid {
+        let operation_id = self.enqueue_daemon_work(target.clone(), work);
         self.pending_settings.insert(
             operation_id,
             PendingSettingsOperation::SimpleMutation { target, action },
@@ -2172,13 +2277,25 @@ impl SettingsCx {
                         self.original_config = authoritative;
                         self.last_secret_notice = notice;
                         self.extended_warnings = vec!["provider settings committed".into()];
+                        self.completed_provider_mutation = Some(Ok(()));
+                        if let Some(pending) = self.pending_provider_add.take() {
+                            self.completed_provider_add = Some(Ok(pending));
+                        }
                     }
                     Ok(other) => {
-                        self.extended_warnings =
-                            vec![format!("unexpected provider mutation response: {other:?}")]
+                        let error = format!("unexpected provider mutation response: {other:?}");
+                        self.extended_warnings = vec![error.clone()];
+                        self.completed_provider_mutation = Some(Err(error.clone()));
+                        if self.pending_provider_add.take().is_some() {
+                            self.completed_provider_add = Some(Err(error));
+                        }
                     }
                     Err(error) => {
-                        self.extended_warnings = vec![format!("provider save failed: {error}")]
+                        self.extended_warnings = vec![format!("provider save failed: {error}")];
+                        self.completed_provider_mutation = Some(Err(error.clone()));
+                        if self.pending_provider_add.take().is_some() {
+                            self.completed_provider_add = Some(Err(error));
+                        }
                     }
                 }
             }
@@ -2406,6 +2523,9 @@ impl SettingsCx {
                     ) => {
                         self.mcp_config = config;
                         self.invalidate_secret_inventory();
+                        if let Some((name, edited)) = self.pending_mcp_navigation.take() {
+                            self.completed_mcp_navigation = Some((name, edited, Ok(())));
+                        }
                         Ok("MCP settings committed".to_string())
                     }
                     (
@@ -2443,9 +2563,14 @@ impl SettingsCx {
                     }
                     (
                         SettingsMutationAction::ProviderCredentialDelete { provider_id },
-                        Ok(Response::ProviderCredentialDeleted { .. } | Response::Ack),
+                        Ok(Response::ProviderCredentialDeleted { .. }),
                     ) => {
                         self.invalidate_secret_inventory_entry(&provider_id, None);
+                        self.completed_provider_auth =
+                            Some(CompletedProviderAuthMutation::Logout {
+                                provider_id: provider_id.clone(),
+                                result: Ok(()),
+                            });
                         Ok(format!("signed out of {provider_id}"))
                     }
                     (
@@ -2460,9 +2585,75 @@ impl SettingsCx {
                         );
                         Ok(format!("stored credential for {provider_id}"))
                     }
+                    (
+                        SettingsMutationAction::WebCredentialPut { provider_id },
+                        Ok(Response::Ack),
+                    ) => {
+                        self.invalidate_secret_inventory_entry(
+                            &provider_id,
+                            Some(
+                                cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord,
+                            ),
+                        );
+                        self.completed_web_credential = Some((provider_id.clone(), Ok(())));
+                        Ok(format!("stored credential for {provider_id}"))
+                    }
+                    (SettingsMutationAction::WebCredentialPut { provider_id }, Ok(other)) => {
+                        let error = format!("unexpected web credential response: {other:?}");
+                        self.completed_web_credential = Some((provider_id, Err(error.clone())));
+                        Err(error)
+                    }
+                    (SettingsMutationAction::WebCredentialPut { provider_id }, Err(error)) => {
+                        self.completed_web_credential = Some((provider_id, Err(error.clone())));
+                        Err(error)
+                    }
                     (SettingsMutationAction::CopilotSetup { provider_id }, Ok(Response::Ack)) => {
                         self.invalidate_secret_inventory_entry(&provider_id, None);
+                        self.completed_provider_auth =
+                            Some(CompletedProviderAuthMutation::Copilot {
+                                provider_id,
+                                result: Ok(()),
+                            });
                         Ok("Copilot token configured in the daemon vault".to_string())
+                    }
+                    (SettingsMutationAction::ProviderCredentialDelete { provider_id }, result) => {
+                        let error = match result {
+                            Ok(other) => format!("unexpected provider logout response: {other:?}"),
+                            Err(error) => error,
+                        };
+                        self.completed_provider_auth =
+                            Some(CompletedProviderAuthMutation::Logout {
+                                provider_id,
+                                result: Err(error.clone()),
+                            });
+                        Err(error)
+                    }
+                    (SettingsMutationAction::CopilotSetup { provider_id }, result) => {
+                        let error = match result {
+                            Ok(other) => format!("unexpected Copilot setup response: {other:?}"),
+                            Err(error) => error,
+                        };
+                        self.completed_provider_auth =
+                            Some(CompletedProviderAuthMutation::Copilot {
+                                provider_id,
+                                result: Err(error.clone()),
+                            });
+                        Err(error)
+                    }
+                    (SettingsMutationAction::McpSave(_), Ok(other)) => {
+                        let error = format!("unexpected MCP settings response: {other:?}");
+                        if let Some((name, edited)) = self.pending_mcp_navigation.take() {
+                            self.completed_mcp_navigation =
+                                Some((name, edited, Err(error.clone())));
+                        }
+                        Err(error)
+                    }
+                    (SettingsMutationAction::McpSave(_), Err(error)) => {
+                        if let Some((name, edited)) = self.pending_mcp_navigation.take() {
+                            self.completed_mcp_navigation =
+                                Some((name, edited, Err(error.clone())));
+                        }
+                        Err(error)
                     }
                     (_, Ok(other)) => {
                         Err(format!("unexpected settings mutation response: {other:?}"))
@@ -3791,6 +3982,18 @@ fn dispatch_from_settings_action(
 }
 
 impl SettingsDialog {
+    fn authority_operation_pending(&self) -> bool {
+        self.cx.authority_operation_pending()
+            || self
+                .page
+                .downcast_ref::<AgentsPage>()
+                .is_some_and(AgentsPage::has_unsettled_external_edit)
+            || self
+                .page
+                .downcast_ref::<ProvidersPage>()
+                .is_some_and(ProvidersPage::has_unsettled_authority_operation)
+    }
+
     fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
         let completion = match self.cx.apply_general_completion(completion) {
             Ok(()) => {
@@ -3866,6 +4069,92 @@ impl SettingsDialog {
                 }
                 if let Some(McpPage::List(state)) = self.page.downcast_mut::<McpPage>() {
                     self.cx.adopt_pending_mcp_oauth(state);
+                }
+                if let Some((provider_id, result)) = self.cx.completed_web_credential.take()
+                    && let Some(page) = self.page.downcast_mut::<ToolsPage>()
+                    && matches!(
+                        page.editing,
+                        Some(tools_page::ToolField::WebKey(provider))
+                            if tools_page::web_key_provider_id(provider) == provider_id
+                    )
+                {
+                    match result {
+                        Ok(()) => {
+                            page.status = Some(format!("{provider_id} key saved to credentials."));
+                            page.buf = TextField::default();
+                            page.editing = None;
+                        }
+                        Err(error) => {
+                            page.status = Some(format!("Save failed: {error}"));
+                        }
+                    }
+                }
+                if let Some((name, edited, result)) = self.cx.completed_mcp_navigation.take() {
+                    match result {
+                        Ok(()) => {
+                            self.page = mcp_page(McpPage::List(mcp_page::ListState {
+                                cursor: 0,
+                                status: Some(if edited {
+                                    format!("saved `{name}`")
+                                } else {
+                                    format!("added `{name}`")
+                                }),
+                                delete_pending: false,
+                                oauth: None,
+                            }));
+                        }
+                        Err(error) => {
+                            if let Some(McpPage::Add(state)) = self.page.downcast_mut::<McpPage>() {
+                                state.status = Some(format!("save failed: {error}"));
+                            }
+                        }
+                    }
+                }
+                if let Some(completion) = self.cx.completed_provider_auth.take()
+                    && let Some(page) = self.page.downcast_mut::<ProvidersPage>()
+                {
+                    match (completion, page) {
+                        (
+                            CompletedProviderAuthMutation::Logout {
+                                provider_id,
+                                result,
+                            },
+                            ProvidersPage::Edit(state),
+                        ) => {
+                            state.status = Some(match result {
+                                Ok(()) => format!("signed out of {provider_id}"),
+                                Err(error) => format!("sign out failed: {error}"),
+                            });
+                        }
+                        (
+                            CompletedProviderAuthMutation::Copilot {
+                                provider_id,
+                                result,
+                            },
+                            ProvidersPage::CopilotSetup { state, .. },
+                        ) => state.apply_daemon_result(provider_id, result),
+                        _ => {}
+                    }
+                }
+                if let Some(completion) = self.cx.completed_provider_add.take()
+                    && let Some(ProvidersPage::Add(state)) =
+                        self.page.downcast_mut::<ProvidersPage>()
+                {
+                    self.cx.adopt_provider_add_completion(state, completion);
+                }
+                if let Some(result) = self.cx.completed_provider_mutation.take()
+                    && self.cx.completed_provider_add.is_none()
+                    && let Some(page) = self.page.downcast_mut::<ProvidersPage>()
+                {
+                    let status = match result {
+                        Ok(()) => "provider settings committed".to_string(),
+                        Err(error) => format!("provider save failed: {error}"),
+                    };
+                    match page {
+                        ProvidersPage::List { status: slot, .. } => *slot = Some(status),
+                        ProvidersPage::Edit(state) => state.status = Some(status),
+                        _ => {}
+                    }
                 }
                 return;
             }
@@ -4178,6 +4467,13 @@ impl SettingsDialog {
                 daemon_effects: VecDeque::new(),
                 pending_settings: BTreeMap::new(),
                 pending_mcp_oauth: None,
+                pending_mcp_navigation: None,
+                completed_mcp_navigation: None,
+                completed_web_credential: None,
+                completed_provider_auth: None,
+                pending_provider_add: None,
+                completed_provider_add: None,
+                completed_provider_mutation: None,
                 completed_shadow_removal: None,
                 pending_shadow_prompt: None,
                 completed_provider_navigation: None,
@@ -4569,7 +4865,7 @@ impl SettingsDialog {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
-        if self.cx.authority_operation_pending() {
+        if self.authority_operation_pending() {
             self.cx.extended_warnings = vec![
                 "Waiting for the daemon to settle this settings operation; navigation is disabled."
                     .into(),
@@ -4592,7 +4888,7 @@ impl SettingsDialog {
     }
 
     fn handle_pointer(&mut self, mouse: MouseEvent) -> SettingsPointerOutcome {
-        if self.cx.authority_operation_pending() && !matches!(mouse.kind, MouseEventKind::Moved) {
+        if self.authority_operation_pending() && !matches!(mouse.kind, MouseEventKind::Moved) {
             self.cx.extended_warnings = vec![
                 "Waiting for the daemon to settle this settings operation; controls are disabled."
                     .into(),
@@ -4752,7 +5048,7 @@ impl SettingsDialog {
         column: u16,
         row: u16,
     ) -> SettingsPointerOutcome {
-        if self.cx.authority_operation_pending() {
+        if self.authority_operation_pending() {
             self.cx.extended_warnings = vec![
                 "Waiting for the daemon to settle this settings operation; controls are disabled."
                     .into(),

@@ -79,7 +79,7 @@ enum WebKeyStatus {
     Stored,
 }
 
-fn web_key_provider_id(provider: WebKeyProvider) -> &'static str {
+pub(super) fn web_key_provider_id(provider: WebKeyProvider) -> &'static str {
     match provider {
         WebKeyProvider::Firecrawl => "firecrawl",
         WebKeyProvider::TinyFish => "tinyfish",
@@ -218,14 +218,9 @@ impl SettingsCx {
                     p.status = Some("Paste a non-empty API key.".to_string());
                 } else {
                     p.status = Some(match self.save_web_api_key(provider, &key) {
-                        Ok(()) => format!(
-                            "{} key saved to credentials.",
-                            web_key_provider_label(provider)
-                        ),
+                        Ok(()) => "saving credential…".to_string(),
                         Err(e) => format!("Save failed: {e}"),
                     });
-                    p.buf = TextField::default();
-                    p.editing = None;
                 }
             }
             ToolField::FirecrawlBaseUrl => {
@@ -456,17 +451,17 @@ impl SettingsCx {
     fn save_web_api_key(&mut self, provider: WebKeyProvider, key: &str) -> Result<(), String> {
         let provider_id = web_key_provider_id(provider).to_string();
         let record = serde_json::json!({ "api_key": key }).to_string();
-        self.queue_simple_mutation(
+        self.queue_simple_secret_mutation(
             super::SettingsEffectTarget {
                 surface: "settings.web-credential",
                 owner: provider_id.clone(),
                 revision: Some(uuid::Uuid::new_v4().to_string()),
             },
-            Request::PutProviderCredential {
+            super::SettingsDaemonEffectWork::ProviderCredentialPut {
                 provider_id: provider_id.clone(),
-                record,
+                record: super::SecretPayload::new(record),
             },
-            super::SettingsMutationAction::ProviderCredentialPut { provider_id },
+            super::SettingsMutationAction::WebCredentialPut { provider_id },
         );
         self.extended_warnings = vec!["saving web credential…".into()];
         Ok(())

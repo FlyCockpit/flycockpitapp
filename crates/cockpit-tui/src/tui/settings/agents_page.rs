@@ -312,6 +312,17 @@ pub(super) struct AgentDetail {
 }
 
 impl AgentsPage {
+    pub(super) fn has_unsettled_external_edit(&self) -> bool {
+        self.pending_external_edit.is_some()
+            || self.pending_operations.values().any(|pending| {
+                matches!(
+                    pending,
+                    PendingAgentOperation::BeginLease { .. }
+                        | PendingAgentOperation::CompleteLease { .. }
+                )
+            })
+    }
+
     /// Build the page by discovering agents at `cwd`.
     pub(super) fn new(_cwd: &std::path::Path) -> Self {
         Self {
@@ -956,7 +967,7 @@ impl AgentsPage {
 
     fn apply_begin_lease(
         &mut self,
-        _cx: &mut SettingsCx,
+        cx: &mut SettingsCx,
         cwd: PathBuf,
         name: String,
         expected_revision: String,
@@ -994,14 +1005,28 @@ impl AgentsPage {
         let staging = match agent_external_edit_staging() {
             Ok(staging) => staging,
             Err(error) => {
-                self.editing = Some(draft);
-                self.status = Some(error);
+                self.settle_unserviced_editor_lease(
+                    cx,
+                    cwd,
+                    name,
+                    lease.lease_id,
+                    lease.snapshot.revision,
+                    draft,
+                    error,
+                );
                 return;
             }
         };
         if let Err(error) = seed_agent_external_edit_staging(&staging, draft.text()) {
-            self.editing = Some(draft);
-            self.status = Some(error);
+            self.settle_unserviced_editor_lease(
+                cx,
+                cwd,
+                name,
+                lease.lease_id,
+                lease.snapshot.revision,
+                draft,
+                error,
+            );
             return;
         }
         let id = self.external_edit_ops.begin();
@@ -1017,6 +1042,43 @@ impl AgentsPage {
             servicing: false,
         });
         self.status = Some("opening $EDITOR…".into());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn settle_unserviced_editor_lease(
+        &mut self,
+        cx: &mut SettingsCx,
+        cwd: PathBuf,
+        name: String,
+        lease_id: String,
+        consumed_revision: String,
+        draft: AgentEditor,
+        detail: String,
+    ) {
+        self.stage(
+            cx,
+            super::SettingsEffectTarget {
+                surface: "agents.editor-lease-complete",
+                owner: format!("{}::{lease_id}", cwd.display()),
+                revision: Some(consumed_revision.clone()),
+            },
+            cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+                project_root: cwd.to_string_lossy().into_owned(),
+                lease_id: lease_id.clone(),
+                markdown: None,
+            },
+            PendingAgentOperation::CompleteLease {
+                cwd,
+                name,
+                lease_id,
+                consumed_revision,
+                markdown: None,
+                draft: Some(draft),
+                detail: Some(detail),
+                outcome: super::pointer_actions::ExternalEditOutcome::Failed,
+            },
+        );
+        self.status = Some("external editor setup failed; cancelling daemon lease…".into());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1082,7 +1144,22 @@ impl AgentsPage {
             // recovery draft remains available because the lease may still be
             // live server-side.
             match response {
-                Ok(cockpit_core::daemon::proto::Response::AgentEditorLeaseCompleted(_)) => {
+                Ok(cockpit_core::daemon::proto::Response::AgentEditorLeaseCompleted(result))
+                    if cockpit_proto::validate_agent_mutation_envelope(
+                        &result,
+                        Some(&consumed_revision),
+                        Some(&lease_id),
+                        false,
+                    )
+                    .is_ok()
+                        && !result.changed
+                        && result.affected == 0
+                        && result.snapshot.is_none()
+                        && matches!(
+                            result.outcome,
+                            cockpit_core::daemon::proto::AgentMutationOutcome::Reconciled
+                        ) =>
+                {
                     self.status = Some(detail.unwrap_or_else(|| match outcome {
                         super::pointer_actions::ExternalEditOutcome::Cancelled => {
                             "external edit cancelled".into()
@@ -1229,13 +1306,15 @@ impl AgentsPage {
         let Some(mut pending) = self.pending_external_edit.take() else {
             return;
         };
+        let mut settled_outcome = outcome;
+        let mut settled_detail = detail;
         let markdown = if matches!(outcome, super::pointer_actions::ExternalEditOutcome::Saved) {
             match read_agent_external_edit_staging(&pending) {
                 Ok(markdown) => Some(markdown),
                 Err(error) => {
-                    self.editing = pending.draft.take();
-                    self.status = Some(error);
-                    return;
+                    settled_outcome = super::pointer_actions::ExternalEditOutcome::Failed;
+                    settled_detail = Some(error);
+                    None
                 }
             }
         } else {
@@ -1267,8 +1346,8 @@ impl AgentsPage {
                 consumed_revision,
                 markdown,
                 draft: pending.draft.take(),
-                detail,
-                outcome,
+                detail: settled_detail,
+                outcome: settled_outcome,
             },
         );
         self.status = Some("settling external editor lease…".into());

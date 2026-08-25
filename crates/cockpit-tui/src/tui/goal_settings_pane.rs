@@ -429,10 +429,9 @@ impl GoalSettingsPane {
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<GoalSettingsOutcome> {
         if self.in_flight.is_some() {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                return Some(GoalSettingsOutcome::Close);
-            }
-            self.status = Some("goal settings operation is still pending".to_string());
+            self.status = Some(
+                "goal settings operation is still pending; this pane cannot close yet".to_string(),
+            );
             return None;
         }
         if self.confirm.is_some() {

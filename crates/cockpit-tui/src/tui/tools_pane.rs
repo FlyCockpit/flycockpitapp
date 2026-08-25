@@ -287,10 +287,9 @@ impl ToolsPane {
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<ToolsOutcome> {
         if self.in_flight.is_some() {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                return Some(ToolsOutcome::Close);
-            }
-            self.status = Some("tool settings operation is still pending".to_string());
+            self.status = Some(
+                "tool settings operation is still pending; this pane cannot close yet".to_string(),
+            );
             return None;
         }
         if self.confirm.is_some() {

@@ -434,15 +434,15 @@ impl SettingsCx {
                         return Nav::Stay;
                     }
                     let flow_id = flow.flow_id.clone();
-                    self.queue_simple_mutation(
+                    self.queue_simple_secret_mutation(
                         super::SettingsEffectTarget {
                             surface: "settings.mcp-oauth-complete",
                             owner: flow.server.clone(),
                             revision: Some(flow_id.clone()),
                         },
-                        cockpit_core::daemon::proto::Request::CompleteMcpOAuth {
+                        super::SettingsDaemonEffectWork::McpOAuthComplete {
                             flow_id: flow_id.clone(),
-                            input: Some(input),
+                            input: super::SecretPayload::new(input),
                         },
                         super::SettingsMutationAction::McpOAuthComplete {
                             server: flow.server.clone(),
@@ -639,16 +639,11 @@ impl SettingsCx {
             .cloned()
             .collect::<BTreeSet<_>>();
         match self.save_mcp(&cfg, &secret_values, &stale_refs) {
-            Ok(()) => Nav::Replace(super::mcp_page(McpPage::List(ListState {
-                cursor: 0,
-                status: Some(if s.original_name.is_some() {
-                    format!("saved `{name}`")
-                } else {
-                    format!("added `{name}`")
-                }),
-                delete_pending: false,
-                oauth: None,
-            }))),
+            Ok(()) => {
+                self.pending_mcp_navigation = Some((name, s.original_name.is_some()));
+                s.status = Some("saving MCP server…".into());
+                Nav::Stay
+            }
             Err(e) => {
                 s.status = Some(format!("save failed: {e}"));
                 Nav::Stay

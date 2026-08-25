@@ -527,6 +527,18 @@ impl ProvidersPointerSurface {
 }
 
 impl ProvidersPage {
+    pub(super) fn has_unsettled_authority_operation(&self) -> bool {
+        match self {
+            Self::OAuthSetup { state, .. } => state.pending || state.polling,
+            Self::Add(state) => state
+                .oauth_auth
+                .as_ref()
+                .is_some_and(|oauth| oauth.pending || oauth.polling),
+            Self::CopilotSetup { state, .. } => state.operation.pending().is_some(),
+            _ => false,
+        }
+    }
+
     /// Sealed compile-time inventory for provider pointer fixtures. There is
     /// intentionally no wildcard: a new provider state cannot compile until
     /// it declares which semantic pointer surface it renders.
@@ -806,7 +818,21 @@ impl CopilotSetupState {
             },
             super::SettingsMutationAction::CopilotSetup { provider_id },
         );
-        self.complete(operation_id, Ok("Copilot setup queued…".into()));
+        self.outcome = Some(Ok("Copilot setup pending…".into()));
+    }
+
+    pub(super) fn apply_daemon_result(&mut self, provider_id: String, result: Result<(), String>) {
+        let Some(operation_id) = self.operation.pending() else {
+            self.outcome = Some(Err(format!(
+                "ignored stale Copilot setup receipt for {provider_id}"
+            )));
+            return;
+        };
+        self.outcome = None;
+        self.complete(
+            operation_id,
+            result.map(|()| format!("Copilot authentication configured for {provider_id}")),
+        );
     }
 
     fn complete(
@@ -1350,45 +1376,60 @@ impl SettingsCx {
         template: &'static ProviderTemplate,
     ) {
         self.config.providers.insert(id.clone(), entry.clone());
+        self.pending_provider_add = Some((id, entry, template.supports_models_endpoint));
         match self.save_config() {
             Ok(()) => {
-                s.saved_provider_id = Some(id.clone());
-                let notice = self.last_secret_notice.take();
-                if !s.is_step("saving") {
-                    let _ = s.run.submit(WizardAnswer::Acknowledged);
-                }
-                if s.is_step("saving") {
-                    let _ = s.run.submit(WizardAnswer::Acknowledged);
-                }
-                if s.is_step("fetching") {
-                    s.error = Some(match notice {
-                        Some(notice) => format!("saved. {notice} Fetching /models…"),
-                        None => "saved. Fetching /models…".into(),
-                    });
-                    s.fetch = Some(FetchHandle::spawn(id, entry, self.provider_fetch_root()));
-                    let _ = s.run.submit(WizardAnswer::Acknowledged);
-                } else if s.is_step("test-key-choice") {
-                    s.error = Some(match notice {
-                        Some(notice) => format!("saved. {notice}"),
-                        None => "saved.".into(),
-                    });
-                } else if !template.supports_models_endpoint {
-                    s.error = Some(match notice {
-                        Some(notice) => {
-                            format!("saved. {notice} Provider has no /models endpoint")
-                        }
-                        None => "saved. provider has no /models endpoint".into(),
-                    });
-                } else {
-                    s.error = Some(match notice {
-                        Some(notice) => format!("saved. {notice}"),
-                        None => "saved.".into(),
-                    });
-                }
+                s.error = Some("saving provider…".into());
             }
             Err(e) => {
+                self.pending_provider_add = None;
                 s.error = Some(format!("save failed: {e}"));
             }
+        }
+    }
+
+    pub(super) fn adopt_provider_add_completion(
+        &mut self,
+        s: &mut AddState,
+        completion: Result<(String, ProviderEntry, bool), String>,
+    ) {
+        let (id, entry, supports_models_endpoint) = match completion {
+            Ok(committed) => committed,
+            Err(error) => {
+                s.error = Some(format!("save failed: {error}"));
+                return;
+            }
+        };
+        s.saved_provider_id = Some(id.clone());
+        let notice = self.last_secret_notice.take();
+        if !s.is_step("saving") {
+            let _ = s.run.submit(WizardAnswer::Acknowledged);
+        }
+        if s.is_step("saving") {
+            let _ = s.run.submit(WizardAnswer::Acknowledged);
+        }
+        if s.is_step("fetching") {
+            s.error = Some(match notice {
+                Some(notice) => format!("saved. {notice} Fetching /models…"),
+                None => "saved. Fetching /models…".into(),
+            });
+            s.fetch = Some(FetchHandle::spawn(id, entry, self.provider_fetch_root()));
+            let _ = s.run.submit(WizardAnswer::Acknowledged);
+        } else if s.is_step("test-key-choice") {
+            s.error = Some(match notice {
+                Some(notice) => format!("saved. {notice}"),
+                None => "saved.".into(),
+            });
+        } else if !supports_models_endpoint {
+            s.error = Some(match notice {
+                Some(notice) => format!("saved. {notice} Provider has no /models endpoint"),
+                None => "saved. provider has no /models endpoint".into(),
+            });
+        } else {
+            s.error = Some(match notice {
+                Some(notice) => format!("saved. {notice}"),
+                None => "saved.".into(),
+            });
         }
     }
 
@@ -1728,18 +1769,7 @@ impl SettingsCx {
             .providers
             .insert(s.provider_id.clone(), (*s.entry).clone());
         match self.save_config() {
-            Ok(()) => {
-                // Bump the live resolution generation so subsequent editors
-                // observe a new config epoch after a successful write.
-                self.config.resolution_generation =
-                    self.config.resolution_generation.saturating_add(1);
-                Some(
-                    self.last_secret_notice
-                        .take()
-                        .map(|notice| format!("saved. {notice}"))
-                        .unwrap_or_else(|| "saved".to_string()),
-                )
-            }
+            Ok(()) => Some("saving provider…".to_string()),
             Err(error) => {
                 match previous {
                     Some(entry) => {
@@ -1992,10 +2022,7 @@ impl SettingsCx {
             Some(EditAction::OAuthAuth(provider)) => {
                 if self.provider_oauth_logged_in(provider) == Some(true) {
                     s.status = Some(match self.logout_provider_oauth(provider) {
-                        Ok(()) => match provider {
-                            OAuthProvider::Grok => "signed out of Grok subscription auth".into(),
-                            OAuthProvider::Codex => "signed out of Codex subscription auth".into(),
-                        },
+                        Ok(()) => "signing out…".into(),
                         Err(error) => format!("sign out failed: {error}"),
                     });
                     return Nav::Stay;

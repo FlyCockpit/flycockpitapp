@@ -895,6 +895,15 @@ pub fn parse_agent(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> 
     parse_agent_with_scope(text, name, source, DefinitionScope::Workspace)
 }
 
+/// Parse a daemon-served agent snapshot.  The daemon is a trusted source for
+/// all publisher provenances (`cockpit`, `authored`, `local`), so this uses
+/// [`DefinitionScope::DaemonSnapshot`] which accepts any publisher without
+/// re-checking the loader boundary.  Callers must only use this for markdown
+/// that arrived over a daemon RPC — never for workspace files.
+pub fn parse_daemon_agent_snapshot(text: &str, name: &str, source: PathBuf) -> Result<AgentDef> {
+    parse_agent_with_scope(text, name, source, DefinitionScope::DaemonSnapshot)
+}
+
 /// Parse a definition with origin supplied by its trusted owner. The only
 /// daemon-local owner today is the persisted assistant loader; all ordinary
 /// workspace paths use [`parse_agent`] and cannot claim the `local` publisher.

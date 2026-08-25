@@ -1193,7 +1193,15 @@ fn apply_redacted_occurrence_mutations(
 }
 
 fn validate_new_denylist_literal(value: &str) -> Result<(), ErrorPayload> {
-    if value.is_empty() || value.len() > 64 * 1024 || value.contains('\0') {
+    // Align with `MAX_SENSITIVE_FRAME_BYTES` (16 KiB): the wire type
+    // `SensitiveWireLiteral` enforces this cap at deserialization, so a larger
+    // literal fails closed before reaching this validator.  Keeping the
+    // validator at the same bound gives one consistent failure mode instead
+    // of two different errors for the same logical constraint.
+    if value.is_empty()
+        || value.len() > cockpit_proto::MAX_SENSITIVE_FRAME_BYTES
+        || value.contains('\0')
+    {
         return Err(bad_request("denylist literal is invalid"));
     }
     let trimmed = value.trim();

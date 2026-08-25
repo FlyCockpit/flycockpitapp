@@ -64,7 +64,7 @@ impl ToolsPane {
         {
             anyhow::bail!("daemon returned a misrouted or oversized agent snapshot");
         }
-        let def = cockpit_core::agents::parse_agent(
+        let def = cockpit_core::agents::parse_daemon_agent_snapshot(
             &snapshot.markdown,
             agent_name,
             PathBuf::from("<daemon-agent-snapshot>"),

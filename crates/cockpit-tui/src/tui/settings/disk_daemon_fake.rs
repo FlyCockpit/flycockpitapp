@@ -611,7 +611,13 @@ fn unset_object_path(root: &mut serde_json::Value, path: &[String]) -> Result<()
 }
 
 fn validate_new_denylist_literal(value: &str) -> Result<(), String> {
-    if value.is_empty() || value.len() > 64 * 1024 || value.contains('\0') {
+    // Align with `MAX_SENSITIVE_FRAME_BYTES` (16 KiB): the wire type
+    // `SensitiveWireLiteral` enforces this cap at deserialization.  Keeping
+    // the validator at the same bound gives one consistent failure mode.
+    if value.is_empty()
+        || value.len() > cockpit_proto::MAX_SENSITIVE_FRAME_BYTES
+        || value.contains('\0')
+    {
         return Err("denylist literal is invalid".to_string());
     }
     let trimmed = value.trim();

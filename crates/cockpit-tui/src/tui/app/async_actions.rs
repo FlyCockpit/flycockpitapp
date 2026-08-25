@@ -6,6 +6,13 @@ const OAUTH_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const OAUTH_HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const OAUTH_SETTLEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+fn valid_settlement_request_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 async fn oauth_settlement(
     client: &cockpit_core::daemon::client::DaemonClient,
     client_operation_id: String,
@@ -99,31 +106,56 @@ async fn begin_provider_oauth(
     let response = match response {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) | Err(_) => match oauth_settlement(&client, client_operation_id.clone()).await {
-            Ok(response) => response,
+            Ok(response @ Ok(_)) => response,
+            Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
             Err(error) => return Ok(oauth_settlement_unknown(error)),
         },
     };
     match response.map_err(|e| e.to_string())? {
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
             pending: false,
             response: Some(response),
-        }) if settlement_operation_id == client_operation_id => match *response {
-            cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
-                client_operation_id: receipt_operation_id,
-                request_hash,
-                flow_id,
-                authorize_url,
-                user_code,
-            } if receipt_operation_id == client_operation_id && request_hash == expected_hash => {
-                Ok(crate::tui::async_action::OAuthAsyncResult::Began {
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "begin_provider_oauth"
+            && settlement_hash == expected_hash =>
+        {
+            match *response {
+                cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
+                    client_operation_id: receipt_operation_id,
+                    request_hash,
                     flow_id,
                     authorize_url,
                     user_code,
-                })
+                } if receipt_operation_id == client_operation_id
+                    && request_hash == expected_hash =>
+                {
+                    Ok(crate::tui::async_action::OAuthAsyncResult::Began {
+                        flow_id,
+                        authorize_url,
+                        user_code,
+                    })
+                }
+                other => Err(format!("unexpected OAuth begin settlement: {other:?}")),
             }
-            other => Err(format!("unexpected OAuth begin settlement: {other:?}")),
-        },
+        }
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
+            pending: false,
+            response: None,
+            terminal_error: Some(error),
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "begin_provider_oauth"
+            && settlement_hash == expected_hash =>
+        {
+            Err(error.to_string())
+        }
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
             client_operation_id: receipt_operation_id,
             request_hash,
@@ -139,11 +171,18 @@ async fn begin_provider_oauth(
         }
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
             pending: true,
             ..
-        }) if settlement_operation_id == client_operation_id => Ok(oauth_settlement_unknown(
-            "OAuth begin is still pending; retrying must use the same operation",
-        )),
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "begin_provider_oauth"
+            && settlement_hash == expected_hash =>
+        {
+            Ok(oauth_settlement_unknown(
+                "OAuth begin is still pending; retrying must use the same operation",
+            ))
+        }
         Ok(other) => Err(format!(
             "unexpected provider OAuth begin response: {other:?}"
         )),
@@ -173,30 +212,53 @@ async fn complete_provider_oauth(
     let response = match response {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) | Err(_) => match oauth_settlement(&client, client_operation_id.clone()).await {
-            Ok(response) => response,
+            Ok(response @ Ok(_)) => response,
+            Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
             Err(error) => return Ok(oauth_settlement_unknown(error)),
         },
     };
     match response.map_err(|e| e.to_string())? {
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
             pending: false,
             response: Some(response),
-        }) if settlement_operation_id == client_operation_id => match *response {
-            cockpit_core::daemon::proto::Response::ProviderOAuthCompleted {
-                client_operation_id: receipt_operation_id,
-                request_hash,
-                flow_id: receipt_flow_id,
-                logged_in,
-                ..
-            } if receipt_operation_id == client_operation_id
-                && request_hash == expected_hash
-                && receipt_flow_id == flow_id =>
-            {
-                Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "complete_provider_oauth"
+            && valid_settlement_request_hash(&settlement_hash) =>
+        {
+            match *response {
+                cockpit_core::daemon::proto::Response::ProviderOAuthCompleted {
+                    client_operation_id: receipt_operation_id,
+                    request_hash,
+                    flow_id: receipt_flow_id,
+                    logged_in,
+                    ..
+                } if receipt_operation_id == client_operation_id
+                    && request_hash == expected_hash
+                    && receipt_flow_id == flow_id =>
+                {
+                    Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
+                }
+                other => Err(format!("unexpected OAuth completion settlement: {other:?}")),
             }
-            other => Err(format!("unexpected OAuth completion settlement: {other:?}")),
-        },
+        }
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
+            pending: false,
+            response: None,
+            terminal_error: Some(error),
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "complete_provider_oauth"
+            && valid_settlement_request_hash(&settlement_hash) =>
+        {
+            Err(error.to_string())
+        }
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCompleted {
             client_operation_id: receipt_operation_id,
             request_hash,
@@ -211,11 +273,18 @@ async fn complete_provider_oauth(
         }
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
             pending: true,
             ..
-        }) if settlement_operation_id == client_operation_id => Ok(oauth_settlement_unknown(
-            "OAuth completion is still pending; retrying must use the same operation",
-        )),
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "complete_provider_oauth"
+            && valid_settlement_request_hash(&settlement_hash) =>
+        {
+            Ok(oauth_settlement_unknown(
+                "OAuth completion is still pending; retrying must use the same operation",
+            ))
+        }
         Ok(other) => Err(format!(
             "unexpected provider OAuth completion response: {other:?}"
         )),
@@ -248,42 +317,65 @@ async fn cancel_provider_oauth(
     let response = match response {
         Ok(Ok(response)) => response,
         Ok(Err(_)) | Err(_) => match oauth_settlement(&client, client_operation_id.clone()).await {
-            Ok(response) => response,
+            Ok(response @ Ok(_)) => response,
+            Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
             Err(error) => return Ok(oauth_settlement_unknown(error)),
         },
     };
     match response {
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
             pending: false,
             response: Some(response),
-        }) if settlement_operation_id == client_operation_id => match *response {
-            cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
-                client_operation_id: receipt_operation_id,
-                request_hash,
-                flow_id: receipt_flow_id,
-                cancelled: true,
-            } if receipt_operation_id == client_operation_id
-                && request_hash == expected_hash
-                && (flow_id.is_none() || receipt_flow_id == flow_id) =>
-            {
-                Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "cancel_provider_oauth"
+            && settlement_hash == expected_hash =>
+        {
+            match *response {
+                cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+                    client_operation_id: receipt_operation_id,
+                    request_hash,
+                    flow_id: receipt_flow_id,
+                    cancelled: true,
+                } if receipt_operation_id == client_operation_id
+                    && request_hash == expected_hash
+                    && (flow_id.is_none() || receipt_flow_id == flow_id) =>
+                {
+                    Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
+                }
+                cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+                    client_operation_id: receipt_operation_id,
+                    request_hash,
+                    flow_id: receipt_flow_id,
+                    cancelled: false,
+                } if receipt_operation_id == client_operation_id
+                    && request_hash == expected_hash
+                    && (flow_id.is_none() || receipt_flow_id == flow_id) =>
+                {
+                    Ok(crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal)
+                }
+                other => Err(format!(
+                    "unexpected OAuth cancellation settlement: {other:?}"
+                )),
             }
-            cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
-                client_operation_id: receipt_operation_id,
-                request_hash,
-                flow_id: receipt_flow_id,
-                cancelled: false,
-            } if receipt_operation_id == client_operation_id
-                && request_hash == expected_hash
-                && (flow_id.is_none() || receipt_flow_id == flow_id) =>
-            {
-                Ok(crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal)
-            }
-            other => Err(format!(
-                "unexpected OAuth cancellation settlement: {other:?}"
-            )),
-        },
+        }
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
+            pending: false,
+            response: None,
+            terminal_error: Some(error),
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "cancel_provider_oauth"
+            && settlement_hash == expected_hash =>
+        {
+            Err(error.to_string())
+        }
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
             client_operation_id: receipt_operation_id,
             request_hash,
@@ -308,11 +400,18 @@ async fn cancel_provider_oauth(
         }
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
             pending: true,
             ..
-        }) if settlement_operation_id == client_operation_id => Ok(oauth_settlement_unknown(
-            "OAuth cancellation is still pending; retrying must use the same operation",
-        )),
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "cancel_provider_oauth"
+            && settlement_hash == expected_hash =>
+        {
+            Ok(oauth_settlement_unknown(
+                "OAuth cancellation is still pending; retrying must use the same operation",
+            ))
+        }
         Ok(other) => Err(format!(
             "unexpected provider OAuth cancel response: {other:?}"
         )),
@@ -2714,5 +2813,7 @@ mod oauth_settlement_source_tests {
         assert!(source.contains("oauth_settlement(&client"));
         assert!(source.contains("OAuthAsyncResult::AlreadyTerminal"));
         assert!(source.contains("OAuthAsyncResult::AlreadyTerminal => Ok(false)"));
+        assert!(source.contains("result: Result<bool, String>"));
+        assert!(source.contains("operation_kind == \"cancel_provider_oauth\""));
     }
 }

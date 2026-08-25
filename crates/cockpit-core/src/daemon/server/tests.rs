@@ -16741,6 +16741,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             layer_id: "fixture-layer".into(),
             expected_revision: "fixture-revision".into(),
             client_operation_id: "fixture-operation".into(),
+            mutation_intent_hash: "00".repeat(32),
             mutation: cockpit_proto::ProviderMutationBatch {
                 upserts: vec![cockpit_proto::ProviderMutationUpsert {
                     provider_id: "example".into(),
@@ -23912,7 +23913,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::CompleteMcpOAuth { client_operation_id: "complete-mcp".into(), flow_id: "flow".into(), input: None }, kind: "complete_mcp_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::CancelMcpOAuth { client_operation_id: "cancel-mcp".into(), begin_client_operation_id: "begin-mcp".into(), flow_id: Some("flow".into()) }, kind: "cancel_mcp_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetProviderCatalogSnapshot { project_root: "/tmp/project".into(), provider_id: None, snapshot_session_id: "fixture-snapshot".into() }, kind: "get_provider_catalog_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
-        CommandMetadataCase { request: Request::ApplyProviderMutation { snapshot_session_id: "fixture-snapshot".into(), layer_id: "fixture-layer".into(), expected_revision: "fixture-revision".into(), client_operation_id: "fixture-operation".into(), mutation: cockpit_proto::ProviderMutationBatch { upserts: vec![cockpit_proto::ProviderMutationUpsert { provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }], deletes: Vec::new(), metadata: None } }, kind: "apply_provider_mutation", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::ApplyProviderMutation { snapshot_session_id: "fixture-snapshot".into(), layer_id: "fixture-layer".into(), expected_revision: "fixture-revision".into(), client_operation_id: "fixture-operation".into(), mutation_intent_hash: "00".repeat(32), mutation: cockpit_proto::ProviderMutationBatch { upserts: vec![cockpit_proto::ProviderMutationUpsert { provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }], deletes: Vec::new(), metadata: None } }, kind: "apply_provider_mutation", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetLocalOperationSettlement { client_operation_id: "fixture-operation".into() }, kind: "get_local_operation_settlement", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::FetchProviderModels { project_root: "/tmp/project".into(), provider_id: None, model_id: None, deep: false, on_unlisted: None, allow_fallback: false }, kind: "fetch_provider_models", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::GetProviderUsageSnapshot { project_root: "/tmp/project".into(), provider_id: None }, kind: "get_provider_usage_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },

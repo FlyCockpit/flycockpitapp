@@ -8045,24 +8045,50 @@ async fn handle_serialized_request_impl(
                 .map_err(internal)?
                 .ok_or_else(|| bad_request("local operation settlement is unknown"))?;
             match settlement {
-                crate::db::local_operation_receipts::LocalOperationSettlement::Pending => {
+                crate::db::local_operation_receipts::LocalOperationSettlement::Pending(identity) => {
                     Ok(Response::LocalOperationSettlement {
                         client_operation_id,
+                        operation_kind: identity.operation_kind,
+                        request_hash: local_operation_stored_hash_hex(&identity.request_hash)?,
                         pending: true,
                         response: None,
+                        terminal_error: None,
+                        terminal_cancelled: false,
                     })
                 }
-                crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(json) => {
+                crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(identity, json) => {
                     let response = serde_json::from_str(&json).map_err(internal)?;
                     Ok(Response::LocalOperationSettlement {
                         client_operation_id,
+                        operation_kind: identity.operation_kind,
+                        request_hash: local_operation_stored_hash_hex(&identity.request_hash)?,
                         pending: false,
                         response: Some(Box::new(response)),
+                        terminal_error: None,
+                        terminal_cancelled: false,
                     })
                 }
-                crate::db::local_operation_receipts::LocalOperationSettlement::TerminalError(json)
-                | crate::db::local_operation_receipts::LocalOperationSettlement::TerminalCancelled(json) => {
-                    Err(serde_json::from_str(&json).map_err(internal)?)
+                crate::db::local_operation_receipts::LocalOperationSettlement::TerminalError(identity, json) => {
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id,
+                        operation_kind: identity.operation_kind,
+                        request_hash: local_operation_stored_hash_hex(&identity.request_hash)?,
+                        pending: false,
+                        response: None,
+                        terminal_error: Some(serde_json::from_str(&json).map_err(internal)?),
+                        terminal_cancelled: false,
+                    })
+                }
+                crate::db::local_operation_receipts::LocalOperationSettlement::TerminalCancelled(identity, json) => {
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id,
+                        operation_kind: identity.operation_kind,
+                        request_hash: local_operation_stored_hash_hex(&identity.request_hash)?,
+                        pending: false,
+                        response: None,
+                        terminal_error: Some(serde_json::from_str(&json).map_err(internal)?),
+                        terminal_cancelled: true,
+                    })
                 }
             }
         }
@@ -8634,7 +8660,7 @@ async fn handle_serialized_request_impl(
                         .await
                         .map_err(internal)?
                     {
-                        Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(json)) => {
+                        Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(_, json)) => {
                             match serde_json::from_str::<Response>(&json).map_err(internal)? {
                                 Response::ProviderOAuthStarted { flow_id, .. } => Some(flow_id),
                                 _ => None,
@@ -9262,7 +9288,7 @@ async fn handle_serialized_request_impl(
                         .await
                         .map_err(internal)?
                     {
-                        Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(json)) => {
+                        Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(_, json)) => {
                             match serde_json::from_str::<Response>(&json).map_err(internal)? {
                                 Response::McpOAuthStarted { flow_id, .. } => Some(flow_id),
                                 _ => None,
@@ -9560,6 +9586,7 @@ async fn handle_serialized_request_impl(
             layer_id,
             expected_revision,
             client_operation_id,
+            mutation_intent_hash,
             mutation,
         } => {
             if ctx.paths.ephemeral {
@@ -9573,6 +9600,7 @@ async fn handle_serialized_request_impl(
                 layer_id,
                 expected_revision,
                 client_operation_id,
+                mutation_intent_hash,
                 mutation,
                 settings_capability_owner(state),
             )
@@ -12225,7 +12253,7 @@ async fn provider_catalog_snapshot(
             snapshot_session_id.to_string(),
             ProviderEditCapability {
                 owner: capability_owner,
-                project_root: canonical_root,
+                project_root: canonical_root.clone(),
                 target_path,
                 layer_id: layer_id.clone(),
                 revision: revision.clone(),
@@ -12241,6 +12269,7 @@ async fn provider_catalog_snapshot(
         config: view,
         snapshot_session_id: snapshot_session_id.to_string(),
         layer_id,
+        owner_root: canonical_root,
         base_revision: revision,
         config_generation,
     })
@@ -12261,9 +12290,16 @@ async fn apply_provider_mutation(
     layer_id: String,
     expected_revision: String,
     client_operation_id: String,
+    mutation_intent_hash: String,
     mutation: cockpit_proto::ProviderMutationBatch,
     capability_owner: String,
 ) -> std::result::Result<Response, ErrorPayload> {
+    let observed_intent_hash = mutation.sanitized_intent_hash().map_err(internal)?;
+    if observed_intent_hash != mutation_intent_hash {
+        return Err(bad_request(
+            "provider mutation intent digest does not match its body",
+        ));
+    }
     let request_hash = local_operation_secret_request_hash(
         ctx,
         b"flycockpit/local-operation/provider-mutation/v1\0",
@@ -12272,6 +12308,8 @@ async fn apply_provider_mutation(
             &snapshot_session_id,
             &layer_id,
             &expected_revision,
+            &mutation_intent_hash,
+            &mutation_intent_hash,
             &mutation,
         ),
     )?;
@@ -12403,6 +12441,20 @@ fn local_operation_request_hash_hex(request_hash: &[u8; 32]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn local_operation_stored_hash_hex(
+    request_hash: &[u8],
+) -> std::result::Result<String, ErrorPayload> {
+    if request_hash.len() != 32 {
+        return Err(internal(anyhow::anyhow!(
+            "local operation receipt contains an invalid request hash"
+        )));
+    }
+    Ok(request_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 enum LocalOperationStart {
@@ -12803,6 +12855,7 @@ async fn stage_and_recover_provider_batch(
     snapshot_session_id: &str,
     layer_id: &str,
     consumed_revision: &str,
+    mutation_intent_hash: &str,
 ) -> std::result::Result<ProviderMutationJournalCommit, ErrorPayload> {
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (cwd, trust_policy, effective) = daemon_provider_config(ctx, project_root).await?;
@@ -12954,6 +13007,8 @@ async fn stage_and_recover_provider_batch(
         client_operation_id: client_operation_id.to_owned(),
         snapshot_session_id: snapshot_session_id.to_owned(),
         layer_id: layer_id.to_owned(),
+        owner_root: project_root.to_owned(),
+        mutation_intent_hash: mutation_intent_hash.to_owned(),
         consumed_revision: consumed_revision.to_owned(),
         result_revision: result_revision.clone(),
         config_generation,
@@ -13082,6 +13137,7 @@ async fn stage_and_recover_provider_batch(
         .map_err(internal)?
     {
         Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
+            _,
             json,
         )) => serde_json::from_str::<Response>(&json).map_err(internal)?,
         _ => {
@@ -13934,6 +13990,7 @@ async fn setup_copilot_auth(
         .map_err(internal)?
     {
         Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
+            _,
             json,
         )) => serde_json::from_str(&json).map_err(internal),
         _ => Err(internal(anyhow::anyhow!(

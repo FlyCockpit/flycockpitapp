@@ -1414,6 +1414,7 @@
       "client_operation_id": "provider-operation-fixture",
       "expected_revision": "provider-revision-fixture",
       "layer_id": "provider-layer-fixture",
+      "mutation_intent_hash": "1111111111111111111111111111111111111111111111111111111111111111",
       "mutation": {
         "deletes": [],
         "upserts": [{

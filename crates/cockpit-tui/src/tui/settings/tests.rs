@@ -72,6 +72,8 @@ fn queued_secret_payloads_have_redacted_debug_and_single_owners() {
     let plan = ProviderMutationPlan {
         snapshot_session_id: "snapshot".into(),
         layer_id: "layer".into(),
+        owner_root: "/project".into(),
+        mutation_intent_hash: "00".repeat(32),
         expected_revision: "revision".into(),
         client_operation_id: "operation".into(),
         saves: vec![save],
@@ -8898,6 +8900,10 @@ fn durable_settings_mutations_retain_unknown_settlement_until_receipt() {
     assert!(source.contains("local operation settlement query timed out"));
     assert!(source.contains("operation settlement is unknown"));
     assert!(source.contains("authority_operation_pending"));
+    assert!(source.contains("pending_settlement_kind"));
+    assert!(source.contains("valid_local_settlement_hash"));
+    assert!(source.contains("operation was authoritatively rejected"));
+    assert!(source.contains("operation was authoritatively cancelled"));
 }
 
 #[test]
@@ -8916,4 +8922,6 @@ fn oauth_and_project_receipts_are_bound_to_exact_authority_targets() {
     assert!(source.contains("typed settings commit remains unsettled"));
     assert!(mcp.contains("expected_consumed_revision"));
     assert!(mcp.contains("expected_result_revision"));
+    assert!(source.contains("sanitized_intent_hash"));
+    assert!(source.contains("provider_view_matches_mutation"));
 }

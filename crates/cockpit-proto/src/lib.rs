@@ -3233,9 +3233,10 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "cancel_provider_oauth"
                 | "begin_mcp_oauth"
                 | "complete_mcp_oauth"
-                | "cancel_mcp_oauth" => 17,
+                | "cancel_mcp_oauth"
+                | "apply_provider_mutation" => 17,
                 "cancel_leak_reveal" => 16,
-                "get_provider_catalog_snapshot" | "apply_provider_mutation" => 15,
+                "get_provider_catalog_snapshot" => 15,
                 "list_secret_inventory"
                 | "put_named_secret"
                 | "put_subscription_ack"
@@ -3332,9 +3333,10 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "provider_credential_committed"
                 | "local_operation_settlement"
                 | "copilot_auth_committed"
-                | "mcp_config_committed" => 17,
+                | "mcp_config_committed"
+                | "provider_catalog_snapshot"
+                | "provider_mutation_committed" => 17,
                 "leak_reveal_cancelled" => 16,
-                "provider_catalog_snapshot" | "provider_mutation_committed" => 15,
                 "flycockpit_org_sync"
                 | "provider_models_fetched"
                 | "provider_usage_snapshot"
@@ -6605,24 +6607,31 @@ mod tests {
     #[test]
     fn current_protocol_gates_provider_catalog_leak_and_oauth_cancellation() {
         let provider_requests = [
-            Request::GetProviderCatalogSnapshot {
-                project_root: "/project".into(),
-                provider_id: None,
-                snapshot_session_id: "snapshot".into(),
-            },
-            Request::ApplyProviderMutation {
-                snapshot_session_id: "snapshot".into(),
-                layer_id: "layer".into(),
-                expected_revision: "revision".into(),
-                client_operation_id: "operation".into(),
-                mutation: ProviderMutationBatch {
-                    upserts: Vec::new(),
-                    deletes: Vec::new(),
-                    metadata: None,
+            (
+                Request::GetProviderCatalogSnapshot {
+                    project_root: "/project".into(),
+                    provider_id: None,
+                    snapshot_session_id: "snapshot".into(),
                 },
-            },
+                15,
+            ),
+            (
+                Request::ApplyProviderMutation {
+                    snapshot_session_id: "snapshot".into(),
+                    layer_id: "layer".into(),
+                    expected_revision: "revision".into(),
+                    client_operation_id: "operation".into(),
+                    mutation_intent_hash: "00".repeat(32),
+                    mutation: ProviderMutationBatch {
+                        upserts: Vec::new(),
+                        deletes: Vec::new(),
+                        metadata: None,
+                    },
+                },
+                17,
+            ),
         ];
-        for request in provider_requests {
+        for (request, expected_version) in provider_requests {
             assert_eq!(
                 body_required_protocol_version(&Body::Request {
                     id: Uuid::nil(),
@@ -6631,28 +6640,37 @@ mod tests {
                     request,
                 })
                 .0,
-                15
+                expected_version
             );
         }
-        for response in [
-            Response::ProviderCatalogSnapshot {
-                config: ProviderConfigView::default(),
-                snapshot_session_id: "snapshot".into(),
-                layer_id: "layer".into(),
-                base_revision: "revision".into(),
-                config_generation: 1,
-            },
-            Response::ProviderMutationCommitted {
-                client_operation_id: "operation".into(),
-                snapshot_session_id: "snapshot".into(),
-                layer_id: "layer".into(),
-                consumed_revision: "revision".into(),
-                result_revision: "next".into(),
-                config_generation: 2,
-                config: ProviderConfigView::default(),
-                status: ConfigCommitStatus::Committed,
-                publication: ConfigPublicationStatus::Published,
-            },
+        for (response, expected_version) in [
+            (
+                Response::ProviderCatalogSnapshot {
+                    config: ProviderConfigView::default(),
+                    snapshot_session_id: "snapshot".into(),
+                    layer_id: "layer".into(),
+                    owner_root: "/project".into(),
+                    base_revision: "revision".into(),
+                    config_generation: 1,
+                },
+                17,
+            ),
+            (
+                Response::ProviderMutationCommitted {
+                    client_operation_id: "operation".into(),
+                    snapshot_session_id: "snapshot".into(),
+                    layer_id: "layer".into(),
+                    owner_root: "/project".into(),
+                    mutation_intent_hash: "00".repeat(32),
+                    consumed_revision: "revision".into(),
+                    result_revision: "next".into(),
+                    config_generation: 2,
+                    config: ProviderConfigView::default(),
+                    status: ConfigCommitStatus::Committed,
+                    publication: ConfigPublicationStatus::Published,
+                },
+                17,
+            ),
         ] {
             assert_eq!(
                 body_required_protocol_version(&Body::Response {
@@ -6660,7 +6678,7 @@ mod tests {
                     response: Box::new(response),
                 })
                 .0,
-                15
+                expected_version
             );
         }
 

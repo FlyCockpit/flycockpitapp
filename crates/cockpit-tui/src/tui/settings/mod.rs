@@ -345,6 +345,8 @@ impl std::fmt::Debug for SettingsDaemonEffectWork {
 pub(crate) struct ProviderMutationPlan {
     snapshot_session_id: String,
     layer_id: String,
+    owner_root: String,
+    mutation_intent_hash: String,
     expected_revision: String,
     client_operation_id: String,
     saves: Vec<ProviderSavePlan>,
@@ -366,6 +368,8 @@ impl std::fmt::Debug for ProviderMutationPlan {
         f.debug_struct("ProviderMutationPlan")
             .field("snapshot_session_id", &self.snapshot_session_id)
             .field("layer_id", &self.layer_id)
+            .field("owner_root", &self.owner_root)
+            .field("mutation_intent_hash", &self.mutation_intent_hash)
             .field("expected_revision", &self.expected_revision)
             .field("client_operation_id", &self.client_operation_id)
             .field("save_count", &self.saves.len())
@@ -383,6 +387,53 @@ impl std::fmt::Debug for ProviderSavePlan {
             .field("header_secret_count", &self.header_secrets.len())
             .finish()
     }
+}
+
+fn provider_plan_intent_hash(
+    saves: &[ProviderSavePlan],
+    deletes: &[(String, bool)],
+    metadata: &Option<(
+        BTreeMap<String, cockpit_config::config::providers::ProviderModelRef>,
+        OnUnlistedModelsFetch,
+    )>,
+) -> Result<String, String> {
+    cockpit_proto::ProviderMutationBatch {
+        upserts: saves
+            .iter()
+            .map(|save| cockpit_proto::ProviderMutationUpsert {
+                provider_id: save.provider_id.clone(),
+                entry: save.entry.clone(),
+                header_secrets: save
+                    .header_secrets
+                    .iter()
+                    .map(|secret| {
+                        secret
+                            .as_ref()
+                            .map(|_| cockpit_proto::ProviderSecretValue::new(String::new()))
+                    })
+                    .collect(),
+            })
+            .collect(),
+        deletes: deletes
+            .iter()
+            .map(
+                |(provider_id, delete_stored_secrets)| cockpit_proto::ProviderMutationDelete {
+                    provider_id: provider_id.clone(),
+                    delete_stored_secrets: *delete_stored_secrets,
+                },
+            )
+            .collect(),
+        metadata: metadata
+            .as_ref()
+            .map(|(category_defaults, on_unlisted_models_fetch)| {
+                cockpit_proto::ProviderLayerMetadataPatch {
+                    category_defaults: category_defaults.clone(),
+                    on_unlisted_models_fetch: *on_unlisted_models_fetch,
+                }
+            }),
+    }
+    .sanitized_intent_hash()
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Debug)]
@@ -528,17 +579,72 @@ pub(crate) async fn execute_settings_daemon_work(
                         }
                     }),
             };
+            let observed_intent_hash = mutation
+                .sanitized_intent_hash()
+                .map_err(|error| format!("failed to identify provider mutation: {error}"))?;
+            if observed_intent_hash != plan.mutation_intent_hash {
+                return Err(
+                    "provider mutation changed after its authority gate was installed".into(),
+                );
+            }
+            let expected_intent_hash = plan.mutation_intent_hash.clone();
+            let expected_operation_id = plan.client_operation_id.clone();
+            let expected_session_id = plan.snapshot_session_id.clone();
+            let expected_layer_id = plan.layer_id.clone();
+            let expected_owner_root = plan.owner_root.clone();
+            let expected_revision = plan.expected_revision.clone();
+            let expected_upserts = mutation
+                .upserts
+                .iter()
+                .map(|upsert| (upsert.provider_id.clone(), upsert.entry.clone()))
+                .collect::<Vec<_>>();
+            let expected_deletes = mutation
+                .deletes
+                .iter()
+                .map(|delete| delete.provider_id.clone())
+                .collect::<Vec<_>>();
+            let expected_metadata = mutation.metadata.clone();
             let response = client
                 .request(Request::ApplyProviderMutation {
-                    snapshot_session_id: plan.snapshot_session_id,
-                    layer_id: plan.layer_id,
-                    expected_revision: plan.expected_revision,
-                    client_operation_id: plan.client_operation_id,
+                    snapshot_session_id: expected_session_id.clone(),
+                    layer_id: expected_layer_id.clone(),
+                    expected_revision: expected_revision.clone(),
+                    client_operation_id: expected_operation_id.clone(),
+                    mutation_intent_hash: expected_intent_hash.clone(),
                     mutation,
                 })
                 .await
                 .map_err(|error| error.to_string())?
                 .map_err(|error| error.to_string())?;
+            match &response {
+                Response::ProviderMutationCommitted {
+                    client_operation_id,
+                    snapshot_session_id,
+                    layer_id,
+                    owner_root,
+                    mutation_intent_hash,
+                    consumed_revision,
+                    config,
+                    status: cockpit_proto::ConfigCommitStatus::Committed,
+                    ..
+                } if client_operation_id == &expected_operation_id
+                    && snapshot_session_id == &expected_session_id
+                    && layer_id == &expected_layer_id
+                    && owner_root == &expected_owner_root
+                    && mutation_intent_hash == &expected_intent_hash
+                    && consumed_revision == &expected_revision
+                    && provider_view_matches_mutation(
+                        config,
+                        &expected_upserts,
+                        &expected_deletes,
+                        expected_metadata.as_ref(),
+                    ) => {}
+                other => {
+                    return Err(format!(
+                        "provider mutation returned an unbound or semantically mismatched receipt: {other:?}"
+                    ));
+                }
+            }
             Ok(SettingsDaemonWorkOutcome {
                 response: Ok(response),
                 committed_refresh_needed: None,
@@ -602,17 +708,46 @@ pub(crate) async fn execute_settings_daemon_work(
                     Ok(Ok(response)) => response,
                     Ok(Err(_)) | Err(_) => Response::LocalOperationSettlement {
                         client_operation_id: plan.client_operation_id.clone(),
+                        operation_kind: String::new(),
+                        request_hash: String::new(),
                         pending: true,
                         response: None,
+                        terminal_error: None,
+                        terminal_cancelled: false,
                     },
                 },
             };
             let response = match response {
                 Response::LocalOperationSettlement {
                     client_operation_id,
+                    operation_kind,
+                    request_hash,
                     pending: false,
                     response: Some(response),
-                } if client_operation_id == plan.client_operation_id => *response,
+                    terminal_error: None,
+                    terminal_cancelled: false,
+                } if client_operation_id == plan.client_operation_id
+                    && operation_kind == "apply_extended_config_patch"
+                    && valid_local_settlement_hash(&request_hash) =>
+                {
+                    *response
+                }
+                Response::LocalOperationSettlement {
+                    client_operation_id,
+                    operation_kind,
+                    request_hash,
+                    pending: false,
+                    response: None,
+                    terminal_error: Some(error),
+                    ..
+                } if client_operation_id == plan.client_operation_id
+                    && operation_kind == "apply_extended_config_patch"
+                    && valid_local_settlement_hash(&request_hash) =>
+                {
+                    return Err(format!(
+                        "typed settings mutation was authoritatively rejected: {error}"
+                    ));
+                }
                 response @ Response::LocalOperationSettlement {
                     client_operation_id: ref returned_operation_id,
                     pending: true,
@@ -995,6 +1130,8 @@ enum PendingSettingsOperation {
         client_operation_id: String,
         snapshot_session_id: String,
         layer_id: String,
+        owner_root: String,
+        mutation_intent_hash: String,
         expected_revision: String,
         expected_generation: u64,
         staged_default: Option<cockpit_config::config::providers::ActiveModelRef>,
@@ -1161,6 +1298,20 @@ enum SettingsMutationAction {
 }
 
 impl SettingsMutationAction {
+    fn operation_kind(&self) -> &'static str {
+        match self {
+            Self::McpSave { .. } => "save_mcp_config",
+            Self::McpOAuthBegin { .. } => "begin_mcp_oauth",
+            Self::McpOAuthComplete { .. } => "complete_mcp_oauth",
+            Self::McpOAuthCancel { .. } => "cancel_mcp_oauth",
+            Self::ProviderCredentialDelete { .. } => "delete_provider_credential",
+            Self::ProviderCredentialPut { .. } | Self::WebCredentialPut { .. } => {
+                "put_provider_credential"
+            }
+            Self::CopilotSetup { .. } => "setup_copilot_auth",
+        }
+    }
+
     fn settlement_id(&self) -> Option<&str> {
         match self {
             Self::McpSave {
@@ -1375,6 +1526,23 @@ impl SettingsMutationAction {
             _ => false,
         }
     }
+}
+
+fn pending_settlement_kind(operation: &PendingSettingsOperation) -> Option<&'static str> {
+    match operation {
+        PendingSettingsOperation::ProviderMutation { .. } => Some("apply_provider_mutation"),
+        PendingSettingsOperation::ExtendedSave { .. }
+        | PendingSettingsOperation::TypedDocumentEdit { .. } => Some("apply_extended_config_patch"),
+        PendingSettingsOperation::SimpleMutation { action, .. } => Some(action.operation_kind()),
+        _ => None,
+    }
+}
+
+fn valid_local_settlement_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn valid_vault_freshness(consumed: u64, result: u64, changed: bool) -> bool {
@@ -2533,6 +2701,7 @@ pub struct SettingsCx {
 struct ProviderEditAuthority {
     snapshot_session_id: String,
     layer_id: String,
+    owner_root: String,
     base_revision: String,
     config_generation: u64,
 }
@@ -2900,6 +3069,8 @@ impl SettingsCx {
                 project_root,
                 snapshot_session_id,
                 layer_id,
+                owner_root,
+                mutation_intent_hash,
                 expected_layer,
                 expected_revision,
                 expected_generation,
@@ -2982,6 +3153,8 @@ impl SettingsCx {
                 client_operation_id,
                 snapshot_session_id,
                 layer_id,
+                owner_root,
+                mutation_intent_hash,
                 expected_revision,
                 expected_generation,
                 staged_default,
@@ -2995,6 +3168,8 @@ impl SettingsCx {
                     client_operation_id: client_operation_id.clone(),
                     snapshot_session_id: snapshot_session_id.clone(),
                     layer_id: layer_id.clone(),
+                    owner_root: owner_root.clone(),
+                    mutation_intent_hash: mutation_intent_hash.clone(),
                     expected_revision: expected_revision.clone(),
                     expected_generation,
                     staged_default: staged_default.clone(),
@@ -3005,6 +3180,8 @@ impl SettingsCx {
                         client_operation_id: returned_operation_id,
                         snapshot_session_id: returned_session_id,
                         layer_id: returned_layer_id,
+                        owner_root: returned_owner_root,
+                        mutation_intent_hash: returned_intent_hash,
                         consumed_revision,
                         result_revision,
                         config_generation,
@@ -3014,7 +3191,10 @@ impl SettingsCx {
                     }) if returned_operation_id == client_operation_id
                         && returned_session_id == snapshot_session_id
                         && returned_layer_id == layer_id
+                        && returned_owner_root == owner_root
+                        && returned_intent_hash == mutation_intent_hash
                         && consumed_revision == expected_revision
+                        && cockpit_proto::is_opaque_authority_token(&result_revision)
                         && config_generation == expected_generation.saturating_add(1)
                         && self.latest_provider_snapshot_session_id.as_deref()
                             == Some(returned_session_id.as_str()) =>
@@ -3027,6 +3207,7 @@ impl SettingsCx {
                         self.provider_edit_authority = Some(ProviderEditAuthority {
                             snapshot_session_id: returned_session_id,
                             layer_id: returned_layer_id,
+                            owner_root: returned_owner_root,
                             base_revision: result_revision,
                             config_generation,
                         });
@@ -3096,6 +3277,7 @@ impl SettingsCx {
                         config,
                         snapshot_session_id: returned_session_id,
                         layer_id,
+                        owner_root,
                         base_revision,
                         config_generation,
                     }) if returned_session_id == snapshot_session_id
@@ -3109,6 +3291,7 @@ impl SettingsCx {
                         self.provider_edit_authority = Some(ProviderEditAuthority {
                             snapshot_session_id,
                             layer_id,
+                            owner_root,
                             base_revision,
                             config_generation,
                         });
@@ -3648,12 +3831,20 @@ impl SettingsCx {
                 if completion.target != target {
                     return Ok(());
                 }
+                let expected_kind = pending_settlement_kind(&original);
                 match completion.response {
                     Ok(Response::LocalOperationSettlement {
                         client_operation_id: returned_id,
+                        operation_kind,
+                        request_hash,
                         pending: false,
                         response: Some(response),
-                    }) if returned_id == client_operation_id => {
+                        terminal_error: None,
+                        terminal_cancelled: false,
+                    }) if returned_id == client_operation_id
+                        && expected_kind == Some(operation_kind.as_str())
+                        && valid_local_settlement_hash(&request_hash) =>
+                    {
                         let original = *original;
                         let original_target = original.target();
                         self.pending_settings
@@ -3668,9 +3859,16 @@ impl SettingsCx {
                     }
                     Ok(Response::LocalOperationSettlement {
                         client_operation_id: returned_id,
+                        operation_kind,
+                        request_hash,
                         pending: true,
                         response: None,
-                    }) if returned_id == client_operation_id => {
+                        terminal_error: None,
+                        terminal_cancelled: false,
+                    }) if returned_id == client_operation_id
+                        && expected_kind == Some(operation_kind.as_str())
+                        && valid_local_settlement_hash(&request_hash) =>
+                    {
                         self.pending_settings.insert(
                             completion.operation_id,
                             PendingSettingsOperation::SettlementUnknown {
@@ -3683,6 +3881,35 @@ impl SettingsCx {
                             "operation remains unsettled; press any key to query the durable receipt again"
                                 .into(),
                         ];
+                    }
+                    Ok(Response::LocalOperationSettlement {
+                        client_operation_id: returned_id,
+                        operation_kind,
+                        request_hash,
+                        pending: false,
+                        response: None,
+                        terminal_error: Some(error),
+                        terminal_cancelled,
+                    }) if returned_id == client_operation_id
+                        && expected_kind == Some(operation_kind.as_str())
+                        && valid_local_settlement_hash(&request_hash) =>
+                    {
+                        let original = *original;
+                        let original_target = original.target();
+                        self.pending_settings
+                            .insert(completion.operation_id, original);
+                        let message = if terminal_cancelled {
+                            format!("operation was authoritatively cancelled: {error}")
+                        } else {
+                            format!("operation was authoritatively rejected: {error}")
+                        };
+                        return self.apply_general_completion(SettingsDaemonEffectCompletion {
+                            dialog_id: completion.dialog_id,
+                            operation_id: completion.operation_id,
+                            target: original_target,
+                            response: Err(message),
+                            committed_refresh_needed: None,
+                        });
                     }
                     Ok(other) => {
                         tracing::warn!(response = ?other, "ignored unbound local settlement query response");
@@ -5054,7 +5281,7 @@ impl Dialog {
         provider: OAuthProvider,
         client_flow_id: pointer_actions::OAuthFlowId,
         operation_id: shell::PointerOperationId,
-        result: Result<(), String>,
+        result: Result<bool, String>,
     ) {
         if let Dialog::Settings(s) = self {
             s.apply_oauth_cancel(provider, client_flow_id, operation_id, result);
@@ -5977,7 +6204,7 @@ impl SettingsDialog {
         provider: OAuthProvider,
         client_flow_id: pointer_actions::OAuthFlowId,
         operation_id: shell::PointerOperationId,
-        result: Result<(), String>,
+        result: Result<bool, String>,
     ) {
         let Some(state) = self.oauth_flow_state_mut(provider) else {
             return;
@@ -7184,14 +7411,18 @@ impl SettingsCx {
             owner: authority.layer_id.clone(),
             revision: Some(authority.base_revision.clone()),
         };
+        let metadata = metadata_changed.then_some((category_defaults, on_unlisted_models_fetch));
+        let mutation_intent_hash = provider_plan_intent_hash(&saves, &deletes, &metadata)?;
         let plan = ProviderMutationPlan {
             snapshot_session_id: authority.snapshot_session_id.clone(),
             layer_id: authority.layer_id.clone(),
+            owner_root: authority.owner_root.clone(),
+            mutation_intent_hash: mutation_intent_hash.clone(),
             expected_revision: authority.base_revision.clone(),
             client_operation_id: client_operation_id.clone(),
             saves,
             deletes,
-            metadata: metadata_changed.then_some((category_defaults, on_unlisted_models_fetch)),
+            metadata,
         };
         let operation_id = self.enqueue_daemon_work(
             target.clone(),
@@ -7204,6 +7435,8 @@ impl SettingsCx {
                 client_operation_id,
                 snapshot_session_id: authority.snapshot_session_id,
                 layer_id: authority.layer_id,
+                owner_root: authority.owner_root,
+                mutation_intent_hash,
                 expected_revision: authority.base_revision,
                 expected_generation: authority.config_generation,
                 staged_default: self.original_config.active_model.clone(),
@@ -7235,15 +7468,19 @@ impl SettingsCx {
             owner: authority.layer_id.clone(),
             revision: Some(authority.base_revision.clone()),
         };
+        let deletes = vec![(provider_id, delete_stored_secrets)];
+        let mutation_intent_hash = provider_plan_intent_hash(&[], &deletes, &None)?;
         let operation_id = self.enqueue_daemon_work(
             target.clone(),
             SettingsDaemonEffectWork::ProviderMutation(ProviderMutationPlan {
                 snapshot_session_id: authority.snapshot_session_id.clone(),
                 layer_id: authority.layer_id.clone(),
+                owner_root: authority.owner_root.clone(),
+                mutation_intent_hash: mutation_intent_hash.clone(),
                 expected_revision: authority.base_revision.clone(),
                 client_operation_id: client_operation_id.clone(),
                 saves: Vec::new(),
-                deletes: vec![(provider_id, delete_stored_secrets)],
+                deletes,
                 metadata: None,
             }),
         );
@@ -7254,6 +7491,8 @@ impl SettingsCx {
                 client_operation_id,
                 snapshot_session_id: authority.snapshot_session_id,
                 layer_id: authority.layer_id,
+                owner_root: authority.owner_root,
+                mutation_intent_hash,
                 expected_revision: authority.base_revision,
                 expected_generation: authority.config_generation,
                 staged_default: self.original_config.active_model.clone(),
@@ -7357,6 +7596,45 @@ fn providers_config_from_view(
         active_model: view.active_model.clone(),
         resolution_generation: 0,
     }
+}
+
+fn provider_view_matches_mutation(
+    view: &cockpit_core::daemon::proto::ProviderConfigView,
+    upserts: &[(String, ProviderEntry)],
+    deletes: &[String],
+    metadata: Option<&cockpit_proto::ProviderLayerMetadataPatch>,
+) -> bool {
+    if deletes
+        .iter()
+        .any(|provider_id| view.providers.contains_key(provider_id))
+    {
+        return false;
+    }
+    for (provider_id, expected) in upserts {
+        let Some(observed) = view.providers.get(provider_id) else {
+            return false;
+        };
+        let mut expected_entry = expected.clone();
+        expected_entry.url = cockpit_proto::redact_url_for_owner_view(&expected_entry.url);
+        expected_entry.credential_ref = None;
+        expected_entry.headers.clear();
+        if serde_json::to_value(&expected_entry).ok() != serde_json::to_value(&observed.entry).ok()
+            || observed.headers.len() != expected.headers.len()
+            || !observed
+                .headers
+                .iter()
+                .zip(&expected.headers)
+                .all(|(actual, wanted)| {
+                    actual.redacted && actual.name.eq_ignore_ascii_case(&wanted.name)
+                })
+        {
+            return false;
+        }
+    }
+    metadata.is_none_or(|metadata| {
+        view.category_defaults == metadata.category_defaults
+            && view.on_unlisted_models_fetch == Some(metadata.on_unlisted_models_fetch)
+    })
 }
 
 #[cfg(test)]

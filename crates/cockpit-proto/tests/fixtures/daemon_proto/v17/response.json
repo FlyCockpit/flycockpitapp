@@ -105,6 +105,7 @@
       },
       "config_generation": 1,
       "layer_id": "provider-layer-fixture",
+      "owner_root": "/tmp/project",
       "snapshot_session_id": "provider-snapshot-fixture"
     },
     "response": "provider_catalog_snapshot"
@@ -139,6 +140,8 @@
       "config_generation": 2,
       "consumed_revision": "provider-revision-fixture",
       "layer_id": "provider-layer-fixture",
+      "mutation_intent_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "owner_root": "/tmp/project",
       "publication": "published",
       "result_revision": "provider-result-fixture",
       "snapshot_session_id": "provider-snapshot-fixture",
@@ -2552,7 +2555,10 @@
     "response": "local_operation_settlement",
     "data": {
       "client_operation_id": "11111111-1111-4111-8111-111111111111",
+      "operation_kind": "put_provider_credential",
       "pending": false,
+      "request_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "terminal_cancelled": false,
       "response": {
         "response": "provider_credential_committed",
         "data": {

@@ -426,6 +426,7 @@ pub enum Response {
         config: ProviderConfigView,
         snapshot_session_id: String,
         layer_id: String,
+        owner_root: String,
         base_revision: String,
         config_generation: u64,
     },
@@ -444,6 +445,8 @@ pub enum Response {
         client_operation_id: String,
         snapshot_session_id: String,
         layer_id: String,
+        owner_root: String,
+        mutation_intent_hash: String,
         consumed_revision: String,
         result_revision: String,
         config_generation: u64,
@@ -472,9 +475,21 @@ pub enum Response {
     /// `response` is present only after the durable terminal receipt commits.
     LocalOperationSettlement {
         client_operation_id: String,
+        /// Daemon-recorded domain; prevents a reused operation id from being
+        /// accepted as settlement for a different mutation.
+        operation_kind: String,
+        /// Lowercase SHA-256 of the exact request identity recorded at begin.
+        request_hash: String,
         pending: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response: Option<Box<Response>>,
+        /// Authoritative terminal rejection. Transport errors never populate
+        /// this field and therefore cannot be confused with a committed reject.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_error: Option<crate::ErrorPayload>,
+        /// True only for a durably recorded terminal cancellation.
+        #[serde(default)]
+        terminal_cancelled: bool,
     },
     CopilotAuthCommitted {
         client_operation_id: String,

@@ -18,10 +18,16 @@ pub enum LocalOperationBegin {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalOperationSettlement {
-    Pending,
-    TerminalSuccess(String),
-    TerminalError(String),
-    TerminalCancelled(String),
+    Pending(LocalOperationIdentity),
+    TerminalSuccess(LocalOperationIdentity, String),
+    TerminalError(LocalOperationIdentity, String),
+    TerminalCancelled(LocalOperationIdentity, String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalOperationIdentity {
+    pub operation_kind: String,
+    pub request_hash: Vec<u8>,
 }
 
 impl Db {
@@ -31,16 +37,19 @@ impl Db {
         client_operation_id: String,
     ) -> Result<Option<LocalOperationSettlement>> {
         self.read(move |conn| {
-            let result: Option<(String, Option<String>)> = conn.query_row(
-                "SELECT state,terminal_outcome_json FROM local_operation_receipts WHERE owner_digest=?1 AND client_operation_id=?2",
+            let result: Option<(String, Vec<u8>, String, Option<String>)> = conn.query_row(
+                "SELECT operation_kind,request_hash,state,terminal_outcome_json FROM local_operation_receipts WHERE owner_digest=?1 AND client_operation_id=?2",
                 params![owner_digest, client_operation_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             ).optional()?;
-            Ok(result.map(|(state, outcome)| match (state.as_str(), outcome) {
-                ("terminal_success", Some(json)) => LocalOperationSettlement::TerminalSuccess(json),
-                ("terminal_error", Some(json)) => LocalOperationSettlement::TerminalError(json),
-                ("terminal_cancelled", Some(json)) => LocalOperationSettlement::TerminalCancelled(json),
-                _ => LocalOperationSettlement::Pending,
+            Ok(result.map(|(operation_kind, request_hash, state, outcome)| {
+                let identity = LocalOperationIdentity { operation_kind, request_hash };
+                match (state.as_str(), outcome) {
+                ("terminal_success", Some(json)) => LocalOperationSettlement::TerminalSuccess(identity, json),
+                ("terminal_error", Some(json)) => LocalOperationSettlement::TerminalError(identity, json),
+                ("terminal_cancelled", Some(json)) => LocalOperationSettlement::TerminalCancelled(identity, json),
+                _ => LocalOperationSettlement::Pending(identity),
+                }
             }))
         }).await
     }

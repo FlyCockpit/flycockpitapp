@@ -24,6 +24,23 @@ where
     Ok(value)
 }
 
+fn deserialize_lower_hex_sha256<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(serde::de::Error::custom(
+            "value must be a 64-character lowercase SHA-256 digest",
+        ));
+    }
+    Ok(value)
+}
+
 fn deserialize_bounded_string<'de, const MAX: usize, D>(
     deserializer: D,
 ) -> std::result::Result<String, D::Error>
@@ -1602,6 +1619,9 @@ pub enum Request {
         expected_revision: String,
         #[serde(deserialize_with = "deserialize_owner_identifier")]
         client_operation_id: String,
+        /// Non-secret digest of the exact staged provider mutation intent.
+        #[serde(deserialize_with = "deserialize_lower_hex_sha256")]
+        mutation_intent_hash: String,
         mutation: crate::ProviderMutationBatch,
     },
 
@@ -3017,6 +3037,7 @@ impl Request {
                 layer_id,
                 expected_revision,
                 client_operation_id,
+                mutation_intent_hash: _,
                 mutation,
             } => {
                 for (label, value) in [
@@ -3579,7 +3600,7 @@ macro_rules! command {
             #[cfg(feature = "remote")]
             (Request::GetFlycockpitAccount, "get_flycockpit_account", owner_only, none, false, read_only, none, serialized, none, "-", []);
             (Request::GetProviderCatalogSnapshot { project_root, provider_id, snapshot_session_id }, "get_provider_catalog_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|provider_id:Option<String>|snapshot_session_id:String", [project_root: String => project_root, provider_id: Option<String> => param, snapshot_session_id: String => param]);
-            (Request::ApplyProviderMutation { snapshot_session_id, layer_id, expected_revision, client_operation_id, mutation }, "apply_provider_mutation", owner_only, none, true, local_only, none, serialized, none, "snapshot_session_id:String|layer_id:String|expected_revision:String|client_operation_id:String|mutation:crate::ProviderMutationBatch", [snapshot_session_id: String => param, layer_id: String => param, expected_revision: String => param, client_operation_id: String => param, mutation: crate::ProviderMutationBatch => param]);
+            (Request::ApplyProviderMutation { snapshot_session_id, layer_id, expected_revision, client_operation_id, mutation_intent_hash, mutation }, "apply_provider_mutation", owner_only, none, true, local_only, none, serialized, none, "snapshot_session_id:String|layer_id:String|expected_revision:String|client_operation_id:String|mutation_intent_hash:String|mutation:crate::ProviderMutationBatch", [snapshot_session_id: String => param, layer_id: String => param, expected_revision: String => param, client_operation_id: String => param, mutation_intent_hash: String => param, mutation: crate::ProviderMutationBatch => param]);
             (Request::FetchProviderModels { project_root, provider_id, model_id, deep, on_unlisted, allow_fallback }, "fetch_provider_models", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:Option<String>|model_id:Option<String>|deep:bool|on_unlisted:Option<cockpit_config::config::providers::OnUnlistedModelsFetch>|allow_fallback:bool", [project_root: String => project_root, provider_id: Option<String> => param, model_id: Option<String> => param, deep: bool => param, on_unlisted: Option<cockpit_config::config::providers::OnUnlistedModelsFetch> => param, allow_fallback: bool => param]);
             (Request::GetProviderUsageSnapshot { project_root, provider_id }, "get_provider_usage_snapshot", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String|provider_id:Option<String>", [project_root: String => project_root, provider_id: Option<String> => param]);
             (Request::UpsertProviderConfig { project_root, provider_id, entry }, "upsert_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param]);

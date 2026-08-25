@@ -14910,6 +14910,7 @@ async fn save_mcp_config(
         .count();
     let terminal_response = Response::McpConfigCommitted {
         client_operation_id: client_operation_id.to_owned(),
+        request_hash: crate::intel::hex_lower(&request_hash),
         project_root: requested_project_root,
         owner_root: project_root.to_owned(),
         config_path: path.to_string_lossy().into_owned(),

@@ -336,6 +336,12 @@ impl SettingsCx {
             .or_else(|| self.config_path.parent().map(std::path::Path::to_path_buf))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let config_json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
+        let prior_json = serde_json::to_string(&self.config).map_err(|e| e.to_string())?;
+        use sha2::{Digest as _, Sha256};
+        let expected_consumed_revision =
+            super::hex_lower_for_authority(Sha256::digest(prior_json.as_bytes()).as_slice());
+        let expected_result_revision =
+            super::hex_lower_for_authority(Sha256::digest(config_json.as_bytes()).as_slice());
         let secret_values_json = serde_json::to_string(secret_values).map_err(|e| e.to_string())?;
         let cleanup_names_json = serde_json::to_string(cleanup_names).map_err(|e| e.to_string())?;
         let owner = project_root.display().to_string();
@@ -357,6 +363,10 @@ impl SettingsCx {
                 config: cfg.clone(),
                 client_operation_id,
                 project_root: owner,
+                expected_owner_root: super::canonical_project_root(&project_root),
+                expected_config_path: self.config_path.to_string_lossy().into_owned(),
+                expected_consumed_revision,
+                expected_result_revision,
             },
         );
         self.extended_warnings = vec!["saving MCP settings…".into()];

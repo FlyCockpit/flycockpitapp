@@ -110,6 +110,10 @@ fn local_receipt_request_hash<T: serde::Serialize>(request: &T) -> Result<String
         .collect())
 }
 
+fn hex_lower_for_authority(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn canonical_project_root(project_root: &std::path::Path) -> String {
     // Launch/session project roots are daemon-resolved before entering the
     // settings surface. Preserve that authority identity without performing
@@ -1074,6 +1078,10 @@ enum SettingsMutationAction {
         config: cockpit_core::mcp::config::McpConfig,
         client_operation_id: String,
         project_root: String,
+        expected_owner_root: String,
+        expected_config_path: String,
+        expected_consumed_revision: String,
+        expected_result_revision: String,
     },
     McpOAuthBegin {
         server: String,
@@ -1205,14 +1213,33 @@ impl SettingsMutationAction {
                 Self::McpSave {
                     client_operation_id,
                     project_root,
+                    expected_owner_root,
+                    expected_config_path,
+                    expected_consumed_revision,
+                    expected_result_revision,
                     ..
                 },
                 Response::McpConfigCommitted {
                     client_operation_id: returned_id,
+                    request_hash,
                     project_root: returned_root,
+                    owner_root,
+                    config_path,
+                    consumed_revision,
+                    result_revision,
+                    config_generation,
                     ..
                 },
-            ) => returned_id == client_operation_id && returned_root == project_root,
+            ) => {
+                returned_id == client_operation_id
+                    && returned_root == project_root
+                    && owner_root == expected_owner_root
+                    && config_path == expected_config_path
+                    && consumed_revision == expected_consumed_revision
+                    && result_revision == expected_result_revision
+                    && cockpit_proto::is_opaque_authority_token(request_hash)
+                    && *config_generation > 0
+            }
             (
                 Self::ProviderCredentialDelete {
                     provider_id,
@@ -3230,22 +3257,30 @@ impl SettingsCx {
                             config,
                             client_operation_id,
                             project_root,
+                            expected_owner_root,
+                            expected_config_path,
+                            expected_consumed_revision,
+                            expected_result_revision,
                         },
                         Ok(Response::McpConfigCommitted {
                             client_operation_id: returned_operation_id,
+                            request_hash,
                             project_root: returned_root,
                             owner_root,
                             config_path,
                             consumed_revision,
                             result_revision,
+                            config_generation,
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
                         && returned_root == project_root
-                        && !owner_root.trim().is_empty()
-                        && !config_path.trim().is_empty()
-                        && cockpit_proto::is_opaque_authority_token(&consumed_revision)
-                        && cockpit_proto::is_opaque_authority_token(&result_revision) =>
+                        && owner_root == expected_owner_root
+                        && config_path == expected_config_path
+                        && consumed_revision == expected_consumed_revision
+                        && result_revision == expected_result_revision
+                        && cockpit_proto::is_opaque_authority_token(&request_hash)
+                        && config_generation > 0 =>
                     {
                         self.mcp_config = config;
                         self.invalidate_secret_inventory();

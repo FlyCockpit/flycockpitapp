@@ -6872,6 +6872,7 @@ mod tests {
             },
             Response::McpConfigCommitted {
                 client_operation_id: "save-mcp".into(),
+                request_hash: "22".repeat(32),
                 project_root: "/workspace".into(),
                 owner_root: "/workspace".into(),
                 config_path: "/workspace/.cockpit/mcp.json".into(),

@@ -406,6 +406,10 @@ pub enum Response {
     /// intentionally omitted; clients refresh their redacted view/inventory.
     McpConfigCommitted {
         client_operation_id: String,
+        /// Daemon-keyed digest binding the terminal receipt to the exact
+        /// request body. Older archived fixtures predate this field.
+        #[serde(default)]
+        request_hash: String,
         project_root: String,
         owner_root: String,
         config_path: String,

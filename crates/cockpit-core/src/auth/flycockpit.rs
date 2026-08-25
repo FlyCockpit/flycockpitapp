@@ -18,7 +18,10 @@ pub use flycockpit_test_helpers::*;
 
 pub use crate::daemon::proto::{AccountInfo, RelayChoice, StoredFlycockpitCredential};
 
-pub const CREDENTIAL_KEY: &str = "flycockpit";
+/// Reserved provider-credential key; sourced from the always-available
+/// `crate::auth::FLYCOCKPIT_CREDENTIAL_KEY` so the reservation stays in sync
+/// with the ungated semantic check.
+pub const CREDENTIAL_KEY: &str = crate::auth::FLYCOCKPIT_CREDENTIAL_KEY;
 pub const CLIENT_ID: &str = "cockpit-cli";
 pub const DEVICE_SCOPE: &str = "account:instance";
 pub const DEFAULT_SERVER_URL: &str = "https://app.flycockpit.dev";

@@ -253,6 +253,7 @@ impl ClientPrincipal {
         self.is_owner() || self.has_scope(PrincipalScope::Terminal)
     }
 
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     pub fn has_project_scope(&self, scope: PrincipalScope, project_root: &str) -> bool {
         match self {
             Self::Owner => true,
@@ -270,6 +271,7 @@ impl ClientPrincipal {
         }
     }
 
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
     fn has_scope(&self, scope: PrincipalScope) -> bool {
         match self {
             Self::Owner => true,
@@ -285,6 +287,7 @@ impl ClientPrincipal {
 }
 
 impl PrincipalGrant {
+    #[cfg(feature = "remote")]
     fn matches_project(&self, project_root: &str) -> bool {
         match self.project_root.as_deref() {
             // An `ImageGenerationAdmin` grant NEVER inherits the rootless
@@ -320,6 +323,7 @@ fn local_principal_name() -> String {
     }
 }
 
+#[cfg(feature = "remote")]
 fn roots_equal(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -327,6 +331,7 @@ fn roots_equal(a: &str, b: &str) -> bool {
     canonical_if_exists(a) == canonical_if_exists(b)
 }
 
+#[cfg(feature = "remote")]
 fn canonical_if_exists(path: &str) -> PathBuf {
     Path::new(path)
         .canonicalize()
@@ -538,7 +543,7 @@ mod tests {
             rows.len() > 80,
             "command table should enumerate Request rows"
         );
-        let expected = std::collections::BTreeSet::from([
+        let mut expected = std::collections::BTreeSet::from([
             "agent_installation_inspect",
             "agent_installation_list",
             "daemon_status",
@@ -584,14 +589,14 @@ mod tests {
             "subagent_transcript",
             "terminal_ingress_status",
             "list_packages",
-            "get_connector_state",
-            "get_org_sync_status",
             "list_failed_tool_calls",
             "get_session_compactions",
             "get_assistant",
             "diagnose_media_reservation",
             "get_doctor_snapshot",
         ]);
+        #[cfg(feature = "remote")]
+        expected.extend(["get_connector_state", "get_org_sync_status"]);
         let actual: std::collections::BTreeSet<_> = rows
             .iter()
             .filter_map(|(kind, ordering)| {

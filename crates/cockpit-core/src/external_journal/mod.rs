@@ -578,6 +578,7 @@ impl ExternalJournal {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[cfg(feature = "remote")]
     pub(crate) async fn drain_remote_rename_artifact_cleanup(
         &self,
     ) -> Result<usize, ExternalJournalError> {
@@ -668,7 +669,10 @@ impl ExternalJournal {
 
         let journal = Self::new(db, spool, keys);
         let report = journal.recover(now_wall_ms).await?;
-        journal.drain_remote_rename_artifact_cleanup().await?;
+        #[cfg(feature = "remote")]
+        {
+            journal.drain_remote_rename_artifact_cleanup().await?;
+        }
         // Bounded housekeeping: session deletion writes a tombstone every time,
         // including ephemeral sweeps, so it needs a retention policy.
         journal

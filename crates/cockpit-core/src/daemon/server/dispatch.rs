@@ -1,6 +1,8 @@
 use super::attachments::*;
 use super::authz::*;
-use super::run_invocation::{principal_digest, wall_ms_now};
+use super::run_invocation::principal_digest;
+#[cfg(feature = "remote")]
+use super::run_invocation::wall_ms_now;
 use super::sessions::*;
 #[cfg(feature = "remote")]
 use super::sessions_remote::{self, RemoteSessionLedger};
@@ -322,23 +324,29 @@ mod oauth_store_tests {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "remote")]
 struct PinMutationRejected(String);
 
+#[cfg(feature = "remote")]
 impl std::fmt::Display for PinMutationRejected {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
     }
 }
 
+#[cfg(feature = "remote")]
 impl std::error::Error for PinMutationRejected {}
 
 #[derive(Debug)]
+#[cfg(feature = "remote")]
 struct GoalMutationRejected(String);
+#[cfg(feature = "remote")]
 impl std::fmt::Display for GoalMutationRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
+#[cfg(feature = "remote")]
 impl std::error::Error for GoalMutationRejected {}
 
 fn app_flag_db_key(key: proto::AppFlagKey) -> &'static str {
@@ -440,6 +448,7 @@ pub(super) struct OversizedTextArtifactAdmissionRequest<'a> {
     pub remote_operation: Option<&'a super::RemoteOperationContext>,
 }
 
+#[cfg_attr(not(feature = "remote"), allow(unused_variables))]
 pub(super) fn oversized_text_artifact_admission(
     ctx: &DaemonContext,
     handle: &crate::daemon::session_worker::SessionWorkerHandle,
@@ -9921,7 +9930,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
                 Some("provider id must not be empty")
             } else if provider_id.contains('\0') {
                 Some("provider id contains NUL")
-            } else if provider_id == crate::auth::flycockpit::CREDENTIAL_KEY
+            } else if provider_id == crate::auth::FLYCOCKPIT_CREDENTIAL_KEY
                 || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
             {
                 Some("provider id is reserved")
@@ -9936,7 +9945,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
                 Some("provider id must not be empty")
             } else if provider_id.contains('\0') {
                 Some("provider id contains NUL")
-            } else if provider_id == crate::auth::flycockpit::CREDENTIAL_KEY
+            } else if provider_id == crate::auth::FLYCOCKPIT_CREDENTIAL_KEY
                 || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
             {
                 Some("provider id is reserved")

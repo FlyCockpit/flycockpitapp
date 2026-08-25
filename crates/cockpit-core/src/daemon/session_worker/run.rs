@@ -638,6 +638,7 @@ fn text_artifact_terminal_error(
 /// because a later, independent in-memory/remote admission gate declined the
 /// message. The exact lease composition below owns the receipt, reservation,
 /// and any bound run invocation together.
+#[cfg(feature = "remote")]
 fn remote_send_rejection_reason(
     error: &proto::ErrorPayload,
 ) -> crate::db::db::text_artifacts::TextArtifactRejectReason {

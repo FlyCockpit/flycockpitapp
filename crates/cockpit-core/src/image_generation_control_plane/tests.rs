@@ -11,7 +11,10 @@
 //! - `image_generation_admin_grant_resolution`: active authority key and lifecycle
 
 use super::*;
-use crate::daemon::principal::{ClientPrincipal, PrincipalGrant, PrincipalScope};
+use crate::daemon::principal::PrincipalScope;
+#[cfg(feature = "remote")]
+use crate::daemon::principal::{ClientPrincipal, PrincipalGrant};
+#[cfg(feature = "remote")]
 use crate::daemon::relay_envelope::RelayGrantScope;
 use cockpit_proto::capability_ceiling::{
     RemoteAttachmentCapabilityV1, RemoteProjectCapabilityV1, permission_ceiling_digest,
@@ -21,6 +24,7 @@ use cockpit_proto::capability_ceiling::{
 // Helper: build a remote principal
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "remote")]
 fn remote_principal(scope: RelayGrantScope, project_root: Option<String>) -> ClientPrincipal {
     // After the standalone relay cutover, `ClientPrincipal::from_relay` is
     // gone. The daemon constructs remote principals only from
@@ -65,6 +69,7 @@ mod authz {
         }
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn remote_legacy_grants_never_authorize_mutation() {
         // A remote principal with any legacy scope can never authorize a
@@ -84,6 +89,7 @@ mod authz {
         }
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn remote_principal_without_admin_grant_cannot_mutate() {
         let principal =
@@ -91,6 +97,7 @@ mod authz {
         assert!(!legacy_grants_can_authorize_mutation(&principal));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn remote_principal_with_rootless_grant_cannot_mutate() {
         // The rootless wildcard never applies for image admin.
@@ -261,6 +268,7 @@ mod authz {
 mod old_behavior_rejection {
     use super::*;
 
+    #[cfg(feature = "remote")]
     #[test]
     fn legacy_remote_principal_grants_cannot_authorize_mutation() {
         for scope in [
@@ -375,6 +383,7 @@ mod old_behavior_rejection {
         ));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn generic_attached_writer_cannot_authorize_config_mutation() {
         // A generic attached session writer (Agent scope) cannot authorize
@@ -383,6 +392,7 @@ mod old_behavior_rejection {
         assert!(!legacy_grants_can_authorize_mutation(&writer));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn client_supplied_project_path_is_not_authoritative() {
         // The server derives principal, scope, project root from the
@@ -392,6 +402,7 @@ mod old_behavior_rejection {
         assert!(!legacy_grants_can_authorize_mutation(&principal));
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn instance_wide_grant_still_matches_any_project_for_non_image_scopes() {
         // Preserve the still-correct instance_wide_grant_matches_any_project

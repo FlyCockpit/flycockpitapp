@@ -11827,7 +11827,7 @@ async fn handle_serialized_request_impl(
                 )?;
                 Ok(response)
             };
-            terminalize_local_operation(
+            terminalize_provider_local_operation(
                 ctx,
                 settlement_owner.clone(),
                 client_operation_id.clone(),
@@ -14454,17 +14454,57 @@ async fn apply_provider_mutation(
     }
     .await;
     if let Err(error) = &result {
-        finish_local_operation_error(
+        let journal_exists = provider_operation_journal_exists(
             ctx,
-            capability_owner,
-            client_operation_id,
-            request_hash,
+            &capability_owner,
+            &client_operation_id,
+            &request_hash,
             fencing_generation,
-            error,
         )
         .await?;
+        if !journal_exists {
+            finish_local_operation_error(
+                ctx,
+                capability_owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                error,
+            )
+            .await?;
+        }
     }
     result
+}
+
+async fn provider_operation_journal_exists(
+    ctx: &DaemonContext,
+    owner: &str,
+    client_operation_id: &str,
+    request_hash: &[u8; 32],
+    fencing_generation: i64,
+) -> std::result::Result<bool, ErrorPayload> {
+    let owner = owner.to_owned();
+    let client_operation_id = client_operation_id.to_owned();
+    let request_hash = *request_hash;
+    ctx.db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_config_journals
+                  WHERE owner_digest=?1 AND client_operation_id=?2
+                    AND request_hash=?3 AND fencing_generation=?4)",
+                rusqlite::params![
+                    owner,
+                    client_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation
+                ],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .map_err(internal)
 }
 
 fn local_operation_request_hash<T: serde::Serialize>(
@@ -15128,6 +15168,85 @@ where
                 &error,
             )
             .await?;
+            Err(error)
+        }
+    }
+}
+
+/// Terminalize a provider mutation unless its authenticated publication
+/// journal still owns the outcome. A retained journal means the file may have
+/// committed and only exact three-way recovery may settle the receipt; turning
+/// that state into a terminal error would falsely authorize a retry.
+async fn terminalize_provider_local_operation<F>(
+    ctx: &DaemonContext,
+    owner: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    operation: F,
+) -> std::result::Result<Response, ErrorPayload>
+where
+    F: std::future::Future<Output = std::result::Result<Response, ErrorPayload>>,
+{
+    match operation.await {
+        Ok(response) => {
+            let response_operation_id = client_operation_id_from_response(&response)?;
+            if response_operation_id != client_operation_id {
+                let error = internal(anyhow::anyhow!(
+                    "provider operation produced a receipt for a different operation"
+                ));
+                if !provider_operation_journal_exists(
+                    ctx,
+                    &owner,
+                    &client_operation_id,
+                    &request_hash,
+                    fencing_generation,
+                )
+                .await?
+                {
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                }
+                return Err(error);
+            }
+            finish_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
+            Ok(response)
+        }
+        Err(error) => {
+            if !provider_operation_journal_exists(
+                ctx,
+                &owner,
+                &client_operation_id,
+                &request_hash,
+                fencing_generation,
+            )
+            .await?
+            {
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+            }
             Err(error)
         }
     }
@@ -16524,7 +16643,7 @@ async fn setup_copilot_auth(
     ctx: &DaemonContext,
     project_root: &str,
     provider_id: &str,
-    env: std::collections::HashMap<String, String>,
+    mut env: std::collections::HashMap<String, String>,
     is_local_owner: bool,
     journal_binding: CopilotJournalBinding,
 ) -> std::result::Result<Response, ErrorPayload> {
@@ -16542,15 +16661,16 @@ async fn setup_copilot_auth(
             "adopting the daemon host's ambient GitHub token is local-only; a remote owner must authenticate the provider through the explicit OAuth flow",
         ));
     }
-    let token = ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+    let mut token = zeroize::Zeroizing::new(
+        ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
         .into_iter()
-        .find_map(|name| env.get(name).filter(|value| !value.trim().is_empty()))
-        .cloned()
+        .find_map(|name| env.remove(name).filter(|value| !value.trim().is_empty()))
         .ok_or_else(|| {
             bad_request(
                 "Copilot authentication is unavailable in the daemon environment; set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN for the daemon",
             )
-        })?;
+        })?,
+    );
     let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
     let mut entry = config
         .providers
@@ -16572,7 +16692,9 @@ async fn setup_copilot_auth(
         header_secrets.push(None);
         entry.headers.len() - 1
     };
-    header_secrets[index] = Some(cockpit_proto::ProviderSecretValue::new(token));
+    header_secrets[index] = Some(cockpit_proto::ProviderSecretValue::new(std::mem::take(
+        &mut *token,
+    )));
     let owner = journal_binding.owner_digest.clone();
     let operation_id = journal_binding.client_operation_id.clone();
     provider_config_save_under_lock(
@@ -16689,6 +16811,33 @@ mod provider_atomic_authority_tests {
             .expect("provider batch recovery source");
         assert!(recovery.contains("ConfigDoc::load(&path)"));
         assert!(recovery.contains("doc.write(&payload.config)"));
+        assert!(recovery.contains("hold_config_mutation_lock(&path)"));
+        assert!(recovery.contains("actual_revision == intended_revision"));
+        assert!(recovery.contains("actual_revision == consumed_revision"));
+        assert!(recovery.contains("refusing to overwrite newer configuration"));
+    }
+
+    #[test]
+    fn provider_journal_errors_remain_unsettled_until_exact_recovery() {
+        let source = include_str!("dispatch.rs");
+        let apply = source
+            .split("async fn apply_provider_mutation")
+            .nth(1)
+            .and_then(|tail| tail.split("fn local_operation_request_hash").next())
+            .expect("provider mutation coordinator source");
+        assert!(apply.contains("provider_operation_journal_exists("));
+        assert!(apply.contains("if !journal_exists"));
+
+        let copilot_terminalizer = source
+            .split("async fn terminalize_provider_local_operation")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("async fn commit_local_provider_credential")
+                    .next()
+            })
+            .expect("provider journal terminalizer source");
+        assert!(copilot_terminalizer.contains("provider_operation_journal_exists("));
+        assert!(copilot_terminalizer.contains("finish_local_operation_error("));
     }
 
     #[test]
@@ -17454,6 +17603,7 @@ fn retain_only_stale_provider_credentials(
 pub(super) async fn recover_all_provider_config_journals(
     ctx: &DaemonContext,
 ) -> std::result::Result<(), ErrorPayload> {
+    let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     let roots: Vec<String> = ctx
         .db
         .read(|conn| {
@@ -17470,7 +17620,17 @@ pub(super) async fn recover_all_provider_config_journals(
         .await
         .map_err(internal)?;
     for root in roots {
-        recover_provider_config_journals(ctx, &root, None).await?;
+        if let Err(error) = recover_provider_config_journals(ctx, &root, None).await {
+            if error.code == ErrorCode::Conflict {
+                tracing::error!(
+                    project_root = %root,
+                    "provider journal retained with settlement unknown: {}",
+                    error.message
+                );
+                continue;
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }

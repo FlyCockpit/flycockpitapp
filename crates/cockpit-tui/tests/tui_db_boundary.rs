@@ -366,20 +366,28 @@ fn tui_sources() -> String {
 
 #[test]
 fn production_uses_cockpit_proto_directly() {
+    fn normalize_ident(ident: impl AsRef<str>) -> String {
+        ident
+            .as_ref()
+            .strip_prefix("r#")
+            .unwrap_or(ident.as_ref())
+            .to_string()
+    }
+
     fn use_paths(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<String>) {
         match tree {
             syn::UseTree::Path(path) => {
-                prefix.push(path.ident.to_string());
+                prefix.push(normalize_ident(path.ident.to_string()));
                 use_paths(&path.tree, prefix, out);
                 prefix.pop();
             }
             syn::UseTree::Name(name) => {
-                prefix.push(name.ident.to_string());
+                prefix.push(normalize_ident(name.ident.to_string()));
                 out.push(prefix.join("::"));
                 prefix.pop();
             }
             syn::UseTree::Rename(rename) => {
-                prefix.push(rename.ident.to_string());
+                prefix.push(normalize_ident(rename.ident.to_string()));
                 out.push(prefix.join("::"));
                 prefix.pop();
             }
@@ -417,7 +425,8 @@ fn production_uses_cockpit_proto_directly() {
             let compact = source
                 .chars()
                 .filter(|ch| !ch.is_whitespace())
-                .collect::<String>();
+                .collect::<String>()
+                .replace("r#", "");
             if compact.contains("cockpit_core::daemon::proto") {
                 findings.push(format!(
                     "{}: qualified cockpit-core protocol re-export",
@@ -451,6 +460,8 @@ fn production_uses_cockpit_proto_directly() {
     }
 
     let mut findings = Vec::new();
+    assert_eq!(normalize_ident("r#daemon"), "daemon");
+    assert_eq!(normalize_ident("r#proto"), "proto");
     visit(&repo_root().join("crates/cockpit-tui/src"), &mut findings);
     assert!(
         findings.is_empty(),

@@ -262,7 +262,10 @@ impl std::fmt::Debug for SettingsDaemonEffectWork {
 }
 
 pub(crate) struct ProviderMutationPlan {
-    project_root: String,
+    snapshot_session_id: String,
+    layer_id: String,
+    expected_revision: String,
+    client_operation_id: String,
     saves: Vec<ProviderSavePlan>,
     deletes: Vec<(String, bool)>,
     metadata: Option<(
@@ -280,7 +283,10 @@ pub(crate) struct ProviderSavePlan {
 impl std::fmt::Debug for ProviderMutationPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderMutationPlan")
-            .field("project_root", &self.project_root)
+            .field("snapshot_session_id", &self.snapshot_session_id)
+            .field("layer_id", &self.layer_id)
+            .field("expected_revision", &self.expected_revision)
+            .field("client_operation_id", &self.client_operation_id)
             .field("save_count", &self.saves.len())
             .field("deletes", &self.deletes)
             .field("metadata", &self.metadata)
@@ -380,68 +386,58 @@ pub(crate) async fn execute_settings_daemon_work(
             committed_refresh_needed: None,
         }),
         SettingsDaemonEffectWork::ProviderMutation(plan) => {
-            let mut final_response = None;
-            for save in plan.saves {
-                let header_secrets = save
-                    .header_secrets
+            let mutation = cockpit_proto::ProviderMutationBatch {
+                upserts: plan
+                    .saves
                     .into_iter()
-                    .map(|secret| secret.map(|mut value| std::mem::take(&mut *value)))
-                    .collect();
-                let response = client
-                    .request(Request::SaveProviderConfig {
-                        project_root: plan.project_root.clone(),
+                    .map(|save| cockpit_proto::ProviderMutationUpsert {
                         provider_id: save.provider_id,
                         entry: save.entry,
-                        header_secrets,
+                        header_secrets: save
+                            .header_secrets
+                            .into_iter()
+                            .map(|secret| {
+                                secret.map(|mut value| {
+                                    cockpit_proto::ProviderSecretValue::new(std::mem::take(
+                                        &mut *value,
+                                    ))
+                                })
+                            })
+                            .collect(),
                     })
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .map_err(|error| error.to_string())?;
-                if !matches!(response, Response::ProviderConfigUpserted { .. }) {
-                    return Err(format!(
-                        "unexpected daemon provider-save response: {response:?}"
-                    ));
-                }
-                final_response = Some(response);
-            }
-            for (provider_id, delete_stored_secrets) in plan.deletes {
-                let response = client
-                    .request(Request::DeleteProviderConfig {
-                        project_root: plan.project_root.clone(),
-                        provider_id,
-                        delete_stored_secrets,
+                    .collect(),
+                deletes: plan
+                    .deletes
+                    .into_iter()
+                    .map(|(provider_id, delete_stored_secrets)| {
+                        cockpit_proto::ProviderMutationDelete {
+                            provider_id,
+                            delete_stored_secrets,
+                        }
                     })
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .map_err(|error| error.to_string())?;
-                if !matches!(response, Response::ProviderConfigUpserted { .. }) {
-                    return Err(format!(
-                        "unexpected daemon provider-delete response: {response:?}"
-                    ));
-                }
-                final_response = Some(response);
-            }
-            if let Some((category_defaults, on_unlisted_models_fetch)) = plan.metadata {
-                let response = client
-                    .request(Request::SetProviderLayerMetadata {
-                        project_root: plan.project_root,
-                        category_defaults_json: serde_json::to_string(&category_defaults)
-                            .map_err(|error| error.to_string())?,
-                        on_unlisted_models_fetch,
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .map_err(|error| error.to_string())?;
-                if !matches!(response, Response::ProviderConfigUpserted { .. }) {
-                    return Err(format!(
-                        "unexpected daemon provider-metadata response: {response:?}"
-                    ));
-                }
-                final_response = Some(response);
-            }
+                    .collect(),
+                metadata: plan
+                    .metadata
+                    .map(|(category_defaults, on_unlisted_models_fetch)| {
+                        cockpit_proto::ProviderLayerMetadataPatch {
+                            category_defaults,
+                            on_unlisted_models_fetch,
+                        }
+                    }),
+            };
+            let response = client
+                .request(Request::ApplyProviderMutation {
+                    snapshot_session_id: plan.snapshot_session_id,
+                    layer_id: plan.layer_id,
+                    expected_revision: plan.expected_revision,
+                    client_operation_id: plan.client_operation_id,
+                    mutation,
+                })
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
             Ok(SettingsDaemonWorkOutcome {
-                response: final_response
-                    .ok_or_else(|| "provider mutation contained no changes".to_string()),
+                response: Ok(response),
                 committed_refresh_needed: None,
             })
         }
@@ -839,6 +835,7 @@ enum PendingSettingsOperation {
     ProviderCatalog {
         project_root: String,
         provider_id: Option<String>,
+        snapshot_session_id: String,
         navigation: Option<ProviderNavigation>,
     },
     ProjectShadowSnapshot {
@@ -847,6 +844,11 @@ enum PendingSettingsOperation {
     },
     ProviderMutation {
         target: SettingsEffectTarget,
+        client_operation_id: String,
+        snapshot_session_id: String,
+        layer_id: String,
+        expected_revision: String,
+        expected_generation: u64,
         staged_default: Option<cockpit_config::config::providers::ActiveModelRef>,
         notice: Option<String>,
     },
@@ -895,6 +897,7 @@ impl PendingSettingsOperation {
             Self::ProviderCatalog {
                 project_root,
                 provider_id,
+                snapshot_session_id,
                 ..
             } => SettingsEffectTarget {
                 surface: "settings.provider-catalog",
@@ -903,7 +906,7 @@ impl PendingSettingsOperation {
                     project_root,
                     provider_id.as_deref().unwrap_or("*")
                 ),
-                revision: None,
+                revision: Some(snapshot_session_id.clone()),
             },
         };
         expected == *actual
@@ -2000,6 +2003,8 @@ pub struct SettingsCx {
     /// altered, or unselected removals before merging selected typed fields
     /// into the authoritative raw document.
     original_config: ProvidersConfig,
+    provider_edit_authority: Option<ProviderEditAuthority>,
+    latest_provider_snapshot_session_id: Option<String>,
     /// Cached secret-free cockpit-only settings projection. Read by the UI and
     /// Tools pages; mutations are committed only by the daemon.
     pub(super) extended: ExtendedConfig,
@@ -2076,6 +2081,14 @@ pub struct SettingsCx {
     pub(super) secret_store_migrate_calls: usize,
     pub(super) dependency_refresh_calls: usize,
     pub(super) dependency_refresh: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[derive(Clone)]
+struct ProviderEditAuthority {
+    snapshot_session_id: String,
+    layer_id: String,
+    base_revision: String,
+    config_generation: u64,
 }
 
 impl SettingsCx {
@@ -2278,15 +2291,18 @@ impl SettingsCx {
             project_root,
             provider_id.as_deref().unwrap_or("*")
         );
+        let snapshot_session_id = uuid::Uuid::new_v4().to_string();
+        self.latest_provider_snapshot_session_id = Some(snapshot_session_id.clone());
         let operation_id = self.enqueue_daemon_effect(
             SettingsEffectTarget {
                 surface: "settings.provider-catalog",
                 owner,
-                revision: None,
+                revision: Some(snapshot_session_id.clone()),
             },
             Request::GetProviderCatalogSnapshot {
                 project_root: project_root.clone(),
                 provider_id: provider_id.clone(),
+                snapshot_session_id: snapshot_session_id.clone(),
             },
         );
         self.pending_settings.insert(
@@ -2294,6 +2310,7 @@ impl SettingsCx {
             PendingSettingsOperation::ProviderCatalog {
                 project_root,
                 provider_id,
+                snapshot_session_id,
                 navigation,
             },
         );
@@ -2449,6 +2466,11 @@ impl SettingsCx {
             }
             PendingSettingsOperation::ProviderMutation {
                 target,
+                client_operation_id,
+                snapshot_session_id,
+                layer_id,
+                expected_revision,
+                expected_generation,
                 staged_default,
                 notice,
             } => {
@@ -2456,13 +2478,43 @@ impl SettingsCx {
                     return Ok(());
                 }
                 match completion.response {
-                    Ok(Response::ProviderConfigUpserted { config }) => {
+                    Ok(Response::ProviderMutationCommitted {
+                        client_operation_id: returned_operation_id,
+                        snapshot_session_id: returned_session_id,
+                        layer_id: returned_layer_id,
+                        consumed_revision,
+                        result_revision,
+                        config_generation,
+                        config,
+                        status: cockpit_proto::ConfigCommitStatus::Committed,
+                        publication,
+                    }) if returned_operation_id == client_operation_id
+                        && returned_session_id == snapshot_session_id
+                        && returned_layer_id == layer_id
+                        && consumed_revision == expected_revision
+                        && config_generation == expected_generation.saturating_add(1)
+                        && self.latest_provider_snapshot_session_id.as_deref()
+                            == Some(returned_session_id.as_str()) =>
+                    {
                         let mut authoritative = providers_config_from_view(&config);
+                        authoritative.set_resolution_generation(config_generation);
                         authoritative.active_model = staged_default;
                         self.config = authoritative.clone();
                         self.original_config = authoritative;
+                        self.provider_edit_authority = Some(ProviderEditAuthority {
+                            snapshot_session_id: returned_session_id,
+                            layer_id: returned_layer_id,
+                            base_revision: result_revision,
+                            config_generation,
+                        });
                         self.last_secret_notice = notice;
-                        self.extended_warnings = vec!["provider settings committed".into()];
+                        self.extended_warnings = vec![if publication
+                            == cockpit_proto::ConfigPublicationStatus::Published
+                        {
+                            "provider settings committed".into()
+                        } else {
+                            "provider settings committed, but publication is degraded; reload before editing again".into()
+                        }];
                         self.completed_provider_mutation = Some(Ok(()));
                         self.completed_provider_mutation_navigation =
                             self.pending_provider_mutation_navigation.take();
@@ -2510,6 +2562,7 @@ impl SettingsCx {
             PendingSettingsOperation::ProviderCatalog {
                 project_root,
                 provider_id,
+                snapshot_session_id,
                 navigation,
             } => {
                 let expected = SettingsEffectTarget {
@@ -2519,16 +2572,32 @@ impl SettingsCx {
                         project_root,
                         provider_id.as_deref().unwrap_or("*")
                     ),
-                    revision: None,
+                    revision: Some(snapshot_session_id.clone()),
                 };
                 if completion.target != expected {
                     return Ok(());
                 }
                 match completion.response {
-                    Ok(Response::ProviderCatalogSnapshot { config }) => {
-                        let parsed = providers_config_from_view(&config);
+                    Ok(Response::ProviderCatalogSnapshot {
+                        config,
+                        snapshot_session_id: returned_session_id,
+                        layer_id,
+                        base_revision,
+                        config_generation,
+                    }) if returned_session_id == snapshot_session_id
+                        && self.latest_provider_snapshot_session_id.as_deref()
+                            == Some(returned_session_id.as_str()) =>
+                    {
+                        let mut parsed = providers_config_from_view(&config);
+                        parsed.set_resolution_generation(config_generation);
                         self.config = parsed.clone();
                         self.original_config = parsed;
+                        self.provider_edit_authority = Some(ProviderEditAuthority {
+                            snapshot_session_id,
+                            layer_id,
+                            base_revision,
+                            config_generation,
+                        });
                         if let Some(navigation) = navigation {
                             self.completed_provider_navigation =
                                 Some((navigation, self.config.clone()));
@@ -4731,6 +4800,8 @@ impl SettingsDialog {
                 pointer_surface: SettingsPointerSurface::default(),
                 original_config: config.clone(),
                 config,
+                provider_edit_authority: None,
+                latest_provider_snapshot_session_id: None,
                 extended,
                 extended_base,
                 extended_revision,
@@ -5985,57 +6056,58 @@ impl SettingsCx {
     /// can refresh its authoritative snapshot atomically with the mutation.
     fn upsert_provider_config_via_daemon(
         &mut self,
-        config: &ProvidersConfig,
+        config: &mut ProvidersConfig,
         notice: Option<String>,
     ) -> Result<(), String> {
-        let project_root = self
-            .active_project_root
-            .as_deref()
-            .or(self.picker_cwd.as_deref())
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| "provider save requires a project context".to_string())?;
+        if self
+            .pending_settings
+            .values()
+            .any(|pending| matches!(pending, PendingSettingsOperation::ProviderMutation { .. }))
+        {
+            return Err("a provider settings save is already pending".into());
+        }
+        let authority = self.provider_edit_authority.clone().ok_or_else(|| {
+            "provider snapshot has no edit capability; reload before saving".to_string()
+        })?;
         // `config` is the dialog's effective view in some launch paths. Send
         // only the user's edit intent: unchanged inherited providers must not
         // be re-upserted into the defining layer and shadow the global entry.
         let saves = config
             .providers
-            .iter()
-            .filter(|(provider_id, entry)| {
+            .iter_mut()
+            .filter_map(|(provider_id, entry)| {
+                let changed =
                 self.original_config
                     .providers
-                    .get(*provider_id)
-                    .is_none_or(|original| !provider_entries_equal(original, entry))
-            })
-            .map(|(provider_id, entry)| {
+                    .get(provider_id)
+                    .is_none_or(|original| !provider_entries_equal(original, entry));
+                if !changed {
+                    return None;
+                }
                 let header_secrets = entry
                     .headers
-                    .iter()
+                    .iter_mut()
                     .map(|header| {
                         let value = header.value.trim();
-                        (!value.is_empty()
+                        let is_secret = !value.is_empty()
                             && !value.starts_with('$')
                             && !cockpit_config::config::providers::is_safe_provider_header_reference(
                                 &header.name.to_ascii_lowercase(),
                                 value,
                             )
-                            && !secret_display::is_mask_value(value))
-                        .then(|| zeroize::Zeroizing::new(header.value.clone()))
+                            && !secret_display::is_mask_value(value);
+                        is_secret.then(|| {
+                            zeroize::Zeroizing::new(std::mem::take(&mut header.value))
+                        })
                     })
-                    .collect();
-                let mut queued_entry = entry.clone();
-                for (header, secret) in queued_entry.headers.iter_mut().zip(&header_secrets) {
-                    if secret.is_some() {
-                        // The plaintext has a single owner in `header_secrets`.
-                        // The daemon replaces this placeholder before publish.
-                        header.value.clear();
-                    }
-                }
-                ProviderSavePlan {
+                    .collect::<Vec<_>>();
+                Some(ProviderSavePlan {
                     provider_id: provider_id.clone(),
-                    entry: queued_entry,
+                    // Every staged plaintext was moved, not cloned, before
+                    // this reference-only projection was cloned.
+                    entry: entry.clone(),
                     header_secrets,
-                }
+                })
             })
             .collect::<Vec<_>>();
         let deletes = self
@@ -6054,16 +6126,17 @@ impl SettingsCx {
         if saves.is_empty() && deletes.is_empty() && !metadata_changed {
             return Ok(());
         }
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
         let target = SettingsEffectTarget {
             surface: "settings.provider-mutation",
-            owner: project_root.display().to_string(),
-            revision: Some(format!(
-                "generation:{}",
-                self.original_config.resolution_generation
-            )),
+            owner: authority.layer_id.clone(),
+            revision: Some(authority.base_revision.clone()),
         };
         let plan = ProviderMutationPlan {
-            project_root: project_root.display().to_string(),
+            snapshot_session_id: authority.snapshot_session_id.clone(),
+            layer_id: authority.layer_id.clone(),
+            expected_revision: authority.base_revision.clone(),
+            client_operation_id: client_operation_id.clone(),
             saves,
             deletes,
             metadata: metadata_changed.then_some((category_defaults, on_unlisted_models_fetch)),
@@ -6076,6 +6149,11 @@ impl SettingsCx {
             operation_id,
             PendingSettingsOperation::ProviderMutation {
                 target,
+                client_operation_id,
+                snapshot_session_id: authority.snapshot_session_id,
+                layer_id: authority.layer_id,
+                expected_revision: authority.base_revision,
+                expected_generation: authority.config_generation,
                 staged_default: self.original_config.active_model.clone(),
                 notice,
             },
@@ -6089,25 +6167,29 @@ impl SettingsCx {
         provider_id: String,
         delete_stored_secrets: bool,
     ) -> Result<(), String> {
-        let project_root = self
-            .active_project_root
-            .as_deref()
-            .or(self.picker_cwd.as_deref())
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| "provider delete requires a project context".to_string())?;
+        if self
+            .pending_settings
+            .values()
+            .any(|pending| matches!(pending, PendingSettingsOperation::ProviderMutation { .. }))
+        {
+            return Err("a provider settings save is already pending".into());
+        }
+        let authority = self.provider_edit_authority.clone().ok_or_else(|| {
+            "provider snapshot has no edit capability; reload before deleting".to_string()
+        })?;
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
         let target = SettingsEffectTarget {
             surface: "settings.provider-delete",
-            owner: provider_id.clone(),
-            revision: Some(format!(
-                "generation:{}",
-                self.original_config.resolution_generation
-            )),
+            owner: authority.layer_id.clone(),
+            revision: Some(authority.base_revision.clone()),
         };
         let operation_id = self.enqueue_daemon_work(
             target.clone(),
             SettingsDaemonEffectWork::ProviderMutation(ProviderMutationPlan {
-                project_root: project_root.display().to_string(),
+                snapshot_session_id: authority.snapshot_session_id.clone(),
+                layer_id: authority.layer_id.clone(),
+                expected_revision: authority.base_revision.clone(),
+                client_operation_id: client_operation_id.clone(),
                 saves: Vec::new(),
                 deletes: vec![(provider_id, delete_stored_secrets)],
                 metadata: None,
@@ -6117,6 +6199,11 @@ impl SettingsCx {
             operation_id,
             PendingSettingsOperation::ProviderMutation {
                 target,
+                client_operation_id,
+                snapshot_session_id: authority.snapshot_session_id,
+                layer_id: authority.layer_id,
+                expected_revision: authority.base_revision,
+                expected_generation: authority.config_generation,
                 staged_default: self.original_config.active_model.clone(),
                 notice: None,
             },
@@ -6131,7 +6218,25 @@ impl SettingsCx {
         // the daemon's authoritative effective-default operation, and the
         // dialog only shows the new value once that verified result arrives.
         self.stage_default_model_change();
-        self.upsert_provider_config_via_daemon(&merged, notice.map(|notice| notice.render()))
+        let result = self
+            .upsert_provider_config_via_daemon(&mut merged, notice.map(|notice| notice.render()));
+        // Once queued, leave no second plaintext owner in the live dialog.
+        for entry in self.config.providers.values_mut() {
+            for header in &mut entry.headers {
+                let value = header.value.trim();
+                if !value.is_empty()
+                    && !value.starts_with('$')
+                    && !secret_display::is_mask_value(value)
+                    && !cockpit_config::config::providers::is_safe_provider_header_reference(
+                        &header.name.to_ascii_lowercase(),
+                        value,
+                    )
+                {
+                    header.value = "********".into();
+                }
+            }
+        }
+        result
     }
 
     fn delete_provider_and_stored_secrets(
@@ -6231,8 +6336,9 @@ fn daemon_provider_view_snapshot_inner(
     match settings_daemon_request(Request::GetProviderCatalogSnapshot {
         project_root,
         provider_id,
+        snapshot_session_id: uuid::Uuid::new_v4().to_string(),
     }) {
-        Ok(Response::ProviderCatalogSnapshot { config }) => Some(config),
+        Ok(Response::ProviderCatalogSnapshot { config, .. }) => Some(config),
         Ok(other) => {
             tracing::warn!(response = ?other, "unexpected daemon provider snapshot response");
             None

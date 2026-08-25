@@ -75,6 +75,23 @@ const FLYCOCKPIT_REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// cleanup. They share the named-secret vault namespace.
 static CONFIG_PUBLICATION_RPC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[derive(Clone)]
+struct ProviderEditCapability {
+    owner: String,
+    project_root: String,
+    target_path: std::path::PathBuf,
+    layer_id: String,
+    revision: String,
+    config_generation: u64,
+    expires_at: Instant,
+}
+
+static PROVIDER_EDIT_CAPABILITIES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, ProviderEditCapability>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const PROVIDER_EDIT_CAPABILITY_TTL: Duration = Duration::from_secs(30 * 60);
+const PROVIDER_EDIT_CAPABILITY_CAPACITY: usize = 128;
+
 struct McpOAuthPending {
     project_root: String,
     server: String,
@@ -7753,7 +7770,41 @@ async fn handle_serialized_request_impl(
         Request::GetProviderCatalogSnapshot {
             project_root,
             provider_id,
-        } => provider_catalog_snapshot(ctx, &project_root, provider_id.as_deref()).await,
+            snapshot_session_id,
+        } => {
+            provider_catalog_snapshot(
+                ctx,
+                &project_root,
+                provider_id.as_deref(),
+                &snapshot_session_id,
+                settings_capability_owner(state),
+            )
+            .await
+        }
+
+        Request::ApplyProviderMutation {
+            snapshot_session_id,
+            layer_id,
+            expected_revision,
+            client_operation_id,
+            mutation,
+        } => {
+            if ctx.paths.ephemeral {
+                return Err(bad_request(
+                    "ephemeral daemons do not accept provider config writes",
+                ));
+            }
+            apply_provider_mutation(
+                ctx,
+                snapshot_session_id,
+                layer_id,
+                expected_revision,
+                client_operation_id,
+                mutation,
+                settings_capability_owner(state),
+            )
+            .await
+        }
 
         Request::FetchProviderModels {
             project_root,
@@ -9906,7 +9957,17 @@ async fn handle_concurrent_request_impl(
         Request::GetProviderCatalogSnapshot {
             project_root,
             provider_id,
-        } => provider_catalog_snapshot(&ctx, &project_root, provider_id.as_deref()).await,
+            snapshot_session_id,
+        } => {
+            provider_catalog_snapshot(
+                &ctx,
+                &project_root,
+                provider_id.as_deref(),
+                &snapshot_session_id,
+                shared.capability_owner.clone(),
+            )
+            .await
+        }
         Request::ListPackages => list_packages_response(&ctx).await,
         #[cfg(feature = "remote")]
         Request::GetConnectorState => get_connector_state_response(&ctx).await,
@@ -10229,10 +10290,17 @@ async fn provider_catalog_snapshot(
     ctx: &DaemonContext,
     project_root: &str,
     provider_id: Option<&str>,
+    snapshot_session_id: &str,
+    capability_owner: String,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (cwd, trust_policy, mut config) = daemon_provider_config(ctx, project_root).await?;
+    // The CAS covers the complete effective provider projection even when the
+    // caller asks to render only one row. A sibling provider edit therefore
+    // invalidates this capability instead of being overwritten by a partial
+    // snapshot save.
+    let revision = provider_config_revision(&config)?;
     if let Some(provider_id) = provider_id {
         let Some(entry) = config.providers.remove(provider_id) else {
             return Err(bad_request(format!(
@@ -10242,10 +10310,480 @@ async fn provider_catalog_snapshot(
         config.providers.clear();
         config.providers.insert(provider_id.to_string(), entry);
     }
+    let config_generation = inventory::current_config_generation();
+    let canonical_root = crate::secret_ownership::canonical_owner_root(project_root);
+    let target_path =
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            ctx.config_source()
+                .config_write_target_for_provider(&cwd, "default")
+        })
+        .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+    let layer_material = format!(
+        "provider-layer\0{canonical_root}\0{}\0{snapshot_session_id}",
+        target_path.display()
+    );
+    let layer_id =
+        crate::intel::hex_lower(&<Sha256 as sha2::Digest>::digest(layer_material.as_bytes()));
+    {
+        let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+            .lock()
+            .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
+        let now = Instant::now();
+        capabilities.retain(|_, capability| capability.expires_at > now);
+        if capabilities.len() >= PROVIDER_EDIT_CAPABILITY_CAPACITY
+            && !capabilities.contains_key(snapshot_session_id)
+        {
+            return Err(bad_request(
+                "provider edit capability capacity reached; retry after an edit expires",
+            ));
+        }
+        capabilities.insert(
+            snapshot_session_id.to_string(),
+            ProviderEditCapability {
+                owner: capability_owner,
+                project_root: canonical_root,
+                target_path,
+                layer_id: layer_id.clone(),
+                revision: revision.clone(),
+                config_generation,
+                expires_at: now + PROVIDER_EDIT_CAPABILITY_TTL,
+            },
+        );
+    }
     let mut view = crate::secret_ref::redact_provider_view(&config);
     view.mcp_config_json = Some(redacted_mcp_config_json(ctx, &cwd, &trust_policy)?);
     view.extended_config_json = Some(redacted_extended_config_json(ctx, &cwd, &trust_policy)?);
-    bounded_provider_response(Response::ProviderCatalogSnapshot { config: view })
+    bounded_provider_response(Response::ProviderCatalogSnapshot {
+        config: view,
+        snapshot_session_id: snapshot_session_id.to_string(),
+        layer_id,
+        base_revision: revision,
+        config_generation,
+    })
+}
+
+fn provider_config_revision(
+    config: &crate::config::providers::ProvidersConfig,
+) -> std::result::Result<String, ErrorPayload> {
+    let bytes = serde_json::to_vec(config).map_err(internal)?;
+    Ok(crate::intel::hex_lower(&<Sha256 as sha2::Digest>::digest(
+        &bytes,
+    )))
+}
+
+async fn apply_provider_mutation(
+    ctx: &DaemonContext,
+    snapshot_session_id: String,
+    layer_id: String,
+    expected_revision: String,
+    client_operation_id: String,
+    mutation: cockpit_proto::ProviderMutationBatch,
+    capability_owner: String,
+) -> std::result::Result<Response, ErrorPayload> {
+    let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    let capability = {
+        let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+            .lock()
+            .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
+        let now = Instant::now();
+        capabilities.retain(|_, capability| capability.expires_at > now);
+        capabilities
+            .get(&snapshot_session_id)
+            .cloned()
+            .ok_or_else(|| bad_request("provider edit capability is absent or expired"))?
+    };
+    let (_, _, current) = daemon_provider_config(ctx, &capability.project_root).await?;
+    let observed_revision = provider_config_revision(&current)?;
+    validate_provider_edit_capability(
+        &capability,
+        &capability_owner,
+        &layer_id,
+        &expected_revision,
+        inventory::current_config_generation(),
+        &observed_revision,
+    )?;
+
+    // Validate the entire intent before the first durable side effect. This is
+    // also defense in depth for typed in-process callers that bypass decoding.
+    let mut ids = std::collections::BTreeSet::new();
+    for upsert in &mutation.upserts {
+        if !ids.insert(upsert.provider_id.as_str()) {
+            return Err(bad_request("provider mutation contains duplicate ids"));
+        }
+        validate_daemon_provider_url(&upsert.entry.url)?;
+        validate_unique_provider_header_names(&upsert.entry.headers)?;
+        if upsert.header_secrets.len() != upsert.entry.headers.len() {
+            return Err(bad_request(
+                "provider header secret count does not match headers",
+            ));
+        }
+    }
+    for delete in &mutation.deletes {
+        if !ids.insert(delete.provider_id.as_str()) {
+            return Err(bad_request("provider mutation contains duplicate ids"));
+        }
+    }
+
+    stage_and_recover_provider_batch(
+        ctx,
+        &capability.project_root,
+        &capability.target_path,
+        mutation,
+    )
+    .await?;
+
+    let (_, _, committed) = daemon_provider_config(ctx, &capability.project_root).await?;
+    let result_revision = provider_config_revision(&committed)?;
+    let config_generation = inventory::publish_committed_config_generation();
+    {
+        let mut capabilities = PROVIDER_EDIT_CAPABILITIES
+            .lock()
+            .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
+        capabilities.insert(
+            snapshot_session_id.clone(),
+            ProviderEditCapability {
+                owner: capability.owner,
+                project_root: capability.project_root,
+                target_path: capability.target_path,
+                layer_id: layer_id.clone(),
+                revision: result_revision.clone(),
+                config_generation,
+                expires_at: Instant::now() + PROVIDER_EDIT_CAPABILITY_TTL,
+            },
+        );
+    }
+    Ok(Response::ProviderMutationCommitted {
+        client_operation_id,
+        snapshot_session_id,
+        layer_id,
+        consumed_revision: expected_revision,
+        result_revision,
+        config_generation,
+        config: crate::secret_ref::redact_provider_view(&committed),
+        status: cockpit_proto::ConfigCommitStatus::Committed,
+        publication: cockpit_proto::ConfigPublicationStatus::Published,
+    })
+}
+
+fn validate_provider_edit_capability(
+    capability: &ProviderEditCapability,
+    owner: &str,
+    layer_id: &str,
+    expected_revision: &str,
+    current_generation: u64,
+    observed_revision: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    if capability.layer_id != layer_id || capability.revision != expected_revision {
+        return Err(bad_request(
+            "provider edit capability does not match the submitted base revision",
+        ));
+    }
+    if capability.owner != owner {
+        return Err(bad_request(
+            "provider edit capability belongs to another authenticated owner",
+        ));
+    }
+    if current_generation != capability.config_generation {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "configuration generation changed; reload before saving".into(),
+        });
+    }
+    if observed_revision != expected_revision {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "provider configuration changed; reload before saving".into(),
+        });
+    }
+    Ok(())
+}
+
+async fn stage_and_recover_provider_batch(
+    ctx: &DaemonContext,
+    project_root: &str,
+    capability_target: &std::path::Path,
+    mutation: cockpit_proto::ProviderMutationBatch,
+) -> std::result::Result<(), ErrorPayload> {
+    recover_provider_config_journals(ctx, project_root, None).await?;
+    let (cwd, trust_policy, effective) = daemon_provider_config(ctx, project_root).await?;
+    let target = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        ctx.config_source()
+            .config_write_target_for_provider(&cwd, "default")
+    })
+    .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+    if target != capability_target {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "provider authority layer changed; reload before saving".into(),
+        });
+    }
+    for provider_id in mutation
+        .upserts
+        .iter()
+        .map(|upsert| upsert.provider_id.as_str())
+        .chain(
+            mutation
+                .deletes
+                .iter()
+                .map(|delete| delete.provider_id.as_str()),
+        )
+    {
+        let provider_target =
+            crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+                ctx.config_source()
+                    .config_write_target_for_provider(&cwd, provider_id)
+            })
+            .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+        if provider_target != target {
+            return Err(bad_request(
+                "provider batch spans multiple authority layers; reload the defining layer",
+            ));
+        }
+    }
+    let doc = crate::config::providers::ConfigDoc::load(&target).map_err(internal)?;
+    let mut desired = doc.providers();
+    let mut staged: Vec<(String, zeroize::Zeroizing<String>)> = Vec::new();
+    let mut static_refs = std::collections::BTreeSet::new();
+    let mut cleanup_named = std::collections::BTreeSet::new();
+    let mut cleanup_credentials =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    let mut credential_claims = Vec::<(String, String)>::new();
+    let batch_id = Uuid::now_v7().to_string();
+
+    for mut upsert in mutation.upserts {
+        let prior = desired
+            .providers
+            .get(&upsert.provider_id)
+            .or_else(|| effective.providers.get(&upsert.provider_id));
+        if let Some(prior) = prior {
+            let refs = provider_owned_secret_references(prior);
+            cleanup_named.extend(refs.0);
+            cleanup_credentials
+                .entry(upsert.provider_id.clone())
+                .or_default()
+                .extend(refs.1);
+            for (index, header) in upsert.entry.headers.iter_mut().enumerate() {
+                if header.value.trim() == "********"
+                    && let Some(old_header) = prior
+                        .headers
+                        .iter()
+                        .find(|candidate| candidate.name.eq_ignore_ascii_case(&header.name))
+                {
+                    header.value.clone_from(&old_header.value);
+                }
+                if upsert.header_secrets[index].is_none()
+                    && !header.value.trim().is_empty()
+                    && !crate::config::providers::is_safe_provider_header_reference(
+                        &header.name.to_ascii_lowercase(),
+                        &header.value,
+                    )
+                {
+                    return Err(bad_request(
+                        "a redacted provider header could not be restored authoritatively",
+                    ));
+                }
+            }
+        }
+        for (index, (header, secret)) in upsert
+            .entry
+            .headers
+            .iter_mut()
+            .zip(upsert.header_secrets)
+            .enumerate()
+        {
+            if let Some(secret) = secret {
+                let slug = upsert
+                    .provider_id
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphanumeric())
+                    .take(48)
+                    .collect::<String>();
+                let name = format!("provider-{slug}-{batch_id}-{index}");
+                header.value = format!("$secret:{name}");
+                staged.push((name, secret.into_zeroizing()));
+            }
+        }
+        validate_daemon_provider_url(&upsert.entry.url)?;
+        validate_unique_provider_header_names(&upsert.entry.headers)?;
+        ensure_provider_credential_reference_available(ctx, &upsert.entry).await?;
+        let staged_names = staged
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        static_refs.extend(
+            provider_owned_secret_references(&upsert.entry)
+                .0
+                .into_iter()
+                .filter(|name| !staged_names.contains(name.as_str())),
+        );
+        if let Some(reference) = &upsert.entry.credential_ref {
+            credential_claims.push((upsert.provider_id.clone(), reference.clone()));
+        }
+        desired.providers.insert(upsert.provider_id, upsert.entry);
+    }
+    for delete in mutation.deletes {
+        if let Some(prior) = desired.providers.remove(&delete.provider_id)
+            && delete.delete_stored_secrets
+        {
+            let refs = provider_owned_secret_references(&prior);
+            cleanup_named.extend(refs.0);
+            cleanup_credentials
+                .entry(delete.provider_id)
+                .or_default()
+                .extend(refs.1);
+        }
+    }
+    if let Some(metadata) = mutation.metadata {
+        desired.category_defaults = metadata.category_defaults;
+        desired.on_unlisted_models_fetch = Some(metadata.on_unlisted_models_fetch);
+    }
+
+    let journal_id = format!("provider-batch-{batch_id}");
+    let payload = ProviderBatchJournalPayload {
+        config_path: target.to_string_lossy().into_owned(),
+        config: desired,
+        cleanup_credentials,
+    };
+    let payload_json = serde_json::to_string(&payload).map_err(internal)?;
+    let cleanup_named_json = serde_json::to_string(&cleanup_named).map_err(internal)?;
+    let project_root_owned = project_root.to_string();
+    let vault = ctx.secret_vault.clone();
+    let journal_id_for_tx = journal_id.clone();
+    let staged_names = staged
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let credential_claims_for_compensation = credential_claims.clone();
+    ctx.db
+        .transaction(move |conn| {
+            for reference in &static_refs {
+                ensure_static_named_reference_owned_on_conn(
+                    conn,
+                    &vault,
+                    reference,
+                    "provider",
+                    &project_root_owned,
+                )?;
+            }
+            for (name, secret) in &staged {
+                reject_conflicting_named_ownership_on_conn(
+                    conn,
+                    name,
+                    "provider",
+                    &project_root_owned,
+                )?;
+                vault.put_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                    name,
+                    secret.as_bytes(),
+                )?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO secret_named_ownership
+                     (item_id, owner_kind, project_root, created_at)
+                     VALUES (?1, 'provider', ?2, ?3)",
+                    rusqlite::params![
+                        name,
+                        project_root_owned,
+                        chrono::Utc::now().timestamp_millis()
+                    ],
+                )?;
+            }
+            for (provider_id, reference) in &credential_claims {
+                conn.execute(
+                    "INSERT OR IGNORE INTO secret_credential_ownership
+                     (item_id, provider_id, project_root, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        reference,
+                        provider_id,
+                        project_root_owned,
+                        chrono::Utc::now().timestamp_millis()
+                    ],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO provider_config_journals
+                 (journal_id, project_root, provider_id, action, entry_json,
+                  cleanup_named_json, cleanup_credential_json, created_at)
+                 VALUES (?1, ?2, '__provider_batch__', 'batch', ?3, ?4, '[]', ?5)",
+                rusqlite::params![
+                    journal_id_for_tx,
+                    project_root_owned,
+                    payload_json,
+                    cleanup_named_json,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(map_named_secret_tx_error)?;
+    if let Err(error) = ctx.publish_owner_redaction_table() {
+        let compensation = compensate_provider_batch_staging(
+            ctx,
+            &journal_id,
+            &staged_names,
+            &credential_claims_for_compensation,
+        )
+        .await;
+        ctx.poison_redaction_publication(&error);
+        return match compensation {
+            Ok(()) => Err(internal(error)),
+            Err(compensation_error) => Err(internal(anyhow::anyhow!(
+                "provider redaction publication failed: {error}; staging compensation failed: {}",
+                compensation_error.message
+            ))),
+        };
+    }
+    // The single durable batch intent is visible before any file changes.
+    // Recovery writes the complete desired layer and retires cleanup only
+    // after every provider file and metadata field converges.
+    recover_provider_config_journals(ctx, project_root, None).await
+}
+
+async fn compensate_provider_batch_staging(
+    ctx: &DaemonContext,
+    journal_id: &str,
+    staged_names: &[String],
+    credential_claims: &[(String, String)],
+) -> std::result::Result<(), ErrorPayload> {
+    let journal_id = journal_id.to_string();
+    let staged_names = staged_names.to_vec();
+    let credential_claims = credential_claims.to_vec();
+    let vault = ctx.secret_vault.clone();
+    ctx.db
+        .transaction(move |conn| {
+            for name in &staged_names {
+                vault.delete_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                    name,
+                )?;
+                conn.execute(
+                    "DELETE FROM secret_named_ownership
+                     WHERE item_id = ?1 AND owner_kind = 'provider'
+                       AND project_root = (SELECT project_root FROM provider_config_journals WHERE journal_id = ?2)",
+                    rusqlite::params![name, journal_id],
+                )?;
+            }
+            for (provider_id, reference) in &credential_claims {
+                conn.execute(
+                    "DELETE FROM secret_credential_ownership
+                     WHERE item_id = ?1 AND provider_id = ?2
+                       AND project_root = (SELECT project_root FROM provider_config_journals WHERE journal_id = ?3)
+                       AND created_at >= (SELECT created_at FROM provider_config_journals WHERE journal_id = ?3)",
+                    rusqlite::params![reference, provider_id, journal_id],
+                )?;
+            }
+            conn.execute(
+                "DELETE FROM provider_config_journals WHERE journal_id = ?1",
+                rusqlite::params![journal_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)
 }
 
 fn redacted_extended_config_json(
@@ -11017,6 +11555,78 @@ struct ProviderConfigJournal {
     cleanup_credential_json: String,
 }
 
+#[cfg(test)]
+mod provider_atomic_authority_tests {
+    use super::*;
+
+    fn capability() -> ProviderEditCapability {
+        ProviderEditCapability {
+            owner: "owner".into(),
+            project_root: "/project".into(),
+            target_path: "/project/.cockpit/config.json".into(),
+            layer_id: "layer".into(),
+            revision: "revision".into(),
+            config_generation: 7,
+            expires_at: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn provider_cas_rejects_stale_revision_and_concurrent_generation() {
+        let stale = validate_provider_edit_capability(
+            &capability(),
+            "owner",
+            "layer",
+            "revision",
+            7,
+            "other-revision",
+        )
+        .unwrap_err();
+        assert_eq!(stale.code, ErrorCode::Conflict);
+
+        let concurrent = validate_provider_edit_capability(
+            &capability(),
+            "owner",
+            "layer",
+            "revision",
+            8,
+            "revision",
+        )
+        .unwrap_err();
+        assert_eq!(concurrent.code, ErrorCode::Conflict);
+    }
+
+    #[test]
+    fn provider_batch_journal_is_the_only_prepublication_durable_intent() {
+        let source = include_str!("dispatch.rs");
+        let batch = source
+            .split("async fn stage_and_recover_provider_batch")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("async fn compensate_provider_batch_staging")
+                    .next()
+            })
+            .expect("provider batch coordinator source");
+        assert!(batch.contains("'__provider_batch__', 'batch'"));
+        assert!(batch.contains("recover_provider_config_journals(ctx, project_root, None)"));
+        assert!(batch.contains("publish_owner_redaction_table"));
+        assert!(!batch.contains("provider_config_save_under_lock("));
+        assert!(!batch.contains("provider_config_delete_under_lock("));
+    }
+
+    #[test]
+    fn provider_batch_recovery_preserves_unknown_document_keys() {
+        let source = include_str!("dispatch.rs");
+        let recovery = source
+            .split("\"batch\" =>")
+            .nth(1)
+            .and_then(|tail| tail.split("_ => return Err").next())
+            .expect("provider batch recovery source");
+        assert!(recovery.contains("ConfigDoc::load(&path)"));
+        assert!(recovery.contains("doc.write(&payload.config)"));
+    }
+}
+
 fn provider_owned_secret_references(
     entry: &crate::config::providers::ProviderEntry,
 ) -> (
@@ -11254,6 +11864,39 @@ pub(super) async fn recover_provider_config_journals(
                     doc.write(&layer).map_err(internal)?;
                 }
             }
+            "batch" => {
+                let payload: ProviderBatchJournalPayload = serde_json::from_str(
+                    journal
+                        .entry_json
+                        .as_deref()
+                        .ok_or_else(|| bad_request("provider batch journal is missing payload"))?,
+                )
+                .map_err(internal)?;
+                for (provider_id, entry) in &payload.config.providers {
+                    validate_daemon_provider_url(&entry.url)?;
+                    validate_unique_provider_header_names(&entry.headers)?;
+                    ensure_provider_named_references_claimed(ctx, project_root.as_str(), entry)
+                        .await?;
+                    ensure_provider_credential_reference_available(ctx, entry).await?;
+                    if provider_id.trim().is_empty() {
+                        return Err(bad_request("provider batch journal contains an empty id"));
+                    }
+                }
+                let path = std::path::PathBuf::from(&payload.config_path);
+                let expected_path =
+                    crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+                        ctx.config_source()
+                            .config_write_target_for_provider(&cwd, "default")
+                    })
+                    .ok_or_else(|| bad_request("no cockpit config found"))?;
+                if path != expected_path {
+                    return Err(bad_request(
+                        "provider batch journal target no longer matches its authority layer",
+                    ));
+                }
+                let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+                doc.write(&payload.config).map_err(internal)?;
+            }
             _ => return Err(bad_request("provider config journal has an invalid action")),
         }
         let (_, _, effective) = daemon_provider_config(ctx, project_root.as_str()).await?;
@@ -11303,6 +11946,33 @@ pub(super) async fn recover_provider_config_journals(
                 .map_err(internal)?;
             }
         }
+        if journal.action == "batch" {
+            let payload: ProviderBatchJournalPayload = serde_json::from_str(
+                journal
+                    .entry_json
+                    .as_deref()
+                    .ok_or_else(|| bad_request("provider batch journal is missing payload"))?,
+            )
+            .map_err(internal)?;
+            for (provider_id, references) in payload.cleanup_credentials {
+                for reference in references {
+                    let sole_claim =
+                        release_credential_ownership(ctx, &reference, &provider_id, &project_root)
+                            .await?;
+                    retire_credential_ownership(ctx, &reference, &provider_id, &project_root)
+                        .await?;
+                    if !live_credentials.contains(&reference) && sole_claim.is_none_or(|sole| sole)
+                    {
+                        ctx.mutate_owner_vault_item(
+                            cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                            &reference,
+                            None,
+                        )
+                        .map_err(internal)?;
+                    }
+                }
+            }
+        }
         let journal_id = journal.journal_id;
         ctx.db
             .write(move |conn| {
@@ -11316,6 +11986,14 @@ pub(super) async fn recover_provider_config_journals(
             .map_err(internal)?;
     }
     Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProviderBatchJournalPayload {
+    config_path: String,
+    config: crate::config::providers::ProvidersConfig,
+    #[serde(default)]
+    cleanup_credentials: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
 #[cfg(any(unix, test))]
@@ -11399,10 +12077,20 @@ async fn provider_config_save(
     ctx: &DaemonContext,
     project_root: &str,
     provider_id: &str,
+    entry: crate::config::providers::ProviderEntry,
+    header_secrets: Vec<Option<String>>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    provider_config_save_under_lock(ctx, project_root, provider_id, entry, header_secrets).await
+}
+
+async fn provider_config_save_under_lock(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: &str,
     mut entry: crate::config::providers::ProviderEntry,
     mut header_secrets: Vec<Option<String>>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     // Canonicalize the workspace root once, at this daemon boundary, so every
     // ownership claim, journal, recovery, and owner-scoped read below keys on the
     // same symlink-resolved form the authz layer and resolution paths use — a
@@ -12765,6 +13453,15 @@ async fn provider_config_delete(
     delete_stored_secrets: bool,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    provider_config_delete_under_lock(ctx, project_root, provider_id, delete_stored_secrets).await
+}
+
+async fn provider_config_delete_under_lock(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: &str,
+    delete_stored_secrets: bool,
+) -> std::result::Result<Response, ErrorPayload> {
     // Converge a matching prior intent before deciding that the provider is
     // absent; otherwise a crash between journal/file publication can turn a
     // requested no-op into a skipped cleanup.
@@ -12817,6 +13514,21 @@ async fn provider_layer_metadata_set(
     on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    provider_layer_metadata_set_under_lock(
+        ctx,
+        project_root,
+        category_defaults_json,
+        on_unlisted_models_fetch,
+    )
+    .await
+}
+
+async fn provider_layer_metadata_set_under_lock(
+    ctx: &DaemonContext,
+    project_root: &str,
+    category_defaults_json: String,
+    on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch,
+) -> std::result::Result<Response, ErrorPayload> {
     let category_defaults: std::collections::BTreeMap<
         String,
         crate::config::providers::ProviderModelRef,

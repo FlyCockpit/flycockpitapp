@@ -21,11 +21,12 @@ async fn daemon_catalog(
         .request(Request::GetProviderCatalogSnapshot {
             project_root: cwd.display().to_string(),
             provider_id,
+            snapshot_session_id: uuid::Uuid::new_v4().to_string(),
         })
         .await
         .context("requesting provider catalog from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected provider catalog request: {error}"))?;
-    let Response::ProviderCatalogSnapshot { config } = response else {
+    let Response::ProviderCatalogSnapshot { config, .. } = response else {
         anyhow::bail!(
             "daemon returned unexpected response to provider catalog request: {response:?}"
         );

@@ -376,6 +376,10 @@ pub enum Response {
     },
     ProviderCatalogSnapshot {
         config: ProviderConfigView,
+        snapshot_session_id: String,
+        layer_id: String,
+        base_revision: String,
+        config_generation: u64,
     },
     ProviderModelsFetched {
         results: Vec<ProviderModelFetchResult>,
@@ -386,6 +390,18 @@ pub enum Response {
     },
     ProviderConfigUpserted {
         config: ProviderConfigView,
+    },
+    /// Exact receipt for one atomic provider-layer CAS mutation.
+    ProviderMutationCommitted {
+        client_operation_id: String,
+        snapshot_session_id: String,
+        layer_id: String,
+        consumed_revision: String,
+        result_revision: String,
+        config_generation: u64,
+        config: ProviderConfigView,
+        status: crate::ConfigCommitStatus,
+        publication: crate::ConfigPublicationStatus,
     },
     /// Result of deleting a provider credential. `found` reports whether the
     /// authorized OAuth record existed; `deleted` reports the mutation.
@@ -1173,6 +1189,7 @@ macro_rules! response_variants {
             (Response::ProviderModelsFetched { .. }, "provider_models_fetched");
             (Response::ProviderUsageSnapshot { .. }, "provider_usage_snapshot");
             (Response::ProviderConfigUpserted { .. }, "provider_config_upserted");
+            (Response::ProviderMutationCommitted { .. }, "provider_mutation_committed");
             (Response::ProviderCredentialDeleted { .. }, "provider_credential_deleted");
             (Response::StartupDisclosures { .. }, "startup_disclosures");
             (Response::AppFlag { .. }, "app_flag");

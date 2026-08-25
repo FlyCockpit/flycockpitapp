@@ -56,10 +56,15 @@ pub use config_management::{
 pub mod bulk_transfer;
 pub mod host_capabilities;
 pub mod image_control;
+pub mod provider_management;
 pub use host_capabilities::{
     CatalogDependencyImportance, CatalogDependencyRow, CatalogDependencyState,
     CatalogExecutionTarget, FeatureCapabilityRow, FeatureCapabilityState, HostCapabilitySnapshot,
     SecretStoreIntent, SecretStorePlacement, SecretStoreSnapshot,
+};
+pub use provider_management::{
+    ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,
+    ProviderMutationUpsert, ProviderSecretValue,
 };
 #[cfg(feature = "remote")]
 pub mod remote_connection_metadata;
@@ -1024,12 +1029,12 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// workspace-agent, and assistant-definition authority RPCs, including
 /// occurrence-bound denylist edits with nonce-bound committed receipts.
 /// (`assistant_display_*`) the live chip/stream path and retires the v9/v10
-/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 14.
-pub const PROTOCOL_VERSION: u32 = 14;
+/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 15.
+pub const PROTOCOL_VERSION: u32 = 15;
 
-/// Oldest wire schema version this binary accepts. v14 is current-only: the
+/// Oldest wire schema version this binary accepts. v15 is current-only: the
 /// display-event breaking change has no v9/v10-compatible fallback.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 14;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 15;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -3497,8 +3502,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[14];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[15];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -6909,7 +6914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v14_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v15_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -6960,13 +6965,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 14);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 14);
+        assert_eq!(PROTOCOL_VERSION, 15);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 15);
         let fixture = proto_fixture_tests::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v14 config_refreshed fixture")
+                .expect("current v15 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -6981,20 +6986,20 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 14);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 14);
+        assert_eq!(PROTOCOL_VERSION, 15);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 15);
         let fixture = proto_fixture_tests::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v14 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v15 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v14 {response_name} must freeze the inclusive verification cap"
+                "current v15 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v14 {response_name} must deserialize: {error}")
+                panic!("current v15 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -7007,13 +7012,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v14 {response_name} assistant identity is invalid: {error}")
+                panic!("current v15 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v14 assistant inventory must carry bounded opaque revisions");
+            .expect("current v15 assistant inventory must carry bounded opaque revisions");
     }
 
     #[test]

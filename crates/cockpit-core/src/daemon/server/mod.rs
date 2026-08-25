@@ -619,6 +619,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::ProviderModelsFetched { .. }
         | proto::Response::ProviderUsageSnapshot { .. }
         | proto::Response::ProviderConfigUpserted { .. }
+        | proto::Response::ProviderMutationCommitted { .. }
         | proto::Response::ProviderCredentialDeleted { .. }
         | proto::Response::AppFlag { .. }
         | proto::Response::AppFlagSeen { .. } => {}

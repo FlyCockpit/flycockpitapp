@@ -52,7 +52,10 @@ fn queued_secret_payloads_have_redacted_debug_and_single_owners() {
         header_secrets: vec![Some(zeroize::Zeroizing::new(sentinel.to_string()))],
     };
     let plan = ProviderMutationPlan {
-        project_root: "/workspace".into(),
+        snapshot_session_id: "snapshot".into(),
+        layer_id: "layer".into(),
+        expected_revision: "revision".into(),
+        client_operation_id: "operation".into(),
         saves: vec![save],
         deletes: Vec::new(),
         metadata: None,
@@ -63,6 +66,39 @@ fn queued_secret_payloads_have_redacted_debug_and_single_owners() {
     let mcp = include_str!("mcp_page.rs");
     assert!(settings.contains("Vec<Option<zeroize::Zeroizing<String>>>"));
     assert!(mcp.contains("SecretPayload::new(secret_values_json)"));
+}
+
+#[test]
+fn provider_settings_use_one_exact_atomic_receipt_and_no_legacy_sequence() {
+    let settings = include_str!("mod.rs");
+    let executor = settings
+        .split("SettingsDaemonEffectWork::ProviderMutation(plan) =>")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("SettingsDaemonEffectWork::TypedDocumentEdit")
+                .next()
+        })
+        .expect("provider mutation executor");
+    assert_eq!(executor.matches(".request(").count(), 1);
+    assert!(executor.contains("Request::ApplyProviderMutation"));
+    assert!(!executor.contains("Request::SaveProviderConfig"));
+    assert!(!executor.contains("Request::DeleteProviderConfig"));
+    assert!(!executor.contains("Request::SetProviderLayerMetadata"));
+
+    let completion = settings
+        .split("Ok(Response::ProviderMutationCommitted")
+        .nth(1)
+        .expect("provider committed receipt handling");
+    for exact_field in [
+        "returned_operation_id == client_operation_id",
+        "returned_session_id == snapshot_session_id",
+        "returned_layer_id == layer_id",
+        "consumed_revision == expected_revision",
+        "config_generation == expected_generation.saturating_add(1)",
+    ] {
+        assert!(completion.contains(exact_field), "missing {exact_field}");
+    }
+    assert!(completion.contains("ConfigPublicationStatus::Published"));
 }
 
 #[test]

@@ -1528,6 +1528,23 @@ pub enum Request {
             deserialize_with = "deserialize_owner_optional_provider_id"
         )]
         provider_id: Option<String>,
+        /// Client nonce binding the returned opaque edit capability.
+        #[serde(deserialize_with = "deserialize_nonempty_string")]
+        snapshot_session_id: String,
+    },
+
+    /// Apply one complete provider-layer edit under the daemon's snapshot CAS.
+    /// No filesystem path crosses this mutation boundary.
+    ApplyProviderMutation {
+        #[serde(deserialize_with = "deserialize_nonempty_string")]
+        snapshot_session_id: String,
+        #[serde(deserialize_with = "deserialize_nonempty_string")]
+        layer_id: String,
+        #[serde(deserialize_with = "deserialize_nonempty_string")]
+        expected_revision: String,
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        client_operation_id: String,
+        mutation: crate::ProviderMutationBatch,
     },
 
     /// Resolve credentials, fetch provider models, and persist resulting
@@ -2842,8 +2859,19 @@ impl Request {
             Self::GetProviderCatalogSnapshot {
                 project_root,
                 provider_id,
+                snapshot_session_id,
+            } => {
+                validate_owner_project_root(project_root)?;
+                validate_owner_identifier("provider snapshot session", snapshot_session_id, 128)?;
+                if let Some(provider_id) = provider_id {
+                    validate_owner_identifier(
+                        "provider id",
+                        provider_id,
+                        MAX_OWNER_PROVIDER_ID_BYTES,
+                    )?;
+                }
             }
-            | Self::GetProviderUsageSnapshot {
+            Self::GetProviderUsageSnapshot {
                 project_root,
                 provider_id,
             } => {
@@ -2854,6 +2882,85 @@ impl Request {
                         provider_id,
                         MAX_OWNER_PROVIDER_ID_BYTES,
                     )?;
+                }
+            }
+            Self::ApplyProviderMutation {
+                snapshot_session_id,
+                layer_id,
+                expected_revision,
+                client_operation_id,
+                mutation,
+            } => {
+                for (label, value) in [
+                    ("provider snapshot session", snapshot_session_id),
+                    ("provider layer capability", layer_id),
+                    ("provider base revision", expected_revision),
+                    ("provider client operation", client_operation_id),
+                ] {
+                    validate_owner_identifier(label, value, 128)?;
+                }
+                if mutation
+                    .upserts
+                    .len()
+                    .saturating_add(mutation.deletes.len())
+                    > 64
+                {
+                    return Err("provider mutation exceeds maximum batch size".into());
+                }
+                if mutation.metadata.as_ref().is_some_and(|metadata| {
+                    serde_json::to_vec(metadata)
+                        .map(|bytes| bytes.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES)
+                        .unwrap_or(true)
+                }) {
+                    return Err("provider metadata exceeds maximum encoded length".into());
+                }
+                if mutation.upserts.is_empty()
+                    && mutation.deletes.is_empty()
+                    && mutation.metadata.is_none()
+                {
+                    return Err("provider mutation contains no changes".into());
+                }
+                let mut ids = std::collections::BTreeSet::new();
+                for upsert in &mutation.upserts {
+                    validate_owner_identifier(
+                        "provider id",
+                        &upsert.provider_id,
+                        MAX_OWNER_PROVIDER_ID_BYTES,
+                    )?;
+                    if !ids.insert(upsert.provider_id.as_str()) {
+                        return Err("provider mutation contains duplicate ids".into());
+                    }
+                    if upsert.header_secrets.len() != upsert.entry.headers.len() {
+                        return Err("provider header secret count does not match headers".into());
+                    }
+                    if serde_json::to_vec(&upsert.entry)
+                        .map_err(|_| "provider entry must be serializable".to_string())?
+                        .len()
+                        > MAX_OWNER_PROVIDER_ENTRY_BYTES
+                    {
+                        return Err("provider entry exceeds maximum length".into());
+                    }
+                    validate_credential_free_provider_url(&upsert.entry.url)?;
+                    cockpit_config::config::providers::validate_provider_headers(
+                        &upsert.provider_id,
+                        &upsert.entry.headers,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    for secret in upsert.header_secrets.iter().flatten() {
+                        if secret.is_empty() || secret.len() > MAX_OWNER_SECRET_VALUE_BYTES {
+                            return Err("provider header secret exceeds maximum length".into());
+                        }
+                    }
+                }
+                for delete in &mutation.deletes {
+                    validate_owner_identifier(
+                        "provider id",
+                        &delete.provider_id,
+                        MAX_OWNER_PROVIDER_ID_BYTES,
+                    )?;
+                    if !ids.insert(delete.provider_id.as_str()) {
+                        return Err("provider mutation contains duplicate ids".into());
+                    }
                 }
             }
             Self::SetProviderLayerMetadata {
@@ -3053,6 +3160,7 @@ macro_rules! request_variants {
             #[cfg(feature = "remote")]
             (Request::GetFlycockpitAccount, "get_flycockpit_account");
             (Request::GetProviderCatalogSnapshot { .. }, "get_provider_catalog_snapshot");
+            (Request::ApplyProviderMutation { .. }, "apply_provider_mutation");
             (Request::FetchProviderModels { .. }, "fetch_provider_models");
             (Request::GetProviderUsageSnapshot { .. }, "get_provider_usage_snapshot");
             (Request::UpsertProviderConfig { .. }, "upsert_provider_config");
@@ -3345,7 +3453,8 @@ macro_rules! command {
             (Request::DeleteProviderCredential { provider_id, project_root }, "delete_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "provider_id:String|project_root:Option<String>", [provider_id: String => param, project_root: Option<String> => param]);
             #[cfg(feature = "remote")]
             (Request::GetFlycockpitAccount, "get_flycockpit_account", owner_only, none, false, read_only, none, serialized, none, "-", []);
-            (Request::GetProviderCatalogSnapshot { project_root, provider_id }, "get_provider_catalog_snapshot", owner_only, none, false, read_only, none, concurrent, path(project_root), "project_root:String|provider_id:Option<String>", [project_root: String => project_root, provider_id: Option<String> => param]);
+            (Request::GetProviderCatalogSnapshot { project_root, provider_id, snapshot_session_id }, "get_provider_catalog_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|provider_id:Option<String>|snapshot_session_id:String", [project_root: String => project_root, provider_id: Option<String> => param, snapshot_session_id: String => param]);
+            (Request::ApplyProviderMutation { snapshot_session_id, layer_id, expected_revision, client_operation_id, mutation }, "apply_provider_mutation", owner_only, none, true, local_only, none, serialized, none, "snapshot_session_id:String|layer_id:String|expected_revision:String|client_operation_id:String|mutation:crate::ProviderMutationBatch", [snapshot_session_id: String => param, layer_id: String => param, expected_revision: String => param, client_operation_id: String => param, mutation: crate::ProviderMutationBatch => param]);
             (Request::FetchProviderModels { project_root, provider_id, model_id, deep, on_unlisted, allow_fallback }, "fetch_provider_models", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:Option<String>|model_id:Option<String>|deep:bool|on_unlisted:Option<cockpit_config::config::providers::OnUnlistedModelsFetch>|allow_fallback:bool", [project_root: String => project_root, provider_id: Option<String> => param, model_id: Option<String> => param, deep: bool => param, on_unlisted: Option<cockpit_config::config::providers::OnUnlistedModelsFetch> => param, allow_fallback: bool => param]);
             (Request::GetProviderUsageSnapshot { project_root, provider_id }, "get_provider_usage_snapshot", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String|provider_id:Option<String>", [project_root: String => project_root, provider_id: Option<String> => param]);
             (Request::UpsertProviderConfig { project_root, provider_id, entry }, "upsert_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param]);

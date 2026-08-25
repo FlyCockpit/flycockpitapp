@@ -484,7 +484,7 @@ impl ConfigMutationLock {
                 return Ok(None);
             }
             match file.try_lock() {
-                Ok(()) => return Ok(Some(Self::enter(file))),
+                Ok(()) => return Ok(Self::enter_before_deadline(file, deadline)),
                 Err(std::fs::TryLockError::WouldBlock) => {
                     let now = std::time::Instant::now();
                     if now >= deadline {
@@ -505,6 +505,23 @@ impl ConfigMutationLock {
         }
     }
 
+    /// Converts an acquired OS lock into mutation authority only while the
+    /// caller's deadline is still live.
+    ///
+    /// `try_lock` and this check are intentionally adjacent but cannot be
+    /// atomic. Rechecking here closes the window where a contender acquires
+    /// the lock just after its bounded recovery budget expires. Dropping the
+    /// file on the expired path releases the OS lock without ever incrementing
+    /// this thread's re-entrancy depth.
+    fn enter_before_deadline(file: std::fs::File, deadline: std::time::Instant) -> Option<Self> {
+        if std::time::Instant::now() >= deadline {
+            drop(file);
+            None
+        } else {
+            Some(Self::enter(file))
+        }
+    }
+
     fn enter(file: std::fs::File) -> Self {
         MUTATION_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
         Self {
@@ -522,6 +539,38 @@ impl ConfigMutationLock {
 impl Drop for ConfigMutationLock {
     fn drop(&mut self) {
         MUTATION_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+#[cfg(test)]
+mod mutation_lock_deadline_tests {
+    #[test]
+    fn expired_post_acquisition_deadline_releases_lock_without_entering_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("mutation.lock");
+        let acquired = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        acquired.try_lock().unwrap();
+
+        let guard =
+            super::ConfigMutationLock::enter_before_deadline(acquired, std::time::Instant::now());
+
+        assert!(guard.is_none());
+        assert!(!super::ConfigMutationLock::is_held_by_current_thread());
+
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        contender
+            .try_lock()
+            .expect("expired acquisition must release the OS lock");
     }
 }
 

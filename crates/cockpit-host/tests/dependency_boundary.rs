@@ -48,12 +48,27 @@ fn core_does_not_reexport_moved_host_authority() {
         "pub mod path_containment",
         "pub mod private_fs",
         "pub mod process",
-        "pub use cockpit_host",
     ] {
         assert!(
             !lib.contains(forbidden),
             "cockpit-core must not shim moved host authority: {forbidden}"
         );
+    }
+    let mut pending = vec![core];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("read core source directory") {
+            let path = entry.expect("core source entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                let source = std::fs::read_to_string(&path).expect("read core production source");
+                assert!(
+                    !source.contains("pub use cockpit_host"),
+                    "cockpit-core production source must not re-export host authority: {}",
+                    path.display()
+                );
+            }
+        }
     }
 }
 

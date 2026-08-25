@@ -55,7 +55,7 @@ pub use cockpit_db::image_generation_plan::{
     ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1, TargetPlanV1,
     TypedParameterV1, VectorSanitizerProvenanceV1,
 };
-pub use cockpit_host::private_fs::held_directory::{
+use cockpit_host::private_fs::held_directory::{
     HeldArtifactEvidence, HeldDirectoryEffectEvidence, HeldDirectoryEffectOutcome,
     HeldDirectoryRecovery, HeldSealOutcome, HeldSealedArtifact, HeldTemporaryArtifact,
 };

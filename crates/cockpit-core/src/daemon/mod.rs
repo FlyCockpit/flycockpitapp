@@ -89,12 +89,16 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 #[cfg(unix)]
+use cockpit_host::daemon_lifecycle::read_pid_executable;
+use cockpit_host::daemon_lifecycle::read_pid_file;
+#[cfg(unix)]
 use cockpit_host::daemon_lifecycle::verify_cockpit_daemon_pid_identity;
+#[cfg(any(unix, test))]
+use cockpit_host::daemon_lifecycle::write_pid_file;
 #[cfg(any(unix, test))]
 use cockpit_host::daemon_lifecycle::{
     ForegroundMetadataGuard, PidIdentity, remove_metadata_if_pid_matches,
 };
-use cockpit_host::daemon_lifecycle::{cmdline_is_cockpit_daemon, read_pid_file};
 #[cfg(all(test, unix))]
 use cockpit_host::daemon_lifecycle::{parse_macos_procargs2, split_proc_cmdline};
 use cockpit_host::private_fs::ensure_private_dir;
@@ -670,7 +674,15 @@ fn status_for_unreachable_pid_with_cleanup(
     let Some(pid) = read_pid_file(&paths.pid_file) else {
         return DaemonStatus::Stale;
     };
-    status_for_pid_identity(verify_cockpit_daemon_pid_identity(pid), cleanup)
+    status_for_pid_identity(published_executable_pid_identity(paths, pid), cleanup)
+}
+
+#[cfg(unix)]
+fn published_executable_pid_identity(paths: &DaemonPaths, pid: u32) -> PidIdentity {
+    let Some(approved_executable) = read_pid_executable(&paths.pid_file) else {
+        return PidIdentity::Unverified;
+    };
+    verify_cockpit_daemon_pid_identity(pid, &approved_executable)
 }
 
 #[cfg(unix)]
@@ -905,7 +917,12 @@ pub fn spawn_detached_with_resume(no_sandbox: bool, resume_all_sessions: bool) -
 
 pub fn restart_no_sandbox_from_argv(args: &[String], explicit_no_sandbox: bool) -> bool {
     explicit_no_sandbox
-        || (cmdline_is_cockpit_daemon(args) && args.iter().any(|arg| arg == "--no-sandbox"))
+        || (argv_requests_daemon_start(args) && args.iter().any(|arg| arg == "--no-sandbox"))
+}
+
+fn argv_requests_daemon_start(args: &[String]) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == "daemon" && pair[1] == "start")
 }
 
 pub fn derive_restart_no_sandbox(paths: &DaemonPaths, explicit_no_sandbox: bool) -> bool {
@@ -1283,7 +1300,8 @@ async fn run_foreground_inner_with_boot_db(
     }
     // Clear any stale leftover.
     let _ = std::fs::remove_file(&paths.socket);
-    std::fs::write(&paths.pid_file, std::process::id().to_string())
+    let executable = std::env::current_exe().context("resolving daemon executable identity")?;
+    write_pid_file(&paths.pid_file, std::process::id(), &executable)
         .with_context(|| format!("writing pid file {}", paths.pid_file.display()))?;
     let endpoint_record = if !paths.ephemeral
         && DaemonPaths::resolve_canonical()
@@ -1683,7 +1701,7 @@ pub fn stop(paths: &DaemonPaths) -> Result<bool> {
     return stop_unix_with(
         paths,
         pid,
-        verify_cockpit_daemon_pid_identity,
+        |pid| published_executable_pid_identity(paths, pid),
         send_sigterm,
         || paths.pid_file.exists(),
     );
@@ -2786,18 +2804,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cmdline_identity_requires_cockpit_daemon_start() {
-        assert!(cmdline_is_cockpit_daemon(&[
+        assert!(argv_requests_daemon_start(&[
             "/usr/bin/cockpit".into(),
             "daemon".into(),
             "start".into(),
             "--foreground".into(),
         ]));
-        assert!(!cmdline_is_cockpit_daemon(&[
+        assert!(!argv_requests_daemon_start(&[
             "/usr/bin/sleep".into(),
             "daemon".into(),
             "start".into(),
         ]));
-        assert!(!cmdline_is_cockpit_daemon(&[
+        assert!(!argv_requests_daemon_start(&[
             "/usr/bin/cockpit".into(),
             "session".into(),
             "list".into(),
@@ -2835,7 +2853,7 @@ mod tests {
         let args = parse_macos_procargs2(&bytes).unwrap();
 
         assert_eq!(args[0], "/usr/local/bin/cockpit");
-        assert!(cmdline_is_cockpit_daemon(&args));
+        assert!(argv_requests_daemon_start(&args));
     }
 
     #[cfg(unix)]
@@ -2861,7 +2879,7 @@ mod tests {
             &["/usr/local/bin/cockpit", "session", "list"],
         );
         let args = parse_macos_procargs2(&non_daemon).unwrap();
-        assert!(!cmdline_is_cockpit_daemon(&args));
+        assert!(!argv_requests_daemon_start(&args));
     }
 
     #[cfg(unix)]

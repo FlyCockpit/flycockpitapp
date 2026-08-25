@@ -20,7 +20,26 @@ pub enum PidIdentity {
 /// Read a decimal PID from a daemon metadata file.
 pub fn read_pid_file(pid_file: &Path) -> Option<u32> {
     let value = std::fs::read_to_string(pid_file).ok()?;
-    value.trim().parse().ok()
+    value.lines().next()?.trim().parse().ok()
+}
+
+/// Read the canonical executable identity bound to PID publication. Legacy
+/// numeric-only PID files deliberately return `None` and therefore cannot
+/// authorize a signal.
+pub fn read_pid_executable(pid_file: &Path) -> Option<PathBuf> {
+    let value = std::fs::read_to_string(pid_file).ok()?;
+    let mut lines = value.lines();
+    lines.next()?.trim().parse::<u32>().ok()?;
+    let executable = PathBuf::from(lines.next()?.trim());
+    (!executable.as_os_str().is_empty()).then_some(executable)
+}
+
+/// Atomically publish a PID together with the exact canonical executable that
+/// owns it. This receipt is the authority later used before signaling.
+pub fn write_pid_file(pid_file: &Path, pid: u32, executable: &Path) -> anyhow::Result<()> {
+    let executable = std::fs::canonicalize(executable)?;
+    let body = format!("{pid}\n{}\n", executable.display());
+    crate::private_fs::write_private_file(pid_file, body.as_bytes())
 }
 
 /// Remove PID and socket metadata only while the PID file still binds the
@@ -34,17 +53,71 @@ pub fn remove_metadata_if_pid_matches(pid_file: &Path, socket: &Path, expected_p
     true
 }
 
-/// Verify that a live PID's argv is a Cockpit daemon-start invocation.
+/// Verify that a live PID is the exact approved Cockpit executable and its
+/// argv is a daemon-start invocation. The approved executable is explicit so
+/// production can bind verification to the executable that published the
+/// lifecycle metadata; tests must pass their own test-binary path deliberately.
 #[cfg(unix)]
-pub fn verify_cockpit_daemon_pid_identity(pid: u32) -> PidIdentity {
+pub fn verify_cockpit_daemon_pid_identity(pid: u32, approved_executable: &Path) -> PidIdentity {
     if !process_exists(pid) {
         return PidIdentity::Missing;
     }
-    match read_process_cmdline(pid) {
-        Ok(args) if cmdline_is_cockpit_daemon(&args) => PidIdentity::VerifiedDaemon,
-        Ok(_) => PidIdentity::NotDaemon,
-        Err(_) => PidIdentity::Unverified,
+    let executable = match read_process_executable(pid) {
+        Ok(executable) => executable,
+        Err(_) => return PidIdentity::Unverified,
+    };
+    let args = match read_process_cmdline(pid) {
+        Ok(args) => args,
+        Err(_) => return PidIdentity::Unverified,
+    };
+    let daemon_argv = args
+        .windows(2)
+        .any(|pair| pair[0] == "daemon" && pair[1] == "start");
+    if cmdline_is_cockpit_daemon(&args, &executable, approved_executable) {
+        PidIdentity::VerifiedDaemon
+    } else if daemon_argv {
+        // A daemon-shaped process whose executable receipt does not bind is
+        // not safe to signal, but neither is it safe to declare stale and
+        // unlink beneath it.
+        PidIdentity::Unverified
+    } else {
+        PidIdentity::NotDaemon
     }
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+}
+
+#[cfg(target_os = "macos")]
+fn read_process_executable(pid: u32) -> std::io::Result<PathBuf> {
+    const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
+    unsafe extern "C" {
+        fn proc_pidpath(pid: libc::c_int, buffer: *mut libc::c_void, size: u32) -> libc::c_int;
+    }
+    let mut bytes = vec![0_u8; PROC_PIDPATHINFO_MAXSIZE];
+    // SAFETY: proc_pidpath writes at most the supplied buffer length.
+    let length = unsafe {
+        proc_pidpath(
+            pid as libc::c_int,
+            bytes.as_mut_ptr().cast(),
+            bytes.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    bytes.truncate(length as usize);
+    Ok(PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn read_process_executable(_pid: u32) -> std::io::Result<PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "executable identity verification is unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -114,6 +187,7 @@ fn read_process_cmdline(_pid: u32) -> std::io::Result<Vec<String>> {
     ))
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub fn split_proc_cmdline(bytes: &[u8]) -> Vec<String> {
     bytes
         .split(|byte| *byte == 0)
@@ -173,18 +247,30 @@ fn invalid_procargs(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
-pub fn cmdline_is_cockpit_daemon(args: &[String]) -> bool {
-    let Some(program) = args.first() else {
+#[cfg(any(unix, test))]
+pub fn cmdline_is_cockpit_daemon(
+    args: &[String],
+    observed_executable: &Path,
+    approved_executable: &Path,
+) -> bool {
+    if args.is_empty() {
         return false;
-    };
-    let program_name = Path::new(program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(program);
-    program_name.contains("cockpit")
+    }
+    exact_executable_identity(observed_executable, approved_executable)
         && args
             .windows(2)
             .any(|pair| pair[0] == "daemon" && pair[1] == "start")
+}
+
+#[cfg(any(unix, test))]
+fn exact_executable_identity(observed: &Path, approved: &Path) -> bool {
+    let Ok(observed) = std::fs::canonicalize(observed) else {
+        return false;
+    };
+    let Ok(approved) = std::fs::canonicalize(approved) else {
+        return false;
+    };
+    observed == approved
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,6 +332,59 @@ impl Drop for ForegroundMetadataGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_cmdline_requires_exact_approved_executable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let approved = temp.path().join("cockpit");
+        let lookalike = temp.path().join("cockpit-malware");
+        std::fs::write(&approved, b"approved").expect("approved executable fixture");
+        std::fs::write(&lookalike, b"lookalike").expect("lookalike executable fixture");
+
+        assert!(cmdline_is_cockpit_daemon(
+            &[
+                approved.display().to_string(),
+                "daemon".into(),
+                "start".into(),
+            ],
+            &approved,
+            &approved,
+        ));
+        assert!(!cmdline_is_cockpit_daemon(
+            &[
+                lookalike.display().to_string(),
+                "daemon".into(),
+                "start".into(),
+            ],
+            &lookalike,
+            &approved,
+        ));
+        assert!(!cmdline_is_cockpit_daemon(
+            &[
+                approved.display().to_string(),
+                "daemon".into(),
+                "status".into(),
+            ],
+            &approved,
+            &approved,
+        ));
+    }
+
+    #[test]
+    fn pid_publication_binds_canonical_executable_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let executable = temp.path().join("cockpit");
+        let pid_file = temp.path().join("daemon.pid");
+        std::fs::write(&executable, b"executable fixture").expect("executable fixture");
+
+        write_pid_file(&pid_file, 42, &executable).expect("publish pid identity");
+
+        assert_eq!(read_pid_file(&pid_file), Some(42));
+        assert_eq!(
+            read_pid_executable(&pid_file),
+            std::fs::canonicalize(executable).ok()
+        );
+    }
 
     #[test]
     fn metadata_guard_removes_only_exact_owned_endpoint() {

@@ -11264,6 +11264,10 @@ fn oauth_exchange_failure_and_cancellation_have_atomic_receipt_cleanup() {
         })
         .expect("OAuth failure settlement helper must exist");
     assert!(failure.contains("mutate_item_on_conn"));
+    assert!(failure.contains("owns_exact_claim"));
+    assert!(failure.contains("completion_client_operation_id == client_operation_id"));
+    assert!(failure.contains("completion_request_hash == request_hash"));
+    assert!(failure.contains("completion_fencing_generation == fencing_generation"));
     assert!(failure.contains("UPDATE local_operation_receipts"));
     assert!(failure.contains("AND state='executing'"));
     let cancellation = source
@@ -11272,6 +11276,7 @@ fn oauth_exchange_failure_and_cancellation_have_atomic_receipt_cleanup() {
         .and_then(|tail| tail.split("async fn fail_oauth_exchange").next())
         .expect("OAuth cancellation settlement helper must exist");
     assert!(cancellation.contains("mutate_item_on_conn"));
+    assert!(cancellation.contains("DurableOAuthFlow::Cancelled"));
     assert!(cancellation.contains("UPDATE local_operation_receipts"));
     for branch in ["Request::CancelProviderOAuth", "Request::CancelMcpOAuth"] {
         let body = source
@@ -11279,6 +11284,65 @@ fn oauth_exchange_failure_and_cancellation_have_atomic_receipt_cleanup() {
             .nth(1)
             .expect("OAuth cancellation handler must exist");
         assert!(body.contains("terminalize_local_operation("));
+    }
+}
+
+#[test]
+fn oauth_ready_expiry_and_exchange_recovery_are_exact_and_capacity_releasing() {
+    let source = include_str!("dispatch.rs");
+    let expiry = source
+        .split("async fn expire_ready_oauth_flow")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn purge_durable_oauth_flows").next())
+        .expect("Ready OAuth expiry helper must exist");
+    for marker in [
+        "begin_request_hash",
+        "begin_fencing_generation",
+        "DurableOAuthFlow::Expired",
+        "SELECT EXISTS",
+        "AND state='terminal_success'",
+        "mutate_item_on_conn",
+    ] {
+        assert!(expiry.contains(marker), "expiry omitted {marker}");
+    }
+    let purge = source
+        .split("async fn purge_durable_oauth_flows")
+        .nth(1)
+        .and_then(|tail| tail.split("fn find_durable_oauth_flow").next())
+        .expect("OAuth capacity maintenance must exist");
+    assert!(purge.contains("if *ready && *expired"));
+    assert!(!purge.contains("*expired && !*receipt_protected"));
+
+    let claim = source
+        .split("async fn claim_oauth_exchange")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn commit_oauth_begin").next())
+        .expect("OAuth exact claim helper must exist");
+    for marker in [
+        "get_item_on_conn",
+        "exact_live_ready",
+        "completion_client_operation_id",
+        "completion_request_hash",
+        "completion_fencing_generation",
+        "state='executing'",
+    ] {
+        assert!(claim.contains(marker), "claim omitted {marker}");
+    }
+
+    let recovery = source
+        .split("async fn recover_committed_oauth_settlements")
+        .nth(1)
+        .and_then(|tail| tail.split("fn load_oauth_flow").next())
+        .expect("OAuth startup recovery must exist");
+    for marker in [
+        "DurableOAuthFlow::ProviderExchanging",
+        "DurableOAuthFlow::McpExchanging",
+        "completion_client_operation_id",
+        "completion_request_hash",
+        "completion_fencing_generation",
+        "state='terminal_cancelled'",
+    ] {
+        assert!(recovery.contains(marker), "recovery omitted {marker}");
     }
 }
 

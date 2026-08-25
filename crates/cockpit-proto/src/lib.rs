@@ -3247,8 +3247,8 @@ pub enum InterruptRaiseReason {
 
 /// Return the first protocol version that can carry a typed body. This gate
 /// is intentionally applied after negotiation and before serialization: a
-/// v10 client can use the v9 compatibility window, but must never serialize a
-/// v10-only RPC with a v9 envelope and leave an older daemon to interpret it.
+/// A compatibility-window client must never serialize a newer RPC with an
+/// older envelope and leave an older daemon to interpret it.
 fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
     match body {
         Body::Request { request, .. } => {
@@ -3260,6 +3260,12 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "begin_mcp_oauth"
                 | "complete_mcp_oauth"
                 | "cancel_mcp_oauth"
+                | "put_provider_credential"
+                | "delete_provider_credential"
+                | "save_mcp_config"
+                | "apply_extended_config_patch"
+                | "get_local_operation_settlement"
+                | "setup_copilot_auth"
                 | "put_subscription_ack"
                 | "apply_provider_mutation"
                 | "begin_agent_editor_lease"
@@ -3270,8 +3276,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 "list_secret_inventory"
                 | "put_named_secret"
                 | "delete_named_secret"
-                | "put_provider_credential"
-                | "delete_provider_credential"
                 | "get_flycockpit_account"
                 | "set_flycockpit_connector_enabled"
                 | "sync_flycockpit_org_policy"
@@ -3282,14 +3286,11 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "delete_provider_config"
                 | "set_provider_layer_metadata"
                 | "save_provider_config"
-                | "save_mcp_config"
-                | "setup_copilot_auth"
                 | "apply_setup_wizard"
                 | "get_agent_inventory"
                 | "get_agent_edit_snapshot"
                 | "mutate_agent"
                 | "get_extended_config_snapshot"
-                | "apply_extended_config_patch"
                 | "save_extended_config"
                 | "export_policy"
                 | "import_policy"
@@ -3365,7 +3366,8 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "provider_catalog_snapshot"
                 | "provider_mutation_committed"
                 | "agent_editor_lease_begun"
-                | "agent_editor_lease_completed" => 17,
+                | "agent_editor_lease_completed"
+                | "extended_config_saved" => 17,
                 "leak_reveal_cancelled" => 16,
                 "flycockpit_org_sync"
                 | "provider_models_fetched"
@@ -3373,7 +3375,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "provider_config_upserted"
                 | "secret_inventory"
                 | "flycockpit_account"
-                | "extended_config_saved"
                 | "setup_wizard_applied"
                 | "policy_exported"
                 | "policy_imported"
@@ -6821,8 +6822,41 @@ mod tests {
     }
 
     #[test]
-    fn oauth_receipts_require_v17_while_older_durable_surfaces_keep_v10() {
+    fn durable_owner_receipts_and_mutations_require_v17() {
         for request in [
+            Request::PutProviderCredential {
+                client_operation_id: "put-provider".into(),
+                provider_id: "example".into(),
+                record: SensitiveWirePayload::new("{}".into()),
+            },
+            Request::DeleteProviderCredential {
+                client_operation_id: "delete-provider".into(),
+                provider_id: "example".into(),
+                project_root: None,
+            },
+            Request::GetLocalOperationSettlement {
+                client_operation_id: "settlement".into(),
+            },
+            Request::SaveMcpConfig {
+                client_operation_id: "save-mcp".into(),
+                project_root: "/tmp/project".into(),
+                config_json: "{}".into(),
+                secret_values_json: SensitiveWirePayload::new("{}".into()),
+                cleanup_names_json: "[]".into(),
+            },
+            Request::ApplyExtendedConfigPatch {
+                client_operation_id: "patch-config".into(),
+                project_root: "/tmp/project".into(),
+                layer_id: "layer".into(),
+                patch: ExtendedConfigPatch {
+                    operations: Vec::new(),
+                    materialize: true,
+                    denylist: Vec::new(),
+                    redacted_mutations: Vec::new(),
+                },
+                expected_revision: "00".repeat(32),
+                snapshot_session_id: "snapshot".into(),
+            },
             Request::BeginProviderOAuth {
                 client_operation_id: "begin-provider".into(),
                 provider_id: "codex-oauth".into(),
@@ -6956,28 +6990,46 @@ mod tests {
                 consumed_vault_generation: 6,
                 result_vault_generation: 7,
             },
+            Response::ExtendedConfigSaved {
+                client_operation_id: "patch-config".into(),
+                request_hash: "44".repeat(32),
+                hash: "55".repeat(32),
+                config_generation: 7,
+                layer_id: "layer".into(),
+                layer: CockpitConfigLayer::Project,
+                consumed_revision: "66".repeat(32),
+                result_revision: "77".repeat(32),
+                status: ConfigCommitStatus::Committed,
+                publication: ConfigPublicationStatus::Published,
+                denylist: Vec::new(),
+            },
+            Response::CopilotAuthCommitted {
+                client_operation_id: "setup-copilot".into(),
+                project_root: "/tmp/project".into(),
+                owner_root: "/tmp/project".into(),
+                owner_scope: "project:/tmp/project".into(),
+                provider_id: "copilot".into(),
+                consumed_vault_generation: 6,
+                result_vault_generation: 7,
+                config_generation: 7,
+            },
+            Response::LocalOperationSettlement {
+                client_operation_id: "settlement".into(),
+                operation_kind: "save_mcp_config".into(),
+                request_hash: "88".repeat(32),
+                pending: true,
+                response: None,
+                terminal_error: None,
+                terminal_cancelled: false,
+            },
         ] {
-            let expected = if matches!(
-                response.wire_tag(),
-                "provider_oauth_started"
-                    | "provider_oauth_completed"
-                    | "provider_oauth_cancelled"
-                    | "mcp_oauth_started"
-                    | "mcp_oauth_completed"
-                    | "mcp_oauth_cancelled"
-                    | "subscription_ack_committed"
-            ) {
-                17
-            } else {
-                10
-            };
             assert_eq!(
                 body_required_protocol_version(&Body::Response {
                     id: Uuid::nil(),
                     response: Box::new(response),
                 })
                 .0,
-                expected
+                17
             );
         }
     }
@@ -7538,9 +7590,19 @@ mod tests {
     #[test]
     fn settings_v17_receipts_bind_exact_operations_and_content() {
         let requests = proto_fixture_tests::read_fixture("request.json");
-        assert!(
-            requests["apply_extended_config_patch"]["params"]["client_operation_id"].is_string()
-        );
+        for tag in [
+            "put_provider_credential",
+            "delete_provider_credential",
+            "save_mcp_config",
+            "apply_extended_config_patch",
+            "get_local_operation_settlement",
+            "setup_copilot_auth",
+        ] {
+            assert!(
+                requests[tag]["params"]["client_operation_id"].is_string(),
+                "current v17 fixture must carry an operation id for {tag}"
+            );
+        }
         let responses = proto_fixture_tests::read_fixture("response.json");
         let receipt = &responses["extended_config_saved"]["data"];
         assert!(receipt["client_operation_id"].is_string());

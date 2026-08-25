@@ -1005,6 +1005,7 @@ async fn trusted_settings_root(
 /// occurred and permit a fresh snapshot/retry. Divergence remains pending.
 pub(super) async fn recover_extended_config_patch_journals(
     ctx: &crate::daemon::server::DaemonContext,
+    publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
 ) -> Result<(), ErrorPayload> {
     type Row = (String, String, Vec<u8>, i64, String, String, String, String);
     let rows: Vec<Row> = ctx
@@ -1034,13 +1035,18 @@ pub(super) async fn recover_extended_config_patch_journals(
         .await
         .map_err(internal)?;
     for (owner, operation, request_hash, fence, target, consumed, intended, response_json) in rows {
-        let observed = tokio::task::spawn_blocking(move || {
-            let path = std::path::PathBuf::from(target);
-            let (bytes, _) = read_optional_config(&path)?;
-            Ok::<_, ErrorPayload>(content_hash(&bytes))
+        let path = std::path::PathBuf::from(target);
+        let observed_path = path.clone();
+        let observed = publication.with_target(&path, move |_| {
+            let (bytes, _) = read_optional_config(&observed_path)
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            Ok(content_hash(&bytes))
         })
         .await
-        .map_err(|error| internal(error))??;
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::Shutdown,
+            message: format!("bounded typed-settings recovery could not acquire publication authority: {error:#}"),
+        })?;
         let terminal = if observed == intended {
             let mut response: Response = serde_json::from_str(&response_json).map_err(internal)?;
             let generation = if intended == consumed {

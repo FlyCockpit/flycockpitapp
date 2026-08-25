@@ -14,7 +14,6 @@ use crate::daemon::proto::{
 use crate::daemon::server::DaemonContext;
 
 const EDITOR_LEASE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
-const PRE_SOCKET_CONFIG_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SealedEditorReplay {
@@ -393,8 +392,9 @@ pub(crate) async fn maintain_editor_leases(ctx: &DaemonContext) -> Result<(), Er
 /// pre-socket boot: no live predecessor can still own the in-memory claim.
 pub(crate) async fn recover_editor_leases_before_publish(
     ctx: &DaemonContext,
+    publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
 ) -> Result<(), ErrorPayload> {
-    let config_lock_deadline = std::time::Instant::now() + PRE_SOCKET_CONFIG_LOCK_TIMEOUT;
+    let config_lock_deadline = publication.deadline();
     let completing = ctx
         .db
         .recoverable_agent_editor_completions(chrono::Utc::now().timestamp_millis())
@@ -1146,7 +1146,10 @@ async fn settle_agent_mutation_journal(
 /// visible. A matching intended projection proves that atomic publication
 /// crossed its durability boundary; a divergent projection remains pending
 /// for explicit repair rather than fabricating either success or rejection.
-pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64, ErrorPayload> {
+pub async fn recover_agent_mutation_journals(
+    ctx: &DaemonContext,
+    publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
+) -> Result<u64, ErrorPayload> {
     let _publication = crate::daemon::server::inventory::write_authority_publication().await;
     type Row = (
         String,
@@ -1263,20 +1266,49 @@ pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64,
         let check_root = root.clone();
         let check_plan = plan.clone();
         let check_vault = ctx.secret_vault.clone();
-        let matches = tokio::task::spawn_blocking(move || {
-            projection_matches_plan(&check_root, &check_plan, &check_vault)
-        })
-        .await
-        .map_err(join_error)??;
-        if !matches {
-            let consumed_root = root.clone();
-            let consumed_plan = plan.clone();
-            let consumed_vault = ctx.secret_vault.clone();
-            let still_consumed = tokio::task::spawn_blocking(move || {
-                projection_matches_consumed(&consumed_root, &consumed_plan, &consumed_vault)
+        let lock_target = root.join(".cockpit/config.json");
+        let projection_name = agent_name.clone();
+        let result_is_absent = plan.result_is_absent;
+        let (matches, still_consumed, definition_revision, inventory_revision) = publication
+            .with_target(&lock_target, move |_| {
+                let matches = projection_matches_plan(&check_root, &check_plan, &check_vault)
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                let still_consumed = if matches {
+                    false
+                } else {
+                    projection_matches_consumed(&check_root, &check_plan, &check_vault)
+                        .map_err(|error| anyhow::anyhow!(error.message))?
+                };
+                let definition_revision = if matches {
+                    match projection_name.as_deref() {
+                        Some(name) if !result_is_absent => {
+                            current_definition_revision_sync(&check_root, name).ok()
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let inventory_revision = if matches && projection_name.is_none() {
+                    current_inventory_revision(&check_root).ok()
+                } else {
+                    None
+                };
+                Ok((
+                    matches,
+                    still_consumed,
+                    definition_revision,
+                    inventory_revision,
+                ))
             })
             .await
-            .map_err(join_error)??;
+            .map_err(|error| ErrorPayload {
+                code: ErrorCode::Shutdown,
+                message: format!(
+                    "bounded agent recovery could not acquire publication authority: {error:#}"
+                ),
+            })?;
+        if !matches {
             if still_consumed {
                 cancel_agent_mutation_journal(
                     ctx,
@@ -1304,25 +1336,6 @@ pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64,
             recovered = recovered.saturating_add(1);
             continue;
         }
-        let projection_root = root.clone();
-        let projection_name = agent_name.clone();
-        let result_is_absent = plan.result_is_absent;
-        let (definition_revision, inventory_revision) = tokio::task::spawn_blocking(move || {
-            let revision = match projection_name.as_deref() {
-                Some(name) if !result_is_absent => {
-                    current_definition_revision_sync(&projection_root, name).ok()
-                }
-                _ => None,
-            };
-            let inventory = if projection_name.is_none() {
-                current_inventory_revision(&projection_root).ok()
-            } else {
-                None
-            };
-            (revision, inventory)
-        })
-        .await
-        .map_err(join_error)?;
         let result_revision = definition_revision
             .or_else(|| inventory_revision.clone())
             .unwrap_or_else(|| {
@@ -3320,7 +3333,10 @@ fn recover_reset_all_locked(
     Ok(())
 }
 
-pub async fn recover_known_workspace_resets(ctx: &DaemonContext) -> Result<(), ErrorPayload> {
+pub async fn recover_known_workspace_resets(
+    ctx: &DaemonContext,
+    publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
+) -> Result<(), ErrorPayload> {
     let sessions = ctx
         .db
         .list_sessions(false, 100_000)
@@ -3370,28 +3386,22 @@ pub async fn recover_known_workspace_resets(ctx: &DaemonContext) -> Result<(), E
         }
         trusted_roots.push(root);
     }
-    tokio::task::spawn_blocking(move || {
-        let config_lock_deadline = std::time::Instant::now() + PRE_SOCKET_CONFIG_LOCK_TIMEOUT;
-        for root in trusted_roots {
-            let lock_target = root.join(".cockpit/config.json");
-            let Some(guard) = cockpit_config::config::try_hold_config_mutation_lock_until(
-                &lock_target,
-                config_lock_deadline,
-            )
-            .map_err(internal)?
-            else {
-                tracing::warn!(
-                    project_root = %root.display(),
-                    "agent reset remains pending because the config mutation lock was busy during bounded boot recovery"
-                );
-                continue;
-            };
-            recover_reset_all_locked(&root, &guard)?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(join_error)?
+    for root in trusted_roots {
+        let lock_target = root.join(".cockpit/config.json");
+        publication
+            .with_target(&lock_target, move |guard| {
+                recover_reset_all_locked(&root, guard)
+                    .map_err(|error| anyhow::anyhow!(error.message))
+            })
+            .await
+            .map_err(|error| ErrorPayload {
+                code: ErrorCode::Shutdown,
+                message: format!(
+                    "bounded agent-reset recovery could not acquire publication authority: {error:#}"
+                ),
+            })?;
+    }
+    Ok(())
 }
 
 fn reset_all_builtins_atomic_locked(

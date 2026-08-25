@@ -11820,7 +11820,7 @@ fn editor_vault_reads_and_boot_publication_lock_waits_are_off_loop_and_bounded()
         .nth(1)
         .and_then(|tail| tail.split("pub async fn inventory").next())
         .expect("editor boot recovery handler");
-    assert!(boot.contains("PRE_SOCKET_CONFIG_LOCK_TIMEOUT"));
+    assert!(boot.contains("publication.deadline()"));
     assert!(boot.contains("Some(config_lock_deadline)"));
 
     let config_files = include_str!("../../../../cockpit-config/src/config/files.rs");
@@ -11843,6 +11843,50 @@ fn editor_vault_reads_and_boot_publication_lock_waits_are_off_loop_and_bounded()
         .expect("vault transactional delete helper");
     assert!(delete.contains("delete_item_conn"));
     assert!(!delete.contains("get_item_on_conn"));
+}
+
+#[test]
+fn pre_socket_file_recovery_uses_one_bounded_publication_authority() {
+    let server = include_str!("mod.rs");
+    let boot = server
+        .split("pub async fn recover_before_socket_publish")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn run_accept_loop").next())
+        .expect("pre-socket recovery body");
+    assert_eq!(
+        boot.matches("PreSocketConfigPublication::new()").count(),
+        1,
+        "boot must mint one absolute config-publication deadline",
+    );
+    for recovery in [
+        "recover_all_provider_config_journals",
+        "recover_all_mcp_config_journals",
+        "recover_extended_config_patch_journals",
+        "recover_image_config_mutation_journals",
+        "recover_known_workspace_resets",
+        "recover_agent_mutation_journals",
+        "recover_editor_leases_before_publish",
+        "recover_effective_default_journals_before_socket",
+    ] {
+        let call = boot
+            .split(recovery)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing recovery family: {recovery}"));
+        assert!(
+            call[..call.len().min(180)].contains("config_publication"),
+            "unbounded recovery family: {recovery}",
+        );
+    }
+
+    let helper = include_str!("../config_publication_recovery.rs");
+    assert!(helper.contains("tokio::task::spawn_blocking"));
+    assert!(helper.contains("try_hold_config_mutation_lock_until"));
+    assert!(helper.contains("action(&guard)"));
+    assert!(
+        helper.contains(
+            "durable DB claim -> with_target(sync classify/publish) -> durable DB settle"
+        )
+    );
 }
 
 #[test]

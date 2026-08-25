@@ -3745,20 +3745,25 @@ async fn run_boot_housekeeping(db: &Db) {
 #[cfg(unix)]
 pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    dispatch::recover_all_provider_config_journals(ctx)
+    // Every file-backed recovery family shares one bounded startup deadline.
+    // Target guards themselves live only inside blocking closures, so no
+    // synchronous filesystem lock can cross an async DB/network suspension.
+    let config_publication =
+        crate::daemon::config_publication_recovery::PreSocketConfigPublication::new();
+    dispatch::recover_all_provider_config_journals(ctx, config_publication)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup provider-config journal recovery failed")?;
-    dispatch::recover_all_mcp_config_journals(ctx)
+    dispatch::recover_all_mcp_config_journals(ctx, config_publication)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup MCP-config journal recovery failed")?;
-    crate::daemon::fs_api::recover_extended_config_patch_journals(ctx)
+    crate::daemon::fs_api::recover_extended_config_patch_journals(ctx, config_publication)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup typed-settings journal recovery failed")?;
     let recovered_image_config =
-        image_control_mutations::recover_image_config_mutation_journals(ctx)
+        image_control_mutations::recover_image_config_mutation_journals(ctx, config_publication)
             .await
             .map_err(|error| anyhow::anyhow!(error.message))
             .context("startup image-config mutation journal recovery failed")?;
@@ -3768,12 +3773,12 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
             "reconciled committed image configuration before socket publication"
         );
     }
-    crate::daemon::agent_management::recover_known_workspace_resets(ctx)
+    crate::daemon::agent_management::recover_known_workspace_resets(ctx, config_publication)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup agent reset journal recovery failed")?;
     let recovered_agent_mutations =
-        crate::daemon::agent_management::recover_agent_mutation_journals(ctx)
+        crate::daemon::agent_management::recover_agent_mutation_journals(ctx, config_publication)
             .await
             .map_err(|error| anyhow::anyhow!(error.message))
             .context("startup agent-mutation journal recovery failed")?;
@@ -3810,7 +3815,7 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
             "settled interrupted local operations without re-execution"
         );
     }
-    crate::daemon::agent_management::recover_editor_leases_before_publish(ctx)
+    crate::daemon::agent_management::recover_editor_leases_before_publish(ctx, config_publication)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup editor completion recovery failed")?;
@@ -3818,9 +3823,12 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup editor lease recovery failed")?;
-    let recovered = crate::daemon::effective_default_recovery::recover_effective_default_journals(
-        &ctx.db, &cwd, None,
-    )
+    let recovered =
+        crate::daemon::effective_default_recovery::recover_effective_default_journals_before_socket(
+            &ctx.db,
+            &cwd,
+            config_publication,
+        )
     .await
     .context("startup effective-default journal recovery failed")?;
     crate::daemon::effective_default_recovery::deliver_recovered_terminals(ctx, recovered).await;

@@ -7258,25 +7258,15 @@ async fn handle_serialized_request_impl(
                 request_hash,
                 fencing_generation,
             );
-            let result = terminalize_local_operation(
+            terminalize_local_operation(
                 ctx,
-                owner.clone(),
-                client_operation_id.clone(),
+                owner,
+                client_operation_id,
                 request_hash,
                 fencing_generation,
                 operation,
             )
-            .await;
-            if result.is_ok() {
-                ctx.db.write(move |conn| {
-                    conn.execute(
-                        "DELETE FROM image_config_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2",
-                        rusqlite::params![owner, client_operation_id],
-                    )?;
-                    Ok(())
-                }).await.map_err(internal)?;
-            }
-            result
+            .await
         }
 
         Request::SaveImageSpendPolicy {
@@ -14305,13 +14295,21 @@ fn provider_config_revision(
     target_path: &std::path::Path,
     config: &crate::config::providers::ProvidersConfig,
 ) -> std::result::Result<String, ErrorPayload> {
+    provider_config_revision_with_vault(&ctx.secret_vault, target_path, config)
+}
+
+fn provider_config_revision_with_vault(
+    vault: &crate::secure_key::SecretVault,
+    target_path: &std::path::Path,
+    config: &crate::config::providers::ProvidersConfig,
+) -> std::result::Result<String, ErrorPayload> {
     let bytes = zeroize::Zeroizing::new(
         serde_json::to_vec(&(target_path.to_string_lossy().as_ref(), config)).map_err(internal)?,
     );
-    Ok(crate::intel::hex_lower(
-        &ctx.secret_vault
-            .keyed_request_identity(b"flycockpit.provider-layer-revision.v1\0", bytes.as_slice()),
-    ))
+    Ok(crate::intel::hex_lower(&vault.keyed_request_identity(
+        b"flycockpit.provider-layer-revision.v1\0",
+        bytes.as_slice(),
+    )))
 }
 
 async fn apply_provider_mutation(
@@ -17131,9 +17129,19 @@ pub(super) async fn recover_provider_config_journals(
     project_root: &str,
     provider_id: Option<&str>,
 ) -> std::result::Result<(), ErrorPayload> {
+    recover_provider_config_journals_inner(ctx, project_root, provider_id, None).await
+}
+
+async fn recover_provider_config_journals_inner(
+    ctx: &DaemonContext,
+    project_root: &str,
+    provider_id: Option<&str>,
+    publication: Option<crate::daemon::config_publication_recovery::PreSocketConfigPublication>,
+) -> std::result::Result<(), ErrorPayload> {
     let project_root = project_root.to_string();
     let provider_id = provider_id.map(str::to_string);
     let project_root_query = project_root.clone();
+    let defer_secret_cleanup = publication.is_some();
     let journals = ctx
         .db
         .read(move |conn| {
@@ -17177,153 +17185,211 @@ pub(super) async fn recover_provider_config_journals(
         .map_err(internal)?;
     for journal in journals {
         let (cwd, trust_policy, _) = daemon_provider_config(ctx, project_root.as_str()).await?;
-        match journal.action.as_str() {
-            "save" => {
-                let path = std::path::PathBuf::from(
-                    journal
-                        .config_path
-                        .as_deref()
-                        .ok_or_else(|| bad_request("provider save journal is missing target"))?,
-                );
-                let consumed_revision = journal.consumed_revision.as_deref().ok_or_else(|| {
-                    bad_request("provider save journal is missing consumed revision")
-                })?;
-                let intended_revision = journal.intended_revision.as_deref().ok_or_else(|| {
-                    bad_request("provider save journal is missing intended revision")
-                })?;
-                let expected_path =
-                    crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-                        ctx.config_source()
-                            .config_write_target_for_provider(&cwd, &journal.provider_id)
-                    })
+        if let Some(publication) = publication {
+            recover_provider_journal_file_before_socket(
+                ctx,
+                project_root.as_str(),
+                &cwd,
+                &trust_policy,
+                &journal,
+                publication,
+            )
+            .await?;
+        } else {
+            match journal.action.as_str() {
+                "save" => {
+                    let path =
+                        std::path::PathBuf::from(journal.config_path.as_deref().ok_or_else(
+                            || bad_request("provider save journal is missing target"),
+                        )?);
+                    let consumed_revision =
+                        journal.consumed_revision.as_deref().ok_or_else(|| {
+                            bad_request("provider save journal is missing consumed revision")
+                        })?;
+                    let intended_revision =
+                        journal.intended_revision.as_deref().ok_or_else(|| {
+                            bad_request("provider save journal is missing intended revision")
+                        })?;
+                    let expected_path = crate::config::trust::with_workspace_trust_policy(
+                        trust_policy.clone(),
+                        || {
+                            ctx.config_source()
+                                .config_write_target_for_provider(&cwd, &journal.provider_id)
+                        },
+                    )
                     .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
-                let expected_path = canonical_mcp_target_path(&expected_path)?;
-                if path != expected_path {
-                    return Err(bad_request(
-                        "provider save journal target no longer matches its authority layer",
-                    ));
-                }
-                crate::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
-                let _file_lock =
-                    cockpit_config::config::hold_config_mutation_lock(&path).map_err(internal)?;
-                let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
-                let actual_revision = provider_config_revision(ctx, &path, &doc.providers())?;
-                if actual_revision == intended_revision {
-                    // Publication already completed; amend only the exact
-                    // authenticated receipt below.
-                } else if actual_revision == consumed_revision {
-                    let entry: crate::config::providers::ProviderEntry =
-                        serde_json::from_str(journal.entry_json.as_deref().ok_or_else(|| {
-                            bad_request("provider save journal is missing its reference-only entry")
-                        })?)
-                        .map_err(internal)?;
-                    // Only the consumed-state branch may replay the desired
-                    // payload. Revalidate every reference immediately before
-                    // publishing it. Divergence was classified above so a
-                    // dead desired reference cannot mask settlement-unknown.
-                    validate_daemon_provider_url(&entry.url)?;
-                    validate_unique_provider_header_names(&entry.headers)?;
-                    ensure_provider_named_references_claimed(ctx, project_root.as_str(), &entry)
-                        .await?;
-                    ensure_provider_credential_reference_available(ctx, &entry).await?;
-                    let mut layer = doc.providers();
-                    layer.providers.insert(journal.provider_id.clone(), entry);
-                    doc.write(&layer).map_err(internal)?;
-                    let published = crate::config::providers::ConfigDoc::load(&path)
-                        .map_err(internal)?
-                        .providers();
-                    if provider_config_revision(ctx, &path, &published)? != intended_revision {
-                        return Err(internal(anyhow::anyhow!(
-                            "provider save did not converge to its intended keyed revision"
-                        )));
+                    let expected_path = canonical_mcp_target_path(&expected_path)?;
+                    if path != expected_path {
+                        return Err(bad_request(
+                            "provider save journal target no longer matches its authority layer",
+                        ));
                     }
-                } else {
-                    return Err(ErrorPayload {
+                    crate::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
+                    let _file_lock = cockpit_config::config::hold_config_mutation_lock(&path)
+                        .map_err(internal)?;
+                    let mut doc =
+                        crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+                    let actual_revision = provider_config_revision(ctx, &path, &doc.providers())?;
+                    if actual_revision == intended_revision {
+                        // Publication already completed; amend only the exact
+                        // authenticated receipt below.
+                    } else if actual_revision == consumed_revision {
+                        let entry: crate::config::providers::ProviderEntry = serde_json::from_str(
+                            journal.entry_json.as_deref().ok_or_else(|| {
+                                bad_request(
+                                    "provider save journal is missing its reference-only entry",
+                                )
+                            })?,
+                        )
+                        .map_err(internal)?;
+                        // Only the consumed-state branch may replay the desired
+                        // payload. Revalidate every reference immediately before
+                        // publishing it. Divergence was classified above so a
+                        // dead desired reference cannot mask settlement-unknown.
+                        validate_daemon_provider_url(&entry.url)?;
+                        validate_unique_provider_header_names(&entry.headers)?;
+                        ensure_provider_named_references_claimed(
+                            ctx,
+                            project_root.as_str(),
+                            &entry,
+                        )
+                        .await?;
+                        ensure_provider_credential_reference_available(ctx, &entry).await?;
+                        let mut layer = doc.providers();
+                        layer.providers.insert(journal.provider_id.clone(), entry);
+                        doc.write(&layer).map_err(internal)?;
+                        let published = crate::config::providers::ConfigDoc::load(&path)
+                            .map_err(internal)?
+                            .providers();
+                        if provider_config_revision(ctx, &path, &published)? != intended_revision {
+                            return Err(internal(anyhow::anyhow!(
+                                "provider save did not converge to its intended keyed revision"
+                            )));
+                        }
+                    } else {
+                        return Err(ErrorPayload {
                         code: ErrorCode::Conflict,
                         message: "provider save settlement is unknown because the authority layer diverged after staging; refusing to overwrite newer configuration".into(),
                     });
+                    }
                 }
-            }
-            "delete" => {
-                let path = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
-                    ctx.config_source()
-                        .config_write_target_for_provider(&cwd, &journal.provider_id)
-                })
-                .ok_or_else(|| bad_request("no cockpit config found"))?;
-                let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
-                let mut layer = doc.providers();
-                if layer.providers.remove(&journal.provider_id).is_some() {
-                    doc.write(&layer).map_err(internal)?;
-                }
-            }
-            "batch" => {
-                let path = std::path::PathBuf::from(
-                    journal
-                        .config_path
-                        .as_deref()
-                        .ok_or_else(|| bad_request("provider batch journal is missing target"))?,
-                );
-                let consumed_revision = journal.consumed_revision.as_deref().ok_or_else(|| {
-                    bad_request("provider batch journal is missing consumed revision")
-                })?;
-                let intended_revision = journal.intended_revision.as_deref().ok_or_else(|| {
-                    bad_request("provider batch journal is missing intended revision")
-                })?;
-                let expected_path =
-                    crate::config::trust::with_workspace_trust_policy(trust_policy, || {
-                        ctx.config_source()
-                            .config_write_target_for_provider(&cwd, "default")
-                    })
-                    .ok_or_else(|| bad_request("no cockpit config found"))?;
-                let expected_path = canonical_mcp_target_path(&expected_path)?;
-                if path != expected_path {
-                    return Err(bad_request(
-                        "provider batch journal target no longer matches its authority layer",
-                    ));
-                }
-                crate::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
-                let _file_lock =
-                    cockpit_config::config::hold_config_mutation_lock(&path).map_err(internal)?;
-                let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
-                let actual_revision = provider_config_revision(ctx, &path, &doc.providers())?;
-                if actual_revision == intended_revision {
-                    // Publication completed before a crash. Never rewrite it;
-                    // recovery only amends the exact authenticated receipt.
-                } else if actual_revision == consumed_revision {
-                    let payload: ProviderBatchJournalPayload =
-                        serde_json::from_str(journal.entry_json.as_deref().ok_or_else(|| {
-                            bad_request("provider batch journal is missing payload")
-                        })?)
+                "delete" => {
+                    let path =
+                        crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+                            ctx.config_source()
+                                .config_write_target_for_provider(&cwd, &journal.provider_id)
+                        })
+                        .ok_or_else(|| bad_request("no cockpit config found"))?;
+                    let consumed_revision =
+                        journal.consumed_revision.as_deref().ok_or_else(|| {
+                            bad_request("provider delete journal is missing consumed revision")
+                        })?;
+                    let intended_revision =
+                        journal.intended_revision.as_deref().ok_or_else(|| {
+                            bad_request("provider delete journal is missing intended revision")
+                        })?;
+                    let _file_lock = cockpit_config::config::hold_config_mutation_lock(&path)
                         .map_err(internal)?;
-                    for (provider_id, entry) in &payload.config.providers {
-                        validate_daemon_provider_url(&entry.url)?;
-                        validate_unique_provider_header_names(&entry.headers)?;
-                        ensure_provider_named_references_claimed(ctx, project_root.as_str(), entry)
-                            .await?;
-                        ensure_provider_credential_reference_available(ctx, entry).await?;
-                        if provider_id.trim().is_empty() {
-                            return Err(bad_request("provider batch journal contains an empty id"));
+                    let mut doc =
+                        crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+                    let mut layer = doc.providers();
+                    let actual_revision = provider_config_revision(ctx, &path, &layer)?;
+                    if actual_revision == intended_revision {
+                        // Publication already committed.
+                    } else if actual_revision == consumed_revision {
+                        layer.providers.remove(&journal.provider_id);
+                        doc.write(&layer).map_err(internal)?;
+                        let published = crate::config::providers::ConfigDoc::load(&path)
+                            .map_err(internal)?
+                            .providers();
+                        if provider_config_revision(ctx, &path, &published)? != intended_revision {
+                            return Err(internal(
+                                "provider delete did not converge to its intended keyed revision",
+                            ));
                         }
+                    } else {
+                        return Err(ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: "provider delete settlement is unknown because the authority layer diverged after staging; refusing to overwrite newer configuration".into(),
+                    });
                     }
-                    doc.write(&payload.config).map_err(internal)?;
-                    let published = crate::config::providers::ConfigDoc::load(&path)
-                        .map_err(internal)?
-                        .providers();
-                    if provider_config_revision(ctx, &path, &published)? != intended_revision {
-                        return Err(internal(anyhow::anyhow!(
-                            "provider publication did not converge to its intended keyed revision"
-                        )));
+                }
+                "batch" => {
+                    let path =
+                        std::path::PathBuf::from(journal.config_path.as_deref().ok_or_else(
+                            || bad_request("provider batch journal is missing target"),
+                        )?);
+                    let consumed_revision =
+                        journal.consumed_revision.as_deref().ok_or_else(|| {
+                            bad_request("provider batch journal is missing consumed revision")
+                        })?;
+                    let intended_revision =
+                        journal.intended_revision.as_deref().ok_or_else(|| {
+                            bad_request("provider batch journal is missing intended revision")
+                        })?;
+                    let expected_path =
+                        crate::config::trust::with_workspace_trust_policy(trust_policy, || {
+                            ctx.config_source()
+                                .config_write_target_for_provider(&cwd, "default")
+                        })
+                        .ok_or_else(|| bad_request("no cockpit config found"))?;
+                    let expected_path = canonical_mcp_target_path(&expected_path)?;
+                    if path != expected_path {
+                        return Err(bad_request(
+                            "provider batch journal target no longer matches its authority layer",
+                        ));
                     }
-                } else {
-                    return Err(ErrorPayload {
+                    crate::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
+                    let _file_lock = cockpit_config::config::hold_config_mutation_lock(&path)
+                        .map_err(internal)?;
+                    let mut doc =
+                        crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+                    let actual_revision = provider_config_revision(ctx, &path, &doc.providers())?;
+                    if actual_revision == intended_revision {
+                        // Publication completed before a crash. Never rewrite it;
+                        // recovery only amends the exact authenticated receipt.
+                    } else if actual_revision == consumed_revision {
+                        let payload: ProviderBatchJournalPayload =
+                            serde_json::from_str(journal.entry_json.as_deref().ok_or_else(
+                                || bad_request("provider batch journal is missing payload"),
+                            )?)
+                            .map_err(internal)?;
+                        for (provider_id, entry) in &payload.config.providers {
+                            validate_daemon_provider_url(&entry.url)?;
+                            validate_unique_provider_header_names(&entry.headers)?;
+                            ensure_provider_named_references_claimed(
+                                ctx,
+                                project_root.as_str(),
+                                entry,
+                            )
+                            .await?;
+                            ensure_provider_credential_reference_available(ctx, entry).await?;
+                            if provider_id.trim().is_empty() {
+                                return Err(bad_request(
+                                    "provider batch journal contains an empty id",
+                                ));
+                            }
+                        }
+                        doc.write(&payload.config).map_err(internal)?;
+                        let published = crate::config::providers::ConfigDoc::load(&path)
+                            .map_err(internal)?
+                            .providers();
+                        if provider_config_revision(ctx, &path, &published)? != intended_revision {
+                            return Err(internal(anyhow::anyhow!(
+                                "provider publication did not converge to its intended keyed revision"
+                            )));
+                        }
+                    } else {
+                        return Err(ErrorPayload {
                         code: ErrorCode::Conflict,
                         message: "provider journal settlement is unknown because the authority layer diverged after staging; refusing to overwrite newer configuration".into(),
                     });
+                    }
                 }
+                _ => return Err(bad_request("provider config journal has an invalid action")),
             }
-            _ => return Err(bad_request("provider config journal has an invalid action")),
         }
-        let generation = if matches!(journal.action.as_str(), "save" | "batch") {
+        let generation = if matches!(journal.action.as_str(), "save" | "delete" | "batch") {
             let consumed = journal.consumed_config_generation.ok_or_else(|| {
                 bad_request("provider journal is missing consumed config generation")
             })?;
@@ -17340,7 +17406,7 @@ pub(super) async fn recover_provider_config_journals(
             inventory::publish_committed_config_generation_at_least(intended);
             intended
         } else {
-            inventory::publish_committed_config_generation()
+            unreachable!("validated provider journal action")
         };
         let (_, _, effective) = daemon_provider_config(ctx, project_root.as_str()).await?;
         if let Some(response_json) = journal.terminal_response_json.as_mut() {
@@ -17378,6 +17444,16 @@ pub(super) async fn recover_provider_config_journals(
             serde_json::from_str(&journal.cleanup_named_json).map_err(internal)?;
         let mut credentials: std::collections::BTreeSet<String> =
             serde_json::from_str(&journal.cleanup_credential_json).map_err(internal)?;
+        if defer_secret_cleanup {
+            if !named.is_empty() || !credentials.is_empty() {
+                tracing::warn!(
+                    journal_id = %journal.journal_id,
+                    "deferred provider secret cleanup after pre-socket publication recovery"
+                );
+            }
+            named.clear();
+            credentials.clear();
+        }
         for provider in effective.providers.values() {
             let (used_named, used_credentials) = provider_owned_secret_references(provider);
             for name in used_named {
@@ -17420,7 +17496,7 @@ pub(super) async fn recover_provider_config_journals(
                 .map_err(internal)?;
             }
         }
-        if journal.action == "batch" {
+        if journal.action == "batch" && !defer_secret_cleanup {
             let payload: ProviderBatchJournalPayload = serde_json::from_str(
                 journal
                     .entry_json
@@ -17491,16 +17567,325 @@ pub(super) async fn recover_provider_config_journals(
                         &response,
                     )?;
                 }
-                conn.execute(
-                    "DELETE FROM provider_config_journals WHERE journal_id = ?1",
-                    rusqlite::params![journal_id],
-                )?;
+                if !defer_secret_cleanup {
+                    conn.execute(
+                        "DELETE FROM provider_config_journals WHERE journal_id = ?1",
+                        rusqlite::params![journal_id],
+                    )?;
+                }
                 Ok(())
             })
             .await
             .map_err(internal)?;
     }
     Ok(())
+}
+
+#[derive(Clone)]
+enum ProviderJournalFileAction {
+    Save {
+        path: std::path::PathBuf,
+        provider_id: String,
+        entry: crate::config::providers::ProviderEntry,
+        consumed_revision: String,
+        intended_revision: String,
+    },
+    Delete {
+        path: std::path::PathBuf,
+        provider_id: String,
+        consumed_revision: String,
+        intended_revision: String,
+    },
+    Batch {
+        path: std::path::PathBuf,
+        config: crate::config::providers::ProvidersConfig,
+        consumed_revision: String,
+        intended_revision: String,
+    },
+}
+
+impl ProviderJournalFileAction {
+    fn target(&self) -> &std::path::Path {
+        match self {
+            Self::Save { path, .. } | Self::Delete { path, .. } | Self::Batch { path, .. } => path,
+        }
+    }
+}
+
+async fn recover_provider_journal_file_before_socket(
+    ctx: &DaemonContext,
+    project_root: &str,
+    cwd: &std::path::Path,
+    trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
+    journal: &ProviderConfigJournal,
+    publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
+) -> std::result::Result<(), ErrorPayload> {
+    let action = match journal.action.as_str() {
+        "save" => {
+            let path = std::path::PathBuf::from(
+                journal
+                    .config_path
+                    .as_deref()
+                    .ok_or_else(|| bad_request("provider save journal is missing target"))?,
+            );
+            let expected_path =
+                crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+                    ctx.config_source()
+                        .config_write_target_for_provider(cwd, &journal.provider_id)
+                })
+                .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+            if path != canonical_mcp_target_path(&expected_path)? {
+                return Err(bad_request(
+                    "provider save journal target no longer matches its authority layer",
+                ));
+            }
+            let entry: crate::config::providers::ProviderEntry =
+                serde_json::from_str(journal.entry_json.as_deref().ok_or_else(|| {
+                    bad_request("provider save journal is missing its reference-only entry")
+                })?)
+                .map_err(internal)?;
+            validate_daemon_provider_url(&entry.url)?;
+            validate_unique_provider_header_names(&entry.headers)?;
+            ProviderJournalFileAction::Save {
+                path,
+                provider_id: journal.provider_id.clone(),
+                entry,
+                consumed_revision: journal.consumed_revision.clone().ok_or_else(|| {
+                    bad_request("provider save journal is missing consumed revision")
+                })?,
+                intended_revision: journal.intended_revision.clone().ok_or_else(|| {
+                    bad_request("provider save journal is missing intended revision")
+                })?,
+            }
+        }
+        "delete" => {
+            let path =
+                crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+                    ctx.config_source()
+                        .config_write_target_for_provider(cwd, &journal.provider_id)
+                })
+                .ok_or_else(|| bad_request("no cockpit config found"))?;
+            ProviderJournalFileAction::Delete {
+                path,
+                provider_id: journal.provider_id.clone(),
+                consumed_revision: journal.consumed_revision.clone().ok_or_else(|| {
+                    bad_request("provider delete journal is missing consumed revision")
+                })?,
+                intended_revision: journal.intended_revision.clone().ok_or_else(|| {
+                    bad_request("provider delete journal is missing intended revision")
+                })?,
+            }
+        }
+        "batch" => {
+            let path = std::path::PathBuf::from(
+                journal
+                    .config_path
+                    .as_deref()
+                    .ok_or_else(|| bad_request("provider batch journal is missing target"))?,
+            );
+            let expected_path =
+                crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+                    ctx.config_source()
+                        .config_write_target_for_provider(cwd, "default")
+                })
+                .ok_or_else(|| bad_request("no cockpit config found"))?;
+            if path != canonical_mcp_target_path(&expected_path)? {
+                return Err(bad_request(
+                    "provider batch journal target no longer matches its authority layer",
+                ));
+            }
+            let payload: ProviderBatchJournalPayload = serde_json::from_str(
+                journal
+                    .entry_json
+                    .as_deref()
+                    .ok_or_else(|| bad_request("provider batch journal is missing payload"))?,
+            )
+            .map_err(internal)?;
+            for (provider_id, entry) in &payload.config.providers {
+                if provider_id.trim().is_empty() {
+                    return Err(bad_request("provider batch journal contains an empty id"));
+                }
+                validate_daemon_provider_url(&entry.url)?;
+                validate_unique_provider_header_names(&entry.headers)?;
+            }
+            ProviderJournalFileAction::Batch {
+                path,
+                config: payload.config,
+                consumed_revision: journal.consumed_revision.clone().ok_or_else(|| {
+                    bad_request("provider batch journal is missing consumed revision")
+                })?,
+                intended_revision: journal.intended_revision.clone().ok_or_else(|| {
+                    bad_request("provider batch journal is missing intended revision")
+                })?,
+            }
+        }
+        _ => return Err(bad_request("provider config journal has an invalid action")),
+    };
+    let target = action.target().to_path_buf();
+    let vault = ctx.secret_vault.clone();
+    let classify_action = action.clone();
+    let classify_vault = vault.clone();
+    let classification = publication
+        .with_target(&target, move |_| {
+            classify_provider_journal_file(&classify_vault, &classify_action)
+                .map_err(|error| anyhow::anyhow!(error.message))
+        })
+        .await
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::Shutdown,
+            message: format!(
+                "bounded provider recovery could not acquire publication authority: {error:#}"
+            ),
+        })?;
+    match classification {
+        ProviderJournalFileClassification::Intended => return Ok(()),
+        ProviderJournalFileClassification::Diverged => {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "provider journal settlement is unknown because the authority layer diverged after staging; refusing to overwrite newer configuration".into(),
+            });
+        }
+        ProviderJournalFileClassification::Consumed => {}
+    }
+
+    // Only a consumed-state replay needs live vault/reference validation.
+    // Already-intended bytes are durable success even when credentials were
+    // later removed by another independently authorized operation.
+    match &action {
+        ProviderJournalFileAction::Save { entry, .. } => {
+            ensure_provider_named_references_claimed(ctx, project_root, entry).await?;
+            ensure_provider_credential_reference_available(ctx, entry).await?;
+        }
+        ProviderJournalFileAction::Batch { config, .. } => {
+            for entry in config.providers.values() {
+                ensure_provider_named_references_claimed(ctx, project_root, entry).await?;
+                ensure_provider_credential_reference_available(ctx, entry).await?;
+            }
+        }
+        ProviderJournalFileAction::Delete { .. } => {}
+    }
+    // Reacquire and re-CAS after async validation. A writer that moved the
+    // layer while validation ran is classified as divergence, never clobbered.
+    publication
+        .with_target(&target, move |_| {
+            reconcile_provider_journal_file(&vault, action)
+                .map_err(|error| anyhow::anyhow!(error.message))
+        })
+        .await
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::Shutdown,
+            message: format!(
+                "bounded provider recovery could not acquire publication authority: {error:#}"
+            ),
+        })
+}
+
+enum ProviderJournalFileClassification {
+    Consumed,
+    Intended,
+    Diverged,
+}
+
+fn classify_provider_journal_file(
+    vault: &crate::secure_key::SecretVault,
+    action: &ProviderJournalFileAction,
+) -> std::result::Result<ProviderJournalFileClassification, ErrorPayload> {
+    let (path, consumed, intended) = match action {
+        ProviderJournalFileAction::Save {
+            path,
+            consumed_revision,
+            intended_revision,
+            ..
+        }
+        | ProviderJournalFileAction::Delete {
+            path,
+            consumed_revision,
+            intended_revision,
+            ..
+        }
+        | ProviderJournalFileAction::Batch {
+            path,
+            consumed_revision,
+            intended_revision,
+            ..
+        } => (path, consumed_revision, intended_revision),
+    };
+    crate::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+    let doc = crate::config::providers::ConfigDoc::load(path).map_err(internal)?;
+    let actual = provider_config_revision_with_vault(vault, path, &doc.providers())?;
+    Ok(if actual == *intended {
+        ProviderJournalFileClassification::Intended
+    } else if actual == *consumed {
+        ProviderJournalFileClassification::Consumed
+    } else {
+        ProviderJournalFileClassification::Diverged
+    })
+}
+
+fn reconcile_provider_journal_file(
+    vault: &crate::secure_key::SecretVault,
+    action: ProviderJournalFileAction,
+) -> std::result::Result<(), ErrorPayload> {
+    let reconcile = |path: &std::path::Path,
+                     consumed_revision: &str,
+                     intended_revision: &str,
+                     desired: Option<crate::config::providers::ProvidersConfig>|
+     -> std::result::Result<(), ErrorPayload> {
+        crate::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+        let mut doc = crate::config::providers::ConfigDoc::load(path).map_err(internal)?;
+        let actual = provider_config_revision_with_vault(vault, path, &doc.providers())?;
+        if actual == intended_revision {
+            return Ok(());
+        }
+        if actual != consumed_revision {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "provider journal settlement is unknown because the authority layer diverged after staging; refusing to overwrite newer configuration".into(),
+            });
+        }
+        doc.write(&desired.ok_or_else(|| internal("provider recovery omitted desired config"))?)
+            .map_err(internal)?;
+        let published = crate::config::providers::ConfigDoc::load(path)
+            .map_err(internal)?
+            .providers();
+        if provider_config_revision_with_vault(vault, path, &published)? != intended_revision {
+            return Err(internal(
+                "provider publication did not converge to its intended keyed revision",
+            ));
+        }
+        Ok(())
+    };
+    match action {
+        ProviderJournalFileAction::Save {
+            path,
+            provider_id,
+            entry,
+            consumed_revision,
+            intended_revision,
+        } => {
+            let doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+            let mut desired = doc.providers();
+            desired.providers.insert(provider_id, entry);
+            reconcile(&path, &consumed_revision, &intended_revision, Some(desired))
+        }
+        ProviderJournalFileAction::Batch {
+            path,
+            config,
+            consumed_revision,
+            intended_revision,
+        } => reconcile(&path, &consumed_revision, &intended_revision, Some(config)),
+        ProviderJournalFileAction::Delete {
+            path,
+            provider_id,
+            consumed_revision,
+            intended_revision,
+        } => {
+            let doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
+            let mut layer = doc.providers();
+            layer.providers.remove(&provider_id);
+            reconcile(&path, &consumed_revision, &intended_revision, Some(layer))
+        }
+    }
 }
 
 fn settle_journaled_local_success_on_conn(
@@ -17591,6 +17976,7 @@ fn retain_only_stale_provider_credentials(
 #[cfg(any(unix, test))]
 pub(super) async fn recover_all_provider_config_journals(
     ctx: &DaemonContext,
+    publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
 ) -> std::result::Result<(), ErrorPayload> {
     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     let roots: Vec<String> = ctx
@@ -17609,7 +17995,9 @@ pub(super) async fn recover_all_provider_config_journals(
         .await
         .map_err(internal)?;
     for root in roots {
-        if let Err(error) = recover_provider_config_journals(ctx, &root, None).await {
+        if let Err(error) =
+            recover_provider_config_journals_inner(ctx, &root, None, Some(publication)).await
+        {
             if error.code == ErrorCode::Conflict {
                 tracing::error!(
                     project_root = %root,
@@ -18710,7 +19098,7 @@ async fn save_mcp_config(
         delete_owned_named_secret(ctx, &name, "mcp", project_root).await?;
     }
     let terminal_response = publish_mcp_journal_generation(ctx, &journal_id).await?;
-    delete_mcp_journal(ctx, &journal_id).await?;
+    delete_mcp_journal(ctx, &journal_id, true).await?;
     Ok(terminal_response)
 }
 
@@ -18721,6 +19109,40 @@ async fn publish_mcp_journal_generation(
     ctx: &DaemonContext,
     journal_id: &str,
 ) -> std::result::Result<Response, ErrorPayload> {
+    let lookup_id = journal_id.to_owned();
+    let terminal: Option<String> = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT receipt.terminal_outcome_json
+                   FROM mcp_config_journals journal
+                   JOIN local_operation_receipts receipt
+                     ON receipt.owner_digest=journal.owner_digest
+                    AND receipt.client_operation_id=journal.client_operation_id
+                    AND receipt.request_hash=journal.request_hash
+                    AND receipt.fencing_generation=journal.fencing_generation
+                  WHERE journal.journal_id=?1 AND receipt.state='terminal_success'",
+                rusqlite::params![lookup_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+        .map_err(internal)?;
+    if let Some(terminal) = terminal {
+        let response: Response = serde_json::from_str(&terminal).map_err(internal)?;
+        let Response::McpConfigCommitted {
+            config_generation, ..
+        } = &response
+        else {
+            return Err(internal(
+                "terminal MCP recovery receipt has the wrong response",
+            ));
+        };
+        inventory::publish_committed_config_generation_at_least(*config_generation);
+        return Ok(response);
+    }
     let journal_id = journal_id.to_owned();
     let generation = inventory::publish_committed_config_generation();
     ctx.db
@@ -18756,6 +19178,7 @@ async fn publish_mcp_journal_generation(
 async fn delete_mcp_journal(
     ctx: &DaemonContext,
     journal_id: &str,
+    retire_journal: bool,
 ) -> std::result::Result<(), ErrorPayload> {
     let journal_id = journal_id.to_owned();
     ctx.db
@@ -18790,10 +19213,12 @@ async fn delete_mcp_journal(
                 fence,
                 &response,
             )?;
-            conn.execute(
-                "DELETE FROM mcp_config_journals WHERE journal_id = ?1",
-                rusqlite::params![journal_id],
-            )?;
+            if retire_journal {
+                conn.execute(
+                    "DELETE FROM mcp_config_journals WHERE journal_id = ?1",
+                    rusqlite::params![journal_id],
+                )?;
+            }
             Ok(())
         })
         .await
@@ -19393,6 +19818,14 @@ pub(super) async fn recover_mcp_config_journals(
     ctx: &DaemonContext,
     project_root: &str,
 ) -> std::result::Result<(), ErrorPayload> {
+    recover_mcp_config_journals_inner(ctx, project_root, None).await
+}
+
+async fn recover_mcp_config_journals_inner(
+    ctx: &DaemonContext,
+    project_root: &str,
+    publication: Option<crate::daemon::config_publication_recovery::PreSocketConfigPublication>,
+) -> std::result::Result<(), ErrorPayload> {
     let root = project_root.to_owned();
     let journals: Vec<(String, String, String, String, String, String)> = ctx
         .db
@@ -19421,43 +19854,94 @@ pub(super) async fn recover_mcp_config_journals(
     for (journal_id, path, config_json, cleanup_json, consumed_revision, intended_revision) in
         journals
     {
+        let defer_secret_cleanup = publication.is_some();
         let path = std::path::PathBuf::from(path);
-        crate::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
-        let file_lock =
-            cockpit_config::config::hold_config_mutation_lock(&path).map_err(internal)?;
-        if canonical_mcp_target_path(&path)? != path {
-            return Err(ErrorPayload {
-                code: ErrorCode::Conflict,
-                message: "MCP journal target was retargeted; durable settlement remains unknown"
-                    .into(),
-            });
+        let reconcile_path = path.clone();
+        let reconcile = move || {
+            reconcile_mcp_journal_file(
+                &reconcile_path,
+                &config_json,
+                &consumed_revision,
+                &intended_revision,
+            )
+            .map_err(|error| anyhow::anyhow!(error.message))
+        };
+        if let Some(publication) = publication {
+            publication
+                .with_target(&path, move |_| reconcile())
+                .await
+                .map_err(|error| ErrorPayload {
+                    code: ErrorCode::Shutdown,
+                    message: format!(
+                        "bounded MCP recovery could not acquire publication authority: {error:#}"
+                    ),
+                })?;
+        } else {
+            tokio::task::spawn_blocking(move || {
+                let _guard =
+                    cockpit_config::config::hold_config_mutation_lock(&path).map_err(internal)?;
+                reconcile().map_err(internal)
+            })
+            .await
+            .map_err(internal)??;
         }
-        let actual_revision = mcp_target_layer_revision(&path)?;
-        if actual_revision != intended_revision && actual_revision != consumed_revision {
-            return Err(ErrorPayload {
-                code: ErrorCode::Conflict,
-                message: "MCP journal found a third-party config revision; durable settlement remains unknown"
-                    .into(),
-            });
-        }
-        crate::mcp::config::McpConfig::parse(&config_json).map_err(internal)?;
-        if actual_revision == consumed_revision {
-            write_mcp_raw_private(&path, &config_json).map_err(internal)?;
-        }
-        drop(file_lock);
         let cleanup: std::collections::BTreeSet<String> =
             serde_json::from_str(&cleanup_json).map_err(internal)?;
-        let live = mcp_global_live_secret_references(ctx, project_root).await?;
-        let _secret_lock = SECRET_OWNER_RPC_LOCK.lock().await;
-        for name in cleanup.difference(&live) {
-            if !release_named_secret_ownership(ctx, name, "mcp", project_root).await? {
-                retire_named_secret_ownership(ctx, name, "mcp", project_root).await?;
-                continue;
+        if defer_secret_cleanup {
+            // Pre-socket recovery cannot hold a synchronous config guard
+            // across the async global-reference/vault transaction. Retaining
+            // stale ownership is a bounded storage leak; deleting a secret
+            // that a concurrent config writer just made live is corruption.
+            // A later explicit owner mutation performs the ordinary locked
+            // reference sweep.
+            if !cleanup.is_empty() {
+                tracing::warn!(
+                    journal_id,
+                    count = cleanup.len(),
+                    "deferred MCP secret cleanup after pre-socket publication recovery"
+                );
             }
-            delete_owned_named_secret(ctx, name, "mcp", project_root).await?;
+        } else {
+            let live = mcp_global_live_secret_references(ctx, project_root).await?;
+            let _secret_lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            for name in cleanup.difference(&live) {
+                if !release_named_secret_ownership(ctx, name, "mcp", project_root).await? {
+                    retire_named_secret_ownership(ctx, name, "mcp", project_root).await?;
+                    continue;
+                }
+                delete_owned_named_secret(ctx, name, "mcp", project_root).await?;
+            }
         }
         publish_mcp_journal_generation(ctx, &journal_id).await?;
-        delete_mcp_journal(ctx, &journal_id).await?;
+        delete_mcp_journal(ctx, &journal_id, !defer_secret_cleanup).await?;
+    }
+    Ok(())
+}
+
+fn reconcile_mcp_journal_file(
+    path: &std::path::Path,
+    config_json: &str,
+    consumed_revision: &str,
+    intended_revision: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    crate::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+    if canonical_mcp_target_path(path)? != path {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "MCP journal target was retargeted; durable settlement remains unknown".into(),
+        });
+    }
+    let actual_revision = mcp_target_layer_revision(path)?;
+    if actual_revision != intended_revision && actual_revision != consumed_revision {
+        return Err(ErrorPayload {
+            code: ErrorCode::Conflict,
+            message: "MCP journal found a third-party config revision; durable settlement remains unknown"
+                .into(),
+        });
+    }
+    crate::mcp::config::McpConfig::parse(config_json).map_err(internal)?;
+    if actual_revision == consumed_revision {
+        write_mcp_raw_private(path, config_json).map_err(internal)?;
     }
     Ok(())
 }
@@ -19465,6 +19949,7 @@ pub(super) async fn recover_mcp_config_journals(
 #[cfg(any(unix, test))]
 pub(super) async fn recover_all_mcp_config_journals(
     ctx: &DaemonContext,
+    publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
 ) -> std::result::Result<(), ErrorPayload> {
     let roots: Vec<String> = ctx
         .db
@@ -19481,7 +19966,7 @@ pub(super) async fn recover_all_mcp_config_journals(
         .await
         .map_err(internal)?;
     for root in roots {
-        recover_mcp_config_journals(ctx, &root).await?;
+        recover_mcp_config_journals_inner(ctx, &root, Some(publication)).await?;
     }
     Ok(())
 }
@@ -19861,14 +20346,46 @@ async fn provider_config_delete_under_lock(
     let provider_id_owned = provider_id.to_string();
     let named_json = serde_json::to_string(&cleanup.0).map_err(internal)?;
     let credentials_json = serde_json::to_string(&cleanup.1).map_err(internal)?;
-    ctx.db.write(move |conn| {
-        conn.execute(
-            "INSERT INTO provider_config_journals (journal_id, project_root, provider_id, action, entry_json, cleanup_named_json, cleanup_credential_json, created_at)
-             VALUES (?1, ?2, ?3, 'delete', NULL, ?4, ?5, ?6)",
-            rusqlite::params![journal_id, project_root_owned, provider_id_owned, named_json, credentials_json, chrono::Utc::now().timestamp_millis()],
-        )?;
-        Ok(())
-    }).await.map_err(internal)?;
+    let consumed_revision = provider_config_revision(ctx, &path, &layer)?;
+    let mut intended_layer = layer.clone();
+    intended_layer.providers.remove(provider_id);
+    let intended_revision = provider_config_revision(ctx, &path, &intended_layer)?;
+    let consumed_config_generation = inventory::current_config_generation();
+    let intended_config_generation = consumed_config_generation
+        .checked_add(1)
+        .ok_or_else(|| internal("provider config generation exhausted"))?;
+    let consumed_config_generation = i64::try_from(consumed_config_generation)
+        .map_err(|_| internal("provider config generation exceeds SQLite range"))?;
+    let intended_config_generation = i64::try_from(intended_config_generation)
+        .map_err(|_| internal("provider config generation exceeds SQLite range"))?;
+    let config_path = path.to_string_lossy().into_owned();
+    ctx.db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO provider_config_journals
+             (journal_id,project_root,provider_id,action,config_path,
+              consumed_revision,intended_revision,consumed_config_generation,
+              intended_config_generation,entry_json,cleanup_named_json,
+              cleanup_credential_json,created_at)
+             VALUES (?1,?2,?3,'delete',?4,?5,?6,?7,?8,NULL,?9,?10,?11)",
+                rusqlite::params![
+                    journal_id,
+                    project_root_owned,
+                    provider_id_owned,
+                    config_path,
+                    consumed_revision,
+                    intended_revision,
+                    consumed_config_generation,
+                    intended_config_generation,
+                    named_json,
+                    credentials_json,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
     recover_provider_config_journals(ctx, project_root, Some(provider_id)).await?;
     let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
     Ok(Response::ProviderConfigUpserted {

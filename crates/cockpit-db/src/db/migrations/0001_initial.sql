@@ -6326,11 +6326,11 @@ CREATE TABLE provider_config_journals (
             AND entry_json IS NOT NULL AND json_valid(entry_json)
             AND json_type(entry_json) = 'object')
     ),
-    CHECK ((action IN ('save', 'batch')) = (config_path IS NOT NULL)
-       AND (action IN ('save', 'batch')) = (consumed_revision IS NOT NULL)
-       AND (action IN ('save', 'batch')) = (intended_revision IS NOT NULL)
-       AND (action IN ('save', 'batch')) = (consumed_config_generation IS NOT NULL)
-       AND (action IN ('save', 'batch')) = (intended_config_generation IS NOT NULL)),
+    CHECK (config_path IS NOT NULL
+       AND consumed_revision IS NOT NULL
+       AND intended_revision IS NOT NULL
+       AND consumed_config_generation IS NOT NULL
+       AND intended_config_generation IS NOT NULL),
     CHECK (consumed_config_generation IS NULL
        OR intended_config_generation = consumed_config_generation + 1),
     CHECK (config_path IS NULL OR length(trim(config_path)) > 0)

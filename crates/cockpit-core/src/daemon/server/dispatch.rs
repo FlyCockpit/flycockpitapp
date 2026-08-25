@@ -9518,13 +9518,17 @@ async fn handle_serialized_request_impl(
                     })
                 }
                 crate::db::local_operation_receipts::LocalOperationSettlement::TerminalCancelled(identity, json) => {
+                    // Validate the durable payload before returning the typed
+                    // cancellation shape, but do not also populate the error
+                    // arm: settlement terminal alternatives are exclusive.
+                    let _: ErrorPayload = serde_json::from_str(&json).map_err(internal)?;
                     Ok(Response::LocalOperationSettlement {
                         client_operation_id,
                         operation_kind: identity.operation_kind,
                         request_hash: local_operation_stored_hash_hex(&identity.request_hash)?,
                         pending: false,
                         response: None,
-                        terminal_error: Some(serde_json::from_str(&json).map_err(internal)?),
+                        terminal_error: None,
                         terminal_cancelled: true,
                     })
                 }

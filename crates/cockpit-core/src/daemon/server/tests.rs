@@ -11701,6 +11701,18 @@ fn assistant_mutations_are_owner_receipted_and_crash_recoverable() {
     );
 }
 
+#[test]
+fn local_operation_cancelled_settlement_has_one_terminal_shape() {
+    let dispatch = include_str!("dispatch.rs");
+    let cancelled = dispatch
+        .split("LocalOperationSettlement::TerminalCancelled")
+        .nth(1)
+        .and_then(|tail| tail.split("Request::BeginProviderOAuth").next())
+        .expect("cancelled local settlement arm must exist");
+    assert!(cancelled.contains("terminal_error: None"));
+    assert!(cancelled.contains("terminal_cancelled: true"));
+}
+
 #[tokio::test]
 #[cfg(feature = "remote")]
 async fn remote_owner_secret_redaction_failure_acknowledges_durable_outcome_then_poisons_daemon() {

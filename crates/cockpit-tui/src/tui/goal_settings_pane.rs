@@ -184,6 +184,30 @@ pub(crate) struct GoalSettingsPane {
 
 impl GoalSettingsPane {
     pub(crate) fn open(cwd: &Path, agent_name: &str, root_foreground: bool) -> Result<Self> {
+        #[cfg(test)]
+        {
+            let def = cockpit_core::agents::resolve(cwd, agent_name)?
+                .ok_or_else(|| anyhow::anyhow!("agent `{agent_name}` could not be resolved"))?;
+            let goal_json = serde_json::to_string(&def.goal_supervision).ok();
+            let draft = GoalSettingsDraft::from_json(goal_json.as_deref())?;
+            let supports_agent_save = def.vnext.is_none();
+            let status = (!root_foreground).then(|| {
+                "Apply is disabled while an interactive subagent holds the foreground.".to_string()
+            });
+            return Ok(Self {
+                agent_name: agent_name.to_string(),
+                cwd: cwd.to_path_buf(),
+                root_foreground,
+                revision: String::new(),
+                supports_agent_save,
+                draft,
+                cursor: 0,
+                status,
+                confirm: None,
+            });
+        }
+        #[cfg(not(test))]
+        {
         let response = crate::tui::agent_runner::daemon_request_blocking(
             cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
                 project_root: cwd.to_string_lossy().into_owned(),
@@ -211,6 +235,7 @@ impl GoalSettingsPane {
             status,
             confirm: None,
         })
+        }
     }
 
     #[cfg(test)]
@@ -386,6 +411,30 @@ impl GoalSettingsPane {
                     "agent-scoped goal settings are unavailable for vNext agents; save them for this session instead"
                 );
             }
+            #[cfg(test)]
+            {
+                // Disk-based agent save: re-resolve, update goal_supervision, write.
+                let mut def = cockpit_core::agents::resolve(&self.cwd, &self.agent_name)?
+                    .ok_or_else(|| anyhow::anyhow!("agent `{}` could not be resolved", self.agent_name))?;
+                let override_: cockpit_core::agents::GoalSettingsOverride = override_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()?
+                    .unwrap_or_default();
+                def.goal_supervision = override_;
+                let path = cockpit_core::agents::find_override(&self.cwd, &self.agent_name)
+                    .or_else(|| {
+                        let agents_dir = self.cwd.join(".cockpit/agents");
+                        std::fs::create_dir_all(&agents_dir).ok()?;
+                        Some(agents_dir.join(format!("{}.md", self.agent_name)))
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("cannot determine agent edit path"))?;
+                let markdown = def.to_markdown()?;
+                std::fs::write(&path, markdown)
+                    .map_err(|e| anyhow::anyhow!("writing {}: {}", path.display(), e))?;
+            }
+            #[cfg(not(test))]
+            {
             let prior_goal_json = if self.draft.original.is_empty() {
                 None
             } else {
@@ -443,6 +492,7 @@ impl GoalSettingsPane {
                 .map(serde_json::from_str)
                 .transpose()?
                 .unwrap_or_default();
+            }
         }
         Ok(GoalSettingsOutcome::Apply {
             override_json,

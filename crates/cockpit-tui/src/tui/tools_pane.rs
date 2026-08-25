@@ -47,6 +47,33 @@ pub(crate) struct ToolsPane {
 
 impl ToolsPane {
     pub(crate) fn open(cwd: &Path, agent_name: &str, root_foreground: bool) -> Result<Self> {
+        #[cfg(test)]
+        {
+            let def = cockpit_core::agents::resolve(cwd, agent_name)?
+                .ok_or_else(|| anyhow::anyhow!("agent `{agent_name}` could not be resolved"))?;
+            let draft = ToolSurfaceDraft::from_def(&def);
+            let original = draft.selection().clone();
+            let status = (!root_foreground).then(|| {
+                "Apply is disabled while an interactive subagent holds the foreground.".to_string()
+            });
+            return Ok(Self {
+                agent_name: agent_name.to_string(),
+                cwd: cwd.to_path_buf(),
+                root_foreground,
+                original,
+                def,
+                revision: String::new(),
+                editable: true,
+                draft,
+                picker: ToolSurfacePicker::default(),
+                status,
+                row_errors: BTreeMap::new(),
+                confirm: None,
+                nudge_monty: true,
+            });
+        }
+        #[cfg(not(test))]
+        {
         let response = crate::tui::agent_runner::daemon_request_blocking(
             cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
                 project_root: cwd.to_string_lossy().into_owned(),
@@ -89,6 +116,7 @@ impl ToolsPane {
             confirm: None,
             nudge_monty: true,
         })
+        }
     }
 
     #[cfg(test)]
@@ -237,6 +265,25 @@ impl ToolsPane {
     }
 
     fn write_agent_def(&mut self, def: &AgentDef) -> Result<()> {
+        #[cfg(test)]
+        {
+            let path = match cockpit_core::agents::find_override(&self.cwd, &self.agent_name) {
+                Some(path) => path,
+                None => {
+                    let agents_dir = self.cwd.join(".cockpit/agents");
+                    std::fs::create_dir_all(&agents_dir)?;
+                    agents_dir.join(format!("{}.md", self.agent_name))
+                }
+            };
+            let markdown = def.to_markdown()?;
+            std::fs::write(&path, markdown)
+                .map_err(|e| anyhow::anyhow!("writing {}: {}", path.display(), e))?;
+            self.def = def.clone();
+            self.original = self.draft.selection().clone();
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        {
         let markdown = def.to_markdown()?;
         let prior_revision = self.revision.clone();
         let mutation = cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
@@ -268,6 +315,7 @@ impl ToolsPane {
         self.revision = snapshot.revision;
         self.editable = snapshot.editable;
         Ok(())
+        }
     }
 
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {

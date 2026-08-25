@@ -782,35 +782,31 @@ impl CopilotSetupState {
 
     /// Ask the daemon to acquire and persist Copilot auth. The daemon returns
     /// only an acknowledgement; the TUI never receives or handles the token.
-    fn submit_daemon(&mut self, project_root: &std::path::Path, provider_id: &str) {
+    fn submit_daemon(
+        &mut self,
+        cx: &mut super::SettingsCx,
+        project_root: &std::path::Path,
+        provider_id: &str,
+    ) {
         if self.already_configured || self.outcome.is_some() || self.operation.pending().is_some() {
             return;
         }
         let operation_id = self.operation.begin();
         let project_root = project_root.display().to_string();
         let provider_id = provider_id.to_string();
-        let result = super::run_settings_daemon(async move {
-            let client = super::settings_daemon_client()
-                .await
-                .map_err(|error| error.to_string())?;
-            match client
-                .request(cockpit_core::daemon::proto::Request::SetupCopilotAuth {
-                    project_root,
-                    provider_id,
-                })
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                Ok(cockpit_core::daemon::proto::Response::Ack) => {
-                    Ok("Copilot token configured in the daemon vault".into())
-                }
-                Ok(other) => Err(format!(
-                    "unexpected daemon Copilot setup response: {other:?}"
-                )),
-                Err(error) => Err(error.to_string()),
-            }
-        });
-        self.complete(operation_id, result);
+        cx.queue_simple_mutation(
+            super::SettingsEffectTarget {
+                surface: "settings.copilot-setup",
+                owner: provider_id.clone(),
+                revision: Some(operation_id.0.to_string()),
+            },
+            cockpit_core::daemon::proto::Request::SetupCopilotAuth {
+                project_root,
+                provider_id: provider_id.clone(),
+            },
+            super::SettingsMutationAction::CopilotSetup { provider_id },
+        );
+        self.complete(operation_id, Ok("Copilot setup queued…".into()));
     }
 
     fn complete(
@@ -1790,7 +1786,7 @@ impl SettingsCx {
         .to_string()
     }
 
-    fn logout_provider_oauth(&self, provider: OAuthProvider) -> Result<(), String> {
+    fn logout_provider_oauth(&mut self, provider: OAuthProvider) -> Result<(), String> {
         let provider_id = match provider {
             OAuthProvider::Grok => cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
             OAuthProvider::Codex => cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
@@ -1804,37 +1800,19 @@ impl SettingsCx {
             .ok_or_else(|| "resolving provider logout workspace: no project context".to_string())?
             .display()
             .to_string();
-        let inventory_provider_id = provider_id.clone();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let client = super::settings_daemon_client()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                match client
-                    .request(
-                        cockpit_core::daemon::proto::Request::DeleteProviderCredential {
-                            provider_id,
-                            project_root: Some(project_root),
-                        },
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    Ok(cockpit_core::daemon::proto::Response::ProviderCredentialDeleted {
-                        ..
-                    })
-                    | Ok(cockpit_core::daemon::proto::Response::Ack) => Ok(()),
-                    Ok(other) => Err(format!(
-                        "unexpected daemon OAuth logout response: {other:?}"
-                    )),
-                    Err(error) => Err(error.to_string()),
-                }
-            })
-        });
-        if result.is_ok() {
-            self.invalidate_secret_inventory_entry(&inventory_provider_id, None);
-        }
-        result
+        self.queue_simple_mutation(
+            super::SettingsEffectTarget {
+                surface: "settings.provider-logout",
+                owner: provider_id.clone(),
+                revision: Some(uuid::Uuid::new_v4().to_string()),
+            },
+            cockpit_core::daemon::proto::Request::DeleteProviderCredential {
+                provider_id: provider_id.clone(),
+                project_root: Some(project_root),
+            },
+            super::SettingsMutationAction::ProviderCredentialDelete { provider_id },
+        );
+        Ok(())
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent, s: &mut EditState) -> Nav {
@@ -2815,7 +2793,9 @@ impl SettingsCx {
                     s.outcome = Some(Err("unable to resolve the provider workspace".into()));
                     return Nav::Stay;
                 };
-                s.submit_daemon(project_root, &parent.provider_id);
+                let project_root = project_root.to_path_buf();
+                let provider_id = parent.provider_id.clone();
+                s.submit_daemon(self, &project_root, &provider_id);
             }
             _ => {}
         }

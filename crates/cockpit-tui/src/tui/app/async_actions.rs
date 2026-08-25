@@ -261,22 +261,12 @@ impl App {
             let dialog_id = effect.dialog_id;
             let operation_id = effect.operation_id;
             let target = effect.target;
-            let request = effect.request;
+            let work = effect.work;
             self.async_actions.start(
                 AsyncActionKind::DaemonRpc("settings.effect"),
                 AsyncActionPolicy::AllowConcurrent,
                 async move {
-                    let response = async {
-                        let client = crate::tui::settings::settings_daemon_client()
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        client
-                            .request(request)
-                            .await
-                            .map_err(|error| error.to_string())?
-                            .map_err(|error| error.to_string())
-                    }
-                    .await;
+                    let response = crate::tui::settings::execute_settings_daemon_work(work).await;
                     Ok(AsyncActionPayload::SettingsDaemon(
                         crate::tui::settings::SettingsDaemonEffectCompletion {
                             dialog_id,

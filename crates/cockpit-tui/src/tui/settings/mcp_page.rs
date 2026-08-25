@@ -337,37 +337,64 @@ impl SettingsCx {
         let config_json = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
         let secret_values_json = serde_json::to_string(secret_values).map_err(|e| e.to_string())?;
         let cleanup_names_json = serde_json::to_string(cleanup_names).map_err(|e| e.to_string())?;
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let client = crate::tui::settings::settings_daemon_client()
-                    .await
-                    .map_err(|e| e.to_string())?;
-                match client
-                    .request(cockpit_core::daemon::proto::Request::SaveMcpConfig {
-                        project_root: project_root.display().to_string(),
-                        config_json,
-                        secret_values_json,
-                        cleanup_names_json,
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?
-                {
-                    Ok(cockpit_core::daemon::proto::Response::McpConfigSaved { .. }) => Ok(()),
-                    Ok(other) => Err(format!(
-                        "daemon returned unexpected MCP save response: {other:?}"
-                    )),
-                    Err(error) => Err(format!("daemon rejected MCP config save: {error}")),
-                }
-            })
-        });
-        if result.is_ok() {
-            self.invalidate_secret_inventory();
-            self.mcp_config = cfg.clone();
-        }
-        result
+        let owner = project_root.display().to_string();
+        self.queue_simple_mutation(
+            super::SettingsEffectTarget {
+                surface: "settings.mcp-save",
+                owner: owner.clone(),
+                revision: Some(uuid::Uuid::new_v4().to_string()),
+            },
+            cockpit_core::daemon::proto::Request::SaveMcpConfig {
+                project_root: owner,
+                config_json,
+                secret_values_json,
+                cleanup_names_json,
+            },
+            super::SettingsMutationAction::McpSave(cfg.clone()),
+        );
+        self.extended_warnings = vec!["saving MCP settings…".into()];
+        Ok(())
     }
 
     fn handle_mcp_list_key(&mut self, key: KeyEvent, s: &mut ListState) -> Nav {
+        if let Some(completion) = self.pending_mcp_oauth.take() {
+            match completion {
+                super::PendingMcpOAuth::Started {
+                    server,
+                    flow_id,
+                    authorize_url,
+                } => {
+                    s.oauth = Some(McpOAuthState {
+                        server,
+                        flow_id,
+                        authorize_url,
+                        callback: TextField::default(),
+                        status: None,
+                    });
+                    s.status = Some(
+                        "open the authorize URL, then paste the callback or code below".into(),
+                    );
+                }
+                super::PendingMcpOAuth::Completed { server, flow_id } => {
+                    if s.oauth
+                        .as_ref()
+                        .is_some_and(|flow| flow.server == server && flow.flow_id == flow_id)
+                    {
+                        s.oauth = None;
+                    }
+                    s.status = Some(format!("authenticated `{server}`"));
+                }
+                super::PendingMcpOAuth::Cancelled { server, flow_id } => {
+                    if s.oauth
+                        .as_ref()
+                        .is_some_and(|flow| flow.server == server && flow.flow_id == flow_id)
+                    {
+                        s.oauth = None;
+                    }
+                    s.status = Some(format!("cancelled MCP OAuth for `{server}`"));
+                }
+            }
+        }
         let cfg = self.load_mcp();
         let names: Vec<String> = cfg.servers.keys().cloned().collect();
         let row_count = names.len() + 1; // + [+ add server]
@@ -376,24 +403,22 @@ impl SettingsCx {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     let flow_id = flow.flow_id.clone();
-                    let result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            let client = crate::tui::settings::settings_daemon_client().await?;
-                            client
-                                .request(cockpit_core::daemon::proto::Request::CancelMcpOAuth {
-                                    flow_id,
-                                })
-                                .await?
-                                .map_err(|error| anyhow::anyhow!(error))
-                        })
-                    });
-                    s.status = Some(match result {
-                        Ok(cockpit_core::daemon::proto::Response::McpOAuthCancelled {
-                            cancelled: true,
-                        }) => format!("cancelled MCP OAuth for `{}`", flow.server),
-                        Ok(_) => "MCP OAuth cancelled".into(),
-                        Err(error) => format!("OAuth cancellation failed: {error}"),
-                    });
+                    self.queue_simple_mutation(
+                        super::SettingsEffectTarget {
+                            surface: "settings.mcp-oauth-cancel",
+                            owner: flow.server.clone(),
+                            revision: Some(flow_id.clone()),
+                        },
+                        cockpit_core::daemon::proto::Request::CancelMcpOAuth {
+                            flow_id: flow_id.clone(),
+                        },
+                        super::SettingsMutationAction::McpOAuthCancel {
+                            server: flow.server.clone(),
+                            flow_id,
+                        },
+                    );
+                    s.oauth = Some(flow);
+                    s.status = Some("cancelling MCP OAuth…".into());
                 }
                 KeyCode::Enter => {
                     let input = flow.callback.text().trim().to_string();
@@ -405,28 +430,23 @@ impl SettingsCx {
                         return Nav::Stay;
                     }
                     let flow_id = flow.flow_id.clone();
-                    let result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            let client = crate::tui::settings::settings_daemon_client().await?;
-                            client
-                                .request(cockpit_core::daemon::proto::Request::CompleteMcpOAuth {
-                                    flow_id,
-                                    input: Some(input),
-                                })
-                                .await?
-                                .map_err(|error| anyhow::anyhow!(error))
-                        })
-                    });
-                    s.status = Some(match result {
-                        Ok(cockpit_core::daemon::proto::Response::McpOAuthCompleted {
-                            authenticated: true,
-                        }) => {
-                            self.invalidate_secret_inventory();
-                            format!("authenticated `{}`", flow.server)
-                        }
-                        Ok(other) => format!("unexpected MCP OAuth response: {other:?}"),
-                        Err(error) => format!("auth failed: {error}"),
-                    });
+                    self.queue_simple_mutation(
+                        super::SettingsEffectTarget {
+                            surface: "settings.mcp-oauth-complete",
+                            owner: flow.server.clone(),
+                            revision: Some(flow_id.clone()),
+                        },
+                        cockpit_core::daemon::proto::Request::CompleteMcpOAuth {
+                            flow_id: flow_id.clone(),
+                            input: Some(input),
+                        },
+                        super::SettingsMutationAction::McpOAuthComplete {
+                            server: flow.server.clone(),
+                            flow_id,
+                        },
+                    );
+                    flow.status = Some("completing authentication…".into());
+                    s.oauth = Some(flow);
                 }
                 _ => {
                     flow.callback.handle_key(key);
@@ -485,44 +505,19 @@ impl SettingsCx {
                             .clone()
                             .or_else(|| std::env::current_dir().ok())
                             .unwrap_or_else(|| std::path::PathBuf::from("."));
-                        let res = tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                let client = crate::tui::settings::settings_daemon_client().await?;
-                                let started = client
-                                    .request(cockpit_core::daemon::proto::Request::BeginMcpOAuth {
-                                        project_root: project_root.display().to_string(),
-                                        server: name.clone(),
-                                    })
-                                    .await?
-                                    .map_err(|error| anyhow::anyhow!(error))?;
-                                let cockpit_core::daemon::proto::Response::McpOAuthStarted {
-                                    flow_id,
-                                    authorize_url,
-                                } = started
-                                else {
-                                    anyhow::bail!(
-                                        "daemon returned unexpected MCP OAuth start response"
-                                    );
-                                };
-                                Ok((flow_id, authorize_url))
-                            })
-                        });
-                        match res {
-                            Ok((flow_id, authorize_url)) => {
-                                s.oauth = Some(McpOAuthState {
-                                    server: name,
-                                    flow_id,
-                                    authorize_url,
-                                    callback: TextField::default(),
-                                    status: None,
-                                });
-                                s.status = Some(
-                                    "open the authorize URL, then paste the callback or code below"
-                                        .into(),
-                                );
-                            }
-                            Err(e) => s.status = Some(format!("auth failed: {e}")),
-                        }
+                        self.queue_simple_mutation(
+                            super::SettingsEffectTarget {
+                                surface: "settings.mcp-oauth-begin",
+                                owner: name.clone(),
+                                revision: None,
+                            },
+                            cockpit_core::daemon::proto::Request::BeginMcpOAuth {
+                                project_root: project_root.display().to_string(),
+                                server: name.clone(),
+                            },
+                            super::SettingsMutationAction::McpOAuthBegin { server: name },
+                        );
+                        s.status = Some("starting MCP OAuth…".into());
                     } else {
                         s.status = Some("server uses no OAuth — nothing to authenticate".into());
                     }

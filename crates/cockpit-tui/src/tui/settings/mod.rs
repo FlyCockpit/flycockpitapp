@@ -107,7 +107,96 @@ pub(crate) struct SettingsDaemonEffectRequest {
     pub(crate) dialog_id: uuid::Uuid,
     pub(crate) operation_id: uuid::Uuid,
     pub(crate) target: SettingsEffectTarget,
-    pub(crate) request: Request,
+    pub(crate) work: SettingsDaemonEffectWork,
+}
+
+#[derive(Debug)]
+pub(crate) enum SettingsDaemonEffectWork {
+    Request(Request),
+    ProviderMutation(ProviderMutationPlan),
+}
+
+#[derive(Debug)]
+pub(crate) struct ProviderMutationPlan {
+    project_root: String,
+    saves: Vec<(String, ProviderEntry, Vec<Option<String>>)>,
+    deletes: Vec<(String, bool)>,
+    metadata: Option<(
+        BTreeMap<String, cockpit_config::config::providers::ProviderModelRef>,
+        OnUnlistedModelsFetch,
+    )>,
+}
+
+pub(crate) async fn execute_settings_daemon_work(
+    work: SettingsDaemonEffectWork,
+) -> Result<Response, String> {
+    let client = settings_daemon_client()
+        .await
+        .map_err(|error| error.to_string())?;
+    match work {
+        SettingsDaemonEffectWork::Request(request) => client
+            .request(request)
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string()),
+        SettingsDaemonEffectWork::ProviderMutation(plan) => {
+            let mut final_response = None;
+            for (provider_id, entry, header_secrets) in plan.saves {
+                let response = client
+                    .request(Request::SaveProviderConfig {
+                        project_root: plan.project_root.clone(),
+                        provider_id,
+                        entry,
+                        header_secrets,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+                if !matches!(response, Response::ProviderConfigUpserted { .. }) {
+                    return Err(format!(
+                        "unexpected daemon provider-save response: {response:?}"
+                    ));
+                }
+                final_response = Some(response);
+            }
+            for (provider_id, delete_stored_secrets) in plan.deletes {
+                let response = client
+                    .request(Request::DeleteProviderConfig {
+                        project_root: plan.project_root.clone(),
+                        provider_id,
+                        delete_stored_secrets,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+                if !matches!(response, Response::ProviderConfigUpserted { .. }) {
+                    return Err(format!(
+                        "unexpected daemon provider-delete response: {response:?}"
+                    ));
+                }
+                final_response = Some(response);
+            }
+            if let Some((category_defaults, on_unlisted_models_fetch)) = plan.metadata {
+                let response = client
+                    .request(Request::SetProviderLayerMetadata {
+                        project_root: plan.project_root,
+                        category_defaults_json: serde_json::to_string(&category_defaults)
+                            .map_err(|error| error.to_string())?,
+                        on_unlisted_models_fetch,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+                if !matches!(response, Response::ProviderConfigUpserted { .. }) {
+                    return Err(format!(
+                        "unexpected daemon provider-metadata response: {response:?}"
+                    ));
+                }
+                final_response = Some(response);
+            }
+            final_response.ok_or_else(|| "provider mutation contained no changes".to_string())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -384,9 +473,44 @@ enum PendingSettingsOperation {
         project_root: String,
         provider_id: Option<String>,
     },
+    ProviderMutation {
+        target: SettingsEffectTarget,
+        staged_default: Option<cockpit_config::config::providers::ActiveModelRef>,
+        notice: Option<String>,
+    },
     Followup {
         label: &'static str,
         target: SettingsEffectTarget,
+    },
+    SimpleMutation {
+        target: SettingsEffectTarget,
+        action: SettingsMutationAction,
+    },
+}
+
+enum SettingsMutationAction {
+    McpSave(cockpit_core::mcp::config::McpConfig),
+    McpOAuthBegin { server: String },
+    McpOAuthComplete { server: String, flow_id: String },
+    McpOAuthCancel { server: String, flow_id: String },
+    ProviderCredentialDelete { provider_id: String },
+    ProviderCredentialPut { provider_id: String },
+    CopilotSetup { provider_id: String },
+}
+
+enum PendingMcpOAuth {
+    Started {
+        server: String,
+        flow_id: String,
+        authorize_url: String,
+    },
+    Completed {
+        server: String,
+        flow_id: String,
+    },
+    Cancelled {
+        server: String,
+        flow_id: String,
     },
 }
 
@@ -1387,6 +1511,7 @@ pub struct SettingsCx {
     dialog_id: uuid::Uuid,
     daemon_effects: VecDeque<SettingsDaemonEffectRequest>,
     pending_settings: BTreeMap<uuid::Uuid, PendingSettingsOperation>,
+    pending_mcp_oauth: Option<PendingMcpOAuth>,
     after_extended_commit: Vec<(SettingsEffectTarget, Request, &'static str)>,
     pub config_path: PathBuf,
     /// Path to the cockpit-only config keys. Same `config.json` as
@@ -1494,13 +1619,42 @@ impl SettingsCx {
             dialog_id: self.dialog_id,
             operation_id,
             target,
-            request,
+            work: SettingsDaemonEffectWork::Request(request),
+        });
+        operation_id
+    }
+
+    fn enqueue_daemon_work(
+        &mut self,
+        target: SettingsEffectTarget,
+        work: SettingsDaemonEffectWork,
+    ) -> uuid::Uuid {
+        let operation_id = uuid::Uuid::new_v4();
+        self.daemon_effects.push_back(SettingsDaemonEffectRequest {
+            dialog_id: self.dialog_id,
+            operation_id,
+            target,
+            work,
         });
         operation_id
     }
 
     fn take_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
         self.daemon_effects.pop_front()
+    }
+
+    fn queue_simple_mutation(
+        &mut self,
+        target: SettingsEffectTarget,
+        request: Request,
+        action: SettingsMutationAction,
+    ) -> uuid::Uuid {
+        let operation_id = self.enqueue_daemon_effect(target.clone(), request);
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::SimpleMutation { target, action },
+        );
+        operation_id
     }
 
     fn queue_extended_load(&mut self) {
@@ -1709,6 +1863,32 @@ impl SettingsCx {
                     Err(error) => self.extended_warnings = vec![format!("load failed: {error}")],
                 }
             }
+            PendingSettingsOperation::ProviderMutation {
+                target,
+                staged_default,
+                notice,
+            } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                match completion.response {
+                    Ok(Response::ProviderConfigUpserted { config }) => {
+                        let mut authoritative = providers_config_from_view(&config);
+                        authoritative.active_model = staged_default;
+                        self.config = authoritative.clone();
+                        self.original_config = authoritative;
+                        self.last_secret_notice = notice;
+                        self.extended_warnings = vec!["provider settings committed".into()];
+                    }
+                    Ok(other) => {
+                        self.extended_warnings =
+                            vec![format!("unexpected provider mutation response: {other:?}")]
+                    }
+                    Err(error) => {
+                        self.extended_warnings = vec![format!("provider save failed: {error}")]
+                    }
+                }
+            }
             PendingSettingsOperation::ProviderCatalog {
                 project_root,
                 provider_id,
@@ -1895,6 +2075,85 @@ impl SettingsCx {
                     self.extended_warnings
                         .push(format!("{label} failed after settings committed: {error}"));
                 }
+            }
+            PendingSettingsOperation::SimpleMutation { target, action } => {
+                if completion.target != target {
+                    return Ok(());
+                }
+                let result = match (action, completion.response) {
+                    (
+                        SettingsMutationAction::McpSave(config),
+                        Ok(Response::McpConfigSaved { .. }),
+                    ) => {
+                        self.mcp_config = config;
+                        self.invalidate_secret_inventory();
+                        Ok("MCP settings committed".to_string())
+                    }
+                    (
+                        SettingsMutationAction::McpOAuthBegin { server },
+                        Ok(Response::McpOAuthStarted {
+                            flow_id,
+                            authorize_url,
+                        }),
+                    ) => {
+                        self.pending_mcp_oauth = Some(PendingMcpOAuth::Started {
+                            server,
+                            flow_id,
+                            authorize_url,
+                        });
+                        Ok("MCP OAuth started; open the authorization URL".to_string())
+                    }
+                    (
+                        SettingsMutationAction::McpOAuthComplete { server, flow_id },
+                        Ok(Response::McpOAuthCompleted {
+                            authenticated: true,
+                        }),
+                    ) => {
+                        self.invalidate_secret_inventory();
+                        self.pending_mcp_oauth =
+                            Some(PendingMcpOAuth::Completed { server, flow_id });
+                        Ok("MCP OAuth authenticated".to_string())
+                    }
+                    (
+                        SettingsMutationAction::McpOAuthCancel { server, flow_id },
+                        Ok(Response::McpOAuthCancelled { cancelled: true }),
+                    ) => {
+                        self.pending_mcp_oauth =
+                            Some(PendingMcpOAuth::Cancelled { server, flow_id });
+                        Ok("MCP OAuth cancelled".to_string())
+                    }
+                    (
+                        SettingsMutationAction::ProviderCredentialDelete { provider_id },
+                        Ok(Response::ProviderCredentialDeleted { .. } | Response::Ack),
+                    ) => {
+                        self.invalidate_secret_inventory_entry(&provider_id, None);
+                        Ok(format!("signed out of {provider_id}"))
+                    }
+                    (
+                        SettingsMutationAction::ProviderCredentialPut { provider_id },
+                        Ok(Response::Ack),
+                    ) => {
+                        self.invalidate_secret_inventory_entry(
+                            &provider_id,
+                            Some(
+                                cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord,
+                            ),
+                        );
+                        Ok(format!("stored credential for {provider_id}"))
+                    }
+                    (SettingsMutationAction::CopilotSetup { provider_id }, Ok(Response::Ack)) => {
+                        self.invalidate_secret_inventory_entry(&provider_id, None);
+                        Ok("Copilot token configured in the daemon vault".to_string())
+                    }
+                    (_, Ok(other)) => {
+                        Err(format!("unexpected settings mutation response: {other:?}"))
+                    }
+                    (_, Err(error)) => Err(error),
+                };
+                self.extended_warnings = vec![match result {
+                    Ok(status) => status,
+                    Err(error) => format!("settings operation failed: {error}"),
+                }];
             }
         }
         Ok(())
@@ -3503,6 +3762,7 @@ impl SettingsDialog {
                 dialog_id: uuid::Uuid::new_v4(),
                 daemon_effects: VecDeque::new(),
                 pending_settings: BTreeMap::new(),
+                pending_mcp_oauth: None,
                 after_extended_commit: Vec::new(),
                 config_path,
                 extended_path,
@@ -3609,28 +3869,7 @@ impl SettingsDialog {
     }
 
     fn save_config(&mut self) -> Result<(), String> {
-        let mut merged = self.config.clone();
-        for (provider_id, entry) in &merged.providers {
-            cockpit_config::config::providers::validate_provider_headers(
-                provider_id,
-                &entry.headers,
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        let notice = self.protect_provider_literal_headers(&mut merged.providers)?;
-        // The layer-wide default is never part of this file write; it goes to
-        // the daemon's authoritative effective-default operation, and the
-        // dialog only shows the new value once that verified result arrives.
-        self.stage_default_model_change();
-        let authoritative = self.upsert_provider_config_via_daemon(&merged)?;
-        // The daemon response is the only post-save source of truth.  It is
-        // deliberately redacted, so replacing the editor state here also
-        // guarantees that a literal header cannot be retained or rotated on
-        // the next save.
-        self.config = authoritative.clone();
-        self.original_config = authoritative;
-        self.last_secret_notice = notice.map(|notice| notice.render());
-        Ok(())
+        self.cx.save_config()
     }
 
     fn delete_provider_and_stored_secrets(
@@ -3638,39 +3877,8 @@ impl SettingsDialog {
         provider_id: &str,
         delete_stored_secrets: bool,
     ) -> Result<usize, String> {
-        // The daemon performs secret cleanup and config deletion as one
-        // retry-safe composite. Do not remove the local row or issue separate
-        // secret RPCs before this succeeds: a failed cleanup must leave the
-        // config as durable intent for the next attempt.
-        let project_root = self
-            .active_project_root
-            .as_deref()
-            .or(self.picker_cwd.as_deref())
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok())
-            .ok_or_else(|| "provider delete requires a project context".to_string())?;
-        run_settings_daemon(async {
-            let client = settings_daemon_client()
-                .await
-                .map_err(|error| error.to_string())?;
-            match client
-                .request(Request::DeleteProviderConfig {
-                    project_root: project_root.display().to_string(),
-                    provider_id: provider_id.to_string(),
-                    delete_stored_secrets,
-                })
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                Ok(Response::ProviderConfigUpserted { .. }) => Ok(()),
-                Ok(other) => Err(format!(
-                    "unexpected daemon provider-delete response: {other:?}"
-                )),
-                Err(error) => Err(error.to_string()),
-            }
-        })?;
-        self.config.providers.remove(provider_id);
-        Ok(0)
+        self.cx
+            .delete_provider_and_stored_secrets(provider_id, delete_stored_secrets)
     }
 
     fn tick(&mut self) {
@@ -4778,9 +4986,10 @@ impl SettingsCx {
     /// adjacent credentials: the daemon has the trust-aware write target and
     /// can refresh its authoritative snapshot atomically with the mutation.
     fn upsert_provider_config_via_daemon(
-        &self,
+        &mut self,
         config: &ProvidersConfig,
-    ) -> Result<ProvidersConfig, String> {
+        notice: Option<String>,
+    ) -> Result<(), String> {
         let project_root = self
             .active_project_root
             .as_deref()
@@ -4791,7 +5000,7 @@ impl SettingsCx {
         // `config` is the dialog's effective view in some launch paths. Send
         // only the user's edit intent: unchanged inherited providers must not
         // be re-upserted into the defining layer and shadow the global entry.
-        let providers = config
+        let saves = config
             .providers
             .iter()
             .filter(|(provider_id, entry)| {
@@ -4800,14 +5009,31 @@ impl SettingsCx {
                     .get(*provider_id)
                     .is_none_or(|original| !provider_entries_equal(original, entry))
             })
-            .map(|(provider_id, entry)| (provider_id.clone(), entry.clone()))
+            .map(|(provider_id, entry)| {
+                let header_secrets = entry
+                    .headers
+                    .iter()
+                    .map(|header| {
+                        let value = header.value.trim();
+                        (!value.is_empty()
+                            && !value.starts_with('$')
+                            && !cockpit_config::config::providers::is_safe_provider_header_reference(
+                                &header.name.to_ascii_lowercase(),
+                                value,
+                            )
+                            && !secret_display::is_mask_value(value))
+                        .then(|| header.value.clone())
+                    })
+                    .collect();
+                (provider_id.clone(), entry.clone(), header_secrets)
+            })
             .collect::<Vec<_>>();
-        let deleted = self
+        let deletes = self
             .original_config
             .providers
             .keys()
             .filter(|provider_id| !config.providers.contains_key(*provider_id))
-            .cloned()
+            .map(|provider_id| (provider_id.clone(), false))
             .collect::<Vec<_>>();
         let category_defaults = config.category_defaults.clone();
         let on_unlisted_models_fetch = config
@@ -4815,113 +5041,41 @@ impl SettingsCx {
             .unwrap_or(OnUnlistedModelsFetch::Keep);
         let metadata_changed = config.category_defaults != self.original_config.category_defaults
             || config.on_unlisted_models_fetch != self.original_config.on_unlisted_models_fetch;
-        run_settings_daemon(async move {
-            let client = settings_daemon_client()
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut authoritative = None;
-            for (provider_id, entry) in providers {
-                let header_secrets = entry
-                        .headers
-                        .iter()
-                        .map(|header| {
-                            let value = header.value.trim();
-                            (!value.is_empty()
-                                && !value.starts_with('$')
-                                && !cockpit_config::config::providers::is_safe_provider_header_reference(
-                                    &header.name.to_ascii_lowercase(),
-                                    value,
-                                )
-                                && !secret_display::is_mask_value(value))
-                            .then(|| header.value.clone())
-                        })
-                        .collect();
-                match client
-                    .request(Request::SaveProviderConfig {
-                        project_root: project_root.display().to_string(),
-                        provider_id,
-                        entry,
-                        header_secrets,
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    Ok(cockpit_core::daemon::proto::Response::ProviderConfigUpserted {
-                        config,
-                    }) => authoritative = Some(config),
-                    Ok(other) => {
-                        return Err(format!(
-                            "unexpected daemon provider-config response: {other:?}"
-                        ));
-                    }
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-            for provider_id in deleted {
-                match client
-                    .request(Request::DeleteProviderConfig {
-                        project_root: project_root.display().to_string(),
-                        provider_id,
-                        delete_stored_secrets: false,
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    Ok(cockpit_core::daemon::proto::Response::ProviderConfigUpserted {
-                        config,
-                    }) => authoritative = Some(config),
-                    Ok(other) => {
-                        return Err(format!(
-                            "unexpected daemon provider-delete response: {other:?}"
-                        ));
-                    }
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-            if !metadata_changed {
-                let mut effective = authoritative
-                    .as_ref()
-                    .map(providers_config_from_view)
-                    .unwrap_or_else(|| config.clone());
-                // A provider-config save must never publish the staged
-                // default-model edit. That change is confirmed only by
-                // the separately queued SetDefaultModel request.
-                effective.active_model = self.original_config.active_model.clone();
-                return Ok::<ProvidersConfig, String>(effective);
-            }
-            match client
-                .request(Request::SetProviderLayerMetadata {
-                    project_root: project_root.display().to_string(),
-                    category_defaults_json: serde_json::to_string(&category_defaults)
-                        .map_err(|error| error.to_string())?,
-                    on_unlisted_models_fetch,
-                })
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                Ok(cockpit_core::daemon::proto::Response::ProviderConfigUpserted { config }) => {
-                    authoritative = Some(config)
-                }
-                Ok(other) => {
-                    return Err(format!(
-                        "unexpected daemon provider-metadata response: {other:?}"
-                    ));
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-            let mut effective = authoritative
-                .as_ref()
-                .map(providers_config_from_view)
-                .unwrap_or_else(|| config.clone());
-            // See the early return above: layer metadata persistence is
-            // not confirmation of the pending default-model mutation.
-            effective.active_model = self.original_config.active_model.clone();
-            Ok::<ProvidersConfig, String>(effective)
-        })
+        if saves.is_empty() && deletes.is_empty() && !metadata_changed {
+            return Ok(());
+        }
+        let target = SettingsEffectTarget {
+            surface: "settings.provider-mutation",
+            owner: project_root.display().to_string(),
+            revision: Some(format!(
+                "generation:{}",
+                self.original_config.resolution_generation
+            )),
+        };
+        let plan = ProviderMutationPlan {
+            project_root: project_root.display().to_string(),
+            saves,
+            deletes,
+            metadata: metadata_changed.then_some((category_defaults, on_unlisted_models_fetch)),
+        };
+        let operation_id = self.enqueue_daemon_work(
+            target.clone(),
+            SettingsDaemonEffectWork::ProviderMutation(plan),
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ProviderMutation {
+                target,
+                staged_default: self.original_config.active_model.clone(),
+                notice,
+            },
+        );
+        self.extended_warnings = vec!["saving provider settings…".into()];
+        Ok(())
     }
 
     fn delete_provider_config_via_daemon(
-        &self,
+        &mut self,
         provider_id: String,
         delete_stored_secrets: bool,
     ) -> Result<(), String> {
@@ -4932,26 +5086,32 @@ impl SettingsCx {
             .map(std::path::Path::to_path_buf)
             .or_else(|| std::env::current_dir().ok())
             .ok_or_else(|| "provider delete requires a project context".to_string())?;
-        run_settings_daemon(async move {
-            let client = settings_daemon_client()
-                .await
-                .map_err(|error| error.to_string())?;
-            match client
-                .request(Request::DeleteProviderConfig {
-                    project_root: project_root.display().to_string(),
-                    provider_id,
-                    delete_stored_secrets,
-                })
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                Ok(cockpit_core::daemon::proto::Response::ProviderConfigUpserted { .. }) => Ok(()),
-                Ok(other) => Err(format!(
-                    "unexpected daemon provider-delete response: {other:?}"
-                )),
-                Err(error) => Err(error.to_string()),
-            }
-        })
+        let target = SettingsEffectTarget {
+            surface: "settings.provider-delete",
+            owner: provider_id.clone(),
+            revision: Some(format!(
+                "generation:{}",
+                self.original_config.resolution_generation
+            )),
+        };
+        let operation_id = self.enqueue_daemon_work(
+            target.clone(),
+            SettingsDaemonEffectWork::ProviderMutation(ProviderMutationPlan {
+                project_root: project_root.display().to_string(),
+                saves: Vec::new(),
+                deletes: vec![(provider_id, delete_stored_secrets)],
+                metadata: None,
+            }),
+        );
+        self.pending_settings.insert(
+            operation_id,
+            PendingSettingsOperation::ProviderMutation {
+                target,
+                staged_default: self.original_config.active_model.clone(),
+                notice: None,
+            },
+        );
+        Ok(())
     }
 
     fn save_config(&mut self) -> Result<(), String> {
@@ -4961,15 +5121,7 @@ impl SettingsCx {
         // the daemon's authoritative effective-default operation, and the
         // dialog only shows the new value once that verified result arrives.
         self.stage_default_model_change();
-        let authoritative = self.upsert_provider_config_via_daemon(&merged)?;
-        // Provider-layer persistence is not confirmation of the separately
-        // staged default-model mutation. Keep the daemon view, which still
-        // contains the previously verified default, until that operation
-        // completes.
-        self.config = authoritative.clone();
-        self.original_config = authoritative;
-        self.last_secret_notice = notice.map(|notice| notice.render());
-        Ok(())
+        self.upsert_provider_config_via_daemon(&merged, notice.map(|notice| notice.render()))
     }
 
     fn delete_provider_and_stored_secrets(
@@ -4978,7 +5130,6 @@ impl SettingsCx {
         delete_stored_secrets: bool,
     ) -> Result<usize, String> {
         self.delete_provider_config_via_daemon(provider_id.to_string(), delete_stored_secrets)?;
-        self.config.providers.remove(provider_id);
         Ok(0)
     }
 }

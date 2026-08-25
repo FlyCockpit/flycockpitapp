@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use crate::tui::settings::secret_display::{MASKED_VALUE, mask_value};
 use crate::tui::textfield::TextField;
 use cockpit_config::extended::{ToolCommandTemplate, WebConfig, WebProvider as ConfigWebProvider};
-use cockpit_core::daemon::proto::{Request, Response, SecretInventoryKind};
+use cockpit_core::daemon::proto::{Request, SecretInventoryKind};
 use cockpit_core::engine::builtin::{builtin_tool_inventory, is_reserved_custom_tool_name};
 use cockpit_core::mcp::cache;
 use cockpit_core::mcp::protocol::{ToolDescriptor, sanitize_tool_descriptor};
@@ -453,37 +453,23 @@ impl SettingsCx {
             .or_else(|| self.stored_web_key(provider).map(|_| WebKeyStatus::Stored))
     }
 
-    fn save_web_api_key(&self, provider: WebKeyProvider, key: &str) -> Result<(), String> {
+    fn save_web_api_key(&mut self, provider: WebKeyProvider, key: &str) -> Result<(), String> {
         let provider_id = web_key_provider_id(provider).to_string();
         let record = serde_json::json!({ "api_key": key }).to_string();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let client = crate::tui::settings::settings_daemon_client()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                match client
-                    .request(Request::PutProviderCredential {
-                        provider_id,
-                        record,
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    Ok(Response::Ack) => Ok(()),
-                    Ok(other) => Err(format!(
-                        "daemon returned unexpected web credential response: {other:?}"
-                    )),
-                    Err(error) => Err(format!("daemon rejected web credential: {error}")),
-                }
-            })
-        });
-        if result.is_ok() {
-            self.invalidate_secret_inventory_entry(
-                web_key_provider_id(provider),
-                Some(SecretInventoryKind::CredentialRecord),
-            );
-        }
-        result
+        self.queue_simple_mutation(
+            super::SettingsEffectTarget {
+                surface: "settings.web-credential",
+                owner: provider_id.clone(),
+                revision: Some(uuid::Uuid::new_v4().to_string()),
+            },
+            Request::PutProviderCredential {
+                provider_id: provider_id.clone(),
+                record,
+            },
+            super::SettingsMutationAction::ProviderCredentialPut { provider_id },
+        );
+        self.extended_warnings = vec!["saving web credential…".into()];
+        Ok(())
     }
 
     fn tools_page_rows(&self) -> Vec<ToolRow> {

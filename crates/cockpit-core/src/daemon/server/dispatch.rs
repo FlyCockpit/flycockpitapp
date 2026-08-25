@@ -1856,10 +1856,11 @@ async fn mutate_owner_vault_item_with_remote_ledger(
         .transaction(move |conn| {
             match plaintext.as_deref() {
                 Some(value) => {
-                    let unchanged = vault
-                        .get_item_on_conn(conn, kind, &item_id)
-                        .map(|current| current.as_slice() == value)
-                        .unwrap_or(false);
+                    let unchanged = match vault.get_item_on_conn(conn, kind, &item_id) {
+                        Ok(current) => current.as_slice() == value,
+                        Err(crate::secure_key::SecureKeyError::NotFound(_)) => false,
+                        Err(error) => return Err(anyhow::anyhow!(error)),
+                    };
                     if !unchanged {
                         vault
                             .put_item_on_conn(conn, kind, &item_id, value)
@@ -1867,10 +1868,12 @@ async fn mutate_owner_vault_item_with_remote_ledger(
                     }
                 }
                 None => {
-                    if vault.get_item_on_conn(conn, kind, &item_id).is_ok() {
-                        vault
+                    match vault.get_item_on_conn(conn, kind, &item_id) {
+                        Ok(_) => vault
                             .delete_item_on_conn(conn, kind, &item_id)
-                            .map_err(|error| anyhow::anyhow!(error))?;
+                            .map_err(|error| anyhow::anyhow!(error))?,
+                        Err(crate::secure_key::SecureKeyError::NotFound(_)) => {}
+                        Err(error) => return Err(anyhow::anyhow!(error)),
                     }
                 }
             }
@@ -8609,22 +8612,24 @@ async fn handle_serialized_request_impl(
                 let credential_record_id = provider.credential_ref.clone().ok_or_else(|| {
                     bad_request(format!("provider `{provider_id}` has no credential_ref"))
                 })?;
-                let credential_present = ctx
-                    .secret_vault
-                    .get_item(
-                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                        &credential_record_id,
-                    )
-                    .is_ok();
+                let credential_present = match ctx.secret_vault.get_item(
+                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                    &credential_record_id,
+                ) {
+                    Ok(_) => true,
+                    Err(crate::secure_key::SecureKeyError::NotFound(_)) => false,
+                    Err(error) => return Err(internal(anyhow::anyhow!(error))),
+                };
                 (credential_record_id, credential_present)
             } else {
-                let credential_present = ctx
-                    .secret_vault
-                    .get_item(
-                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                        &provider_id,
-                    )
-                    .is_ok();
+                let credential_present = match ctx.secret_vault.get_item(
+                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                    &provider_id,
+                ) {
+                    Ok(_) => true,
+                    Err(crate::secure_key::SecureKeyError::NotFound(_)) => false,
+                    Err(error) => return Err(internal(anyhow::anyhow!(error))),
+                };
                 (provider_id.clone(), credential_present)
             };
             let consumed_vault_generation = ctx

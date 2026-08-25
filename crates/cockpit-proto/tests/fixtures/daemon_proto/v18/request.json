@@ -1200,6 +1200,14 @@
     },
     "request": "admit_image_ingress"
   },
+  "discard_image_ingress_draft": {
+    "params": {
+      "session_id": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "admission_id": "01890f3e-7bcd-7abc-8abc-000000000021",
+      "local_operation_id": "01890f3e-7bcd-7abc-8abc-000000000022"
+    },
+    "request": "discard_image_ingress_draft"
+  },
   "retain_https_media": {
     "params": {
       "schemaVersion": 1,

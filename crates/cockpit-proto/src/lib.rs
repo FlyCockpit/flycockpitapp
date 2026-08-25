@@ -1087,7 +1087,9 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v17 adds explicit, owner-scoped provider OAuth
+/// Current wire schema version. v18 adds exact, idempotent disposal of
+/// daemon-admitted image drafts that never crossed the first-reference
+/// boundary. v17 added explicit, owner-scoped provider OAuth
 /// cancellation so local frontends can terminally settle timed-out or dismissed
 /// daemon-owned PKCE/device flows. It also adds correlated durable configuration
 /// receipts, including atomic image-spend policy receipts, and operation-bound
@@ -1100,11 +1102,11 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// reserved, intended, and published settlement without putting document bytes
 /// in SQLite. Terminal editor receipts bind the exact durable consumed/result
 /// configuration generation pair.
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 
-/// Oldest wire schema version this binary accepts. v17 is current-only: the
+/// Oldest wire schema version this binary accepts. v18 is current-only: the
 /// authority lifecycle changes have no safe compatibility fallback.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 17;
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 18;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -3781,8 +3783,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[17];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[18];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -7647,8 +7649,8 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 17);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 17);
+        assert_eq!(PROTOCOL_VERSION, 18);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 18);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
@@ -7668,8 +7670,8 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 17);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 17);
+        assert_eq!(PROTOCOL_VERSION, 18);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 18);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {

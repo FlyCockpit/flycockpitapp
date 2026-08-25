@@ -663,10 +663,10 @@ impl App {
                     ..
                 } = slot
                 {
-                    if possibly_sent {
+                    if possibly_sent && fence.model.supports_images {
                         self.image_ingress_draft_discards
                             .remove(&draft.admission_id);
-                    } else {
+                    } else if !possibly_sent {
                         retained.insert(draft.admission_id);
                     }
                 }

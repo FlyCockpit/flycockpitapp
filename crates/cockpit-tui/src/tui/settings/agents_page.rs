@@ -225,6 +225,24 @@ pub(crate) struct AgentExternalEditStaging {
     path: PathBuf,
 }
 
+impl AgentExternalEditStaging {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub(crate) fn retained_directory(&self) -> Result<std::fs::File, String> {
+        self.directory_handle
+            .try_clone()
+            .map_err(|error| format!("failed to retain external-edit staging directory: {error}"))
+    }
+
+    pub(crate) fn leaf(&self) -> Option<std::ffi::OsString> {
+        (self.path.parent() == Some(self.directory.path()))
+            .then(|| self.path.file_name().map(std::ffi::OsStr::to_os_string))
+            .flatten()
+    }
+}
+
 fn agent_external_edit_staging() -> Result<AgentExternalEditStaging, String> {
     let directory = tempfile::Builder::new()
         .prefix("cockpit-agent-edit-")

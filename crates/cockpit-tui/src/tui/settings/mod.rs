@@ -127,6 +127,15 @@ pub(crate) enum SettingsBlockingEffectWork {
         directory_handle: std::fs::File,
         leaf: std::ffi::OsString,
     },
+    PrepareCategoryEditor {
+        staging_id: uuid::Uuid,
+        seed: String,
+    },
+    ReadCategoryEditor {
+        staging_id: uuid::Uuid,
+        directory_handle: std::fs::File,
+        leaf: std::ffi::OsString,
+    },
 }
 
 impl std::fmt::Debug for SettingsBlockingEffectWork {
@@ -144,6 +153,18 @@ impl std::fmt::Debug for SettingsBlockingEffectWork {
                 .field("staging_id", staging_id)
                 .field("leaf", leaf)
                 .finish(),
+            Self::PrepareCategoryEditor { staging_id, .. } => f
+                .debug_struct("PrepareCategoryEditor")
+                .field("staging_id", staging_id)
+                .field("seed", &"[DRAFT]")
+                .finish(),
+            Self::ReadCategoryEditor {
+                staging_id, leaf, ..
+            } => f
+                .debug_struct("ReadCategoryEditor")
+                .field("staging_id", staging_id)
+                .field("leaf", leaf)
+                .finish(),
         }
     }
 }
@@ -154,6 +175,14 @@ pub(crate) enum SettingsBlockingOutcome {
         staging: agents_page::AgentExternalEditStaging,
     },
     AgentEditorRead {
+        staging_id: uuid::Uuid,
+        text: String,
+    },
+    CategoryEditorPrepared {
+        staging_id: uuid::Uuid,
+        staging: agents_page::AgentExternalEditStaging,
+    },
+    CategoryEditorRead {
         staging_id: uuid::Uuid,
         text: String,
     },
@@ -169,6 +198,16 @@ impl std::fmt::Debug for SettingsBlockingOutcome {
                 .finish(),
             Self::AgentEditorRead { staging_id, text } => f
                 .debug_struct("AgentEditorRead")
+                .field("staging_id", staging_id)
+                .field("bytes", &text.len())
+                .finish(),
+            Self::CategoryEditorPrepared { staging_id, .. } => f
+                .debug_struct("CategoryEditorPrepared")
+                .field("staging_id", staging_id)
+                .field("staging", &"[PRIVATE STAGING]")
+                .finish(),
+            Self::CategoryEditorRead { staging_id, text } => f
+                .debug_struct("CategoryEditorRead")
                 .field("staging_id", staging_id)
                 .field("bytes", &text.len())
                 .finish(),
@@ -192,6 +231,21 @@ pub(crate) fn execute_settings_blocking_work(
             directory_handle,
             leaf,
         } => Ok(SettingsBlockingOutcome::AgentEditorRead {
+            staging_id,
+            text: agents_page::read_agent_external_edit_staging(&directory_handle, &leaf)?,
+        }),
+        SettingsBlockingEffectWork::PrepareCategoryEditor { staging_id, seed } => {
+            let staging = agents_page::prepare_agent_external_edit_staging(&seed)?;
+            Ok(SettingsBlockingOutcome::CategoryEditorPrepared {
+                staging_id,
+                staging,
+            })
+        }
+        SettingsBlockingEffectWork::ReadCategoryEditor {
+            staging_id,
+            directory_handle,
+            leaf,
+        } => Ok(SettingsBlockingOutcome::CategoryEditorRead {
             staging_id,
             text: agents_page::read_agent_external_edit_staging(&directory_handle, &leaf)?,
         }),
@@ -872,6 +926,18 @@ enum PendingSettingsOperation {
         requested_path: String,
         action: TypedDocumentEditAction,
     },
+    CategoryExternalPrepare {
+        target: SettingsEffectTarget,
+        pointer_operation_id: shell::PointerOperationId,
+        staging_id: uuid::Uuid,
+    },
+    CategoryExternalRead {
+        target: SettingsEffectTarget,
+        pointer_operation_id: shell::PointerOperationId,
+        staging_id: uuid::Uuid,
+        outcome: pointer_actions::ExternalEditOutcome,
+        detail: Option<String>,
+    },
 }
 
 impl PendingSettingsOperation {
@@ -900,7 +966,9 @@ impl PendingSettingsOperation {
             | Self::ProviderMutation { target, .. }
             | Self::Followup { target, .. }
             | Self::SimpleMutation { target, .. }
-            | Self::TypedDocumentEdit { target, .. } => target.clone(),
+            | Self::TypedDocumentEdit { target, .. }
+            | Self::CategoryExternalPrepare { target, .. }
+            | Self::CategoryExternalRead { target, .. } => target.clone(),
             Self::ProviderCatalog {
                 project_root,
                 provider_id,
@@ -2993,6 +3061,11 @@ impl SettingsCx {
                     }
                 }
             }
+            PendingSettingsOperation::CategoryExternalPrepare { .. }
+            | PendingSettingsOperation::CategoryExternalRead { .. } => {
+                self.extended_warnings =
+                    vec!["category editor work completed on the wrong effect channel".into()];
+            }
         }
         Ok(())
     }
@@ -4480,6 +4553,17 @@ impl SettingsDialog {
     }
 
     fn apply_blocking_completion(&mut self, completion: SettingsBlockingEffectCompletion) {
+        let category_operation = matches!(
+            self.cx.pending_settings.get(&completion.operation_id),
+            Some(
+                PendingSettingsOperation::CategoryExternalPrepare { .. }
+                    | PendingSettingsOperation::CategoryExternalRead { .. }
+            )
+        );
+        if category_operation && let Some(page) = self.page.downcast_mut::<CategoryPage>() {
+            self.cx.apply_category_blocking_completion(page, completion);
+            return;
+        }
         if let Some(page) = self.page.downcast_mut::<AgentsPage>() {
             page.apply_blocking_completion(&mut self.cx, completion);
         }
@@ -5435,6 +5519,8 @@ impl SettingsDialog {
     fn take_pending_category_external_edit(
         &mut self,
     ) -> Option<(shell::PointerOperationId, PathBuf)> {
+        #[cfg(test)]
+        self.drive_category_blocking_effects_for_test();
         self.page.downcast_mut::<CategoryPage>().and_then(|p| {
             let pending = p.pending_external_edit.as_mut()?;
             let id = pending.operation_id;
@@ -5453,6 +5539,21 @@ impl SettingsDialog {
         };
         self.cx
             .finish_category_page_external_edit(p, operation_id, outcome, detail);
+        #[cfg(test)]
+        self.drive_category_blocking_effects_for_test();
+    }
+
+    #[cfg(test)]
+    fn drive_category_blocking_effects_for_test(&mut self) {
+        while let Some(effect) = self.cx.take_blocking_effect() {
+            let completion = SettingsBlockingEffectCompletion {
+                dialog_id: effect.dialog_id,
+                operation_id: effect.operation_id,
+                target: effect.target,
+                outcome: execute_settings_blocking_work(effect.work),
+            };
+            self.apply_blocking_completion(completion);
+        }
     }
 
     fn finish_agent_external_edit(

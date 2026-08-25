@@ -71,7 +71,10 @@ impl AsyncActionKind {
         match self {
             Self::Refresh(_) => ReadOnly,
             Self::Blocking(label) => match *label {
-                "autocomplete.files" | "doctor.snapshot" | "thread-check" => ReadOnly,
+                "autocomplete.files"
+                | "doctor.snapshot"
+                | "settings.path-suggest"
+                | "thread-check" => ReadOnly,
                 "btw.teardown"
                 | "paste.delivery_receipt"
                 | "queue.edit"

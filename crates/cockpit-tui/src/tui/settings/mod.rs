@@ -183,6 +183,13 @@ pub(crate) struct SettingsBlockingEffectRequest {
 }
 
 pub(crate) enum SettingsBlockingEffectWork {
+    PathSuggestions {
+        editor_generation: uuid::Uuid,
+        draft_generation: u64,
+        cwd: std::path::PathBuf,
+        value: String,
+        mode: crate::tui::dir_suggest::PathSuggestMode,
+    },
     PrepareAgentEditor {
         staging_id: uuid::Uuid,
         seed: String,
@@ -203,9 +210,27 @@ pub(crate) enum SettingsBlockingEffectWork {
     },
 }
 
+impl SettingsBlockingEffectWork {
+    pub(crate) fn action_label(&self) -> &'static str {
+        match self {
+            Self::PathSuggestions { .. } => "settings.path-suggest",
+            _ => "settings.blocking-effect",
+        }
+    }
+}
+
 impl std::fmt::Debug for SettingsBlockingEffectWork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PathSuggestions {
+                editor_generation,
+                draft_generation,
+                ..
+            } => f
+                .debug_struct("PathSuggestions")
+                .field("editor_generation", editor_generation)
+                .field("draft_generation", draft_generation)
+                .finish(),
             Self::PrepareAgentEditor { staging_id, .. } => f
                 .debug_struct("PrepareAgentEditor")
                 .field("staging_id", staging_id)
@@ -235,6 +260,11 @@ impl std::fmt::Debug for SettingsBlockingEffectWork {
 }
 
 pub(crate) enum SettingsBlockingOutcome {
+    PathSuggestions {
+        editor_generation: uuid::Uuid,
+        draft_generation: u64,
+        entries: Vec<crate::tui::dir_suggest::DirSuggestion>,
+    },
     AgentEditorPrepared {
         staging_id: uuid::Uuid,
         staging: agents_page::AgentExternalEditStaging,
@@ -256,6 +286,16 @@ pub(crate) enum SettingsBlockingOutcome {
 impl std::fmt::Debug for SettingsBlockingOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PathSuggestions {
+                editor_generation,
+                draft_generation,
+                entries,
+            } => f
+                .debug_struct("PathSuggestions")
+                .field("editor_generation", editor_generation)
+                .field("draft_generation", draft_generation)
+                .field("entries", &entries.len())
+                .finish(),
             Self::AgentEditorPrepared { staging_id, .. } => f
                 .debug_struct("AgentEditorPrepared")
                 .field("staging_id", staging_id)
@@ -284,6 +324,17 @@ pub(crate) fn execute_settings_blocking_work(
     work: SettingsBlockingEffectWork,
 ) -> Result<SettingsBlockingOutcome, String> {
     match work {
+        SettingsBlockingEffectWork::PathSuggestions {
+            editor_generation,
+            draft_generation,
+            cwd,
+            value,
+            mode,
+        } => Ok(SettingsBlockingOutcome::PathSuggestions {
+            editor_generation,
+            draft_generation,
+            entries: crate::tui::dir_suggest::suggest_paths(&cwd, &value, mode),
+        }),
         SettingsBlockingEffectWork::PrepareAgentEditor { staging_id, seed } => {
             let staging = agents_page::prepare_agent_external_edit_staging(&seed)?;
             Ok(SettingsBlockingOutcome::AgentEditorPrepared {
@@ -5668,7 +5719,19 @@ impl Dialog {
         &mut self,
     ) -> Option<SettingsBlockingEffectRequest> {
         match self {
-            Dialog::Settings(settings) => settings.cx.take_blocking_effect(),
+            Dialog::Settings(settings) => {
+                if let Some(page) = settings.page.downcast_mut::<CategoryPage>()
+                    && let Some(work) = page.take_path_suggestion_work()
+                {
+                    let target = SettingsEffectTarget {
+                        surface: "settings.path-suggestions",
+                        owner: "category-path-editor".into(),
+                        revision: None,
+                    };
+                    settings.cx.enqueue_blocking_work(target, work);
+                }
+                settings.cx.take_blocking_effect()
+            }
             _ => None,
         }
     }
@@ -6172,6 +6235,15 @@ impl SettingsDialog {
     }
 
     fn apply_blocking_completion(&mut self, completion: SettingsBlockingEffectCompletion) {
+        if matches!(
+            &completion.outcome,
+            Ok(SettingsBlockingOutcome::PathSuggestions { .. })
+        ) {
+            if let Some(page) = self.page.downcast_mut::<CategoryPage>() {
+                page.apply_path_suggestions(completion);
+            }
+            return;
+        }
         let category_operation = matches!(
             self.cx.pending_settings.get(&completion.operation_id),
             Some(

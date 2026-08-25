@@ -33,7 +33,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use crate::tui::dir_suggest::{DIR_SUGGEST_WINDOW, DirSuggestion, PathSuggestMode, suggest_paths};
+use crate::tui::dir_suggest::{DIR_SUGGEST_WINDOW, DirSuggestion, PathSuggestMode};
 use crate::tui::textfield::TextField;
 use crate::tui::vim_editor::{VimEditor, VimEditorOutcome};
 use cockpit_config::extended::{
@@ -1282,6 +1282,9 @@ pub(super) struct CategoryPathEditor {
     buf: TextField,
     pub(super) suggest: DirSuggestState,
     mode: PathSuggestMode,
+    editor_generation: uuid::Uuid,
+    draft_generation: u64,
+    pending_suggestions: Option<super::SettingsBlockingEffectWork>,
 }
 
 impl CategoryPathEditor {
@@ -1291,8 +1294,11 @@ impl CategoryPathEditor {
             buf: TextField::new(text),
             suggest: DirSuggestState::default(),
             mode,
+            editor_generation: uuid::Uuid::new_v4(),
+            draft_generation: 0,
+            pending_suggestions: None,
         };
-        editor.refresh(cwd);
+        editor.request_refresh(cwd);
         editor
     }
 
@@ -1303,7 +1309,7 @@ impl CategoryPathEditor {
     #[cfg(test)]
     pub(super) fn set_text_for_test(&mut self, text: String, cwd: &std::path::Path) {
         self.buf.set(text);
-        self.refresh(cwd);
+        self.request_refresh(cwd);
     }
 
     fn cursor(&self) -> usize {
@@ -1312,18 +1318,45 @@ impl CategoryPathEditor {
 
     pub(super) fn paste(&mut self, text: &str, cwd: &std::path::Path) {
         self.buf.paste(text);
-        self.refresh(cwd);
+        self.request_refresh(cwd);
     }
 
-    fn refresh(&mut self, cwd: &std::path::Path) {
-        self.suggest.entries = suggest_paths(cwd, self.buf.text(), self.mode);
+    fn request_refresh(&mut self, cwd: &std::path::Path) {
+        self.draft_generation = self.draft_generation.wrapping_add(1).max(1);
+        self.suggest.entries.clear();
         self.suggest.selected = 0;
         self.suggest.scroll = 0;
+        self.pending_suggestions = Some(super::SettingsBlockingEffectWork::PathSuggestions {
+            editor_generation: self.editor_generation,
+            draft_generation: self.draft_generation,
+            cwd: cwd.to_path_buf(),
+            value: self.buf.text().to_string(),
+            mode: self.mode,
+        });
     }
 
     fn accept(&mut self, replacement: String, cwd: &std::path::Path) {
         self.buf.set(replacement);
-        self.refresh(cwd);
+        self.request_refresh(cwd);
+    }
+
+    fn take_suggestion_work(&mut self) -> Option<super::SettingsBlockingEffectWork> {
+        self.pending_suggestions.take()
+    }
+
+    fn apply_suggestions(
+        &mut self,
+        editor_generation: uuid::Uuid,
+        draft_generation: u64,
+        entries: Vec<DirSuggestion>,
+    ) {
+        if self.editor_generation != editor_generation || self.draft_generation != draft_generation
+        {
+            return;
+        }
+        self.suggest.entries = entries;
+        self.suggest.selected = 0;
+        self.suggest.scroll = 0;
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, surface: &SettingsPointerSurface) {
@@ -1591,6 +1624,29 @@ impl DirSuggestState {
 }
 
 impl CategoryPage {
+    pub(super) fn take_path_suggestion_work(
+        &mut self,
+    ) -> Option<super::SettingsBlockingEffectWork> {
+        self.path_editor.as_mut()?.take_suggestion_work()
+    }
+
+    pub(super) fn apply_path_suggestions(
+        &mut self,
+        completion: super::SettingsBlockingEffectCompletion,
+    ) {
+        let Ok(super::SettingsBlockingOutcome::PathSuggestions {
+            editor_generation,
+            draft_generation,
+            entries,
+        }) = completion.outcome
+        else {
+            return;
+        };
+        if let Some(editor) = self.path_editor.as_mut() {
+            editor.apply_suggestions(editor_generation, draft_generation, entries);
+        }
+    }
+
     pub(super) fn new(category: Category) -> Self {
         Self {
             category,
@@ -2714,7 +2770,7 @@ impl SettingsCx {
                 }
                 _ => {
                     editor.buf.handle_key(key);
-                    editor.refresh(&cwd);
+                    editor.request_refresh(&cwd);
                     p.path_editor = Some(editor);
                 }
             }

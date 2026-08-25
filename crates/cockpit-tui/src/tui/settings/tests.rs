@@ -185,6 +185,28 @@ fn authority_success_is_receipt_driven_and_committed_refresh_is_explicit() {
 }
 
 #[test]
+fn path_suggestion_filesystem_reads_are_blocking_worker_only() {
+    let reducer = include_str!("category.rs");
+    let settings = include_str!("mod.rs");
+    let worker = settings
+        .split("pub(crate) fn execute_settings_blocking_work")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("pub(crate) enum SettingsDaemonEffectWork")
+                .next()
+        })
+        .expect("settings blocking worker inventory");
+
+    assert!(!reducer.contains("suggest_paths("));
+    assert!(!reducer.contains("std::fs::read_dir"));
+    assert!(worker.contains("dir_suggest::suggest_paths"));
+    assert!(settings.contains("\"settings.path-suggest\""));
+    assert!(settings.contains("editor_generation"));
+    assert!(settings.contains("draft_generation"));
+}
+
+#[test]
 fn oauth_acknowledgement_keeps_explicit_authority_until_typed_settlement() {
     let flow = include_str!("providers/oauth_flow.rs");
     let providers = include_str!("providers/mod.rs");

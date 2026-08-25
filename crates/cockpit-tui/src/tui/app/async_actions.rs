@@ -574,7 +574,7 @@ impl App {
             .filter(|result| {
                 matches!(
                     result.kind,
-                    AsyncActionKind::Blocking("settings.blocking-effect")
+                    AsyncActionKind::Blocking("settings.blocking-effect" | "settings.path-suggest")
                 )
             })
             .map(|result| AsyncActionResult {
@@ -758,6 +758,7 @@ impl App {
             let operation_id = effect.operation_id;
             let target = effect.target;
             let work = effect.work;
+            let action_label = work.action_label();
             let metadata = crate::tui::settings::SettingsBlockingEffectMetadata {
                 dialog_id,
                 operation_id,
@@ -766,7 +767,7 @@ impl App {
             let action_id = self
                 .async_actions
                 .start_blocking(
-                    AsyncActionKind::Blocking("settings.blocking-effect"),
+                    AsyncActionKind::Blocking(action_label),
                     AsyncActionPolicy::AllowConcurrent,
                     move || {
                         let outcome = crate::tui::settings::execute_settings_blocking_work(work);
@@ -849,7 +850,7 @@ impl App {
                     self.dialog.apply_settings_daemon_completion(completion);
                 }
             }
-            AsyncActionKind::Blocking("settings.blocking-effect") => {
+            AsyncActionKind::Blocking("settings.blocking-effect" | "settings.path-suggest") => {
                 let metadata = self.settings_blocking_actions.remove(&result.id);
                 let completion = match result.payload {
                     Ok(AsyncActionPayload::SettingsBlocking(completion)) => Some(completion),

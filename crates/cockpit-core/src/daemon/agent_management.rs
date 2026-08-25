@@ -21,6 +21,11 @@ struct EditorLeaseState {
     revision: String,
     expires_at: Instant,
     completing: bool,
+    /// Terminal responses remain replayable until the lease TTL expires. This
+    /// lets a client resolve a lost completion response without repeating the
+    /// underlying file mutation.
+    terminal_result: Option<AgentMutationResult>,
+    terminal_markdown: Option<Option<String>>,
 }
 
 const EDITOR_LEASE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
@@ -102,7 +107,12 @@ pub async fn begin_editor_lease(
     let mut leases = editor_leases().lock().map_err(lock_poison)?;
     let now = Instant::now();
     leases.retain(|_, lease| lease.expires_at > now);
-    if leases.len() >= MAX_EDITOR_LEASES {
+    if leases
+        .values()
+        .filter(|lease| lease.terminal_result.is_none())
+        .count()
+        >= MAX_EDITOR_LEASES
+    {
         return Err(ErrorPayload {
             code: ErrorCode::Unavailable,
             message:
@@ -119,6 +129,8 @@ pub async fn begin_editor_lease(
             revision: expected_revision,
             expires_at: now + EDITOR_LEASE_TTL,
             completing: false,
+            terminal_result: None,
+            terminal_markdown: None,
         },
     );
     drop(leases);
@@ -149,6 +161,14 @@ pub async fn complete_editor_lease(
         let lease = leases
             .get_mut(&id)
             .ok_or_else(|| conflict("editor lease is absent, expired, or already completed"))?;
+        if let Some(result) = lease.terminal_result.clone() {
+            if lease.terminal_markdown.as_ref() != Some(&markdown) {
+                return Err(conflict(
+                    "editor lease was already settled with different content",
+                ));
+            }
+            return Ok(Response::AgentEditorLeaseCompleted(result));
+        }
         if lease.completing {
             return Err(conflict("editor lease completion is already in flight"));
         }
@@ -168,6 +188,7 @@ pub async fn complete_editor_lease(
     }
     let completed_lease_id = id.to_string();
     let consumed_lease_revision = lease.revision.clone();
+    let settlement_markdown = markdown.clone();
     let result = match markdown {
         Some(markdown) => {
             match tokio::task::spawn_blocking(move || {
@@ -206,7 +227,15 @@ pub async fn complete_editor_lease(
         unreachable!("agent mutation always returns AgentMutated")
     };
     result.completed_lease_id = Some(completed_lease_id);
-    editor_leases().lock().map_err(lock_poison)?.remove(&id);
+    {
+        let mut leases = editor_leases().lock().map_err(lock_poison)?;
+        let lease = leases
+            .get_mut(&id)
+            .ok_or_else(|| conflict("editor lease disappeared during completion"))?;
+        lease.completing = false;
+        lease.terminal_markdown = Some(settlement_markdown);
+        lease.terminal_result = Some(result.clone());
+    }
     Ok(Response::AgentEditorLeaseCompleted(result))
 }
 

@@ -93,6 +93,10 @@ pub(super) struct AgentsPage {
     agent_rows: Vec<AgentRow>,
     assistant_rows: Vec<AgentRow>,
     pending_daemon: HashMap<uuid::Uuid, PendingAgentOperation>,
+    /// Exact completion request retained after transport or response
+    /// ambiguity. The page cannot close until the daemon replays a matching
+    /// terminal receipt.
+    uncertain_editor_settlement: Option<Box<PendingAgentOperation>>,
 }
 
 enum PendingAgentOperation {
@@ -354,6 +358,7 @@ pub(super) struct AgentDetail {
 impl AgentsPage {
     pub(super) fn has_unsettled_external_edit(&self) -> bool {
         self.pending_external_edit.is_some()
+            || self.uncertain_editor_settlement.is_some()
             || self.pending_daemon.values().any(|pending| {
                 matches!(
                     pending,
@@ -393,7 +398,51 @@ impl AgentsPage {
             agent_rows: Vec::new(),
             assistant_rows: Vec::new(),
             pending_daemon: HashMap::new(),
+            uncertain_editor_settlement: None,
         }
+    }
+
+    fn retry_uncertain_editor_settlement(&mut self, cx: &mut SettingsCx) {
+        let Some(pending) = self.uncertain_editor_settlement.take() else {
+            return;
+        };
+        let PendingAgentOperation::CompleteLease {
+            cwd,
+            name,
+            lease_id,
+            consumed_revision,
+            markdown,
+            draft,
+            detail,
+            outcome,
+        } = *pending
+        else {
+            unreachable!("only completion operations are retained for settlement")
+        };
+        self.stage(
+            cx,
+            super::SettingsEffectTarget {
+                surface: "agents.editor-lease-complete",
+                owner: format!("{}::{lease_id}", cwd.display()),
+                revision: Some(consumed_revision.clone()),
+            },
+            cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+                project_root: cwd.to_string_lossy().into_owned(),
+                lease_id: lease_id.clone(),
+                markdown: markdown.clone(),
+            },
+            PendingAgentOperation::CompleteLease {
+                cwd,
+                name,
+                lease_id,
+                consumed_revision,
+                markdown,
+                draft,
+                detail,
+                outcome,
+            },
+        );
+        self.status = Some("retrying editor lease settlement…".into());
     }
 
     pub(super) fn queue_load(&mut self, cx: &mut SettingsCx) {
@@ -1151,33 +1200,51 @@ impl AgentsPage {
         draft: AgentEditor,
         response: Result<cockpit_core::daemon::proto::Response, String>,
     ) {
-        let lease = response.and_then(|response| match response {
-            cockpit_core::daemon::proto::Response::AgentEditorLeaseBegun(lease) => {
-                if lease.lease_id.is_empty() {
-                    return Err("daemon returned an empty editor lease ID".into());
-                }
-                validate_agent_snapshot(&lease.snapshot, &cwd, &name, None)?;
-                if lease.snapshot.revision != expected_revision
-                    || !lease.snapshot.editable
-                    || lease.snapshot.source_layer
-                        != cockpit_core::daemon::proto::AgentSourceLayer::Workspace
-                {
-                    return Err(
-                        "daemon editor lease did not match the requested workspace revision".into(),
-                    );
-                }
-                Ok(lease)
+        let lease = match response {
+            Ok(cockpit_core::daemon::proto::Response::AgentEditorLeaseBegun(lease)) => lease,
+            Ok(other) => {
+                self.editing = Some(draft);
+                self.status = Some(format!("unexpected editor lease response: {other:?}"));
+                return;
             }
-            other => Err(format!("unexpected editor lease response: {other:?}")),
-        });
-        let lease = match lease {
-            Ok(lease) => lease,
             Err(error) => {
                 self.editing = Some(draft);
                 self.status = Some(format!("external edit lease failed: {error}"));
                 return;
             }
         };
+        if lease.lease_id.is_empty() {
+            self.editing = Some(draft);
+            self.status = Some("daemon returned an empty editor lease ID".into());
+            return;
+        }
+        let validation =
+            validate_agent_snapshot(&lease.snapshot, &cwd, &name, None).and_then(|()| {
+                if lease.snapshot.revision != expected_revision
+                    || !lease.snapshot.editable
+                    || lease.snapshot.source_layer
+                        != cockpit_core::daemon::proto::AgentSourceLayer::Workspace
+                {
+                    Err("daemon editor lease did not match the requested workspace revision".into())
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(error) = validation {
+            // The lease ID itself is authoritative even when the accompanying
+            // snapshot is malformed or stale. Always settle that server-side
+            // capability before falling back to the in-TUI recovery draft.
+            self.settle_unserviced_editor_lease(
+                cx,
+                cwd,
+                name,
+                lease.lease_id,
+                expected_revision,
+                draft,
+                format!("daemon editor lease snapshot was rejected: {error}"),
+            );
+            return;
+        }
         let staging_id = uuid::Uuid::new_v4();
         let target = super::SettingsEffectTarget {
             surface: "agents.editor-staging-prepare",
@@ -1257,6 +1324,7 @@ impl AgentsPage {
         outcome: super::pointer_actions::ExternalEditOutcome,
         response: Result<cockpit_core::daemon::proto::Response, String>,
     ) {
+        self.uncertain_editor_settlement = None;
         if matches!(outcome, super::pointer_actions::ExternalEditOutcome::Saved) {
             let Some(markdown) = markdown else {
                 self.editing = draft.take();
@@ -1294,9 +1362,19 @@ impl AgentsPage {
                     if let Some(editor) = draft.as_mut() {
                         editor.replace_with_recovery_text(&markdown);
                     }
-                    self.editing = draft.take();
+                    self.uncertain_editor_settlement =
+                        Some(Box::new(PendingAgentOperation::CompleteLease {
+                            cwd,
+                            name,
+                            lease_id,
+                            consumed_revision,
+                            markdown: Some(markdown),
+                            draft: draft.take(),
+                            detail,
+                            outcome,
+                        }));
                     self.status = Some(format!(
-                        "failed to atomically commit external edit: {error}"
+                        "external edit commit settlement is unknown: {error}; press Enter to query/retry"
                     ));
                 }
             }
@@ -1330,15 +1408,41 @@ impl AgentsPage {
                     }));
                 }
                 Ok(other) => {
+                    self.uncertain_editor_settlement =
+                        Some(Box::new(PendingAgentOperation::CompleteLease {
+                            cwd,
+                            name,
+                            lease_id,
+                            consumed_revision,
+                            markdown: None,
+                            draft: draft.take(),
+                            detail,
+                            outcome,
+                        }));
                     self.status = Some(format!(
-                        "unexpected editor cancellation response: {other:?}"
+                        "editor lease settlement is unknown after an unexpected response: {other:?}; press Enter to query/retry"
                     ))
                 }
                 Err(error) => {
-                    self.status = Some(format!("editor lease settlement uncertain: {error}"))
+                    self.uncertain_editor_settlement =
+                        Some(Box::new(PendingAgentOperation::CompleteLease {
+                            cwd,
+                            name,
+                            lease_id,
+                            consumed_revision,
+                            markdown: None,
+                            draft: draft.take(),
+                            detail,
+                            outcome,
+                        }));
+                    self.status = Some(format!(
+                        "editor lease settlement uncertain: {error}; press Enter to query/retry"
+                    ))
                 }
             }
-            self.editing = draft.take();
+            if self.uncertain_editor_settlement.is_none() {
+                self.editing = draft.take();
+            }
         }
     }
 
@@ -2060,6 +2164,16 @@ impl SettingsCx {
     /// `config.json` this settings dialog is editing (the `.cockpit/`
     /// layer the user selected in the picker).
     fn handle_agents_page_key(&mut self, key: KeyEvent, p: &mut AgentsPage) -> Nav {
+        if p.uncertain_editor_settlement.is_some() {
+            if key.code == KeyCode::Enter {
+                p.retry_uncertain_editor_settlement(self);
+            } else {
+                p.status = Some(
+                    "editor lease settlement is unresolved; press Enter to query/retry".into(),
+                );
+            }
+            return Nav::Stay;
+        }
         // ── In-TUI editor (vim or plain) ────────────────────────────
         if p.external_edit_confirmation.is_some() {
             match key.code {

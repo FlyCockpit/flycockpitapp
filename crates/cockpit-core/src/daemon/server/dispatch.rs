@@ -4222,39 +4222,10 @@ async fn handle_serialized_request_impl(
             Ok(Response::AssistantSessionResolved { session, created })
         }
 
-        Request::ListAssistants => {
-            let snapshots = crate::assistants::snapshots(&ctx.db)
-                .await
-                .map_err(internal)?;
-            if snapshots.len() > proto::MAX_ASSISTANT_SUMMARIES {
-                return Err(bad_request(format!(
-                    "assistant inventory exceeds the {}-entry local response limit; remove unused assistants",
-                    proto::MAX_ASSISTANT_SUMMARIES
-                )));
-            }
-            if snapshots.iter().any(|snapshot| {
-                snapshot.row.name.len() > proto::MAX_AGENT_NAME_BYTES
-                    || snapshot.row.home_dir.len() > proto::MAX_ASSISTANT_HOME_BYTES
-                    || snapshot.row.config_json.len() > proto::MAX_ASSISTANT_CONFIG_BYTES
-                    || snapshot
-                        .definition_markdown
-                        .as_ref()
-                        .is_some_and(|value| value.len() > proto::MAX_AGENT_MARKDOWN_BYTES)
-                    || snapshot
-                        .definition_diagnostic
-                        .as_ref()
-                        .is_some_and(|value| value.len() > proto::MAX_ASSISTANT_DIAGNOSTIC_BYTES)
-            }) {
-                return Err(bad_request(
-                    "an assistant projection exceeds the safe local response bounds; repair or remove the assistant",
-                ));
-            }
-            let assistants = snapshots
-                .into_iter()
-                .map(assistant_snapshot_to_proto)
-                .collect();
-            Ok(Response::Assistants { assistants })
-        }
+        Request::ListAssistants => Err(ErrorPayload {
+            code: ErrorCode::Internal,
+            message: "concurrent request `list_assistants` reached serialized dispatch".to_string(),
+        }),
         Request::UpsertAssistant {
             name,
             description,
@@ -9955,6 +9926,39 @@ async fn handle_concurrent_request_impl(
             get_session_compactions_response(&ctx, session_id).await
         }
         Request::GetAssistant { name } => get_assistant_response(&ctx, name).await,
+        Request::ListAssistants => {
+            let snapshots = crate::assistants::snapshots(&ctx.db)
+                .await
+                .map_err(internal)?;
+            if snapshots.len() > proto::MAX_ASSISTANT_SUMMARIES {
+                return Err(bad_request(format!(
+                    "assistant inventory exceeds the {}-entry local response limit; remove unused assistants",
+                    proto::MAX_ASSISTANT_SUMMARIES
+                )));
+            }
+            if snapshots.iter().any(|snapshot| {
+                snapshot.row.name.len() > proto::MAX_AGENT_NAME_BYTES
+                    || snapshot.row.home_dir.len() > proto::MAX_ASSISTANT_HOME_BYTES
+                    || snapshot.row.config_json.len() > proto::MAX_ASSISTANT_CONFIG_BYTES
+                    || snapshot
+                        .definition_markdown
+                        .as_ref()
+                        .is_some_and(|value| value.len() > proto::MAX_AGENT_MARKDOWN_BYTES)
+                    || snapshot
+                        .definition_diagnostic
+                        .as_ref()
+                        .is_some_and(|value| value.len() > proto::MAX_ASSISTANT_DIAGNOSTIC_BYTES)
+            }) {
+                return Err(bad_request(
+                    "an assistant projection exceeds the safe local response bounds; repair or remove the assistant",
+                ));
+            }
+            let assistants = snapshots
+                .into_iter()
+                .map(assistant_snapshot_to_proto)
+                .collect();
+            Ok(Response::Assistants { assistants })
+        }
         Request::DiagnoseMediaReservation { scope, id } => {
             diagnose_media_reservation_response(&ctx, scope, id).await
         }

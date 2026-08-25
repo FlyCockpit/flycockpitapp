@@ -35,6 +35,7 @@ async fn begin_provider_oauth(
     provider_id: &str,
     client_operation_id: String,
 ) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
+    let expected_hash = oauth_request_hash(&("begin_provider_oauth", provider_id))?;
     let client = crate::tui::settings::settings_daemon_client()
         .await
         .map_err(|e| e.to_string())?;
@@ -59,32 +60,38 @@ async fn begin_provider_oauth(
     };
     match response.map_err(|e| e.to_string())? {
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
             pending: false,
             response: Some(response),
-            ..
-        }) => match *response {
+        }) if settlement_operation_id == client_operation_id => match *response {
             cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
+                client_operation_id: receipt_operation_id,
+                request_hash,
                 flow_id,
                 authorize_url,
                 user_code,
-                ..
-            } => Ok(crate::tui::async_action::OAuthAsyncResult::Began {
-                flow_id,
-                authorize_url,
-                user_code,
-            }),
+            } if receipt_operation_id == client_operation_id && request_hash == expected_hash => {
+                Ok(crate::tui::async_action::OAuthAsyncResult::Began {
+                    flow_id,
+                    authorize_url,
+                    user_code,
+                })
+            }
             other => Err(format!("unexpected OAuth begin settlement: {other:?}")),
         },
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
+            client_operation_id: receipt_operation_id,
+            request_hash,
             flow_id,
             authorize_url,
             user_code,
-            ..
-        }) => Ok(crate::tui::async_action::OAuthAsyncResult::Began {
-            flow_id,
-            authorize_url,
-            user_code,
-        }),
+        }) if receipt_operation_id == client_operation_id && request_hash == expected_hash => {
+            Ok(crate::tui::async_action::OAuthAsyncResult::Began {
+                flow_id,
+                authorize_url,
+                user_code,
+            })
+        }
         Ok(other) => Err(format!(
             "unexpected provider OAuth begin response: {other:?}"
         )),
@@ -100,6 +107,8 @@ async fn complete_provider_oauth(
     let client = crate::tui::settings::settings_daemon_client()
         .await
         .map_err(|e| e.to_string())?;
+    let expected_hash =
+        oauth_request_hash(&("complete_provider_oauth", &flow_id, input.as_deref()))?;
     let request = cockpit_core::daemon::proto::Request::CompleteProviderOAuth {
         client_operation_id: client_operation_id.clone(),
         flow_id: flow_id.clone(),
@@ -119,16 +128,34 @@ async fn complete_provider_oauth(
     };
     match response.map_err(|e| e.to_string())? {
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
             pending: false,
             response: Some(response),
-            ..
-        }) => match *response {
-            cockpit_core::daemon::proto::Response::ProviderOAuthCompleted { logged_in, .. } => {
+        }) if settlement_operation_id == client_operation_id => match *response {
+            cockpit_core::daemon::proto::Response::ProviderOAuthCompleted {
+                client_operation_id: receipt_operation_id,
+                request_hash,
+                flow_id: receipt_flow_id,
+                logged_in,
+                ..
+            } if receipt_operation_id == client_operation_id
+                && request_hash == expected_hash
+                && receipt_flow_id == flow_id =>
+            {
                 Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
             }
             other => Err(format!("unexpected OAuth completion settlement: {other:?}")),
         },
-        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCompleted { logged_in, .. }) => {
+        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCompleted {
+            client_operation_id: receipt_operation_id,
+            request_hash,
+            flow_id: receipt_flow_id,
+            logged_in,
+            ..
+        }) if receipt_operation_id == client_operation_id
+            && request_hash == expected_hash
+            && receipt_flow_id == flow_id =>
+        {
             Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
         }
         Ok(other) => Err(format!(
@@ -143,6 +170,11 @@ async fn cancel_provider_oauth(
     begin_client_operation_id: String,
     flow_id: Option<String>,
 ) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
+    let expected_hash = oauth_request_hash(&(
+        "cancel_provider_oauth",
+        &begin_client_operation_id,
+        &flow_id,
+    ))?;
     let client = crate::tui::settings::settings_daemon_client()
         .await
         .map_err(|e| e.to_string())?;
@@ -150,8 +182,8 @@ async fn cancel_provider_oauth(
         OAUTH_CANCEL_TIMEOUT,
         client.request(cockpit_core::daemon::proto::Request::CancelProviderOAuth {
             client_operation_id: client_operation_id.clone(),
-            begin_client_operation_id,
-            flow_id,
+            begin_client_operation_id: begin_client_operation_id.clone(),
+            flow_id: flow_id.clone(),
         }),
     )
     .await;
@@ -160,7 +192,7 @@ async fn cancel_provider_oauth(
         Err(_) => client
             .request(
                 cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
-                    client_operation_id,
+                    client_operation_id: client_operation_id.clone(),
                 },
             )
             .await
@@ -168,14 +200,21 @@ async fn cancel_provider_oauth(
     };
     match response {
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
             pending: false,
             response: Some(response),
-            ..
-        }) => match *response {
+        }) if settlement_operation_id == client_operation_id => match *response {
             cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+                client_operation_id: receipt_operation_id,
+                request_hash,
+                flow_id: receipt_flow_id,
                 cancelled: true,
-                ..
-            } => Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled),
+            } if receipt_operation_id == client_operation_id
+                && request_hash == expected_hash
+                && (flow_id.is_none() || receipt_flow_id == flow_id) =>
+            {
+                Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
+            }
             cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
                 cancelled: false,
                 ..
@@ -185,9 +224,16 @@ async fn cancel_provider_oauth(
             )),
         },
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+            client_operation_id: receipt_operation_id,
+            request_hash,
+            flow_id: receipt_flow_id,
             cancelled: true,
-            ..
-        }) => Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled),
+        }) if receipt_operation_id == client_operation_id
+            && request_hash == expected_hash
+            && (flow_id.is_none() || receipt_flow_id == flow_id) =>
+        {
+            Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
+        }
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
             cancelled: false,
             ..
@@ -197,6 +243,16 @@ async fn cancel_provider_oauth(
         )),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn oauth_request_hash<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    use sha2::{Digest as _, Sha256};
+
+    let bytes = zeroize::Zeroizing::new(serde_json::to_vec(value).map_err(|e| e.to_string())?);
+    Ok(Sha256::digest(bytes.as_slice())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn provider_usage_from_wire(

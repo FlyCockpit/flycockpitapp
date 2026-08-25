@@ -2942,24 +2942,35 @@ pub(crate) fn attached_request_tx_blocking(
 /// `block_in_place` pattern so it's callable from the synchronous TUI
 /// key handlers. `Err(String)` for any transport/typed failure.
 pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
-    use cockpit_core::daemon::{DaemonStatus, discover};
-    let runtime =
-        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
-    tokio::task::block_in_place(|| {
-        runtime.block_on(async {
-            let probe = discover().await;
-            if !matches!(probe.status, DaemonStatus::Running) {
-                return Err("daemon not running".to_string());
-            }
-            let client = cockpit_core::daemon::client::DaemonClient::connect(&probe.paths.socket)
-                .await
-                .map_err(|e| format!("daemon connect: {e}"))?;
-            client
-                .request_ok(req)
-                .await
-                .map_err(|e| format!("daemon request: {e}"))
+    // Unit reducers are synchronous and have no daemon to connect to, so they
+    // share the settings transport seam instead of failing before the request
+    // can be exercised.
+    #[cfg(test)]
+    {
+        return crate::tui::settings::test_daemon_request(req);
+    }
+    #[cfg(not(test))]
+    {
+        use cockpit_core::daemon::{DaemonStatus, discover};
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                let probe = discover().await;
+                if !matches!(probe.status, DaemonStatus::Running) {
+                    return Err("daemon not running".to_string());
+                }
+                let client =
+                    cockpit_core::daemon::client::DaemonClient::connect(&probe.paths.socket)
+                        .await
+                        .map_err(|e| format!("daemon connect: {e}"))?;
+                client
+                    .request_ok(req)
+                    .await
+                    .map_err(|e| format!("daemon request: {e}"))
+            })
         })
-    })
+    }
 }
 
 #[derive(Debug)]

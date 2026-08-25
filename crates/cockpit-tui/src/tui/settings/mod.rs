@@ -43,6 +43,8 @@ mod auth;
 mod category;
 mod dependencies_page;
 mod descriptor;
+#[cfg(test)]
+pub(crate) mod disk_daemon_fake;
 mod grab;
 mod harnesses_page;
 mod image_generation;
@@ -132,7 +134,7 @@ fn run_settings_daemon<T>(
 /// client and tests feed responses through the same snapshot/patch/receipt
 /// validation below; a test double may replace only transport, never config
 /// loading or persistence.
-trait SettingsDaemonEffect: Send + Sync {
+pub(crate) trait SettingsDaemonEffect: Send + Sync {
     fn request(&self, request: Request) -> Result<Response, String>;
 }
 
@@ -159,16 +161,31 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-fn settings_daemon_request(request: Request) -> Result<Response, String> {
-    #[cfg(test)]
+/// Single test-mode entry point for every daemon transport the settings and
+/// agent surfaces use.  A thread-installed effect wins so a test can script
+/// exact wire responses; otherwise the shared disk-backed fake answers the
+/// request against the real filesystem, which keeps the production reducers —
+/// snapshot decoding, receipt validation, and refresh reconciliation — on the
+/// path under test.
+#[cfg(test)]
+pub(crate) fn test_daemon_request(request: Request) -> Result<Response, String> {
     if let Some(effect) = TEST_SETTINGS_DAEMON_EFFECT.with(|slot| slot.borrow().clone()) {
         return effect.request(request);
     }
+    disk_daemon_fake::default_effect().request(request)
+}
+
+fn settings_daemon_request(request: Request) -> Result<Response, String> {
+    #[cfg(test)]
+    {
+        return test_daemon_request(request);
+    }
+    #[cfg(not(test))]
     ProductionSettingsDaemonEffect.request(request)
 }
 
 #[cfg(test)]
-fn with_settings_daemon_effect<T>(
+pub(crate) fn with_settings_daemon_effect<T>(
     effect: Arc<dyn SettingsDaemonEffect>,
     operation: impl FnOnce() -> T,
 ) -> T {
@@ -711,7 +728,9 @@ fn denylist_mutations(
     base: &serde_json::Value,
     desired: &[String],
 ) -> Result<Vec<cockpit_core::daemon::proto::DesiredDenylistEntry>, String> {
-    use cockpit_core::daemon::proto::{DesiredDenylistEntry as D, RedactedDenylistEntry};
+    use cockpit_core::daemon::proto::{
+        DesiredDenylistEntry as D, RedactedDenylistEntry, SensitiveWireLiteral,
+    };
     let entries: Vec<RedactedDenylistEntry> = serde_json::from_value(
         base.get("__cockpit_denylist_entries")
             .cloned()
@@ -745,7 +764,7 @@ fn denylist_mutations(
                 }
                 target.push(D::New {
                     client_nonce: uuid::Uuid::new_v4().to_string(),
-                    literal: value.to_owned(),
+                    literal: SensitiveWireLiteral::new(value.to_owned()),
                 });
             }
         }
@@ -2196,9 +2215,6 @@ impl Dialog {
         provider_id: &str,
         oauth_expired: bool,
     ) -> Self {
-        // The daemon is the authority for effective provider state. Its
-        // redacted snapshot is safe to seed into the editor and also lets the
-        // daemon migrate any legacy literal headers during the first save.
         let Some(config) = daemon_provider_snapshot(cwd, Some(provider_id)) else {
             return Self::open(cwd);
         };
@@ -2966,12 +2982,14 @@ impl SettingsDialog {
 
 impl SettingsDialog {
     pub fn open(config_path: PathBuf) -> Self {
-        let project_root = config_path
-            .parent()
-            .and_then(std::path::Path::parent)
-            .or_else(|| config_path.parent())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let config = daemon_provider_snapshot(project_root, None).unwrap_or_default();
+        let config = {
+            let project_root = config_path
+                .parent()
+                .and_then(std::path::Path::parent)
+                .or_else(|| config_path.parent())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            daemon_provider_snapshot(project_root, None).unwrap_or_default()
+        };
         Self::open_with_config(config_path, config)
     }
 
@@ -2990,10 +3008,6 @@ impl SettingsDialog {
                     let value = serde_json::to_value(&config).unwrap_or_default();
                     (config, value, None, Vec::new())
                 });
-        // Fresh install (no config at this location yet): seed the
-        // skills scan-dir list with the defaults so they show as ordinary
-        // editable rows. Materialization-only — an existing config whose
-        // `scan_dirs` is absent/empty stays empty (clean break).
         let mcp_config = daemon_mcp_snapshot(&config_path).unwrap_or_default();
         Self {
             page: root_page(0),
@@ -3057,10 +3071,6 @@ impl SettingsDialog {
         {
             s.cx.mcp_config = snapshot;
         }
-        // `open_with_config` already loaded the exact selected layer together
-        // with its opaque revision. Do not replace it with the layered
-        // effective projection here: doing so would materialize inherited
-        // values into this layer and detach `extended_base` from the revision.
         s
     }
 
@@ -3104,7 +3114,7 @@ impl SettingsDialog {
                 self.extended_base = base;
                 self.extended_revision = Some(revision);
                 self.extended_warnings.clear();
-                return Ok(SettingsSaveOutcome::Saved);
+                Ok(SettingsSaveOutcome::Saved)
             }
             SettingsPatchOutcome::CommittedRefreshNeeded {
                 result_revision: _,
@@ -3113,7 +3123,7 @@ impl SettingsDialog {
             } => {
                 self.extended_revision = None;
                 self.extended_warnings = vec![warning.clone()];
-                return Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning));
+                Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning))
             }
         }
     }
@@ -4343,7 +4353,7 @@ impl SettingsCx {
                 self.extended_base = base;
                 self.extended_revision = Some(revision);
                 self.extended_warnings.clear();
-                return Ok(SettingsSaveOutcome::Saved);
+                Ok(SettingsSaveOutcome::Saved)
             }
             SettingsPatchOutcome::CommittedRefreshNeeded {
                 result_revision: _,
@@ -4352,7 +4362,7 @@ impl SettingsCx {
             } => {
                 self.extended_revision = None;
                 self.extended_warnings = vec![warning.clone()];
-                return Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning));
+                Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning))
             }
         }
     }
@@ -4700,6 +4710,16 @@ fn config_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
         .map(std::path::Path::to_path_buf)
 }
 
+/// The daemon-owned MCP projection for a project root. `None` means the
+/// daemon could not answer, which is distinct from "no servers configured".
+pub(crate) fn daemon_mcp_snapshot_for_root(
+    root: &std::path::Path,
+) -> Option<cockpit_core::mcp::config::McpConfig> {
+    daemon_provider_view_snapshot(root, None)
+        .and_then(|config| config.mcp_config_json)
+        .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
+}
+
 fn daemon_mcp_snapshot(
     config_path: &std::path::Path,
 ) -> Option<cockpit_core::mcp::config::McpConfig> {
@@ -4708,9 +4728,7 @@ fn daemon_mcp_snapshot(
         .and_then(std::path::Path::parent)
         .or_else(|| config_path.parent())
         .unwrap_or_else(|| std::path::Path::new("."));
-    daemon_provider_view_snapshot(cwd, None)
-        .and_then(|config| config.mcp_config_json)
-        .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
+    daemon_mcp_snapshot_for_root(cwd)
 }
 
 fn provider_entries_equal(left: &ProviderEntry, right: &ProviderEntry) -> bool {

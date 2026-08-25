@@ -4957,6 +4957,10 @@ mod proto_fixture_files {
     use serde_json::{Map, Value};
     use std::path::Path;
 
+    pub(super) fn read_fixture(file_name: &str) -> Map<String, Value> {
+        read_fixture_for(super::PROTOCOL_VERSION, file_name)
+    }
+
     pub(super) fn read_fixture_for(version: u32, file_name: &str) -> Map<String, Value> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -6976,7 +6980,7 @@ mod tests {
     fn config_refreshed_response_is_frozen_in_current_fixture() {
         assert_eq!(PROTOCOL_VERSION, 14);
         assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 14);
-        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
@@ -6997,7 +7001,7 @@ mod tests {
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
         assert_eq!(PROTOCOL_VERSION, 14);
         assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 14);
-        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
@@ -7015,7 +7019,7 @@ mod tests {
 
     #[test]
     fn assistant_registration_revision_is_present_in_current_response_fixtures() {
-        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let fixture = proto_fixture_files::read_fixture("response.json");
         for response_name in ["assistant_upserted", "assistant_definition_saved"] {
             let summary: AssistantSummary =
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
@@ -7032,7 +7036,7 @@ mod tests {
 
     #[test]
     fn authority_commit_receipts_are_frozen_in_current_response_fixtures() {
-        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let fixture = proto_fixture_files::read_fixture("response.json");
         let denylist = &fixture["extended_config_saved"]["data"]["denylist"];
         assert_eq!(
             denylist[0]["consumed_entry_id"],
@@ -7058,7 +7062,7 @@ mod tests {
     fn archived_fixtures_are_retained_but_not_in_the_live_compatibility_window() {
         for version in [12, 13] {
             assert!(!is_protocol_compatible(version));
-            let archived = proto_fixture_tests::read_fixture_for(version, "response.json");
+            let archived = proto_fixture_files::read_fixture_for(version, "response.json");
             assert!(archived.contains_key("config_refreshed"));
             assert!(archived.contains_key("goal_status"));
             assert!(archived.contains_key("goal_updated"));

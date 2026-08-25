@@ -544,6 +544,7 @@ mod tests {
             rows.len() > 80,
             "command table should enumerate Request rows"
         );
+        #[cfg_attr(not(feature = "remote"), allow(unused_mut))]
         let mut expected = std::collections::BTreeSet::from([
             "agent_installation_inspect",
             "agent_installation_list",

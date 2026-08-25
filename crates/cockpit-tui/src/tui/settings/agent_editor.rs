@@ -2,9 +2,10 @@
 //!
 //! The editing engine is the shared [`crate::tui::vim_editor::VimEditor`]
 //! component, which wraps the prompt composer's vim-capable buffer and key
-//! dispatch. This page owns only the agent-file metadata and save/cancel
-//! interpretation. Authoritative bytes are committed only by daemon RPCs;
-//! `$EDITOR` receives a private host staging file under a daemon lease.
+//! dispatch. This page owns only the agent identity/revision metadata and
+//! save/cancel interpretation. Authoritative bytes are committed only by
+//! daemon RPCs; `$EDITOR` receives a private host staging file under a
+//! daemon lease.
 
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
@@ -17,9 +18,6 @@ use crate::tui::vim_editor::{VimEditor, VimEditorOutcome};
 pub(super) struct AgentEditor {
     /// The agent name being edited (for the editor header / re-parse).
     pub(super) name: String,
-    /// Presentation/staging path metadata. This is never an authoritative
-    /// agent or assistant destination written by the editor.
-    pub(super) path: std::path::PathBuf,
     /// Opaque daemon revision captured with the editable snapshot. Both agent
     /// files and daemon-local assistant definitions require one to save; the
     /// `assistant_definition` bit selects their distinct typed mutation RPCs.
@@ -44,12 +42,11 @@ pub(super) enum EditorOutcome {
 }
 
 impl AgentEditor {
-    /// Open the editor on `path`, seeded with `text`. `vim_enabled` mirrors
-    /// the user's composer setting: vim starts in Normal mode, plain starts
-    /// always inserting.
+    /// Open the editor seeded with `text`. `vim_enabled` mirrors the user's
+    /// composer setting: vim starts in Normal mode, plain starts always
+    /// inserting.
     pub(super) fn new(
         name: String,
-        path: std::path::PathBuf,
         text: &str,
         vim_enabled: bool,
         revision: Option<String>,
@@ -57,7 +54,6 @@ impl AgentEditor {
         Self {
             authority_id: super::pointer_actions::AgentId::workspace(&name),
             name,
-            path,
             revision,
             assistant_definition: false,
             vim_enabled,
@@ -67,12 +63,11 @@ impl AgentEditor {
 
     pub(super) fn new_assistant(
         name: String,
-        path: std::path::PathBuf,
         text: &str,
         vim_enabled: bool,
         revision: String,
     ) -> Self {
-        let mut editor = Self::new(name, path, text, vim_enabled, Some(revision));
+        let mut editor = Self::new(name, text, vim_enabled, Some(revision));
         editor.assistant_definition = true;
         editor.authority_id = super::pointer_actions::AgentId::assistant(&editor.name);
         editor
@@ -164,13 +159,7 @@ mod tests {
     }
 
     fn editor(text: &str, vim: bool) -> AgentEditor {
-        AgentEditor::new(
-            "builder".into(),
-            std::path::PathBuf::from("builder.md"),
-            text,
-            vim,
-            None,
-        )
+        AgentEditor::new("builder".into(), text, vim, None)
     }
 
     #[test]

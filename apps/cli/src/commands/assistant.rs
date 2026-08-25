@@ -136,17 +136,12 @@ async fn new(args: AssistantNewArgs) -> Result<()> {
 }
 
 /// Write the assistant's local home-directory artifacts (definition markdown +
-/// identity files) and return the `(config_json, content_hash)` the registry
-/// row needs. Mirrors the file-writing half of
-/// `cockpit_core::assistants::create_assistant` (the DB persist is remoted).
-/// Pure local IO — no daemon — so a parity test can compare its output against
-/// the canonical `create_assistant` and fail if the two ever drift.
-#[cfg(test)]
-fn write_assistant_home(spec: &CreateAssistantSpec) -> Result<(String, String)> {
-    write_assistant_home_with_installation_id(spec, Uuid::new_v4())
-}
-
-/// Write a home with a preallocated installation identity.
+/// identity files) from a preallocated installation identity and return the
+/// `(config_json, content_hash)` the registry row needs. Mirrors the
+/// file-writing half of `cockpit_core::assistants::create_assistant` (the DB
+/// persist is remoted). Pure local IO — no daemon — so a parity test can
+/// compare its output against the canonical `create_assistant` and fail if the
+/// two ever drift.
 ///
 /// Keeping identity allocation explicit here allows the caller to use the
 /// exact same identity in the definition and persisted registry config.
@@ -543,14 +538,18 @@ mod tests {
 
     #[tokio::test]
     async fn cli_write_assistant_home_matches_core_create_assistant() {
-        // Drift guard: `write_assistant_home` duplicates the file-writing half
-        // of `cockpit_core::assistants::create_assistant` (cockpit-core is out
-        // of scope to refactor). Build a home both ways from the same spec and
-        // assert the on-disk definition BYTES and the content hash are
-        // identical, so a future core change to fields/ordering/format fails
-        // here instead of silently producing incompatible homes.
+        // Drift guard: `write_assistant_home_with_installation_id` duplicates
+        // the file-writing half of `cockpit_core::assistants::create_assistant`
+        // (cockpit-core is out of scope to refactor). Build a home both ways
+        // from the same spec and assert the on-disk definition BYTES and the
+        // content hash are identical, so a future core change to
+        // fields/ordering/format fails here instead of silently producing
+        // incompatible homes. Core creates only at the daemon-owned canonical
+        // home, so the environment is isolated to the tempdir and
+        // `default_home_dir` resolves under it.
         let temp = tempfile::tempdir().unwrap();
-        let core_home = temp.path().join("core").join("helper-bot");
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(temp.path()).await;
+        let core_home = default_home_dir("helper-bot").unwrap();
         let cli_home = temp.path().join("cli").join("helper-bot");
 
         let db = Db::open_in_memory().unwrap();
@@ -583,8 +582,9 @@ mod tests {
     #[tokio::test]
     async fn assistant_crud_roundtrip() {
         let temp = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(temp.path()).await;
         let db = Db::open_in_memory().unwrap();
-        let home = temp.path().join("assistants").join("helper-bot");
+        let home = default_home_dir("helper-bot").unwrap();
         let row = create_assistant(
             &db,
             crate::assistants::CreateAssistantSpec {
@@ -601,20 +601,25 @@ mod tests {
         assert!(home.join("assistant.md").is_file());
         assert_eq!(db.list_assistants().await.unwrap().len(), 1);
 
-        let def = crate::assistants::load_from_row(&row).unwrap();
+        let def = {
+            let markdown = std::fs::read_to_string(home.join("assistant.md")).unwrap();
+            cockpit_core::agents::parse_agent(&markdown, &row.name, home.join("assistant.md"))
+                .unwrap()
+        };
         assert_eq!(
-            def.agent.vnext.as_ref().map(|v| v.execution_kind),
+            def.vnext.as_ref().map(|v| v.execution_kind),
             Some(cockpit_core::agents::ExecutionKind::Assistant)
         );
-        assert!(def.agent.model.is_none());
-        assert!(def.agent.tools.is_none());
+        assert!(def.model.is_none());
+        assert!(def.tools.is_none());
     }
 
     #[tokio::test]
     async fn delete_preserves_home_dir() {
         let temp = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(temp.path()).await;
         let db = Db::open_in_memory().unwrap();
-        let home = temp.path().join("assistants").join("helper-bot");
+        let home = default_home_dir("helper-bot").unwrap();
         create_assistant(
             &db,
             crate::assistants::CreateAssistantSpec {

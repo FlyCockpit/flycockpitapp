@@ -3828,6 +3828,8 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
             "option<struct:RemoteBulkTransferRef:v1>"
         }
         "crate::bulk_transfer::BulkTransferId" => "struct:RemoteTransferId:v1",
+        "crate::AgentMutation" => "struct:AgentMutation:v1",
+        "crate::ExtendedConfigPatch" => "struct:ExtendedConfigPatch:v1",
         _ => return None,
     })
 }

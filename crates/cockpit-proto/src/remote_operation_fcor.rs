@@ -217,6 +217,41 @@ impl CanonicalFcorValueV1 for crate::remote_transport::bulk::RemoteBulkTransferR
     }
 }
 
+impl CanonicalFcorValueV1 for crate::bulk_transfer::BulkTransferId {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        out.0.extend_from_slice(self.as_bytes());
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::bulk_transfer::BulkTransferRef {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        // The command table maps this transport-neutral successor onto the same
+        // `struct:RemoteBulkTransferRef:v1` canonical codec, so these bytes must
+        // stay identical to the implementation above. The class-ceiling check
+        // mirrors `BulkTransferRef::new` so an in-process struct literal cannot
+        // bypass it at this boundary.
+        ensure!(
+            self.total_length.value() <= self.mime_class.max_total_length(),
+            "bulk transfer exceeds its MIME-class limit"
+        );
+        let mut nested = CanonicalParamsV1::new();
+        self.transfer_id.encode_fcor_value_v1(&mut nested)?;
+        nested.push_u64(self.total_length.value());
+        nested.0.extend_from_slice(&self.sha256);
+        nested.push_u8(match self.mime_class {
+            crate::bulk_transfer::BulkMimeClass::Image => 1,
+            crate::bulk_transfer::BulkMimeClass::ImageSet => 2,
+            crate::bulk_transfer::BulkMimeClass::Archive => 3,
+            crate::bulk_transfer::BulkMimeClass::Export => 4,
+            crate::bulk_transfer::BulkMimeClass::Opaque => 5,
+            crate::bulk_transfer::BulkMimeClass::RedactedExport => 6,
+        });
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
 macro_rules! canonical_unit_enum16 {
     ($ty:ty, { $($variant:ident = $code:literal),+ $(,)? }) => {
         impl CanonicalFcorValueV1 for $ty {
@@ -654,6 +689,137 @@ impl CanonicalFcorValueV1 for crate::StoredFlycockpitCredential {
         Ok(())
     }
 }
+
+impl CanonicalFcorValueV1 for crate::GoalSupervisionPatch {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        // `cold_skeptic_count` is platform-width in the settings type; canonical
+        // bytes always carry the 64-bit widening (FCOR has no `usize` codec).
+        let cold_skeptic_count = match self.cold_skeptic_count {
+            Some(Some(value)) => Some(Some(u64::try_from(value)?)),
+            Some(None) => Some(None),
+            None => None,
+        };
+        let mut nested = CanonicalParamsV1::new();
+        cold_skeptic_count.encode_fcor_value_v1(&mut nested)?;
+        self.cold_skeptic_model.encode_fcor_value_v1(&mut nested)?;
+        self.max_verification_attempts
+            .encode_fcor_value_v1(&mut nested)?;
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::AgentMutation {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        match self {
+            Self::EjectBuiltin { name } => {
+                nested.push_u16(1);
+                name.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::SaveDefinition { name, markdown } => {
+                nested.push_u16(2);
+                name.encode_fcor_value_v1(&mut nested)?;
+                markdown.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::CreateDefinition { name, markdown } => {
+                nested.push_u16(3);
+                name.encode_fcor_value_v1(&mut nested)?;
+                markdown.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::DeleteCustom { name } => {
+                nested.push_u16(4);
+                name.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::ResetBuiltin { name } => {
+                nested.push_u16(5);
+                name.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::ResetAllBuiltins => nested.push_u16(6),
+            Self::SaveGoalSupervision { name, patch } => {
+                nested.push_u16(7);
+                name.encode_fcor_value_v1(&mut nested)?;
+                patch.encode_fcor_value_v1(&mut nested)?;
+            }
+        }
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::ExtendedConfigPathMutation {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        match self {
+            Self::Set { path, value } => {
+                nested.push_u16(1);
+                path.encode_fcor_value_v1(&mut nested)?;
+                // A free-form settings value has no field-wise canonical form.
+                // Encode the audited RFC 8785 canonicalization as one scalar so
+                // object key order cannot change these bytes.
+                crate::remote_identity_protocol::canonical_json(value)?
+                    .encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Unset { path } => {
+                nested.push_u16(2);
+                path.encode_fcor_value_v1(&mut nested)?;
+            }
+        }
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::DesiredDenylistEntry {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        match self {
+            Self::Existing { entry_id } => {
+                nested.push_u16(1);
+                entry_id.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::New {
+                client_nonce,
+                literal,
+            } => {
+                nested.push_u16(2);
+                client_nonce.encode_fcor_value_v1(&mut nested)?;
+                literal.encode_fcor_value_v1(&mut nested)?;
+            }
+        }
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+impl CanonicalFcorValueV1 for crate::RedactedOccurrenceMutation {
+    fn encode_fcor_value_v1(&self, out: &mut CanonicalParamsV1) -> Result<()> {
+        let mut nested = CanonicalParamsV1::new();
+        match self {
+            Self::Set { pointer, value } => {
+                nested.push_u16(1);
+                pointer.encode_fcor_value_v1(&mut nested)?;
+                value.encode_fcor_value_v1(&mut nested)?;
+            }
+            Self::Unset { pointer } => {
+                nested.push_u16(2);
+                pointer.encode_fcor_value_v1(&mut nested)?;
+            }
+        }
+        out.0.extend(nested.0);
+        Ok(())
+    }
+}
+
+// The denylist literal and the redacted-occurrence replacement are
+// `SensitiveWireLiteral`, so the nested encodings above resolve to the
+// sealed-literal placeholder and no plaintext reaches this canonical buffer.
+canonical_struct!(
+    crate::ExtendedConfigPatch,
+    self,
+    out,
+    [operations, materialize, denylist, redacted_mutations]
+);
 
 impl CanonicalParamsV1 {
     pub fn new() -> Self {

@@ -1851,8 +1851,15 @@
         ],
         "materialize": false,
         "denylist": [
-          {"source":"existing","entry_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-          {"source":"new","client_nonce":"33333333-3333-4333-8333-333333333333","literal":"fixture-secret"}
+          {
+            "source": "existing",
+            "entry_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "source": "new",
+            "client_nonce": "33333333-3333-4333-8333-333333333333",
+            "literal": "fixture-secret"
+          }
         ],
         "redacted_mutations": []
       },

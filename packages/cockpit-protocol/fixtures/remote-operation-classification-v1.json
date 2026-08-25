@@ -163,7 +163,7 @@
         {
           "field": "transfer",
           "role": "param",
-          "type": "crate::remote_transport::bulk::RemoteBulkTransferRef"
+          "type": "crate::bulk_transfer::BulkTransferRef"
         },
         {
           "field": "display_text",
@@ -173,7 +173,7 @@
         {
           "field": "display_transfer",
           "role": "param",
-          "type": "Option<crate::remote_transport::bulk::RemoteBulkTransferRef>"
+          "type": "Option<crate::bulk_transfer::BulkTransferRef>"
         },
         {
           "field": "tag_expansions",
@@ -191,7 +191,7 @@
           "type": "Option<RunInvocationOptions>"
         }
       ],
-      "fcorSchema": "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::remote_transport::bulk::RemoteBulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>",
+      "fcorSchema": "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>",
       "strategy": "sql_transaction",
       "tag": "send_user_message_bulk"
     },
@@ -1176,7 +1176,7 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "name:string|home_dir:string|config_json:string|content_hash:string",
+      "fcorCanonicalSchema": "name:string|description:string|prompt:string",
       "fcorRoles": [
         {
           "field": "name",
@@ -1184,24 +1184,44 @@
           "type": "String"
         },
         {
-          "field": "home_dir",
+          "field": "description",
           "role": "param",
           "type": "String"
         },
         {
-          "field": "config_json",
-          "role": "param",
-          "type": "String"
-        },
-        {
-          "field": "content_hash",
+          "field": "prompt",
           "role": "param",
           "type": "String"
         }
       ],
-      "fcorSchema": "name:String|home_dir:String|config_json:String|content_hash:String",
+      "fcorSchema": "name:String|description:String|prompt:String",
       "strategy": "nonrepeatable_dispatch",
       "tag": "upsert_assistant"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "name:string|markdown:string|expected_revision:string",
+      "fcorRoles": [
+        {
+          "field": "name",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "markdown",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_revision",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "name:String|markdown:String|expected_revision:String",
+      "strategy": "none",
+      "tag": "save_assistant_definition"
     },
     {
       "class": "transactional_mutation",
@@ -1291,10 +1311,10 @@
         {
           "field": "transfer",
           "role": "param",
-          "type": "crate::remote_transport::bulk::RemoteBulkTransferRef"
+          "type": "crate::bulk_transfer::BulkTransferRef"
         }
       ],
-      "fcorSchema": "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef",
+      "fcorSchema": "transfer:crate::bulk_transfer::BulkTransferRef",
       "strategy": "sql_transaction",
       "tag": "import_session_archive"
     },
@@ -1306,7 +1326,7 @@
         {
           "field": "transfer",
           "role": "param",
-          "type": "crate::remote_transport::bulk::RemoteBulkTransferRef"
+          "type": "crate::bulk_transfer::BulkTransferRef"
         },
         {
           "field": "chunk_index",
@@ -1319,7 +1339,7 @@
           "type": "String"
         }
       ],
-      "fcorSchema": "transfer:crate::remote_transport::bulk::RemoteBulkTransferRef|chunk_index:u32|data_base64:String",
+      "fcorSchema": "transfer:crate::bulk_transfer::BulkTransferRef|chunk_index:u32|data_base64:String",
       "strategy": "domain_transaction",
       "tag": "write_bulk_transfer_chunk"
     },
@@ -1331,7 +1351,7 @@
         {
           "field": "transfer_id",
           "role": "param",
-          "type": "crate::remote_protocol_id::RemoteTransferId"
+          "type": "crate::bulk_transfer::BulkTransferId"
         },
         {
           "field": "chunk_index",
@@ -1339,7 +1359,7 @@
           "type": "u32"
         }
       ],
-      "fcorSchema": "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32",
+      "fcorSchema": "transfer_id:crate::bulk_transfer::BulkTransferId|chunk_index:u32",
       "strategy": "none",
       "tag": "read_bulk_transfer_chunk"
     },
@@ -1351,7 +1371,7 @@
         {
           "field": "transfer_id",
           "role": "param",
-          "type": "crate::remote_protocol_id::RemoteTransferId"
+          "type": "crate::bulk_transfer::BulkTransferId"
         },
         {
           "field": "chunk_index",
@@ -1359,7 +1379,7 @@
           "type": "u32"
         }
       ],
-      "fcorSchema": "transfer_id:crate::remote_protocol_id::RemoteTransferId|chunk_index:u32",
+      "fcorSchema": "transfer_id:crate::bulk_transfer::BulkTransferId|chunk_index:u32",
       "strategy": "none",
       "tag": "read_redacted_export_chunk"
     },
@@ -3225,6 +3245,171 @@
       "fcorSchema": "project_root:String|config_json:String|secret_values_json:String|cleanup_names_json:String",
       "strategy": "nonrepeatable_dispatch",
       "tag": "save_mcp_config"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "project_root:String",
+      "strategy": "none",
+      "tag": "get_agent_inventory"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|name:string",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "name",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "project_root:String|name:String",
+      "strategy": "none",
+      "tag": "get_agent_edit_snapshot"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|mutation:struct:AgentMutation:v1|expected_revision:option<string>",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "mutation",
+          "role": "param",
+          "type": "crate::AgentMutation"
+        },
+        {
+          "field": "expected_revision",
+          "role": "param",
+          "type": "Option<String>"
+        }
+      ],
+      "fcorSchema": "project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>",
+      "strategy": "none",
+      "tag": "mutate_agent"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|name:string|expected_revision:string",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "name",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "expected_revision",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "project_root:String|name:String|expected_revision:String",
+      "strategy": "none",
+      "tag": "begin_agent_editor_lease"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|lease_id:string|markdown:option<string>",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "lease_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "markdown",
+          "role": "param",
+          "type": "Option<String>"
+        }
+      ],
+      "fcorSchema": "project_root:String|lease_id:String|markdown:Option<String>",
+      "strategy": "none",
+      "tag": "complete_agent_editor_lease"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|snapshot_session_id:string",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "snapshot_session_id",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "project_root:String|snapshot_session_id:String",
+      "strategy": "none",
+      "tag": "get_extended_config_snapshot"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|layer_id:string|patch:struct:ExtendedConfigPatch:v1|expected_revision:string|snapshot_session_id:string",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "layer_id",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "patch",
+          "role": "param",
+          "type": "crate::ExtendedConfigPatch"
+        },
+        {
+          "field": "expected_revision",
+          "role": "param",
+          "type": "String"
+        },
+        {
+          "field": "snapshot_session_id",
+          "role": "param",
+          "type": "String"
+        }
+      ],
+      "fcorSchema": "project_root:String|layer_id:String|patch:crate::ExtendedConfigPatch|expected_revision:String|snapshot_session_id:String",
+      "strategy": "none",
+      "tag": "apply_extended_config_patch"
     },
     {
       "class": "nonrepeatable_mutation",

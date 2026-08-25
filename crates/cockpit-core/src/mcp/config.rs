@@ -392,9 +392,352 @@ impl McpConfig {
     }
 }
 
+/// Sentinel the owner-view MCP projection substitutes for credential-bearing
+/// values. [`restore_owner_view_redactions`] treats a caller echoing it back
+/// as "keep the daemon's current value", never as a literal to store.
+pub const OWNER_VIEW_REDACTED_SENTINEL: &str = "[redacted]";
+
+/// Redact `config` in place into the owner-view projection served over daemon
+/// snapshots: endpoint and OAuth URLs lose userinfo/query/fragment, and every
+/// env or header value that is not a `$VAR` reference becomes
+/// [`OWNER_VIEW_REDACTED_SENTINEL`]. Save paths that accept this projection
+/// back must run [`restore_owner_view_redactions`] before persisting, or a
+/// round-trip would overwrite real values with the sentinel.
+pub fn redact_config_for_owner_view(config: &mut McpConfig) {
+    for server in config.servers.values_mut() {
+        server.endpoint = server
+            .endpoint
+            .as_deref()
+            .map(cockpit_proto::redact_url_for_owner_view);
+        for value in server.env.values_mut() {
+            if !value.trim_start().starts_with('$') {
+                *value = OWNER_VIEW_REDACTED_SENTINEL.to_string();
+            }
+        }
+        match &mut server.auth {
+            Auth::Header(header) => {
+                if !header.value.trim_start().starts_with('$') {
+                    header.value = OWNER_VIEW_REDACTED_SENTINEL.to_string();
+                }
+            }
+            Auth::Env(env) => {
+                for value in env.vars.values_mut() {
+                    if !value.trim_start().starts_with('$') {
+                        *value = OWNER_VIEW_REDACTED_SENTINEL.to_string();
+                    }
+                }
+            }
+            Auth::Oauth(oauth) => {
+                oauth.authorize_url = oauth
+                    .authorize_url
+                    .as_deref()
+                    .map(cockpit_proto::redact_url_for_owner_view);
+                oauth.token_url = oauth
+                    .token_url
+                    .as_deref()
+                    .map(cockpit_proto::redact_url_for_owner_view);
+            }
+            Auth::None => {}
+        }
+    }
+}
+
+/// Restore daemon-owned values into `incoming` wherever it echoes the
+/// [`redact_config_for_owner_view`] projection back to a save path. `prior`
+/// must be the daemon's current merged on-disk config — the same source the
+/// projection was rendered from.
+///
+/// A value equal to [`OWNER_VIEW_REDACTED_SENTINEL`] is replaced with the
+/// prior value at the same position; a URL equal to the redacted form of the
+/// prior URL is replaced with the prior URL. Restoration never invents
+/// values: a sentinel with no prior counterpart is left in place for the
+/// save-path validator to reject.
+///
+/// Returns the restored credential **literals** keyed by the credential
+/// reference the save-path validator derives for their position (an explicit
+/// `credential_ref` when present, else the canonical `mcp:…` key), so the
+/// daemon can stage them for vault migration atomically with the save.
+/// Restored empty or `$VAR` values are not literals and are not returned.
+pub fn restore_owner_view_redactions(
+    incoming: &mut McpConfig,
+    prior: &McpConfig,
+) -> BTreeMap<String, String> {
+    fn restore_redacted_url(incoming: &mut Option<String>, prior: Option<&str>) {
+        if let (Some(current), Some(prior)) = (incoming.as_deref(), prior)
+            && current == cockpit_proto::redact_url_for_owner_view(prior)
+        {
+            *incoming = Some(prior.to_string());
+        }
+    }
+
+    fn stage_restored_literal(
+        restored: &mut BTreeMap<String, String>,
+        explicit_ref: Option<&String>,
+        derived_ref: impl FnOnce() -> String,
+        value: &str,
+    ) {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed.starts_with('$') {
+            return;
+        }
+        let reference = explicit_ref.cloned().unwrap_or_else(derived_ref);
+        restored.insert(reference, trimmed.to_string());
+    }
+
+    let mut restored = BTreeMap::new();
+    for (name, server) in &mut incoming.servers {
+        let Some(prior_server) = prior.servers.get(name) else {
+            continue;
+        };
+        restore_redacted_url(&mut server.endpoint, prior_server.endpoint.as_deref());
+        for (key, value) in &mut server.env {
+            if value == OWNER_VIEW_REDACTED_SENTINEL
+                && let Some(prior_value) = prior_server.env.get(key)
+            {
+                value.clone_from(prior_value);
+                stage_restored_literal(
+                    &mut restored,
+                    server.env_credential_refs.get(key),
+                    || crate::mcp::auth::base_env_cred_key(name, key),
+                    prior_value,
+                );
+            }
+        }
+        match (&mut server.auth, &prior_server.auth) {
+            (Auth::Header(header), Auth::Header(prior_header)) => {
+                if header.value == OWNER_VIEW_REDACTED_SENTINEL {
+                    header.value.clone_from(&prior_header.value);
+                    stage_restored_literal(
+                        &mut restored,
+                        header.credential_ref.as_ref(),
+                        || crate::mcp::auth::header_cred_key(name),
+                        &prior_header.value,
+                    );
+                }
+            }
+            (Auth::Env(env), Auth::Env(prior_env)) => {
+                for (key, value) in &mut env.vars {
+                    if value == OWNER_VIEW_REDACTED_SENTINEL
+                        && let Some(prior_value) = prior_env.vars.get(key)
+                    {
+                        value.clone_from(prior_value);
+                        stage_restored_literal(
+                            &mut restored,
+                            env.credential_refs.get(key),
+                            || crate::mcp::auth::auth_env_cred_key(name, key),
+                            prior_value,
+                        );
+                    }
+                }
+            }
+            (Auth::Oauth(oauth), Auth::Oauth(prior_oauth)) => {
+                restore_redacted_url(
+                    &mut oauth.authorize_url,
+                    prior_oauth.authorize_url.as_deref(),
+                );
+                restore_redacted_url(&mut oauth.token_url, prior_oauth.token_url.as_deref());
+            }
+            _ => {}
+        }
+    }
+    restored
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server(auth: Auth) -> ServerConfig {
+        ServerConfig {
+            transport: Transport::Streamable,
+            endpoint: Some("https://mcp.example.test/sse?key=raw-endpoint-secret".into()),
+            command: None,
+            args: vec![],
+            env: BTreeMap::from([
+                ("PLAIN_TOKEN".to_string(), "env-literal-secret".to_string()),
+                ("REF_TOKEN".to_string(), "$HOST_TOKEN".to_string()),
+            ]),
+            env_credential_refs: BTreeMap::new(),
+            auth,
+            mode: DisclosureMode::Monty,
+            enabled: true,
+            cache_ttl_secs: 3600,
+            connect_timeout_secs: None,
+            timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn owner_view_redaction_masks_literals_and_keeps_references() {
+        let mut cfg = McpConfig::default();
+        cfg.servers.insert(
+            "svc".into(),
+            server(Auth::Header(HeaderAuth {
+                header: "Authorization".into(),
+                value: "Bearer header-literal-secret".into(),
+                credential_ref: None,
+            })),
+        );
+        redact_config_for_owner_view(&mut cfg);
+        let projected = &cfg.servers["svc"];
+        assert_eq!(
+            projected.endpoint.as_deref(),
+            Some("https://mcp.example.test/sse"),
+            "endpoint query must be stripped from the owner view"
+        );
+        assert_eq!(projected.env["PLAIN_TOKEN"], OWNER_VIEW_REDACTED_SENTINEL);
+        assert_eq!(projected.env["REF_TOKEN"], "$HOST_TOKEN");
+        let Auth::Header(header) = &projected.auth else {
+            panic!("auth kind must survive redaction");
+        };
+        assert_eq!(header.value, OWNER_VIEW_REDACTED_SENTINEL);
+    }
+
+    #[test]
+    fn restore_round_trips_a_toggled_owner_view_projection() {
+        let mut prior = McpConfig::default();
+        prior.servers.insert(
+            "svc".into(),
+            server(Auth::Header(HeaderAuth {
+                header: "Authorization".into(),
+                value: "Bearer header-literal-secret".into(),
+                credential_ref: None,
+            })),
+        );
+        prior.servers.insert(
+            "oauth-svc".into(),
+            ServerConfig {
+                auth: Auth::Oauth(OauthAuth {
+                    authorize_url: Some("https://idp.example.test/auth?tenant=t1".into()),
+                    token_url: Some("https://idp.example.test/token".into()),
+                    client_id: Some("client".into()),
+                    scopes: vec![],
+                }),
+                ..server(Auth::None)
+            },
+        );
+
+        // The owner view of `prior`, with `enabled` flipped by the client —
+        // exactly what a `/mcp off` round-trip sends back.
+        let mut incoming = prior.clone();
+        redact_config_for_owner_view(&mut incoming);
+        for server in incoming.servers.values_mut() {
+            server.enabled = false;
+        }
+
+        let staged = restore_owner_view_redactions(&mut incoming, &prior);
+
+        let mut expected = prior.clone();
+        for server in expected.servers.values_mut() {
+            server.enabled = false;
+        }
+        assert_eq!(
+            incoming.servers, expected.servers,
+            "restore must recover every prior value"
+        );
+        assert_eq!(
+            staged,
+            BTreeMap::from([
+                (
+                    crate::mcp::auth::base_env_cred_key("oauth-svc", "PLAIN_TOKEN"),
+                    "env-literal-secret".to_string()
+                ),
+                (
+                    crate::mcp::auth::base_env_cred_key("svc", "PLAIN_TOKEN"),
+                    "env-literal-secret".to_string()
+                ),
+                (
+                    crate::mcp::auth::header_cred_key("svc"),
+                    "Bearer header-literal-secret".to_string()
+                ),
+            ]),
+            "restored literals must be staged under the validator's derived refs"
+        );
+    }
+
+    #[test]
+    fn restore_prefers_an_explicit_credential_ref_key() {
+        let mut prior = McpConfig::default();
+        prior.servers.insert(
+            "svc".into(),
+            ServerConfig {
+                env: BTreeMap::new(),
+                auth: Auth::Header(HeaderAuth {
+                    header: "Authorization".into(),
+                    value: "Bearer legacy-literal".into(),
+                    credential_ref: Some("mcp:svc:custom".into()),
+                }),
+                ..server(Auth::None)
+            },
+        );
+        let mut incoming = prior.clone();
+        redact_config_for_owner_view(&mut incoming);
+        let staged = restore_owner_view_redactions(&mut incoming, &prior);
+        assert_eq!(
+            staged,
+            BTreeMap::from([(
+                "mcp:svc:custom".to_string(),
+                "Bearer legacy-literal".to_string()
+            )])
+        );
+    }
+
+    #[test]
+    fn restore_of_a_migrated_header_recovers_empty_value_without_staging() {
+        let mut prior = McpConfig::default();
+        prior.servers.insert(
+            "svc".into(),
+            ServerConfig {
+                env: BTreeMap::new(),
+                auth: Auth::Header(HeaderAuth {
+                    header: "Authorization".into(),
+                    value: String::new(),
+                    credential_ref: Some(crate::mcp::auth::header_cred_key("svc")),
+                }),
+                ..server(Auth::None)
+            },
+        );
+        let mut incoming = prior.clone();
+        redact_config_for_owner_view(&mut incoming);
+        {
+            let Auth::Header(header) = &incoming.servers["svc"].auth else {
+                panic!("auth kind must survive redaction");
+            };
+            assert_eq!(
+                header.value, OWNER_VIEW_REDACTED_SENTINEL,
+                "a migrated (empty) header value is still masked in the owner view"
+            );
+        }
+        let staged = restore_owner_view_redactions(&mut incoming, &prior);
+        assert_eq!(incoming.servers, prior.servers);
+        assert!(
+            staged.is_empty(),
+            "an empty restored value is not a literal and must not be staged"
+        );
+    }
+
+    #[test]
+    fn restore_leaves_unmatched_sentinels_for_the_validator() {
+        let prior = McpConfig::default();
+        let mut incoming = McpConfig::default();
+        incoming.servers.insert(
+            "new-svc".into(),
+            server(Auth::Header(HeaderAuth {
+                header: "Authorization".into(),
+                value: OWNER_VIEW_REDACTED_SENTINEL.into(),
+                credential_ref: None,
+            })),
+        );
+        let staged = restore_owner_view_redactions(&mut incoming, &prior);
+        assert!(staged.is_empty());
+        let Auth::Header(header) = &incoming.servers["new-svc"].auth else {
+            panic!("auth kind preserved");
+        };
+        assert_eq!(
+            header.value, OWNER_VIEW_REDACTED_SENTINEL,
+            "a sentinel with no prior value must fail validation, not vanish"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

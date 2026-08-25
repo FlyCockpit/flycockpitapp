@@ -29,6 +29,12 @@ pub(crate) enum DefinitionScope {
     /// after the resolver has proved that the path overrides that exact
     /// built-in name.
     BuiltinOverride,
+    /// A rendered snapshot served by the daemon over the wire.  The daemon is
+    /// a trusted source for all publisher provenances (`cockpit`, `authored`,
+    /// and `local`), so this scope accepts any publisher without re-checking
+    /// the loader boundary.  It is only used by
+    /// [`parse_daemon_agent_snapshot`][super::parse_daemon_agent_snapshot].
+    DaemonSnapshot,
 }
 
 /// The immutable identity recorded by the daemon for a private installation.
@@ -454,6 +460,12 @@ impl VnextAgentDef {
     /// cannot self-attest that it was loaded from daemon-owned storage.
     pub(crate) fn validate_for_scope(&self, scope: DefinitionScope) -> Result<()> {
         self.validate()?;
+        // The daemon is a trusted source for all publisher provenances — it
+        // rendered the snapshot from its own agent store, so the loader
+        // boundary does not apply.
+        if scope == DefinitionScope::DaemonSnapshot {
+            return Ok(());
+        }
         if self.is_local() != (scope == DefinitionScope::DaemonLocal) {
             bail!(
                 "agentId publisher provenance does not match its trusted loader: `local` is reserved for daemon-local definitions and portable publishers are workspace-authored"

@@ -67,6 +67,31 @@ pub(crate) struct IngestMessageImageInput<'a> {
     pub now_monotonic_ms: u64,
 }
 
+pub(crate) struct PublishIngressImageInput {
+    pub admission_id: Uuid,
+    pub session_id: Uuid,
+    pub project_digest: String,
+    pub reservation_id: String,
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
+    pub now_unix_ms: i64,
+}
+
+pub(crate) struct PublishedIngressImage {
+    pub admission_id: Uuid,
+    pub session_id: Uuid,
+    pub attachment_id: Uuid,
+    pub attachment_version: u64,
+    pub availability_generation: u64,
+    pub reservation_id: String,
+    pub normalized_sha256: String,
+    pub normalized_byte_length: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
 pub(crate) struct AcquireComponentLeaseInput {
     pub lease_id: Uuid,
     pub attachment_id: Uuid,
@@ -184,6 +209,34 @@ pub(crate) struct MediaStorageRecovery {
 }
 
 impl MediaStorageRecovery {
+    pub(crate) async fn ingress_image_receipt(
+        &self,
+        admission_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<Option<PublishedIngressImage>> {
+        self.db.read(move |conn| {
+            conn.query_row(
+                "SELECT attachment_id,attachment_version,availability_generation,reservation_id,normalized_sha256,normalized_byte_length,width,height FROM media_ingress_admission_receipts WHERE admission_id=?1 AND session_id=?2",
+                params![admission_id.to_string(),session_id.to_string()],
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?,row.get::<_,u32>(6)?,row.get::<_,u32>(7)?)),
+            )
+            .optional()?
+            .map(|row| Ok(PublishedIngressImage {
+                admission_id,
+                session_id,
+                attachment_id: Uuid::parse_str(&row.0)?,
+                attachment_version: row.1.parse()?,
+                availability_generation: row.2.parse()?,
+                reservation_id: row.3,
+                normalized_sha256: row.4,
+                normalized_byte_length: row.5.parse()?,
+                width: row.6,
+                height: row.7,
+            }))
+            .transpose()
+        }).await
+    }
+
     async fn finish_retained_https_orphan(
         &self,
         operation_id: Uuid,
@@ -1045,6 +1098,164 @@ impl MediaStorageRecovery {
             Ok(())
         }).await
     }
+
+    /// Publish one already-normalized ingress image under the exact durable
+    /// reservation that paid for its decode and retained bytes. No upload or
+    /// second reservation is created. The publication intent makes a crash
+    /// between file creation and database visibility recoverable.
+    pub(crate) async fn publish_ingress_image(
+        &self,
+        input: PublishIngressImageInput,
+    ) -> Result<PublishedIngressImage> {
+        let PublishIngressImageInput {
+            admission_id,
+            session_id,
+            project_digest,
+            reservation_id,
+            bytes,
+            sha256,
+            width,
+            height,
+            now_unix_ms,
+        } = input;
+        ensure!(
+            !bytes.is_empty()
+                && crate::intel::hex_lower(&Sha256::digest(&bytes)) == sha256
+                && width > 0
+                && height > 0,
+            "media_attachment_unavailable"
+        );
+        let storage_id = Uuid::now_v7();
+        let storage_name = storage_id.to_string();
+        let intent_admission = admission_id.to_string();
+        let intent_session = session_id.to_string();
+        let intent_reservation = reservation_id.clone();
+        let intent_storage = storage_name.clone();
+        let intent_sha = sha256.clone();
+        self.db
+            .transaction(move |conn| {
+                conn.execute(
+                    "INSERT INTO media_ingress_publication_intents(admission_id,session_id,reservation_id,storage_id,source_sha256,created_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![intent_admission,intent_session,intent_reservation,intent_storage,intent_sha,now_unix_ms],
+                )?;
+                Ok(())
+            })
+            .await?;
+        let publication = (|| -> Result<(String, u64)> {
+            let mut file = self
+                .owned_root
+                .create_file_exclusive(&storage_name)
+                .map_err(anyhow::Error::new)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            let identity = stable_identity_digest(&file)?;
+            let (length, persisted_sha) = read_full_digest(&mut file)?;
+            ensure!(
+                length == bytes.len() as u64
+                    && persisted_sha == sha256
+                    && stable_identity_digest(&file)? == identity,
+                "ingress publication proof failed"
+            );
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            Ok((identity, length))
+        })();
+        let (identity, length) = match publication {
+            Ok(proof) => proof,
+            Err(error) => {
+                let _ = self.owned_root.remove_file(&storage_name);
+                let _ = self.owned_root.sync();
+                return Err(error);
+            }
+        };
+        let attachment_id = Uuid::now_v7();
+        let component_id = Uuid::now_v7();
+        let expires = now_unix_ms
+            .checked_add(86_400_000)
+            .context("draft expiry overflow")?;
+        let record = MediaAttachmentRecord {
+            attachment_id,
+            session_id,
+            canonical_project_digest: project_digest,
+            media_kind: MediaKind::Image,
+            source_kind: MediaSourceKind::AuthenticatedSessionUpload,
+            canonical_container: "image/png".into(),
+            canonical_mime: "image/png".into(),
+            availability: MediaAvailability::Ready,
+            attachment_version: 1,
+            availability_generation: 1,
+            reference_generation: 1,
+            captured_capability_generation: 1,
+            source_identity_digest: identity.clone(),
+            source_byte_length: length,
+            source_sha256: sha256.clone(),
+            selected_video_stream: None,
+            selected_audio_stream: None,
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+            draft_expires_at_unix_ms: Some(expires),
+            first_referenced_at_unix_ms: None,
+        };
+        let component = cockpit_db::media_attachments::MediaAttachmentComponent {
+            component_id,
+            attachment_id,
+            attachment_version: 1,
+            component_kind: "image_model".into(),
+            storage_id,
+            lifecycle_state: "ready".into(),
+            component_generation: 1,
+            stable_identity_digest: identity,
+            byte_length: length,
+            sha256: sha256.clone(),
+            reservation_id: reservation_id.clone(),
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+        };
+        let receipt_reservation = reservation_id.clone();
+        let receipt_sha = sha256.clone();
+        let transaction_reservation = reservation_id.clone();
+        let commit = self
+            .db
+            .transaction(move |conn| {
+                cockpit_db::Db::insert_media_attachment_conn(conn, &record)?;
+                cockpit_db::Db::insert_media_attachment_component_conn(conn, &component)?;
+                conn.execute(
+                    "INSERT INTO media_image_component_dimensions(component_id,width,height) VALUES(?1,?2,?3)",
+                    params![component_id.to_string(),width,height],
+                )?;
+                crate::media_reservation::settle_and_publish_conn(conn, &transaction_reservation)?;
+                conn.execute(
+                    "INSERT INTO media_ingress_admission_receipts(admission_id,session_id,attachment_id,attachment_version,availability_generation,reservation_id,normalized_sha256,normalized_byte_length,width,height,committed_at_unix_ms) VALUES(?1,?2,?3,'1','1',?4,?5,?6,?7,?8,?9)",
+                    params![admission_id.to_string(),session_id.to_string(),attachment_id.to_string(),receipt_reservation,receipt_sha,length.to_string(),width,height,now_unix_ms],
+                )?;
+                ensure!(
+                    conn.execute(
+                        "DELETE FROM media_ingress_publication_intents WHERE admission_id=?1 AND reservation_id=?2",
+                        params![admission_id.to_string(),transaction_reservation],
+                    )? == 1,
+                    "ingress publication intent lost"
+                );
+                Ok(())
+            })
+            .await;
+        if let Err(error) = commit {
+            let _ = self.owned_root.remove_file(&storage_name);
+            let _ = self.owned_root.sync();
+            return Err(error);
+        }
+        Ok(PublishedIngressImage {
+            admission_id,
+            session_id,
+            attachment_id,
+            attachment_version: 1,
+            availability_generation: 1,
+            reservation_id,
+            normalized_sha256: sha256,
+            normalized_byte_length: length,
+            width,
+            height,
+        })
+    }
+
     pub(crate) async fn ingest_message_image(
         &self,
         input: IngestMessageImageInput<'_>,
@@ -1425,6 +1636,50 @@ impl MediaStorageRecovery {
             MediaUploadLastTransitionV1, MediaUploadSystemActionV1, RemoteMediaOperationOutcomeV1,
         };
         let mut repaired = 0usize;
+        let ingress_intents = self.db.read(|conn| {
+            let mut statement = conn.prepare("SELECT admission_id,reservation_id,storage_id FROM media_ingress_publication_intents ORDER BY created_at_unix_ms,admission_id")?;
+            statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)
+        }).await?;
+        for (admission_id, reservation_id, storage_id) in ingress_intents {
+            let mut proof = Sha256::new();
+            proof.update(b"media-ingress-orphan-cleanup-v1\0");
+            proof.update(admission_id.as_bytes());
+            proof.update([0]);
+            proof.update(storage_id.as_bytes());
+            if let Some(file) = open_optional_verified(&self.owned_root, &storage_id)? {
+                let identity = stable_identity_digest(&file)?;
+                self.owned_root
+                    .remove_file(&storage_id)
+                    .map_err(anyhow::Error::new)?;
+                proof.update(identity.as_bytes());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    ensure!(
+                        file.metadata()?.nlink() == 0,
+                        "ingress orphan was not deleted"
+                    );
+                }
+            }
+            self.owned_root.sync().map_err(anyhow::Error::new)?;
+            let cleanup = crate::intel::hex_lower(&proof.finalize());
+            self.db
+                .transaction(move |conn| {
+                    crate::media_reservation::destroy_verified_media_artifacts_conn(
+                        conn,
+                        &reservation_id,
+                        &cleanup,
+                        u64::try_from(now_unix_ms)?,
+                    )?;
+                    conn.execute(
+                        "DELETE FROM media_ingress_publication_intents WHERE admission_id=?1",
+                        [admission_id],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            repaired += 1;
+        }
         let processing_intents=self.db.read(|conn|{let mut statement=conn.prepare("SELECT job_id,output_ids_json FROM media_attachment_processing_publication_intents ORDER BY created_at_unix_ms,job_id")?;statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<std::result::Result<Vec<_>,_>>().map_err(Into::into)}).await?;
         for (job, outputs_json) in processing_intents {
             let outputs: Vec<String> = serde_json::from_str(&outputs_json)?;

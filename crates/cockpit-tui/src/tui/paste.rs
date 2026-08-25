@@ -74,6 +74,37 @@ pub enum PasteKind {
         hash: u64,
         reference: bool,
     },
+    /// Daemon-retained image. The UI keeps only the opaque attachment ref and
+    /// bounded display/accounting metadata; image bytes never return to it.
+    ImageHandle {
+        image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
+        normalized_byte_length: u64,
+        sha256: String,
+        hash: u64,
+        reference: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum RetainedImage {
+    Bytes(Vec<u8>),
+    Handle {
+        image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
+        normalized_byte_length: u64,
+        sha256: String,
+    },
+}
+
+impl RetainedImage {
+    pub fn normalized_byte_length(&self) -> u64 {
+        match self {
+            Self::Bytes(bytes) => bytes.len() as u64,
+            Self::Handle {
+                normalized_byte_length,
+                ..
+            } => *normalized_byte_length,
+        }
+    }
 }
 
 /// One registered paste block. The byte range `[start, end)` indexes into
@@ -162,7 +193,11 @@ impl PasteRegistry {
     /// image index. Returns `(number, is_duplicate)`.
     fn image_number_for(&self, hash: u64) -> (u32, bool) {
         if let Some(existing) = self.blocks.iter().find_map(|b| match &b.kind {
-            PasteKind::Image { hash: h, .. } if *h == hash => Some(b.number),
+            PasteKind::Image { hash: h, .. } | PasteKind::ImageHandle { hash: h, .. }
+                if *h == hash =>
+            {
+                Some(b.number)
+            }
             _ => None,
         }) {
             return (existing, true);
@@ -171,7 +206,7 @@ impl PasteRegistry {
             .blocks
             .iter()
             .filter_map(|b| match &b.kind {
-                PasteKind::Image { hash, .. } => Some(*hash),
+                PasteKind::Image { hash, .. } | PasteKind::ImageHandle { hash, .. } => Some(*hash),
                 _ => None,
             })
             .collect::<std::collections::BTreeSet<_>>()
@@ -272,6 +307,34 @@ impl PasteRegistry {
             number,
             kind: PasteKind::Image {
                 png,
+                hash,
+                reference,
+            },
+        });
+        placeholder
+    }
+
+    pub fn register_image_handle(
+        &mut self,
+        at: usize,
+        image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
+        normalized_byte_length: u64,
+        sha256: String,
+    ) -> String {
+        let hash = hash_bytes(sha256.as_bytes());
+        let (number, reference) = self.image_number_for(hash);
+        let placeholder = Self::image_placeholder(number);
+        let end = at + placeholder.len();
+        let id = self.next_block_id();
+        self.insert_sorted(PasteBlock {
+            id,
+            start: at,
+            end,
+            number,
+            kind: PasteKind::ImageHandle {
+                image_ref,
+                normalized_byte_length,
+                sha256,
                 hash,
                 reference,
             },
@@ -596,6 +659,25 @@ impl PasteRegistry {
                     images.push(png.clone());
                 }
             }
+            PasteKind::ImageHandle {
+                image_ref,
+                reference,
+                ..
+            } => {
+                if !vision {
+                    out.push_str(&format!(
+                        "[Pasted image #{}: not sent — current model has no image support]",
+                        block.number
+                    ));
+                } else if *reference {
+                    out.push_str(&format!("[reference image #{}]", block.number));
+                } else {
+                    out.push_str(IMAGE_PART_SENTINEL);
+                    images.push(cockpit_core::daemon::proto::encode_retained_image_handle(
+                        image_ref,
+                    ));
+                }
+            }
         });
         (out, images)
     }
@@ -608,7 +690,9 @@ impl PasteRegistry {
             PasteKind::Text { full, .. } => {
                 Self::append_display_paste(out, full, block.number);
             }
-            PasteKind::Image { .. } => out.push_str(&buffer[block.start..block.end]),
+            PasteKind::Image { .. } | PasteKind::ImageHandle { .. } => {
+                out.push_str(&buffer[block.start..block.end])
+            }
         })
     }
 
@@ -620,18 +704,39 @@ impl PasteRegistry {
             PasteKind::Text { full, nonce, .. } => {
                 Self::append_user_paste_wire(out, full, nonce);
             }
-            PasteKind::Image { .. } => out.push_str(&buffer[block.start..block.end]),
+            PasteKind::Image { .. } | PasteKind::ImageHandle { .. } => {
+                out.push_str(&buffer[block.start..block.end])
+            }
         })
     }
 
     /// Retain one payload for each visible image number before an external
     /// editor round-trip. Returned text maps `[Pasted image #N]` back through
     /// this table; missing placeholders are dropped.
-    pub fn image_payloads_by_number(&self) -> BTreeMap<u32, Vec<u8>> {
+    pub fn image_payloads_by_number(&self) -> BTreeMap<u32, RetainedImage> {
         let mut images = BTreeMap::new();
         for block in &self.blocks {
-            if let PasteKind::Image { png, .. } = &block.kind {
-                images.entry(block.number).or_insert_with(|| png.clone());
+            match &block.kind {
+                PasteKind::Image { png, .. } => {
+                    images
+                        .entry(block.number)
+                        .or_insert_with(|| RetainedImage::Bytes(png.clone()));
+                }
+                PasteKind::ImageHandle {
+                    image_ref,
+                    normalized_byte_length,
+                    sha256,
+                    ..
+                } => {
+                    images
+                        .entry(block.number)
+                        .or_insert_with(|| RetainedImage::Handle {
+                            image_ref: image_ref.clone(),
+                            normalized_byte_length: *normalized_byte_length,
+                            sha256: sha256.clone(),
+                        });
+                }
+                PasteKind::Text { .. } => {}
             }
         }
         images
@@ -643,7 +748,7 @@ impl PasteRegistry {
     /// are rebuilt from `retained_images`; unknown image numbers remain text.
     pub fn rebuild_from_editor(
         editor_text: &str,
-        retained_images: &BTreeMap<u32, Vec<u8>>,
+        retained_images: &BTreeMap<u32, RetainedImage>,
         mut count_text: impl FnMut(&str) -> usize,
     ) -> EditorPasteRebuild {
         let mut buffer = String::with_capacity(editor_text.len());
@@ -698,8 +803,20 @@ impl PasteRegistry {
             buffer.push_str(&rest[..image_start]);
             let image_text_start = pos + image_start;
             let image_text = &editor_text[image_text_start..image_text_start + image_len];
-            if let Some(png) = retained_images.get(&image_number) {
-                let placeholder = registry.register_image(buffer.len(), png.clone());
+            if let Some(image) = retained_images.get(&image_number) {
+                let placeholder = match image {
+                    RetainedImage::Bytes(png) => registry.register_image(buffer.len(), png.clone()),
+                    RetainedImage::Handle {
+                        image_ref,
+                        normalized_byte_length,
+                        sha256,
+                    } => registry.register_image_handle(
+                        buffer.len(),
+                        image_ref.clone(),
+                        *normalized_byte_length,
+                        sha256.clone(),
+                    ),
+                };
                 buffer.push_str(&placeholder);
             } else {
                 buffer.push_str(image_text);

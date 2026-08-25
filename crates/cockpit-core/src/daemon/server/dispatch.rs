@@ -6850,11 +6850,11 @@ async fn handle_serialized_request_impl(
             crate::daemon::agent_management::inventory(ctx, project_root).await
         }
 
-        Request::AdmitLocalImagePath {
-            project_root,
-            path,
+        Request::AdmitImageIngress {
+            session_id,
+            source,
             admission_id,
-        } => attachments::admit_local_image_path(ctx, project_root, path, admission_id).await,
+        } => attachments::admit_image_ingress(ctx, state, session_id, source, admission_id).await,
 
         Request::GetAgentEditSnapshot { project_root, name } => {
             crate::daemon::agent_management::edit_snapshot(ctx, project_root, name).await
@@ -13820,11 +13820,6 @@ async fn handle_concurrent_request_impl(
         Request::GetAgentInventory { project_root } => {
             crate::daemon::agent_management::inventory(&ctx, project_root).await
         }
-        Request::AdmitLocalImagePath {
-            project_root,
-            path,
-            admission_id,
-        } => attachments::admit_local_image_path(&ctx, project_root, path, admission_id).await,
         Request::GetAgentEditSnapshot { project_root, name } => {
             crate::daemon::agent_management::edit_snapshot(&ctx, project_root, name).await
         }

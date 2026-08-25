@@ -1189,13 +1189,16 @@
     },
     "request": "register_local_path_media"
   },
-  "admit_local_image_path": {
+  "admit_image_ingress": {
     "params": {
-      "project_root": "/tmp/project",
-      "path": "/tmp/project/file.png",
+      "session_id": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "source": {
+        "kind": "privateTerminalCapability",
+        "capability": "abcdefghijklmnopqrstuvwxyz"
+      },
       "admission_id": "01890f3e-7bcd-7abc-8abc-000000000021"
     },
-    "request": "admit_local_image_path"
+    "request": "admit_image_ingress"
   },
   "retain_https_media": {
     "params": {

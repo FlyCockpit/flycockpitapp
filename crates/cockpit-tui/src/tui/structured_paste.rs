@@ -5,7 +5,6 @@
 //! decisions through the normal App routes.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -351,9 +350,19 @@ pub enum PasteSlotState {
         original_offset: usize,
         display: String,
         wire: String,
-        png: Option<Vec<u8>>,
+        image: Option<PasteImageAdmission>,
     },
     Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasteImageAdmission {
+    Bytes(Vec<u8>),
+    Handle {
+        image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
+        normalized_byte_length: u64,
+        sha256: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -484,7 +493,7 @@ impl SubmissionFenceV1 {
         request_id: Uuid,
         request_generation: u64,
         source_draft_generation: u64,
-        result: Option<(String, String, Option<Vec<u8>>)>,
+        result: Option<(String, String, Option<PasteImageAdmission>)>,
     ) -> bool {
         if self.lifecycle != FenceLifecycle::AwaitingProbes
             || source_draft_generation != self.source_draft_generation
@@ -505,11 +514,11 @@ impl SubmissionFenceV1 {
             _ => return false,
         };
         *slot = match result {
-            Some((display, wire, png)) => PasteSlotState::Ready {
+            Some((display, wire, image)) => PasteSlotState::Ready {
                 original_offset,
                 display,
                 wire,
-                png,
+                image,
             },
             None => PasteSlotState::Unavailable,
         };
@@ -695,73 +704,16 @@ impl PasteCorrelationCache {
     }
 }
 
-/// Parse the only shell literal shapes accepted by the browser bridge.
-/// The parser never expands variables, escapes, tildes, or command syntax.
-pub fn parse_private_image_path_literal(input: &str) -> Option<PathBuf> {
-    if input.len() < 2 {
-        return None;
-    }
-    if input.bytes().any(|byte| byte.is_ascii_control()) {
-        return None;
-    }
-    let decoded = if input.starts_with('\'') && input.ends_with('\'') {
-        decode_single_quoted(input)?
-    } else if input.starts_with('"') && input.ends_with('"') {
-        let inner = &input[1..input.len().checked_sub(1)?];
-        if inner.contains('"')
-            || inner.contains('%')
-            || inner.contains('!')
-            || inner.contains('^')
-            || inner.contains('&')
-            || inner.contains('|')
-            || inner.contains('<')
-            || inner.contains('>')
-        {
-            return None;
-        }
-        inner.to_owned()
-    } else {
-        return None;
-    };
-    if decoded.is_empty() {
-        return None;
-    }
-    let path = PathBuf::from(&decoded);
-    let windows_absolute = decoded.as_bytes().get(..3).is_some_and(|prefix| {
-        prefix[0].is_ascii_alphabetic() && prefix[1] == b':' && matches!(prefix[2], b'\\' | b'/')
-    }) || decoded.starts_with("\\\\");
-    if !path.is_absolute() && !windows_absolute {
-        return None;
-    }
-    let extension = decoded
-        .rsplit_once('.')
-        .map(|(_, extension)| extension.to_ascii_lowercase())?;
-    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
-        return None;
-    }
-    Some(path)
-}
-
-fn decode_single_quoted(input: &str) -> Option<String> {
-    let inner = &input[1..input.len().checked_sub(1)?];
-    if !inner.contains('\'') {
-        return Some(inner.to_owned());
-    }
-    // PowerShell represents one apostrophe as two inside a single-quoted
-    // literal. POSIX shells close the literal and append an escaped quote:
-    // `'a'\''b'`. Those are the only accepted quote transitions.
-    let powershell = inner.replace("''", "'");
-    if powershell.matches('\'').count() * 2 == inner.matches('\'').count() {
-        return Some(powershell);
-    }
-    let posix = input.replace("'\\''", "'");
-    if posix.starts_with('\'') && posix.ends_with('\'') {
-        let decoded = &posix[1..posix.len() - 1];
-        if !decoded.contains('\'') || input.contains("'\\''") {
-            return Some(decoded.to_owned());
-        }
-    }
-    None
+/// Parse the exact opaque terminal-host image capability literal. No path,
+/// shell syntax, or attacker-controlled filename is interpreted by the TUI.
+pub fn parse_private_image_capability(input: &str) -> Option<String> {
+    const PREFIX: &str = "[flycockpit-private-image:";
+    let token = input.strip_prefix(PREFIX)?.strip_suffix(']')?;
+    (token.len() == 26
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()))
+    .then(|| token.to_owned())
 }
 
 #[cfg(test)]
@@ -1030,36 +982,19 @@ mod tests {
     }
 
     #[test]
-    fn paste_path_literal_probe() {
+    fn paste_private_capability_probe() {
         assert_eq!(
-            parse_private_image_path_literal("'/tmp/a b.png'"),
-            Some(PathBuf::from("/tmp/a b.png"))
-        );
-        assert_eq!(
-            parse_private_image_path_literal("'/tmp/a'\\''b & $x;`y`.png'"),
-            Some(PathBuf::from("/tmp/a'b & $x;`y`.png"))
-        );
-        assert_eq!(
-            parse_private_image_path_literal("'C:\\tmp\\a''b & $x.png'"),
-            Some(PathBuf::from("C:\\tmp\\a'b & $x.png"))
-        );
-        assert_eq!(
-            parse_private_image_path_literal("\"C:\\tmp\\a b.png\""),
-            Some(PathBuf::from("C:\\tmp\\a b.png"))
+            parse_private_image_capability("[flycockpit-private-image:abcdefghijklmnopqrstuvwxyz]"),
+            Some("abcdefghijklmnopqrstuvwxyz".into())
         );
         for rejected in [
             "/tmp/a.png",
-            "'/tmp/a'''b.png'",
-            "'/tmp/a'broken'b.png'",
-            "\"%TEMP%\\a.png\"",
-            "\"C:\\tmp\\a&b.png\"",
-            "'a\nb.png'",
+            "[flycockpit-private-image:short]",
+            "[flycockpit-private-image:ABCDEFGHIJKLMNOPQRSTUVWXYY]",
+            "[flycockpit-private-image:abcdefghijklmnopqrstuvwxy!]",
+            "flycockpit-private-image:abcdefghijklmnopqrstuvwxyz",
         ] {
-            assert_eq!(
-                parse_private_image_path_literal(rejected),
-                None,
-                "{rejected}"
-            );
+            assert_eq!(parse_private_image_capability(rejected), None, "{rejected}");
         }
     }
 

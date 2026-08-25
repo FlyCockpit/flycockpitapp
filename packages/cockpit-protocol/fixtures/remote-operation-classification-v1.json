@@ -4344,7 +4344,7 @@
       ],
       "fcorSchema": "project_root:String|path:SensitiveWirePayload|admission_id:Uuid",
       "strategy": "none",
-      "tag": "admit_local_image_path"
+      "tag": "admit_image_ingress"
     },
     {
       "class": "local_only",

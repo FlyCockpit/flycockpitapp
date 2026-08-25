@@ -32,7 +32,11 @@ pub async fn upload_submission_images(
             proto::MAX_IMAGES_PER_USER_MESSAGE
         )));
     }
-    let total: usize = images.iter().map(Vec::len).sum();
+    let total: usize = images
+        .iter()
+        .filter(|image| proto::decode_retained_image_handle(image).is_none())
+        .map(Vec::len)
+        .sum();
     if total > proto::MAX_TOTAL_IMAGE_BYTES {
         return Err(ImageUploadError::Usage(format!(
             "total image data is too large: {} bytes exceeds {} byte limit",
@@ -43,7 +47,11 @@ pub async fn upload_submission_images(
 
     let mut refs = Vec::with_capacity(images.len());
     for png in images {
-        refs.push(upload_one_image(client, png).await?);
+        if let Some(image_ref) = proto::decode_retained_image_handle(png) {
+            refs.push(image_ref);
+        } else {
+            refs.push(upload_one_image(client, png).await?);
+        }
     }
     Ok(refs)
 }

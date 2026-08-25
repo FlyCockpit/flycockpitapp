@@ -21,30 +21,29 @@ use crate::tui::settings::Dialog;
 use cockpit_core::daemon::proto::{self, Request, Response};
 use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
 
-async fn admit_local_image_path_via_daemon(
-    daemon: crate::tui::settings::CapturedSettingsDaemon,
-    project_root: String,
-    path: std::path::PathBuf,
+async fn admit_image_ingress_via_daemon(
+    daemon: crate::tui::agent_runner::AttachedRequestBinding,
+    session_id: uuid::Uuid,
+    source: cockpit_core::daemon::proto::ImageIngressSourceV1,
     admission_id: uuid::Uuid,
 ) -> Result<crate::tui::async_action::DaemonImagePathAdmission, String> {
-    use base64::Engine as _;
-    use sha2::{Digest as _, Sha256};
-
     let response = daemon
-        .request(cockpit_core::daemon::proto::Request::AdmitLocalImagePath {
-            project_root,
-            path: cockpit_core::daemon::proto::SensitiveWirePayload::new(
-                path.to_string_lossy().into_owned(),
-            ),
+        .request(cockpit_core::daemon::proto::Request::AdmitImageIngress {
+            session_id,
+            source,
             admission_id,
         })
         .await?;
-    let cockpit_core::daemon::proto::Response::LocalImagePathAdmitted(admission) = response else {
-        return Err("daemon returned an unexpected local image admission response".into());
+    let cockpit_core::daemon::proto::Response::ImageIngressAdmitted(admission) = response else {
+        return Err("daemon returned an unexpected image ingress response".into());
     };
     if admission.schema_version != 1
-        || admission.kind != "localImagePathAdmission"
+        || admission.kind != "imageIngressAdmissionReceipt"
         || admission.admission_id != admission_id
+        || admission.session_id != session_id
+        || admission.attachment_version == 0
+        || admission.availability_generation == 0
+        || admission.reservation_id.is_empty()
         || admission.normalized_byte_length == 0
         || admission.normalized_byte_length as usize
             > cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES
@@ -53,20 +52,12 @@ async fn admit_local_image_path_via_daemon(
         || admission.width > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
         || admission.height > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
     {
-        return Err("daemon returned an invalid local image admission receipt".into());
-    }
-    let png = base64::engine::general_purpose::STANDARD
-        .decode(admission.normalized_png_base64.as_str())
-        .map_err(|_| "daemon returned an invalid local image payload".to_string())?;
-    if png.len() as u64 != admission.normalized_byte_length
-        || !png.starts_with(b"\x89PNG\r\n\x1a\n")
-        || format!("{:x}", Sha256::digest(&png)) != admission.normalized_sha256
-    {
-        return Err("daemon local image admission integrity check failed".into());
+        return Err("daemon returned an invalid image ingress receipt".into());
     }
     Ok(crate::tui::async_action::DaemonImagePathAdmission {
         admission_id,
-        png,
+        image_ref: admission.image_ref,
+        normalized_byte_length: admission.normalized_byte_length,
         sha256: admission.normalized_sha256,
         width: admission.width,
         height: admission.height,
@@ -226,8 +217,8 @@ impl App {
             if let Some(action_id) = action_id {
                 self.async_actions.abort_id(action_id);
             }
-            if let Some(path) =
-                crate::tui::structured_paste::parse_private_image_path_literal(&data)
+            if let Some(capability) =
+                crate::tui::structured_paste::parse_private_image_capability(&data)
             {
                 let kind = crate::tui::async_action::AsyncActionKind::DaemonRpc(
                     "paste.image_path_admission",
@@ -261,9 +252,13 @@ impl App {
                     },
                 );
                 let original = data;
-                let project_root = self.launch.cwd.to_string_lossy().into_owned();
+                let session_id = self.launch.session_id.unwrap_or(uuid::Uuid::nil());
                 let admission_id = uuid::Uuid::new_v4();
-                let daemon = crate::tui::settings::capture_settings_daemon();
+                let daemon = self
+                    .agent_runner
+                    .as_ref()
+                    .and_then(|runner| runner.as_ref().ok())
+                    .map(|runner| runner.attached_request_binding());
                 let terminal_generation = self.terminal_input_generation;
                 let action_id = self
                     .async_actions
@@ -271,14 +266,18 @@ impl App {
                         kind,
                         crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
                         async move {
-                            let admission = admit_local_image_path_via_daemon(
-                                daemon,
-                                project_root,
-                                path,
-                                admission_id,
-                            )
-                            .await
-                            .ok();
+                            let admission = if let Some(daemon) = daemon {
+                                admit_image_ingress_via_daemon(
+                                    daemon,
+                                    session_id,
+                                    cockpit_core::daemon::proto::ImageIngressSourceV1::PrivateTerminalCapability { capability },
+                                    admission_id,
+                                )
+                                .await
+                                .ok()
+                            } else {
+                                None
+                            };
                             Ok(
                                 crate::tui::async_action::AsyncActionPayload::ImagePathProbe {
                                     request_id: correlation_id,
@@ -3598,6 +3597,13 @@ impl App {
             let cursor = probe.original_offset;
             self.pending_paste_probes.insert(request_id, probe);
             let terminal_generation = self.terminal_input_generation;
+            let session_id = self.launch.session_id.unwrap_or(uuid::Uuid::nil());
+            let daemon = self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(|runner| runner.attached_request_binding());
+            let admission_id = uuid::Uuid::new_v4();
             let action_id = self
                 .async_actions
                 .start(
@@ -3609,6 +3615,29 @@ impl App {
                             .ok()
                             .and_then(Result::ok)
                             .flatten();
+                        let admission = if let (Some(png), Some(daemon)) = (png, daemon) {
+                            use base64::Engine as _;
+                            use sha2::{Digest as _, Sha256};
+                            let sha256 = format!("{:x}", Sha256::digest(&png));
+                            let byte_length = png.len() as u64;
+                            admit_image_ingress_via_daemon(
+                                daemon,
+                                session_id,
+                                cockpit_core::daemon::proto::ImageIngressSourceV1::ClipboardPng {
+                                    png_base64:
+                                        cockpit_core::daemon::proto::SensitiveWirePayload::new(
+                                            base64::engine::general_purpose::STANDARD.encode(png),
+                                        ),
+                                    byte_length,
+                                    sha256,
+                                },
+                                admission_id,
+                            )
+                            .await
+                            .ok()
+                        } else {
+                            None
+                        };
                         Ok(
                             crate::tui::async_action::AsyncActionPayload::NativeImagePaste {
                                 request_id,
@@ -3616,7 +3645,7 @@ impl App {
                                 terminal_generation,
                                 source_draft_generation,
                                 cursor,
-                                png,
+                                admission,
                             },
                         )
                     },
@@ -3628,7 +3657,9 @@ impl App {
             return;
         }
 
-        if let Some(path) = crate::tui::structured_paste::parse_private_image_path_literal(&data) {
+        if let Some(capability) =
+            crate::tui::structured_paste::parse_private_image_capability(&data)
+        {
             let kind =
                 crate::tui::async_action::AsyncActionKind::DaemonRpc("paste.image_path_admission");
             if self.async_actions.pending_kind_count(&kind) >= 8 {
@@ -3657,9 +3688,13 @@ impl App {
             let cursor = probe.original_offset;
             self.pending_paste_probes.insert(request_id, probe);
             let original = data.clone();
-            let project_root = self.launch.cwd.to_string_lossy().into_owned();
+            let session_id = self.launch.session_id.unwrap_or(uuid::Uuid::nil());
             let admission_id = uuid::Uuid::new_v4();
-            let daemon = crate::tui::settings::capture_settings_daemon();
+            let daemon = self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(|runner| runner.attached_request_binding());
             let terminal_generation = self.terminal_input_generation;
             let action_id = self
                 .async_actions
@@ -3667,14 +3702,18 @@ impl App {
                     kind,
                     crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
                     async move {
-                        let admission = admit_local_image_path_via_daemon(
-                            daemon,
-                            project_root,
-                            path,
-                            admission_id,
-                        )
-                        .await
-                        .ok();
+                        let admission = if let Some(daemon) = daemon {
+                            admit_image_ingress_via_daemon(
+                                daemon,
+                                session_id,
+                                cockpit_core::daemon::proto::ImageIngressSourceV1::PrivateTerminalCapability { capability },
+                                admission_id,
+                            )
+                            .await
+                            .ok()
+                        } else {
+                            None
+                        };
                         Ok(
                             crate::tui::async_action::AsyncActionPayload::ImagePathProbe {
                                 request_id,
@@ -3845,11 +3884,13 @@ impl App {
     /// the bytes are retained either way and re-evaluated at send time.
     pub(super) fn insert_image_block(&mut self, png: Vec<u8>) {
         let retained = self.paste_registry.image_payloads_by_number();
-        let total = retained
-            .values()
-            .try_fold(png.len(), |sum, image| sum.checked_add(image.len()));
+        let total = retained.values().try_fold(png.len() as u64, |sum, image| {
+            sum.checked_add(image.normalized_byte_length())
+        });
         if png.len() > cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES
-            || total.is_none_or(|total| total > cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES)
+            || total.is_none_or(|total| {
+                total > cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES as u64
+            })
             || retained.len() >= cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE
         {
             self.show_toast("Paste unavailable", super::ToastKind::Error);
@@ -3860,6 +3901,62 @@ impl App {
             .resolve_insertion(self.composer.cursor());
         self.composer.set_cursor(at);
         let placeholder = self.paste_registry.register_image(at, png);
+        self.composer.insert_str(&placeholder);
+        self.shift_other_blocks_after_insert(at, placeholder.len());
+        self.refresh_at_dismiss();
+        self.reset_at_window();
+        self.reset_slash_window();
+        if !self.active_model_supports_images() {
+            self.show_toast(
+                "Current model has no image support — this image will be sent as a text note.",
+                super::ToastKind::Info,
+            );
+        }
+    }
+
+    pub(super) fn insert_image_handle_block(
+        &mut self,
+        admission: crate::tui::async_action::DaemonImagePathAdmission,
+    ) {
+        let retained = self.paste_registry.image_payloads_by_number();
+        let retained_bytes = retained
+            .values()
+            .try_fold(admission.normalized_byte_length, |sum, image| {
+                sum.checked_add(image.normalized_byte_length())
+            });
+        let image_count = self
+            .paste_registry
+            .blocks()
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.kind,
+                    crate::tui::paste::PasteKind::Image { .. }
+                        | crate::tui::paste::PasteKind::ImageHandle { .. }
+                )
+            })
+            .count();
+        if admission.normalized_byte_length == 0
+            || admission.normalized_byte_length
+                > cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES as u64
+            || retained_bytes.is_none_or(|total| {
+                total > cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES as u64
+            })
+            || image_count >= cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE
+        {
+            self.show_toast("Paste unavailable", super::ToastKind::Error);
+            return;
+        }
+        let at = self
+            .paste_registry
+            .resolve_insertion(self.composer.cursor());
+        self.composer.set_cursor(at);
+        let placeholder = self.paste_registry.register_image_handle(
+            at,
+            admission.image_ref,
+            admission.normalized_byte_length,
+            admission.sha256,
+        );
         self.composer.insert_str(&placeholder);
         self.shift_other_blocks_after_insert(at, placeholder.len());
         self.refresh_at_dismiss();
@@ -4647,6 +4744,9 @@ pub(super) fn validate_pasted_images_for_submit(images: &[Vec<u8>]) -> Result<()
     }
     validate_pasted_image_sizes(images)?;
     for (idx, png) in images.iter().enumerate() {
+        if cockpit_core::daemon::proto::decode_retained_image_handle(png).is_some() {
+            continue;
+        }
         let display_idx = idx + 1;
         let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
             .map_err(|_| format!("Pasted image #{display_idx} is not a valid PNG."))?;
@@ -4674,6 +4774,9 @@ fn validate_pasted_image_sizes(images: &[Vec<u8>]) -> Result<(), String> {
     }
     let mut total = 0usize;
     for (idx, png) in images.iter().enumerate() {
+        if cockpit_core::daemon::proto::decode_retained_image_handle(png).is_some() {
+            continue;
+        }
         let display_idx = idx + 1;
         if png.is_empty() {
             return Err(format!("Pasted image #{display_idx} is empty."));

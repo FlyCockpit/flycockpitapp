@@ -21,6 +21,15 @@ pub struct AuthenticatedTerminalContext {
     pub connection_epoch: u64,
 }
 
+/// Exact, host-retained bytes released by consuming one opaque terminal
+/// ingress capability. Paths never cross the client protocol boundary.
+#[derive(Debug)]
+pub struct PrivateImageIngress {
+    pub bytes: Vec<u8>,
+    pub declared_sha256: String,
+    pub media_type: crate::daemon::proto::terminal::TerminalImageType,
+}
+
 pub trait TerminalHost: std::fmt::Debug + Send + Sync {
     fn open(
         &self,
@@ -87,6 +96,15 @@ pub trait TerminalHost: std::fmt::Debug + Send + Sync {
         binding: crate::daemon::proto::terminal::TerminalBinding,
         operation_id: Uuid,
     ) -> TerminalResult;
+    /// Consume a capability minted by this host for the exact authenticated
+    /// terminal owner and session. Implementations must make this one-shot,
+    /// expiry-bound, root-bound, and reject pathname/object mutation.
+    fn consume_private_image_ingress(
+        &self,
+        context: &AuthenticatedTerminalContext,
+        session_id: Uuid,
+        capability: &str,
+    ) -> std::result::Result<PrivateImageIngress, ErrorPayload>;
     fn contains(&self, terminal_id: Uuid) -> bool;
     fn sweep_idle(&self, now: Instant) -> Vec<Uuid>;
 }
@@ -228,6 +246,15 @@ impl TerminalHost for UnsupportedTerminalHost {
         _binding: crate::daemon::proto::terminal::TerminalBinding,
         _operation_id: Uuid,
     ) -> TerminalResult {
+        Err(unsupported_terminal_host())
+    }
+
+    fn consume_private_image_ingress(
+        &self,
+        _context: &AuthenticatedTerminalContext,
+        _session_id: Uuid,
+        _capability: &str,
+    ) -> std::result::Result<PrivateImageIngress, ErrorPayload> {
         Err(unsupported_terminal_host())
     }
 
@@ -440,6 +467,18 @@ impl TerminalHost for TestTerminalHost {
         operation_id: Uuid,
     ) -> TerminalResult {
         self.ingress_finish(terminal_id, binding, operation_id)
+    }
+
+    fn consume_private_image_ingress(
+        &self,
+        _context: &AuthenticatedTerminalContext,
+        _session_id: Uuid,
+        _capability: &str,
+    ) -> std::result::Result<PrivateImageIngress, ErrorPayload> {
+        Err(ErrorPayload {
+            code: crate::daemon::proto::ErrorCode::BadRequest,
+            message: "private image ingress capability is unavailable".into(),
+        })
     }
 
     fn contains(&self, terminal_id: Uuid) -> bool {

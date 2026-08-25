@@ -1,69 +1,139 @@
 use super::sessions::*;
 use super::*;
 
-const LOCAL_IMAGE_PATH_MAX_INPUT_BYTES: u64 = 10 * 1024 * 1024;
+const IMAGE_INGRESS_MAX_INPUT_BYTES: u64 = 10 * 1024 * 1024;
 
-pub(super) async fn admit_local_image_path(
+struct NormalizedIngressImage {
+    png: Vec<u8>,
+    sha256: String,
+    width: u32,
+    height: u32,
+}
+
+pub(super) async fn admit_image_ingress(
     ctx: &DaemonContext,
-    project_root: String,
-    path: proto::SensitiveWirePayload,
+    state: &mut MutableClientState,
+    session_id: Uuid,
+    source: proto::ImageIngressSourceV1,
     admission_id: Uuid,
 ) -> std::result::Result<Response, ErrorPayload> {
-    if project_root.trim().is_empty() || path.trim().is_empty() || path.len() > 4096 {
-        return Err(bad_request("local image path is unavailable"));
+    use base64::Engine as _;
+    use cockpit_config::config::media_budget::{
+        MediaDimension, MediaEvaluationRequest, PASTE_IMAGE_PROFILE,
+    };
+    if !ctx
+        .media_admission_open
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(internal("media admission recovery is incomplete"));
     }
-    let root = std::fs::canonicalize(&project_root)
-        .map_err(|_| bad_request("local image path is unavailable"))?;
-    let trust = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &root)
+    let attached = require_attached(state)?;
+    if attached.handle.session_id != session_id {
+        return Err(bad_request("image ingress session mismatch"));
+    }
+    let root = attached.handle.project_root.clone();
+    let trust = attached.handle.trust_policy.clone();
+    let project_id = attached.handle.project_id();
+    let project_text = root
+        .to_str()
+        .ok_or_else(|| bad_request("image ingress project is unavailable"))?;
+    let project_digest = crate::intel::hex_lower(&Sha256::digest(project_text.as_bytes()));
+    let storage = ctx
+        .media_storage_recovery
+        .as_ref()
+        .ok_or_else(|| internal("durable media storage unavailable"))?;
+    if let Some(published) = storage
+        .ingress_image_receipt(admission_id, session_id)
         .await
-        .map_err(|_| bad_request("local image path is unavailable"))?;
-    if trust.root.root != root && !root.starts_with(&trust.root.root) {
-        return Err(bad_request("local image path is unavailable"));
+        .map_err(internal)?
+    {
+        return Ok(Response::ImageIngressAdmitted(
+            proto::ImageIngressAdmissionReceiptV1 {
+                schema_version: 1,
+                kind: "imageIngressAdmissionReceipt".into(),
+                admission_id: published.admission_id,
+                session_id: published.session_id,
+                image_ref: proto::ImageAttachmentRef {
+                    id: published.attachment_id,
+                },
+                attachment_version: published.attachment_version,
+                availability_generation: published.availability_generation,
+                reservation_id: published.reservation_id,
+                normalized_sha256: published.normalized_sha256,
+                normalized_byte_length: published.normalized_byte_length,
+                width: published.width,
+                height: published.height,
+            },
+        ));
     }
     let (_, extended) = ctx
         .config_source
         .load_effective_for_daemon(&root, &trust)
-        .map_err(|_| bad_request("local image path is unavailable"))?;
-    let requested = std::path::PathBuf::from(path.as_str());
-    let root_for_worker = root.clone();
-    let admitted = tokio::task::spawn_blocking(move || {
-        normalize_project_image_path(&root_for_worker, &requested, admission_id)
-    })
-    .await
-    .map_err(internal)?
-    .map_err(|_| bad_request("local image path is unavailable"))?;
-    evaluate_local_image_admission_policy(&extended.media_resources, &admitted)
-        .map_err(|_| bad_request("local image path is unavailable"))?;
-    Ok(Response::LocalImagePathAdmitted(admitted))
-}
-
-fn evaluate_local_image_admission_policy(
-    policy: &cockpit_config::config::media_budget::MediaResourcePolicy,
-    admitted: &proto::LocalImagePathAdmissionV1,
-) -> anyhow::Result<()> {
-    use cockpit_config::config::media_budget::{
-        MediaDimension, MediaEvaluationRequest, PASTE_IMAGE_PROFILE,
+        .map_err(internal)?;
+    let policy = extended.media_resources;
+    let (bytes, expected_format, source_sha256) = match source {
+        proto::ImageIngressSourceV1::PrivateTerminalCapability { capability } => {
+            let ingress = state.terminal_host.consume_private_image_ingress(
+                &state.terminal_context,
+                session_id,
+                &capability,
+            )?;
+            let format = match ingress.media_type {
+                proto::terminal::TerminalImageType::Png => image::ImageFormat::Png,
+                proto::terminal::TerminalImageType::Jpeg => image::ImageFormat::Jpeg,
+                proto::terminal::TerminalImageType::Gif => image::ImageFormat::Gif,
+                proto::terminal::TerminalImageType::Webp => image::ImageFormat::WebP,
+            };
+            (ingress.bytes, format, ingress.declared_sha256)
+        }
+        proto::ImageIngressSourceV1::ClipboardPng {
+            png_base64,
+            byte_length,
+            sha256,
+        } => {
+            if byte_length == 0 || byte_length > IMAGE_INGRESS_MAX_INPUT_BYTES {
+                return Err(bad_request("clipboard image is unavailable"));
+            }
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(png_base64.as_str())
+                .map_err(|_| bad_request("clipboard image is unavailable"))?;
+            if bytes.len() as u64 != byte_length || sha256_hex(&bytes) != sha256 {
+                return Err(bad_request("clipboard image integrity mismatch"));
+            }
+            (bytes, image::ImageFormat::Png, sha256)
+        }
     };
-    let pixels = u64::from(admitted.width)
-        .checked_mul(u64::from(admitted.height))
-        .ok_or_else(|| anyhow::anyhow!("pixel count overflow"))?;
-    for (dimension, requested) in [
+    if bytes.is_empty()
+        || bytes.len() as u64 > IMAGE_INGRESS_MAX_INPUT_BYTES
+        || sha256_hex(&bytes) != source_sha256
+    {
+        return Err(bad_request("image ingress source is unavailable"));
+    }
+    let plans = [
         (MediaDimension::QueuedOperationsGlobal, 1),
         (MediaDimension::QueuedOperationsPerSession, 1),
         (
             MediaDimension::EncodedBytesPerObject,
-            admitted.normalized_byte_length,
+            policy.limits().get(MediaDimension::EncodedBytesPerObject),
         ),
         (
             MediaDimension::RetainedBytesPerSession,
-            admitted.normalized_byte_length,
+            policy.limits().get(MediaDimension::RetainedBytesPerSession),
         ),
         (
             MediaDimension::DecodedEdgePixels,
-            u64::from(admitted.width.max(admitted.height)),
+            policy.limits().get(MediaDimension::DecodedEdgePixels),
         ),
-        (MediaDimension::DecodedImagePixels, pixels),
-        (MediaDimension::AggregateDecodedPixelsPerRequest, pixels),
+        (
+            MediaDimension::DecodedImagePixels,
+            policy.limits().get(MediaDimension::DecodedImagePixels),
+        ),
+        (
+            MediaDimension::AggregateDecodedPixelsPerRequest,
+            policy
+                .limits()
+                .get(MediaDimension::AggregateDecodedPixelsPerRequest),
+        ),
         (MediaDimension::LocalCpuJobsGlobal, 1),
         (
             MediaDimension::OperationDeadlineSeconds,
@@ -71,7 +141,9 @@ fn evaluate_local_image_admission_policy(
                 .limits()
                 .get(MediaDimension::OperationDeadlineSeconds),
         ),
-    ] {
+    ]
+    .into_iter()
+    .map(|(dimension, requested)| {
         policy.evaluate(MediaEvaluationRequest {
             dimension,
             requested: Some(requested),
@@ -79,75 +151,204 @@ fn evaluate_local_image_admission_policy(
             profile: Some(PASTE_IMAGE_PROFILE),
             adapter_limit: None,
             request_limit: None,
-        })?;
+        })
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|_| bad_request("image ingress exceeds media policy"))?;
+    let wall_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .try_into()
+        .unwrap_or(0);
+    let reservation_id = format!("image-ingress:{admission_id}");
+    let receipt = ctx
+        .media_ledger
+        .reserve(crate::media_reservation::ReserveRequest {
+            reservation_id: reservation_id.clone(),
+            recovery_id: reservation_id.clone(),
+            owner: crate::media_reservation::MediaOwner {
+                project_id,
+                session_id: session_id.to_string(),
+            },
+            operation: "image_ingress".into(),
+            purpose: "paste_image".into(),
+            plans,
+            wall_ms,
+        })
+        .await
+        .map_err(|error| bad_request(format!("image ingress denied: {error}")))?;
+    let mut abandon = AbandonIngressOnDrop {
+        ledger: ctx.media_ledger.clone(),
+        reservation_id: Some(reservation_id.clone()),
+        wall_ms,
+        decode_worker: None,
+    };
+    ctx.media_ledger
+        .mark_execution_ready(&reservation_id, wall_ms)
+        .await
+        .map_err(internal)?;
+    let execution_plan = ctx
+        .media_ledger
+        .evaluated_plan(&reservation_id, MediaDimension::LocalCpuJobsGlobal)
+        .await
+        .map_err(internal)?;
+    let executing = loop {
+        if ctx.media_ledger.clock_now_ms() >= receipt.deadline_monotonic_ms {
+            return Err(bad_request("image ingress deadline expired"));
+        }
+        match ctx
+            .media_ledger
+            .claim_ready_fair(&reservation_id, execution_plan.clone(), wall_ms)
+            .await
+        {
+            Ok(Some(receipt)) => break receipt,
+            Ok(None) | Err(crate::media_reservation::LedgerError::Denied(_)) => {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Err(error) => return Err(internal(error)),
+        }
+    };
+    abandon.decode_worker = Some(tokio::task::spawn_blocking(move || {
+        normalize_ingress_image(bytes, expected_format)
+    }));
+    let remaining_ms = receipt
+        .deadline_monotonic_ms
+        .saturating_sub(ctx.media_ledger.clock_now_ms());
+    let normalized = tokio::time::timeout(
+        std::time::Duration::from_millis(remaining_ms.max(1)),
+        abandon
+            .decode_worker
+            .as_mut()
+            .expect("decode worker installed"),
+    )
+    .await
+    .map_err(|_| bad_request("image ingress deadline expired"))?
+    .map_err(internal)?
+    .map_err(|_| bad_request("image ingress decode failed"))?;
+    abandon.decode_worker.take();
+    let pixels = u64::from(normalized.width)
+        .checked_mul(u64::from(normalized.height))
+        .ok_or_else(|| bad_request("image pixel count overflow"))?;
+    let mut reconciled = executing;
+    for (dimension, actual) in [
+        (
+            MediaDimension::EncodedBytesPerObject,
+            normalized.png.len() as u64,
+        ),
+        (
+            MediaDimension::RetainedBytesPerSession,
+            normalized.png.len() as u64,
+        ),
+        (
+            MediaDimension::DecodedEdgePixels,
+            u64::from(normalized.width.max(normalized.height)),
+        ),
+        (MediaDimension::DecodedImagePixels, pixels),
+        (MediaDimension::AggregateDecodedPixelsPerRequest, pixels),
+    ] {
+        reconciled = ctx
+            .media_ledger
+            .reconcile_actual(
+                &reservation_id,
+                reconciled.version,
+                dimension,
+                actual,
+                false,
+                wall_ms,
+            )
+            .await
+            .map_err(internal)?;
+        if reconciled.state == crate::media_reservation::ReservationState::OverageQuarantined {
+            return Err(bad_request("image ingress exceeds media policy"));
+        }
     }
-    Ok(())
+    ctx.media_ledger
+        .complete_local_allocation(&reservation_id, reconciled.version, wall_ms)
+        .await
+        .map_err(internal)?;
+    let width = normalized.width;
+    let height = normalized.height;
+    let published = storage
+        .publish_ingress_image(crate::media_storage::PublishIngressImageInput {
+            admission_id,
+            session_id,
+            project_digest,
+            reservation_id: reservation_id.clone(),
+            bytes: normalized.png,
+            sha256: normalized.sha256.clone(),
+            width,
+            height,
+            now_unix_ms: i64::try_from(wall_ms).unwrap_or(i64::MAX),
+        })
+        .await
+        .map_err(internal)?;
+    abandon.reservation_id = None;
+    Ok(Response::ImageIngressAdmitted(
+        proto::ImageIngressAdmissionReceiptV1 {
+            schema_version: 1,
+            kind: "imageIngressAdmissionReceipt".into(),
+            admission_id,
+            session_id,
+            image_ref: proto::ImageAttachmentRef {
+                id: published.attachment_id,
+            },
+            attachment_version: published.attachment_version,
+            availability_generation: published.availability_generation,
+            reservation_id: published.reservation_id,
+            normalized_sha256: published.normalized_sha256,
+            normalized_byte_length: published.normalized_byte_length,
+            width: published.width,
+            height: published.height,
+        },
+    ))
 }
 
-fn normalize_project_image_path(
-    project_root: &std::path::Path,
-    requested: &std::path::Path,
-    admission_id: Uuid,
-) -> anyhow::Result<proto::LocalImagePathAdmissionV1> {
-    use base64::Engine as _;
-    use image::{DynamicImage, GenericImageView as _, ImageDecoder as _, ImageFormat, Limits};
-    use std::io::{Cursor, Read as _};
+struct AbandonIngressOnDrop {
+    ledger: crate::media_reservation::MediaReservationLedger,
+    reservation_id: Option<String>,
+    wall_ms: u64,
+    decode_worker: Option<tokio::task::JoinHandle<anyhow::Result<NormalizedIngressImage>>>,
+}
 
-    let joined = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        project_root.join(requested)
-    };
-    let canonical = std::fs::canonicalize(&joined)?;
-    anyhow::ensure!(
-        canonical.starts_with(project_root),
-        "path escaped workspace"
-    );
-    let mut file = open_local_image_no_follow(&canonical)?;
-    let before = file.metadata()?;
-    anyhow::ensure!(
-        before.is_file() && before.len() > 0 && before.len() <= LOCAL_IMAGE_PATH_MAX_INPUT_BYTES,
-        "invalid source"
-    );
-    let identity_before = local_image_identity(&before);
-    let mut bytes = Vec::with_capacity(usize::try_from(before.len())?);
-    file.by_ref()
-        .take(LOCAL_IMAGE_PATH_MAX_INPUT_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    anyhow::ensure!(
-        bytes.len() as u64 <= LOCAL_IMAGE_PATH_MAX_INPUT_BYTES,
-        "source too large"
-    );
-    let after = file.metadata()?;
-    anyhow::ensure!(
-        before.len() == after.len()
-            && before.len() == bytes.len() as u64
-            && identity_before == local_image_identity(&after),
-        "source changed"
-    );
+impl Drop for AbandonIngressOnDrop {
+    fn drop(&mut self) {
+        let Some(id) = self.reservation_id.take() else {
+            return;
+        };
+        let worker = self.decode_worker.take();
+        let ledger = self.ledger.clone();
+        let wall_ms = self.wall_ms;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Some(worker) = worker {
+                    let _ = worker.await;
+                }
+                let _ = ledger
+                    .abandon_local_operation(
+                        &id,
+                        &format!("abandoned-image-ingress-destroyed:{id}"),
+                        wall_ms,
+                    )
+                    .await;
+            });
+        }
+    }
+}
+
+fn normalize_ingress_image(
+    bytes: Vec<u8>,
+    expected_format: image::ImageFormat,
+) -> anyhow::Result<NormalizedIngressImage> {
+    use image::{DynamicImage, GenericImageView as _, ImageDecoder as _, ImageFormat, Limits};
+    use std::io::Cursor;
 
     let format = image::guess_format(&bytes)?;
+    anyhow::ensure!(format == expected_format, "image type mismatch");
     anyhow::ensure!(
         matches!(
             format,
             ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP
         ),
         "unsupported image"
-    );
-    let extension = canonical
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase)
-        .ok_or_else(|| anyhow::anyhow!("missing image extension"))?;
-    anyhow::ensure!(
-        matches!(
-            (format, extension.as_str()),
-            (ImageFormat::Png, "png")
-                | (ImageFormat::Jpeg, "jpg" | "jpeg")
-                | (ImageFormat::Gif, "gif")
-                | (ImageFormat::WebP, "webp")
-        ),
-        "image extension does not match content"
     );
     reject_local_image_animation(format, &bytes)?;
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
@@ -173,58 +374,12 @@ fn normalize_project_image_path(
         "normalized image exceeds policy"
     );
     let digest = sha256_hex(&png);
-    Ok(proto::LocalImagePathAdmissionV1 {
-        schema_version: 1,
-        kind: "localImagePathAdmission".into(),
-        admission_id,
-        normalized_png_base64: proto::LocalImagePngPayload::new(
-            base64::engine::general_purpose::STANDARD.encode(&png),
-        ),
-        normalized_sha256: digest,
-        normalized_byte_length: png.len() as u64,
+    Ok(NormalizedIngressImage {
+        png,
+        sha256: digest,
         width,
         height,
     })
-}
-
-#[cfg(unix)]
-fn open_local_image_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(windows)]
-fn open_local_image_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_local_image_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(path)
-}
-
-#[cfg(unix)]
-fn local_image_identity(metadata: &std::fs::Metadata) -> (u64, u64, u64, i128) {
-    use std::os::unix::fs::MetadataExt as _;
-    (
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()),
-    )
-}
-
-#[cfg(not(unix))]
-fn local_image_identity(metadata: &std::fs::Metadata) -> (u64, Option<std::time::SystemTime>) {
-    (metadata.len(), metadata.modified().ok())
 }
 
 fn reject_local_image_animation(format: image::ImageFormat, bytes: &[u8]) -> anyhow::Result<()> {

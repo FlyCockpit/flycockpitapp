@@ -1464,7 +1464,7 @@ fn filesystem_authority_classifier_has_path_complete_negative_fixtures() {
 }
 
 #[test]
-fn pasted_image_paths_are_admitted_only_by_the_daemon() {
+fn pasted_images_use_opaque_daemon_retained_ingress() {
     let root = repo_root();
     assert!(
         !root
@@ -1479,12 +1479,14 @@ fn pasted_image_paths_are_admitted_only_by_the_daemon() {
             .unwrap();
 
     assert!(!module.contains("mod image_path_probe"));
-    assert!(input.contains("Request::AdmitLocalImagePath"));
+    assert!(input.contains("Request::AdmitImageIngress"));
+    assert!(input.contains("PrivateTerminalCapability"));
+    assert!(input.contains("ClipboardPng"));
     for forbidden in [
         "std::fs::OpenOptions",
         "ImageReader::with_format",
         "DynamicImage::from_decoder",
-        "normalize_private_image",
+        "to_string_lossy",
     ] {
         assert!(
             !production_source(&input).contains(forbidden),
@@ -1492,12 +1494,15 @@ fn pasted_image_paths_are_admitted_only_by_the_daemon() {
         );
     }
     for required in [
-        "resolve_workspace_trust_policy_from_db",
-        "canonical.starts_with(project_root)",
-        "open_local_image_no_follow",
-        "source changed",
-        "MAX_SINGLE_IMAGE_BYTES",
-        "LocalImagePathAdmitted",
+        "media_ledger.reserve",
+        "mark_execution_ready",
+        "claim_ready_fair",
+        "deadline_monotonic_ms",
+        "normalize_ingress_image",
+        "reconcile_actual",
+        "complete_local_allocation",
+        "publish_ingress_image",
+        "ImageIngressAdmitted",
     ] {
         assert!(
             daemon.contains(required),

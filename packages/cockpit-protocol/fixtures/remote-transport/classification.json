@@ -1725,7 +1725,7 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "admit_local_image_path"
+        "tag": "admit_image_ingress"
       },
       {
         "class": "bounded_request_response",
@@ -2669,7 +2669,7 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "local_image_path_admitted"
+        "tag": "image_ingress_admitted"
       },
       {
         "class": "bounded_request_response",

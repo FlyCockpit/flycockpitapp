@@ -15913,7 +15913,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "register_local_path_media" | "retain_https_media" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
-        "admit_local_image_path" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        "admit_image_ingress" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         "list_leak_reports" | "list_secret_inventory" | "get_flycockpit_account" => {
             AuthzAllowedOutcome::Response
         }
@@ -16249,7 +16249,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("set_workspace_trust"),
         authz_owner_only("recover_security_blocked_media"),
         authz_owner_only("register_local_path_media"),
-        authz_project_read("admit_local_image_path"),
+        authz_session_writer("admit_image_ingress"),
         authz_owner_only("retain_https_media"),
         authz_owner_only("list_leak_reports"),
         authz_owner_only("begin_leak_reveal"),
@@ -17736,7 +17736,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 kind: "registerLocalPathMedia".into(),
                 local_operation_id: Uuid::now_v7(),
                 owner_principal_digest: "11".repeat(32),
-                session_id: Uuid::now_v7(),
+                session_id: Uuid::nil(),
                 canonical_project_digest: "22".repeat(32),
                 client_draft_id: Uuid::now_v7(),
                 requested_media_kind:
@@ -17744,11 +17744,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 path: "/repo/file.png".into(),
             },
         ),
-        "admit_local_image_path" => Request::AdmitLocalImagePath {
-            project_root: root.clone(),
-            path: cockpit_proto::SensitiveWirePayload::new(
-                root.join("file.png").to_string_lossy().into_owned(),
-            ),
+        "admit_image_ingress" => Request::AdmitImageIngress {
+            session_id: Uuid::now_v7(),
+            source: cockpit_proto::ImageIngressSourceV1::PrivateTerminalCapability {
+                capability: "a".repeat(26),
+            },
             admission_id: Uuid::now_v7(),
         },
         "retain_https_media" => {
@@ -24674,16 +24674,16 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
             mutating: true,
         },
         CommandMetadataCase {
-            request: Request::AdmitLocalImagePath {
-                project_root: project_root.clone(),
-                path: cockpit_proto::SensitiveWirePayload::new(
-                    "/tmp/project/file.png".into(),
-                ),
+            request: Request::AdmitImageIngress {
+                session_id: Uuid::nil(),
+                source: cockpit_proto::ImageIngressSourceV1::PrivateTerminalCapability {
+                    capability: "a".repeat(26),
+                },
                 admission_id: Uuid::now_v7(),
             },
-            kind: "admit_local_image_path",
-            session_id: None,
-            audit_path: Some(project_root.as_str()),
+            kind: "admit_image_ingress",
+            session_id: Some(Uuid::nil()),
+            audit_path: None,
             mutating: true,
         },
         CommandMetadataCase {
@@ -25185,7 +25185,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         GetUsageCounts,
         StatsRollup,
         GuidanceEstimate,
-        AdmitLocalImagePath,
+        AdmitImageIngress,
         RestartIfIdle,
         StopDaemon,
         GetHostCapabilities,

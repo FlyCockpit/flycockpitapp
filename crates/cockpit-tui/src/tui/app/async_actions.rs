@@ -1039,18 +1039,12 @@ impl App {
                     cursor,
                     admission: Some(admission),
                 }) if terminal_generation == self.terminal_input_generation => {
-                    let _receipt_metadata = (
-                        admission.admission_id,
-                        admission.sha256.as_str(),
-                        admission.width,
-                        admission.height,
-                    );
                     self.settle_paste_probe(
                         request_id,
                         request_generation,
                         source_draft_generation,
                         cursor,
-                        Some(admission.png),
+                        Some(admission),
                         false,
                     );
                 }
@@ -1093,7 +1087,7 @@ impl App {
                     terminal_generation,
                     source_draft_generation,
                     cursor,
-                    png: Some(png),
+                    admission: Some(admission),
                 }) if terminal_generation == self.terminal_input_generation => {
                     self.terminal_paste_classifier.resolve_shortcut_intent();
                     self.settle_paste_probe(
@@ -1101,7 +1095,7 @@ impl App {
                         request_generation,
                         source_draft_generation,
                         cursor,
-                        Some(png),
+                        Some(admission),
                         false,
                     );
                 }
@@ -1113,7 +1107,7 @@ impl App {
                     request_generation,
                     terminal_generation,
                     source_draft_generation,
-                    png: None,
+                    admission: None,
                     ..
                 }) if terminal_generation == self.terminal_input_generation => {
                     self.settle_paste_probe(
@@ -2187,7 +2181,7 @@ impl App {
         request_generation: u64,
         source_draft_generation: u64,
         cursor: usize,
-        png: Option<Vec<u8>>,
+        admission: Option<crate::tui::async_action::DaemonImagePathAdmission>,
         report_unavailable: bool,
     ) {
         let Some(probe) = self.pending_paste_probes.remove(&request_id) else {
@@ -2209,19 +2203,29 @@ impl App {
             if source_draft_generation != self.draft_generation {
                 return;
             }
-            if let Some(png) = png {
+            if let Some(admission) = admission {
                 self.composer.set_cursor(cursor);
-                self.insert_image_block(png);
+                self.insert_image_handle_block(admission);
             } else if report_unavailable {
                 self.show_toast("Paste unavailable", ToastKind::Error);
             }
             return;
         };
-        if png.is_none() && report_unavailable {
+        if admission.is_none() && report_unavailable {
             self.show_toast("Paste unavailable", ToastKind::Error);
         }
         let ready = if let Some(fence) = self.submission_fences.get_mut(&fence_id) {
-            let result = png.map(|png| ("[image]".to_string(), String::new(), Some(png)));
+            let result = admission.map(|admission| {
+                (
+                    "[image]".to_string(),
+                    String::new(),
+                    Some(crate::tui::structured_paste::PasteImageAdmission::Handle {
+                        image_ref: admission.image_ref,
+                        normalized_byte_length: admission.normalized_byte_length,
+                        sha256: admission.sha256,
+                    }),
+                )
+            });
             let _ = fence.settle_slot(
                 request_id,
                 request_generation,
@@ -2264,11 +2268,11 @@ impl App {
         for slot in &fence.slots {
             if let crate::tui::structured_paste::PasteSlotState::Ready {
                 original_offset,
-                png: Some(png),
+                image: Some(image),
                 ..
             } = slot
             {
-                resolved_images.push((*original_offset, png.clone()));
+                resolved_images.push((*original_offset, image.clone()));
             }
         }
         resolved_images.sort_by_key(|(offset, _)| *offset);
@@ -2312,15 +2316,23 @@ impl App {
         }
         if positional_wire {
             let original_wire = deferred.submission.text.clone();
-            for (inserted, (offset, png)) in resolved_images.iter().enumerate() {
+            for (inserted, (offset, image)) in resolved_images.iter().enumerate() {
                 let offset = floor_char_boundary(&original_wire, *offset);
                 let existing_before = original_wire[..offset]
                     .matches(cockpit_core::daemon::proto::IMAGE_PART_SENTINEL)
                     .count();
-                deferred
-                    .submission
-                    .images
-                    .insert(existing_before + inserted, png.clone());
+                deferred.submission.images.insert(
+                    existing_before + inserted,
+                    match image {
+                        crate::tui::structured_paste::PasteImageAdmission::Bytes(bytes) => {
+                            bytes.clone()
+                        }
+                        crate::tui::structured_paste::PasteImageAdmission::Handle {
+                            image_ref,
+                            ..
+                        } => cockpit_core::daemon::proto::encode_retained_image_handle(image_ref),
+                    },
+                );
             }
             for (offset, _) in resolved_images.iter().rev() {
                 let offset = floor_char_boundary(&deferred.submission.text, *offset);
@@ -2330,12 +2342,19 @@ impl App {
                     .insert_str(offset, cockpit_core::daemon::proto::IMAGE_PART_SENTINEL);
             }
         } else {
-            for (_, png) in &resolved_images {
+            for (_, image) in &resolved_images {
                 deferred
                     .submission
                     .text
                     .push_str(cockpit_core::daemon::proto::IMAGE_PART_SENTINEL);
-                deferred.submission.images.push(png.clone());
+                deferred.submission.images.push(match image {
+                    crate::tui::structured_paste::PasteImageAdmission::Bytes(bytes) => {
+                        bytes.clone()
+                    }
+                    crate::tui::structured_paste::PasteImageAdmission::Handle {
+                        image_ref, ..
+                    } => cockpit_core::daemon::proto::encode_retained_image_handle(image_ref),
+                });
             }
         }
         if positional_display {

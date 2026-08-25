@@ -318,7 +318,7 @@ pub enum AsyncActionPayload {
         terminal_generation: Option<u64>,
         source_draft_generation: u64,
         cursor: usize,
-        png: Option<Vec<u8>>,
+        admission: Option<DaemonImagePathAdmission>,
     },
     PinState {
         session_id: uuid::Uuid,
@@ -419,7 +419,8 @@ pub enum AsyncActionPayload {
 #[derive(Debug)]
 pub struct DaemonImagePathAdmission {
     pub admission_id: uuid::Uuid,
-    pub png: Vec<u8>,
+    pub image_ref: cockpit_core::daemon::proto::ImageAttachmentRef,
+    pub normalized_byte_length: u64,
     pub sha256: String,
     pub width: u32,
     pub height: u32,

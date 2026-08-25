@@ -1,5 +1,62 @@
 use super::*;
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ImageIngressSourceV1 {
+    /// One-shot token minted by the in-process terminal host. It resolves to
+    /// a retained no-follow handle; it is not a pathname or filename.
+    PrivateTerminalCapability { capability: String },
+    /// Clipboard pixels are captured and PNG-encoded by the terminal UI, then
+    /// admitted by the same daemon policy/retention pipeline.
+    ClipboardPng {
+        png_base64: SensitiveWirePayload,
+        byte_length: u64,
+        #[serde(deserialize_with = "deserialize_lower_hex_sha256")]
+        sha256: String,
+    },
+}
+
+impl std::fmt::Debug for ImageIngressSourceV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrivateTerminalCapability { capability } => formatter
+                .debug_struct("PrivateTerminalCapability")
+                .field(
+                    "capability",
+                    &format_args!("[REDACTED; {} bytes]", capability.len()),
+                )
+                .finish(),
+            Self::ClipboardPng {
+                byte_length,
+                sha256,
+                ..
+            } => formatter
+                .debug_struct("ClipboardPng")
+                .field("png_base64", &"[REDACTED]")
+                .field("byte_length", byte_length)
+                .field("sha256", sha256)
+                .finish(),
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+impl crate::remote_operation_fcor::CanonicalFcorValueV1 for ImageIngressSourceV1 {
+    fn encode_fcor_value_v1(
+        &self,
+        out: &mut crate::remote_operation_fcor::CanonicalParamsV1,
+    ) -> anyhow::Result<()> {
+        use sha2::Digest as _;
+        let material = zeroize::Zeroizing::new(serde_json::to_vec(self)?);
+        out.push_bytes(sha2::Sha256::digest(material.as_slice()).as_slice())
+    }
+}
+
 fn deserialize_optional_nonempty_string<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error>
@@ -2217,11 +2274,12 @@ pub enum Request {
     /// Register a project-contained local file while retaining its verified handle.
     RegisterLocalPathMedia(cockpit_db::media_attachments::RegisterLocalPathMediaV1),
 
-    /// Admit a browser-provided image path through daemon-owned workspace and
-    /// media policy. The path is ingress-only and is never echoed back.
-    AdmitLocalImagePath {
-        project_root: String,
-        path: SensitiveWirePayload,
+    /// Consume an opaque terminal-host capability or admit clipboard PNG
+    /// bytes into daemon-owned retained media. Host paths never cross this
+    /// protocol boundary.
+    AdmitImageIngress {
+        session_id: Uuid,
+        source: ImageIngressSourceV1,
         admission_id: Uuid,
     },
 
@@ -3705,7 +3763,7 @@ macro_rules! request_variants {
             (Request::GuidanceEstimate { .. }, "guidance_estimate");
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media");
             (Request::RegisterLocalPathMedia(..), "register_local_path_media");
-            (Request::AdmitLocalImagePath { .. }, "admit_local_image_path");
+            (Request::AdmitImageIngress { .. }, "admit_image_ingress");
             (Request::RetainHttpsMedia(..), "retain_https_media");
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status");
             (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview");
@@ -4004,7 +4062,7 @@ macro_rules! command {
             (Request::GuidanceEstimate { project_root, provider, model }, "guidance_estimate", project_read(project_root), none, false, read_only, none, concurrent, none, "project_root:String|provider:Option<String>|model:Option<String>", [project_root: String => project_root, provider: Option<String> => provider_model_left(model), model: Option<String> => provider_model_right(provider)]);
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
-            (Request::AdmitLocalImagePath { project_root, path, admission_id }, "admit_local_image_path", project_read(project_root), none, true, local_only, none, concurrent, path(project_root), "project_root:String|path:SensitiveWirePayload|admission_id:Uuid", [project_root: String => project_root, path: SensitiveWirePayload => param, admission_id: Uuid => param]);
+            (Request::AdmitImageIngress { session_id, source, admission_id }, "admit_image_ingress", session_writer, attached, true, local_only, none, serialized, none, "session_id:Uuid|source:ImageIngressSourceV1|admission_id:Uuid", [session_id: Uuid => session, source: ImageIngressSourceV1 => param, admission_id: Uuid => param]);
             (Request::RetainHttpsMedia(..), "retain_https_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status", public_read, none, false, read_only, none, serialized, none, "-", []);
             (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview", public_read, none, false, read_only, none, serialized, none, "-", []);
@@ -4367,6 +4425,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         // Secret-bearing JSON payloads contribute only a SHA-256 digest, never
         // plaintext, to FCOR's ordinary canonical byte buffer.
         "SensitiveWirePayload" => "sha256-redacted",
+        "ImageIngressSourceV1" => "sha256-redacted",
         "Option<SensitiveWirePayload>" => "option<sha256-redacted>",
         "crate::image_control::ImageConfigMutationCapabilityV1" => "sha256-redacted",
         "Uuid" => "uuid",

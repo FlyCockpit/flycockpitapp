@@ -1760,18 +1760,24 @@
     },
     "response": "local_path_media_registration"
   },
-  "local_image_path_admitted": {
+  "image_ingress_admitted": {
     "data": {
       "schemaVersion": 1,
-      "kind": "localImagePathAdmission",
+      "kind": "imageIngressAdmissionReceipt",
       "admissionId": "01890f3e-7bcd-7abc-8abc-000000000021",
-      "normalizedPngBase64": "iVBORw0KGgo=",
+      "sessionId": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "imageRef": {
+        "id": "01890f3e-7bcd-7abc-8abc-000000000022"
+      },
+      "attachmentVersion": 1,
+      "availabilityGeneration": 1,
+      "reservationId": "image-ingress:01890f3e-7bcd-7abc-8abc-000000000021",
       "normalizedSha256": "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6",
       "normalizedByteLength": 8,
       "width": 1,
       "height": 1
     },
-    "response": "local_image_path_admitted"
+    "response": "image_ingress_admitted"
   },
   "retained_https_media": {
     "data": {

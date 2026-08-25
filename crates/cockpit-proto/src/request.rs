@@ -1835,7 +1835,7 @@ pub enum Request {
         project_root: String,
         lease_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        markdown: Option<String>,
+        markdown: Option<SensitiveWirePayload>,
     },
 
     /// Query the durable outcome of an exact external-editor settlement
@@ -3970,7 +3970,7 @@ macro_rules! command {
             (Request::GetAgentEditSnapshot { project_root, name }, "get_agent_edit_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|name:String", [project_root: String => project_root, name: String => param]);
             (Request::MutateAgent { client_operation_id, mutation_intent_hash, project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, mutation: crate::AgentMutation => param, expected_revision: Option<String> => param]);
             (Request::BeginAgentEditorLease { client_operation_id, project_root, name, expected_revision }, "begin_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|name:String|expected_revision:String", [client_operation_id: String => param, project_root: String => project_root, name: String => param, expected_revision: String => param]);
-            (Request::CompleteAgentEditorLease { client_operation_id, project_root, lease_id, markdown }, "complete_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|lease_id:String|markdown:Option<String>", [client_operation_id: String => param, project_root: String => project_root, lease_id: String => param, markdown: Option<String> => param]);
+            (Request::CompleteAgentEditorLease { client_operation_id, project_root, lease_id, markdown }, "complete_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|lease_id:String|markdown:Option<SensitiveWirePayload>", [client_operation_id: String => param, project_root: String => project_root, lease_id: String => param, markdown: Option<SensitiveWirePayload> => param]);
             (Request::GetAgentEditorLeaseSettlement { client_operation_id, project_root, lease_id }, "get_agent_editor_lease_settlement", owner_only, none, false, local_only, none, concurrent, path(project_root), "client_operation_id:String|project_root:String|lease_id:String", [client_operation_id: String => param, project_root: String => project_root, lease_id: String => param]);
             (Request::GetExtendedConfigSnapshot { project_root, snapshot_session_id }, "get_extended_config_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|snapshot_session_id:String", [project_root: String => project_root, snapshot_session_id: String => param]);
             (Request::ApplyExtendedConfigPatch { client_operation_id, project_root, layer_id, patch, expected_revision, snapshot_session_id }, "apply_extended_config_patch", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|layer_id:String|patch:crate::ExtendedConfigPatch|expected_revision:String|snapshot_session_id:String", [client_operation_id: String => param, project_root: String => project_root, layer_id: String => param, patch: crate::ExtendedConfigPatch => param, expected_revision: String => param, snapshot_session_id: String => param]);
@@ -4371,6 +4371,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         // Secret-bearing JSON payloads contribute only a SHA-256 digest, never
         // plaintext, to FCOR's ordinary canonical byte buffer.
         "SensitiveWirePayload" => "sha256-redacted",
+        "Option<SensitiveWirePayload>" => "option<sha256-redacted>",
         "crate::image_control::ImageConfigMutationCapabilityV1" => "sha256-redacted",
         "Uuid" => "uuid",
         "Vec<u8>" => "bytes",
@@ -4527,6 +4528,19 @@ pub fn remote_operation_uuid_v7_from_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn optional_sensitive_wire_payload_fcor_is_exactly_digest_redacted() {
+        for tag in ["complete_provider_oauth", "complete_mcp_oauth"] {
+            let schema = canonical_remote_operation_fcor_schema_for_tag(tag)
+                .expect("OAuth completion has a canonical FCOR schema");
+            assert_eq!(
+                schema,
+                "client_operation_id:string|flow_id:string|input:option<sha256-redacted>"
+            );
+        }
+    }
 
     /// `ImportSessionArchive` must not be able to carry archive bytes inline.
     ///

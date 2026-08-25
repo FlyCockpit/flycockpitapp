@@ -11316,6 +11316,7 @@ fn oauth_completion_receipts_and_cancel_race_are_secret_safe() {
 #[test]
 fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
     let source = include_str!("../agent_management.rs");
+    let request_source = include_str!("../../../../cockpit-proto/src/request.rs");
     assert!(source.contains("SealedEditorReplay"));
     assert!(source.contains("SealedEditorCompletion"));
     assert!(source.contains("SecretVaultKind::SealedState"));
@@ -11338,7 +11339,28 @@ fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
     assert!(lease_table.contains("snapshot_identity"));
     assert!(lease_table.contains("completion_operation_id"));
     assert!(lease_table.contains("completion_handle"));
+    assert!(lease_table.contains("publication_phase"));
+    assert!(lease_table.contains("consumed_projection_identity"));
+    assert!(lease_table.contains("intended_projection_identity"));
     assert!(lease_table.contains("publication_result_revision"));
+    assert!(lease_table.contains("consumed_config_generation"));
+    assert!(lease_table.contains("result_config_generation"));
+    assert!(source.contains("prepare_agent_editor_publication_under_publication_lock"));
+    assert!(source.contains("record_agent_editor_publication_under_publication_lock"));
+    assert!(source.contains("authoritative_identity == intended_identity"));
+    assert!(source.contains("authoritative_identity != consumed_identity"));
+    let completion_request = request_source
+        .split("CompleteAgentEditorLease {")
+        .nth(1)
+        .and_then(|tail| tail.split("GetAgentEditorLeaseSettlement {").next())
+        .expect("editor completion request must exist");
+    assert!(completion_request.contains("markdown: Option<SensitiveWirePayload>"));
+    let completion_handler = source
+        .split("async fn complete_editor_lease_inner")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn editor_lease_settlement").next())
+        .expect("editor completion handler must exist");
+    assert!(!completion_handler.contains("markdown.clone()"));
     assert!(source.contains("fail_agent_editor_completion_conn"));
     assert!(!lease_table.contains("snapshot_digest"));
     assert!(!lease_table.contains("snapshot_json"));
@@ -11582,18 +11604,40 @@ fn editor_replay_precedes_mutable_trust_and_terminal_replay_is_exact() {
         begin.find("agent_editor_lease_by_operation").unwrap()
             < begin.find("trusted_canonical_root").unwrap()
     );
+    assert_eq!(
+        begin
+            .matches("agent editor lease completion is already in progress")
+            .count(),
+        2,
+        "both initial replay and duplicate-insert race must direct completing leases to settlement",
+    );
     let complete = source
         .split("async fn complete_editor_lease_inner")
         .nth(1)
         .and_then(|tail| tail.split("pub async fn editor_lease_settlement").next())
         .expect("complete editor lease handler must exist");
     assert!(complete.contains("known_lease.completion_identity != Some(completion_identity)"));
-    assert!(complete.contains("identical bytes"));
+    assert!(complete.contains("authoritative_identity == intended_identity"));
+    assert!(complete.contains("authoritative_identity != consumed_identity"));
+    assert!(complete.contains("workspace_is_trusted"));
+    assert!(complete.contains("if !retry_is_trusted"));
+    assert!(complete.contains("EditorPublicationAttempt::Rejected(mutation_error)"));
+    assert!(complete.contains("EditorPublicationAttempt::Pending(mutation_error)"));
     assert!(complete.contains("retaining sealed payload"));
     assert!(!complete.contains("terminalize_editor_failure"));
     assert!(
         complete.find("known_lease.state == \"terminal\"").unwrap()
             < complete.find("trusted_canonical_root").unwrap()
+    );
+    assert!(
+        complete
+            .find("lease.publication_result_revision.clone()")
+            .unwrap()
+            < complete.find("trusted_canonical_root").unwrap()
+    );
+    assert!(
+        complete.find("match markdown").unwrap() < complete.find("trusted_canonical_root").unwrap(),
+        "cancellation must settle without consulting mutable trust"
     );
     let settlement = source
         .split("pub async fn editor_lease_settlement")
@@ -11601,6 +11645,132 @@ fn editor_replay_precedes_mutable_trust_and_terminal_replay_is_exact() {
         .and_then(|tail| tail.split("fn editor_completion").next())
         .expect("editor settlement handler must exist");
     assert!(!settlement.contains("trusted_root("));
+    assert!(settlement.contains("editor_root_matches"));
+    let root_match = source
+        .split("fn editor_root_matches")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn trusted_root").next())
+        .expect("editor root binding helper must exist");
+    assert!(root_match.contains("canonical_root == requested_root"));
+    assert!(root_match.contains("canonical_project_root(requested_root)"));
+    assert!(!root_match.contains("resolve_workspace_trust_policy"));
+}
+
+#[test]
+fn published_editor_recovery_is_metadata_only_and_terminalizes_before_vault_load() {
+    let source = include_str!("../agent_management.rs");
+    let maintenance = source
+        .split("pub(crate) async fn maintain_editor_leases")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub(crate) async fn recover_editor_leases_before_publish")
+                .next()
+        })
+        .expect("editor maintenance handler");
+    let boot = source
+        .split("pub(crate) async fn recover_editor_leases_before_publish")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn inventory").next())
+        .expect("editor boot recovery handler");
+    for handler in [maintenance, boot] {
+        assert!(
+            handler
+                .find("publication_result_revision.is_some()")
+                .unwrap()
+                < handler.find("load_editor_completion").unwrap(),
+            "published metadata must settle before sealed payload lookup"
+        );
+        assert!(handler.contains("settle_published_editor_completion"));
+    }
+    let settlement = source
+        .split("async fn settle_published_editor_completion")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub(crate) async fn maintain_editor_leases")
+                .next()
+        })
+        .expect("published metadata settlement helper");
+    assert!(settlement.contains("AgentEditorSettlementStatus::Saved"));
+    assert!(settlement.contains("row.owner_digest"));
+    assert!(source.contains("owner_scope: format!(\"project:{project_root}\")"));
+    assert!(settlement.contains("row.completion_operation_id"));
+    assert!(settlement.contains("row.publication_result_revision"));
+    assert!(settlement.contains("row.consumed_config_generation"));
+    assert!(settlement.contains("row.result_config_generation"));
+    assert!(settlement.contains("publish_committed_config_generation_at_least"));
+    assert!(!settlement.contains("publish_committed_config_generation();"));
+    assert!(settlement.contains(".transaction(move |conn|"));
+    assert!(settlement.contains("delete_item_on_conn"));
+    assert!(settlement.contains("finish_agent_editor_completion_conn"));
+    assert!(
+        settlement.find("delete_item_on_conn").unwrap()
+            < settlement
+                .find("finish_agent_editor_completion_conn")
+                .unwrap(),
+        "payload deletion must be part of the transaction before terminalization"
+    );
+    assert!(!settlement.contains(".delete_item("));
+    assert!(!settlement.contains("load_editor_completion"));
+    assert!(source.contains("current_definition_revision_sync"));
+    assert!(source.contains("snapshot: None"));
+    assert!(source.contains("zeroize_agent_edit_snapshot"));
+}
+
+#[test]
+fn editor_vault_reads_and_boot_publication_lock_waits_are_off_loop_and_bounded() {
+    let source = include_str!("../agent_management.rs");
+    for helper in ["load_editor_completion", "load_editor_replay"] {
+        let body = source
+            .split(&format!("async fn {helper}"))
+            .nth(1)
+            .and_then(|tail| tail.split("\n}").next())
+            .unwrap_or_else(|| panic!("missing async {helper} helper"));
+        assert!(body.contains("tokio::task::spawn_blocking"));
+    }
+    let completion = source
+        .split("async fn complete_editor_lease_inner")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn editor_lease_settlement").next())
+        .expect("editor completion handler");
+    assert!(completion.contains("try_hold_config_mutation_lock_until"));
+    assert!(completion.contains("pre_socket_lock_deadline"));
+    assert!(completion.contains("EditorPublicationAttempt::Pending"));
+    assert!(completion.contains("tokio::task::spawn_blocking"));
+    assert!(
+        completion.find("tokio::task::spawn_blocking").unwrap()
+            < completion
+                .find("try_hold_config_mutation_lock_until")
+                .unwrap(),
+        "config lock polling must run inside the blocking worker"
+    );
+    let boot = source
+        .split("pub(crate) async fn recover_editor_leases_before_publish")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn inventory").next())
+        .expect("editor boot recovery handler");
+    assert!(boot.contains("PRE_SOCKET_CONFIG_LOCK_TIMEOUT"));
+    assert!(boot.contains("Some(config_lock_deadline)"));
+
+    let config_files = include_str!("../../../../cockpit-config/src/config/files.rs");
+    let bounded_lock = config_files
+        .split("pub(crate) fn acquire_until")
+        .nth(1)
+        .and_then(|tail| tail.split("fn enter").next())
+        .expect("bounded config lock acquisition helper");
+    assert!(
+        bounded_lock.find("Instant::now() >= deadline").unwrap()
+            < bounded_lock.find("file.try_lock()").unwrap(),
+        "an expired recovery deadline must be checked before lock acquisition",
+    );
+
+    let vault = include_str!("../../secure_key/vault.rs");
+    let delete = vault
+        .split("pub fn delete_item_on_conn")
+        .nth(1)
+        .and_then(|tail| tail.split("pub fn mutate_item").next())
+        .expect("vault transactional delete helper");
+    assert!(delete.contains("delete_item_conn"));
+    assert!(!delete.contains("get_item_on_conn"));
 }
 
 #[test]

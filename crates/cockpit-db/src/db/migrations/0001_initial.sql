@@ -6545,8 +6545,29 @@ CREATE TABLE agent_editor_leases (
     ),
     completion_handle TEXT,
     completion_operation_id TEXT,
+    publication_phase TEXT NOT NULL DEFAULT 'none' CHECK (
+        publication_phase IN ('none', 'intent', 'published')
+    ),
+    consumed_projection_identity TEXT CHECK (
+        consumed_projection_identity IS NULL OR (
+            length(consumed_projection_identity) = 64 AND
+            consumed_projection_identity NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    intended_projection_identity TEXT CHECK (
+        intended_projection_identity IS NULL OR (
+            length(intended_projection_identity) = 64 AND
+            intended_projection_identity NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
     publication_result_revision TEXT CHECK (
         publication_result_revision IS NULL OR length(trim(publication_result_revision)) > 0
+    ),
+    consumed_config_generation INTEGER CHECK (
+        consumed_config_generation IS NULL OR consumed_config_generation >= 0
+    ),
+    result_config_generation INTEGER CHECK (
+        result_config_generation IS NULL OR result_config_generation >= 0
     ),
     terminal_result_json TEXT CHECK (
         terminal_result_json IS NULL OR json_valid(terminal_result_json)
@@ -6569,6 +6590,14 @@ CREATE TABLE agent_editor_leases (
     CHECK ((state = 'open') = (completion_operation_id IS NULL)),
     CHECK ((state = 'open') = (completion_identity IS NULL)),
     CHECK ((state = 'completing') = (completion_handle IS NOT NULL)),
+    CHECK ((publication_phase = 'none') = (consumed_projection_identity IS NULL)),
+    CHECK ((publication_phase = 'none') = (intended_projection_identity IS NULL)),
+    CHECK (publication_phase = 'none' OR state IN ('completing', 'terminal')),
+    CHECK ((publication_phase = 'published') = (publication_result_revision IS NOT NULL)),
+    CHECK ((consumed_config_generation IS NULL) = (result_config_generation IS NULL)),
+    CHECK (result_config_generation IS NULL OR result_config_generation >= consumed_config_generation),
+    CHECK (publication_phase = 'none' OR consumed_config_generation IS NOT NULL),
+    CHECK (publication_phase <> 'published' OR result_config_generation IS NOT NULL),
     CHECK (publication_result_revision IS NULL OR state IN ('completing', 'terminal')),
     CHECK ((state = 'terminal') = ((terminal_result_json IS NOT NULL) OR (terminal_error_json IS NOT NULL))),
     CHECK (terminal_result_json IS NULL OR terminal_error_json IS NULL),
@@ -6593,6 +6622,13 @@ WHEN NEW.owner_digest <> OLD.owner_digest
   OR (OLD.completion_operation_id IS NOT NULL AND NEW.completion_operation_id IS NOT OLD.completion_operation_id)
   OR (OLD.completion_handle IS NOT NULL AND NEW.completion_handle IS NOT OLD.completion_handle AND NEW.state <> 'terminal')
   OR (OLD.publication_result_revision IS NOT NULL AND NEW.publication_result_revision IS NOT OLD.publication_result_revision)
+  OR (OLD.consumed_config_generation IS NOT NULL AND NEW.consumed_config_generation IS NOT OLD.consumed_config_generation)
+  OR (OLD.result_config_generation IS NOT NULL AND NEW.result_config_generation IS NOT OLD.result_config_generation)
+  OR (OLD.publication_phase = 'none' AND NEW.publication_phase NOT IN ('none', 'intent'))
+  OR (OLD.publication_phase = 'intent' AND NEW.publication_phase NOT IN ('intent', 'published'))
+  OR (OLD.publication_phase = 'published' AND NEW.publication_phase <> 'published')
+  OR (OLD.consumed_projection_identity IS NOT NULL AND NEW.consumed_projection_identity IS NOT OLD.consumed_projection_identity)
+  OR (OLD.intended_projection_identity IS NOT NULL AND NEW.intended_projection_identity IS NOT OLD.intended_projection_identity)
   OR (NEW.snapshot_handle IS NOT OLD.snapshot_handle AND NEW.state NOT IN ('completing', 'terminal'))
   OR NEW.expires_at_unix_ms <> OLD.expires_at_unix_ms
   OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms

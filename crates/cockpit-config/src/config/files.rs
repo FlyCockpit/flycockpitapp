@@ -468,6 +468,43 @@ impl ConfigMutationLock {
         }
     }
 
+    pub(crate) fn acquire_until(
+        _target: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<Option<Self>> {
+        let lock_path = mutation_lock_path()?;
+        ensure_parent_dir_private(&lock_path)?;
+
+        let file = open_private_lock_file(&lock_path)?;
+        loop {
+            // A bounded recovery caller must never acquire fresh authority
+            // after its deadline, even when the lock happens to be free at
+            // the first polling attempt.
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self::enter(file))),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(
+                        deadline
+                            .saturating_duration_since(now)
+                            .min(std::time::Duration::from_millis(5)),
+                    );
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| {
+                        format!("locking config mutation at {}", lock_path.display())
+                    });
+                }
+            }
+        }
+    }
+
     fn enter(file: std::fs::File) -> Self {
         MUTATION_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
         Self {

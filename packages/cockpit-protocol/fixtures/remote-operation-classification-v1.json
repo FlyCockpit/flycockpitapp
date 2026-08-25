@@ -2945,7 +2945,7 @@
     {
       "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "client_operation_id:string|flow_id:string|input:option<string>",
+      "fcorCanonicalSchema": "client_operation_id:string|flow_id:string|input:option<sha256-redacted>",
       "fcorRoles": [
         {
           "field": "client_operation_id",
@@ -2960,7 +2960,7 @@
         {
           "field": "input",
           "role": "param",
-          "type": "Option<String>"
+          "type": "Option<SensitiveWirePayload>"
         }
       ],
       "fcorSchema": "client_operation_id:String|flow_id:String|input:Option<SensitiveWirePayload>",
@@ -3020,7 +3020,7 @@
     {
       "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "client_operation_id:string|flow_id:string|input:option<string>",
+      "fcorCanonicalSchema": "client_operation_id:string|flow_id:string|input:option<sha256-redacted>",
       "fcorRoles": [
         {
           "field": "client_operation_id",
@@ -3035,7 +3035,7 @@
         {
           "field": "input",
           "role": "param",
-          "type": "Option<String>"
+          "type": "Option<SensitiveWirePayload>"
         }
       ],
       "fcorSchema": "client_operation_id:String|flow_id:String|input:Option<SensitiveWirePayload>",
@@ -3434,8 +3434,13 @@
     {
       "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "project_root:string|lease_id:string|markdown:option<string>",
+      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|lease_id:string|markdown:option<sha256-redacted>",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "project_root",
           "role": "project_root",
@@ -3449,10 +3454,10 @@
         {
           "field": "markdown",
           "role": "param",
-          "type": "Option<String>"
+          "type": "Option<SensitiveWirePayload>"
         }
       ],
-      "fcorSchema": "project_root:String|lease_id:String|markdown:Option<String>",
+      "fcorSchema": "client_operation_id:String|project_root:String|lease_id:String|markdown:Option<SensitiveWirePayload>",
       "strategy": "none",
       "tag": "complete_agent_editor_lease"
     },

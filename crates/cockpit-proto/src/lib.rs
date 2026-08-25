@@ -1052,6 +1052,11 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// reads also carry one shared configuration generation, while agent inventory
 /// binds its canonical and requested workspace roots. Browser-provided local
 /// image paths are admitted by a daemon-only, trust-scoped normalization RPC.
+/// External-editor completion documents use the redacting
+/// `SensitiveWirePayload` wrapper, and durable publication journals distinguish
+/// reserved, intended, and published settlement without putting document bytes
+/// in SQLite. Terminal editor receipts bind the exact durable consumed/result
+/// configuration generation pair.
 pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Oldest wire schema version this binary accepts. v17 is current-only: the
@@ -6922,7 +6927,9 @@ mod tests {
                 client_operation_id: "complete-editor".into(),
                 project_root: "/tmp/project".into(),
                 lease_id: Uuid::nil().to_string(),
-                markdown: None,
+                markdown: Some(SensitiveWirePayload::new(
+                    "---\nschemaVersion: 2\n---\nBe helpful.\n".into(),
+                )),
             },
             Request::GetAgentEditorLeaseSettlement {
                 client_operation_id: "complete-editor".into(),
@@ -7805,6 +7812,7 @@ mod tests {
             assert!(requests[tag]["params"]["client_operation_id"].is_string());
             assert!(requests[tag]["params"]["lease_id"].is_string());
         }
+        assert!(requests["complete_agent_editor_lease"]["params"]["markdown"].is_string());
         assert!(
             requests["get_agent_editor_lease_settlement"]["params"]
                 .get("markdown")
@@ -7818,6 +7826,8 @@ mod tests {
         assert!(receipt["client_operation_id"].is_string());
         assert!(receipt["lease_id"].is_string());
         assert!(receipt["consumed_revision"].is_string());
+        assert_eq!(receipt["consumed_config_generation"], 7);
+        assert_eq!(receipt["result_config_generation"], 8);
         assert!(receipt["status"]["result_revision"].is_string());
         assert!(receipt.get("markdown").is_none());
         assert!(receipt.get("snapshot").is_none());

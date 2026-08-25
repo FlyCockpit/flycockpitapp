@@ -36,8 +36,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use cockpit_config::extended::ExtendedConfig;
 use cockpit_core::agents::{AgentKind, BUILTIN_AGENT_NAMES};
 use cockpit_core::daemon::proto::{
-    AgentEditSnapshot, AgentEditTarget, AgentEditorLease, AgentEntryKind, AgentInventoryEntry,
-    AgentMutation, AgentMutationOutcome, AgentMutationResult, AgentSourceLayer, CockpitConfigLayer,
+    AgentEditSnapshot, AgentEditTarget, AgentEditorCompletion, AgentEditorLease,
+    AgentEditorSettlementStatus, AgentEntryKind, AgentInventoryEntry, AgentMutation,
+    AgentMutationOutcome, AgentMutationResult, AgentSourceLayer, CockpitConfigLayer,
     CommittedDenylistEntry, ConfigCommitStatus, ConfigPublicationStatus, DesiredDenylistEntry,
     ExtendedConfigField, ExtendedConfigLayerSnapshot, ExtendedConfigPatch,
     ExtendedConfigPathMutation, RedactedDenylistEntry, Request, Response,
@@ -137,21 +138,41 @@ impl SettingsDaemonEffect for DiskDaemonFake {
                     .map(Response::AgentEditSnapshot)
             }
             Request::MutateAgent {
+                client_operation_id,
+                mutation_intent_hash,
                 project_root,
                 mutation,
                 expected_revision,
-            } => mutate_agent(Path::new(&project_root), mutation, expected_revision)
-                .map(Response::AgentMutated),
+            } => mutate_agent(
+                client_operation_id,
+                mutation_intent_hash,
+                Path::new(&project_root),
+                mutation,
+                expected_revision,
+            )
+            .map(Response::AgentMutated),
             Request::BeginAgentEditorLease {
+                client_operation_id,
                 project_root,
                 name,
                 expected_revision,
-            } => begin_editor_lease(Path::new(&project_root), &name, expected_revision),
+            } => begin_editor_lease(
+                client_operation_id,
+                Path::new(&project_root),
+                &name,
+                expected_revision,
+            ),
             Request::CompleteAgentEditorLease {
+                client_operation_id,
                 project_root,
                 lease_id,
                 markdown,
-            } => complete_editor_lease(Path::new(&project_root), &lease_id, markdown),
+            } => complete_editor_lease(
+                client_operation_id,
+                Path::new(&project_root),
+                &lease_id,
+                markdown,
+            ),
             // The assistant registry lives in the daemon database, so the disk
             // fake projects an empty registry and refuses every mutation rather
             // than inventing registry rows a test could not have created.
@@ -1286,6 +1307,8 @@ fn agent_inventory(root: &Path) -> Result<Response, String> {
     Ok(Response::AgentInventory {
         entries,
         inventory_revision,
+        project_root: root.to_string_lossy().into_owned(),
+        requested_project_root: root.to_string_lossy().into_owned(),
         config_generation: current_config_generation(),
     })
 }
@@ -1335,10 +1358,13 @@ fn reset_all_builtins(root: &Path) -> Result<u32, String> {
 }
 
 fn mutate_agent(
+    client_operation_id: String,
+    mutation_intent_hash: String,
     root: &Path,
     mutation: AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<AgentMutationResult, String> {
+    let agent_name = cockpit_proto::agent_mutation_name(&mutation).map(str::to_owned);
     let consumed_revision = expected_revision.clone();
     let generation_before = current_config_generation();
     let resets_inventory = matches!(&mutation, AgentMutation::ResetAllBuiltins);
@@ -1509,19 +1535,44 @@ fn mutate_agent(
     let result_inventory_revision = resets_inventory
         .then(|| inventory_entries(root).map(|entries| inventory_revision(&entries)))
         .transpose()?;
+    let result_revision = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.revision.clone())
+        .or_else(|| result_inventory_revision.clone())
+        .unwrap_or_else(|| {
+            content_hash(
+                format!(
+                    "agent-mutation-tombstone:{}:{}:{}",
+                    root.display(),
+                    agent_name.as_deref().unwrap_or("inventory"),
+                    config_generation
+                )
+                .as_bytes(),
+            )
+        });
     Ok(AgentMutationResult {
+        client_operation_id,
+        mutation_intent_hash,
+        project_root: root.to_string_lossy().into_owned(),
+        requested_project_root: root.to_string_lossy().into_owned(),
+        owner_scope: format!("project:{}", root.to_string_lossy()),
+        agent_name,
         changed,
         affected,
         snapshot,
+        consumed_config_generation: generation_before,
+        result_config_generation: config_generation,
         config_generation,
         inventory_revision: result_inventory_revision,
         consumed_revision,
+        result_revision,
         completed_lease_id: None,
         outcome: AgentMutationOutcome::Reconciled,
     })
 }
 
 fn begin_editor_lease(
+    client_operation_id: String,
     root: &Path,
     name: &str,
     expected_revision: String,
@@ -1541,6 +1592,7 @@ fn begin_editor_lease(
             },
         );
     Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
+        client_operation_id,
         lease_id,
         expires_at_unix_ms: chrono::Utc::now().timestamp_millis() + EDITOR_LEASE_TTL_MS,
         snapshot,
@@ -1548,9 +1600,10 @@ fn begin_editor_lease(
 }
 
 fn complete_editor_lease(
+    client_operation_id: String,
     root: &Path,
     lease_id: &str,
-    markdown: Option<String>,
+    markdown: Option<cockpit_proto::SensitiveWirePayload>,
 ) -> Result<Response, String> {
     let lease = editor_leases()
         .lock()
@@ -1563,30 +1616,68 @@ fn complete_editor_lease(
     }
     // The lease stays reserved until completion reaches a terminal state, so a
     // failed save leaves the same retryable token in place.
+    let is_save = markdown.is_some();
     let mut result = match markdown {
-        Some(markdown) => mutate_agent(
-            root,
-            AgentMutation::SaveDefinition {
-                name: lease.name.clone(),
-                markdown,
-            },
-            Some(lease.revision.clone()),
-        )?,
-        None => AgentMutationResult {
-            changed: false,
-            affected: 0,
-            snapshot: None,
-            config_generation: current_config_generation(),
-            inventory_revision: None,
-            consumed_revision: Some(lease.revision.clone()),
-            completed_lease_id: None,
-            outcome: AgentMutationOutcome::Reconciled,
-        },
+        Some(markdown) => {
+            let mut markdown = markdown.into_zeroizing();
+            mutate_agent(
+                client_operation_id.clone(),
+                content_hash(format!("editor-save:{lease_id}:{}", lease.name).as_bytes()),
+                root,
+                AgentMutation::SaveDefinition {
+                    name: lease.name.clone(),
+                    markdown: std::mem::take(&mut *markdown),
+                },
+                Some(lease.revision.clone()),
+            )?
+        }
+        None => {
+            let generation = current_config_generation();
+            AgentMutationResult {
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash: content_hash(format!("editor-cancel:{lease_id}").as_bytes()),
+                project_root: root.to_string_lossy().into_owned(),
+                requested_project_root: root.to_string_lossy().into_owned(),
+                owner_scope: format!("project:{}", root.to_string_lossy()),
+                agent_name: Some(lease.name.clone()),
+                changed: false,
+                affected: 0,
+                snapshot: None,
+                consumed_config_generation: generation,
+                result_config_generation: generation,
+                config_generation: generation,
+                inventory_revision: None,
+                consumed_revision: Some(lease.revision.clone()),
+                result_revision: lease.revision.clone(),
+                completed_lease_id: None,
+                outcome: AgentMutationOutcome::Reconciled,
+            }
+        }
     };
     result.completed_lease_id = Some(lease_id.to_string());
+    let consumed_config_generation = result.consumed_config_generation;
+    let result_config_generation = result.result_config_generation;
+    let status = if is_save {
+        AgentEditorSettlementStatus::Saved {
+            result_revision: result.result_revision.clone(),
+            outcome: result.outcome.clone(),
+        }
+    } else {
+        AgentEditorSettlementStatus::Cancelled
+    };
     editor_leases()
         .lock()
         .map_err(|_| poisoned("agent editor lease"))?
         .remove(lease_id);
-    Ok(Response::AgentEditorLeaseCompleted(result))
+    Ok(Response::AgentEditorLeaseCompleted(AgentEditorCompletion {
+        client_operation_id,
+        project_root: root.to_string_lossy().into_owned(),
+        owner_scope: format!("project:{}", root.to_string_lossy()),
+        agent_name: lease.name,
+        lease_id: lease_id.to_string(),
+        consumed_revision: lease.revision,
+        consumed_config_generation: Some(consumed_config_generation),
+        result_config_generation: Some(result_config_generation),
+        status,
+    }))
 }

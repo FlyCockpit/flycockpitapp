@@ -7,8 +7,12 @@
 //! the writer connection and panics if called from any Tokio runtime; async
 //! code must use [`Db::read`], [`Db::write`], or [`Db::transaction`] instead.
 //! Four temporary sync UI/event/maintenance wrappers remain until
-//! `db-sync-wrapper-migration`; the cockpit-db-local AST/call-graph gate in
-//! `tests/db_blocking_boundary_gate.rs` freezes that exact allowlist.
+//! `db-sync-wrapper-migration`. Three typed agent-publication journal methods
+//! also bridge the writer while a caller owns a `!Send` cross-process
+//! filesystem lock; unlike the CLI escape hatch, they accept only journal
+//! fields and cannot run caller-provided SQL. The cockpit-db-local
+//! AST/call-graph gate in `tests/db_blocking_boundary_gate.rs` freezes that
+//! exact allowlist and its ownership rationale.
 //!
 //! Async migration rules:
 //!

@@ -264,9 +264,18 @@ pub struct AgentEditorLease {
 pub struct AgentEditorCompletion {
     pub client_operation_id: String,
     pub project_root: String,
+    /// Canonical authority scope which owned the lease and publication.
+    pub owner_scope: String,
     pub agent_name: String,
     pub lease_id: String,
     pub consumed_revision: String,
+    /// Exact configuration generation consumed and produced by a terminal
+    /// save/cancel. Pending and rejected settlements have no committed
+    /// generation pair.
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub consumed_config_generation: Option<u64>,
+    #[serde(deserialize_with = "deserialize_present_option")]
+    pub result_config_generation: Option<u64>,
     pub status: AgentEditorSettlementStatus,
 }
 
@@ -303,6 +312,7 @@ pub fn validate_agent_editor_completion(
         return Err("editor settlement is bound to the wrong client operation");
     }
     if receipt.project_root != expected_project_root
+        || receipt.owner_scope != format!("project:{expected_project_root}")
         || receipt.agent_name != expected_agent_name
         || receipt.lease_id != expected_lease_id
     {
@@ -316,14 +326,43 @@ pub fn validate_agent_editor_completion(
     match &receipt.status {
         AgentEditorSettlementStatus::Saved {
             result_revision, ..
-        } if !crate::is_opaque_authority_token(result_revision) => {
-            Err("editor settlement returned a malformed result revision")
+        } => {
+            if !crate::is_opaque_authority_token(result_revision) {
+                return Err("editor settlement returned a malformed result revision");
+            }
+            let (Some(consumed), Some(result)) = (
+                receipt.consumed_config_generation,
+                receipt.result_config_generation,
+            ) else {
+                return Err("saved editor settlement omitted its generation pair");
+            };
+            if result < consumed {
+                return Err("saved editor settlement returned a regressive generation");
+            }
+            Ok(())
+        }
+        AgentEditorSettlementStatus::Cancelled => {
+            let (Some(consumed), Some(result)) = (
+                receipt.consumed_config_generation,
+                receipt.result_config_generation,
+            ) else {
+                return Err("cancelled editor settlement omitted its generation pair");
+            };
+            if result != consumed {
+                return Err("cancelled editor settlement changed the configuration generation");
+            }
+            Ok(())
         }
         AgentEditorSettlementStatus::Rejected { error }
             if error.message.trim().is_empty()
                 || error.message.len() > MAX_AGENT_METADATA_BYTES =>
         {
             Err("editor settlement returned an invalid rejection")
+        }
+        _ if receipt.consumed_config_generation.is_some()
+            || receipt.result_config_generation.is_some() =>
+        {
+            Err("non-committed editor settlement carried a generation pair")
         }
         _ => Ok(()),
     }

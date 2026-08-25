@@ -2119,7 +2119,9 @@ impl AgentsPage {
                         client_operation_id: client_operation_id.clone(),
                         project_root: cwd.to_string_lossy().into_owned(),
                         lease_id: lease_id.clone(),
-                        markdown: markdown.clone(),
+                        markdown: markdown
+                            .clone()
+                            .map(cockpit_proto::SensitiveWirePayload::new),
                     },
                     PendingAgentOperation::CompleteLease {
                         client_operation_id,
@@ -2478,7 +2480,9 @@ impl AgentsPage {
                 client_operation_id: client_operation_id.clone(),
                 project_root: cwd.to_string_lossy().into_owned(),
                 lease_id: lease_id.clone(),
-                markdown: markdown.clone(),
+                markdown: markdown
+                    .clone()
+                    .map(cockpit_proto::SensitiveWirePayload::new),
             },
             PendingAgentOperation::CompleteLease {
                 client_operation_id,

@@ -1545,6 +1545,15 @@ fn pasted_images_use_opaque_daemon_retained_ingress() {
     let daemon =
         fs::read_to_string(root.join("crates/cockpit-core/src/daemon/server/attachments.rs"))
             .unwrap();
+    let async_actions =
+        fs::read_to_string(root.join("crates/cockpit-tui/src/tui/app/async_actions.rs")).unwrap();
+    let terminal_controls =
+        fs::read_to_string(root.join("crates/cockpit-tui/src/tui/app/terminal_controls.rs"))
+            .unwrap();
+    let storage =
+        fs::read_to_string(root.join("crates/cockpit-core/src/media_storage.rs")).unwrap();
+    let database =
+        fs::read_to_string(root.join("crates/cockpit-db/src/db/media_attachments.rs")).unwrap();
 
     assert!(!module.contains("mod image_path_probe"));
     assert!(input.contains("Request::AdmitImageIngress"));
@@ -1571,10 +1580,28 @@ fn pasted_images_use_opaque_daemon_retained_ingress() {
         "complete_local_allocation",
         "publish_ingress_image",
         "ImageIngressAdmitted",
+        "image_ingress_draft_discard_receipt",
+        "image_ingress_draft_discard_mutation",
     ] {
         assert!(
             daemon.contains(required),
             "daemon image admission is missing {required}"
         );
     }
+    for required in [
+        "Request::DiscardImageIngressDraft",
+        "paste.image_ingress_discard",
+        "settings_daemon_client",
+        "FenceLifecycle::PossiblySent",
+        "image_ingress_draft_discards",
+    ] {
+        assert!(
+            async_actions.contains(required),
+            "TUI image draft lifecycle is missing {required}"
+        );
+    }
+    assert!(terminal_controls.contains("image_ingress_draft_discards"));
+    assert!(storage.contains("origin_admission_id: Some(admission_id)"));
+    assert!(database.contains("record.first_referenced_at_unix_ms.is_some()"));
+    assert!(database.contains("media_attachment_component_leases"));
 }

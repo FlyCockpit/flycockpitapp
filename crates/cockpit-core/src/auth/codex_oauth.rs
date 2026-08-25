@@ -9,6 +9,7 @@ use reqwest::StatusCode;
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use zeroize::Zeroize;
 
 use crate::credentials::CredentialStore;
 
@@ -51,6 +52,14 @@ pub struct DeviceLogin {
     pub user_code: String,
     device_auth_id: String,
     interval_secs: u64,
+}
+
+impl Drop for DeviceLogin {
+    fn drop(&mut self) {
+        self.verification_uri.zeroize();
+        self.user_code.zeroize();
+        self.device_auth_id.zeroize();
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

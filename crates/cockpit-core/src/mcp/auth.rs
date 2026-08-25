@@ -24,6 +24,7 @@ use base64::Engine;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use super::config::{Auth, OauthAuth, ServerConfig};
 
@@ -328,6 +329,14 @@ pub struct McpOAuthFlow {
     listener: Option<tokio::net::TcpListener>,
 }
 
+impl Drop for McpOAuthFlow {
+    fn drop(&mut self) {
+        self.verifier.zeroize();
+        self.state.zeroize();
+        self.redirect_uri.zeroize();
+    }
+}
+
 #[cfg(test)]
 impl McpOAuthFlow {
     /// Whether this flow bound a local loopback listener (local-owner path).
@@ -401,10 +410,10 @@ pub async fn begin_oauth_flow(
 /// display-layer convenience; it carries only an authorization code and CSRF
 /// state, never an access or refresh token.
 pub async fn complete_oauth_flow(
-    flow: McpOAuthFlow,
+    mut flow: McpOAuthFlow,
     callback: Option<&str>,
 ) -> Result<StoredTokens> {
-    let (code, got_state) = match (callback, flow.listener) {
+    let (code, got_state) = match (callback, flow.listener.take()) {
         // Explicit callback (the remote-owner path, and a local convenience):
         // parse the code + CSRF state the client returned over the RPC.
         (Some(callback), _) => parse_callback_target(callback)?,
@@ -417,7 +426,9 @@ pub async fn complete_oauth_flow(
             "this MCP OAuth flow was started for a remote client; complete it with the callback code"
         ),
     };
-    if got_state != flow.state {
+    let code = zeroize::Zeroizing::new(code);
+    let got_state = zeroize::Zeroizing::new(got_state);
+    if got_state.as_str() != flow.state {
         bail!("OAuth state mismatch (possible CSRF)");
     }
     exchange_code(&flow.oauth, &code, &flow.verifier, &flow.redirect_uri).await

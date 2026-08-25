@@ -12,6 +12,7 @@ use rand::Rng;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use crate::credentials::CredentialStore;
 
@@ -64,6 +65,15 @@ pub struct ManualLogin {
     state: String,
     verifier: String,
     token_endpoint: String,
+}
+
+impl Drop for ManualLogin {
+    fn drop(&mut self) {
+        self.authorize_url.zeroize();
+        self.state.zeroize();
+        self.verifier.zeroize();
+        self.token_endpoint.zeroize();
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -123,7 +133,11 @@ pub async fn complete_manual_login_unpersisted(
     login: ManualLogin,
     input: &str,
 ) -> Result<StoredTokens> {
-    let code = parse_callback_input(input, &login.state, CallbackSource::ManualPaste)?;
+    let code = zeroize::Zeroizing::new(parse_callback_input(
+        input,
+        &login.state,
+        CallbackSource::ManualPaste,
+    )?);
     exchange_code(&login.token_endpoint, &code, &login.verifier).await
 }
 
@@ -141,7 +155,7 @@ async fn complete_login(
     source: CallbackSource,
     store: Option<&mut CredentialStore>,
 ) -> Result<StoredTokens> {
-    let code = parse_callback_input(input, &login.state, source)?;
+    let code = zeroize::Zeroizing::new(parse_callback_input(input, &login.state, source)?);
     let tokens = exchange_code(&login.token_endpoint, &code, &login.verifier).await?;
     match store {
         Some(store) => store_tokens_in(store, &tokens)?,
@@ -516,8 +530,12 @@ pub async fn complete_local_callback_login_unpersisted(
     login: ManualLogin,
     listener: tokio::net::TcpListener,
 ) -> Result<StoredTokens> {
-    let callback = wait_for_callback_async(&listener).await?;
-    let code = parse_callback_input(&callback, &login.state, CallbackSource::LocalListener)?;
+    let callback = zeroize::Zeroizing::new(wait_for_callback_async(&listener).await?);
+    let code = zeroize::Zeroizing::new(parse_callback_input(
+        &callback,
+        &login.state,
+        CallbackSource::LocalListener,
+    )?);
     exchange_code(&login.token_endpoint, &code, &login.verifier).await
 }
 
@@ -534,7 +552,7 @@ async fn complete_local_callback_login_in_store(
     listener: tokio::net::TcpListener,
     store: Option<&mut CredentialStore>,
 ) -> Result<StoredTokens> {
-    let callback = wait_for_callback_async(&listener).await?;
+    let callback = zeroize::Zeroizing::new(wait_for_callback_async(&listener).await?);
     complete_login(login, &callback, CallbackSource::LocalListener, store).await
 }
 

@@ -401,6 +401,11 @@ impl App {
                     self.handle_tools_outcome(outcome);
                 }
             }
+            AsyncActionKind::DaemonRpc("workspace-trust.effect") => {
+                if let Ok(AsyncActionPayload::WorkspaceTrust(completion)) = result.payload {
+                    self.apply_workspace_trust_completion(completion);
+                }
+            }
             AsyncActionKind::DaemonRpc("sessions.list") => {
                 let mut live_ids = None;
                 let mut preview_request = None;

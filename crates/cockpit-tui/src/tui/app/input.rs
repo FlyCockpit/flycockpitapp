@@ -630,6 +630,9 @@ impl App {
         //   2. if it requested close: drain its result, close it
         //   3. unconditionally `return false`
         if self.startup_modal_on_top() == Some(StartupModal::WorkspaceTrust) {
+            if self.pending_workspace_trust.is_some() {
+                return false;
+            }
             let should_close = self.dialog.handle_key(key);
             if should_close && let Some((root, mode)) = self.dialog.take_workspace_trust_choice() {
                 return self.apply_workspace_trust_choice(root, mode);

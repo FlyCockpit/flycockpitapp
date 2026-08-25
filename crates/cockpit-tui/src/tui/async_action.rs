@@ -270,6 +270,7 @@ pub enum AsyncActionPayload {
     },
     GoalSettings(crate::tui::goal_settings_pane::GoalSettingsCompletion),
     Tools(crate::tui::tools_pane::ToolsCompletion),
+    WorkspaceTrust(crate::tui::app::WorkspaceTrustCompletion),
     SettingsDaemon(crate::tui::settings::SettingsDaemonEffectCompletion),
     MouseCopy(MouseCopyResult),
 }

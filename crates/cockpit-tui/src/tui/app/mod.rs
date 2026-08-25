@@ -662,48 +662,177 @@ impl App {
                 cockpit_core::daemon::proto::WorkspaceTrustMode::Untrusted
             }
         };
+        if self.pending_workspace_trust.is_some() {
+            self.show_toast("workspace trust save is already pending", ToastKind::Info);
+            return false;
+        }
         let project_root = root.root.to_string_lossy().into_owned();
-        let config_generation = match set_workspace_trust_with_retry(
-            &project_root,
+        let operation_id = uuid::Uuid::new_v4();
+        let expected_generation = self.config_snapshot.generation;
+        self.pending_workspace_trust = Some(PendingWorkspaceTrust {
+            operation_id,
+            root,
+            mode,
             rpc_mode,
-            self.config_snapshot.generation,
-            crate::tui::agent_runner::daemon_request_blocking_classified,
-        ) {
+            project_root: project_root.clone(),
+            expected_generation,
+        });
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("workspace-trust.effect"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("workspace-trust.effect")),
+            async move {
+                let result =
+                    set_workspace_trust_async(&project_root, rpc_mode, expected_generation).await;
+                Ok(AsyncActionPayload::WorkspaceTrust(
+                    WorkspaceTrustCompletion {
+                        operation_id,
+                        project_root,
+                        mode: rpc_mode,
+                        expected_generation,
+                        result,
+                    },
+                ))
+            },
+        );
+        self.show_toast("saving workspace trust…", ToastKind::Info);
+        false
+    }
+
+    fn apply_workspace_trust_completion(&mut self, completion: WorkspaceTrustCompletion) {
+        let Some(pending) = self.pending_workspace_trust.take() else {
+            return;
+        };
+        if completion.operation_id != pending.operation_id
+            || completion.project_root != pending.project_root
+            || completion.mode != pending.rpc_mode
+            || completion.expected_generation != pending.expected_generation
+        {
+            self.pending_workspace_trust = Some(pending);
+            return;
+        }
+        let config_generation = match completion.result {
             Ok(generation) => generation,
             Err(error) => {
                 self.show_toast(
                     format!("workspace trust could not be saved: {error}"),
                     ToastKind::Error,
                 );
-                return false;
+                return;
             }
         };
-        self.config_snapshot.generation = config_generation;
+        if config_generation <= pending.expected_generation {
+            self.show_toast(
+                "workspace trust receipt did not advance config generation",
+                ToastKind::Error,
+            );
+            return;
+        }
+        self.config_snapshot.generation = self.config_snapshot.generation.max(config_generation);
         self.config_snapshot
             .providers
-            .set_resolution_generation(config_generation);
-        if mode == cockpit_config::WorkspaceTrustMode::Untrusted {
+            .set_resolution_generation(self.config_snapshot.generation);
+        if pending.mode == cockpit_config::WorkspaceTrustMode::Untrusted {
             self.push_plain(format!(
                 "workspace {} is untrusted and cannot be opened",
-                root.root.display()
+                pending.root.root.display()
             ));
-            return true;
+            self.exit_requested = true;
+            return;
         }
-        if let Err(error) = cockpit_config::trust::apply_trusted_workspace(root, mode) {
+        if let Err(error) =
+            cockpit_config::trust::apply_trusted_workspace(pending.root, pending.mode)
+        {
             self.show_toast(format!("workspace trust failed: {error}"), ToastKind::Error);
-            return false;
+            return;
         }
-        if mode == cockpit_config::WorkspaceTrustMode::Trust {
+        if pending.mode == cockpit_config::WorkspaceTrustMode::Trust {
             self.resync_config_after_local_write();
         }
         self.dialog = Dialog::None;
         if self.daemon_prompt.is_none() {
             self.maybe_open_add_provider_wizard();
         }
-        false
     }
 }
 
+#[derive(Debug)]
+struct PendingWorkspaceTrust {
+    operation_id: uuid::Uuid,
+    root: cockpit_config::trust::TrustRoot,
+    mode: cockpit_config::WorkspaceTrustMode,
+    rpc_mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    project_root: String,
+    expected_generation: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct WorkspaceTrustCompletion {
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) project_root: String,
+    pub(crate) mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    pub(crate) expected_generation: u64,
+    pub(crate) result: Result<u64, String>,
+}
+
+async fn set_workspace_trust_async(
+    project_root: &str,
+    mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
+    mut expected_generation: u64,
+) -> Result<u64, String> {
+    let client = crate::tui::settings::settings_daemon_client()
+        .await
+        .map_err(|error| error.to_string())?;
+    for attempt in 0..=1 {
+        let response = client
+            .request(cockpit_core::daemon::proto::Request::SetWorkspaceTrust {
+                project_root: project_root.to_string(),
+                mode,
+                expected_config_generation: expected_generation,
+            })
+            .await
+            .map_err(|error| format!("daemon request: {error}"))?;
+        match response {
+            Ok(cockpit_core::daemon::proto::Response::WorkspaceTrustSet { config_generation })
+                if config_generation > expected_generation =>
+            {
+                return Ok(config_generation);
+            }
+            Ok(cockpit_core::daemon::proto::Response::WorkspaceTrustSet { .. }) => {
+                return Err("daemon returned a non-advancing workspace trust generation".into());
+            }
+            Ok(other) => return Err(format!("unexpected workspace trust response: {other:?}")),
+            Err(error)
+                if error.code == cockpit_core::daemon::proto::ErrorCode::Conflict
+                    && attempt == 0 =>
+            {
+                expected_generation = match client
+                    .request(
+                        cockpit_core::daemon::proto::Request::GetStartupDisclosures {
+                            project_root: project_root.to_string(),
+                        },
+                    )
+                    .await
+                    .map_err(|error| format!("daemon request: {error}"))?
+                {
+                    Ok(cockpit_core::daemon::proto::Response::StartupDisclosures {
+                        config_generation,
+                        ..
+                    }) => config_generation,
+                    Ok(other) => {
+                        return Err(format!(
+                            "unexpected config generation refresh response: {other:?}"
+                        ));
+                    }
+                    Err(error) => return Err(format!("daemon request: {error}")),
+                };
+            }
+            Err(error) => return Err(format!("daemon request: {error}")),
+        }
+    }
+    unreachable!("the retry loop returns after its second attempt")
+}
+
+#[cfg(test)]
 fn set_workspace_trust_with_retry(
     project_root: &str,
     mode: cockpit_core::daemon::proto::WorkspaceTrustMode,
@@ -752,6 +881,7 @@ fn set_workspace_trust_with_retry(
     unreachable!("the retry loop returns after its second attempt")
 }
 
+#[cfg(test)]
 fn blocking_request_error(error: crate::tui::agent_runner::BlockingDaemonRequestError) -> String {
     match error {
         crate::tui::agent_runner::BlockingDaemonRequestError::Conflict(message) => {
@@ -1724,6 +1854,8 @@ pub struct App {
     pub(super) launch: LaunchInfo,
     /// Daemon-pushed config the TUI renders from; see [`HeldConfig`].
     pub(super) config_snapshot: HeldConfig,
+    pending_workspace_trust: Option<PendingWorkspaceTrust>,
+    exit_requested: bool,
     pub(super) active_model_state_generation: u64,
     /// Security disclosures must be fetched from the daemon before a session
     /// attachment can be created. Failures leave this false and user actions
@@ -3370,6 +3502,8 @@ impl App {
             paste_client_instance_id: uuid::Uuid::new_v4(),
             launch,
             config_snapshot,
+            pending_workspace_trust: None,
+            exit_requested: false,
             active_model_state_generation: 0,
             // Existing unit harnesses construct App without an event loop or
             // daemon fake; gate-focused tests explicitly set this false.
@@ -3896,6 +4030,9 @@ impl App {
                 .await?
             {
                 needs_redraw = true;
+            }
+            if self.exit_requested {
+                break;
             }
             if self.tick_attention_interrupt() {
                 needs_redraw = true;

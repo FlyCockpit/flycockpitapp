@@ -235,6 +235,7 @@ async fn skills_pane_stale_result_dropped() {
     app.apply_async_action_result(AsyncActionResult {
         id: stale_id,
         kind: AsyncActionKind::DaemonRpc("skills.list"),
+        presentation_stale: false,
         payload: Ok(AsyncActionPayload::Skills(SkillsPaneFetchResult {
             generation: stale_generation,
             source: SkillsPaneSource::Session,

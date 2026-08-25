@@ -176,6 +176,7 @@ async fn durability_confirmed_publish_shows_an_ordinary_success_toast() {
     app.apply_async_action_result(AsyncActionResult {
         id,
         kind: AsyncActionKind::Blocking("copy.file"),
+        presentation_stale: false,
         payload: Ok(AsyncActionPayload::CopyToFile {
             path: "/tmp/out.md".into(),
             bytes_written: 5,
@@ -201,6 +202,7 @@ async fn durability_unconfirmed_publish_shows_a_distinct_warning_never_a_failure
     app.apply_async_action_result(AsyncActionResult {
         id,
         kind: AsyncActionKind::Blocking("copy.file"),
+        presentation_stale: false,
         payload: Ok(AsyncActionPayload::CopyToFile {
             path: "/tmp/out.md".into(),
             bytes_written: 5,

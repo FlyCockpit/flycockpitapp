@@ -837,6 +837,7 @@ mod tests {
             app.apply_async_action_result(AsyncActionResult {
                 id,
                 kind: AsyncActionKind::Blocking(action),
+                presentation_stale: false,
                 payload: Ok(AsyncActionPayload::Unit),
             });
             assert_eq!(last_plain(&app), expected);

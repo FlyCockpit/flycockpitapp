@@ -458,6 +458,10 @@ pub enum OAuthAsyncResult {
 pub struct AsyncActionResult {
     pub id: AsyncActionId,
     pub kind: AsyncActionKind,
+    /// The owning view moved on while this action was running. Authority
+    /// owners must still consume the correlated settlement, but may suppress
+    /// user-facing presentation derived from it.
+    pub presentation_stale: bool,
     pub payload: Result<AsyncActionPayload, String>,
 }
 
@@ -912,25 +916,18 @@ impl AsyncActionRunner {
         self.pending.len()
     }
 
-    /// Advance the UI ownership fence and cancel blocking work owned by the
-    /// previous view. Exports and non-blocking work may keep running; their
-    /// completions are discarded by `drain_completed`, which also releases the
-    /// corresponding pending/keyed slots so later deduped requests are not
-    /// permanently blocked.
+    /// Advance the UI presentation fence. Only discardable read-only blocking
+    /// work is cancelled; authority-owning work remains registered until its
+    /// correlated terminal completion is consumed.
     pub fn advance_view_generation(&mut self) {
         self.view_generation = self.view_generation.wrapping_add(1).max(1);
         let stale = self
             .pending
             .iter()
             .filter_map(|(id, pending)| {
-                matches!(&pending.kind, AsyncActionKind::Blocking(_))
+                (matches!(&pending.kind, AsyncActionKind::Blocking(_))
+                    && pending.kind.authority() == AsyncActionAuthority::ReadOnly)
                     .then_some(*id)
-                    .filter(|_| {
-                        !matches!(
-                            &pending.kind,
-                            AsyncActionKind::Blocking("export.transcript" | "export.debug")
-                        )
-                    })
             })
             .collect::<Vec<_>>();
         for id in stale {
@@ -944,6 +941,7 @@ impl AsyncActionRunner {
             .iter()
             .filter_map(|(id, pending)| {
                 (matches!(&pending.kind, AsyncActionKind::Blocking(_))
+                    && pending.kind.authority() == AsyncActionAuthority::ReadOnly
                     && now.saturating_duration_since(pending.started_at) >= timeout)
                     .then_some((*id, pending.kind.clone()))
             })
@@ -954,6 +952,7 @@ impl AsyncActionRunner {
                 self.abort_id_inner(id, false).then_some(AsyncActionResult {
                     id,
                     kind,
+                    presentation_stale: false,
                     payload: Err("operation timed out".to_string()),
                 })
             })
@@ -1261,17 +1260,16 @@ impl AsyncActionRunner {
             {
                 self.keyed.remove(&key);
             }
-            // Stale-view completions (exports left running across
-            // `advance_view_generation`, non-blocking work, etc.) must still
-            // release pending/keyed ownership so a later same-key action is
-            // not permanently stuck behind a discarded result.
-            if stale_view && !matches!(&completed.kind, AsyncActionKind::DaemonRpc("sealed.effect"))
-            {
+            // Read-only stale results are presentation-only and discardable.
+            // Authority-owning results must reach their correlated settlement
+            // owner even after the presenting view has moved on.
+            if stale_view && completed.kind.authority() == AsyncActionAuthority::ReadOnly {
                 continue;
             }
             results.push(AsyncActionResult {
                 id: completed.id,
                 kind: completed.kind,
+                presentation_stale: stale_view,
                 payload: completed.payload,
             });
         }
@@ -1292,6 +1290,7 @@ impl AsyncActionRunner {
             self.cancelled.push(AsyncActionResult {
                 id,
                 kind: pending.kind,
+                presentation_stale: false,
                 payload: Err("operation cancelled by shutdown".to_string()),
             });
         }
@@ -1338,6 +1337,7 @@ impl AsyncActionRunner {
             self.cancelled.push(AsyncActionResult {
                 id,
                 kind: pending.kind,
+                presentation_stale: false,
                 payload: Err("operation cancelled by shutdown".to_string()),
             });
         }
@@ -1424,6 +1424,7 @@ impl AsyncActionRunner {
             self.cancelled.push(AsyncActionResult {
                 id,
                 kind: pending.kind,
+                presentation_stale: false,
                 payload: Err("operation cancelled".to_string()),
             });
         }

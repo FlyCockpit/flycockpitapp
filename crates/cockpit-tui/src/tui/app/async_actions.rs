@@ -580,6 +580,7 @@ impl App {
             .map(|result| AsyncActionResult {
                 id: result.id,
                 kind: result.kind.clone(),
+                presentation_stale: result.presentation_stale,
                 payload: Err("operation cancelled".into()),
             })
             .collect::<Vec<_>>();
@@ -824,7 +825,8 @@ impl App {
         // settlement path and outgoing delivery-receipt fence bookkeeping may
         // run; every other completion is presentation noise from the discarded
         // transcript (including Blocking timeouts that bypass view-generation).
-        if self.provisional_new_session
+        if (result.presentation_stale || self.provisional_new_session)
+            && result.kind.authority() == crate::tui::async_action::AsyncActionAuthority::ReadOnly
             && !matches!(
                 result.kind,
                 AsyncActionKind::Internal(
@@ -833,12 +835,6 @@ impl App {
                     | AsyncActionKind::DaemonRpc("sealed.effect" | "mcp.local")
             )
         {
-            if matches!(
-                result.kind,
-                AsyncActionKind::Blocking("settings.blocking-effect")
-            ) {
-                self.settings_blocking_actions.remove(&result.id);
-            }
             return;
         }
         match result.kind {

@@ -127,24 +127,188 @@ enum DurableOAuthFlow {
         authorize_url: String,
         user_code: Option<String>,
         ready: ProviderOAuthReady,
+        created_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    },
+    ProviderExchanging {
+        owner: String,
+        begin_client_operation_id: String,
+        provider_id: String,
+        claimed_at_unix_ms: i64,
     },
     Mcp {
         owner: String,
         begin_client_operation_id: String,
         authorize_url: String,
         pending: McpOAuthPending,
+        created_at_unix_ms: i64,
+        expires_at_unix_ms: i64,
+    },
+    McpExchanging {
+        owner: String,
+        begin_client_operation_id: String,
+        project_root: String,
+        server: String,
+        claimed_at_unix_ms: i64,
     },
     ProviderCommitted {
         owner: String,
         begin_client_operation_id: String,
         provider_id: String,
+        committed_at_unix_ms: i64,
     },
     McpCommitted {
         owner: String,
         begin_client_operation_id: String,
         project_root: String,
         server: String,
+        committed_at_unix_ms: i64,
     },
+}
+
+fn oauth_wall_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn oauth_expiry_ms(created_at_unix_ms: i64) -> i64 {
+    created_at_unix_ms.saturating_add(i64::try_from(OAUTH_FLOW_TTL.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn durable_oauth_expired(flow: &DurableOAuthFlow, now_unix_ms: i64) -> bool {
+    match flow {
+        DurableOAuthFlow::Provider {
+            expires_at_unix_ms, ..
+        }
+        | DurableOAuthFlow::Mcp {
+            expires_at_unix_ms, ..
+        } => now_unix_ms >= *expires_at_unix_ms,
+        DurableOAuthFlow::ProviderExchanging {
+            claimed_at_unix_ms, ..
+        }
+        | DurableOAuthFlow::McpExchanging {
+            claimed_at_unix_ms, ..
+        } => now_unix_ms >= oauth_expiry_ms(*claimed_at_unix_ms),
+        DurableOAuthFlow::ProviderCommitted {
+            committed_at_unix_ms,
+            ..
+        }
+        | DurableOAuthFlow::McpCommitted {
+            committed_at_unix_ms,
+            ..
+        } => now_unix_ms >= oauth_expiry_ms(*committed_at_unix_ms),
+    }
+}
+
+fn durable_oauth_owner_and_created(flow: &DurableOAuthFlow) -> (&str, i64) {
+    match flow {
+        DurableOAuthFlow::Provider {
+            owner,
+            created_at_unix_ms,
+            ..
+        }
+        | DurableOAuthFlow::Mcp {
+            owner,
+            created_at_unix_ms,
+            ..
+        } => (owner, *created_at_unix_ms),
+        DurableOAuthFlow::ProviderExchanging {
+            owner,
+            claimed_at_unix_ms,
+            ..
+        }
+        | DurableOAuthFlow::McpExchanging {
+            owner,
+            claimed_at_unix_ms,
+            ..
+        } => (owner, *claimed_at_unix_ms),
+        DurableOAuthFlow::ProviderCommitted {
+            owner,
+            committed_at_unix_ms,
+            ..
+        }
+        | DurableOAuthFlow::McpCommitted {
+            owner,
+            committed_at_unix_ms,
+            ..
+        } => (owner, *committed_at_unix_ms),
+    }
+}
+
+fn purge_durable_oauth_flows(
+    ctx: &DaemonContext,
+    admitting_owner: &str,
+) -> std::result::Result<(), ErrorPayload> {
+    let mut flows = Vec::new();
+    for item_id in ctx
+        .secret_vault
+        .list_item_ids(cockpit_db::secret_vault::SecretVaultKind::SealedState)
+        .map_err(|error| internal(anyhow::anyhow!(error)))?
+        .into_iter()
+        .filter(|id| id.starts_with("oauth-flow:"))
+    {
+        let flow_id = item_id.trim_start_matches("oauth-flow:").to_owned();
+        if let Some(flow) = load_oauth_flow(ctx, &flow_id)? {
+            let (owner, created) = durable_oauth_owner_and_created(&flow);
+            flows.push((flow_id, owner.to_owned(), created));
+        }
+    }
+    flows.sort_by_key(|(_, _, created)| *created);
+    let owner_excess = flows
+        .iter()
+        .filter(|(_, owner, _)| owner == admitting_owner)
+        .count()
+        .saturating_sub(OAUTH_FLOW_OWNER_CAPACITY.saturating_sub(1));
+    let global_excess = flows
+        .len()
+        .saturating_sub(OAUTH_FLOW_GLOBAL_CAPACITY.saturating_sub(1));
+    let mut owner_removed = 0usize;
+    let mut global_removed = 0usize;
+    for (flow_id, owner, _) in flows {
+        let remove_for_owner = owner == admitting_owner && owner_removed < owner_excess;
+        let remove_for_global = global_removed < global_excess;
+        if remove_for_owner || remove_for_global {
+            delete_oauth_flow(ctx, &flow_id)?;
+            owner_removed += usize::from(remove_for_owner);
+            global_removed += 1;
+        }
+    }
+    Ok(())
+}
+
+fn find_durable_oauth_flow(
+    ctx: &DaemonContext,
+    owner: &str,
+    begin_client_operation_id: &str,
+) -> std::result::Result<Option<(String, DurableOAuthFlow)>, ErrorPayload> {
+    for item_id in ctx
+        .secret_vault
+        .list_item_ids(cockpit_db::secret_vault::SecretVaultKind::SealedState)
+        .map_err(|error| internal(anyhow::anyhow!(error)))?
+        .into_iter()
+        .filter(|id| id.starts_with("oauth-flow:"))
+    {
+        let flow_id = item_id.trim_start_matches("oauth-flow:").to_owned();
+        let Some(flow) = load_oauth_flow(ctx, &flow_id)? else {
+            continue;
+        };
+        let matches_begin = match &flow {
+            DurableOAuthFlow::Provider {
+                owner: durable_owner,
+                begin_client_operation_id: durable_begin,
+                ..
+            }
+            | DurableOAuthFlow::Mcp {
+                owner: durable_owner,
+                begin_client_operation_id: durable_begin,
+                ..
+            } => durable_owner == owner && durable_begin == begin_client_operation_id,
+            _ => false,
+        };
+        if matches_begin {
+            return Ok(Some((flow_id, flow)));
+        }
+    }
+    Ok(None)
 }
 
 fn oauth_flow_vault_id(flow_id: &str) -> String {
@@ -175,9 +339,16 @@ fn load_oauth_flow(
         cockpit_db::secret_vault::SecretVaultKind::SealedState,
         &oauth_flow_vault_id(flow_id),
     ) {
-        Ok(bytes) => serde_json::from_slice(bytes.as_slice())
-            .map(Some)
-            .map_err(internal),
+        Ok(bytes) => {
+            let flow: DurableOAuthFlow =
+                serde_json::from_slice(bytes.as_slice()).map_err(internal)?;
+            if durable_oauth_expired(&flow, oauth_wall_ms()) {
+                delete_oauth_flow(ctx, flow_id)?;
+                Ok(None)
+            } else {
+                Ok(Some(flow))
+            }
+        }
         Err(crate::secure_key::SecureKeyError::NotFound(_)) => Ok(None),
         Err(error) => Err(internal(anyhow::anyhow!(error))),
     }
@@ -197,6 +368,17 @@ fn delete_oauth_flow(ctx: &DaemonContext, flow_id: &str) -> std::result::Result<
 const OAUTH_FLOW_TTL: Duration = Duration::from_secs(10 * 60);
 const OAUTH_FLOW_GLOBAL_CAPACITY: usize = 64;
 const OAUTH_FLOW_OWNER_CAPACITY: usize = 8;
+
+fn local_operation_secret_request_hash<T: serde::Serialize>(
+    ctx: &DaemonContext,
+    domain: &'static [u8],
+    request: &T,
+) -> std::result::Result<[u8; 32], ErrorPayload> {
+    let encoded = zeroize::Zeroizing::new(serde_json::to_vec(request).map_err(internal)?);
+    Ok(ctx
+        .secret_vault
+        .keyed_request_identity(domain, encoded.as_slice()))
+}
 
 struct StoredProviderOAuthFlow {
     owner: String,
@@ -614,6 +796,30 @@ mod oauth_store_tests {
             .await;
         assert!(store.cancel_provider("flow", "owner").await);
         assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn durable_oauth_contract_is_expiring_fenced_and_secret_safe() {
+        let source = include_str!("dispatch.rs");
+        for required in [
+            "created_at_unix_ms",
+            "expires_at_unix_ms",
+            "ProviderExchanging",
+            "McpExchanging",
+            "purge_durable_oauth_flows",
+            "local_operation_secret_request_hash",
+            "keyed_request_identity",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing OAuth durability guard: {required}"
+            );
+        }
+        assert!(source.contains("authorize_url: String::new()"));
+        assert!(source.contains("user_code: None"));
+        assert!(source.contains("provider-oauth/complete/v1\\0"));
+        assert!(source.contains("mcp-oauth/complete/v1\\0"));
+        assert!(source.contains("finish_local_operation_error("));
     }
 }
 
@@ -7545,8 +7751,11 @@ async fn handle_serialized_request_impl(
             record,
         } => {
             let settlement_owner = settings_capability_owner(state);
-            let request_hash =
-                local_operation_request_hash(&("put_provider_credential", &provider_id, &record))?;
+            let request_hash = local_operation_secret_request_hash(
+                ctx,
+                b"flycockpit/local-operation/provider-credential/put/v1\0",
+                &("put_provider_credential", &provider_id, &record),
+            )?;
             #[cfg(feature = "remote")]
             let request = Request::PutProviderCredential {
                 client_operation_id: client_operation_id.clone(),
@@ -7731,9 +7940,18 @@ async fn handle_serialized_request_impl(
                     "ephemeral daemons do not accept persistent provider OAuth logins",
                 ));
             }
+            if provider_id != crate::auth::xai_oauth::CREDENTIAL_KEY
+                && provider_id != crate::auth::codex_oauth::CREDENTIAL_KEY
+            {
+                return Err(bad_request("unsupported provider OAuth flow"));
+            }
             let owner = oauth_owner(state);
-            let request_hash =
-                local_operation_request_hash(&("begin_provider_oauth", &provider_id))?;
+            purge_durable_oauth_flows(ctx, &owner)?;
+            let request_hash = local_operation_secret_request_hash(
+                ctx,
+                b"flycockpit/local-operation/provider-oauth/begin/v1\0",
+                &("begin_provider_oauth", &provider_id),
+            )?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -7743,6 +7961,28 @@ async fn handle_serialized_request_impl(
             )
             .await?
             {
+                LocalOperationStart::Replay(Response::ProviderOAuthStarted {
+                    client_operation_id,
+                    request_hash,
+                    flow_id,
+                    ..
+                }) => {
+                    let Some(DurableOAuthFlow::Provider {
+                        authorize_url,
+                        user_code,
+                        ..
+                    }) = load_oauth_flow(ctx, &flow_id)?
+                    else {
+                        return Err(conflict("provider OAuth begin receipt has no live flow"));
+                    };
+                    return Ok(Response::ProviderOAuthStarted {
+                        client_operation_id,
+                        request_hash,
+                        flow_id,
+                        authorize_url,
+                        user_code,
+                    });
+                }
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
@@ -7758,13 +7998,68 @@ async fn handle_serialized_request_impl(
                     authorize_url,
                     user_code,
                 };
+                let receipt = Response::ProviderOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    flow_id: match &response {
+                        Response::ProviderOAuthStarted { flow_id, .. } => flow_id.clone(),
+                        _ => unreachable!(),
+                    },
+                    authorize_url: String::new(),
+                    user_code: None,
+                };
                 finish_local_operation(
                     ctx,
                     owner,
                     client_operation_id,
                     request_hash,
                     fencing_generation,
-                    &response,
+                    &receipt,
+                )
+                .await?;
+                return Ok(response);
+            }
+            if let Some((
+                flow_id,
+                DurableOAuthFlow::Provider {
+                    authorize_url,
+                    user_code,
+                    ready,
+                    ..
+                },
+            )) = find_durable_oauth_flow(ctx, &owner, &client_operation_id)?
+            {
+                ctx.oauth_flows
+                    .insert_provider(
+                        flow_id.clone(),
+                        owner.clone(),
+                        client_operation_id.clone(),
+                        authorize_url.clone(),
+                        user_code.clone(),
+                        ProviderOAuthFlow::Ready(ready),
+                    )
+                    .await;
+                let response = Response::ProviderOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    flow_id: flow_id.clone(),
+                    authorize_url,
+                    user_code,
+                };
+                let receipt = Response::ProviderOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    flow_id,
+                    authorize_url: String::new(),
+                    user_code: None,
+                };
+                finish_local_operation(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &receipt,
                 )
                 .await?;
                 return Ok(response);
@@ -7772,9 +8067,22 @@ async fn handle_serialized_request_impl(
             let flow_id = uuid::Uuid::new_v4().to_string();
             let (flow, authorize_url, user_code) = match provider_id.as_str() {
                 crate::auth::xai_oauth::CREDENTIAL_KEY => {
-                    let login = crate::auth::xai_oauth::begin_manual_login()
-                        .await
-                        .map_err(internal)?;
+                    let login = match crate::auth::xai_oauth::begin_manual_login().await {
+                        Ok(login) => login,
+                        Err(cause) => {
+                            let error = internal(cause);
+                            finish_local_operation_error(
+                                ctx,
+                                owner,
+                                client_operation_id,
+                                request_hash,
+                                fencing_generation,
+                                &error,
+                            )
+                            .await?;
+                            return Err(error);
+                        }
+                    };
                     let authorize_url = login.authorize_url.clone();
                     (
                         ProviderOAuthFlow::Ready(ProviderOAuthReady::Grok(login)),
@@ -7783,9 +8091,22 @@ async fn handle_serialized_request_impl(
                     )
                 }
                 crate::auth::codex_oauth::CREDENTIAL_KEY => {
-                    let login = crate::auth::codex_oauth::begin_device_code_login()
-                        .await
-                        .map_err(internal)?;
+                    let login = match crate::auth::codex_oauth::begin_device_code_login().await {
+                        Ok(login) => login,
+                        Err(cause) => {
+                            let error = internal(cause);
+                            finish_local_operation_error(
+                                ctx,
+                                owner,
+                                client_operation_id,
+                                request_hash,
+                                fencing_generation,
+                                &error,
+                            )
+                            .await?;
+                            return Err(error);
+                        }
+                    };
                     let authorize_url = login.verification_uri.clone();
                     let user_code = Some(login.user_code.clone());
                     (
@@ -7794,12 +8115,13 @@ async fn handle_serialized_request_impl(
                         user_code,
                     )
                 }
-                _ => return Err(bad_request("unsupported provider OAuth flow")),
+                _ => unreachable!("provider OAuth kind was validated before ledger admission"),
             };
             let ProviderOAuthFlow::Ready(durable_ready) = &flow else {
                 unreachable!("new provider OAuth flow must be ready")
             };
-            persist_oauth_flow(
+            let created_at_unix_ms = oauth_wall_ms();
+            if let Err(error) = persist_oauth_flow(
                 ctx,
                 &flow_id,
                 &DurableOAuthFlow::Provider {
@@ -7808,8 +8130,21 @@ async fn handle_serialized_request_impl(
                     authorize_url: authorize_url.clone(),
                     user_code: user_code.clone(),
                     ready: durable_ready.clone(),
+                    created_at_unix_ms,
+                    expires_at_unix_ms: oauth_expiry_ms(created_at_unix_ms),
                 },
-            )?;
+            ) {
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
             ctx.oauth_flows
                 .insert_provider(
                     flow_id.clone(),
@@ -7827,13 +8162,23 @@ async fn handle_serialized_request_impl(
                 authorize_url,
                 user_code,
             };
+            let receipt = Response::ProviderOAuthStarted {
+                client_operation_id: client_operation_id.clone(),
+                request_hash: local_operation_request_hash_hex(&request_hash),
+                flow_id: match &response {
+                    Response::ProviderOAuthStarted { flow_id, .. } => flow_id.clone(),
+                    _ => unreachable!(),
+                },
+                authorize_url: String::new(),
+                user_code: None,
+            };
             finish_local_operation(
                 ctx,
                 owner,
                 client_operation_id,
                 request_hash,
                 fencing_generation,
-                &response,
+                &receipt,
             )
             .await?;
             Ok(response)
@@ -7850,8 +8195,11 @@ async fn handle_serialized_request_impl(
                 ));
             }
             let owner = oauth_owner(state);
-            let request_hash =
-                local_operation_request_hash(&("complete_provider_oauth", &flow_id, &input))?;
+            let request_hash = local_operation_secret_request_hash(
+                ctx,
+                b"flycockpit/local-operation/provider-oauth/complete/v1\0",
+                &("complete_provider_oauth", &flow_id, &input),
+            )?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -7907,6 +8255,7 @@ async fn handle_serialized_request_impl(
                         authorize_url,
                         user_code,
                         ready,
+                        ..
                     }) = load_oauth_flow(ctx, &flow_id)?
                     && durable_owner == owner
                 {
@@ -7931,13 +8280,23 @@ async fn handle_serialized_request_impl(
                             bad_request("provider OAuth flow is unknown or already completed")
                         })?,
                 };
-                let exchange_ready = ready.clone();
-                let exchange = match exchange_ready {
+                let provider_id = match &ready {
+                    ProviderOAuthReady::Grok(_) => crate::auth::xai_oauth::CREDENTIAL_KEY,
+                    ProviderOAuthReady::Codex(_) => crate::auth::codex_oauth::CREDENTIAL_KEY,
+                };
+                persist_oauth_flow(
+                    ctx,
+                    &flow_id,
+                    &DurableOAuthFlow::ProviderExchanging {
+                        owner: owner.clone(),
+                        begin_client_operation_id: durable_begin_client_operation_id.clone(),
+                        provider_id: provider_id.to_owned(),
+                        claimed_at_unix_ms: oauth_wall_ms(),
+                    },
+                )?;
+                let exchange = match ready {
                     ProviderOAuthReady::Grok(login) => {
                         let Some(callback) = input.as_deref() else {
-                            ctx.oauth_flows
-                                .restore_provider(&flow_id, &owner, ProviderOAuthReady::Grok(login))
-                                .await;
                             return Err(bad_request(
                                 "Grok OAuth completion requires a callback URL or code",
                             ));
@@ -7953,13 +8312,6 @@ async fn handle_serialized_request_impl(
                     }
                     ProviderOAuthReady::Codex(login) => {
                         if input.is_some() {
-                            ctx.oauth_flows
-                                .restore_provider(
-                                    &flow_id,
-                                    &owner,
-                                    ProviderOAuthReady::Codex(login),
-                                )
-                                .await;
                             return Err(bad_request(
                                 "Codex device OAuth does not accept callback input",
                             ));
@@ -7976,15 +8328,8 @@ async fn handle_serialized_request_impl(
                             })
                     }
                 };
-                let (provider_id, record) = match exchange {
-                    Ok(value) => value,
-                    Err(error) => {
-                        ctx.oauth_flows
-                            .restore_provider(&flow_id, &owner, ready)
-                            .await;
-                        return Err(error);
-                    }
-                };
+                let (provider_id, record) = exchange?;
+                let record = zeroize::Zeroizing::new(record);
                 let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
                 if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(conflict("provider OAuth completion was cancelled"));
@@ -7994,6 +8339,7 @@ async fn handle_serialized_request_impl(
                         owner: owner.clone(),
                         begin_client_operation_id: durable_begin_client_operation_id,
                         provider_id: provider_id.to_owned(),
+                        committed_at_unix_ms: oauth_wall_ms(),
                     })
                     .map_err(internal)?,
                 );
@@ -8037,14 +8383,29 @@ async fn handle_serialized_request_impl(
                     retry_after_seconds: None,
                 })
             };
-            let response = mutation.await?;
+            let response = match mutation.await {
+                Ok(response) => response,
+                Err(error) => {
+                    ctx.oauth_flows.remove_provider(&flow_id, &owner).await;
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
             finish_local_operation(
                 ctx,
                 owner,
                 client_operation_id,
                 request_hash,
                 fencing_generation,
-                &response,
+                &receipt,
             )
             .await?;
             delete_oauth_flow(ctx, &flow_id)?;
@@ -8112,6 +8473,13 @@ async fn handle_serialized_request_impl(
                         })) if durable_owner == owner && durable_begin == begin_client_operation_id
                     ) || matches!(
                         load_oauth_flow(ctx, candidate),
+                        Ok(Some(DurableOAuthFlow::ProviderExchanging {
+                            owner: durable_owner,
+                            begin_client_operation_id: durable_begin,
+                            ..
+                        })) if durable_owner == owner && durable_begin == begin_client_operation_id
+                    ) || matches!(
+                        load_oauth_flow(ctx, candidate),
                         Ok(Some(DurableOAuthFlow::ProviderCommitted {
                             owner: durable_owner,
                             begin_client_operation_id: durable_begin,
@@ -8170,42 +8538,12 @@ async fn handle_serialized_request_impl(
             // all key on the same canonical workspace root as later resolution.
             let project_root = crate::secret_ownership::canonical_owner_root(&project_root);
             let owner = oauth_owner(state);
-            let request_hash =
-                local_operation_request_hash(&("begin_mcp_oauth", &project_root, &server))?;
-            let fencing_generation = match begin_local_operation(
+            purge_durable_oauth_flows(ctx, &owner)?;
+            let request_hash = local_operation_secret_request_hash(
                 ctx,
-                &owner,
-                &client_operation_id,
-                "begin_mcp_oauth",
-                request_hash,
-            )
-            .await?
-            {
-                LocalOperationStart::Replay(response) => return Ok(response),
-                LocalOperationStart::Execute(generation) => generation,
-            };
-            if let Some((flow_id, authorize_url)) = ctx
-                .oauth_flows
-                .mcp_started(&owner, &client_operation_id)
-                .await
-            {
-                let response = Response::McpOAuthStarted {
-                    client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&request_hash),
-                    flow_id,
-                    authorize_url,
-                };
-                finish_local_operation(
-                    ctx,
-                    owner,
-                    client_operation_id,
-                    request_hash,
-                    fencing_generation,
-                    &response,
-                )
-                .await?;
-                return Ok(response);
-            }
+                b"flycockpit/local-operation/mcp-oauth/begin/v1\0",
+                &("begin_mcp_oauth", &project_root, &server),
+            )?;
             let cwd = std::path::PathBuf::from(&project_root);
             let trust_policy =
                 crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
@@ -8228,6 +8566,108 @@ async fn handle_serialized_request_impl(
                 [crate::mcp::auth::cred_key(&server)],
             )
             .await?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &owner,
+                &client_operation_id,
+                "begin_mcp_oauth",
+                request_hash,
+            )
+            .await?
+            {
+                LocalOperationStart::Replay(Response::McpOAuthStarted {
+                    client_operation_id,
+                    request_hash,
+                    flow_id,
+                    ..
+                }) => {
+                    let Some(DurableOAuthFlow::Mcp { authorize_url, .. }) =
+                        load_oauth_flow(ctx, &flow_id)?
+                    else {
+                        return Err(conflict("MCP OAuth begin receipt has no live flow"));
+                    };
+                    return Ok(Response::McpOAuthStarted {
+                        client_operation_id,
+                        request_hash,
+                        flow_id,
+                        authorize_url,
+                    });
+                }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            if let Some((flow_id, authorize_url)) = ctx
+                .oauth_flows
+                .mcp_started(&owner, &client_operation_id)
+                .await
+            {
+                let response = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    flow_id,
+                    authorize_url,
+                };
+                let receipt = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    flow_id: match &response {
+                        Response::McpOAuthStarted { flow_id, .. } => flow_id.clone(),
+                        _ => unreachable!(),
+                    },
+                    authorize_url: String::new(),
+                };
+                finish_local_operation(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &receipt,
+                )
+                .await?;
+                return Ok(response);
+            }
+            if let Some((
+                flow_id,
+                DurableOAuthFlow::Mcp {
+                    authorize_url,
+                    pending,
+                    ..
+                },
+            )) = find_durable_oauth_flow(ctx, &owner, &client_operation_id)?
+            {
+                ctx.oauth_flows
+                    .insert_mcp(
+                        flow_id.clone(),
+                        owner.clone(),
+                        client_operation_id.clone(),
+                        authorize_url.clone(),
+                        pending,
+                    )
+                    .await;
+                let response = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    flow_id: flow_id.clone(),
+                    authorize_url,
+                };
+                let receipt = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    flow_id,
+                    authorize_url: String::new(),
+                };
+                finish_local_operation(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &receipt,
+                )
+                .await?;
+                return Ok(response);
+            }
             // Only a LOCAL owner may have the daemon open a host browser and
             // bind a host loopback listener for the callback. For a remote
             // caller the daemon returns the authorize URL only (no browser, no
@@ -8240,16 +8680,32 @@ async fn handle_serialized_request_impl(
                 remote_operation,
             );
             let (flow, authorize_url) =
-                crate::mcp::auth::begin_oauth_flow(&server, server_config, local_display)
+                match crate::mcp::auth::begin_oauth_flow(&server, server_config, local_display)
                     .await
-                    .map_err(internal)?;
+                {
+                    Ok(started) => started,
+                    Err(cause) => {
+                        let error = internal(cause);
+                        finish_local_operation_error(
+                            ctx,
+                            owner,
+                            client_operation_id,
+                            request_hash,
+                            fencing_generation,
+                            &error,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
             let flow_id = uuid::Uuid::new_v4().to_string();
             let pending = McpOAuthPending {
                 project_root,
                 server,
                 flow,
             };
-            persist_oauth_flow(
+            let created_at_unix_ms = oauth_wall_ms();
+            if let Err(error) = persist_oauth_flow(
                 ctx,
                 &flow_id,
                 &DurableOAuthFlow::Mcp {
@@ -8264,8 +8720,21 @@ async fn handle_serialized_request_impl(
                         )
                         .map_err(internal)?,
                     },
+                    created_at_unix_ms,
+                    expires_at_unix_ms: oauth_expiry_ms(created_at_unix_ms),
                 },
-            )?;
+            ) {
+                finish_local_operation_error(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
             ctx.oauth_flows
                 .insert_mcp(
                     flow_id.clone(),
@@ -8281,13 +8750,22 @@ async fn handle_serialized_request_impl(
                 flow_id,
                 authorize_url,
             };
+            let receipt = Response::McpOAuthStarted {
+                client_operation_id: client_operation_id.clone(),
+                request_hash: local_operation_request_hash_hex(&request_hash),
+                flow_id: match &response {
+                    Response::McpOAuthStarted { flow_id, .. } => flow_id.clone(),
+                    _ => unreachable!(),
+                },
+                authorize_url: String::new(),
+            };
             finish_local_operation(
                 ctx,
                 owner,
                 client_operation_id,
                 request_hash,
                 fencing_generation,
-                &response,
+                &receipt,
             )
             .await?;
             Ok(response)
@@ -8304,8 +8782,11 @@ async fn handle_serialized_request_impl(
                 ));
             }
             let owner = oauth_owner(state);
-            let request_hash =
-                local_operation_request_hash(&("complete_mcp_oauth", &flow_id, &input))?;
+            let request_hash = local_operation_secret_request_hash(
+                ctx,
+                b"flycockpit/local-operation/mcp-oauth/complete/v1\0",
+                &("complete_mcp_oauth", &flow_id, &input),
+            )?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -8352,6 +8833,7 @@ async fn handle_serialized_request_impl(
                         begin_client_operation_id,
                         authorize_url,
                         pending,
+                        ..
                     }) = load_oauth_flow(ctx, &flow_id)?
                     && durable_owner == owner
                 {
@@ -8375,13 +8857,25 @@ async fn handle_serialized_request_impl(
                             bad_request("MCP OAuth flow is unknown or already completed")
                         })?,
                 };
+                persist_oauth_flow(
+                    ctx,
+                    &flow_id,
+                    &DurableOAuthFlow::McpExchanging {
+                        owner: owner.clone(),
+                        begin_client_operation_id: durable_begin_client_operation_id.clone(),
+                        project_root: pending.project_root.clone(),
+                        server: pending.server.clone(),
+                        claimed_at_unix_ms: oauth_wall_ms(),
+                    },
+                )?;
                 // Once claimed, this flow is one-shot. A provider exchange may have
                 // consumed its authorization code even if vault persistence fails,
                 // so it must not be reinserted for a second exchange.
                 let tokens = crate::mcp::auth::complete_oauth_flow(pending.flow, input.as_deref())
                     .await
                     .map_err(internal)?;
-                let record = serde_json::to_vec(&tokens).map_err(internal)?;
+                let record =
+                    zeroize::Zeroizing::new(serde_json::to_vec(&tokens).map_err(internal)?);
                 let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
                 if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(conflict("MCP OAuth completion was cancelled"));
@@ -8394,6 +8888,7 @@ async fn handle_serialized_request_impl(
                         begin_client_operation_id: durable_begin_client_operation_id,
                         project_root: owner_root.clone(),
                         server: pending.server.clone(),
+                        committed_at_unix_ms: oauth_wall_ms(),
                     })
                     .map_err(internal)?,
                 );
@@ -8459,7 +8954,22 @@ async fn handle_serialized_request_impl(
                     authenticated: true,
                 })
             };
-            let response = mutation.await?;
+            let response = match mutation.await {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
+                    finish_local_operation_error(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
             let _ = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
             finish_local_operation(
                 ctx,
@@ -8529,6 +9039,13 @@ async fn handle_serialized_request_impl(
                     matches!(
                         load_oauth_flow(ctx, candidate),
                         Ok(Some(DurableOAuthFlow::Mcp {
+                            owner: durable_owner,
+                            begin_client_operation_id: durable_begin,
+                            ..
+                        })) if durable_owner == owner && durable_begin == begin_client_operation_id
+                    ) || matches!(
+                        load_oauth_flow(ctx, candidate),
+                        Ok(Some(DurableOAuthFlow::McpExchanging {
                             owner: durable_owner,
                             begin_client_operation_id: durable_begin,
                             ..

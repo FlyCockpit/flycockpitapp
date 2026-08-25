@@ -55,22 +55,89 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-/// Authoritative top-level command surface advertised by the public v0.1
-/// artifact. Commands outside this list remain parseable for compatibility,
-/// but are absent from help, generated man pages, and shell completions.
+/// Authoritative top-level command surface advertised by the public v0.1 artifact.
 pub const PUBLIC_V0_1_COMMANDS: &[&str] = &[
     "ask", "run", "agent", "provider", "setup", "models", "daemon", "doctor", "session", "trust",
     "export", "config", "init",
 ];
 
-pub(crate) fn public_v0_1_command() -> clap::Command {
-    let mut command = Cli::command();
-    for subcommand in command.get_subcommands_mut() {
-        if !PUBLIC_V0_1_COMMANDS.contains(&subcommand.get_name()) {
-            subcommand.hide(true);
+pub fn public_v0_1_command() -> clap::Command {
+    PublicCli::command()
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "cockpit",
+    version,
+    about = "AI coding harness with an interactive terminal UI",
+    propagate_version = true
+)]
+pub struct PublicCli {
+    #[arg(long, value_name = "PATH")]
+    pub project: Option<PathBuf>,
+    #[arg(long, global = true)]
+    pub print_logs: bool,
+    #[arg(long, global = true, value_name = "LEVEL")]
+    pub log_level: Option<String>,
+    #[arg(long, global = true, hide = true)]
+    pub pure: bool,
+    #[arg(long, global = true)]
+    pub debug_last_message: bool,
+    #[arg(long, global = true)]
+    pub no_sandbox: bool,
+    #[command(subcommand)]
+    pub command: Option<PublicCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PublicCommand {
+    Ask(AskArgs),
+    Run(RunArgs),
+    #[command(subcommand)]
+    Agent(AgentCommand),
+    #[command(subcommand, name = "provider")]
+    Provider(ProvidersCommand),
+    Setup(SetupArgs),
+    Models(ModelsArgs),
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+    Doctor(DoctorArgs),
+    #[command(subcommand)]
+    Session(SessionCommand),
+    #[command(subcommand)]
+    Trust(TrustCommand),
+    Export(ExportArgs),
+    #[command(subcommand)]
+    Config(ConfigCommand),
+    Init(InitArgs),
+}
+
+impl From<PublicCli> for Cli {
+    fn from(value: PublicCli) -> Self {
+        Self {
+            project: value.project,
+            print_logs: value.print_logs,
+            log_level: value.log_level,
+            pure: value.pure,
+            debug_last_message: value.debug_last_message,
+            no_sandbox: value.no_sandbox,
+            command: value.command.map(|command| match command {
+                PublicCommand::Ask(args) => Command::Ask(args),
+                PublicCommand::Run(args) => Command::Run(args),
+                PublicCommand::Agent(args) => Command::Agent(args),
+                PublicCommand::Provider(args) => Command::Provider(args),
+                PublicCommand::Setup(args) => Command::Setup(args),
+                PublicCommand::Models(args) => Command::Models(args),
+                PublicCommand::Daemon(args) => Command::Daemon(args),
+                PublicCommand::Doctor(args) => Command::Doctor(args),
+                PublicCommand::Session(args) => Command::Session(args),
+                PublicCommand::Trust(args) => Command::Trust(args),
+                PublicCommand::Export(args) => Command::Export(args),
+                PublicCommand::Config(args) => Command::Config(args),
+                PublicCommand::Init(args) => Command::Init(args),
+            }),
         }
     }
-    command
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,7 +169,7 @@ pub enum Command {
     Account(AccountCommand),
 
     /// Manage AI providers and credentials.
-    #[command(subcommand, name = "provider", alias = "providers", alias = "auth")]
+    #[command(subcommand, name = "provider")]
     Provider(ProvidersCommand),
 
     /// Run an interactive setup wizard.
@@ -1760,32 +1827,11 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "remote")]
     #[test]
-    fn provider_aliases_parse() {
-        for root in ["provider", "providers", "auth"] {
-            let cli = Cli::try_parse_from(["cockpit", root, "list"]).unwrap();
-            assert!(matches!(
-                cli.command,
-                Some(Command::Provider(ProvidersCommand::List))
-            ));
-
-            let cli =
-                Cli::try_parse_from(["cockpit", root, "usage", "--provider", "openai"]).unwrap();
-            match cli.command {
-                Some(Command::Provider(ProvidersCommand::Usage(args))) => {
-                    assert_eq!(args.provider.as_deref(), Some("openai"));
-                }
-                other => panic!("expected provider usage command, got {other:?}"),
-            }
-
-            let cli = Cli::try_parse_from(["cockpit", root, "logout", "codex-oauth"]).unwrap();
-            match cli.command {
-                Some(Command::Provider(ProvidersCommand::Logout(args))) => {
-                    assert_eq!(args.provider, "codex-oauth");
-                }
-                other => panic!("expected provider logout command, got {other:?}"),
-            }
+    fn provider_has_no_public_root_aliases() {
+        assert!(PublicCli::try_parse_from(["cockpit", "provider", "list"]).is_ok());
+        for alias in ["providers", "auth"] {
+            assert!(PublicCli::try_parse_from(["cockpit", alias, "list"]).is_err());
         }
     }
 

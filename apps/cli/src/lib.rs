@@ -42,6 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::cli::{Cli, Command};
+pub use crate::cli::public_v0_1_command;
 
 pub mod manpages {
     use std::fs;
@@ -724,7 +725,10 @@ fn error_stderr_line(err: &anyhow::Error) -> String {
 
 async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
     use clap::FromArgMatches as _;
-    let cli = Cli::from_arg_matches(&crate::cli::public_v0_1_command().get_matches())?;
+    let cli = crate::cli::PublicCli::from_arg_matches(
+        &crate::cli::public_v0_1_command().get_matches(),
+    )?
+    .into();
 
     init_tracing(cli.log_level.as_deref(), cli.print_logs);
 

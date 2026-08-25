@@ -130,19 +130,29 @@ fn remote_conformance_is_opt_in_and_release_declares_local_profile() {
 
 #[test]
 fn public_v0_1_allowlist_is_exact_and_single_source() {
-    let cli = source("apps/cli/src/cli.rs");
     let fixture: serde_json::Value = serde_json::from_str(&source(
         "apps/cli/tests/fixtures/public-v0.1-command-snapshot.json",
     ))
     .unwrap();
-    let commands = fixture["commands"].as_array().unwrap();
-    for command in commands {
-        let command = command.as_str().unwrap();
-        assert!(cli.contains(&format!("\"{command}\"")), "missing {command}");
-    }
-    assert_eq!(commands.len(), 13);
-    assert!(cli.contains("PUBLIC_V0_1_COMMANDS.contains"));
-    assert!(source("apps/cli/src/lib.rs").contains("public_v0_1_command()"));
+    let expected = fixture["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let command = cockpit_cli::public_v0_1_command();
+    let actual = command
+        .get_subcommands()
+        .flat_map(|subcommand| {
+            std::iter::once(subcommand.get_name().to_owned()).chain(
+                subcommand
+                    .get_all_aliases()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual, expected);
 }
 
 #[test]

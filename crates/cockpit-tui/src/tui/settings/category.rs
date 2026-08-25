@@ -1555,8 +1555,10 @@ fn long_text_setting(id: SettingId) -> bool {
 #[derive(Debug, Clone)]
 pub(super) struct ShadowedGlobalPrompt {
     pub(super) setting: SettingId,
+    pub(super) source_config: std::path::PathBuf,
     pub(super) project_config: std::path::PathBuf,
     pub(super) path: &'static [&'static str],
+    pub(super) expected_effective_value: serde_json::Value,
 }
 
 /// Directory autosuggest for the packages-dir field: the ranked candidate
@@ -3346,10 +3348,17 @@ impl SettingsCx {
         if self.config_path == project_config {
             return None;
         }
+        let document = serde_json::to_value(&self.extended).ok()?;
+        let expected_effective_value = path
+            .iter()
+            .try_fold(&document, |value, segment| value.get(*segment))?
+            .clone();
         Some(ShadowedGlobalPrompt {
             setting: id,
+            source_config: self.config_path.clone(),
             project_config,
             path,
+            expected_effective_value,
         })
     }
 

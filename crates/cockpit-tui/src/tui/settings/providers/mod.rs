@@ -827,6 +827,7 @@ impl CopilotSetupState {
         let operation_id = self.operation.begin();
         let project_root = project_root.display().to_string();
         let provider_id = provider_id.to_string();
+        let client_operation_id = operation_id.0.to_string();
         cx.queue_simple_mutation(
             super::SettingsEffectTarget {
                 surface: "settings.copilot-setup",
@@ -834,10 +835,15 @@ impl CopilotSetupState {
                 revision: Some(operation_id.0.to_string()),
             },
             cockpit_core::daemon::proto::Request::SetupCopilotAuth {
-                project_root,
+                client_operation_id: client_operation_id.clone(),
+                project_root: project_root.clone(),
                 provider_id: provider_id.clone(),
             },
-            super::SettingsMutationAction::CopilotSetup { provider_id },
+            super::SettingsMutationAction::CopilotSetup {
+                provider_id,
+                client_operation_id,
+                project_root,
+            },
         );
         self.outcome = Some(Ok("Copilot setup pending…".into()));
     }
@@ -1860,17 +1866,23 @@ impl SettingsCx {
             .ok_or_else(|| "resolving provider logout workspace: no project context".to_string())?
             .display()
             .to_string();
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
         self.queue_simple_mutation(
             super::SettingsEffectTarget {
                 surface: "settings.provider-logout",
                 owner: provider_id.clone(),
-                revision: Some(uuid::Uuid::new_v4().to_string()),
+                revision: Some(client_operation_id.clone()),
             },
             cockpit_core::daemon::proto::Request::DeleteProviderCredential {
+                client_operation_id: client_operation_id.clone(),
                 provider_id: provider_id.clone(),
-                project_root: Some(project_root),
+                project_root: Some(project_root.clone()),
             },
-            super::SettingsMutationAction::ProviderCredentialDelete { provider_id },
+            super::SettingsMutationAction::ProviderCredentialDelete {
+                provider_id,
+                client_operation_id,
+                project_root,
+            },
         );
         Ok(())
     }

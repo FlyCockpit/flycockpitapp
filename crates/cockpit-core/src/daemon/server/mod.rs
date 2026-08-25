@@ -621,9 +621,16 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::ProviderUsageSnapshot { .. }
         | proto::Response::ProviderConfigUpserted { .. }
         | proto::Response::ProviderMutationCommitted { .. }
-        | proto::Response::ProviderCredentialDeleted { .. }
         | proto::Response::AppFlag { .. }
         | proto::Response::AppFlagSeen { .. } => {}
+        proto::Response::ProviderCredentialCommitted { project_root, .. } => {
+            if let Some(root) = project_root {
+                scrub_string(root, redact);
+            }
+        }
+        proto::Response::CopilotAuthCommitted { project_root, .. } => {
+            scrub_string(project_root, redact);
+        }
         #[cfg(feature = "remote")]
         proto::Response::FlycockpitStored
         | proto::Response::FlycockpitNotLoggedIn
@@ -680,8 +687,15 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::RunInvocationCancelResult { .. }
         | proto::Response::ProviderOAuthCompleted { .. }
         | proto::Response::McpOAuthCompleted { .. }
-        | proto::Response::McpOAuthCancelled { .. }
-        | proto::Response::McpConfigSaved { .. } => {}
+        | proto::Response::McpOAuthCancelled { .. } => {}
+        proto::Response::McpConfigCommitted {
+            project_root,
+            config_path,
+            ..
+        } => {
+            scrub_string(project_root, redact);
+            scrub_string(config_path, redact);
+        }
         #[cfg(feature = "remote")]
         proto::Response::RemoteOperationStatus { .. } => {}
         proto::Response::ProviderOAuthStarted { authorize_url, .. } => {

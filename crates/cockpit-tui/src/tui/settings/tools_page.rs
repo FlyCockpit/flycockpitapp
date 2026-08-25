@@ -451,17 +451,22 @@ impl SettingsCx {
     fn save_web_api_key(&mut self, provider: WebKeyProvider, key: &str) -> Result<(), String> {
         let provider_id = web_key_provider_id(provider).to_string();
         let record = serde_json::json!({ "api_key": key }).to_string();
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
         self.queue_simple_secret_mutation(
             super::SettingsEffectTarget {
                 surface: "settings.web-credential",
                 owner: provider_id.clone(),
-                revision: Some(uuid::Uuid::new_v4().to_string()),
+                revision: Some(client_operation_id.clone()),
             },
             super::SettingsDaemonEffectWork::ProviderCredentialPut {
+                client_operation_id: client_operation_id.clone(),
                 provider_id: provider_id.clone(),
                 record: super::SecretPayload::new(record),
             },
-            super::SettingsMutationAction::WebCredentialPut { provider_id },
+            super::SettingsMutationAction::WebCredentialPut {
+                provider_id,
+                client_operation_id,
+            },
         );
         self.extended_warnings = vec!["saving web credential…".into()];
         Ok(())

@@ -141,17 +141,33 @@ async fn add(args: McpAddArgs) -> Result<()> {
         serde_json::to_string(&secret_values).context("serializing MCP secret values")?;
     let cleanup_names_json = serde_json::to_string(&BTreeSet::<String>::new())
         .context("serializing MCP cleanup names")?;
+    let client_operation_id = uuid::Uuid::new_v4().to_string();
+    let project_root = cwd.display().to_string();
     match daemon
         .client
         .request(Request::SaveMcpConfig {
-            project_root: cwd.display().to_string(),
+            client_operation_id: client_operation_id.clone(),
+            project_root: project_root.clone(),
             config_json,
             secret_values_json,
             cleanup_names_json,
         })
         .await?
     {
-        Ok(Response::McpConfigSaved { .. }) => {}
+        Ok(Response::McpConfigCommitted {
+            client_operation_id: returned_operation_id,
+            project_root: returned_root,
+            owner_root,
+            config_path,
+            consumed_revision,
+            result_revision,
+            ..
+        }) if returned_operation_id == client_operation_id
+            && returned_root == project_root
+            && !owner_root.trim().is_empty()
+            && !config_path.trim().is_empty()
+            && cockpit_proto::is_opaque_authority_token(&consumed_revision)
+            && cockpit_proto::is_opaque_authority_token(&result_revision) => {}
         Ok(other) => bail!("daemon returned unexpected response to MCP config save: {other:?}"),
         Err(error) => bail!("daemon rejected MCP config save: {error}"),
     }

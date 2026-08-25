@@ -375,7 +375,14 @@ pub enum Response {
     },
     /// Authoritative result of an MCP config publication. Credential refs are
     /// intentionally omitted; clients refresh their redacted view/inventory.
-    McpConfigSaved {
+    McpConfigCommitted {
+        client_operation_id: String,
+        project_root: String,
+        owner_root: String,
+        config_path: String,
+        consumed_revision: String,
+        result_revision: String,
+        config_generation: u64,
         credential_count: u32,
     },
     ProviderCatalogSnapshot {
@@ -407,11 +414,22 @@ pub enum Response {
         status: crate::ConfigCommitStatus,
         publication: crate::ConfigPublicationStatus,
     },
-    /// Result of deleting a provider credential. `found` reports whether the
-    /// authorized OAuth record existed; `deleted` reports the mutation.
-    ProviderCredentialDeleted {
-        found: bool,
-        deleted: bool,
+    /// Exact receipt for a daemon-owned provider credential mutation.
+    ProviderCredentialCommitted {
+        client_operation_id: String,
+        provider_id: String,
+        project_root: Option<String>,
+        owner_root: Option<String>,
+        stored: bool,
+        changed: bool,
+        config_generation: u64,
+    },
+    CopilotAuthCommitted {
+        client_operation_id: String,
+        project_root: String,
+        owner_root: String,
+        provider_id: String,
+        config_generation: u64,
     },
     StartupDisclosures {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1189,13 +1207,14 @@ macro_rules! response_variants {
             (Response::McpOAuthStarted { .. }, "mcp_oauth_started");
             (Response::McpOAuthCompleted { .. }, "mcp_oauth_completed");
             (Response::McpOAuthCancelled { .. }, "mcp_oauth_cancelled");
-            (Response::McpConfigSaved { .. }, "mcp_config_saved");
+            (Response::McpConfigCommitted { .. }, "mcp_config_committed");
             (Response::ProviderCatalogSnapshot { .. }, "provider_catalog_snapshot");
             (Response::ProviderModelsFetched { .. }, "provider_models_fetched");
             (Response::ProviderUsageSnapshot { .. }, "provider_usage_snapshot");
             (Response::ProviderConfigUpserted { .. }, "provider_config_upserted");
             (Response::ProviderMutationCommitted { .. }, "provider_mutation_committed");
-            (Response::ProviderCredentialDeleted { .. }, "provider_credential_deleted");
+            (Response::ProviderCredentialCommitted { .. }, "provider_credential_committed");
+            (Response::CopilotAuthCommitted { .. }, "copilot_auth_committed");
             (Response::StartupDisclosures { .. }, "startup_disclosures");
             (Response::AppFlag { .. }, "app_flag");
             (Response::AppFlagSeen { .. }, "app_flag_seen");

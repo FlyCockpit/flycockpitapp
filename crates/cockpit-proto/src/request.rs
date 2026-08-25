@@ -1455,6 +1455,8 @@ pub enum Request {
     /// Store one provider credential record as canonical JSON in the daemon
     /// vault. The JSON string is intentionally opaque to the wire contract.
     PutProviderCredential {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         provider_id: String,
         #[serde(deserialize_with = "deserialize_owner_provider_record")]
@@ -1513,6 +1515,8 @@ pub enum Request {
 
     /// Remove one provider credential record from the daemon vault.
     DeleteProviderCredential {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         provider_id: String,
         /// When supplied, `provider_id` is a configured provider identifier.
@@ -1628,6 +1632,8 @@ pub enum Request {
     /// and persist them through the provider-config owner path.  The response
     /// is status-only; the credential never crosses the RPC boundary.
     SetupCopilotAuth {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
@@ -1650,6 +1656,8 @@ pub enum Request {
     /// secret changes. Secret values and cleanup names are JSON envelopes so
     /// the wire never exposes the core MCP implementation type.
     SaveMcpConfig {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
         #[serde(deserialize_with = "deserialize_owner_mcp_json")]
@@ -2496,9 +2504,11 @@ impl Request {
                 }
             }
             Self::PutProviderCredential {
+                client_operation_id,
                 provider_id,
                 record,
             } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 if provider_id.len() > MAX_OWNER_PROVIDER_ID_BYTES {
                     return Err("provider id exceeds maximum length".to_string());
                 }
@@ -2569,9 +2579,11 @@ impl Request {
                 }
             }
             Self::DeleteProviderCredential {
+                client_operation_id,
                 provider_id,
                 project_root,
             } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
                 if provider_id.starts_with(RESERVED_OWNER_PROVIDER_ID_PREFIX)
                     || provider_id == RESERVED_FLYCOCKPIT_PROVIDER_ID
@@ -2667,9 +2679,11 @@ impl Request {
                 .map_err(|error| error.to_string())?;
             }
             Self::SetupCopilotAuth {
+                client_operation_id,
                 project_root,
                 provider_id,
             } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
             }
@@ -2709,11 +2723,13 @@ impl Request {
                 }
             }
             Self::SaveMcpConfig {
+                client_operation_id,
                 project_root,
                 config_json,
                 secret_values_json,
                 cleanup_names_json,
             } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
                 for (label, value) in [
                     ("MCP config", config_json),
@@ -3467,7 +3483,7 @@ macro_rules! command {
             (Request::PutNamedSecret { name, value }, "put_named_secret", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|value:String", [name: String => param, value: String => param]);
             (Request::PutSubscriptionAck { provider_id }, "put_subscription_ack", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "provider_id:String", [provider_id: String => param]);
             (Request::DeleteNamedSecret { name }, "delete_named_secret", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String", [name: String => param]);
-            (Request::PutProviderCredential { provider_id, record }, "put_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "provider_id:String|record:String", [provider_id: String => param, record: String => param]);
+            (Request::PutProviderCredential { client_operation_id, provider_id, record }, "put_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|provider_id:String|record:String", [client_operation_id: String => param, provider_id: String => param, record: String => param]);
             // OAuth handshakes retain daemon-process PKCE/device state. They
             // cannot be safely replayed through a remote durable ledger after
             // reconnect/restart; only the final vault mutation is durable.
@@ -3485,7 +3501,7 @@ macro_rules! command {
             (Request::BeginMcpOAuth { project_root, server }, "begin_mcp_oauth", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String|server:String", [project_root: String => project_root, server: String => param]);
             (Request::CompleteMcpOAuth { flow_id, input }, "complete_mcp_oauth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "flow_id:String|input:Option<String>", [flow_id: String => param, input: Option<String> => param]);
             (Request::CancelMcpOAuth { flow_id }, "cancel_mcp_oauth", owner_only, none, true, local_only, none, serialized, none, "flow_id:String", [flow_id: String => param]);
-            (Request::DeleteProviderCredential { provider_id, project_root }, "delete_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "provider_id:String|project_root:Option<String>", [provider_id: String => param, project_root: Option<String> => param]);
+            (Request::DeleteProviderCredential { client_operation_id, provider_id, project_root }, "delete_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|provider_id:String|project_root:Option<String>", [client_operation_id: String => param, provider_id: String => param, project_root: Option<String> => param]);
             #[cfg(feature = "remote")]
             (Request::GetFlycockpitAccount, "get_flycockpit_account", owner_only, none, false, read_only, none, serialized, none, "-", []);
             (Request::GetProviderCatalogSnapshot { project_root, provider_id, snapshot_session_id }, "get_provider_catalog_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|provider_id:Option<String>|snapshot_session_id:String", [project_root: String => project_root, provider_id: Option<String> => param, snapshot_session_id: String => param]);
@@ -3494,12 +3510,12 @@ macro_rules! command {
             (Request::GetProviderUsageSnapshot { project_root, provider_id }, "get_provider_usage_snapshot", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String|provider_id:Option<String>", [project_root: String => project_root, provider_id: Option<String> => param]);
             (Request::UpsertProviderConfig { project_root, provider_id, entry }, "upsert_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param]);
             (Request::SaveProviderConfig { project_root, provider_id, entry, header_secrets }, "save_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<String>>", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param, header_secrets: Vec<Option<String>> => param]);
-            (Request::SetupCopilotAuth { project_root, provider_id }, "setup_copilot_auth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String", [project_root: String => project_root, provider_id: String => param]);
+            (Request::SetupCopilotAuth { client_operation_id, project_root, provider_id }, "setup_copilot_auth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|provider_id:String", [client_operation_id: String => param, project_root: String => project_root, provider_id: String => param]);
             (Request::ApplySetupWizard { project_root, wizard_id, answers_json }, "apply_setup_wizard", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|wizard_id:String|answers_json:String", [project_root: String => project_root, wizard_id: String => param, answers_json: String => param]);
             // Composite MCP publication is reserved in the remote ledger
             // before dispatch. The daemon's journal + staged vault commit
             // makes the nonrepeatable outcome replay-safe.
-            (Request::SaveMcpConfig { project_root, config_json, secret_values_json, cleanup_names_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|config_json:String|secret_values_json:String|cleanup_names_json:String", [project_root: String => project_root, config_json: String => param, secret_values_json: String => param, cleanup_names_json: String => param]);
+            (Request::SaveMcpConfig { client_operation_id, project_root, config_json, secret_values_json, cleanup_names_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|config_json:String|secret_values_json:String|cleanup_names_json:String", [client_operation_id: String => param, project_root: String => project_root, config_json: String => param, secret_values_json: String => param, cleanup_names_json: String => param]);
             (Request::GetAgentInventory { project_root }, "get_agent_inventory", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAgentEditSnapshot { project_root, name }, "get_agent_edit_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|name:String", [project_root: String => project_root, name: String => param]);
             (Request::MutateAgent { project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [project_root: String => project_root, mutation: crate::AgentMutation => param, expected_revision: Option<String> => param]);

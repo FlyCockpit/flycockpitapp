@@ -7246,11 +7246,13 @@ async fn handle_serialized_request_impl(
         }
 
         Request::PutProviderCredential {
+            client_operation_id,
             provider_id,
             record,
         } => {
             #[cfg(feature = "remote")]
             let request = Request::PutProviderCredential {
+                client_operation_id: client_operation_id.clone(),
                 provider_id: provider_id.clone(),
                 record: record.clone(),
             };
@@ -7274,6 +7276,15 @@ async fn handle_serialized_request_impl(
                 bad_request("provider credential record is not valid JSON")
             })?;
             let record_bytes = serde_json::to_vec(&record_value).map_err(internal)?;
+            let receipt = Response::ProviderCredentialCommitted {
+                client_operation_id,
+                provider_id: provider_id.clone(),
+                project_root: None,
+                owner_root: None,
+                stored: true,
+                changed: true,
+                config_generation: inventory::current_config_generation(),
+            };
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             #[cfg(feature = "remote")]
             {
@@ -7286,7 +7297,7 @@ async fn handle_serialized_request_impl(
                             &provider_id,
                             Some(&record_bytes),
                             "put_provider_credential",
-                            Response::Ack,
+                            receipt,
                             None,
                         )
                         .await
@@ -7298,7 +7309,7 @@ async fn handle_serialized_request_impl(
                             Some(&record_bytes),
                         )
                         .map_err(internal)?;
-                        Ok(Response::Ack)
+                        Ok(receipt)
                     }
                 }
             }
@@ -7310,7 +7321,7 @@ async fn handle_serialized_request_impl(
                     Some(&record_bytes),
                 )
                 .map_err(internal)?;
-                Ok(Response::Ack)
+                Ok(receipt)
             }
         }
 
@@ -7667,11 +7678,13 @@ async fn handle_serialized_request_impl(
         }
 
         Request::DeleteProviderCredential {
+            client_operation_id,
             provider_id,
             project_root,
         } => {
             #[cfg(feature = "remote")]
             let request = Request::DeleteProviderCredential {
+                client_operation_id: client_operation_id.clone(),
                 provider_id: provider_id.clone(),
                 project_root: project_root.clone(),
             };
@@ -7699,7 +7712,10 @@ async fn handle_serialized_request_impl(
             // direct (`project_root: None`) path is the owner-settings mirror
             // of `PutProviderCredential`: the owner supplies the raw vault
             // record id and receives a plain `Ack`.
-            let (credential_record_id, response) = if let Some(project_root) =
+            let canonical_project_root = project_root
+                .as_deref()
+                .map(crate::secret_ownership::canonical_owner_root);
+            let (credential_record_id, changed) = if let Some(project_root) =
                 project_root.as_deref()
             {
                 let (_, _, config) = daemon_provider_config(ctx, project_root).await?;
@@ -7721,15 +7737,25 @@ async fn handle_serialized_request_impl(
                         &credential_record_id,
                     )
                     .is_ok();
-                (
-                    credential_record_id,
-                    Response::ProviderCredentialDeleted {
-                        found: credential_present,
-                        deleted: credential_present,
-                    },
-                )
+                (credential_record_id, credential_present)
             } else {
-                (provider_id.clone(), Response::Ack)
+                let credential_present = ctx
+                    .secret_vault
+                    .get_item(
+                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                        &provider_id,
+                    )
+                    .is_ok();
+                (provider_id.clone(), credential_present)
+            };
+            let response = Response::ProviderCredentialCommitted {
+                client_operation_id,
+                provider_id,
+                project_root,
+                owner_root: canonical_project_root,
+                stored: false,
+                changed,
+                config_generation: inventory::current_config_generation(),
             };
             #[cfg(feature = "remote")]
             {
@@ -7982,6 +8008,7 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SetupCopilotAuth {
+            client_operation_id,
             project_root,
             provider_id,
         } => {
@@ -7992,6 +8019,7 @@ async fn handle_serialized_request_impl(
             }
             #[cfg(feature = "remote")]
             let request = Request::SetupCopilotAuth {
+                client_operation_id: client_operation_id.clone(),
                 project_root: project_root.clone(),
                 provider_id: provider_id.clone(),
             };
@@ -8021,7 +8049,13 @@ async fn handle_serialized_request_impl(
                 is_local_owner,
             )
             .await;
-            let operation_result = operation_result.map(|_| Response::Ack);
+            let operation_result = operation_result.map(|_| Response::CopilotAuthCommitted {
+                client_operation_id,
+                owner_root: crate::secret_ownership::canonical_owner_root(&project_root),
+                project_root,
+                provider_id,
+                config_generation: inventory::current_config_generation(),
+            });
             finish_provider_mutation_future!(remote_operation, ctx, "setup_copilot_auth", async {
                 operation_result
             })
@@ -8064,6 +8098,7 @@ async fn handle_serialized_request_impl(
         }
 
         Request::SaveMcpConfig {
+            client_operation_id,
             project_root,
             config_json,
             secret_values_json,
@@ -8076,6 +8111,7 @@ async fn handle_serialized_request_impl(
             }
             #[cfg(feature = "remote")]
             let request = Request::SaveMcpConfig {
+                client_operation_id: client_operation_id.clone(),
                 project_root: project_root.clone(),
                 config_json: config_json.clone(),
                 secret_values_json: secret_values_json.clone(),
@@ -8091,6 +8127,7 @@ async fn handle_serialized_request_impl(
             }
             let operation_result = save_mcp_config(
                 ctx,
+                &client_operation_id,
                 &project_root,
                 &config_json,
                 &secret_values_json,
@@ -10232,6 +10269,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
         Request::PutProviderCredential {
             provider_id,
             record,
+            ..
         } => {
             if provider_id.trim().is_empty() {
                 Some("provider id must not be empty")
@@ -12448,12 +12486,14 @@ async fn provider_config_save_under_lock(
 /// cleanup of refs made stale by delete/rename edits.
 async fn save_mcp_config(
     ctx: &DaemonContext,
+    client_operation_id: &str,
     project_root: &str,
     config_json: &str,
     secret_values_json: &str,
     _cleanup_names_json: &str,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+    let requested_project_root = project_root.to_owned();
     // Canonicalize the workspace root once at this daemon boundary so every
     // ownership claim/guard/journal below (and later resolution) keys on the
     // same symlink-resolved form. The CLI (`cockpit mcp add`) sends a raw cwd;
@@ -12513,6 +12553,9 @@ async fn save_mcp_config(
         .iter()
         .flat_map(|(server_name, server)| mcp_secret_references(server_name, server))
         .collect::<std::collections::BTreeSet<_>>();
+    use sha2::Digest as _;
+    let prior_json = serde_json::to_string(&prior_config).map_err(internal)?;
+    let consumed_revision = crate::intel::hex_lower(&Sha256::digest(prior_json.as_bytes()));
     let journal_id = Uuid::now_v7().to_string();
     let cleanup_json = serde_json::to_string(&prior_references).map_err(internal)?;
     let config_json_owned = serde_json::to_string(&config).map_err(internal)?;
@@ -12682,7 +12725,15 @@ async fn save_mcp_config(
         .iter()
         .flat_map(|(name, server)| mcp_secret_references(name, server))
         .count();
-    Ok(Response::McpConfigSaved {
+    let result_revision = crate::intel::hex_lower(&Sha256::digest(config_json_owned.as_bytes()));
+    Ok(Response::McpConfigCommitted {
+        client_operation_id: client_operation_id.to_owned(),
+        project_root: requested_project_root,
+        owner_root: project_root.to_owned(),
+        config_path: path.to_string_lossy().into_owned(),
+        consumed_revision,
+        result_revision,
+        config_generation: inventory::publish_committed_config_generation(),
         credential_count: u32::try_from(credential_count).unwrap_or(u32::MAX),
     })
 }

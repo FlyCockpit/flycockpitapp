@@ -338,19 +338,25 @@ impl SettingsCx {
         let secret_values_json = serde_json::to_string(secret_values).map_err(|e| e.to_string())?;
         let cleanup_names_json = serde_json::to_string(cleanup_names).map_err(|e| e.to_string())?;
         let owner = project_root.display().to_string();
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
         self.queue_simple_secret_mutation(
             super::SettingsEffectTarget {
                 surface: "settings.mcp-save",
                 owner: owner.clone(),
-                revision: Some(uuid::Uuid::new_v4().to_string()),
+                revision: Some(client_operation_id.clone()),
             },
             super::SettingsDaemonEffectWork::McpConfigSave {
-                project_root: owner,
+                client_operation_id: client_operation_id.clone(),
+                project_root: owner.clone(),
                 config_json,
                 secret_values_json: super::SecretPayload::new(secret_values_json),
                 cleanup_names_json,
             },
-            super::SettingsMutationAction::McpSave(cfg.clone()),
+            super::SettingsMutationAction::McpSave {
+                config: cfg.clone(),
+                client_operation_id,
+                project_root: owner,
+            },
         );
         self.extended_warnings = vec!["saving MCP settings…".into()];
         Ok(super::SettingsSaveOutcome::Queued)
@@ -1639,7 +1645,7 @@ mod tests {
         assert!(!production.contains("Request::SaveMcpConfig"));
         assert!(production.contains("self.mcp_config.clone()"));
         assert!(!production.contains("read_to_string"));
-        assert!(production.contains("Response::McpConfigSaved"));
+        assert!(production.contains("Response::McpConfigCommitted"));
         assert!(!production.contains("Response::Ack"));
         assert!(!production.contains("write_private"));
         assert!(!production.contains("CredentialStore"));

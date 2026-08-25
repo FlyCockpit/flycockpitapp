@@ -2880,8 +2880,13 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "provider_id:string|record:string",
+      "fcorCanonicalSchema": "client_operation_id:string|provider_id:string|record:string",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "provider_id",
           "role": "param",
@@ -2893,7 +2898,7 @@
           "type": "String"
         }
       ],
-      "fcorSchema": "provider_id:String|record:String",
+      "fcorSchema": "client_operation_id:String|provider_id:String|record:String",
       "strategy": "nonrepeatable_dispatch",
       "tag": "put_provider_credential"
     },
@@ -3005,8 +3010,13 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "provider_id:string|project_root:option<string>",
+      "fcorCanonicalSchema": "client_operation_id:string|provider_id:string|project_root:option<string>",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "provider_id",
           "role": "param",
@@ -3018,7 +3028,7 @@
           "type": "Option<String>"
         }
       ],
-      "fcorSchema": "provider_id:String|project_root:Option<String>",
+      "fcorSchema": "client_operation_id:String|provider_id:String|project_root:Option<String>",
       "strategy": "nonrepeatable_dispatch",
       "tag": "delete_provider_credential"
     },
@@ -3169,8 +3179,13 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "project_root:string|provider_id:string",
+      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|provider_id:string",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "project_root",
           "role": "project_root",
@@ -3182,7 +3197,7 @@
           "type": "String"
         }
       ],
-      "fcorSchema": "project_root:String|provider_id:String",
+      "fcorSchema": "client_operation_id:String|project_root:String|provider_id:String",
       "strategy": "nonrepeatable_dispatch",
       "tag": "setup_copilot_auth"
     },
@@ -3214,8 +3229,13 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "project_root:string|config_json:string|secret_values_json:string|cleanup_names_json:string",
+      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|config_json:string|secret_values_json:string|cleanup_names_json:string",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "project_root",
           "role": "project_root",
@@ -3237,7 +3257,7 @@
           "type": "String"
         }
       ],
-      "fcorSchema": "project_root:String|config_json:String|secret_values_json:String|cleanup_names_json:String",
+      "fcorSchema": "client_operation_id:String|project_root:String|config_json:String|secret_values_json:String|cleanup_names_json:String",
       "strategy": "nonrepeatable_dispatch",
       "tag": "save_mcp_config"
     },

@@ -2501,13 +2501,19 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "provider_credential_deleted"
+        "tag": "provider_credential_committed"
       },
       {
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "mcp_config_saved"
+        "tag": "mcp_config_committed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "copilot_auth_committed"
       },
       {
         "class": "bounded_request_response",

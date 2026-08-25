@@ -255,6 +255,7 @@ pub(crate) fn execute_settings_blocking_work(
 pub(crate) enum SettingsDaemonEffectWork {
     Request(Request),
     ProviderCredentialPut {
+        client_operation_id: String,
         provider_id: String,
         record: SecretPayload,
     },
@@ -263,6 +264,7 @@ pub(crate) enum SettingsDaemonEffectWork {
         input: SecretPayload,
     },
     McpConfigSave {
+        client_operation_id: String,
         project_root: String,
         config_json: String,
         secret_values_json: SecretPayload,
@@ -395,11 +397,13 @@ pub(crate) async fn execute_settings_daemon_work(
             committed_refresh_needed: None,
         }),
         SettingsDaemonEffectWork::ProviderCredentialPut {
+            client_operation_id,
             provider_id,
             record,
         } => Ok(SettingsDaemonWorkOutcome {
             response: client
                 .request(Request::PutProviderCredential {
+                    client_operation_id,
                     provider_id,
                     record: record.take(),
                 })
@@ -422,6 +426,7 @@ pub(crate) async fn execute_settings_daemon_work(
             })
         }
         SettingsDaemonEffectWork::McpConfigSave {
+            client_operation_id,
             project_root,
             config_json,
             secret_values_json,
@@ -429,6 +434,7 @@ pub(crate) async fn execute_settings_daemon_work(
         } => Ok(SettingsDaemonWorkOutcome {
             response: client
                 .request(Request::SaveMcpConfig {
+                    client_operation_id,
                     project_root,
                     config_json,
                     secret_values_json: secret_values_json.take(),
@@ -1010,14 +1016,40 @@ enum TypedDocumentEditAction {
 }
 
 enum SettingsMutationAction {
-    McpSave(cockpit_core::mcp::config::McpConfig),
-    McpOAuthBegin { server: String },
-    McpOAuthComplete { server: String, flow_id: String },
-    McpOAuthCancel { server: String, flow_id: String },
-    ProviderCredentialDelete { provider_id: String },
-    ProviderCredentialPut { provider_id: String },
-    WebCredentialPut { provider_id: String },
-    CopilotSetup { provider_id: String },
+    McpSave {
+        config: cockpit_core::mcp::config::McpConfig,
+        client_operation_id: String,
+        project_root: String,
+    },
+    McpOAuthBegin {
+        server: String,
+    },
+    McpOAuthComplete {
+        server: String,
+        flow_id: String,
+    },
+    McpOAuthCancel {
+        server: String,
+        flow_id: String,
+    },
+    ProviderCredentialDelete {
+        provider_id: String,
+        client_operation_id: String,
+        project_root: String,
+    },
+    ProviderCredentialPut {
+        provider_id: String,
+        client_operation_id: String,
+    },
+    WebCredentialPut {
+        provider_id: String,
+        client_operation_id: String,
+    },
+    CopilotSetup {
+        provider_id: String,
+        client_operation_id: String,
+        project_root: String,
+    },
 }
 
 enum CompletedProviderAuthMutation {
@@ -2852,9 +2884,27 @@ impl SettingsCx {
                 }
                 let result = match (action, completion.response) {
                     (
-                        SettingsMutationAction::McpSave(config),
-                        Ok(Response::McpConfigSaved { .. }),
-                    ) => {
+                        SettingsMutationAction::McpSave {
+                            config,
+                            client_operation_id,
+                            project_root,
+                        },
+                        Ok(Response::McpConfigCommitted {
+                            client_operation_id: returned_operation_id,
+                            project_root: returned_root,
+                            owner_root,
+                            config_path,
+                            consumed_revision,
+                            result_revision,
+                            ..
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && returned_root == project_root
+                        && !owner_root.trim().is_empty()
+                        && !config_path.trim().is_empty()
+                        && cockpit_proto::is_opaque_authority_token(&consumed_revision)
+                        && cockpit_proto::is_opaque_authority_token(&result_revision) =>
+                    {
                         self.mcp_config = config;
                         self.invalidate_secret_inventory();
                         if let Some((name, edited)) = self.pending_mcp_navigation.take() {
@@ -2896,9 +2946,24 @@ impl SettingsCx {
                         Ok("MCP OAuth cancelled".to_string())
                     }
                     (
-                        SettingsMutationAction::ProviderCredentialDelete { provider_id },
-                        Ok(Response::ProviderCredentialDeleted { .. }),
-                    ) => {
+                        SettingsMutationAction::ProviderCredentialDelete {
+                            provider_id,
+                            client_operation_id,
+                            project_root,
+                        },
+                        Ok(Response::ProviderCredentialCommitted {
+                            client_operation_id: returned_operation_id,
+                            provider_id: returned_provider_id,
+                            project_root: Some(returned_root),
+                            owner_root: Some(owner_root),
+                            stored: false,
+                            ..
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && returned_provider_id == provider_id
+                        && returned_root == project_root
+                        && !owner_root.trim().is_empty() =>
+                    {
                         self.invalidate_secret_inventory_entry(&provider_id, None);
                         self.completed_provider_auth =
                             Some(CompletedProviderAuthMutation::Logout {
@@ -2908,9 +2973,21 @@ impl SettingsCx {
                         Ok(format!("signed out of {provider_id}"))
                     }
                     (
-                        SettingsMutationAction::ProviderCredentialPut { provider_id },
-                        Ok(Response::Ack),
-                    ) => {
+                        SettingsMutationAction::ProviderCredentialPut {
+                            provider_id,
+                            client_operation_id,
+                        },
+                        Ok(Response::ProviderCredentialCommitted {
+                            client_operation_id: returned_operation_id,
+                            provider_id: returned_provider_id,
+                            project_root: None,
+                            owner_root: None,
+                            stored: true,
+                            ..
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && returned_provider_id == provider_id =>
+                    {
                         self.invalidate_secret_inventory_entry(
                             &provider_id,
                             Some(
@@ -2920,9 +2997,21 @@ impl SettingsCx {
                         Ok(format!("stored credential for {provider_id}"))
                     }
                     (
-                        SettingsMutationAction::WebCredentialPut { provider_id },
-                        Ok(Response::Ack),
-                    ) => {
+                        SettingsMutationAction::WebCredentialPut {
+                            provider_id,
+                            client_operation_id,
+                        },
+                        Ok(Response::ProviderCredentialCommitted {
+                            client_operation_id: returned_operation_id,
+                            provider_id: returned_provider_id,
+                            project_root: None,
+                            owner_root: None,
+                            stored: true,
+                            ..
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && returned_provider_id == provider_id =>
+                    {
                         self.invalidate_secret_inventory_entry(
                             &provider_id,
                             Some(
@@ -2932,16 +3021,33 @@ impl SettingsCx {
                         self.completed_web_credential = Some((provider_id.clone(), Ok(())));
                         Ok(format!("stored credential for {provider_id}"))
                     }
-                    (SettingsMutationAction::WebCredentialPut { provider_id }, Ok(other)) => {
+                    (SettingsMutationAction::WebCredentialPut { provider_id, .. }, Ok(other)) => {
                         let error = format!("unexpected web credential response: {other:?}");
                         self.completed_web_credential = Some((provider_id, Err(error.clone())));
                         Err(error)
                     }
-                    (SettingsMutationAction::WebCredentialPut { provider_id }, Err(error)) => {
+                    (SettingsMutationAction::WebCredentialPut { provider_id, .. }, Err(error)) => {
                         self.completed_web_credential = Some((provider_id, Err(error.clone())));
                         Err(error)
                     }
-                    (SettingsMutationAction::CopilotSetup { provider_id }, Ok(Response::Ack)) => {
+                    (
+                        SettingsMutationAction::CopilotSetup {
+                            provider_id,
+                            client_operation_id,
+                            project_root,
+                        },
+                        Ok(Response::CopilotAuthCommitted {
+                            client_operation_id: returned_operation_id,
+                            project_root: returned_root,
+                            owner_root,
+                            provider_id: returned_provider_id,
+                            ..
+                        }),
+                    ) if returned_operation_id == client_operation_id
+                        && returned_provider_id == provider_id
+                        && returned_root == project_root
+                        && !owner_root.trim().is_empty() =>
+                    {
                         self.invalidate_secret_inventory_entry(&provider_id, None);
                         self.completed_provider_auth =
                             Some(CompletedProviderAuthMutation::Copilot {
@@ -2950,7 +3056,10 @@ impl SettingsCx {
                             });
                         Ok("Copilot token configured in the daemon vault".to_string())
                     }
-                    (SettingsMutationAction::ProviderCredentialDelete { provider_id }, result) => {
+                    (
+                        SettingsMutationAction::ProviderCredentialDelete { provider_id, .. },
+                        result,
+                    ) => {
                         let error = match result {
                             Ok(other) => format!("unexpected provider logout response: {other:?}"),
                             Err(error) => error,
@@ -2962,7 +3071,7 @@ impl SettingsCx {
                             });
                         Err(error)
                     }
-                    (SettingsMutationAction::CopilotSetup { provider_id }, result) => {
+                    (SettingsMutationAction::CopilotSetup { provider_id, .. }, result) => {
                         let error = match result {
                             Ok(other) => format!("unexpected Copilot setup response: {other:?}"),
                             Err(error) => error,
@@ -2974,7 +3083,7 @@ impl SettingsCx {
                             });
                         Err(error)
                     }
-                    (SettingsMutationAction::McpSave(_), Ok(other)) => {
+                    (SettingsMutationAction::McpSave { .. }, Ok(other)) => {
                         let error = format!("unexpected MCP settings response: {other:?}");
                         if let Some((name, edited)) = self.pending_mcp_navigation.take() {
                             self.completed_mcp_navigation =
@@ -2982,7 +3091,7 @@ impl SettingsCx {
                         }
                         Err(error)
                     }
-                    (SettingsMutationAction::McpSave(_), Err(error)) => {
+                    (SettingsMutationAction::McpSave { .. }, Err(error)) => {
                         if let Some((name, edited)) = self.pending_mcp_navigation.take() {
                             self.completed_mcp_navigation =
                                 Some((name, edited, Err(error.clone())));
@@ -3021,8 +3130,9 @@ impl SettingsCx {
                         config_generation,
                     }) => {
                         let reconciled = layers
-                            .into_iter()
-                            .find(|layer| layer.display_path == requested_path);
+                            .iter()
+                            .find(|layer| layer.display_path == requested_path)
+                            .cloned();
                         match (action, reconciled) {
                             (TypedDocumentEditAction::Scaffold, Some(layer)) => {
                                 match decode_extended_layer(layer, config_generation) {
@@ -3040,9 +3150,46 @@ impl SettingsCx {
                                     }
                                 }
                             }
-                            (TypedDocumentEditAction::RemoveProjectShadow(prompt), Some(_)) => {
-                                self.completed_shadow_removal = Some(prompt);
-                                self.extended_warnings = vec!["project override removed".into()];
+                            (
+                                TypedDocumentEditAction::RemoveProjectShadow(prompt),
+                                Some(project_layer),
+                            ) => {
+                                let project_authored =
+                                    project_layer.authored_paths.iter().any(|authored| {
+                                        authored
+                                            .iter()
+                                            .map(String::as_str)
+                                            .eq(prompt.path.iter().copied())
+                                    });
+                                let source = layers.iter().find(|layer| {
+                                    layer.display_path == prompt.source_config.display().to_string()
+                                });
+                                let source_matches = source.is_some_and(|layer| {
+                                    let value = serde_json::to_value(&layer.config).ok();
+                                    let effective = value.as_ref().and_then(|document| {
+                                        prompt.path.iter().try_fold(document, |value, segment| {
+                                            value.get(*segment)
+                                        })
+                                    });
+                                    !project_authored
+                                        && layer.authored_paths.iter().any(|authored| {
+                                            authored
+                                                .iter()
+                                                .map(String::as_str)
+                                                .eq(prompt.path.iter().copied())
+                                        })
+                                        && effective == Some(&prompt.expected_effective_value)
+                                });
+                                if source_matches {
+                                    self.completed_shadow_removal = Some(prompt);
+                                    self.extended_warnings =
+                                        vec!["project override removed".into()];
+                                } else {
+                                    self.extended_revision = None;
+                                    self.extended_warnings = vec![
+                                        "project override commit returned an unreconciled effective value; reload before editing again".into(),
+                                    ];
+                                }
                             }
                             (_, None) => {
                                 self.extended_warnings = vec![

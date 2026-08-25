@@ -124,6 +124,8 @@ const OAUTH_FLOW_OWNER_CAPACITY: usize = 8;
 struct StoredProviderOAuthFlow {
     owner: String,
     begin_client_operation_id: String,
+    authorize_url: String,
+    user_code: Option<String>,
     created_at: Instant,
     flow: ProviderOAuthFlow,
 }
@@ -131,6 +133,7 @@ struct StoredProviderOAuthFlow {
 struct StoredMcpOAuthFlow {
     owner: String,
     begin_client_operation_id: String,
+    authorize_url: String,
     created_at: Instant,
     flow: McpOAuthFlow,
 }
@@ -201,6 +204,8 @@ impl OAuthFlowStore {
         id: String,
         owner: String,
         begin_client_operation_id: String,
+        authorize_url: String,
+        user_code: Option<String>,
         flow: ProviderOAuthFlow,
     ) {
         let mut flows = self.provider.lock().await;
@@ -221,10 +226,31 @@ impl OAuthFlowStore {
             StoredProviderOAuthFlow {
                 owner,
                 begin_client_operation_id,
+                authorize_url,
+                user_code,
                 created_at: Instant::now(),
                 flow,
             },
         );
+    }
+
+    async fn provider_started(
+        &self,
+        owner: &str,
+        begin_id: &str,
+    ) -> Option<(String, String, Option<String>)> {
+        let mut flows = self.provider.lock().await;
+        Self::purge_provider(&mut flows);
+        flows
+            .iter()
+            .find(|(_, flow)| flow.owner == owner && flow.begin_client_operation_id == begin_id)
+            .map(|(id, flow)| {
+                (
+                    id.clone(),
+                    flow.authorize_url.clone(),
+                    flow.user_code.clone(),
+                )
+            })
     }
 
     async fn claim_provider(
@@ -299,6 +325,7 @@ impl OAuthFlowStore {
         id: String,
         owner: String,
         begin_client_operation_id: String,
+        authorize_url: String,
         flow: McpOAuthPending,
     ) {
         let mut flows = self.mcp.lock().await;
@@ -319,10 +346,20 @@ impl OAuthFlowStore {
             StoredMcpOAuthFlow {
                 owner,
                 begin_client_operation_id,
+                authorize_url,
                 created_at: Instant::now(),
                 flow: McpOAuthFlow::Ready(flow),
             },
         );
+    }
+
+    async fn mcp_started(&self, owner: &str, begin_id: &str) -> Option<(String, String)> {
+        let mut flows = self.mcp.lock().await;
+        Self::purge_mcp(&mut flows);
+        flows
+            .iter()
+            .find(|(_, flow)| flow.owner == owner && flow.begin_client_operation_id == begin_id)
+            .map(|(id, flow)| (id.clone(), flow.authorize_url.clone()))
     }
 
     async fn claim_mcp(
@@ -452,6 +489,8 @@ mod oauth_store_tests {
                     format!("flow-{index}"),
                     "owner-a".to_string(),
                     format!("begin-{index}"),
+                    "https://example.test".into(),
+                    None,
                     ProviderOAuthFlow::Completing {
                         cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     },
@@ -489,6 +528,8 @@ mod oauth_store_tests {
                 "flow".into(),
                 "owner".into(),
                 "begin".into(),
+                "https://example.test".into(),
+                None,
                 ProviderOAuthFlow::Completing {
                     cancelled: cancelled.clone(),
                 },
@@ -7561,6 +7602,22 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
+            if let Some((flow_id, authorize_url, user_code)) = ctx
+                .oauth_flows
+                .provider_started(&owner, &client_operation_id)
+                .await
+            {
+                let response = Response::ProviderOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    flow_id,
+                    authorize_url,
+                    user_code,
+                };
+                finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
+                    .await?;
+                return Ok(response);
+            }
             let flow_id = uuid::Uuid::new_v4().to_string();
             let (flow, authorize_url, user_code) = match provider_id.as_str() {
                 crate::auth::xai_oauth::CREDENTIAL_KEY => {
@@ -7593,6 +7650,8 @@ async fn handle_serialized_request_impl(
                     flow_id.clone(),
                     owner.clone(),
                     client_operation_id.clone(),
+                    authorize_url.clone(),
+                    user_code.clone(),
                     flow,
                 )
                 .await;
@@ -7800,6 +7859,21 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
+            if let Some((flow_id, authorize_url)) = ctx
+                .oauth_flows
+                .mcp_started(&owner, &client_operation_id)
+                .await
+            {
+                let response = Response::McpOAuthStarted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    flow_id,
+                    authorize_url,
+                };
+                finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
+                    .await?;
+                return Ok(response);
+            }
             let cwd = std::path::PathBuf::from(&project_root);
             let trust_policy =
                 crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
@@ -7843,6 +7917,7 @@ async fn handle_serialized_request_impl(
                     flow_id.clone(),
                     owner.clone(),
                     client_operation_id.clone(),
+                    authorize_url.clone(),
                     McpOAuthPending {
                         project_root,
                         server,

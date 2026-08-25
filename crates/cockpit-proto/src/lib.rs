@@ -3653,6 +3653,18 @@ mod proto_fixture_tests {
             ("response", "response.json", response_variant_tags()),
             ("event", "event.json", event_variant_tags()),
         ] {
+            let expected = if matches!(
+                request.wire_tag(),
+                "begin_provider_oauth"
+                    | "complete_provider_oauth"
+                    | "begin_mcp_oauth"
+                    | "complete_mcp_oauth"
+                    | "cancel_mcp_oauth"
+            ) {
+                17
+            } else {
+                10
+            };
             assert_eq!(
                 tags.iter().filter(|tag| **tag == UNKNOWN_SENTINEL).count(),
                 1,
@@ -6659,7 +6671,7 @@ mod tests {
     }
 
     #[test]
-    fn every_new_oauth_and_durable_save_surface_requires_v10() {
+    fn oauth_receipts_require_v17_while_older_durable_surfaces_keep_v10() {
         for request in [
             Request::BeginProviderOAuth {
                 client_operation_id: "begin-provider".into(),
@@ -6698,7 +6710,7 @@ mod tests {
                     request,
                 })
                 .0,
-                10
+                expected
             );
         }
         for response in [
@@ -6715,6 +6727,12 @@ mod tests {
                 flow_id: "flow".into(),
                 logged_in: true,
                 retry_after_seconds: None,
+            },
+            Response::ProviderOAuthCancelled {
+                client_operation_id: "cancel-provider".into(),
+                request_hash: "00".repeat(32),
+                flow_id: Some("flow".into()),
+                cancelled: true,
             },
             Response::McpOAuthStarted {
                 client_operation_id: "begin-mcp".into(),
@@ -6742,13 +6760,26 @@ mod tests {
                 deleted: true,
             },
         ] {
+            let expected = if matches!(
+                response.wire_tag(),
+                "provider_oauth_started"
+                    | "provider_oauth_completed"
+                    | "provider_oauth_cancelled"
+                    | "mcp_oauth_started"
+                    | "mcp_oauth_completed"
+                    | "mcp_oauth_cancelled"
+            ) {
+                17
+            } else {
+                10
+            };
             assert_eq!(
                 body_required_protocol_version(&Body::Response {
                     id: Uuid::nil(),
                     response: Box::new(response),
                 })
                 .0,
-                10
+                expected
             );
         }
     }

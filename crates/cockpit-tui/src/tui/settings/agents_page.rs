@@ -1282,6 +1282,7 @@ impl AgentsPage {
                                 cwd,
                                 mutation,
                                 expected_revision,
+                                expected_config_generation,
                                 purpose,
                                 querying,
                             }));

@@ -286,6 +286,10 @@ pub enum AsyncActionPayload {
 #[derive(Debug, Clone)]
 pub enum OAuthAsyncResult {
     Failed(String),
+    /// The daemon may have committed the exact operation, but its terminal
+    /// receipt was not observable within the bounded settlement query. The
+    /// owning flow must stay fenced and retry the same daemon operation.
+    SettlementUnknown(String),
     Acknowledged,
     Began {
         flow_id: String,

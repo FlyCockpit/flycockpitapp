@@ -4931,6 +4931,20 @@ impl Dialog {
         }
     }
 
+    pub(crate) fn apply_oauth_settlement_unknown(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        error: String,
+    ) {
+        if let Some(s) = self.state.as_mut()
+            && let Some(s) = s.downcast_mut::<SettingsDialog>()
+        {
+            s.apply_oauth_settlement_unknown(provider, client_flow_id, operation_id, error);
+        }
+    }
+
     pub(crate) fn apply_oauth_acknowledgement(
         &mut self,
         provider: OAuthProvider,
@@ -5840,6 +5854,21 @@ impl SettingsDialog {
         };
         if state.accepts_result(client_flow_id, operation_id) {
             state.apply_cancel(result);
+        }
+    }
+
+    fn apply_oauth_settlement_unknown(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        error: String,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if state.accepts_result(client_flow_id, operation_id) {
+            state.apply_settlement_unknown(error);
         }
     }
 

@@ -12,20 +12,44 @@ async fn oauth_settlement(
 ) -> anyhow::Result<
     Result<cockpit_core::daemon::proto::Response, cockpit_core::daemon::proto::ErrorPayload>,
 > {
-    tokio::time::timeout(
-        OAUTH_SETTLEMENT_TIMEOUT,
-        client.request(
-            cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
-                client_operation_id,
-            },
-        ),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "OAuth settlement query timed out; the exact operation remains unsettled and must be retried"
+    const ATTEMPTS: usize = 3;
+    for attempt in 0..ATTEMPTS {
+        let response = tokio::time::timeout(
+            OAUTH_SETTLEMENT_TIMEOUT,
+            client.request(
+                cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                    client_operation_id: client_operation_id.clone(),
+                },
+            ),
         )
-    })?
+        .await;
+        if let Ok(result) = response {
+            if !matches!(
+                result,
+                Ok(
+                    cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+                        pending: true,
+                        ..
+                    }
+                )
+            ) || attempt + 1 == ATTEMPTS
+            {
+                return result;
+            }
+        } else if attempt + 1 == ATTEMPTS {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Err(anyhow::anyhow!(
+        "OAuth settlement query timed out; the exact operation remains unsettled and must be retried"
+    ))
+}
+
+fn oauth_settlement_unknown(
+    error: impl std::fmt::Display,
+) -> crate::tui::async_action::OAuthAsyncResult {
+    crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error.to_string())
 }
 
 fn oauth_payload(
@@ -42,10 +66,12 @@ fn oauth_payload(
 
 fn oauth_operation_id(
     client_flow_id: crate::tui::settings::pointer_actions::OAuthFlowId,
-    operation_id: crate::tui::settings::shell::PointerOperationId,
     kind: &str,
 ) -> String {
-    format!("tui-oauth-{}-{}-{kind}", client_flow_id.0, operation_id.0)
+    // UI pointer-operation IDs change when a user retries. The durable daemon
+    // key deliberately does not: an ambiguous operation must be queried or
+    // replayed with the exact same idempotency identity.
+    format!("tui-oauth-{}-{kind}", client_flow_id.0)
 }
 
 fn oauth_begin_operation_id(
@@ -72,9 +98,10 @@ async fn begin_provider_oauth(
     .await;
     let response = match response {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) | Err(_) => oauth_settlement(&client, client_operation_id.clone())
-            .await
-            .map_err(|error| error.to_string())?,
+        Ok(Err(_)) | Err(_) => match oauth_settlement(&client, client_operation_id.clone()).await {
+            Ok(response) => response,
+            Err(error) => return Ok(oauth_settlement_unknown(error)),
+        },
     };
     match response.map_err(|e| e.to_string())? {
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
@@ -110,6 +137,13 @@ async fn begin_provider_oauth(
                 user_code,
             })
         }
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            pending: true,
+            ..
+        }) if settlement_operation_id == client_operation_id => Ok(oauth_settlement_unknown(
+            "OAuth begin is still pending; retrying must use the same operation",
+        )),
         Ok(other) => Err(format!(
             "unexpected provider OAuth begin response: {other:?}"
         )),
@@ -135,9 +169,10 @@ async fn complete_provider_oauth(
     let response = tokio::time::timeout(OAUTH_COMPLETE_TIMEOUT, client.request(request)).await;
     let response = match response {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) | Err(_) => oauth_settlement(&client, client_operation_id.clone())
-            .await
-            .map_err(|error| error.to_string())?,
+        Ok(Err(_)) | Err(_) => match oauth_settlement(&client, client_operation_id.clone()).await {
+            Ok(response) => response,
+            Err(error) => return Ok(oauth_settlement_unknown(error)),
+        },
     };
     match response.map_err(|e| e.to_string())? {
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
@@ -171,6 +206,13 @@ async fn complete_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
         }
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            pending: true,
+            ..
+        }) if settlement_operation_id == client_operation_id => Ok(oauth_settlement_unknown(
+            "OAuth completion is still pending; retrying must use the same operation",
+        )),
         Ok(other) => Err(format!(
             "unexpected provider OAuth completion response: {other:?}"
         )),
@@ -202,9 +244,10 @@ async fn cancel_provider_oauth(
     .await;
     let response = match response {
         Ok(Ok(response)) => response,
-        Ok(Err(_)) | Err(_) => oauth_settlement(&client, client_operation_id.clone())
-            .await
-            .map_err(|error| error.to_string())?,
+        Ok(Err(_)) | Err(_) => match oauth_settlement(&client, client_operation_id.clone()).await {
+            Ok(response) => response,
+            Err(error) => return Ok(oauth_settlement_unknown(error)),
+        },
     };
     match response {
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
@@ -260,6 +303,13 @@ async fn cancel_provider_oauth(
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal)
         }
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            pending: true,
+            ..
+        }) if settlement_operation_id == client_operation_id => Ok(oauth_settlement_unknown(
+            "OAuth cancellation is still pending; retrying must use the same operation",
+        )),
         Ok(other) => Err(format!(
             "unexpected provider OAuth cancel response: {other:?}"
         )),
@@ -1772,6 +1822,19 @@ impl App {
                         operation_id,
                         result: crate::tui::async_action::OAuthAsyncResult::Failed(error),
                     }) => (client_flow_id, operation_id, Err(error)),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error),
+                    }) => {
+                        self.dialog.apply_oauth_settlement_unknown(
+                            OAuthProvider::Codex,
+                            client_flow_id,
+                            operation_id,
+                            error,
+                        );
+                        return;
+                    }
                     _ => return,
                 };
                 self.dialog.apply_oauth_begin(
@@ -1793,6 +1856,19 @@ impl App {
                         operation_id,
                         result: crate::tui::async_action::OAuthAsyncResult::Failed(error),
                     }) => (client_flow_id, operation_id, Err(error)),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error),
+                    }) => {
+                        self.dialog.apply_oauth_settlement_unknown(
+                            OAuthProvider::Codex,
+                            client_flow_id,
+                            operation_id,
+                            error,
+                        );
+                        return;
+                    }
                     _ => return,
                 };
                 self.dialog.apply_oauth_complete(
@@ -1827,6 +1903,19 @@ impl App {
                         operation_id,
                         result: crate::tui::async_action::OAuthAsyncResult::Failed(error),
                     }) => (client_flow_id, operation_id, Err(error)),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error),
+                    }) => {
+                        self.dialog.apply_oauth_settlement_unknown(
+                            OAuthProvider::Grok,
+                            client_flow_id,
+                            operation_id,
+                            error,
+                        );
+                        return;
+                    }
                     _ => return,
                 };
                 self.dialog.apply_oauth_begin(
@@ -1848,6 +1937,19 @@ impl App {
                         operation_id,
                         result: crate::tui::async_action::OAuthAsyncResult::Failed(error),
                     }) => (client_flow_id, operation_id, Err(error)),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error),
+                    }) => {
+                        self.dialog.apply_oauth_settlement_unknown(
+                            OAuthProvider::Grok,
+                            client_flow_id,
+                            operation_id,
+                            error,
+                        );
+                        return;
+                    }
                     _ => return,
                 };
                 self.dialog.apply_oauth_complete(
@@ -1870,6 +1972,15 @@ impl App {
                             Ok(payload)
                         }
                         crate::tui::async_action::OAuthAsyncResult::Failed(error) => Err(error),
+                        crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error) => {
+                            self.dialog.apply_oauth_settlement_unknown(
+                                provider,
+                                client_flow_id,
+                                operation_id,
+                                error,
+                            );
+                            return;
+                        }
                         _ => Err("unexpected OAuth host result".into()),
                     };
                     self.dialog.apply_oauth_present(
@@ -2238,7 +2349,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 complete_provider_oauth(
-                                    oauth_operation_id(client_flow_id, operation_id, "complete"),
+                                    oauth_operation_id(client_flow_id, "complete"),
                                     flow_id,
                                     None,
                                 )
@@ -2273,7 +2384,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 complete_provider_oauth(
-                                    oauth_operation_id(client_flow_id, operation_id, "complete"),
+                                    oauth_operation_id(client_flow_id, "complete"),
                                     flow_id,
                                     Some(input),
                                 )
@@ -2333,7 +2444,7 @@ impl App {
                                 client_flow_id,
                                 operation_id,
                                 cancel_provider_oauth(
-                                    oauth_operation_id(client_flow_id, operation_id, "cancel"),
+                                    oauth_operation_id(client_flow_id, "cancel"),
                                     oauth_begin_operation_id(client_flow_id),
                                     flow_id,
                                 )

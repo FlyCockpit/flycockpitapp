@@ -659,6 +659,16 @@ impl OAuthFlowState {
         }
     }
 
+    pub(crate) fn apply_settlement_unknown(&mut self, error: String) {
+        // Do not clear pending/polling/session state: the daemon operation may
+        // already be committed. Navigation remains fenced, and the next user
+        // retry derives the same durable operation ID from this flow.
+        self.pending = true;
+        self.status = Some(Err(format!(
+            "OAuth settlement is unknown; retry the exact operation: {error}"
+        )));
+    }
+
     #[cfg(test)]
     pub(super) fn begin_copy_for_test(
         &mut self,

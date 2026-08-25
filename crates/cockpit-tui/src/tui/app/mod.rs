@@ -415,6 +415,7 @@ pub(crate) struct PendingMcpLocal {
     pub intent: McpLocalIntent,
     pub phase: McpLocalPhase,
     pub config: Option<cockpit_core::mcp::config::McpConfig>,
+    pub mutation_intent_hash: Option<String>,
 }
 
 pub(crate) struct ModelSelectionRetry {

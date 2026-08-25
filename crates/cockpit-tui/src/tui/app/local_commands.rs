@@ -12,6 +12,18 @@ fn mcp_projection_revision(config: &cockpit_core::mcp::config::McpConfig) -> Opt
     )
 }
 
+fn mcp_mutation_intent_hash(project_root: &str, config_json: &str) -> Option<String> {
+    use sha2::Digest as _;
+
+    let encoded = serde_json::to_vec(&("save_mcp_config", project_root, config_json, "[]")).ok()?;
+    Some(
+        sha2::Sha256::digest(&encoded)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
 impl App {
     pub(super) fn apply_local_command_result(
         &mut self,
@@ -1001,6 +1013,7 @@ impl App {
         intent: McpLocalIntent,
         phase: McpLocalPhase,
         config: Option<cockpit_core::mcp::config::McpConfig>,
+        mutation_intent_hash: Option<String>,
         request: cockpit_core::daemon::proto::Request,
     ) {
         self.slash_menu_cache.borrow_mut().take();
@@ -1043,6 +1056,7 @@ impl App {
             intent,
             phase,
             config,
+            mutation_intent_hash,
         });
     }
 
@@ -1058,6 +1072,7 @@ impl App {
             pending.intent,
             McpLocalPhase::Settlement,
             pending.config,
+            pending.mutation_intent_hash,
             cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
                 client_operation_id: pending.operation_id.to_string(),
             },
@@ -1097,6 +1112,7 @@ impl App {
             McpLocalPhase::Snapshot {
                 snapshot_session_id: snapshot_session_id.clone(),
             },
+            None,
             None,
             cockpit_core::daemon::proto::Request::GetProviderCatalogSnapshot {
                 project_root,
@@ -1217,12 +1233,28 @@ impl App {
                             ),
                             cleanup_names_json: "[]".to_string(),
                         };
+                        let Some(mutation_intent_hash) = mcp_mutation_intent_hash(
+                            &pending.project_root,
+                            match &request {
+                                cockpit_core::daemon::proto::Request::SaveMcpConfig {
+                                    config_json,
+                                    ..
+                                } => config_json,
+                                _ => unreachable!("constructed above"),
+                            },
+                        ) else {
+                            self.push_plain(
+                                "/mcp: failed to bind the save mutation intent".to_string(),
+                            );
+                            return;
+                        };
                         self.replace_mcp_local_action(
                             pending.operation_id,
                             pending.project_root.clone(),
                             pending.intent,
                             McpLocalPhase::Save,
                             Some(mcp),
+                            Some(mutation_intent_hash),
                             request,
                         );
                     }
@@ -1231,6 +1263,8 @@ impl App {
             McpLocalPhase::Save => {
                 let cockpit_core::daemon::proto::Response::McpConfigCommitted {
                     client_operation_id,
+                    request_hash,
+                    mutation_intent_hash,
                     project_root,
                     result_revision,
                     config_generation,
@@ -1242,6 +1276,12 @@ impl App {
                 };
                 if client_operation_id != pending.operation_id.to_string()
                     || project_root != pending.project_root
+                    || request_hash.len() != 64
+                    || !request_hash
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                    || pending.mutation_intent_hash.as_deref()
+                        != Some(mutation_intent_hash.as_str())
                 {
                     self.start_mcp_settlement(pending, true);
                     return;
@@ -1257,6 +1297,7 @@ impl App {
                         config_generation,
                     },
                     pending.config,
+                    pending.mutation_intent_hash,
                     cockpit_core::daemon::proto::Request::GetProviderCatalogSnapshot {
                         project_root: pending.project_root,
                         provider_id: None,
@@ -1311,6 +1352,8 @@ impl App {
                 };
                 let cockpit_core::daemon::proto::Response::McpConfigCommitted {
                     client_operation_id,
+                    request_hash: receipt_request_hash,
+                    mutation_intent_hash,
                     project_root,
                     result_revision,
                     config_generation,
@@ -1324,6 +1367,9 @@ impl App {
                 };
                 if client_operation_id != pending.operation_id.to_string()
                     || project_root != pending.project_root
+                    || receipt_request_hash != request_hash
+                    || pending.mutation_intent_hash.as_deref()
+                        != Some(mutation_intent_hash.as_str())
                 {
                     self.push_plain(
                         "/mcp: durable save receipt did not match the requested target."
@@ -1342,6 +1388,7 @@ impl App {
                         config_generation,
                     },
                     pending.config,
+                    pending.mutation_intent_hash,
                     cockpit_core::daemon::proto::Request::GetProviderCatalogSnapshot {
                         project_root: pending.project_root,
                         provider_id: None,

@@ -154,7 +154,7 @@ async fn begin_provider_oauth(
             && operation_kind == "begin_provider_oauth"
             && settlement_hash == expected_hash =>
         {
-            Err(error.to_string())
+            Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
         }
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
             client_operation_id: receipt_operation_id,
@@ -257,7 +257,7 @@ async fn complete_provider_oauth(
             && operation_kind == "complete_provider_oauth"
             && valid_settlement_request_hash(&settlement_hash) =>
         {
-            Err(error.to_string())
+            Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
         }
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCompleted {
             client_operation_id: receipt_operation_id,
@@ -374,7 +374,7 @@ async fn cancel_provider_oauth(
             && operation_kind == "cancel_provider_oauth"
             && settlement_hash == expected_hash =>
         {
-            Err(error.to_string())
+            Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
         }
         Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
             client_operation_id: receipt_operation_id,
@@ -1922,7 +1922,9 @@ impl App {
                     Ok(AsyncActionPayload::OAuth {
                         client_flow_id,
                         operation_id,
-                        result: crate::tui::async_action::OAuthAsyncResult::Failed(error),
+                        result:
+                            crate::tui::async_action::OAuthAsyncResult::Failed(error)
+                            | crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error),
                     }) => (client_flow_id, operation_id, Err(error)),
                     Ok(AsyncActionPayload::OAuth {
                         client_flow_id,
@@ -1956,7 +1958,9 @@ impl App {
                     Ok(AsyncActionPayload::OAuth {
                         client_flow_id,
                         operation_id,
-                        result: crate::tui::async_action::OAuthAsyncResult::Failed(error),
+                        result:
+                            crate::tui::async_action::OAuthAsyncResult::Failed(error)
+                            | crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error),
                     }) => (client_flow_id, operation_id, Err(error)),
                     Ok(AsyncActionPayload::OAuth {
                         client_flow_id,
@@ -2003,7 +2007,9 @@ impl App {
                     Ok(AsyncActionPayload::OAuth {
                         client_flow_id,
                         operation_id,
-                        result: crate::tui::async_action::OAuthAsyncResult::Failed(error),
+                        result:
+                            crate::tui::async_action::OAuthAsyncResult::Failed(error)
+                            | crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error),
                     }) => (client_flow_id, operation_id, Err(error)),
                     Ok(AsyncActionPayload::OAuth {
                         client_flow_id,
@@ -2037,7 +2043,9 @@ impl App {
                     Ok(AsyncActionPayload::OAuth {
                         client_flow_id,
                         operation_id,
-                        result: crate::tui::async_action::OAuthAsyncResult::Failed(error),
+                        result:
+                            crate::tui::async_action::OAuthAsyncResult::Failed(error)
+                            | crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error),
                     }) => (client_flow_id, operation_id, Err(error)),
                     Ok(AsyncActionPayload::OAuth {
                         client_flow_id,
@@ -2073,7 +2081,10 @@ impl App {
                         crate::tui::async_action::OAuthAsyncResult::Presented(payload) => {
                             Ok(payload)
                         }
-                        crate::tui::async_action::OAuthAsyncResult::Failed(error) => Err(error),
+                        crate::tui::async_action::OAuthAsyncResult::Failed(error)
+                        | crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error) => {
+                            Err(error)
+                        }
                         crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error) => {
                             self.dialog.apply_oauth_settlement_unknown(
                                 provider,
@@ -2101,6 +2112,17 @@ impl App {
                 }) = result.payload
                     && let Some(provider) = self.dialog.oauth_provider()
                 {
+                    if let crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error) =
+                        result
+                    {
+                        self.dialog.apply_oauth_cancel_authoritative_failure(
+                            provider,
+                            client_flow_id,
+                            operation_id,
+                            error,
+                        );
+                        return;
+                    }
                     let outcome = match result {
                         crate::tui::async_action::OAuthAsyncResult::Cancelled => Ok(true),
                         crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal => Ok(false),

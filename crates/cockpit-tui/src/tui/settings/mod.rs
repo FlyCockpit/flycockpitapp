@@ -5288,6 +5288,23 @@ impl Dialog {
         }
     }
 
+    pub(crate) fn apply_oauth_cancel_authoritative_failure(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        error: String,
+    ) {
+        if let Dialog::Settings(settings) = self {
+            settings.apply_oauth_cancel_authoritative_failure(
+                provider,
+                client_flow_id,
+                operation_id,
+                error,
+            );
+        }
+    }
+
     pub(crate) fn apply_oauth_settlement_unknown(
         &mut self,
         provider: OAuthProvider,
@@ -6211,6 +6228,21 @@ impl SettingsDialog {
         };
         if state.accepts_result(client_flow_id, operation_id) {
             state.apply_cancel(result);
+        }
+    }
+
+    fn apply_oauth_cancel_authoritative_failure(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        error: String,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if state.accepts_result(client_flow_id, operation_id) {
+            state.apply_cancel_authoritative_failure(error);
         }
     }
 

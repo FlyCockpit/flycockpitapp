@@ -286,6 +286,10 @@ pub enum AsyncActionPayload {
 #[derive(Debug, Clone)]
 pub enum OAuthAsyncResult {
     Failed(String),
+    /// A correlated durable receipt proves that the daemon rejected or
+    /// cancelled the operation. Unlike transport failure this releases the
+    /// owning authority gate.
+    AuthoritativeFailure(String),
     /// The daemon may have committed the exact operation, but its terminal
     /// receipt was not observable within the bounded settlement query. The
     /// owning flow must stay fenced and retry the same daemon operation.

@@ -1620,7 +1620,11 @@ pub enum Request {
         #[serde(deserialize_with = "deserialize_owner_identifier")]
         client_operation_id: String,
         /// Non-secret digest of the exact staged provider mutation intent.
-        #[serde(deserialize_with = "deserialize_lower_hex_sha256")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_lower_hex_sha256",
+            skip_serializing_if = "String::is_empty"
+        )]
         mutation_intent_hash: String,
         mutation: crate::ProviderMutationBatch,
     },

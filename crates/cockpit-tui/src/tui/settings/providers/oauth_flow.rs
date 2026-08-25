@@ -659,6 +659,18 @@ impl OAuthFlowState {
         }
     }
 
+    pub(crate) fn apply_cancel_authoritative_failure(&mut self, error: String) {
+        self.pending = false;
+        self.polling = false;
+        self.paste_focused = false;
+        self.focus_paste_after_begin = false;
+        self.manual_input.set("");
+        self.session = OAuthSession::None;
+        self.status = Some(Err(format!(
+            "OAuth cancellation was authoritatively rejected: {error}"
+        )));
+    }
+
     pub(crate) fn apply_settlement_unknown(&mut self, error: String) {
         // Do not clear pending/polling/session state: the daemon operation may
         // already be committed. Navigation remains fenced, and the next user

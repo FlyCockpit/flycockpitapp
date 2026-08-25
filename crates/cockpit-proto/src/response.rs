@@ -426,6 +426,7 @@ pub enum Response {
         config: ProviderConfigView,
         snapshot_session_id: String,
         layer_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         owner_root: String,
         base_revision: String,
         config_generation: u64,
@@ -445,7 +446,9 @@ pub enum Response {
         client_operation_id: String,
         snapshot_session_id: String,
         layer_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         owner_root: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         mutation_intent_hash: String,
         consumed_revision: String,
         result_revision: String,

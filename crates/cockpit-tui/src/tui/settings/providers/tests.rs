@@ -7438,6 +7438,17 @@ fn pending_oauth_accepts_only_correlated_cancel_and_unlocks_on_terminal_result()
 }
 
 #[test]
+fn oauth_authoritative_cancel_failure_releases_navigation_gate() {
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
+    let _ = handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::Standalone);
+    let _ = handle_oauth_flow_key(press(KeyCode::Esc), &mut state, OAuthHost::Standalone);
+    state.apply_cancel_authoritative_failure("rejected".into());
+    assert!(!state.polling);
+    assert!(!state.pending);
+    assert!(state.status.as_ref().is_some_and(|status| status.is_err()));
+}
+
+#[test]
 fn oauth_action_completion_rejects_wrong_flow_and_superseded_operation() {
     let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
     let first = handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::Standalone)

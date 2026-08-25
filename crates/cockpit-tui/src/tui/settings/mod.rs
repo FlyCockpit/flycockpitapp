@@ -1328,7 +1328,7 @@ impl SettingsMutationAction {
         }
     }
 
-    fn settlement_id(&self) -> Option<&str> {
+    fn settlement_id(&self) -> &str {
         match self {
             Self::McpSave {
                 client_operation_id,
@@ -1361,8 +1361,7 @@ impl SettingsMutationAction {
             | Self::CopilotSetup {
                 client_operation_id,
                 ..
-            } => Some(client_operation_id),
-            _ => None,
+            } => client_operation_id,
         }
     }
 
@@ -3592,11 +3591,11 @@ impl SettingsCx {
                 if completion.target != target {
                     return Ok(());
                 }
-                if let Some(client_operation_id) = action.settlement_id().map(str::to_owned)
-                    && completion
-                        .response
-                        .as_ref()
-                        .map_or(true, |response| !action.matches_durable_receipt(response))
+                let client_operation_id = action.settlement_id().to_owned();
+                if completion
+                    .response
+                    .as_ref()
+                    .map_or(true, |response| !action.matches_durable_receipt(response))
                 {
                     self.queue_settlement_query(
                         client_operation_id,
@@ -4102,14 +4101,16 @@ impl SettingsCx {
                             }
                             (
                                 TypedDocumentEditAction::RemoveProjectShadow(prompt),
-                                Some(project_layer),
+                                project_layer,
                             ) => {
                                 let project_authored =
-                                    project_layer.authored_paths.iter().any(|authored| {
-                                        authored
-                                            .iter()
-                                            .map(String::as_str)
-                                            .eq(prompt.path.iter().copied())
+                                    project_layer.as_ref().is_some_and(|project_layer| {
+                                        project_layer.authored_paths.iter().any(|authored| {
+                                            authored
+                                                .iter()
+                                                .map(String::as_str)
+                                                .eq(prompt.path.iter().copied())
+                                        })
                                     });
                                 let source = layers.iter().find(|layer| {
                                     layer.display_path == prompt.source_config.display().to_string()

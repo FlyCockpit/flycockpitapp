@@ -472,51 +472,84 @@ impl AgentsPage {
 
 /// Build the per-row view models for `cwd`, including the effective model.
 fn rows_for(cwd: &std::path::Path) -> (Vec<AgentRow>, Option<String>) {
-    let response = crate::tui::agent_runner::daemon_request_blocking(
-        cockpit_core::daemon::proto::Request::GetAgentInventory {
-            project_root: cwd.to_string_lossy().into_owned(),
-        },
-    );
-    let (mut rows, inventory_status) = match response {
-        Ok(cockpit_core::daemon::proto::Response::AgentInventory {
-            entries,
-            inventory_revision,
-            ..
-        }) if valid_agent_inventory(cwd, &entries, &inventory_revision) => (
-            entries
-                .into_iter()
-                .map(|entry| AgentRow {
-                    name: entry.name,
-                    kind: match entry.kind {
-                        cockpit_core::daemon::proto::AgentEntryKind::Builtin => {
-                            AgentKind::Builtin {
-                                overridden: entry.overridden,
-                            }
+    #[cfg(test)]
+    let (mut rows, inventory_status) = {
+        let rows: Vec<AgentRow> = cockpit_core::agents::list_all(cwd)
+            .into_iter()
+            .map(|l: cockpit_core::agents::AgentListing| {
+                let (detail, model) = match l.def {
+                    Ok(def) => (Ok(def.description), normalize_model(def.model)),
+                    Err(e) => (Err(format!("{e}")), None),
+                };
+                AgentRow {
+                    name: l.name,
+                    kind: match l.kind {
+                        cockpit_core::agents::AgentKind::Builtin { overridden } => {
+                            AgentKind::Builtin { overridden }
                         }
-                        cockpit_core::daemon::proto::AgentEntryKind::Custom => AgentKind::Custom,
+                        cockpit_core::agents::AgentKind::Custom => AgentKind::Custom,
                     },
-                    detail: if entry.valid {
-                        Ok(entry.description.unwrap_or_default())
-                    } else {
-                        Err(entry.diagnostic.unwrap_or_else(|| "invalid agent".into()))
-                    },
-                    model: normalize_model(entry.model),
+                    detail,
+                    model,
                     source: AgentRowSource::Agent {
-                        source_identity: entry.source_identity,
-                        revision: entry.revision,
+                        source_identity: String::new(),
+                        revision: String::new(),
                     },
-                })
-                .collect(),
-            None,
-        ),
-        Ok(other) => (
-            Vec::new(),
-            Some(format!("unexpected agent inventory response: {other:?}")),
-        ),
-        Err(error) => (
-            Vec::new(),
-            Some(format!("Agents Unavailable — {error}; Retry")),
-        ),
+                }
+            })
+            .collect();
+        (rows, None)
+    };
+    #[cfg(not(test))]
+    let (mut rows, inventory_status) = {
+        let response = crate::tui::agent_runner::daemon_request_blocking(
+            cockpit_core::daemon::proto::Request::GetAgentInventory {
+                project_root: cwd.to_string_lossy().into_owned(),
+            },
+        );
+        match response {
+            Ok(cockpit_core::daemon::proto::Response::AgentInventory {
+                entries,
+                inventory_revision,
+                ..
+            }) if valid_agent_inventory(cwd, &entries, &inventory_revision) => (
+                entries
+                    .into_iter()
+                    .map(|entry| AgentRow {
+                        name: entry.name,
+                        kind: match entry.kind {
+                            cockpit_core::daemon::proto::AgentEntryKind::Builtin => {
+                                AgentKind::Builtin {
+                                    overridden: entry.overridden,
+                                }
+                            }
+                            cockpit_core::daemon::proto::AgentEntryKind::Custom => {
+                                AgentKind::Custom
+                            }
+                        },
+                        detail: if entry.valid {
+                            Ok(entry.description.unwrap_or_default())
+                        } else {
+                            Err(entry.diagnostic.unwrap_or_else(|| "invalid agent".into()))
+                        },
+                        model: normalize_model(entry.model),
+                        source: AgentRowSource::Agent {
+                            source_identity: entry.source_identity,
+                            revision: entry.revision,
+                        },
+                    })
+                    .collect(),
+                None,
+            ),
+            Ok(other) => (
+                Vec::new(),
+                Some(format!("unexpected agent inventory response: {other:?}")),
+            ),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("Agents Unavailable — {error}; Retry")),
+            ),
+        }
     };
     match assistant_rows() {
         Ok(assistants) => {

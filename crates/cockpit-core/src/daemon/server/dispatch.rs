@@ -12677,7 +12677,11 @@ async fn provider_catalog_snapshot(
         );
     }
     let mut view = crate::secret_ref::redact_provider_view(&config);
-    view.mcp_config_json = Some(redacted_mcp_config_json(ctx, &cwd, &trust_policy)?);
+    let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
+    view.mcp_config_json = Some(mcp.config_json);
+    view.mcp_owner_root = Some(canonical_root.clone());
+    view.mcp_config_path = Some(mcp.config_path);
+    view.mcp_revision = Some(mcp.revision);
     view.extended_config_json = Some(redacted_extended_config_json(ctx, &cwd, &trust_policy)?);
     bounded_provider_response(Response::ProviderCatalogSnapshot {
         config: view,
@@ -13674,13 +13678,37 @@ fn redacted_extended_config_json(
 /// Project the layered MCP config for settings clients without returning any
 /// credential-bearing literal. The daemon still reads/parses the config at
 /// this owner boundary; the TUI receives only this sanitized projection.
-fn redacted_mcp_config_json(
+struct RedactedMcpConfigSnapshot {
+    config_json: String,
+    config_path: String,
+    revision: String,
+}
+
+fn redacted_mcp_config_snapshot(
     ctx: &DaemonContext,
     cwd: &std::path::Path,
     trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
-) -> std::result::Result<String, ErrorPayload> {
+) -> std::result::Result<RedactedMcpConfigSnapshot, ErrorPayload> {
     let paths = daemon_mcp_paths(ctx, cwd, trust_policy)?;
     let mut config = mcp_config_from_paths(&paths)?;
+    let target = paths.last().cloned().or_else(|| {
+        crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+            cockpit_config::config::dirs::most_specific_config_write_target(cwd)
+                .map(|path| path.with_file_name(cockpit_config::config::dirs::MCP_FILE))
+        })
+    });
+    let path = target
+        .ok_or_else(|| bad_request("no Cockpit config layer is available for MCP snapshot"))?
+        .parent()
+        .ok_or_else(|| bad_request("MCP config target has no parent"))?
+        .join(cockpit_config::config::dirs::MCP_FILE);
+    let prior = match std::fs::read_to_string(&path) {
+        Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).map_err(internal)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::mcp::config::McpConfig::default()
+        }
+        Err(error) => return Err(internal(error)),
+    };
     for server in config.servers.values_mut() {
         server.endpoint = server
             .endpoint
@@ -13735,7 +13763,14 @@ fn redacted_mcp_config_json(
             crate::mcp::config::Auth::None => {}
         }
     }
-    serde_json::to_string(&config).map_err(internal)
+    let config_json = serde_json::to_string(&config).map_err(internal)?;
+    let prior_json = serde_json::to_string(&prior).map_err(internal)?;
+    use sha2::Digest as _;
+    Ok(RedactedMcpConfigSnapshot {
+        config_json,
+        config_path: path.to_string_lossy().into_owned(),
+        revision: crate::intel::hex_lower(&Sha256::digest(prior_json.as_bytes())),
+    })
 }
 
 // Model fetch is parameterized by provider/model selectors plus the fetch-mode

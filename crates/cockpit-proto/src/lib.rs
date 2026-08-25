@@ -275,6 +275,17 @@ pub struct ProviderConfigView {
     /// contains no header/env literals or credential values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_config_json: Option<String>,
+    /// Daemon-selected canonical MCP authority root and write target for this
+    /// snapshot. These bind a later save receipt without making the frontend
+    /// rediscover layered config paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_owner_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_config_path: Option<String>,
+    /// SHA-256 revision of the authoritative target layer (not the merged
+    /// effective projection in `mcp_config_json`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_revision: Option<String>,
     /// Optional daemon-redacted extended settings projection. JSON keeps the
     /// settings crate out of the wire/core protocol while ensuring clients do
     /// not load legacy config.json literals locally.

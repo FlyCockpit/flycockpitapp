@@ -33,12 +33,12 @@ async fn oauth_settlement(
         if let Ok(result) = response {
             if !matches!(
                 result,
-                Ok(
+                Ok(Ok(
                     cockpit_core::daemon::proto::Response::LocalOperationSettlement {
                         pending: true,
                         ..
                     }
-                )
+                ))
             ) || attempt + 1 == ATTEMPTS
             {
                 return result;
@@ -139,7 +139,9 @@ async fn begin_provider_oauth(
                         user_code,
                     })
                 }
-                other => Err(format!("unexpected OAuth begin settlement: {other:?}")),
+                other => Ok(oauth_settlement_unknown(format!(
+                    "OAuth begin receipt was malformed or unbound: {other:?}"
+                ))),
             }
         }
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
@@ -183,10 +185,10 @@ async fn begin_provider_oauth(
                 "OAuth begin is still pending; retrying must use the same operation",
             ))
         }
-        Ok(other) => Err(format!(
-            "unexpected provider OAuth begin response: {other:?}"
-        )),
-        Err(error) => Err(error.to_string()),
+        Ok(other) => Ok(oauth_settlement_unknown(format!(
+            "provider OAuth begin response was malformed or unbound: {other:?}"
+        ))),
+        Err(error) => Ok(oauth_settlement_unknown(error)),
     }
 }
 
@@ -242,7 +244,9 @@ async fn complete_provider_oauth(
                 {
                     Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
                 }
-                other => Err(format!("unexpected OAuth completion settlement: {other:?}")),
+                other => Ok(oauth_settlement_unknown(format!(
+                    "OAuth completion receipt was malformed or unbound: {other:?}"
+                ))),
             }
         }
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
@@ -285,10 +289,10 @@ async fn complete_provider_oauth(
                 "OAuth completion is still pending; retrying must use the same operation",
             ))
         }
-        Ok(other) => Err(format!(
-            "unexpected provider OAuth completion response: {other:?}"
-        )),
-        Err(error) => Err(error.to_string()),
+        Ok(other) => Ok(oauth_settlement_unknown(format!(
+            "provider OAuth completion response was malformed or unbound: {other:?}"
+        ))),
+        Err(error) => Ok(oauth_settlement_unknown(error)),
     }
 }
 
@@ -357,9 +361,9 @@ async fn cancel_provider_oauth(
                 {
                     Ok(crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal)
                 }
-                other => Err(format!(
-                    "unexpected OAuth cancellation settlement: {other:?}"
-                )),
+                other => Ok(oauth_settlement_unknown(format!(
+                    "OAuth cancellation receipt was malformed or unbound: {other:?}"
+                ))),
             }
         }
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
@@ -412,10 +416,10 @@ async fn cancel_provider_oauth(
                 "OAuth cancellation is still pending; retrying must use the same operation",
             ))
         }
-        Ok(other) => Err(format!(
-            "unexpected provider OAuth cancel response: {other:?}"
-        )),
-        Err(error) => Err(error.to_string()),
+        Ok(other) => Ok(oauth_settlement_unknown(format!(
+            "provider OAuth cancel response was malformed or unbound: {other:?}"
+        ))),
+        Err(error) => Ok(oauth_settlement_unknown(error)),
     }
 }
 
@@ -1894,7 +1898,19 @@ impl App {
                     };
                     let outcome = match result {
                         crate::tui::async_action::OAuthAsyncResult::Acknowledged => Ok(()),
-                        crate::tui::async_action::OAuthAsyncResult::Failed(error) => Err(error),
+                        crate::tui::async_action::OAuthAsyncResult::Failed(error)
+                        | crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error) => {
+                            Err(error)
+                        }
+                        crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error) => {
+                            self.dialog.apply_oauth_settlement_unknown(
+                                provider,
+                                client_flow_id,
+                                operation_id,
+                                error,
+                            );
+                            return;
+                        }
                         _ => Err("unexpected OAuth acknowledgement result".into()),
                     };
                     self.dialog.apply_oauth_acknowledgement(
@@ -2432,6 +2448,8 @@ impl App {
                                 // OAuth pane reuses the exact daemon operation.
                                 let client_operation_id =
                                     client_flow_id.subscription_ack_operation_id();
+                                let expected_hash =
+                                    oauth_request_hash(&("put_subscription_ack", provider_id))?;
                                 let request = cockpit_core::daemon::proto::Request::PutSubscriptionAck {
                                     client_operation_id: client_operation_id.clone(),
                                     provider_id: provider_id.to_string(),
@@ -2444,41 +2462,54 @@ impl App {
                                 let response = match direct {
                                     Ok(Ok(Ok(response))) => response,
                                     Ok(Ok(Err(error))) => {
-                                        return Err(format!("daemon rejected acknowledgement: {error}"));
+                                        return Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(
+                                            format!("daemon rejected acknowledgement: {error}"),
+                                        ));
                                     }
                                     Ok(Err(_)) | Err(_) => {
-                                        let settlement = tokio::time::timeout(
+                                        let settlement = match tokio::time::timeout(
                                             std::time::Duration::from_secs(10),
                                             client.request(cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
                                                 client_operation_id: client_operation_id.clone(),
                                             }),
                                         )
-                                        .await
-                                        .map_err(|_| "acknowledgement settlement query timed out; retry to query the same durable operation".to_string())?
-                                        .map_err(|error| error.to_string())?
-                                        .map_err(|error| error.to_string())?;
+                                        .await {
+                                            Ok(Ok(Ok(response))) => response,
+                                            Ok(Ok(Err(error))) => return Ok(oauth_settlement_unknown(error)),
+                                            Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
+                                            Err(_) => return Ok(oauth_settlement_unknown(
+                                                "acknowledgement settlement query timed out; retry to query the same durable operation",
+                                            )),
+                                        };
                                         match settlement {
                                             cockpit_core::daemon::proto::Response::LocalOperationSettlement {
                                                 client_operation_id: returned_id,
                                                 operation_kind,
+                                                request_hash,
                                                 pending: false,
                                                 response: Some(response),
                                                 terminal_error: None,
                                                 terminal_cancelled: false,
-                                                ..
                                             } if returned_id == client_operation_id
-                                                && operation_kind == "put_subscription_ack" => *response,
+                                                && operation_kind == "put_subscription_ack"
+                                                && request_hash == expected_hash => *response,
                                             cockpit_core::daemon::proto::Response::LocalOperationSettlement {
                                                 client_operation_id: returned_id,
                                                 operation_kind,
+                                                request_hash,
                                                 pending: false,
                                                 terminal_error: Some(error),
                                                 ..
                                             } if returned_id == client_operation_id
-                                                && operation_kind == "put_subscription_ack" => {
-                                                return Err(format!("acknowledgement was authoritatively rejected: {error}"));
+                                                && operation_kind == "put_subscription_ack"
+                                                && request_hash == expected_hash => {
+                                                return Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(
+                                                    format!("acknowledgement was authoritatively rejected: {error}"),
+                                                ));
                                             }
-                                            _ => return Err("acknowledgement settlement remains unknown; retry before starting OAuth".into()),
+                                            other => return Ok(oauth_settlement_unknown(format!(
+                                                "acknowledgement settlement remains unknown or unbound; retry the same operation: {other:?}"
+                                            ))),
                                         }
                                     }
                                 };
@@ -2492,13 +2523,14 @@ impl App {
                                         changed,
                                     } if returned_id == client_operation_id
                                         && returned_provider == provider_id
-                                        && request_hash.len() == 64
-                                        && request_hash.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                                        && request_hash == expected_hash
                                         && result_vault_generation > 0
                                         && if changed { result_vault_generation > consumed_vault_generation } else { result_vault_generation == consumed_vault_generation } => {
                                         Ok(crate::tui::async_action::OAuthAsyncResult::Acknowledged)
                                     }
-                                    other => Err(format!("unexpected acknowledgement receipt: {other:?}")),
+                                    other => Ok(oauth_settlement_unknown(format!(
+                                        "acknowledgement receipt was malformed or unbound: {other:?}"
+                                    ))),
                                 }
                             }
                             .await;
@@ -2896,5 +2928,9 @@ mod oauth_settlement_source_tests {
         assert!(source.contains("OAuthAsyncResult::AlreadyTerminal => Ok(false)"));
         assert!(source.contains("result: Result<bool, String>"));
         assert!(source.contains("operation_kind == \"cancel_provider_oauth\""));
+        assert!(source.contains("Ok(Ok("));
+        assert!(source.contains("receipt was malformed or unbound"));
+        assert!(source.contains("request_hash == expected_hash"));
+        assert!(source.contains("acknowledgement settlement remains unknown or unbound"));
     }
 }

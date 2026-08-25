@@ -158,7 +158,6 @@ pub(crate) struct OAuthBrowserBegin {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 impl OAuthBrowserBegin {
     pub(crate) fn for_test(listening: bool, ssh: bool) -> Self {
         Self {
@@ -334,6 +333,7 @@ impl OAuthOption {
 #[cfg(test)]
 pub(crate) fn prepare_grok_browser_start(
     login: xai_oauth::ManualLogin,
+    effects: OAuthEffects,
     port: u16,
 ) -> GrokBrowserStart {
     let ssh = (effects.is_ssh)();

@@ -2654,6 +2654,11 @@ pub struct SettingsCx {
     /// Daemon-redacted MCP snapshot. MCP config is never read from disk by
     /// the TUI; saves replace this cache only after the owner RPC succeeds.
     pub(super) mcp_config: cockpit_core::mcp::config::McpConfig,
+    /// Daemon-selected authority metadata for `mcp_config`. A save is not
+    /// eligible until all three values came from the same catalog snapshot.
+    pub(super) mcp_owner_root: Option<String>,
+    pub(super) mcp_config_path: Option<String>,
+    pub(super) mcp_revision: Option<String>,
     /// The cwd this dialog was opened against. Held so Root's `h`/←
     /// can reopen the picker without losing context. `None` when the
     /// settings dialog was opened from a flow that has no picker to
@@ -3382,10 +3387,20 @@ impl SettingsCx {
                             self.completed_provider_navigation =
                                 Some((navigation, self.config.clone()));
                         }
-                        if let Some(raw) = config.mcp_config_json
-                            && let Ok(mcp) = cockpit_core::mcp::config::McpConfig::parse(&raw)
+                        self.mcp_owner_root = None;
+                        self.mcp_config_path = None;
+                        self.mcp_revision = None;
+                        if let (Some(raw), Some(owner_root), Some(config_path), Some(revision)) = (
+                            config.mcp_config_json,
+                            config.mcp_owner_root,
+                            config.mcp_config_path,
+                            config.mcp_revision,
+                        ) && let Ok(mcp) = cockpit_core::mcp::config::McpConfig::parse(&raw)
                         {
                             self.mcp_config = mcp;
+                            self.mcp_owner_root = Some(owner_root);
+                            self.mcp_config_path = Some(config_path);
+                            self.mcp_revision = Some(revision);
                         }
                     }
                     Ok(other) => {
@@ -3621,6 +3636,9 @@ impl SettingsCx {
                         && config_generation > 0 =>
                     {
                         self.mcp_config = config;
+                        self.mcp_owner_root = Some(expected_owner_root);
+                        self.mcp_config_path = Some(expected_config_path);
+                        self.mcp_revision = Some(expected_result_revision);
                         self.invalidate_secret_inventory();
                         if let Some((name, edited)) = self.pending_mcp_navigation.take() {
                             self.completed_mcp_navigation = Some((name, edited, Ok(())));
@@ -6058,6 +6076,9 @@ impl SettingsDialog {
                 extended_revision,
                 extended_warnings,
                 mcp_config,
+                mcp_owner_root: None,
+                mcp_config_path: None,
+                mcp_revision: None,
                 picker_cwd: None,
                 active_project_root: None,
                 sandbox_enabled: true,

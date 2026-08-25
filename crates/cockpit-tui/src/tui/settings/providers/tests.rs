@@ -7315,17 +7315,17 @@ pub(crate) fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
         )
     );
     click_rendered_provider_action(&mut dialog, &action);
-    assert_eq!(
-        oauth_effects_log(),
-        vec!["copy:https://example.test/oauth".to_string()]
+    assert!(
+        oauth_effects_log().is_empty(),
+        "pointer reducer must not touch host clipboard"
     );
     assert!(matches!(
-        dialog.test_page(),
-        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
-            if state.flow_id == visible_flow_id
-                && state.status.as_ref().is_some_and(|status| {
-                    status.as_ref().is_ok_and(|message| message.contains("copied OAuth URL"))
-                })
+        dialog.cx.pending_oauth_action.take(),
+        Some(OAuthFlowRequest {
+            client_flow_id,
+            op: OAuthFlowOp::Present { user_code: None, open_browser: false, advance_flow: false, .. },
+            ..
+        }) if client_flow_id == visible_flow_id
     ));
     drop(tmp);
 
@@ -7353,20 +7353,17 @@ pub(crate) fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
         )
     );
     click_rendered_provider_action(&mut dialog, &action);
-    assert_eq!(
-        oauth_effects_log(),
-        vec![
-            "copy:CODE-123".to_string(),
-            "open:https://example.test/device".to_string(),
-        ]
+    assert!(
+        oauth_effects_log().is_empty(),
+        "pointer reducer must not open browser or copy"
     );
     assert!(matches!(
-        dialog.test_page(),
-        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
-            if state.flow_id == visible_flow_id
-                && state.status.as_ref().is_some_and(|status| status.as_deref() == Ok(
-                    "copied device code (unverified — also reachable via the Open link above)"
-                ))
+        dialog.cx.pending_oauth_action.take(),
+        Some(OAuthFlowRequest {
+            client_flow_id,
+            op: OAuthFlowOp::Present { user_code: Some(code), open_browser: true, advance_flow: false, .. },
+            ..
+        }) if client_flow_id == visible_flow_id && code == "CODE-123"
     ));
     drop(tmp);
 

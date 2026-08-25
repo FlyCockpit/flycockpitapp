@@ -1485,6 +1485,7 @@ pub enum Request {
     #[serde(rename = "begin_provider_oauth")]
     BeginProviderOAuth {
         /// Stable owner-generated idempotency key for this begin attempt.
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
         client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         provider_id: String,
@@ -1495,6 +1496,7 @@ pub enum Request {
     /// ignore it and poll using state retained by the daemon.
     #[serde(rename = "complete_provider_oauth")]
     CompleteProviderOAuth {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
         client_operation_id: String,
         flow_id: String,
         #[serde(default)]
@@ -1505,11 +1507,13 @@ pub enum Request {
     /// idempotent so a client can settle a timed-out or already-consumed flow.
     #[serde(rename = "cancel_provider_oauth")]
     CancelProviderOAuth {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
         client_operation_id: String,
         /// The begin operation is always known, even when its response (and
         /// therefore the daemon flow id) was lost in transport.
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
         begin_client_operation_id: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_owner_optional_provider_id")]
         flow_id: Option<String>,
     },
 
@@ -1517,6 +1521,7 @@ pub enum Request {
     /// callback state; the client receives only an opaque flow id and URL.
     #[serde(rename = "begin_mcp_oauth")]
     BeginMcpOAuth {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
         client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -1527,6 +1532,7 @@ pub enum Request {
     /// URL/code supplied by a UI, but never a token.
     #[serde(rename = "complete_mcp_oauth")]
     CompleteMcpOAuth {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
         client_operation_id: String,
         flow_id: String,
         #[serde(default)]
@@ -1536,9 +1542,11 @@ pub enum Request {
     /// Cancel an in-progress daemon-owned MCP OAuth flow.
     #[serde(rename = "cancel_mcp_oauth")]
     CancelMcpOAuth {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
         client_operation_id: String,
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
         begin_client_operation_id: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_owner_optional_provider_id")]
         flow_id: Option<String>,
     },
 

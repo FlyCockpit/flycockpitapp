@@ -479,6 +479,24 @@ mod oauth_store_tests {
             Some("flow-8")
         );
     }
+
+    #[tokio::test]
+    async fn cancellation_fences_an_inflight_provider_completion() {
+        let store = OAuthFlowStore::new();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        store
+            .insert_provider(
+                "flow".into(),
+                "owner".into(),
+                "begin".into(),
+                ProviderOAuthFlow::Completing {
+                    cancelled: cancelled.clone(),
+                },
+            )
+            .await;
+        assert!(store.cancel_provider("flow", "owner").await);
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
 }
 
 #[derive(Debug)]

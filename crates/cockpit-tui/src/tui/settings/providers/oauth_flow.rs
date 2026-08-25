@@ -337,7 +337,6 @@ impl OAuthOption {
 #[cfg(test)]
 pub(crate) fn prepare_grok_browser_start(
     login: xai_oauth::ManualLogin,
-    effects: OAuthEffects,
     port: u16,
 ) -> GrokBrowserStart {
     let ssh = (effects.is_ssh)();
@@ -501,7 +500,6 @@ impl OAuthFlowState {
             acknowledgement_required: true,
             copy_operation: super::super::shell::PointerOperationGate::default(),
             action_operation: super::super::shell::PointerOperationGate::default(),
-            effects,
         }
     }
 

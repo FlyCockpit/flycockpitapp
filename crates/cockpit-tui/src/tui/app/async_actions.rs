@@ -1095,7 +1095,7 @@ impl App {
                                 source_draft_generation,
                                 0,
                                 None,
-                                true,
+                                !presentation_stale,
                             );
                         }
                         if presentation_stale {

@@ -74,10 +74,9 @@ impl TiktokenEncoding {
             Self::Cl100k => cl100k_base_singleton(),
             Self::O200k => o200k_base_singleton(),
         };
+        // Already `Vec<u32>`; the old `.map(|id| id as u32)` was a no-op cast
+        // that `clippy::unnecessary_cast` rejects under `-D warnings`.
         bpe.encode_with_special_tokens(text)
-            .into_iter()
-            .map(|id| id as u32)
-            .collect()
     }
 
     pub fn warm(self) {

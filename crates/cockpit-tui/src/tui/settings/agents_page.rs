@@ -5347,15 +5347,26 @@ pub(super) mod tests {
             })
             .cloned()
             .expect("raw editor publishes text body");
+        // The editor is seeded with the daemon's canonical re-render of the
+        // agent, so the frontmatter line count is not the raw fixture's.
+        // Click the row the `body` line actually occupies.
+        let body_row = page(&dialog)
+            .editing
+            .as_ref()
+            .unwrap()
+            .text()
+            .lines()
+            .position(|line| line == "body")
+            .expect("daemon snapshot markdown retains the body line") as u16;
         dialog.handle_pointer(super::super::tests::settings_mouse(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             edit_text.rect.x,
-            edit_text.rect.y + 3,
+            edit_text.rect.y + body_row,
         ));
         dialog.handle_pointer(super::super::tests::settings_mouse(
             crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
             edit_text.rect.x,
-            edit_text.rect.y + 3,
+            edit_text.rect.y + body_row,
         ));
         page_mut(&mut dialog)
             .editing

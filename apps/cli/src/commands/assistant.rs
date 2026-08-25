@@ -687,11 +687,13 @@ mod tests {
         assert!(home.join("assistant.md").is_file());
         assert_eq!(db.list_assistants().await.unwrap().len(), 1);
 
-        let def = {
-            let markdown = std::fs::read_to_string(home.join("assistant.md")).unwrap();
-            cockpit_core::agents::parse_agent(&markdown, &row.name, home.join("assistant.md"))
-                .unwrap()
-        };
+        // Assistant definitions carry the `local/` publisher, which only the
+        // daemon-local trusted loader accepts.
+        let def = cockpit_core::agents::load_daemon_local_named_from_file(
+            &home.join("assistant.md"),
+            &row.name,
+        )
+        .unwrap();
         assert_eq!(
             def.vnext.as_ref().map(|v| v.execution_kind),
             Some(cockpit_core::agents::ExecutionKind::Assistant)

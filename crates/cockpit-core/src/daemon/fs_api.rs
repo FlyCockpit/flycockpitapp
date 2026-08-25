@@ -2583,7 +2583,7 @@ mod tests {
 
         let resp =
             save_extended_config_sync(root_text, "config.json", &incoming_str, None).unwrap();
-        assert!(matches!(resp, Response::ExtendedConfigSaved { .. }));
+        assert!(matches!(resp, Response::ExtendedConfigWritten { .. }));
 
         // The registry is preserved AND the other change landed.
         let after = std::fs::read_to_string(root.join("config.json")).unwrap();
@@ -2650,7 +2650,8 @@ mod tests {
                     entry_id: "second".into(),
                 },
                 cockpit_proto::DesiredDenylistEntry::New {
-                    client_nonce: "replacement-occurrence".into(),
+                    // Nonces must be canonical UUIDs; anything else is refused.
+                    client_nonce: "6a1f0f6e-9f7b-4a0e-8c8e-2b54a1f0c9d3".into(),
                     literal: cockpit_proto::SensitiveWireLiteral::new("new-value".into()),
                 },
             ],
@@ -2658,7 +2659,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result[0], ("second".into(), None, "same".into()));
-        assert_eq!(result[1].1.as_deref(), Some("replacement-occurrence"));
+        assert_eq!(
+            result[1].1.as_deref(),
+            Some("6a1f0f6e-9f7b-4a0e-8c8e-2b54a1f0c9d3")
+        );
         assert_ne!(result[1].0, "first");
         assert_eq!(
             document["redact"]["denylist"],

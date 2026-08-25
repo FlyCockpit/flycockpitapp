@@ -5955,6 +5955,7 @@ async fn stats_rollup_runs_off_request_loop() {
 
 #[tokio::test]
 async fn assistant_rpc_creates_session_via_registry() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
     let assistant_home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -6030,6 +6031,7 @@ async fn assistant_rpc_creates_session_via_registry() {
 
 #[tokio::test]
 async fn assistant_session_creation_is_atomic() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
     let assistant_home = tempfile::tempdir().unwrap();
     let untrusted_project = tempfile::tempdir().unwrap();
@@ -6109,6 +6111,7 @@ async fn typed_invalid_attach_model_is_rejected_before_any_mutation() {
 
 #[tokio::test]
 async fn assistant_session_requires_an_initial_or_default_model() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
         crate::config::providers::ProvidersConfig::default(),
         crate::config::extended::ExtendedConfig::default(),
@@ -15787,6 +15790,7 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "save_assistant_definition"
         | "begin_agent_editor_lease"
         | "complete_agent_editor_lease"
+        | "get_agent_editor_lease_settlement"
         | "apply_extended_config_patch"
         | "get_agent_edit_snapshot" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         // `mutate_agent` with `ResetAllBuiltins` and no expected_revision fails
@@ -15847,6 +15851,7 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("mutate_agent"),
         authz_owner_only("begin_agent_editor_lease"),
         authz_owner_only("complete_agent_editor_lease"),
+        authz_owner_only("get_agent_editor_lease_settlement"),
         authz_owner_only("resolve_assistant_session"),
         authz_owner_only("create_assistant_session"),
         authz_session_writer("auto_title"),
@@ -17890,9 +17895,13 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             })
         }
         "save_assistant_definition" => Request::SaveAssistantDefinition {
+            client_operation_id: "authz-matrix-probe".into(),
+            mutation_intent_hash: "00".repeat(32),
+            project_root: project_root.to_string_lossy().into_owned(),
             name: "authz-matrix-probe".into(),
             markdown: "---\ndescription: probe\n---\nbody".into(),
             expected_revision: "rev".into(),
+            expected_config_generation: 0,
         },
         "get_agent_inventory" => Request::GetAgentInventory {
             project_root: project_root.to_string_lossy().into_owned(),
@@ -17902,16 +17911,20 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             name: "build".into(),
         },
         "mutate_agent" => Request::MutateAgent {
+            client_operation_id: "authz-matrix-probe".into(),
+            mutation_intent_hash: "00".repeat(32),
             project_root: project_root.to_string_lossy().into_owned(),
             mutation: cockpit_proto::AgentMutation::ResetAllBuiltins,
             expected_revision: None,
         },
         "begin_agent_editor_lease" => Request::BeginAgentEditorLease {
+            client_operation_id: "authz-matrix-probe".into(),
             project_root: project_root.to_string_lossy().into_owned(),
             name: "build".into(),
             expected_revision: "rev".into(),
         },
         "complete_agent_editor_lease" => Request::CompleteAgentEditorLease {
+            client_operation_id: "authz-matrix-probe".into(),
             project_root: project_root.to_string_lossy().into_owned(),
             lease_id: "lease".into(),
             markdown: None,
@@ -17921,6 +17934,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             snapshot_session_id: "snap".into(),
         },
         "apply_extended_config_patch" => Request::ApplyExtendedConfigPatch {
+            client_operation_id: "authz-matrix-probe".into(),
             project_root: project_root.to_string_lossy().into_owned(),
             layer_id: "layer".into(),
             patch: cockpit_proto::ExtendedConfigPatch {
@@ -17931,6 +17945,11 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             },
             expected_revision: "rev".into(),
             snapshot_session_id: "snap".into(),
+        },
+        "get_agent_editor_lease_settlement" => Request::GetAgentEditorLeaseSettlement {
+            client_operation_id: "authz-matrix-probe".into(),
+            project_root: project_root.to_string_lossy().into_owned(),
+            lease_id: "lease".into(),
         },
         other => panic!("unhandled authz matrix request kind {other}"),
     }
@@ -21389,7 +21408,7 @@ async fn assert_goal_mutating_malformed(kind: &str) {
 
 async fn create_test_assistant(
     ctx: &Arc<DaemonContext>,
-    tmp: &tempfile::TempDir,
+    _tmp: &tempfile::TempDir,
     name: &str,
 ) -> crate::db::assistants::AssistantRow {
     crate::assistants::create_assistant(
@@ -21398,7 +21417,7 @@ async fn create_test_assistant(
             name: name.to_string(),
             description: "test assistant".to_string(),
             prompt: "You are a test assistant.".to_string(),
-            home_dir: tmp.path().join(name),
+            home_dir: crate::assistants::default_home_dir(name).unwrap(),
         },
     )
     .await
@@ -21407,6 +21426,7 @@ async fn create_test_assistant(
 
 #[cfg(unix)]
 async fn assert_create_assistant_session_happy() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
     let ctx = test_ctx();
     let tmp = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -24734,7 +24754,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::GetSessionCompactions { session_id }, kind: "get_session_compactions", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::PurgeEndedSessions { before: 0 }, kind: "purge_ended_sessions", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetAssistant { name: "a".into() }, kind: "get_assistant", session_id: None, audit_path: None, mutating: false },
-        CommandMetadataCase { request: Request::DeleteAssistant { client_operation_id: "delete-assistant".into(), mutation_intent_hash: cockpit_proto::assistant_mutation_intent_hash(&project_root, "delete", "a", "revision", None), project_root: project_root.clone(), name: "a".into(), expected_revision: "revision".into(), expected_config_generation: 7 }, kind: "delete_assistant", session_id: None, audit_path: Some(project_root.as_str()), mutating: true },
+        CommandMetadataCase { request: Request::DeleteAssistant { client_operation_id: "delete-assistant".into(), mutation_intent_hash: cockpit_proto::assistant_mutation_intent_hash(&project_root, "delete", "a", "revision", None), project_root: project_root.clone(), name: "a".into(), expected_revision: "revision".into(), expected_config_generation: 7 }, kind: "delete_assistant", session_id: None, audit_path: Some("/repo"), mutating: true },
         CommandMetadataCase { request: Request::DiagnoseMediaReservation { scope: "s".into(), id: "i".into() }, kind: "diagnose_media_reservation", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::RepairMediaReservation { scope: "s".into(), id: "i".into(), expected_block_generation: 0, repair_plan_digest: "d".into(), idempotency_key: "k".into() }, kind: "repair_media_reservation", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::GetDoctorSnapshot { project_root: None, no_sandbox: false, offline: false }, kind: "get_doctor_snapshot", session_id: None, audit_path: None, mutating: false },
@@ -24743,14 +24763,6 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::AgentInstallationSubmitChoice(cockpit_proto::AgentInstallationSubmitChoiceV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, continuation_token: Uuid::new_v4().to_string(), choice_id: Some("choice-a".into()), defer: false }), kind: "agent_installation_submit_choice", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::AgentInstallationList(cockpit_proto::AgentInstallationReadV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, installation_id: None }), kind: "agent_installation_list", session_id: None, audit_path: None, mutating: false },
         CommandMetadataCase { request: Request::AgentInstallationInspect(cockpit_proto::AgentInstallationReadV1 { dto_version: cockpit_proto::AGENT_INSTALLATION_DTO_VERSION, scope: cockpit_proto::AgentInstallationScopeWire::Global, workspace_path: None, installation_id: Some(Uuid::new_v4().to_string()) }), kind: "agent_installation_inspect", session_id: None, audit_path: None, mutating: false },
-        CommandMetadataCase { request: Request::SaveAssistantDefinition { name: "a".into(), markdown: "---\ndescription: test\n---\nbody".into(), expected_revision: "rev".into() }, kind: "save_assistant_definition", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::GetAgentInventory { project_root: project_root.clone() }, kind: "get_agent_inventory", session_id: None, audit_path: Some("/repo"), mutating: false },
-        CommandMetadataCase { request: Request::GetAgentEditSnapshot { project_root: project_root.clone(), name: "build".into() }, kind: "get_agent_edit_snapshot", session_id: None, audit_path: Some("/repo"), mutating: false },
-        CommandMetadataCase { request: Request::MutateAgent { project_root: project_root.clone(), mutation: cockpit_proto::AgentMutation::ResetAllBuiltins, expected_revision: None }, kind: "mutate_agent", session_id: None, audit_path: Some("/repo"), mutating: true },
-        CommandMetadataCase { request: Request::BeginAgentEditorLease { project_root: project_root.clone(), name: "build".into(), expected_revision: "rev".into() }, kind: "begin_agent_editor_lease", session_id: None, audit_path: Some("/repo"), mutating: true },
-        CommandMetadataCase { request: Request::CompleteAgentEditorLease { project_root: project_root.clone(), lease_id: "lease".into(), markdown: None }, kind: "complete_agent_editor_lease", session_id: None, audit_path: Some("/repo"), mutating: true },
-        CommandMetadataCase { request: Request::GetExtendedConfigSnapshot { project_root: project_root.clone(), snapshot_session_id: "snap".into() }, kind: "get_extended_config_snapshot", session_id: None, audit_path: Some("/repo"), mutating: false },
-        CommandMetadataCase { request: Request::ApplyExtendedConfigPatch { project_root: project_root.clone(), layer_id: "layer".into(), patch: cockpit_proto::ExtendedConfigPatch { operations: Vec::new(), materialize: false, denylist: Vec::new(), redacted_mutations: Vec::new() }, expected_revision: "rev".into(), snapshot_session_id: "snap".into() }, kind: "apply_extended_config_patch", session_id: None, audit_path: Some("/repo"), mutating: true },
     ]);
 
     // Drift-proof exhaustiveness (`daemon-trust-test-isolation.md`): the
@@ -30393,6 +30405,7 @@ async fn client_transport_executor_error_wins_over_dependent_clean_writer_exit()
 
     let error = super::select_client_task(&mut reader, &mut writer, &mut event, &mut executor)
         .await
+        .result
         .unwrap_err();
     reader.abort();
     writer.abort();

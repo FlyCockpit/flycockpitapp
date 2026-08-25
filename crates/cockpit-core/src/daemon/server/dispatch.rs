@@ -1352,8 +1352,8 @@ impl OAuthFlowStore {
     /// flow. The durable sealed marker remains authoritative and is settled
     /// separately by [`maintain_durable_oauth_flows`].
     async fn maintain(&self) {
-        Self::purge_provider(&mut self.provider.lock().await);
-        Self::purge_mcp(&mut self.mcp.lock().await);
+        Self::purge_provider(&mut *self.provider.lock().await);
+        Self::purge_mcp(&mut *self.mcp.lock().await);
     }
 
     fn evict_oldest_provider(
@@ -5893,7 +5893,7 @@ async fn handle_serialized_request_impl(
                 fencing_generation,
                 mutation_intent_hash.clone(),
                 requested_project_root.clone(),
-                project_root.clone(),
+                project_root.to_string_lossy().to_string(),
                 name.clone(),
                 "save",
                 expected_revision.clone(),
@@ -5950,7 +5950,7 @@ async fn handle_serialized_request_impl(
             let response = Response::AssistantDefinitionSaved {
                 client_operation_id: client_operation_id.clone(),
                 mutation_intent_hash,
-                project_root,
+                project_root: project_root.to_string_lossy().to_string(),
                 requested_project_root,
                 name,
                 assistant,
@@ -6322,7 +6322,7 @@ async fn handle_serialized_request_impl(
                 fencing_generation,
                 mutation_intent_hash.clone(),
                 requested_project_root.clone(),
-                project_root.clone(),
+                project_root.to_string_lossy().to_string(),
                 name.clone(),
                 "delete",
                 expected_revision.clone(),
@@ -6367,7 +6367,7 @@ async fn handle_serialized_request_impl(
             let response = Response::AssistantDeleted {
                 client_operation_id: client_operation_id.clone(),
                 mutation_intent_hash,
-                project_root,
+                project_root: project_root.to_string_lossy().to_string(),
                 requested_project_root,
                 name,
                 consumed_revision: expected_revision,
@@ -14389,6 +14389,7 @@ async fn apply_provider_mutation(
             &snapshot_session_id,
             &layer_id,
             &expected_revision,
+            &mutation_intent_hash,
         )
         .await?;
         {
@@ -15173,7 +15174,7 @@ async fn commit_local_provider_credential(
                         conn,
                         cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
                         &credential_record_id,
-                        record.as_deref(),
+                        record.as_deref().map(|v| v.as_slice()),
                     )
                     .map_err(|error| anyhow::anyhow!(error))?;
             }
@@ -15287,7 +15288,7 @@ fn client_operation_id_from_response(
                 ..
             },
         )
-        | Response::AgentMutated(AgentMutationResult {
+        | Response::AgentMutated(cockpit_proto::AgentMutationResult {
             client_operation_id,
             ..
         }) => Ok(client_operation_id.clone()),
@@ -15551,7 +15552,7 @@ async fn stage_and_recover_provider_batch(
                         chrono::Utc::now().timestamp_millis()
                     ],
                 )?;
-                if inserted != 1 {
+                if inserted == 0 {
                     anyhow::bail!("new provider secret claim was not inserted");
                 }
                 inserted_named_claims.insert(name.clone());
@@ -15563,7 +15564,7 @@ async fn stage_and_recover_provider_batch(
                     provider_id,
                     &project_root_owned,
                 )?;
-                if inserted == 1 {
+                if inserted {
                     inserted_credential_claims
                         .entry(provider_id.clone())
                         .or_default()
@@ -16994,7 +16995,7 @@ pub(super) async fn recover_provider_config_journals(
         })
         .await
         .map_err(internal)?;
-    for journal in journals {
+    for mut journal in journals {
         let (cwd, trust_policy, _) = daemon_provider_config(ctx, project_root.as_str()).await?;
         match journal.action.as_str() {
             "save" => {
@@ -17781,7 +17782,7 @@ async fn save_mcp_config(
     recover_mcp_config_journals(ctx, project_root).await?;
     let mut config: crate::mcp::config::McpConfig =
         crate::mcp::config::McpConfig::parse(config_json).map_err(internal)?;
-    let secret_values: std::collections::BTreeMap<String, proto::SensitiveWirePayload> =
+    let mut secret_values: std::collections::BTreeMap<String, proto::SensitiveWirePayload> =
         serde_json::from_str(secret_values_json)
             .map_err(|error| bad_request(format!("invalid MCP secret values: {error}")))?;
     let cwd = std::path::PathBuf::from(project_root);
@@ -17800,7 +17801,7 @@ async fn save_mcp_config(
     for (reference, value) in
         crate::mcp::config::restore_owner_view_redactions(&mut config, &prior_merged)
     {
-        secret_values.entry(reference).or_insert(value);
+        secret_values.entry(reference).or_insert(value.into());
     }
     for (name, value) in &secret_values {
         if name.is_empty() || name.len() > cockpit_proto::MAX_OWNER_SECRET_NAME_BYTES {
@@ -17920,8 +17921,8 @@ async fn save_mcp_config(
         project_root: requested_project_root,
         owner_root: project_root.to_owned(),
         config_path: path.to_string_lossy().into_owned(),
-        consumed_revision,
-        result_revision,
+        consumed_revision: consumed_revision.clone(),
+        result_revision: result_revision.clone(),
         // Recovery assigns the current boot's committed generation only after
         // the reference-only file has durably converged.
         config_generation: 0,

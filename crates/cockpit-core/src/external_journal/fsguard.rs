@@ -899,7 +899,7 @@ mod imp {
 }
 
 pub use imp::DirGuard;
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(all(unix, any(feature = "remote", test)))]
 pub use imp::{HeldEntryIdentity, HeldRenameEffect};
 
 impl DirGuard {

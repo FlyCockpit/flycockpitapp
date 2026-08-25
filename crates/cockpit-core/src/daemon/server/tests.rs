@@ -16084,8 +16084,18 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "pin"
             | "refresh_env"
             | "refresh_config"
-    ) || (kind == "get_inventory_bundle" && level != AuthzLevel::NoAccess)
+    ) || authz_kind_needs_attached_state_remote(kind, level)
+}
+
+#[cfg(feature = "remote")]
+fn authz_kind_needs_attached_state_remote(kind: &str, level: AuthzLevel) -> bool {
+    (kind == "get_inventory_bundle" && level != AuthzLevel::NoAccess)
         || (kind == "lsp_control" && matches!(level, AuthzLevel::Owner | AuthzLevel::Writer))
+}
+
+#[cfg(not(feature = "remote"))]
+fn authz_kind_needs_attached_state_remote(_kind: &str, _level: AuthzLevel) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -24042,6 +24052,14 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         PurgeEndedSessions,
         GetAssistant,
         DeleteAssistant,
+        SaveAssistantDefinition,
+        GetAgentInventory,
+        GetAgentEditSnapshot,
+        MutateAgent,
+        BeginAgentEditorLease,
+        CompleteAgentEditorLease,
+        GetExtendedConfigSnapshot,
+        ApplyExtendedConfigPatch,
         DiagnoseMediaReservation,
         RepairMediaReservation,
         GetDoctorSnapshot,

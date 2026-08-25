@@ -1,5 +1,6 @@
 use super::shell::PointerOperationId;
 use super::*;
+use cockpit_config::extended::ExtendedConfigDoc;
 
 #[test]
 fn empty_object_merge_patch_is_derived_as_noop_for_existing_object() {

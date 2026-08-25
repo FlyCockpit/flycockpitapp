@@ -601,13 +601,17 @@ mod tests {
         assert!(home.join("assistant.md").is_file());
         assert_eq!(db.list_assistants().await.unwrap().len(), 1);
 
-        let def = crate::assistants::load_from_row(&row).unwrap();
+        let def = {
+            let markdown = std::fs::read_to_string(home.join("assistant.md")).unwrap();
+            cockpit_core::agents::parse_agent(&markdown, &row.name, home.join("assistant.md"))
+                .unwrap()
+        };
         assert_eq!(
-            def.agent.vnext.as_ref().map(|v| v.execution_kind),
+            def.vnext.as_ref().map(|v| v.execution_kind),
             Some(cockpit_core::agents::ExecutionKind::Assistant)
         );
-        assert!(def.agent.model.is_none());
-        assert!(def.agent.tools.is_none());
+        assert!(def.model.is_none());
+        assert!(def.tools.is_none());
     }
 
     #[tokio::test]

@@ -55,7 +55,7 @@ use cockpit_db::external_journal::{
 use cockpit_db::filesystem_identity::FilesystemIdentityV1;
 
 pub(crate) use fsguard::DirGuard;
-#[cfg(all(unix, feature = "remote"))]
+#[cfg(all(unix, any(feature = "remote", test)))]
 pub(crate) use fsguard::{HeldEntryIdentity, HeldRenameEffect};
 pub use fsguard::{
     OpenStrictness, SPOOL_DIR_MODE, SPOOL_FILE_MODE, SPOOL_PERMISSION_POLICY, SpoolPermissionPolicy,

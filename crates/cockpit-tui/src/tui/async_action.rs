@@ -29,6 +29,138 @@ pub enum AsyncActionKind {
     Internal(&'static str),
 }
 
+/// Process-exit disposition for an asynchronous action.
+///
+/// This classification belongs to the action type, rather than to an App
+/// screen, so every exit route observes the same authority boundary. Unknown
+/// blocking, daemon, and internal actions fail closed: a newly introduced
+/// action must be deliberately classified as read-only before it can be
+/// abandoned during process exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncActionAuthority {
+    /// A projection or cancellable computation that cannot have committed a
+    /// durable or host-visible side effect.
+    ReadOnly,
+    /// A durable daemon mutation whose correlated terminal receipt is needed.
+    DurableMutation,
+    /// A host-side publication or external process interaction.
+    HostMutation,
+    /// Session/runner lifecycle authority that must be reconciled.
+    SessionLifecycle,
+    /// An unclassified action. This is deliberately authority-owning.
+    Unclassified,
+}
+
+impl AsyncActionAuthority {
+    pub const fn owns_local_authority(self) -> bool {
+        !matches!(self, Self::ReadOnly)
+    }
+}
+
+impl AsyncActionKind {
+    /// Return the authoritative process-exit classification for this action.
+    ///
+    /// Keep the string inventory here exhaustive for production labels. The
+    /// conservative fallback means an omitted/new label cannot silently punch
+    /// through the global exit fence.
+    pub fn authority(&self) -> AsyncActionAuthority {
+        use AsyncActionAuthority::{
+            DurableMutation, HostMutation, ReadOnly, SessionLifecycle, Unclassified,
+        };
+
+        match self {
+            Self::Refresh(_) => ReadOnly,
+            Self::Blocking(label) => match *label {
+                "autocomplete.files" | "doctor.snapshot" | "thread-check" => ReadOnly,
+                "btw.teardown"
+                | "paste.delivery_receipt"
+                | "queue.edit"
+                | "settings.blocking-effect" => DurableMutation,
+                "copy.file" | "curator.command" | "export.debug" | "export.transcript"
+                | "local.command" | "mouse.copy" => HostMutation,
+                // `blocking-create` is a test-only unknown-action fixture. It
+                // remains fenced, exactly like a newly added production label.
+                _ => Unclassified,
+            },
+            Self::DaemonRpc(label) => match *label {
+                "guidance.estimate"
+                | "history.page"
+                | "inventory.bundle"
+                | "leaks-list"
+                | "resources.snapshot"
+                | "sessions.list"
+                | "sessions.live"
+                | "sessions.preview"
+                | "skills.list"
+                | "subagent.history.page" => ReadOnly,
+                "assistant.resolve"
+                | "btw.resolve-interrupt"
+                | "fork.create"
+                | "side.discard"
+                | "side.start" => SessionLifecycle,
+                "goal.clear"
+                | "goal.create"
+                | "goal.disposition"
+                | "goal.set"
+                | "goal-settings.effect"
+                | "leaks"
+                | "leaks-delete"
+                | "leaks-rotate"
+                | "mcp.local"
+                | "note"
+                | "paste.image_path_admission"
+                | "rename"
+                | "resources.promote"
+                | "sealed"
+                | "sealed.effect"
+                | "sessions.mutation"
+                | "settings.effect"
+                | "subagent.steer"
+                | "tools.effect"
+                | "workspace-trust.effect" => DurableMutation,
+                _ => Unclassified,
+            },
+            Self::Internal(label) => match *label {
+                "app-drop"
+                | "complete"
+                | "paste.deadline"
+                | "paste.native_image"
+                | "paste.reducer_progress"
+                | "paste.test_probe"
+                | "paste.token_count"
+                | "pending"
+                | "pins.review"
+                | "shutdown"
+                | "startup.dependencies"
+                | "startup.guidance.estimate"
+                | "startup.remote_disclosures"
+                | "subagent.history" => ReadOnly,
+                "btw.runner.attach"
+                | "runner.attach"
+                | "session.fork"
+                | "session.resume"
+                | "session.side"
+                | "session.side.return"
+                | "session.switch" => SessionLifecycle,
+                "leaks.rpc"
+                | "notes.rpc"
+                | "oauth.acknowledge"
+                | "oauth.cancel"
+                | "oauth.codex.begin"
+                | "oauth.codex.poll"
+                | "oauth.grok.begin"
+                | "oauth.grok.complete"
+                | "pins.pin"
+                | "pins.toggle"
+                | "pins.unpin"
+                | "rename.auto" => DurableMutation,
+                "oauth.host.present" => HostMutation,
+                _ => Unclassified,
+            },
+        }
+    }
+}
+
 /// Classified auto-copy delivery. Never carries plaintext or OS error detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseCopyResult {
@@ -835,6 +967,14 @@ impl AsyncActionRunner {
             .collect()
     }
 
+    /// Whether any pending action still owns durable, host-publication, or
+    /// lifecycle authority. Unknown action labels are fenced by default.
+    pub fn has_unsettled_local_authority(&self) -> bool {
+        self.pending
+            .values()
+            .any(|pending| pending.kind.authority().owns_local_authority())
+    }
+
     #[cfg(test)]
     pub fn pending_ids(&self) -> Vec<AsyncActionId> {
         let mut ids: Vec<_> = self.pending.keys().copied().collect();
@@ -1302,6 +1442,67 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::oneshot;
     use tokio::time::{Duration, sleep};
+
+    #[test]
+    fn action_authority_is_enum_owned_and_fails_closed() {
+        use AsyncActionAuthority::{
+            DurableMutation, HostMutation, ReadOnly, SessionLifecycle, Unclassified,
+        };
+
+        for (kind, expected) in [
+            (AsyncActionKind::Refresh("future-projection"), ReadOnly),
+            (AsyncActionKind::Blocking("doctor.snapshot"), ReadOnly),
+            (AsyncActionKind::Blocking("copy.file"), HostMutation),
+            (
+                AsyncActionKind::DaemonRpc("settings.effect"),
+                DurableMutation,
+            ),
+            (
+                AsyncActionKind::DaemonRpc("session.switch.unknown"),
+                Unclassified,
+            ),
+            (
+                AsyncActionKind::Internal("session.switch"),
+                SessionLifecycle,
+            ),
+        ] {
+            assert_eq!(
+                kind.authority(),
+                expected,
+                "wrong classification for {kind:?}"
+            );
+        }
+
+        for unknown in [
+            AsyncActionKind::Blocking("new-blocking-action"),
+            AsyncActionKind::DaemonRpc("new-daemon-action"),
+            AsyncActionKind::Internal("new-internal-action"),
+        ] {
+            assert_eq!(unknown.authority(), Unclassified);
+            assert!(
+                unknown.authority().owns_local_authority(),
+                "unknown actions must never bypass the process exit fence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_computes_authority_from_every_pending_action() {
+        let mut runner = AsyncActionRunner::default();
+        runner.start(
+            AsyncActionKind::Refresh("status"),
+            AsyncActionPolicy::AllowConcurrent,
+            std::future::pending(),
+        );
+        assert!(!runner.has_unsettled_local_authority());
+
+        runner.start(
+            AsyncActionKind::Internal("new-unclassified-action"),
+            AsyncActionPolicy::AllowConcurrent,
+            std::future::pending(),
+        );
+        assert!(runner.has_unsettled_local_authority());
+    }
 
     async fn wait_for_results(runner: &mut AsyncActionRunner) -> Vec<AsyncActionResult> {
         for _ in 0..20 {

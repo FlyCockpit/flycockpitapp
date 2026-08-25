@@ -4151,7 +4151,10 @@ impl App {
             {
                 needs_redraw = true;
             }
-            if self.exit_requested {
+            // Programmatic exits cross the same process-wide authority fence
+            // as Ctrl+C, Ctrl+D, and `/exit`. Do not surrender an operation
+            // merely because a completion handler requested shutdown.
+            if self.exit_requested && !self.has_unsettled_local_authority() {
                 break;
             }
             if self.tick_attention_interrupt() {

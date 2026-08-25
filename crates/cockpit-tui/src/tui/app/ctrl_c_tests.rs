@@ -385,6 +385,23 @@ fn exit_routes_share_the_app_wide_authority_gate() {
 }
 
 #[test]
+fn async_authority_inventory_is_central_and_programmatic_exit_is_fenced() {
+    let terminal_controls = include_str!("terminal_controls.rs");
+    let app = include_str!("mod.rs");
+    let async_action = include_str!("../async_action.rs");
+
+    assert!(terminal_controls.contains("self.async_actions.has_unsettled_local_authority()"));
+    assert!(
+        !terminal_controls.contains("AsyncActionKind::"),
+        "App exit code must not maintain a second action-label inventory"
+    );
+    assert!(async_action.contains("pub fn authority(&self)"));
+    assert!(async_action.contains("_ => Unclassified"));
+    assert!(async_action.contains("!matches!(self, Self::ReadOnly)"));
+    assert!(app.contains("if self.exit_requested && !self.has_unsettled_local_authority()"));
+}
+
+#[test]
 fn bare_note_shows_usage_only() {
     use super::{App, HistoryEntry, Overlay};
     let tmp = tempfile::tempdir().unwrap();

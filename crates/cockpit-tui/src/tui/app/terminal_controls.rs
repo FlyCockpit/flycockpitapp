@@ -17,57 +17,7 @@ impl App {
             || !self.pending_control_requests.is_empty()
             || !self.pending_usage.is_empty()
             || !self.settings_blocking_actions.is_empty()
-            || self.has_unsettled_authority_async_action()
-    }
-
-    fn has_unsettled_authority_async_action(&self) -> bool {
-        use crate::tui::async_action::AsyncActionKind::{Blocking, DaemonRpc, Internal};
-
-        [
-            Blocking("btw.teardown"),
-            Blocking("copy.file"),
-            Blocking("export.debug"),
-            Blocking("export.transcript"),
-            Blocking("local.command"),
-            Blocking("queue.edit"),
-            Blocking("settings.blocking-effect"),
-            DaemonRpc("btw.resolve-interrupt"),
-            DaemonRpc("fork.create"),
-            DaemonRpc("leaks-rotate"),
-            DaemonRpc("mcp.local"),
-            DaemonRpc("note"),
-            DaemonRpc("paste.image_path_admission"),
-            DaemonRpc("rename"),
-            DaemonRpc("resources.promote"),
-            DaemonRpc("sealed"),
-            DaemonRpc("sealed.effect"),
-            DaemonRpc("sessions.mutation"),
-            DaemonRpc("side.discard"),
-            DaemonRpc("side.start"),
-            DaemonRpc("subagent.steer"),
-            DaemonRpc("workspace-trust.effect"),
-            Internal("btw.runner.attach"),
-            Internal("leaks.rpc"),
-            Internal("notes.rpc"),
-            Internal("oauth.acknowledge"),
-            Internal("oauth.cancel"),
-            Internal("oauth.codex.begin"),
-            Internal("oauth.codex.poll"),
-            Internal("oauth.grok.begin"),
-            Internal("oauth.grok.complete"),
-            Internal("pins.pin"),
-            Internal("pins.toggle"),
-            Internal("pins.unpin"),
-            Internal("rename.auto"),
-            Internal("runner.attach"),
-            Internal("session.fork"),
-            Internal("session.resume"),
-            Internal("session.side"),
-            Internal("session.side.return"),
-            Internal("session.switch"),
-        ]
-        .iter()
-        .any(|kind| self.async_actions.has_pending_kind(kind))
+            || self.async_actions.has_unsettled_local_authority()
     }
 
     /// Return true only when shutdown may surrender all local authority.

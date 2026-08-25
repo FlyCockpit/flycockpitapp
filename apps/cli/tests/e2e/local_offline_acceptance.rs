@@ -198,7 +198,8 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
     session.start_trusted_daemon();
 
     let secret = "release-acceptance-secret-7f31";
-    let turn = run(&session, &["run", "--json", secret]);
+    let prompt = format!("durable release prompt {secret}");
+    let turn = run(&session, &["run", "--json", &prompt]);
     assert!(turn.status.success(), "{}", output_text(&turn));
     let events = String::from_utf8_lossy(&turn.stdout)
         .lines()
@@ -251,7 +252,7 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
     assert!(
         provider.captured().iter().any(|request| {
             let body = request.body.to_string();
-            body.contains(secret)
+            body.contains("durable release prompt")
                 && body.contains("durable release reply")
                 && body.contains("resume exact session")
         }),

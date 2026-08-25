@@ -189,7 +189,11 @@ fn describe_mouse(app: &App, _: &SlashCommand) -> String {
 }
 
 fn describe_mcp(app: &App, _: &SlashCommand) -> String {
-    let cfg = app.mcp_load();
+    let Some(cfg) = app.mcp_snapshot() else {
+        return "Manage MCP servers (status unavailable) (arg: settings/list/on/off/toggle [id]; \
+                bare = list)"
+            .to_string();
+    };
     let enabled = cfg.servers.values().filter(|s| s.enabled).count();
     let total = cfg.servers.len();
     format!(

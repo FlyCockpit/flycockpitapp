@@ -1,5 +1,6 @@
 use super::shell::PointerOperationId;
 use super::*;
+use cockpit_config::extended::ExtendedConfigDoc;
 
 #[test]
 fn settings_input_pages_do_not_wait_on_daemon_rpcs() {
@@ -488,7 +489,7 @@ fn denylist_commit_receipt_binds_consumed_and_created_occurrences_exactly() {
         },
         cockpit_core::daemon::proto::DesiredDenylistEntry::New {
             client_nonce: nonce.into(),
-            literal: "secret".into(),
+            literal: cockpit_core::daemon::proto::SensitiveWireLiteral::new("secret".into()),
         },
     ];
     let committed = vec![
@@ -753,18 +754,59 @@ impl EditorEnv {
     }
 }
 
+/// Open a dialog on a fixture config that lives outside every layer the daemon
+/// discovers.
+///
+/// Two arrangements make such a path usable. Registering it as a settings layer
+/// lets the extended-config snapshot and patch RPCs resolve it, and the provider
+/// snapshot is handed in from that same file the way the production provider
+/// entry points hand in an already-authoritative one — the layered provider
+/// catalog cannot see a config in a bare temporary directory.
+pub(super) fn open_fixture_dialog(path: &std::path::Path) -> SettingsDialog {
+    super::disk_daemon_fake::register_settings_layer_target(path);
+    let config = cockpit_config::providers::ConfigDoc::load(path)
+        .map(|document| document.providers())
+        .unwrap_or_default();
+    SettingsDialog::open_with_config(path.to_path_buf(), config)
+}
+
 pub(super) fn fresh_dialog(tmp: &TempDir) -> SettingsDialog {
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
-    let mut dialog = SettingsDialog::open(path);
-    // `SettingsDialog::open` seeds the MCP snapshot from the daemon view, which
-    // in the cfg(test) path falls back to `McpConfig::discover` and would read
-    // this developer box's real `~/.config/cockpit/mcp.json`. Clear it so every
-    // fresh dialog starts from an empty, hermetic MCP inventory; tests that need
-    // servers seed `dialog.mcp_config` explicitly (mirroring the daemon
-    // snapshot the production TUI receives).
+    let mut dialog = open_fixture_dialog(&path);
+    // The MCP inventory reaches the dialog as the daemon's projection of
+    // `McpConfig::discover`, which would read this developer box's real
+    // `~/.config/cockpit/mcp.json`. Clear it so every fresh dialog starts from
+    // an empty, hermetic MCP inventory; tests that need servers seed
+    // `dialog.mcp_config` explicitly (mirroring the daemon snapshot the
+    // production TUI receives).
     dialog.mcp_config = cockpit_core::mcp::config::McpConfig::default();
     dialog
+}
+
+/// The denylist as literals.
+///
+/// A committed save replaces every denylist row with the daemon's opaque
+/// occurrence draft, so resolve those positionally against the layer the save
+/// wrote; rows the user has typed but not yet committed are already literals.
+fn resolved_denylist(dialog: &SettingsDialog) -> Vec<String> {
+    let persisted = ExtendedConfigDoc::load(&dialog.extended_path)
+        .map(|document| document.config().redact.denylist)
+        .unwrap_or_default();
+    dialog
+        .extended
+        .redact
+        .denylist
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if value.starts_with(super::DENYLIST_EXISTING_DRAFT_PREFIX) {
+                persisted.get(index).cloned().unwrap_or_default()
+            } else {
+                value.clone()
+            }
+        })
+        .collect()
 }
 
 fn write_provider_file(config_path: &std::path::Path, provider_id: &str, json: &str) {
@@ -1453,7 +1495,7 @@ fn pointer_string_list_action_families_dispatch_from_fresh_sources() {
                 .iter()
                 .map(|value| value.display().to_string())
                 .collect(),
-            StringListKind::RedactDenylist => dialog.extended.redact.denylist.clone(),
+            StringListKind::RedactDenylist => resolved_denylist(dialog),
             StringListKind::RedactAllowlist => dialog.extended.redact.allowlist.clone(),
             StringListKind::GitignoreAllow => dialog.extended.gitignore_allow.clone(),
         }
@@ -2951,7 +2993,9 @@ fn standalone_pointer_dialog(tmp: &TempDir, title: &str) -> SettingsDialog {
     if title == "LSP" {
         let active = tmp.path().join("active-project");
         std::fs::create_dir_all(&active).unwrap();
-        SettingsDialog::open_from_picker(tmp.path().join("config.json"), active)
+        let path = tmp.path().join("config.json");
+        super::disk_daemon_fake::register_settings_layer_target(&path);
+        SettingsDialog::open_from_picker(path, active)
     } else {
         fresh_dialog(tmp)
     }
@@ -5447,6 +5491,11 @@ fn global_name_edit_prompts_to_remove_shadowing_project_value() {
         r#"{"name":"Project","tui":{"show_cwd":false}}"#,
     )
     .unwrap();
+    // Neither layer sits under a root the daemon discovers from this test's
+    // process cwd; register both so the global edit and the project-shadow
+    // removal each resolve their own layer.
+    super::disk_daemon_fake::register_settings_layer_target(&global);
+    super::disk_daemon_fake::register_settings_layer_target(&project_config);
 
     let mut d = SettingsDialog::open_from_picker(global.clone(), project.clone());
     open_category_on(&mut d, Category::Profile, SettingId::Name);
@@ -5493,6 +5542,8 @@ pub(super) fn run_pointer_category_confirmation_and_effect_matrix() {
         std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
         std::fs::write(&global, r#"{"name":"Global"}"#).unwrap();
         std::fs::write(&project_config, r#"{"name":"Project"}"#).unwrap();
+        super::disk_daemon_fake::register_settings_layer_target(&global);
+        super::disk_daemon_fake::register_settings_layer_target(&project_config);
         let mut dialog = SettingsDialog::open_from_picker(global, project);
         open_category_on(&mut dialog, Category::Profile, SettingId::Name);
         dialog.handle_key(press(KeyCode::Enter));
@@ -5612,7 +5663,7 @@ fn dialog_with_one_provider(tmp: &TempDir) -> SettingsDialog {
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
     write_provider_file(&path, "vendor", r#"{"url":"https://x","headers":[]}"#);
-    let mut d = SettingsDialog::open(path);
+    let mut d = open_fixture_dialog(&path);
     d.enter_providers();
     d
 }
@@ -5766,7 +5817,7 @@ fn root_menu_exposes_the_default_model_row_first() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
-    let d = SettingsDialog::open(path);
+    let d = open_fixture_dialog(&path);
     assert_eq!(root_nodes()[0].title, DEFAULT_MODEL_TITLE);
     assert!(matches!(d.test_page(), TestPageRef::Root { cursor: 0 }));
 }
@@ -5776,7 +5827,7 @@ fn default_model_row_shows_the_effective_default_and_opens_the_shared_picker() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
-    let mut d = SettingsDialog::open(path);
+    let mut d = open_fixture_dialog(&path);
     d.config.active_model = Some(cockpit_config::providers::ActiveModelRef {
         provider: "vendor".into(),
         model: "m1".into(),
@@ -5809,7 +5860,7 @@ fn default_model_row_shows_an_explicit_unset_state() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
-    let mut d = SettingsDialog::open(path);
+    let mut d = open_fixture_dialog(&path);
 
     d.handle_key(press(KeyCode::Enter));
     let text = render_settings_rows(&d, 100, 24).join("\n");
@@ -5821,7 +5872,7 @@ fn clearing_the_default_from_settings_delegates_to_the_daemon_operation() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
-    let mut d = SettingsDialog::open(path);
+    let mut d = open_fixture_dialog(&path);
     d.config.active_model = Some(cockpit_config::providers::ActiveModelRef {
         provider: "vendor".into(),
         model: "m1".into(),
@@ -5868,7 +5919,7 @@ fn clearing_an_already_unset_default_stages_nothing() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
-    let mut d = SettingsDialog::open(path);
+    let mut d = open_fixture_dialog(&path);
 
     d.handle_key(press(KeyCode::Enter));
     d.handle_key(press(KeyCode::Char('x')));
@@ -6973,12 +7024,12 @@ fn seeded_harnesses_reappear_after_settings_disk_round_trip() {
     let path = tmp.path().join("config.json");
     std::fs::write(&path, "{}").unwrap();
 
-    let mut d = SettingsDialog::open(path.clone());
+    let mut d = open_fixture_dialog(&path);
     d.command_installed = |_| true;
     seed_via_keys(&mut d);
     assert_eq!(harness_status(&d).as_deref(), Some("saved"));
 
-    let mut reopened = SettingsDialog::open(path);
+    let mut reopened = open_fixture_dialog(&path);
     enter_harnesses_from_root(&mut reopened);
     for name in ["claude", "codex", "opencode", "copilot", "goose", "grok"] {
         assert!(
@@ -6989,7 +7040,7 @@ fn seeded_harnesses_reappear_after_settings_disk_round_trip() {
 }
 
 #[test]
-fn harnesses_page_shows_rows_and_warning_when_unrelated_field_is_malformed() {
+fn harnesses_page_refuses_a_layer_whose_unrelated_field_is_malformed() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("config.json");
     std::fs::write(
@@ -7003,16 +7054,14 @@ fn harnesses_page_shows_rows_and_warning_when_unrelated_field_is_malformed() {
     )
     .unwrap();
 
-    let mut d = SettingsDialog::open(path);
+    let mut d = open_fixture_dialog(&path);
     enter_harnesses_from_root(&mut d);
-    assert!(d.extended.harnesses.contains_key("codex"));
-    assert!(
-        harness_status(&d)
-            .as_deref()
-            .is_some_and(|s| s.contains("ignored malformed `tui`")),
-        "expected malformed-field warning, got {:?}",
-        harness_status(&d)
-    );
+    // The settings snapshot is all-or-nothing: a layer the typed schema cannot
+    // parse is refused whole, so the page opens on defaults instead of
+    // presenting a partially parsed document as editable state.
+    assert!(d.extended.harnesses.is_empty());
+    assert!(d.extended_revision.is_none());
+    assert_eq!(harness_status(&d), None);
 }
 
 /// Move to the `[seed installed presets]` row and activate it. Assumes
@@ -7253,7 +7302,7 @@ pub(super) fn dialog_with_models(tmp: &TempDir) -> SettingsDialog {
         "openai",
         r#"{"url":"https://o","headers":[],"models":[{"id":"gpt-5"}]}"#,
     );
-    SettingsDialog::open(path)
+    open_fixture_dialog(&path)
 }
 
 /// The picker builds a grouped list across all configured providers,
@@ -7691,6 +7740,9 @@ fn create_config_scaffold_failure_stays_open_with_path_status() {
 fn create_config_success_opens_settings_editor() {
     let tmp = TempDir::new().unwrap();
     let target = tmp.path().join(".cockpit");
+    // Scaffolding materializes the layer through the daemon patch path, so the
+    // target has to be a layer the daemon can resolve.
+    super::disk_daemon_fake::register_settings_layer_target(&target.join("config.json"));
     let mut d = Dialog::CreateConfig {
         choices: vec![ConfigDir {
             kind: ConfigDirKind::Project,
@@ -7903,7 +7955,7 @@ fn string_list_keyboard_delete_remains_immediate() {
     ));
 
     d.handle_key(press(KeyCode::Char('d')));
-    assert_eq!(d.extended.redact.denylist, vec!["other-value".to_string()]);
+    assert_eq!(resolved_denylist(&d), vec!["other-value".to_string()]);
     let on_disk = std::fs::read_to_string(&d.extended_path).unwrap();
     assert!(!on_disk.contains("secret-value"), "{on_disk}");
 }
@@ -7948,19 +8000,23 @@ fn redact_denylist_existing_edit_is_replacement_only() {
         TestPageRef::StringList(p) => {
             let grabbed = p.grabbed.as_ref().expect("grabbed denylist row");
             assert_eq!(grabbed.buf.text(), "");
-            assert_eq!(grabbed.original_name.as_deref(), Some("secret-value"));
+            // A committed row is addressed by its opaque occurrence, so the
+            // literal is never carried back into the editor.
+            let original = grabbed.original_name.as_deref().expect("existing row");
+            assert!(original.starts_with(super::DENYLIST_EXISTING_DRAFT_PREFIX));
+            assert!(!original.contains("secret-value"));
         }
         other => panic!("expected StringList, got {other:?}"),
     }
     d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.redact.denylist, vec!["secret-value".to_string()]);
+    assert_eq!(resolved_denylist(&d), vec!["secret-value".to_string()]);
 
     d.handle_key(press(KeyCode::Enter));
     for ch in "replacement".chars() {
         d.handle_key(press(KeyCode::Char(ch)));
     }
     d.handle_key(press(KeyCode::Enter));
-    assert_eq!(d.extended.redact.denylist, vec!["replacement".to_string()]);
+    assert_eq!(resolved_denylist(&d), vec!["replacement".to_string()]);
 }
 
 #[test]
@@ -8912,7 +8968,7 @@ fn privacy_reset_restores_knobs_but_preserves_redaction_content() {
         vec![PathBuf::from("/secure/app.env"), PathBuf::from("local.env")]
     );
     assert_eq!(
-        d.extended.redact.denylist,
+        resolved_denylist(&d),
         vec!["must-redact".to_string(), "also-redact".to_string()]
     );
     assert_eq!(
@@ -8925,7 +8981,7 @@ fn privacy_reset_restores_knobs_but_preserves_redaction_content() {
     );
 
     let reloaded = ExtendedConfigDoc::load(&d.extended_path).unwrap().config();
-    assert_eq!(reloaded.redact.denylist, d.extended.redact.denylist);
+    assert_eq!(reloaded.redact.denylist, resolved_denylist(&d));
     assert_eq!(reloaded.redact.allowlist, d.extended.redact.allowlist);
     assert_eq!(reloaded.gitignore_allow, d.extended.gitignore_allow);
     assert!(!reloaded.allow_remote_config);

@@ -67,6 +67,17 @@ impl AgentId {
     pub(super) fn name(&self) -> &str {
         &self.name
     }
+
+    /// Occurrence tokens bind to a workspace's live source identity and
+    /// revision, so pointer coverage keys on the stable name form instead.
+    #[cfg(test)]
+    pub(super) fn canonical_for_coverage(&self) -> Self {
+        match self.occurrence.split_once(':') {
+            Some(("workspace", _)) => Self::workspace(&self.name),
+            Some(("assistant", _)) => Self::assistant(&self.name),
+            _ => self.clone(),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ProviderId(pub String);

@@ -5174,6 +5174,10 @@ mod proto_fixture_files {
     use serde_json::{Map, Value};
     use std::path::Path;
 
+    pub(super) fn read_fixture(file_name: &str) -> Map<String, Value> {
+        read_fixture_for(super::PROTOCOL_VERSION, file_name)
+    }
+
     pub(super) fn read_fixture_for(version: u32, file_name: &str) -> Map<String, Value> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -7623,7 +7627,7 @@ mod tests {
 
     #[test]
     fn assistant_registration_revision_is_present_in_current_response_fixtures() {
-        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let fixture = proto_fixture_files::read_fixture("response.json");
         for response_name in ["assistant_upserted", "assistant_definition_saved"] {
             let summary: AssistantSummary =
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
@@ -7796,7 +7800,7 @@ mod tests {
     fn archived_fixtures_are_retained_but_not_in_the_live_compatibility_window() {
         for version in [12, 13] {
             assert!(!is_protocol_compatible(version));
-            let archived = proto_fixture_tests::read_fixture_for(version, "response.json");
+            let archived = proto_fixture_files::read_fixture_for(version, "response.json");
             assert!(archived.contains_key("config_refreshed"));
             assert!(archived.contains_key("goal_status"));
             assert!(archived.contains_key("goal_updated"));

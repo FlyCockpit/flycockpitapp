@@ -166,8 +166,16 @@ impl ExtendedConfigPatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RedactedOccurrenceMutation {
-    Set { pointer: String, value: String },
-    Unset { pointer: String },
+    /// The replacement plaintext. Wire shape is an unchanged JSON string; the
+    /// newtype keeps it out of the non-zeroizing FCOR canonical buffer and out
+    /// of `Debug`.
+    Set {
+        pointer: String,
+        value: crate::SensitiveWireLiteral,
+    },
+    Unset {
+        pointer: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -347,48 +355,52 @@ impl ExtendedConfigField {
             Self::Preflight => "preflight",
             Self::SystemPrompt => "system_prompt",
             Self::Schedule => "schedule",
-            Self::ResourceScheduler => "resource_scheduler",
+            Self::ResourceScheduler => "resourceScheduler",
             Self::Sandbox => "sandbox",
             Self::Daemon => "daemon",
-            Self::MediaResources => "media_resources",
+            Self::MediaResources => "mediaResources",
             Self::Retention => "retention",
             Self::Delegation => "delegation",
             Self::Deepthink => "deepthink",
             Self::Review => "review",
-            Self::GoalSupervision => "goal_supervision",
+            Self::GoalSupervision => "goalSupervision",
             Self::Lsp => "lsp",
             Self::DataSyntax => "data_syntax",
             Self::LoopGuard => "loop_guard",
-            Self::MaxPrimaryRounds => "max_primary_rounds",
+            Self::MaxPrimaryRounds => "maxPrimaryRounds",
             Self::Dialog => "dialog",
             Self::Skills => "skills",
             Self::LlmMode => "llm_mode",
-            Self::DefaultPrimaryAgent => "default_primary_agent",
+            Self::DefaultPrimaryAgent => "defaultPrimaryAgent",
             Self::RemovedDefaultPrimaryAgent => "removed_default_primary_agent",
             Self::Translation => "translation",
             Self::SandboxEscalationEnabled => "sandbox_escalation_enabled",
-            Self::DefaultApprovalMode => "default_approval_mode",
-            Self::ApprovalPolicy => "approval_policy",
-            Self::PredictNextMessage => "predict_next_message",
-            Self::ShellCompression => "shell_compression",
-            Self::CommandResourceProfiles => "command_resource_profiles",
-            Self::InlineThink => "inline_think",
-            Self::HintToolCallCorrections => "hint_tool_call_corrections",
-            Self::TextEmbeddedRecovery => "text_embedded_recovery",
-            Self::IntelCentralityRanking => "intel_centrality_ranking",
+            Self::DefaultApprovalMode => "defaultApprovalMode",
+            Self::ApprovalPolicy => "approvalPolicy",
+            Self::PredictNextMessage => "predictNextMessage",
+            Self::ShellCompression => "shellCompression",
+            Self::CommandResourceProfiles => "commandResourceProfiles",
+            Self::InlineThink => "inlineThink",
+            Self::HintToolCallCorrections => "hintToolCallCorrections",
+            Self::TextEmbeddedRecovery => "textEmbeddedRecovery",
+            Self::IntelCentralityRanking => "intelCentralityRanking",
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Deliberately not `PartialEq`/`Eq`: the new-entry literal is a secret, and a
+/// derived comparison would be a value-derived equality oracle over it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum DesiredDenylistEntry {
     Existing {
         entry_id: String,
     },
+    /// Wire shape is an unchanged JSON string; the newtype keeps the plaintext
+    /// out of the non-zeroizing FCOR canonical buffer and out of `Debug`.
     New {
         client_nonce: String,
-        literal: String,
+        literal: crate::SensitiveWireLiteral,
     },
 }
 

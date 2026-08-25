@@ -383,7 +383,6 @@ fn row_agent_id(name: &str, source: &AgentRowSource) -> super::pointer_actions::
 
 pub(super) struct AgentDetail {
     name: String,
-    path: PathBuf,
     original_text: String,
     revision: Option<String>,
     def: AgentDef,
@@ -3430,7 +3429,6 @@ impl SettingsCx {
                 self.save_agent_detail(p);
             }
             KeyCode::Char('e') => {
-                let path = detail.path.clone();
                 let name = detail.name.clone();
                 let text = detail.original_text.clone();
                 let revision = detail.revision.clone();
@@ -3440,9 +3438,9 @@ impl SettingsCx {
                 let vim = self.extended.tui.vim_mode.vim_enabled();
                 p.editing = match (assistant_definition, revision) {
                     (true, Some(revision)) => {
-                        Some(AgentEditor::new_assistant(name, path, &text, vim, revision))
+                        Some(AgentEditor::new_assistant(name, &text, vim, revision))
                     }
-                    (false, revision) => Some(AgentEditor::new(name, path, &text, vim, revision)),
+                    (false, revision) => Some(AgentEditor::new(name, &text, vim, revision)),
                     (true, None) => {
                         p.status = Some("raw edit failed: missing assistant revision".into());
                         None
@@ -3512,11 +3510,7 @@ impl SettingsCx {
             }
             AgentRowSource::Assistant {
                 markdown, revision, ..
-            } => (
-                PathBuf::from("<daemon-assistant-definition>"),
-                markdown.clone(),
-                Some(revision.clone()),
-            ),
+            } => (markdown.clone(), Some(revision.clone())),
             AgentRowSource::AssistantUnavailable { .. } => {
                 p.status = Some("assistant definition is unavailable; run cockpit doctor".into());
                 return;
@@ -3553,7 +3547,6 @@ impl SettingsCx {
         let draft = ToolSurfaceDraft::from_def(&def);
         p.detail = Some(AgentDetail {
             name,
-            path,
             original_text,
             revision,
             def,
@@ -3687,7 +3680,6 @@ impl SettingsCx {
                 p.editing = Some(
                     AgentEditor::new_assistant(
                         name,
-                        PathBuf::from("<daemon-assistant-definition>"),
                         markdown,
                         self.extended.tui.vim_mode.vim_enabled(),
                         revision.clone(),
@@ -3751,7 +3743,6 @@ impl SettingsCx {
                 p.editing = Some(
                     AgentEditor::new_assistant(
                         name,
-                        PathBuf::from("<daemon-assistant-definition>"),
                         markdown,
                         self.extended.tui.vim_mode.vim_enabled(),
                         revision.clone(),
@@ -4801,6 +4792,7 @@ pub(super) mod tests {
         fs::create_dir_all(&cockpit).unwrap();
         let config_path = cockpit.join("config.json");
         fs::write(&config_path, "{}").unwrap();
+        super::super::disk_daemon_fake::register_settings_layer_target(&config_path);
         let trust = cockpit_config::trust::enter_workspace_trust_policy(
             crate::tui::app::trusted_workspace_policy_for_tests(tmp.path()),
         );
@@ -4829,6 +4821,14 @@ pub(super) mod tests {
         page_mut(d).cursor = idx;
     }
 
+    /// The occurrence-bound identity the page renders for `name`. Row pointer
+    /// targets carry the daemon's exact source identity and revision, so a
+    /// fixture must read it from the live rows rather than name it.
+    fn row_id(d: &SettingsDialog, name: &str) -> super::super::pointer_actions::AgentId {
+        let row = page(d).rows.iter().find(|row| row.name == name).unwrap();
+        row_agent_id(&row.name, &row.source)
+    }
+
     struct EditorEnv {
         _guard: cockpit_test_support::TestEnvGuard,
     }
@@ -4845,32 +4845,6 @@ pub(super) mod tests {
         fn unset() -> Self {
             Self::with(None)
         }
-    }
-
-    struct XdgDataEnv {
-        _guard: cockpit_test_support::TestEnvGuard,
-    }
-
-    impl XdgDataEnv {
-        fn new(path: &std::path::Path) -> Self {
-            let guard = cockpit_test_support::TestEnvGuard::blocking_lock();
-            guard.set_var("XDG_DATA_HOME", path);
-            Self { _guard: guard }
-        }
-
-        async fn new_async(path: &std::path::Path) -> Self {
-            let guard = cockpit_test_support::TestEnvGuard::lock().await;
-            guard.set_var("XDG_DATA_HOME", path);
-            Self { _guard: guard }
-        }
-    }
-
-    fn focus_tool(d: &mut SettingsDialog, name: &str) {
-        let idx = cockpit_core::agents::tool_surface_catalog()
-            .iter()
-            .position(|tool| tool.name == name)
-            .unwrap();
-        page_mut(d).detail.as_mut().unwrap().picker.set_cursor(idx);
     }
 
     fn vnext_workspace_agent(name: &str, description: &str, body: &str) -> String {
@@ -5137,24 +5111,21 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn in_tui_edit_save_invalid_surfaces_parse_error() {
+    fn in_tui_edit_save_invalid_is_refused_and_keeps_the_draft() {
         let _g = EditorEnv::unset();
         let tmp = TempDir::new().unwrap();
         let agents_dir = tmp.path().join(".cockpit/agents");
         fs::create_dir_all(&agents_dir).unwrap();
-        fs::write(
-            agents_dir.join("mine.md"),
-            vnext_workspace_agent("mine", "orig", "body"),
-        )
-        .unwrap();
+        let original = vnext_workspace_agent("mine", "orig", "body");
+        fs::write(agents_dir.join("mine.md"), &original).unwrap();
         let mut d = agents_dialog(&tmp);
         d.extended.tui.vim_mode = cockpit_config::extended::VimModeSetting::Disabled;
         focus(&mut d, "mine");
         d.handle_key(press(KeyCode::Char('e')));
-        // Type a body-only document (no frontmatter) so the saved file fails
+        // Type a body-only document (no frontmatter) so the save fails
         // `parse_agent`. We replace by typing after deleting the original via
-        // repeated forward-delete, then save: the SAVE path re-reads from disk
-        // and surfaces the parse result rather than silently accepting it.
+        // repeated forward-delete, then save: the daemon refuses the definition
+        // instead of publishing a broken agent.
         for _ in 0..64 {
             d.handle_key(press(KeyCode::Delete));
         }
@@ -5162,15 +5133,23 @@ pub(super) mod tests {
             d.handle_key(press(KeyCode::Char(ch)));
         }
         d.handle_key(ctrl_s());
-        assert!(page(&d).editing.is_none(), "save closes the editor");
+        assert!(
+            page(&d).editing.is_some(),
+            "a refused save keeps the editor open for repair"
+        );
         assert!(
             page(&d)
                 .status
                 .as_deref()
                 .unwrap_or("")
-                .contains("parse error"),
-            "invalid file surfaces a parse error, got {:?}",
+                .contains("invalid agent definition"),
+            "invalid content is refused with the daemon's diagnostic, got {:?}",
             page(&d).status
+        );
+        assert_eq!(
+            fs::read_to_string(agents_dir.join("mine.md")).unwrap(),
+            original,
+            "a refused save never reaches the authoritative file"
         );
     }
 
@@ -5341,9 +5320,7 @@ pub(super) mod tests {
         // The pointer Edit action opens the in-TUI raw editor directly
         // (edit_selected_in_tui), bypassing the v2 detail-page guard.
         let edit_action = super::super::pointer_actions::SettingsPointerAction::Agents(
-            super::super::pointer_actions::AgentsAction::Edit(
-                super::super::pointer_actions::AgentId::workspace("pointer-agent"),
-            ),
+            super::super::pointer_actions::AgentsAction::Edit(row_id(&dialog, "pointer-agent")),
         );
         click_agent_action(&mut dialog, &edit_action);
         assert!(
@@ -5550,8 +5527,8 @@ pub(super) mod tests {
                     .permissions()
                     .mode()
                     & 0o777,
-                0o640,
-                "atomic replacement preserves the original mode"
+                0o600,
+                "the committed definition is published owner-only, never widened by the editor"
             );
         }
         let status = page(&dialog).status.clone();
@@ -5572,12 +5549,14 @@ pub(super) mod tests {
         ] {
             let mut retry = agents_dialog(&tmp);
             focus(&mut retry, "pointer-agent");
-            retry.handle_key(press(KeyCode::Enter));
-            retry.handle_key(press(KeyCode::Char('e')));
+            let edit_action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::Edit(row_id(&retry, "pointer-agent")),
+            );
+            click_agent_action(&mut retry, &edit_action);
             page_mut(&mut retry)
                 .editing
                 .as_mut()
-                .unwrap()
+                .expect("pointer Edit opens the in-TUI raw editor")
                 .paste("RETAINED");
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
@@ -5603,12 +5582,22 @@ pub(super) mod tests {
             retry.finish_agent_external_edit(operation, outcome, None);
             super::super::pointer_acceptance_tests::record_dispatched_action(&result_action);
             assert!(page(&retry).pending_external_edit.is_none());
+            // Cancelling restores the exact pre-handoff draft; a failed editor
+            // run keeps whatever bytes the external editor left behind.
+            let retained = if matches!(
+                outcome,
+                super::super::pointer_actions::ExternalEditOutcome::Cancelled
+            ) {
+                "RETAINED"
+            } else {
+                "externally changed staging"
+            };
             assert!(
                 page(&retry)
                     .editing
                     .as_ref()
-                    .is_some_and(|editor| editor.text().contains("RETAINED")),
-                "{outcome:?} restores the exact retryable draft"
+                    .is_some_and(|editor| editor.text().contains(retained)),
+                "{outcome:?} restores the retryable draft"
             );
             assert!(page(&retry).external_edit_ops.pending().is_none());
             assert!(
@@ -5629,8 +5618,13 @@ pub(super) mod tests {
             .unwrap();
             let mut conflict = agents_dialog(&tmp);
             focus(&mut conflict, "pointer-agent");
-            conflict.handle_key(press(KeyCode::Enter));
-            conflict.handle_key(press(KeyCode::Char('e')));
+            let edit_action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::Edit(row_id(
+                    &conflict,
+                    "pointer-agent",
+                )),
+            );
+            click_agent_action(&mut conflict, &edit_action);
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
             );
@@ -5643,7 +5637,13 @@ pub(super) mod tests {
             let effect = page_mut(&mut conflict)
                 .take_external_edit_request()
                 .expect("regular-file conflict effect");
-            fs::write(&effect.path, "staged replacement").unwrap();
+            // A well-formed staged definition, so only the revision conflict
+            // can refuse the commit.
+            fs::write(
+                &effect.path,
+                vnext_workspace_agent("pointer-agent", "pointer fixture", "Zbody"),
+            )
+            .unwrap();
             let concurrent =
                 vnext_workspace_agent("pointer-agent", "pointer fixture", "Ybody").into_bytes();
             if replacement {
@@ -5674,8 +5674,13 @@ pub(super) mod tests {
             let before = fs::read(&target).unwrap();
             let mut chmod_race = agents_dialog(&tmp);
             focus(&mut chmod_race, "pointer-agent");
-            chmod_race.handle_key(press(KeyCode::Enter));
-            chmod_race.handle_key(press(KeyCode::Char('e')));
+            let edit_action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::Edit(row_id(
+                    &chmod_race,
+                    "pointer-agent",
+                )),
+            );
+            click_agent_action(&mut chmod_race, &edit_action);
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
             );
@@ -5691,8 +5696,8 @@ pub(super) mod tests {
             fs::write(&effect.path, "staged replacement").unwrap();
             // The suite may run under a process umask changed by another
             // regression, and the identity-replacement case above creates a
-            // fresh inode. Choose a mode relative to the live target so this
-            // is always a real metadata race rather than occasionally a no-op.
+            // fresh inode. Choose a mode relative to the live target so the
+            // concurrent chmod is always a real metadata change.
             let original_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
             let concurrent_mode = if original_mode == 0o600 { 0o640 } else { 0o600 };
             fs::set_permissions(&target, fs::Permissions::from_mode(concurrent_mode)).unwrap();
@@ -5704,22 +5709,23 @@ pub(super) mod tests {
             assert_eq!(
                 fs::read(&target).unwrap(),
                 before,
-                "chmod conflict keeps bytes"
+                "a refused commit keeps bytes"
             );
             assert_eq!(
                 fs::metadata(&target).unwrap().permissions().mode() & 0o777,
                 concurrent_mode,
-                "commit must not restore stale permissions after a concurrent chmod"
+                "the host never restores stale permissions after a concurrent chmod"
             );
             assert!(
                 page(&chmod_race).editing.is_some(),
-                "draft restored on chmod conflict"
+                "draft restored on a refused commit"
             );
             assert!(
-                page(&chmod_race)
-                    .status
-                    .as_deref()
-                    .is_some_and(|status| status.contains("metadata changed"))
+                page(&chmod_race).status.as_deref().is_some_and(
+                    |status| status.contains("failed to atomically commit external edit")
+                ),
+                "a refused commit is reported, got {:?}",
+                page(&chmod_race).status
             );
         }
 
@@ -5728,8 +5734,13 @@ pub(super) mod tests {
             use std::os::unix::fs::symlink;
             let mut swapped = agents_dialog(&tmp);
             focus(&mut swapped, "pointer-agent");
-            swapped.handle_key(press(KeyCode::Enter));
-            swapped.handle_key(press(KeyCode::Char('e')));
+            let edit_action = super::super::pointer_actions::SettingsPointerAction::Agents(
+                super::super::pointer_actions::AgentsAction::Edit(row_id(
+                    &swapped,
+                    "pointer-agent",
+                )),
+            );
+            click_agent_action(&mut swapped, &edit_action);
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::ExternalEditBegin(agent.clone()),
             );
@@ -5742,7 +5753,13 @@ pub(super) mod tests {
             let effect = page_mut(&mut swapped)
                 .take_external_edit_request()
                 .expect("symlink-swap effect");
-            fs::write(&effect.path, "staged replacement").unwrap();
+            // A well-formed staged definition, so only the swapped source can
+            // refuse the commit.
+            fs::write(
+                &effect.path,
+                vnext_workspace_agent("pointer-agent", "pointer fixture", "Zbody"),
+            )
+            .unwrap();
             let target = agents_dir.join("pointer-agent.md");
             let victim = tmp.path().join("symlink-victim.md");
             fs::write(&victim, "victim stays unchanged").unwrap();
@@ -5759,10 +5776,11 @@ pub(super) mod tests {
             );
             assert!(page(&swapped).editing.is_some(), "draft restored on swap");
             assert!(
-                page(&swapped)
-                    .status
-                    .as_deref()
-                    .is_some_and(|status| status.contains("symbolic link"))
+                page(&swapped).status.as_deref().is_some_and(
+                    |status| status.contains("failed to atomically commit external edit")
+                ),
+                "a swapped source refuses the commit, got {:?}",
+                page(&swapped).status
             );
         }
     }
@@ -5783,16 +5801,21 @@ pub(super) mod tests {
             // The pointer Edit action opens the in-TUI raw editor directly
             // (edit_selected_in_tui), bypassing the v2 detail-page guard.
             let edit_action = super::super::pointer_actions::SettingsPointerAction::Agents(
-                super::super::pointer_actions::AgentsAction::Edit(
-                    super::super::pointer_actions::AgentId::workspace("pointer-agent"),
-                ),
+                super::super::pointer_actions::AgentsAction::Edit(row_id(&dialog, "pointer-agent")),
             );
             click_agent_action(&mut dialog, &edit_action);
+            // The draft has to stay a publishable definition: the daemon
+            // refuses anything that does not parse, so the terminal action
+            // under test would never be reached.
             page_mut(&mut dialog)
                 .editing
                 .as_mut()
                 .expect("raw editor opens")
-                .paste("changed-by-pointer\n");
+                .replace_with_recovery_text(&vnext_workspace_agent(
+                    "pointer-agent",
+                    "pointer fixture",
+                    "changed-by-pointer",
+                ));
             let agent = super::super::pointer_actions::AgentId::workspace("pointer-agent");
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 if terminal == "save" {
@@ -5909,17 +5932,20 @@ pub(super) mod tests {
     pub(crate) fn run_pointer_agent_open_regression() {
         let source_tmp = TempDir::new().unwrap();
         let source = populated_pointer_agents_dialog(&source_tmp);
-        let identities = page(&source)
+        // A row identity is bound to its exact daemon-returned source, so each
+        // fixture workspace mints its own; only the names carry over.
+        let names = page(&source)
             .rows
             .iter()
-            .map(|row| row_agent_id(&row.name, &row.source))
+            .map(|row| row.name.clone())
             .collect::<Vec<_>>();
-        assert!(!identities.is_empty(), "populated Agents source has rows");
+        assert!(!names.is_empty(), "populated Agents source has rows");
 
-        for agent in &identities {
+        for name in &names {
             let tmp = TempDir::new().unwrap();
             let mut dialog = populated_pointer_agents_dialog(&tmp);
-            focus(&mut dialog, agent.name());
+            focus(&mut dialog, name);
+            let agent = row_id(&dialog, name);
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::Open(agent.clone()),
             );
@@ -5940,10 +5966,11 @@ pub(super) mod tests {
             );
         }
 
-        for agent in &identities {
+        for name in &names {
             let tmp = TempDir::new().unwrap();
             let mut dialog = populated_pointer_agents_dialog(&tmp);
-            focus(&mut dialog, agent.name());
+            focus(&mut dialog, name);
+            let agent = row_id(&dialog, name);
             let action = super::super::pointer_actions::SettingsPointerAction::Agents(
                 super::super::pointer_actions::AgentsAction::Edit(agent.clone()),
             );
@@ -5960,7 +5987,7 @@ pub(super) mod tests {
         let tmp = TempDir::new().unwrap();
         let mut dialog = populated_pointer_agents_dialog(&tmp);
         focus(&mut dialog, "pointer-agent");
-        let custom = super::super::pointer_actions::AgentId::workspace("pointer-agent");
+        let custom = row_id(&dialog, "pointer-agent");
         let delete = super::super::pointer_actions::SettingsPointerAction::Agents(
             super::super::pointer_actions::AgentsAction::Delete(custom.clone()),
         );
@@ -5996,15 +6023,15 @@ pub(super) mod tests {
             "cancelling ResetAll preserves configured agents"
         );
 
-        let builtin = super::super::pointer_actions::AgentId::workspace("Build");
+        let tmp = TempDir::new().unwrap();
+        let mut dialog = overridden_pointer_agent_dialog(&tmp, "Build");
+        let builtin = row_id(&dialog, "Build");
         let reset = super::super::pointer_actions::SettingsPointerAction::Agents(
             super::super::pointer_actions::AgentsAction::Reset(builtin.clone()),
         );
         let cancel = super::super::pointer_actions::SettingsPointerAction::Agents(
             super::super::pointer_actions::AgentsAction::Cancel(builtin),
         );
-        let tmp = TempDir::new().unwrap();
-        let mut dialog = overridden_pointer_agent_dialog(&tmp, "Build");
         click_agent_action(&mut dialog, &reset);
         assert!(page(&dialog).reset_one.is_pending());
         assert!(tmp.path().join(".cockpit/agents/Build.md").exists());
@@ -6017,6 +6044,10 @@ pub(super) mod tests {
 
         let tmp = TempDir::new().unwrap();
         let mut dialog = overridden_pointer_agent_dialog(&tmp, "Build");
+        let builtin = row_id(&dialog, "Build");
+        let reset = super::super::pointer_actions::SettingsPointerAction::Agents(
+            super::super::pointer_actions::AgentsAction::Reset(builtin),
+        );
         click_agent_action(&mut dialog, &reset);
         assert!(page(&dialog).reset_one.is_pending());
         click_agent_action(&mut dialog, &reset);
@@ -6043,19 +6074,6 @@ pub(super) mod tests {
         let metadata = fs::symlink_metadata(&staging.path).unwrap();
         assert!(metadata.is_file());
         assert!(!metadata.file_type().is_symlink());
-    }
-
-    #[cfg(not(unix))]
-    #[test]
-    fn external_editor_metadata_detects_readonly_permission_change() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("agent.md");
-        fs::write(&path, "agent").unwrap();
-        let original = AgentFileMetadata::capture(&fs::metadata(&path).unwrap());
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_readonly(!permissions.readonly());
-        fs::set_permissions(&path, permissions).unwrap();
-        assert!(!original.matches(&fs::metadata(&path).unwrap()));
     }
 
     #[test]

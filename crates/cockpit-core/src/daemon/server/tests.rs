@@ -16371,6 +16371,7 @@ async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
             authz_matrix_request(case.kind, session_id, tmp.path()),
         )
         .await;
+        #[cfg_attr(not(feature = "remote"), allow(irrefutable_let_patterns))]
         let AuthzExpectation::Allow(expected) = case.expectation(AuthzLevel::Owner) else {
             panic!("{} must authorize the local owner", case.kind);
         };
@@ -16719,8 +16720,18 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "pin"
             | "refresh_env"
             | "refresh_config"
-    ) || (kind == "get_inventory_bundle" && level != AuthzLevel::NoAccess)
+    ) || authz_kind_needs_attached_state_remote(kind, level)
+}
+
+#[cfg(all(unix, feature = "remote"))]
+fn authz_kind_needs_attached_state_remote(kind: &str, level: AuthzLevel) -> bool {
+    (kind == "get_inventory_bundle" && level != AuthzLevel::NoAccess)
         || (kind == "lsp_control" && matches!(level, AuthzLevel::Owner | AuthzLevel::Writer))
+}
+
+#[cfg(all(unix, not(feature = "remote")))]
+fn authz_kind_needs_attached_state_remote(_kind: &str, _level: AuthzLevel) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -24744,6 +24755,14 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         PurgeEndedSessions,
         GetAssistant,
         DeleteAssistant,
+        SaveAssistantDefinition,
+        GetAgentInventory,
+        GetAgentEditSnapshot,
+        MutateAgent,
+        BeginAgentEditorLease,
+        CompleteAgentEditorLease,
+        GetExtendedConfigSnapshot,
+        ApplyExtendedConfigPatch,
         DiagnoseMediaReservation,
         RepairMediaReservation,
         GetDoctorSnapshot,

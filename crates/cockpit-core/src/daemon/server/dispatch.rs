@@ -17588,6 +17588,24 @@ async fn save_mcp_config(
     let secret_values: std::collections::BTreeMap<String, proto::SensitiveWirePayload> =
         serde_json::from_str(secret_values_json)
             .map_err(|error| bad_request(format!("invalid MCP secret values: {error}")))?;
+    let cwd = std::path::PathBuf::from(project_root);
+    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
+        .await
+        .map_err(workspace_trust_error)?;
+    let mcp_paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
+    // Clients edit the owner-view projection (`redacted_mcp_config_json`), so
+    // an unedited credential comes back as the redaction sentinel, not the
+    // stored value. Restore the daemon's current values at those positions
+    // before validation — otherwise every save from a redacted view would
+    // either persist the sentinel or fail the literal check. Restored legacy
+    // literals are staged (unless the caller staged that reference itself) so
+    // migration to the vault stays daemon-owned and atomic.
+    let prior_merged = mcp_config_from_paths(&mcp_paths)?;
+    for (reference, value) in
+        crate::mcp::config::restore_owner_view_redactions(&mut config, &prior_merged)
+    {
+        secret_values.entry(reference).or_insert(value);
+    }
     for (name, value) in &secret_values {
         if name.is_empty() || name.len() > cockpit_proto::MAX_OWNER_SECRET_NAME_BYTES {
             return Err(bad_request("MCP secret name exceeds maximum length"));
@@ -17602,11 +17620,6 @@ async fn save_mcp_config(
     // alongside a staged secret, and reject every other literal before either
     // the vault transaction or config publication starts.
     validate_and_normalize_mcp_credentials(&mut config, &secret_values)?;
-    let cwd = std::path::PathBuf::from(project_root);
-    let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
-        .await
-        .map_err(workspace_trust_error)?;
-    let mcp_paths = daemon_mcp_paths(ctx, &cwd, &trust_policy)?;
     let target = mcp_paths.last().cloned().or_else(|| {
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             cockpit_config::config::dirs::most_specific_config_write_target(&cwd)

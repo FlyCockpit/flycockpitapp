@@ -974,46 +974,55 @@ impl App {
         self.push_plain("/stop: cancelled.".to_string());
     }
 
-    /// Resolve the layered `mcp.json` path for the cwd (first discovered
-    /// `.cockpit/`), preferring an existing file, else the first creatable.
-    pub(super) fn mcp_config_path(&self) -> Option<std::path::PathBuf> {
-        let cwd = &self.launch.cwd;
-        for d in cockpit_config::dirs::discover_config_dirs(cwd) {
-            let p = d.path.join("mcp.json");
-            if p.exists() {
-                return Some(p);
-            }
-        }
-        cockpit_config::dirs::cwd_scoped_creatable_dirs(cwd)
-            .into_iter()
-            .next()
-            .map(|d| d.path.join("mcp.json"))
-    }
-
-    pub(super) fn mcp_load(&self) -> cockpit_core::mcp::config::McpConfig {
+    /// The daemon-owned MCP projection for the launch cwd. `None` means the
+    /// daemon could not answer; callers that write back must not mistake that
+    /// for an empty config.
+    pub(super) fn mcp_snapshot(&self) -> Option<cockpit_core::mcp::config::McpConfig> {
         #[cfg(test)]
         MCP_LOAD_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        cockpit_core::mcp::config::McpConfig::discover(&self.launch.cwd)
+        crate::tui::settings::daemon_mcp_snapshot_for_root(&self.launch.cwd)
     }
 
+    /// Publish an edited MCP config through the daemon-owned save RPC. `cfg`
+    /// is the owner-view projection from [`Self::mcp_snapshot`]: the daemon
+    /// restores real values behind any redaction sentinels it echoed, so no
+    /// credential material moves through (or is lost by) this client.
     pub(super) fn mcp_save(&mut self, cfg: &cockpit_core::mcp::config::McpConfig) -> bool {
         self.slash_menu_cache.borrow_mut().take();
-        let Some(path) = self.mcp_config_path() else {
-            self.push_plain("No writable .cockpit/ directory for MCP config".to_string());
-            return false;
-        };
-        match cfg.write_private(&path) {
-            Ok(_) => true,
+        let config_json = match serde_json::to_string(cfg) {
+            Ok(json) => json,
             Err(_) => {
-                self.push_plain("Failed to write mcp.json".to_string());
+                self.push_plain("Failed to serialize MCP config".to_string());
+                return false;
+            }
+        };
+        let request = cockpit_core::daemon::proto::Request::SaveMcpConfig {
+            project_root: self.launch.cwd.display().to_string(),
+            config_json,
+            secret_values_json: "{}".to_string(),
+            cleanup_names_json: "[]".to_string(),
+        };
+        match crate::tui::agent_runner::daemon_request_blocking(request) {
+            Ok(cockpit_core::daemon::proto::Response::McpConfigSaved { .. }) => true,
+            Ok(_) => {
+                self.push_plain(
+                    "Failed to save MCP config: unexpected daemon response".to_string(),
+                );
+                false
+            }
+            Err(error) => {
+                self.push_plain(format!("Failed to save MCP config: {error}"));
                 false
             }
         }
     }
 
     pub(super) fn mcp_list(&mut self) {
-        let cfg = self.mcp_load();
+        let Some(cfg) = self.mcp_snapshot() else {
+            self.push_plain("MCP status unavailable: the daemon could not be reached.".to_string());
+            return;
+        };
         if cfg.servers.is_empty() {
             self.push_plain("No MCP servers configured.".to_string());
             return;
@@ -1037,7 +1046,10 @@ impl App {
     /// `/mcp on|off|toggle [id]`. `enable=None` toggles; a mixed set toggled
     /// in bulk turns all **off** (spec). `id=None` applies to every server.
     pub(super) fn mcp_set_enabled(&mut self, id: Option<&str>, enable: Option<bool>) {
-        let mut cfg = self.mcp_load();
+        let Some(mut cfg) = self.mcp_snapshot() else {
+            self.push_plain("MCP status unavailable: the daemon could not be reached.".to_string());
+            return;
+        };
         if let Some(id) = id {
             let Some(server) = cfg.servers.get_mut(id) else {
                 self.push_plain(format!("Unknown MCP server `{id}`"));

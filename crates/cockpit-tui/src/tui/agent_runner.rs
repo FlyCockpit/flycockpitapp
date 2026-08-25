@@ -2965,25 +2965,33 @@ fn local_guidance_estimate(
 /// `AsyncActionRunner::start_blocking`/`spawn_blocking` worker; reducers and
 /// event handlers use typed async effects. `Err(String)` for any
 /// transport/typed failure.
-fn daemon_request_blocking(req: Request) -> Result<Response, String> {
-    use cockpit_core::daemon::{DaemonStatus, discover};
-    let runtime =
-        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
-    tokio::task::block_in_place(|| {
-        runtime.block_on(async {
-            let probe = discover().await;
-            if !matches!(probe.status, DaemonStatus::Running) {
-                return Err("daemon not running".to_string());
-            }
-            let client = cockpit_core::daemon::client::DaemonClient::connect(&probe.paths.socket)
-                .await
-                .map_err(|e| format!("daemon connect: {e}"))?;
-            client
-                .request_ok(req)
-                .await
-                .map_err(|e| format!("daemon request: {e}"))
+pub(crate) fn daemon_request_blocking(req: Request) -> Result<Response, String> {
+    #[cfg(test)]
+    {
+        return crate::tui::settings::test_daemon_request(req);
+    }
+    #[cfg(not(test))]
+    {
+        use cockpit_core::daemon::{DaemonStatus, discover};
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                let probe = discover().await;
+                if !matches!(probe.status, DaemonStatus::Running) {
+                    return Err("daemon not running".to_string());
+                }
+                let client =
+                    cockpit_core::daemon::client::DaemonClient::connect(&probe.paths.socket)
+                        .await
+                        .map_err(|e| format!("daemon connect: {e}"))?;
+                client
+                    .request_ok(req)
+                    .await
+                    .map_err(|e| format!("daemon request: {e}"))
+            })
         })
-    })
+    }
 }
 
 /// Blocking daemon transport for an [`AsyncActionRunner::start_blocking`]

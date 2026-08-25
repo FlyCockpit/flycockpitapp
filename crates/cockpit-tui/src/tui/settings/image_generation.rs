@@ -2189,7 +2189,7 @@ mod tests {
         let path = tmp.path().join("config.json");
         std::fs::write(&path, "{}").unwrap();
         std::mem::forget(tmp);
-        super::super::SettingsDialog::open(path)
+        super::super::tests::open_fixture_dialog(&path)
     }
 
     fn render_page_lines(

@@ -15,6 +15,7 @@ pub(crate) fn force_sidecar_parent_sync_failure_for_test(path: Option<PathBuf>) 
         .expect("sidecar sync failure hook poisoned") = path;
 }
 
+#[cfg(unix)]
 fn sidecar_parent_sync_forced_failure(path: &Path) -> bool {
     #[cfg(test)]
     {

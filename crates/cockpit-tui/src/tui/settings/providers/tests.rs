@@ -167,7 +167,7 @@ fn dialog_with_config(config: ProvidersConfig) -> (tempfile::TempDir, SettingsDi
     std::fs::write(&path, "{}").unwrap();
     let mut doc = ConfigDoc::load(&path).unwrap();
     doc.write(&config).unwrap();
-    let mut dialog = SettingsDialog::open(path);
+    let mut dialog = super::super::tests::open_fixture_dialog(&path);
     dialog.active_project_root = Some(tmp.path().to_path_buf());
     let trust_root = cockpit_config::config::trust::resolve_trust_root(tmp.path())
         .expect("provider fixture trust root");

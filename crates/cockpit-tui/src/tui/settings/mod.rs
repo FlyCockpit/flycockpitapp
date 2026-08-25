@@ -43,6 +43,8 @@ mod auth;
 mod category;
 mod dependencies_page;
 mod descriptor;
+#[cfg(test)]
+pub(crate) mod disk_daemon_fake;
 mod grab;
 mod harnesses_page;
 mod image_generation;
@@ -939,16 +941,24 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn settings_daemon_request(request: Request) -> Result<Response, String> {
-    #[cfg(test)]
+pub(crate) fn test_daemon_request(request: Request) -> Result<Response, String> {
     if let Some(effect) = TEST_SETTINGS_DAEMON_EFFECT.with(|slot| slot.borrow().clone()) {
         return effect.request(request);
     }
+    disk_daemon_fake::default_effect().request(request)
+}
+
+fn settings_daemon_request(request: Request) -> Result<Response, String> {
+    #[cfg(test)]
+    {
+        return test_daemon_request(request);
+    }
+    #[cfg(not(test))]
     ProductionSettingsDaemonEffect.request(request)
 }
 
 #[cfg(test)]
-fn with_settings_daemon_effect<T>(
+pub(crate) fn with_settings_daemon_effect<T>(
     effect: Arc<dyn SettingsDaemonEffect>,
     operation: impl FnOnce() -> T,
 ) -> T {
@@ -2096,7 +2106,9 @@ fn denylist_mutations(
     base: &serde_json::Value,
     desired: &[String],
 ) -> Result<Vec<cockpit_core::daemon::proto::DesiredDenylistEntry>, String> {
-    use cockpit_core::daemon::proto::{DesiredDenylistEntry as D, RedactedDenylistEntry};
+    use cockpit_core::daemon::proto::{
+        DesiredDenylistEntry as D, RedactedDenylistEntry, SensitiveWireLiteral,
+    };
     let entries: Vec<RedactedDenylistEntry> = serde_json::from_value(
         base.get("__cockpit_denylist_entries")
             .cloned()
@@ -2130,7 +2142,7 @@ fn denylist_mutations(
                 }
                 target.push(D::New {
                     client_nonce: uuid::Uuid::new_v4().to_string(),
-                    literal: value.to_owned(),
+                    literal: SensitiveWireLiteral::new(value.to_owned()),
                 });
             }
         }
@@ -8202,6 +8214,16 @@ fn config_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
         .and_then(std::path::Path::parent)
         .or_else(|| path.parent())
         .map(std::path::Path::to_path_buf)
+}
+
+/// The daemon-owned MCP projection for a project root. `None` means the
+/// daemon could not answer, which is distinct from "no servers configured".
+pub(crate) fn daemon_mcp_snapshot_for_root(
+    root: &std::path::Path,
+) -> Option<cockpit_core::mcp::config::McpConfig> {
+    daemon_provider_view_snapshot(root, None)
+        .and_then(|config| config.mcp_config_json)
+        .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
 }
 
 fn provider_entries_equal(left: &ProviderEntry, right: &ProviderEntry) -> bool {

@@ -1210,6 +1210,7 @@ mod redaction_placeholder_guard_tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             shutdown_gate: crate::daemon::shutdown::ShutdownSignal::new(),
             approver: None,
+            image_generation_dispatch: None,
             deferred_log: crate::engine::deferred::DeferredLog::new(),
             root_agent_frame: true,
             skill_write_origin: crate::skills::manage::SkillWriteOrigin::Foreground,

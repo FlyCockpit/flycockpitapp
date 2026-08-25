@@ -923,6 +923,15 @@ pub struct ToolCtx {
     /// skips the prompt — it never silently denies. Shared `Arc` so one
     /// approver instance backs the whole delegation tree.
     pub approver: Option<Arc<crate::approval::Approver>>,
+    /// Session-scoped image-generation dispatch funnel. The `generate_image`
+    /// tool routes an authorized request through this to the central
+    /// [`crate::approval::Approver`] chokepoint and, on `Allow`, a durable
+    /// queued job. `None` until the daemon wires it with the runtime registry +
+    /// owner context (lands with the upstream adapter-map reconciliation); a
+    /// missing funnel makes the tool report that dispatch is unavailable in this
+    /// session rather than fabricating an outcome.
+    pub image_generation_dispatch:
+        Option<std::sync::Arc<crate::image_generation_job::ImageGenerationDispatchService>>,
     /// The current frame's deferred-log buffer (`plan.md §3d`). A subagent's
     /// `defer_to_orchestrator` tool appends out-of-scope asks here; the
     /// driver drains it when the frame pops and folds it into the report the

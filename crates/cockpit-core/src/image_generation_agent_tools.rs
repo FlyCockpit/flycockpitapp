@@ -867,43 +867,229 @@ impl Tool for GenerateImageTool {
         Some(image_generation_tool_schema(self.name()))
     }
 
-    async fn call(&self, args: Value, _ctx: &ToolCtx) -> Result<ToolOutput> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         // Validate the arguments through the strict schema layer before
         // any provider contact. The composite authorization decision is
         // computed centrally before dispatch.
         validate_generate_image_args(&args)?;
-        let prompt = args
-            .get("prompt")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_input("`prompt` is required"))?;
-        let directory = args
-            .get("directory")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_input("`directory` is required"))?;
-        let base_stem = args
-            .get("base_stem")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_input("`base_stem` is required"))?;
-        let target_count = args
-            .get("targets")
-            .and_then(Value::as_array)
-            .map_or(1, |t| t.len() as u32);
-        let total_outputs = args
-            .get("targets")
-            .and_then(Value::as_array)
-            .map_or(1, |t| {
-                t.iter()
-                    .map(|target| target.get("samples").and_then(Value::as_u64).unwrap_or(1) as u32)
-                    .sum()
-            });
-        Ok(ToolOutput::text(format!(
-            "Image generation plan created for prompt: \"{prompt:.80}\"\n\nTargets: \
-             {target_count}\nTotal outputs: {total_outputs}\nOutput directory: \
-             {directory}\nBase stem: {base_stem}\n\nThe plan is pending composite \
-             authorization and dispatch. Use `get_image_generation_job` to check \
-             status."
-        )))
+        let dispatch_args = parse_generate_image_dispatch_args(&args)?;
+
+        // Route through the session-scoped dispatch funnel, which owns the
+        // central [`crate::approval::Approver`] chokepoint and durable job
+        // commit. Both the funnel and an approver must be present; otherwise the
+        // request cannot be authorized in this session. Nothing here fabricates
+        // an outcome, and no prompt text, raw path, secret, or reference byte is
+        // ever surfaced — the dispatch service returns only redacted, model-safe
+        // copy.
+        let (Some(service), Some(approver)) =
+            (ctx.image_generation_dispatch.as_ref(), ctx.approver.as_ref())
+        else {
+            return Ok(ToolOutput::text(
+                "Image generation dispatch is not available in this session. No job was created \
+                 and no provider was contacted."
+                    .to_string(),
+            ));
+        };
+
+        match service
+            .dispatch_generate_image(&ctx.session, approver, &dispatch_args)
+            .await?
+        {
+            crate::image_generation_job::GenerateImageDispatchOutcome::Queued { job_id } => {
+                Ok(ToolOutput::text(format!(
+                    "Image generation job `{job_id}` was authorized and queued. Use \
+                     `get_image_generation_job` with this id to check status; \
+                     `cancel_image_generation_job` requests idempotent cancellation."
+                )))
+            }
+            crate::image_generation_job::GenerateImageDispatchOutcome::Refused { reason } => {
+                // `reason` is already redacted, model-safe copy. No job was
+                // created and no provider was contacted.
+                Ok(ToolOutput::text(reason))
+            }
+            crate::image_generation_job::GenerateImageDispatchOutcome::Incompatible {
+                alternatives,
+            } => Ok(ToolOutput::text(format_incompatible_alternatives(&alternatives))),
+        }
     }
+}
+
+/// Parse already-schema-validated `generate_image` arguments into the owned
+/// dispatch DTO. Shared top-level `width`/`height`/`format` are the default for
+/// every target; a per-target value overrides when present. `samples` defaults
+/// to 1. When `targets` is omitted the schema means "the configured default
+/// target with one sample": a single placeholder target with an empty
+/// `target_id` is emitted, which the daemon reconciliation resolves to the
+/// configured default when the adapter map lands. References are a flat list;
+/// each target is bound to every reference by index.
+fn parse_generate_image_dispatch_args(
+    args: &Value,
+) -> Result<crate::image_generation_job::GenerateImageDispatchArgs> {
+    let prompt = args
+        .get("prompt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_input("`prompt` is required"))?
+        .to_string();
+    let directory = args
+        .get("directory")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_input("`directory` is required"))?
+        .to_string();
+    let base_stem = args
+        .get("base_stem")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_input("`base_stem` is required"))?
+        .to_string();
+
+    // Shared defaults. Absent dimensions are carried as 0, the "provider
+    // default / nearest supported" sentinel for the non-optional DTO field;
+    // absent format defaults to `png`.
+    let shared_width = args.get("width").and_then(Value::as_u64).map(|v| v as u32);
+    let shared_height = args.get("height").and_then(Value::as_u64).map(|v| v as u32);
+    let shared_format = args
+        .get("format")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let references: Vec<ImageReferenceTag> = args
+        .get("references")
+        .and_then(Value::as_array)
+        .map(|refs| {
+            refs.iter()
+                .map(parse_image_reference_tag)
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    // The flat reference list carries no per-target binding in the schema, so
+    // every target is bound to every reference by index.
+    let all_reference_indices: Vec<usize> = (0..references.len()).collect();
+
+    let targets = match args.get("targets").and_then(Value::as_array) {
+        Some(entries) if !entries.is_empty() => entries
+            .iter()
+            .map(|entry| {
+                parse_generate_image_dispatch_target(
+                    entry,
+                    shared_width,
+                    shared_height,
+                    shared_format.as_deref(),
+                    &all_reference_indices,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?,
+        _ => vec![crate::image_generation_job::GenerateImageDispatchTarget {
+            target_id: String::new(),
+            samples: 1,
+            width: shared_width.unwrap_or(0),
+            height: shared_height.unwrap_or(0),
+            format: shared_format.clone().unwrap_or_else(|| "png".to_string()),
+            parameters: BTreeMap::new(),
+            reference_indices: all_reference_indices.clone(),
+        }],
+    };
+
+    Ok(crate::image_generation_job::GenerateImageDispatchArgs {
+        prompt,
+        directory,
+        base_stem,
+        targets,
+        references,
+    })
+}
+
+/// Parse one schema-validated target entry into a resolved dispatch target,
+/// folding in the shared width/height/format defaults.
+fn parse_generate_image_dispatch_target(
+    entry: &Value,
+    shared_width: Option<u32>,
+    shared_height: Option<u32>,
+    shared_format: Option<&str>,
+    all_reference_indices: &[usize],
+) -> Result<crate::image_generation_job::GenerateImageDispatchTarget> {
+    let target_id = entry
+        .get("target_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_input("each target requires a `target_id`"))?
+        .to_string();
+    let samples = entry
+        .get("samples")
+        .and_then(Value::as_u64)
+        .unwrap_or(1) as u32;
+    let width = entry
+        .get("width")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32)
+        .or(shared_width)
+        .unwrap_or(0);
+    let height = entry
+        .get("height")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32)
+        .or(shared_height)
+        .unwrap_or(0);
+    let format = entry
+        .get("format")
+        .and_then(Value::as_str)
+        .or(shared_format)
+        .unwrap_or("png")
+        .to_string();
+    let parameters: BTreeMap<String, TypedParameter> = match entry.get("parameters") {
+        Some(parameters) => serde_json::from_value(parameters.clone())
+            .map_err(|err| invalid_input(format!("invalid target `parameters`: {err}")))?,
+        None => BTreeMap::new(),
+    };
+    Ok(crate::image_generation_job::GenerateImageDispatchTarget {
+        target_id,
+        samples,
+        width,
+        height,
+        format,
+        parameters,
+        reference_indices: all_reference_indices.to_vec(),
+    })
+}
+
+/// Build a typed reference tag from a schema-validated reference object. The
+/// validator guarantees exactly one of `attachment_id` / `local_path`.
+fn parse_image_reference_tag(reference: &Value) -> Result<ImageReferenceTag> {
+    if let Some(attachment_id) = reference.get("attachment_id").and_then(Value::as_str) {
+        Ok(ImageReferenceTag::Attachment {
+            attachment_id: attachment_id.to_string(),
+        })
+    } else if let Some(local_path) = reference.get("local_path").and_then(Value::as_str) {
+        Ok(ImageReferenceTag::LocalPath {
+            local_path: local_path.to_string(),
+        })
+    } else {
+        Err(invalid_input(
+            "each reference must tag exactly one of `attachment_id` or `local_path`",
+        ))
+    }
+}
+
+/// Render the redacted per-target capability alternatives from an
+/// `Incompatible` dispatch outcome into model-safe text. Never surfaces a
+/// prompt, raw path, secret, or reference byte.
+fn format_incompatible_alternatives(
+    alternatives: &[crate::image_generation_job::ImageGenerationTargetAlternativeV1],
+) -> String {
+    let mut lines = vec![
+        "Image generation was not dispatched: the requested targets are incompatible with their \
+         sealed capability. No job was created and no provider was contacted."
+            .to_string(),
+    ];
+    for alternative in alternatives {
+        lines.push(format!(
+            "- target `{}`: formats [{}], max {}x{} — {}",
+            alternative.target_id,
+            alternative.supported_formats.join(", "),
+            alternative.maximum_width,
+            alternative.maximum_height,
+            alternative.reason,
+        ));
+    }
+    lines.join("\n")
 }
 
 /// `get_image_generation_job` — query durable job status.

@@ -2193,6 +2193,7 @@ pub(crate) async fn run_turn(
         cancel,
         shutdown_gate: agent.model.shutdown_gate(),
         approver,
+        image_generation_dispatch: None,
         deferred_log,
         root_agent_frame: is_root,
         skill_write_origin,

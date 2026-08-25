@@ -1453,6 +1453,11 @@ pub(crate) async fn recover_image_config_mutation_journals(
             let terminal = receipt_outcome
                 .as_deref()
                 .ok_or_else(|| internal("terminal image mutation receipt omitted its outcome"))?;
+            if terminal != response_json {
+                return Err(internal(
+                    "terminal image mutation receipt does not exactly match its journaled response",
+                ));
+            }
             let response: Response = serde_json::from_str(terminal).map_err(internal)?;
             let Response::ImageControlMutated(receipt) = response else {
                 return Err(internal(

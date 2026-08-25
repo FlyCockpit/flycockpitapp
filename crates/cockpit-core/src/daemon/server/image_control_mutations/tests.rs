@@ -723,6 +723,8 @@ fn durability_source_ratchet_requires_exact_cas_journal_and_post_commit_publicat
     assert!(recovery.contains("receipt.state"));
     assert!(recovery.contains("receipt.terminal_outcome_json"));
     assert!(recovery.contains("if receipt_state == \"terminal_success\""));
+    assert!(recovery.contains("if terminal != response_json"));
+    assert!(recovery.contains("does not exactly match its journaled response"));
     assert!(recovery.contains("actual != intended"));
     assert!(recovery.contains("if actual == intended"));
     assert!(recovery.contains("publication_phase == \"prepared\""));

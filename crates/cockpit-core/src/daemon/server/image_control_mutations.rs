@@ -1391,6 +1391,7 @@ pub(crate) async fn recover_image_config_mutation_journals(
         String,
         String,
         String,
+        u64,
         String,
         String,
         String,
@@ -1405,7 +1406,7 @@ pub(crate) async fn recover_image_config_mutation_journals(
             let mut statement = conn.prepare(
                 "SELECT journal.owner_digest,journal.client_operation_id,journal.request_hash,
                     journal.fencing_generation,journal.target_path,journal.consumed_revision,
-                    journal.intended_revision,journal.publication_phase,
+                    journal.intended_revision,journal.consumed_generation,journal.publication_phase,
                     journal.terminal_response_json,receipt.state,
                     receipt.terminal_outcome_json,receipt.request_hash,
                     receipt.fencing_generation,receipt.operation_kind
@@ -1432,6 +1433,7 @@ pub(crate) async fn recover_image_config_mutation_journals(
                         row.get(11)?,
                         row.get(12)?,
                         row.get(13)?,
+                        row.get(14)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1448,6 +1450,7 @@ pub(crate) async fn recover_image_config_mutation_journals(
         target,
         consumed,
         intended,
+        consumed_generation,
         publication_phase,
         response_json,
         receipt_state,
@@ -1553,9 +1556,18 @@ pub(crate) async fn recover_image_config_mutation_journals(
                             "terminal image journal has the wrong publication receipt",
                         ));
                     };
-                    inventory::publish_committed_config_generation_at_least(
-                        committed.result_config_generation,
-                    );
+                    let expected_generation =
+                        consumed_generation.saturating_add(u64::from(intended != consumed));
+                    if committed.client_operation_id != operation
+                        || committed.consumed_revision != consumed
+                        || committed.result_revision != intended
+                        || committed.result_config_generation != expected_generation
+                    {
+                        return Err(internal(
+                            "terminal image publication receipt does not bind its journal",
+                        ));
+                    }
+                    inventory::publish_committed_config_generation_at_least(expected_generation);
                 }
             }
             let retire_owner = owner;

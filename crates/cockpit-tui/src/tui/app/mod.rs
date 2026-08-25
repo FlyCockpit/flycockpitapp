@@ -3689,9 +3689,20 @@ impl App {
         .await;
         if let Some(notice) = self.startup_daemon_notice.take() {
             let key = cockpit_core::daemon::proto::AppFlagKey::DaemonAutostartNotice;
-            let state = crate::tui::agent_runner::daemon_request_blocking(
-                cockpit_core::daemon::proto::Request::GetAppFlag { key },
-            );
+            // Startup is already async. Await the daemon directly so the runtime
+            // worker remains available to the daemon connection and terminal
+            // event sources instead of synchronously re-entering it.
+            let state = async {
+                let client = crate::tui::settings::settings_daemon_client()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                client
+                    .request(cockpit_core::daemon::proto::Request::GetAppFlag { key })
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())
+            }
+            .await;
             match state {
                 Ok(cockpit_core::daemon::proto::Response::AppFlag { seen: true, .. }) => {}
                 Ok(cockpit_core::daemon::proto::Response::AppFlag {
@@ -3699,12 +3710,20 @@ impl App {
                     version,
                     ..
                 }) => {
-                    let _ = crate::tui::agent_runner::daemon_request_blocking(
-                        cockpit_core::daemon::proto::Request::MarkAppFlagSeen {
-                            key,
-                            expected_version: version,
-                        },
-                    );
+                    let _ = async {
+                        let client = crate::tui::settings::settings_daemon_client()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        client
+                            .request(cockpit_core::daemon::proto::Request::MarkAppFlagSeen {
+                                key,
+                                expected_version: version,
+                            })
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .map_err(|error| error.to_string())
+                    }
+                    .await;
                     self.show_toast(notice, ToastKind::Info);
                 }
                 _ => self.show_toast(notice, ToastKind::Info),

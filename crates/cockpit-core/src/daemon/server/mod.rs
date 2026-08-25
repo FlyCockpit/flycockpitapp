@@ -624,6 +624,22 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::SubscriptionAckCommitted { .. }
         | proto::Response::AppFlag { .. }
         | proto::Response::AppFlagSeen { .. } => {}
+        proto::Response::LocalOperationSettlement {
+            response,
+            terminal_error,
+            ..
+        } => {
+            // Settlement is an envelope around another response. Apply the
+            // same backstop recursively so an owner-only nested response can
+            // never bypass the principal-specific scrubber when that receipt
+            // is later queried by another allowed principal.
+            if let Some(response) = response {
+                scrub_response_free_text(response, redact);
+            }
+            if let Some(error) = terminal_error {
+                scrub_string(&mut error.message, redact);
+            }
+        }
         proto::Response::ProviderCredentialCommitted { project_root, .. } => {
             if let Some(root) = project_root {
                 scrub_string(root, redact);

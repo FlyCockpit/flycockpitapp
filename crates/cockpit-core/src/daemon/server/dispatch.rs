@@ -7804,42 +7804,75 @@ async fn handle_serialized_request_impl(
                 let item_id = format!("{}{}", crate::auth::subscription_ack::PREFIX, provider_id);
                 let payload =
                     serde_json::to_vec(&serde_json::Value::Bool(true)).map_err(internal)?;
-                let consumed_vault_generation = ctx
-                    .secret_vault
-                    .current_inventory_generation()
-                    .map_err(|error| internal(anyhow::anyhow!(error)))?;
-                let changed = ctx
-                    .secret_vault
-                    .get_item(
-                        cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
-                        &item_id,
-                    )
-                    .map(|current| current.as_slice() != payload.as_slice())
-                    .unwrap_or(true);
-                ctx.mutate_owner_vault_item(
-                    cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
-                    &item_id,
-                    Some(&payload),
-                )
-                .map_err(internal)?;
-                let response = Response::SubscriptionAckCommitted {
-                    client_operation_id: client_operation_id.clone(),
-                    provider_id: provider_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&request_hash),
-                    changed,
-                    consumed_vault_generation,
-                    result_vault_generation: consumed_vault_generation
-                        .saturating_add(u64::from(changed)),
-                };
-                finish_local_operation(
-                    ctx,
-                    settlement_owner.clone(),
-                    client_operation_id.clone(),
-                    request_hash,
-                    fencing_generation,
-                    &response,
-                )
-                .await?;
+                let vault = ctx.secret_vault.clone();
+                let owner = settlement_owner.clone();
+                let operation_id = client_operation_id.clone();
+                let provider = provider_id.clone();
+                let item_id_for_tx = item_id.clone();
+                let payload_for_tx = payload.clone();
+                let response = ctx
+                    .db
+                    .transaction(move |conn| {
+                        cockpit_db::secret_vault::ensure_inventory_generation_conn(conn)?;
+                        let consumed_vault_generation =
+                            cockpit_db::secret_vault::inventory_generation_conn(conn)?;
+                        let changed = match vault.get_item_on_conn(
+                            conn,
+                            cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
+                            &item_id_for_tx,
+                        ) {
+                            Ok(current) => current.as_slice() != payload_for_tx.as_slice(),
+                            Err(crate::secure_key::SecureKeyError::NotFound(_)) => true,
+                            Err(error) => return Err(anyhow::anyhow!(error)),
+                        };
+                        if changed {
+                            vault
+                                .mutate_item_on_conn(
+                                    conn,
+                                    cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
+                                    &item_id_for_tx,
+                                    Some(payload_for_tx.as_slice()),
+                                )
+                                .map_err(|error| anyhow::anyhow!(error))?;
+                        }
+                        let result_vault_generation =
+                            cockpit_db::secret_vault::inventory_generation_conn(conn)?;
+                        let response = Response::SubscriptionAckCommitted {
+                            client_operation_id: operation_id.clone(),
+                            provider_id: provider,
+                            request_hash: local_operation_request_hash_hex(&request_hash),
+                            changed,
+                            consumed_vault_generation,
+                            result_vault_generation,
+                        };
+                        let receipt_json = serde_json::to_string(&response)?;
+                        let settled = conn.execute(
+                            "UPDATE local_operation_receipts
+                             SET state='terminal_success',terminal_outcome_json=?5,
+                                 execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                             WHERE owner_digest=?1 AND client_operation_id=?2
+                               AND request_hash=?3 AND fencing_generation=?4
+                               AND state='executing'",
+                            rusqlite::params![
+                                owner,
+                                operation_id,
+                                request_hash.as_slice(),
+                                fencing_generation,
+                                receipt_json,
+                                chrono::Utc::now().timestamp_millis()
+                            ],
+                        )?;
+                        if settled != 1 {
+                            anyhow::bail!("subscription acknowledgement lost its receipt fence");
+                        }
+                        Ok(response)
+                    })
+                    .await
+                    .map_err(internal)?;
+                if let Err(error) = ctx.publish_owner_redaction_table() {
+                    ctx.poison_redaction_publication(&error);
+                    tracing::error!(%error, "subscription acknowledgement committed but redaction publication failed; daemon poisoned");
+                }
                 Ok(response)
             }
             .await;
@@ -12601,7 +12634,22 @@ async fn finish_local_operation_error(
         );
         return Ok(());
     }
-    let error_json = serde_json::to_string(error).map_err(internal)?;
+    // Local receipts survive daemon restarts and are queryable independently
+    // of the request that produced them. Never persist an anyhow/provider/
+    // filesystem-derived message here: those strings can contain paths,
+    // response bodies, or secret-adjacent diagnostics. The typed code remains
+    // authoritative while the public message is deliberately fixed and
+    // bounded. Detailed diagnostics stay in process-local logs only.
+    let terminal_error = ErrorPayload {
+        code: error.code.clone(),
+        message: if error.code == ErrorCode::Shutdown {
+            "the daemon stopped before the local operation completed"
+        } else {
+            "the local operation was rejected; inspect daemon diagnostics for details"
+        }
+        .to_owned(),
+    };
+    let error_json = serde_json::to_string(&terminal_error).map_err(internal)?;
     ctx.db
         .finish_local_operation(
             owner,

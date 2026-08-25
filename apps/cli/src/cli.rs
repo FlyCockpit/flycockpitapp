@@ -55,12 +55,6 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-/// Authoritative top-level command surface advertised by the public v0.1 artifact.
-pub const PUBLIC_V0_1_COMMANDS: &[&str] = &[
-    "ask", "run", "agent", "provider", "setup", "models", "daemon", "doctor", "session", "trust",
-    "export", "config", "init",
-];
-
 pub fn public_v0_1_command() -> clap::Command {
     PublicCli::command()
 }

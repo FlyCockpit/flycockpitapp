@@ -921,6 +921,11 @@ enum ProviderNavigation {
     },
 }
 
+enum ProviderMutationNavigation {
+    List { status: String },
+    Edit { provider_id: String, status: String },
+}
+
 enum TypedDocumentEditAction {
     Scaffold,
     RemoveProjectShadow(category::ShadowedGlobalPrompt),
@@ -1972,6 +1977,8 @@ pub struct SettingsCx {
     pending_provider_add: Option<(String, ProviderEntry, bool)>,
     completed_provider_add: Option<Result<(String, ProviderEntry, bool), String>>,
     completed_provider_mutation: Option<Result<(), String>>,
+    pending_provider_mutation_navigation: Option<ProviderMutationNavigation>,
+    completed_provider_mutation_navigation: Option<ProviderMutationNavigation>,
     completed_shadow_removal: Option<category::ShadowedGlobalPrompt>,
     pending_shadow_prompt: Option<category::ShadowedGlobalPrompt>,
     completed_provider_navigation: Option<(ProviderNavigation, ProvidersConfig)>,
@@ -2457,6 +2464,8 @@ impl SettingsCx {
                         self.last_secret_notice = notice;
                         self.extended_warnings = vec!["provider settings committed".into()];
                         self.completed_provider_mutation = Some(Ok(()));
+                        self.completed_provider_mutation_navigation =
+                            self.pending_provider_mutation_navigation.take();
                         if let Some(pending) = self.pending_provider_add.take() {
                             self.completed_provider_add = Some(Ok(pending));
                         }
@@ -2465,6 +2474,7 @@ impl SettingsCx {
                         let error = format!("unexpected provider mutation response: {other:?}");
                         self.extended_warnings = vec![error.clone()];
                         self.completed_provider_mutation = Some(Err(error.clone()));
+                        self.pending_provider_mutation_navigation = None;
                         if self.pending_provider_add.take().is_some() {
                             self.completed_provider_add = Some(Err(error));
                         }
@@ -2472,6 +2482,7 @@ impl SettingsCx {
                     Err(error) => {
                         self.extended_warnings = vec![format!("provider save failed: {error}")];
                         self.completed_provider_mutation = Some(Err(error.clone()));
+                        self.pending_provider_mutation_navigation = None;
                         if self.pending_provider_add.take().is_some() {
                             self.completed_provider_add = Some(Err(error));
                         }
@@ -4357,6 +4368,32 @@ impl SettingsDialog {
                         _ => {}
                     }
                 }
+                if let Some(navigation) = self.cx.completed_provider_mutation_navigation.take() {
+                    self.page = match navigation {
+                        ProviderMutationNavigation::List { status } => {
+                            providers_page(ProvidersPage::List {
+                                cursor: initial_list_cursor(&self.cx.config),
+                                status: Some(status),
+                                delete_pending: false,
+                            })
+                        }
+                        ProviderMutationNavigation::Edit {
+                            provider_id,
+                            status,
+                        } => {
+                            let entry = self
+                                .cx
+                                .config
+                                .providers
+                                .get(&provider_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            let mut edit = EditState::new(provider_id, entry);
+                            edit.status = Some(status);
+                            providers_page(ProvidersPage::Edit(edit))
+                        }
+                    };
+                }
                 return;
             }
             Err(completion) => completion,
@@ -4682,6 +4719,8 @@ impl SettingsDialog {
                 pending_provider_add: None,
                 completed_provider_add: None,
                 completed_provider_mutation: None,
+                pending_provider_mutation_navigation: None,
+                completed_provider_mutation_navigation: None,
                 completed_shadow_removal: None,
                 pending_shadow_prompt: None,
                 completed_provider_navigation: None,

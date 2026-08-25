@@ -530,12 +530,22 @@ impl ProvidersPage {
     pub(super) fn has_unsettled_authority_operation(&self) -> bool {
         match self {
             Self::OAuthSetup { state, .. } => state.pending || state.polling,
-            Self::Add(state) => state
-                .oauth_auth
-                .as_ref()
-                .is_some_and(|oauth| oauth.pending || oauth.polling),
+            Self::Add(state) => {
+                state.fetch.is_some()
+                    || state
+                        .oauth_auth
+                        .as_ref()
+                        .is_some_and(|oauth| oauth.pending || oauth.polling)
+            }
+            Self::Edit(state) => state.fetch.is_some(),
+            Self::Headers { parent, .. }
+            | Self::Models { parent, .. }
+            | Self::ModelSettings { parent, .. }
+            | Self::ProviderSettings { parent, .. } => parent.fetch.is_some(),
+            Self::FetchAll(state) => state.is_fetching(),
+            Self::DeepFetch { state, .. } => state.is_running(),
             Self::CopilotSetup { state, .. } => state.operation.pending().is_some(),
-            _ => false,
+            Self::List { .. } | Self::FetchOnePrompt(_) | Self::FetchFallbackPrompt(_) => false,
         }
     }
 
@@ -1064,7 +1074,10 @@ impl SettingsDialog {
                 entry.mark_model_fetch_success(catalog);
                 let count = entry.models.len();
                 message = match self.save_config() {
-                    Ok(()) => fetch_success_message(count, catalog),
+                    Ok(()) => format!(
+                        "{}; saving provider catalog…",
+                        fetch_success_message(count, catalog)
+                    ),
                     Err(e) => format!("save failed: {e}"),
                 };
             }
@@ -1093,16 +1106,22 @@ impl SettingsDialog {
                     if let Some(entry) = self.config.providers.get_mut(provider_id) {
                         entry.mark_model_fetch_unsupported();
                     }
-                    let _ = self.save_config();
-                    message = "provider has no /models endpoint (skipped)".to_string();
+                    message = match self.save_config() {
+                        Ok(()) => "provider has no /models endpoint; saving fetch status…".into(),
+                        Err(error) => format!("fetch status save failed: {error}"),
+                    };
                 }
                 Err(e) => {
                     let reason = redact_model_fetch_reason(e.as_str());
                     if let Some(entry) = self.config.providers.get_mut(provider_id) {
                         entry.mark_model_fetch_failed_kept_existing(reason.clone());
                     }
-                    let _ = self.save_config();
-                    message = format!("fetch failed: {reason}");
+                    message = match self.save_config() {
+                        Ok(()) => format!("fetch failed: {reason}; saving failure status…"),
+                        Err(error) => {
+                            format!("fetch failed: {reason}; status save failed: {error}")
+                        }
+                    };
                 }
                 Ok(FetchOutcome::Models { .. }) | Ok(FetchOutcome::FallbackAvailable { .. }) => {
                     unreachable!()
@@ -1235,7 +1254,7 @@ impl SettingsCx {
                     Some(cycle_on_unlisted(self.config.on_unlisted_models_fetch));
                 *status = Some(match self.save_config() {
                     Ok(()) => format!(
-                        "on unlisted models: {}",
+                        "saving on-unlisted-models policy ({})…",
                         on_unlisted_label(self.config.on_unlisted_models_fetch)
                     ),
                     Err(e) => format!("save failed: {e}"),
@@ -2650,19 +2669,22 @@ impl SettingsCx {
                     .get(&s.provider_id)
                     .map(|entry| entry.models.len())
                     .unwrap_or(0);
-                let status = match self.save_config() {
-                    Ok(()) => fetch_success_message(count, s.catalog),
-                    Err(e) => format!("save failed: {e}"),
-                };
-                let entry = self
-                    .config
-                    .providers
-                    .get(&s.provider_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let mut edit = EditState::new(s.provider_id.clone(), entry);
-                edit.status = Some(status);
-                return Nav::Replace(super::providers_page(ProvidersPage::Edit(edit)));
+                match self.save_config() {
+                    Ok(()) => {
+                        self.pending_provider_mutation_navigation =
+                            Some(super::ProviderMutationNavigation::Edit {
+                                provider_id: s.provider_id.clone(),
+                                status: fetch_success_message(count, s.catalog),
+                            });
+                        self.extended_warnings = vec!["saving fetched provider catalog…".into()];
+                    }
+                    Err(error) => {
+                        self.extended_warnings = vec![format!(
+                            "save failed: {error}; fetched catalog choice remains open for retry"
+                        )];
+                    }
+                }
+                return Nav::Stay;
             }
             _ => {}
         }
@@ -2711,19 +2733,22 @@ impl SettingsCx {
                     if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
                         entry.mark_model_fetch_failed_kept_existing(s.reason.clone());
                     }
-                    let status = match self.save_config() {
-                        Ok(()) => "kept existing catalog after live fetch failure".to_string(),
-                        Err(e) => format!("save failed: {e}"),
-                    };
-                    let entry = self
-                        .config
-                        .providers
-                        .get(&s.provider_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut edit = EditState::new(s.provider_id.clone(), entry);
-                    edit.status = Some(status);
-                    return Nav::Replace(super::providers_page(ProvidersPage::Edit(edit)));
+                    match self.save_config() {
+                        Ok(()) => {
+                            self.pending_provider_mutation_navigation =
+                                Some(super::ProviderMutationNavigation::Edit {
+                                    provider_id: s.provider_id.clone(),
+                                    status: "kept existing catalog after live fetch failure".into(),
+                                });
+                            self.extended_warnings = vec!["saving provider fetch status…".into()];
+                        }
+                        Err(error) => {
+                            self.extended_warnings = vec![format!(
+                                "save failed: {error}; fallback choice remains open for retry"
+                            )];
+                        }
+                    }
+                    return Nav::Stay;
                 }
                 2 => {
                     if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
@@ -2743,19 +2768,23 @@ impl SettingsCx {
                         .get(&s.provider_id)
                         .map(|entry| entry.models.len())
                         .unwrap_or(0);
-                    let status = match self.save_config() {
-                        Ok(()) => fetch_success_message(count, s.catalog),
-                        Err(e) => format!("save failed: {e}"),
-                    };
-                    let entry = self
-                        .config
-                        .providers
-                        .get(&s.provider_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut edit = EditState::new(s.provider_id.clone(), entry);
-                    edit.status = Some(status);
-                    return Nav::Replace(super::providers_page(ProvidersPage::Edit(edit)));
+                    match self.save_config() {
+                        Ok(()) => {
+                            self.pending_provider_mutation_navigation =
+                                Some(super::ProviderMutationNavigation::Edit {
+                                    provider_id: s.provider_id.clone(),
+                                    status: fetch_success_message(count, s.catalog),
+                                });
+                            self.extended_warnings =
+                                vec!["saving fallback provider catalog…".into()];
+                        }
+                        Err(error) => {
+                            self.extended_warnings = vec![format!(
+                                "save failed: {error}; fallback choice remains open for retry"
+                            )];
+                        }
+                    }
+                    return Nav::Stay;
                 }
                 _ => {
                     return Nav::Replace(super::providers_page(ProvidersPage::List {

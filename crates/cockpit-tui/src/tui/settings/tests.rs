@@ -104,11 +104,23 @@ fn settings_cannot_close_or_accept_a_stale_session_completion_while_pending() {
 #[test]
 fn authority_success_is_receipt_driven_and_committed_refresh_is_explicit() {
     let source = include_str!("mod.rs");
+    let providers = include_str!("providers/mod.rs");
+    let fetch = include_str!("providers/fetch.rs");
     assert!(source.contains("if self.authority_operation_pending()"));
     assert!(source.contains("completed_mcp_navigation"));
     assert!(source.contains("adopt_pending_mcp_oauth"));
     assert!(source.contains("committed_refresh_needed"));
     assert!(source.contains("settings committed at generation"));
+    assert!(source.contains("pending_provider_mutation_navigation.take()"));
+    assert!(source.contains("completed_provider_mutation_navigation"));
+    assert!(providers.contains("has_unsettled_authority_operation"));
+    assert!(providers.contains("Self::FetchAll(state) => state.is_fetching()"));
+    assert!(providers.contains("ProviderMutationNavigation::Edit"));
+    assert!(fetch.contains("ProviderMutationNavigation::List"));
+    assert!(fetch.contains("return Nav::Stay"));
+    let mcp = include_str!("mcp_page.rs");
+    assert!(mcp.contains("Result<super::SettingsSaveOutcome, String>"));
+    assert!(mcp.contains("Ok(super::SettingsSaveOutcome::Queued)"));
 }
 
 #[test]

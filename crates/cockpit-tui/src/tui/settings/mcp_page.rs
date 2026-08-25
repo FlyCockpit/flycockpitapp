@@ -328,7 +328,7 @@ impl SettingsCx {
         cfg: &McpConfig,
         secret_values: &BTreeMap<String, String>,
         cleanup_names: &BTreeSet<String>,
-    ) -> Result<(), String> {
+    ) -> Result<super::SettingsSaveOutcome, String> {
         let project_root = self
             .active_project_root
             .clone()
@@ -353,7 +353,7 @@ impl SettingsCx {
             super::SettingsMutationAction::McpSave(cfg.clone()),
         );
         self.extended_warnings = vec!["saving MCP settings…".into()];
-        Ok(())
+        Ok(super::SettingsSaveOutcome::Queued)
     }
 
     pub(super) fn adopt_pending_mcp_oauth(&mut self, s: &mut ListState) {
@@ -639,7 +639,7 @@ impl SettingsCx {
             .cloned()
             .collect::<BTreeSet<_>>();
         match self.save_mcp(&cfg, &secret_values, &stale_refs) {
-            Ok(()) => {
+            Ok(_) => {
                 self.pending_mcp_navigation = Some((name, s.original_name.is_some()));
                 s.status = Some("saving MCP server…".into());
                 Nav::Stay

@@ -408,7 +408,6 @@ pub(crate) struct OAuthFlowState {
     acknowledgement_required: bool,
     copy_operation: super::super::shell::PointerOperationGate,
     action_operation: super::super::shell::PointerOperationGate,
-    effects: OAuthEffects,
 }
 
 impl OAuthFlowState {

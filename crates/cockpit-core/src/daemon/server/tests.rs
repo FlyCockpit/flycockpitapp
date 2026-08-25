@@ -8213,6 +8213,7 @@ async fn owner_secret_inventory_accepts_max_subscription_ack_cursor() {
     let mut state = owner_state();
     handle_request(
         Request::PutSubscriptionAck {
+            client_operation_id: "subscription-ack-max-provider".into(),
             provider_id: provider_id.clone(),
         },
         &mut state,
@@ -16733,6 +16734,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
         #[cfg(feature = "remote")]
         "clear_flycockpit_credential" => Request::ClearFlycockpitCredential,
         "put_subscription_ack" => Request::PutSubscriptionAck {
+            client_operation_id: "subscription-ack".into(),
             provider_id: "codex-oauth".into(),
         },
         "begin_provider_oauth" => Request::BeginProviderOAuth {
@@ -23938,7 +23940,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::SyncFlycockpitOrgPolicy, kind: "sync_flycockpit_org_policy", session_id: None, audit_path: None, mutating: true },
         #[cfg(feature = "remote")]
         CommandMetadataCase { request: Request::EnrollFlycockpitOrgSync { org_id: "org-fixture".into() }, kind: "enroll_flycockpit_org_sync", session_id: None, audit_path: None, mutating: true },
-        CommandMetadataCase { request: Request::PutSubscriptionAck { provider_id: "codex-oauth".into() }, kind: "put_subscription_ack", session_id: None, audit_path: None, mutating: true },
+        CommandMetadataCase { request: Request::PutSubscriptionAck { client_operation_id: "subscription-ack".into(), provider_id: "codex-oauth".into() }, kind: "put_subscription_ack", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::BeginProviderOAuth { client_operation_id: "begin-provider".into(), provider_id: "example".into() }, kind: "begin_provider_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::CompleteProviderOAuth { client_operation_id: "complete-provider".into(), flow_id: "flow".into(), input: None }, kind: "complete_provider_oauth", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::CancelProviderOAuth { client_operation_id: "cancel-provider".into(), begin_client_operation_id: "begin-provider".into(), flow_id: Some("flow".into()) }, kind: "cancel_provider_oauth", session_id: None, audit_path: None, mutating: true },

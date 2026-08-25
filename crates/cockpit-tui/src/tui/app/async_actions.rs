@@ -2422,24 +2422,77 @@ impl App {
                                 let client = crate::tui::settings::settings_daemon_client()
                                     .await
                                     .map_err(|e| e.to_string())?;
-                                match client
-                                    .request(
-                                        cockpit_core::daemon::proto::Request::PutSubscriptionAck {
-                                            provider_id: provider_id.to_string(),
-                                        },
-                                    )
-                                    .await
-                                    .map_err(|e| e.to_string())?
-                                {
-                                    Ok(cockpit_core::daemon::proto::Response::Ack) => {
+                                // Retrying acknowledgement for the same visible
+                                // OAuth pane reuses the exact daemon operation.
+                                let client_operation_id =
+                                    client_flow_id.subscription_ack_operation_id();
+                                let request = cockpit_core::daemon::proto::Request::PutSubscriptionAck {
+                                    client_operation_id: client_operation_id.clone(),
+                                    provider_id: provider_id.to_string(),
+                                };
+                                let direct = tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    client.request(request),
+                                )
+                                .await;
+                                let response = match direct {
+                                    Ok(Ok(Ok(response))) => response,
+                                    Ok(Ok(Err(error))) => {
+                                        return Err(format!("daemon rejected acknowledgement: {error}"));
+                                    }
+                                    Ok(Err(_)) | Err(_) => {
+                                        let settlement = tokio::time::timeout(
+                                            std::time::Duration::from_secs(10),
+                                            client.request(cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                                                client_operation_id: client_operation_id.clone(),
+                                            }),
+                                        )
+                                        .await
+                                        .map_err(|_| "acknowledgement settlement query timed out; retry to query the same durable operation".to_string())?
+                                        .map_err(|error| error.to_string())?
+                                        .map_err(|error| error.to_string())?;
+                                        match settlement {
+                                            cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+                                                client_operation_id: returned_id,
+                                                operation_kind,
+                                                pending: false,
+                                                response: Some(response),
+                                                terminal_error: None,
+                                                terminal_cancelled: false,
+                                                ..
+                                            } if returned_id == client_operation_id
+                                                && operation_kind == "put_subscription_ack" => *response,
+                                            cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+                                                client_operation_id: returned_id,
+                                                operation_kind,
+                                                pending: false,
+                                                terminal_error: Some(error),
+                                                ..
+                                            } if returned_id == client_operation_id
+                                                && operation_kind == "put_subscription_ack" => {
+                                                return Err(format!("acknowledgement was authoritatively rejected: {error}"));
+                                            }
+                                            _ => return Err("acknowledgement settlement remains unknown; retry before starting OAuth".into()),
+                                        }
+                                    }
+                                };
+                                match response {
+                                    cockpit_core::daemon::proto::Response::SubscriptionAckCommitted {
+                                        client_operation_id: returned_id,
+                                        provider_id: returned_provider,
+                                        request_hash,
+                                        consumed_vault_generation,
+                                        result_vault_generation,
+                                        changed,
+                                    } if returned_id == client_operation_id
+                                        && returned_provider == provider_id
+                                        && request_hash.len() == 64
+                                        && request_hash.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                                        && result_vault_generation > 0
+                                        && if changed { result_vault_generation > consumed_vault_generation } else { result_vault_generation == consumed_vault_generation } => {
                                         Ok(crate::tui::async_action::OAuthAsyncResult::Acknowledged)
                                     }
-                                    Ok(other) => Err(format!(
-                                        "unexpected acknowledgement response: {other:?}"
-                                    )),
-                                    Err(error) => {
-                                        Err(format!("daemon rejected acknowledgement: {error}"))
-                                    }
+                                    other => Err(format!("unexpected acknowledgement receipt: {other:?}")),
                                 }
                             }
                             .await;

@@ -840,14 +840,25 @@ async fn require_subscription_oauth_acknowledgement(
         .read_line()
         .context("reading subscription OAuth acknowledgement")?;
     if response.trim().eq_ignore_ascii_case("I acknowledge") {
+        // Stable across process restarts so rerunning setup replays the exact
+        // durable acknowledgement after a lost response.
+        let client_operation_id = format!("setup-subscription-ack-{provider}");
         match daemon
             .client
             .request(Request::PutSubscriptionAck {
+                client_operation_id: client_operation_id.clone(),
                 provider_id: provider.to_string(),
             })
             .await?
         {
-            Ok(Response::Ack) => {}
+            Ok(Response::SubscriptionAckCommitted {
+                client_operation_id: returned_id,
+                provider_id,
+                request_hash,
+                ..
+            }) if returned_id == client_operation_id
+                && provider_id == provider
+                && request_hash.len() == 64 => {}
             Ok(other) => {
                 bail!("daemon returned unexpected acknowledgement store response: {other:?}")
             }

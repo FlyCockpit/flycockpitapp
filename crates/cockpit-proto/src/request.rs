@@ -1472,6 +1472,8 @@ pub enum Request {
     /// disclosure.  This has a distinct vault kind and a typed JSON `true`
     /// payload; it is not a named secret and is never returned over the wire.
     PutSubscriptionAck {
+        #[serde(deserialize_with = "deserialize_owner_identifier")]
+        client_operation_id: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         provider_id: String,
     },
@@ -2553,7 +2555,11 @@ impl Request {
             {
                 return Err("leak reveal capability must be 64 lowercase hex bytes".to_string());
             }
-            Self::PutSubscriptionAck { provider_id } => {
+            Self::PutSubscriptionAck {
+                client_operation_id,
+                provider_id,
+            } => {
+                validate_owner_identifier("client operation", client_operation_id, 128)?;
                 if provider_id.trim().is_empty() {
                     return Err("subscription provider id must not be empty".to_string());
                 }
@@ -3587,7 +3593,7 @@ macro_rules! command {
             (Request::EnrollFlycockpitOrgSync { org_id }, "enroll_flycockpit_org_sync", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "org_id:String", [org_id: String => param]);
             (Request::ListSecretInventory { cursor, limit }, "list_secret_inventory", owner_only, none, false, read_only, none, serialized, none, "cursor:Option<String>|limit:Option<u16>", [cursor: Option<String> => param, limit: Option<u16> => param]);
             (Request::PutNamedSecret { name, value }, "put_named_secret", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|value:String", [name: String => param, value: String => param]);
-            (Request::PutSubscriptionAck { provider_id }, "put_subscription_ack", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "provider_id:String", [provider_id: String => param]);
+            (Request::PutSubscriptionAck { client_operation_id, provider_id }, "put_subscription_ack", owner_only, none, true, local_only, none, serialized, none, "client_operation_id:String|provider_id:String", [client_operation_id: String => param, provider_id: String => param]);
             (Request::DeleteNamedSecret { name }, "delete_named_secret", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String", [name: String => param]);
             (Request::PutProviderCredential { client_operation_id, provider_id, record }, "put_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|provider_id:String|record:SensitiveWirePayload", [client_operation_id: String => param, provider_id: String => param, record: SensitiveWirePayload => param]);
             (Request::GetLocalOperationSettlement { client_operation_id }, "get_local_operation_settlement", owner_only, none, false, local_only, none, serialized, none, "client_operation_id:String", [client_operation_id: String => param]);
@@ -4771,7 +4777,6 @@ mod tests {
                         | "get_startup_disclosures"
                         | "list_secret_inventory"
                         | "put_named_secret"
-                        | "put_subscription_ack"
                         | "delete_named_secret"
                         | "put_provider_credential"
                         | "delete_provider_credential"
@@ -5023,6 +5028,7 @@ mod tests {
         let oversized_provider_id = "p".repeat(MAX_OWNER_PROVIDER_ID_BYTES + 1);
         assert!(
             Request::PutSubscriptionAck {
+                client_operation_id: "subscription-ack".into(),
                 provider_id: oversized_provider_id.clone(),
             }
             .validate_semantics()

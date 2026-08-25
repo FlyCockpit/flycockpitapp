@@ -621,6 +621,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::ProviderUsageSnapshot { .. }
         | proto::Response::ProviderConfigUpserted { .. }
         | proto::Response::ProviderMutationCommitted { .. }
+        | proto::Response::SubscriptionAckCommitted { .. }
         | proto::Response::AppFlag { .. }
         | proto::Response::AppFlagSeen { .. } => {}
         proto::Response::ProviderCredentialCommitted { project_root, .. } => {

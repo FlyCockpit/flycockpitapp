@@ -3234,12 +3234,12 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "begin_mcp_oauth"
                 | "complete_mcp_oauth"
                 | "cancel_mcp_oauth"
+                | "put_subscription_ack"
                 | "apply_provider_mutation" => 17,
                 "cancel_leak_reveal" => 16,
                 "get_provider_catalog_snapshot" => 15,
                 "list_secret_inventory"
                 | "put_named_secret"
-                | "put_subscription_ack"
                 | "delete_named_secret"
                 | "put_provider_credential"
                 | "delete_provider_credential"
@@ -3331,6 +3331,7 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "mcp_oauth_completed"
                 | "mcp_oauth_cancelled"
                 | "provider_credential_committed"
+                | "subscription_ack_committed"
                 | "local_operation_settlement"
                 | "copilot_auth_committed"
                 | "mcp_config_committed"
@@ -6899,6 +6900,14 @@ mod tests {
                 result_vault_generation: 7,
                 config_generation: 7,
             },
+            Response::SubscriptionAckCommitted {
+                client_operation_id: "subscription-ack".into(),
+                provider_id: "codex-oauth".into(),
+                request_hash: "33".repeat(32),
+                changed: true,
+                consumed_vault_generation: 6,
+                result_vault_generation: 7,
+            },
         ] {
             let expected = if matches!(
                 response.wire_tag(),
@@ -6908,6 +6917,7 @@ mod tests {
                     | "mcp_oauth_started"
                     | "mcp_oauth_completed"
                     | "mcp_oauth_cancelled"
+                    | "subscription_ack_committed"
             ) {
                 17
             } else {

@@ -2789,6 +2789,70 @@ impl SettingsCx {
         self.queue_settlement_query(client_operation_id, *original);
     }
 
+    /// Apply a daemon-recorded terminal rejection without feeding it back
+    /// through the transport-error path. Transport failures leave authority
+    /// fenced and are queried again; this path is proof that the mutation did
+    /// not commit, so drafts may remain editable and the fence may be released.
+    fn apply_terminal_settlement(
+        &mut self,
+        original: PendingSettingsOperation,
+        error: cockpit_proto::ErrorPayload,
+        cancelled: bool,
+    ) {
+        let disposition = if cancelled { "cancelled" } else { "rejected" };
+        let message = format!("operation was authoritatively {disposition}: {error}");
+        match original {
+            PendingSettingsOperation::ProviderMutation { .. } => {
+                self.completed_provider_mutation = Some(Err(message.clone()));
+                self.completed_provider_mutation_navigation =
+                    self.pending_provider_mutation_navigation.take();
+                if self.pending_provider_add.is_some() {
+                    self.pending_provider_add = None;
+                    self.completed_provider_add = Some(Err(message.clone()));
+                }
+            }
+            PendingSettingsOperation::SimpleMutation { action, .. } => match action {
+                SettingsMutationAction::McpSave { .. } => {
+                    if let Some((name, edited)) = self.pending_mcp_navigation.take() {
+                        self.completed_mcp_navigation = Some((name, edited, Err(message.clone())));
+                    }
+                }
+                SettingsMutationAction::McpOAuthBegin { .. } => {
+                    self.pending_mcp_oauth = None;
+                }
+                // Complete/cancel rejection does not terminate the existing
+                // daemon flow. Keep its full retry identity and URL intact.
+                SettingsMutationAction::McpOAuthComplete { .. }
+                | SettingsMutationAction::McpOAuthCancel { .. } => {}
+                SettingsMutationAction::ProviderCredentialDelete { provider_id, .. } => {
+                    self.completed_provider_auth = Some(CompletedProviderAuthMutation::Logout {
+                        provider_id,
+                        result: Err(message.clone()),
+                    });
+                }
+                SettingsMutationAction::WebCredentialPut { provider_id, .. } => {
+                    self.completed_web_credential = Some((provider_id, Err(message.clone())));
+                }
+                SettingsMutationAction::CopilotSetup { provider_id, .. } => {
+                    self.completed_provider_auth = Some(CompletedProviderAuthMutation::Copilot {
+                        provider_id,
+                        result: Err(message.clone()),
+                    });
+                }
+                SettingsMutationAction::ProviderCredentialPut { .. } => {}
+            },
+            // Extended and typed-document drafts are intentionally untouched:
+            // the authoritative rejection proves their base revision was not
+            // consumed, so the user can correct and submit the same draft.
+            PendingSettingsOperation::ExtendedSave { .. }
+            | PendingSettingsOperation::TypedDocumentEdit { .. } => {}
+            _ => {
+                tracing::warn!("terminal settlement received for a non-settling settings action");
+            }
+        }
+        self.extended_warnings = vec![message];
+    }
+
     fn enqueue_daemon_work(
         &mut self,
         target: SettingsEffectTarget,
@@ -3894,22 +3958,7 @@ impl SettingsCx {
                         && expected_kind == Some(operation_kind.as_str())
                         && valid_local_settlement_hash(&request_hash) =>
                     {
-                        let original = *original;
-                        let original_target = original.target();
-                        self.pending_settings
-                            .insert(completion.operation_id, original);
-                        let message = if terminal_cancelled {
-                            format!("operation was authoritatively cancelled: {error}")
-                        } else {
-                            format!("operation was authoritatively rejected: {error}")
-                        };
-                        return self.apply_general_completion(SettingsDaemonEffectCompletion {
-                            dialog_id: completion.dialog_id,
-                            operation_id: completion.operation_id,
-                            target: original_target,
-                            response: Err(message),
-                            committed_refresh_needed: None,
-                        });
+                        self.apply_terminal_settlement(*original, error, terminal_cancelled);
                     }
                     Ok(other) => {
                         tracing::warn!(response = ?other, "ignored unbound local settlement query response");

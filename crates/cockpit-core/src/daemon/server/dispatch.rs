@@ -7758,64 +7758,86 @@ async fn handle_serialized_request_impl(
             }
         }
 
-        Request::PutSubscriptionAck { provider_id } => {
-            #[cfg(feature = "remote")]
-            let request = Request::PutSubscriptionAck {
-                provider_id: provider_id.clone(),
-            };
+        Request::PutSubscriptionAck {
+            client_operation_id,
+            provider_id,
+        } => {
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept persistent subscription acknowledgement writes",
                 ));
             }
-            #[cfg(feature = "remote")]
-            if let Some(operation) = remote_operation
-                && let Some(response) =
-                    begin_remote_nonrepeatable(&request, &authorized_request, operation, ctx)
-                        .await?
+            let settlement_owner = settings_capability_owner(state);
+            let request_hash =
+                local_operation_request_hash(&("put_subscription_ack", &provider_id))?;
+            let fencing_generation = match begin_local_operation(
+                ctx,
+                &settlement_owner,
+                &client_operation_id,
+                "put_subscription_ack",
+                request_hash,
+            )
+            .await?
             {
-                return Ok(response);
-            }
-            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
-            let item_id = format!("{}{}", crate::auth::subscription_ack::PREFIX, provider_id);
-            let payload = serde_json::to_vec(&serde_json::Value::Bool(true)).map_err(internal)?;
-            #[cfg(feature = "remote")]
-            {
-                match remote_operation {
-                    Some(operation) => {
-                        mutate_owner_vault_item_with_remote_ledger(
-                            ctx,
-                            operation,
-                            cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
-                            &item_id,
-                            Some(&payload),
-                            "put_subscription_ack",
-                            Response::Ack,
-                            None,
-                        )
-                        .await
-                    }
-                    None => {
-                        ctx.mutate_owner_vault_item(
-                            cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
-                            &item_id,
-                            Some(&payload),
-                        )
-                        .map_err(internal)?;
-                        Ok(Response::Ack)
-                    }
-                }
-            }
-            #[cfg(not(feature = "remote"))]
-            {
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
+            let result = async {
+                let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+                let item_id = format!("{}{}", crate::auth::subscription_ack::PREFIX, provider_id);
+                let payload =
+                    serde_json::to_vec(&serde_json::Value::Bool(true)).map_err(internal)?;
+                let consumed_vault_generation = ctx
+                    .secret_vault
+                    .current_inventory_generation()
+                    .map_err(|error| internal(anyhow::anyhow!(error)))?;
+                let changed = ctx
+                    .secret_vault
+                    .get_item(
+                        cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
+                        &item_id,
+                    )
+                    .map(|current| current.as_slice() != payload.as_slice())
+                    .unwrap_or(true);
                 ctx.mutate_owner_vault_item(
                     cockpit_db::secret_vault::SecretVaultKind::SubscriptionAck,
                     &item_id,
                     Some(&payload),
                 )
                 .map_err(internal)?;
-                Ok(Response::Ack)
+                let response = Response::SubscriptionAckCommitted {
+                    client_operation_id: client_operation_id.clone(),
+                    provider_id: provider_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&request_hash),
+                    changed,
+                    consumed_vault_generation,
+                    result_vault_generation: consumed_vault_generation
+                        .saturating_add(u64::from(changed)),
+                };
+                finish_local_operation(
+                    ctx,
+                    settlement_owner.clone(),
+                    client_operation_id.clone(),
+                    request_hash,
+                    fencing_generation,
+                    &response,
+                )
+                .await?;
+                Ok(response)
             }
+            .await;
+            if let Err(error) = &result {
+                finish_local_operation_error(
+                    ctx,
+                    settlement_owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    error,
+                )
+                .await?;
+            }
+            result
         }
 
         Request::DeleteNamedSecret { name } => {

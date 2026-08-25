@@ -2850,21 +2850,6 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "provider_id:string",
-      "fcorRoles": [
-        {
-          "field": "provider_id",
-          "role": "param",
-          "type": "String"
-        }
-      ],
-      "fcorSchema": "provider_id:String",
-      "strategy": "nonrepeatable_dispatch",
-      "tag": "put_subscription_ack"
-    },
-    {
-      "class": "nonrepeatable_mutation",
-      "evidence": null,
       "fcorCanonicalSchema": "name:string",
       "fcorRoles": [
         {

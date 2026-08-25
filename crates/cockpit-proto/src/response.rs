@@ -474,6 +474,18 @@ pub enum Response {
         result_vault_generation: u64,
         config_generation: u64,
     },
+    /// Exact durable receipt for a subscription disclosure acknowledgement.
+    SubscriptionAckCommitted {
+        client_operation_id: String,
+        provider_id: String,
+        /// Lowercase SHA-256 of the non-secret request identity.
+        request_hash: String,
+        changed: bool,
+        #[serde(default)]
+        consumed_vault_generation: u64,
+        #[serde(default)]
+        result_vault_generation: u64,
+    },
     /// Owner-scoped resolution of a transport-ambiguous local mutation.
     /// `response` is present only after the durable terminal receipt commits.
     LocalOperationSettlement {
@@ -1295,6 +1307,7 @@ macro_rules! response_variants {
             (Response::ProviderConfigUpserted { .. }, "provider_config_upserted");
             (Response::ProviderMutationCommitted { .. }, "provider_mutation_committed");
             (Response::ProviderCredentialCommitted { .. }, "provider_credential_committed");
+            (Response::SubscriptionAckCommitted { .. }, "subscription_ack_committed");
             (Response::CopilotAuthCommitted { .. }, "copilot_auth_committed");
             (Response::StartupDisclosures { .. }, "startup_disclosures");
             (Response::AppFlag { .. }, "app_flag");

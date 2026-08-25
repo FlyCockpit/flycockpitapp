@@ -360,12 +360,8 @@ impl SettingsCx {
         let secret_values_json = serde_json::to_string(secret_values).map_err(|e| e.to_string())?;
         let cleanup_names_json = serde_json::to_string(cleanup_names).map_err(|e| e.to_string())?;
         let owner = project_root.display().to_string();
-        let expected_request_intent_hash = super::local_receipt_request_hash(&(
-            "save_mcp_config",
-            &owner,
-            &config_json,
-            &cleanup_names_json,
-        ))?;
+        let expected_request_intent_hash =
+            cockpit_proto::mcp_mutation_intent_hash(&owner, &config_json, &cleanup_names_json);
         let client_operation_id = uuid::Uuid::new_v4().to_string();
         self.queue_simple_secret_mutation(
             super::SettingsEffectTarget {

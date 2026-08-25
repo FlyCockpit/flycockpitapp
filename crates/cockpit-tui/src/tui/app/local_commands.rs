@@ -13,15 +13,11 @@ fn mcp_projection_revision(config: &cockpit_core::mcp::config::McpConfig) -> Opt
 }
 
 fn mcp_mutation_intent_hash(project_root: &str, config_json: &str) -> Option<String> {
-    use sha2::Digest as _;
-
-    let encoded = serde_json::to_vec(&("save_mcp_config", project_root, config_json, "[]")).ok()?;
-    Some(
-        sha2::Sha256::digest(&encoded)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-    )
+    Some(cockpit_proto::mcp_mutation_intent_hash(
+        project_root,
+        config_json,
+        "[]",
+    ))
 }
 
 impl App {

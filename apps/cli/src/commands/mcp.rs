@@ -168,19 +168,8 @@ async fn add(args: McpAddArgs) -> Result<()> {
     let cleanup_names_json = serde_json::to_string(&BTreeSet::<String>::new())
         .context("serializing MCP cleanup names")?;
     let client_operation_id = uuid::Uuid::new_v4().to_string();
-    use sha2::Digest as _;
-    let mutation_intent_hash = sha2::Sha256::digest(
-        serde_json::to_vec(&(
-            "save_mcp_config",
-            &project_root,
-            &config_json,
-            &cleanup_names_json,
-        ))?
-        .as_slice(),
-    )
-    .iter()
-    .map(|byte| format!("{byte:02x}"))
-    .collect::<String>();
+    let mutation_intent_hash =
+        cockpit_proto::mcp_mutation_intent_hash(&project_root, &config_json, &cleanup_names_json);
     match daemon
         .client
         .request(Request::SaveMcpConfig {

@@ -8,15 +8,14 @@
 //! commit). After conversion the same fixtures must resolve identically off the
 //! held snapshot — this pins behavior parity (criterion 8).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cockpit_config::extended::LlmMode;
-use tokio::sync::mpsc;
 
 use super::App;
-use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
+use crate::tui::agent_runner::{AgentRunner, TestRunnerOverrides};
 
 // ---- Fixed config tree + committed fixtures --------------------------------
 
@@ -121,51 +120,10 @@ fn marked_snapshot(
 /// A minimal attached runner so `resync_config_after_local_write` takes the
 /// daemon-signal path (no disk read) instead of the detached bootstrap refresh.
 fn stub_runner() -> AgentRunner {
-    let (input_tx, _r0) = mpsc::channel(1);
-    let (record_tx, _r1) = mpsc::channel(1);
-    let (control_tx, _r2) = mpsc::channel(1);
-    let (attached_request_tx, _r3) = mpsc::channel(1);
-    AgentRunner {
-        input_tx,
-        record_tx,
-        control_tx,
-        attached_request_tx,
-        events: Arc::new(Mutex::new(Vec::new())),
-        event_notify: Arc::new(tokio::sync::Notify::new()),
-        active_agent: Arc::new(Mutex::new("Build".to_string())),
-        active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
-        skill_inventory_names: Arc::new(Mutex::new(None)),
-        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
-        active_model_state: None,
-        session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
-        attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        submission_session_tx: tokio::sync::watch::channel(
-            crate::tui::agent_runner::SubmissionSessionBinding::unbound(),
-        )
-        .0,
-        awaiting_durable: Default::default(),
-        short_id: "abc123".to_string(),
-        project_id: "project".to_string(),
-        usage: UsageCounts::default(),
-        owns_daemon: false,
-        owned_daemon_guard: None,
-        socket: PathBuf::from("/tmp/cockpit-test.sock"),
-        history: Vec::new(),
-        paused_work: Vec::new(),
-        repair_required: None,
-        btw_fork: None,
-        daemon_version: "test".to_string(),
-        daemon_compatible: true,
-        current_client: None,
-        attach_context: None,
+    AgentRunner::test_fixture(TestRunnerOverrides {
         last_applied_seq: Some(Arc::new(Mutex::new(Some(0)))),
-        client_tasks: ClientTasks::default(),
-        #[cfg(test)]
-        test_session_switch_rx: Arc::new(Mutex::new(None)),
-        #[cfg(test)]
-        test_force_can_switch: false,
-        test_advance_epoch_when_switch_task_created: false,
-    }
+        ..Default::default()
+    })
 }
 
 fn app_for_tree(tree: &Path) -> App {

@@ -6947,6 +6947,10 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        // Also handled on the concurrent path (its declared ordering); this
+        // serialized arm keeps the exhaustive match and the in-process
+        // `handle_request` helper working, mirroring the sibling
+        // `GetExtendedConfigSnapshot` arm below.
         Request::GetAgentEditorLeaseSettlement {
             client_operation_id,
             project_root,
@@ -13816,6 +13820,24 @@ async fn handle_concurrent_request_impl(
         Request::GetAgentEditSnapshot { project_root, name } => {
             crate::daemon::agent_management::edit_snapshot(&ctx, project_root, name).await
         }
+        // Settlement polling is a pure read over the durable lease registry and
+        // must stay reachable while the serialized queue is busy — a client
+        // recovering an interrupted `CompleteAgentEditorLease` polls this while
+        // its own mutation may still hold the serialized path.
+        Request::GetAgentEditorLeaseSettlement {
+            client_operation_id,
+            project_root,
+            lease_id,
+        } => {
+            crate::daemon::agent_management::editor_lease_settlement(
+                &ctx,
+                client_operation_id,
+                project_root,
+                lease_id,
+                shared.capability_owner.clone(),
+            )
+            .await
+        }
         Request::GetExtendedConfigSnapshot {
             project_root,
             snapshot_session_id,
@@ -14223,20 +14245,28 @@ async fn provider_catalog_snapshot(
     }
     let config_generation = inventory::current_config_generation();
     let canonical_root = crate::secret_ownership::canonical_owner_root(project_root);
+    // A missing provider layer (e.g. a fresh install with no config directory
+    // yet) must not fail this read: the snapshot is still a valid projection,
+    // it just cannot mint an edit capability. Clients treat the absent
+    // capability fields as read-only and an empty `layer_id` as "no editable
+    // layer"; a later mutation attempt fails the capability lookup instead.
     let target_path =
         crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
             ctx.config_source()
                 .config_write_target_for_provider(&cwd, "default")
+        });
+    let layer_id = target_path
+        .as_ref()
+        .map(|target_path| {
+            let layer_material = format!(
+                "provider-layer\0{canonical_root}\0{}\0{snapshot_session_id}",
+                target_path.display()
+            );
+            crate::intel::hex_lower(&<Sha256 as sha2::Digest>::digest(layer_material.as_bytes()))
         })
-        .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
-    let layer_material = format!(
-        "provider-layer\0{canonical_root}\0{}\0{snapshot_session_id}",
-        target_path.display()
-    );
-    let layer_id =
-        crate::intel::hex_lower(&<Sha256 as sha2::Digest>::digest(layer_material.as_bytes()));
+        .unwrap_or_default();
     let mcp = redacted_mcp_config_snapshot(ctx, &cwd, &trust_policy)?;
-    {
+    let minted_edit_capability = if let Some(target_path) = target_path {
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
             .lock()
             .map_err(|_| internal(anyhow::anyhow!("provider capability registry poisoned")))?;
@@ -14258,18 +14288,37 @@ async fn provider_catalog_snapshot(
                 layer_id: layer_id.clone(),
                 revision: revision.clone(),
                 config_generation,
-                mcp_target_path: std::path::PathBuf::from(&mcp.config_path),
-                mcp_revision: mcp.revision.clone(),
+                // An absent MCP layer leaves empty bindings; `save_mcp_config`
+                // then fails its path/revision equality checks, so the
+                // capability cannot be replayed against an MCP target.
+                mcp_target_path: mcp
+                    .as_ref()
+                    .map(|mcp| std::path::PathBuf::from(&mcp.config_path))
+                    .unwrap_or_default(),
+                mcp_revision: mcp
+                    .as_ref()
+                    .map(|mcp| mcp.revision.clone())
+                    .unwrap_or_default(),
                 expires_at: now + PROVIDER_EDIT_CAPABILITY_TTL,
             },
         );
-    }
+        true
+    } else {
+        false
+    };
     let mut view = crate::secret_ref::redact_provider_view(&config);
-    view.mcp_config_json = Some(mcp.config_json);
-    view.mcp_owner_root = Some(canonical_root.clone());
-    view.mcp_config_path = Some(mcp.config_path);
-    view.mcp_edit_capability = Some(snapshot_session_id.to_string());
-    view.mcp_revision = Some(mcp.revision);
+    if let Some(mcp) = mcp {
+        view.mcp_config_json = Some(mcp.config_json);
+        view.mcp_owner_root = Some(canonical_root.clone());
+        view.mcp_config_path = Some(mcp.config_path);
+        // The capability/revision pair is advertised only when a capability
+        // was actually minted; MCP saves require both, so a capability-less
+        // snapshot stays visibly read-only.
+        if minted_edit_capability {
+            view.mcp_edit_capability = Some(snapshot_session_id.to_string());
+            view.mcp_revision = Some(mcp.revision);
+        }
+    }
     view.extended_config_json = Some(redacted_extended_config_json(ctx, &cwd, &trust_policy)?);
     bounded_provider_response(Response::ProviderCatalogSnapshot {
         config: view,
@@ -14314,7 +14363,6 @@ async fn apply_provider_mutation(
             &snapshot_session_id,
             &layer_id,
             &expected_revision,
-            &mutation_intent_hash,
             &mutation_intent_hash,
             &mutation,
         ),
@@ -14438,23 +14486,25 @@ async fn apply_provider_mutation(
     result
 }
 
-pub(super) fn local_operation_request_hash<T: serde::Serialize>(
+fn local_operation_request_hash<T: serde::Serialize>(
     request: &T,
 ) -> std::result::Result<[u8; 32], ErrorPayload> {
     let encoded = zeroize::Zeroizing::new(serde_json::to_vec(request).map_err(internal)?);
     Ok(Sha256::digest(encoded.as_slice()).into())
 }
 
-pub(super) fn local_operation_request_hash_hex(request_hash: &[u8; 32]) -> String {
+fn local_operation_request_hash_hex(request_hash: &[u8; 32]) -> String {
     request_hash
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
-/// Test-only helper: register an MCP edit capability so `SaveMcpConfig`
-/// requests can pass the capability gate without first calling
-/// `GetProviderCatalogSnapshot`.
+/// Test-only registrar for NEGATIVE capability-gate tests: it fabricates a
+/// registry entry that a real mint could never produce (e.g. a foreign owner
+/// digest), so a `SaveMcpConfig` rejection can be asserted. Positive-path
+/// tests must mint through the real `GetProviderCatalogSnapshot` flow instead
+/// — registering the request's own values here makes the gate tautological.
 #[cfg(test)]
 pub(super) fn register_mcp_edit_capability_for_test(
     snapshot_session_id: &str,
@@ -15582,7 +15632,7 @@ async fn stage_and_recover_provider_batch(
                         chrono::Utc::now().timestamp_millis()
                     ],
                 )?;
-                if inserted == 0 {
+                if inserted != 1 {
                     anyhow::bail!("new provider secret claim was not inserted");
                 }
                 inserted_named_claims.insert(name.clone());
@@ -15769,11 +15819,14 @@ struct RedactedMcpConfigSnapshot {
     revision: String,
 }
 
+/// `Ok(None)` means no Cockpit config layer exists to project MCP state from
+/// (a fresh install); the catalog snapshot then omits the MCP projection
+/// instead of failing the read.
 fn redacted_mcp_config_snapshot(
     ctx: &DaemonContext,
     cwd: &std::path::Path,
     trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
-) -> std::result::Result<RedactedMcpConfigSnapshot, ErrorPayload> {
+) -> std::result::Result<Option<RedactedMcpConfigSnapshot>, ErrorPayload> {
     let paths = daemon_mcp_paths(ctx, cwd, trust_policy)?;
     let mut config = mcp_config_from_paths(&paths)?;
     let target = paths.last().cloned().or_else(|| {
@@ -15782,8 +15835,10 @@ fn redacted_mcp_config_snapshot(
                 .map(|path| path.with_file_name(cockpit_config::config::dirs::MCP_FILE))
         })
     });
+    let Some(target) = target else {
+        return Ok(None);
+    };
     let path = target
-        .ok_or_else(|| bad_request("no Cockpit config layer is available for MCP snapshot"))?
         .parent()
         .ok_or_else(|| bad_request("MCP config target has no parent"))?
         .join(cockpit_config::config::dirs::MCP_FILE);
@@ -15852,11 +15907,11 @@ fn redacted_mcp_config_snapshot(
     let config_json = serde_json::to_string(&config).map_err(internal)?;
     let prior_json = serde_json::to_string(&prior).map_err(internal)?;
     use sha2::Digest as _;
-    Ok(RedactedMcpConfigSnapshot {
+    Ok(Some(RedactedMcpConfigSnapshot {
         config_json,
         config_path: path.to_string_lossy().into_owned(),
         revision: crate::intel::hex_lower(&Sha256::digest(prior_json.as_bytes())),
-    })
+    }))
 }
 
 fn canonical_mcp_target_path(
@@ -16491,7 +16546,7 @@ async fn provider_config_upsert(
     ctx: &DaemonContext,
     project_root: &str,
     provider_id: &str,
-    mut entry: crate::config::providers::ProviderEntry,
+    entry: crate::config::providers::ProviderEntry,
 ) -> std::result::Result<Response, ErrorPayload> {
     if provider_id.trim().is_empty() {
         return Err(bad_request("provider_id must not be empty"));
@@ -17764,12 +17819,11 @@ async fn save_mcp_config(
 ) -> std::result::Result<Response, ErrorPayload> {
     let _lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     let requested_project_root = project_root.to_owned();
-    let mutation_intent_hash = local_operation_request_hash_hex(&local_operation_request_hash(&(
-        "save_mcp_config",
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(
         &requested_project_root,
-        &config_json,
-        &cleanup_names_json,
-    ))?);
+        config_json,
+        cleanup_names_json,
+    );
     if mutation_intent_hash != supplied_mutation_intent_hash {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,

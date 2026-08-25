@@ -478,11 +478,15 @@ mod tests {
     use crate::engine::tool::Tool;
     use crate::test_env::TestEnvGuard;
 
+    /// Build a tool context for the `helper` assistant inside an isolated
+    /// cockpit home. `validate_row_home` requires the canonical
+    /// `default_home_dir`, so the home is derived here and returned for the
+    /// test to read/write identity files under; the guard must stay alive for
+    /// the test's duration.
     async fn assistant_tool_ctx(
         project: &Path,
-        _home: &Path,
         mode: SoulEditMode,
-    ) -> (ToolCtx, AssistantRow, TestEnvGuard) {
+    ) -> (ToolCtx, AssistantRow, std::path::PathBuf, TestEnvGuard) {
         let env = TestEnvGuard::isolated_cockpit_home_async().await;
         let home = crate::assistants::default_home_dir("helper").unwrap();
         std::fs::create_dir_all(&home).unwrap();
@@ -574,6 +578,7 @@ mod tests {
                 env_overlay: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             },
             row,
+            home,
             env,
         )
     }
@@ -662,10 +667,8 @@ mod tests {
     #[tokio::test]
     async fn soul_edit_modes_human_only_refuses() {
         let project = tempfile::tempdir().unwrap();
-        let _home = tempfile::tempdir().unwrap();
-        let (ctx, _, _env) =
-            assistant_tool_ctx(project.path(), _home.path(), SoulEditMode::HumanOnly).await;
-        let home = crate::assistants::default_home_dir("helper").unwrap();
+        let (ctx, _, home, _env) =
+            assistant_tool_ctx(project.path(), SoulEditMode::HumanOnly).await;
         let original = std::fs::read_to_string(soul_path(&home)).unwrap();
 
         let out = crate::tools::write::WriteTool
@@ -684,19 +687,14 @@ mod tests {
             "{}",
             out.content
         );
-        assert_eq!(
-            std::fs::read_to_string(soul_path(&home)).unwrap(),
-            original
-        );
+        assert_eq!(std::fs::read_to_string(soul_path(&home)).unwrap(), original);
     }
 
     #[tokio::test]
     async fn soul_edit_modes_approve_proposals_requires_approval() {
         let project = tempfile::tempdir().unwrap();
-        let _home = tempfile::tempdir().unwrap();
-        let (ctx, _, _env) =
-            assistant_tool_ctx(project.path(), _home.path(), SoulEditMode::ApproveProposals).await;
-        let home = crate::assistants::default_home_dir("helper").unwrap();
+        let (ctx, _, home, _env) =
+            assistant_tool_ctx(project.path(), SoulEditMode::ApproveProposals).await;
 
         let out = crate::tools::write::WriteTool
             .call(
@@ -720,10 +718,8 @@ mod tests {
     #[tokio::test]
     async fn soul_edit_modes_approve_proposals_applies_on_approval() {
         let project = tempfile::tempdir().unwrap();
-        let _home = tempfile::tempdir().unwrap();
-        let (mut ctx, _, _env) =
-            assistant_tool_ctx(project.path(), _home.path(), SoulEditMode::ApproveProposals).await;
-        let home = crate::assistants::default_home_dir("helper").unwrap();
+        let (mut ctx, _, home, _env) =
+            assistant_tool_ctx(project.path(), SoulEditMode::ApproveProposals).await;
         let store = crate::approval::store::GrantStore::new(
             ctx.session.db.clone(),
             ctx.session.id,
@@ -809,10 +805,8 @@ mod tests {
     #[tokio::test]
     async fn soul_edit_modes_autonomous_applies_and_records_hash() {
         let project = tempfile::tempdir().unwrap();
-        let _home = tempfile::tempdir().unwrap();
-        let (mut ctx, _, _env) =
-            assistant_tool_ctx(project.path(), _home.path(), SoulEditMode::Autonomous).await;
-        let home = crate::assistants::default_home_dir("helper").unwrap();
+        let (mut ctx, _, home, _env) =
+            assistant_tool_ctx(project.path(), SoulEditMode::Autonomous).await;
         let store = crate::approval::store::GrantStore::new(
             ctx.session.db.clone(),
             ctx.session.id,

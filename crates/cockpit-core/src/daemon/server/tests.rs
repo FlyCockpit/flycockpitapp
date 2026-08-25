@@ -7290,7 +7290,7 @@ fn stub_active_model_ref() -> crate::config::providers::ActiveModelRef {
     }
 }
 
-fn stub_config_source() -> crate::daemon::config_source::ConfigSource {
+fn stub_providers_config() -> crate::config::providers::ProvidersConfig {
     use crate::config::providers::{ModelEntry, ProviderEntry};
 
     let mut providers = std::collections::BTreeMap::new();
@@ -7305,13 +7305,37 @@ fn stub_config_source() -> crate::daemon::config_source::ConfigSource {
             ..ProviderEntry::default()
         },
     );
+    crate::config::providers::ProvidersConfig {
+        providers,
+        active_model: Some(stub_active_model_ref()),
+        ..crate::config::providers::ProvidersConfig::default()
+    }
+}
+
+fn stub_config_source() -> crate::daemon::config_source::ConfigSource {
     crate::daemon::config_source::ConfigSource::fixed(
-        crate::config::providers::ProvidersConfig {
-            providers,
-            active_model: Some(stub_active_model_ref()),
-            ..crate::config::providers::ProvidersConfig::default()
-        },
+        stub_providers_config(),
         crate::config::extended::ExtendedConfig::default(),
+    )
+}
+
+/// Like [`stub_config_source`], but with a per-workspace provider layer
+/// (`<cwd>/.cockpit/config.json`) as the write target and watch path.
+/// `GetProviderCatalogSnapshot` can then mint a genuine provider/MCP edit
+/// capability, so save tests exercise the production capability flow instead
+/// of fabricating registry entries.
+fn stub_layered_config_source() -> crate::daemon::config_source::ConfigSource {
+    let providers = stub_providers_config();
+    let extended = crate::config::extended::ExtendedConfig::default();
+    crate::daemon::config_source::ConfigSource::new(
+        move |_cwd| Ok((providers.clone(), extended.clone())),
+        |cwd, _provider_id| Some(cwd.join(".cockpit/config.json")),
+        |cwd| {
+            crate::daemon::config_source::ConfigWatchPaths::new(
+                vec![cwd.join(".cockpit/config.json")],
+                Vec::new(),
+            )
+        },
     )
 }
 
@@ -7546,21 +7570,72 @@ fn persistent_test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<Dae
     )
 }
 
-/// Compute the MCP layer revision the same way the dispatch does: hash the
-/// serialized prior on-disk MCP config (or the default config when the file
-/// is absent). Used by MCP save tests to supply a matching `expected_revision`.
-fn mcp_layer_revision_for_test(config_path: &str) -> String {
-    let config = match std::fs::read_to_string(config_path) {
-        Ok(raw) => crate::mcp::config::McpConfig::parse(&raw).unwrap(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            crate::mcp::config::McpConfig::default()
-        }
-        Err(error) => panic!("failed to read prior MCP config for revision: {error}"),
+/// [`persistent_test_ctx_with_credential_path`] with the layered stub config
+/// source, for tests that mint a real provider/MCP edit capability.
+fn persistent_layered_test_ctx_with_credential_path(
+    path: std::path::PathBuf,
+) -> Arc<DaemonContext> {
+    let db = Db::open_in_memory().expect("in-memory db");
+    let locks = Arc::new(LockManager::in_memory(db.clone()));
+    let paths = DaemonPaths {
+        socket: std::path::PathBuf::from("/tmp/cockpit-persistent-test.sock"),
+        pid_file: std::path::PathBuf::from("/tmp/cockpit-persistent-test.pid"),
+        ephemeral: false,
     };
-    use sha2::Digest as _;
-    crate::intel::hex_lower(&sha2::Sha256::digest(
-        serde_json::to_string(&config).unwrap().as_bytes(),
-    ))
+    Arc::new(
+        DaemonContext::new(
+            db,
+            locks,
+            paths,
+            crate::daemon::terminal::test_host_factory(),
+            stub_layered_config_source(),
+        )
+        .with_credential_store_path(path),
+    )
+}
+
+/// The daemon-derived MCP save authority a real `GetProviderCatalogSnapshot`
+/// minted: everything a `SaveMcpConfig` request must echo back.
+struct McpEditAuthority {
+    owner_root: String,
+    config_path: String,
+    capability: String,
+    revision: String,
+}
+
+/// Mint an MCP edit capability through the production
+/// `GetProviderCatalogSnapshot` flow — the same request the CLI and TUI issue
+/// before an MCP save — and return the daemon-derived save authority.
+async fn mint_mcp_edit_authority(
+    ctx: &Arc<DaemonContext>,
+    state: &mut MutableClientState,
+    root: &str,
+    snapshot_session_id: &str,
+) -> McpEditAuthority {
+    let response = handle_request(
+        Request::GetProviderCatalogSnapshot {
+            project_root: root.to_string(),
+            provider_id: None,
+            snapshot_session_id: snapshot_session_id.to_string(),
+        },
+        state,
+        ctx,
+    )
+    .await
+    .expect("provider catalog snapshot mints the MCP edit capability");
+    let Response::ProviderCatalogSnapshot { config: view, .. } = response else {
+        panic!("expected ProviderCatalogSnapshot response");
+    };
+    McpEditAuthority {
+        owner_root: view.mcp_owner_root.expect("canonical MCP owner root"),
+        config_path: view
+            .mcp_config_path
+            .expect("daemon-selected MCP config path"),
+        capability: view
+            .mcp_edit_capability
+            .expect("minted MCP edit capability"),
+        revision: view.mcp_revision.expect("MCP target-layer revision"),
+    }
 }
 
 fn test_ctx_with_credential_path(path: std::path::PathBuf) -> Arc<DaemonContext> {
@@ -8414,7 +8489,7 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
     let mcp_path = cockpit_dir.join("mcp.json");
     let prior_config = "{\"servers\":{}}\n";
     std::fs::write(&mcp_path, prior_config).unwrap();
-    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let ctx = persistent_layered_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
     // Trust the workspace so the save proceeds past the trust gate (which now
     // resolves before content validation, for sentinel restoration) and the
     // literal check is what rejects each case.
@@ -8425,17 +8500,8 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
     store.save().unwrap();
     let mut state = owner_state();
     let root = tmp.path().to_string_lossy().into_owned();
-    let owner_digest = super::run_invocation::principal_digest(&state.principal);
-    let canonical_root = crate::secret_ownership::canonical_owner_root(&root);
-    let mcp_config_path = format!("{root}/.cockpit/mcp.json");
-    let expected_revision = mcp_layer_revision_for_test(&mcp_config_path);
-    super::dispatch::register_mcp_edit_capability_for_test(
-        "reject-literal-mcp-save",
-        &owner_digest,
-        &canonical_root,
-        &mcp_config_path,
-        &expected_revision,
-    );
+    let authority =
+        mint_mcp_edit_authority(&ctx, &mut state, &root, "reject-literal-mcp-save").await;
     let cases = [
         serde_json::json!({
             "servers": {"literal-header": {
@@ -8458,23 +8524,16 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
     ];
     for (i, config) in cases.into_iter().enumerate() {
         let config_json = serde_json::to_string(&config).unwrap();
-        let mutation_intent_hash = super::dispatch::local_operation_request_hash_hex(
-            &super::dispatch::local_operation_request_hash(&(
-                "save_mcp_config",
-                root.as_str(),
-                &config_json,
-                "[]",
-            ))
-            .unwrap(),
-        );
+        let mutation_intent_hash =
+            cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, "[]");
         let result = handle_request(
             Request::SaveMcpConfig {
                 client_operation_id: format!("reject-literal-mcp-save-{i}").into(),
                 project_root: root.clone(),
-                snapshot_capability: "reject-literal-mcp-save".into(),
-                owner_root: canonical_root.clone(),
-                config_path: mcp_config_path.clone(),
-                expected_revision: expected_revision.clone(),
+                snapshot_capability: authority.capability.clone(),
+                owner_root: authority.owner_root.clone(),
+                config_path: authority.config_path.clone(),
+                expected_revision: authority.revision.clone(),
                 mutation_intent_hash,
                 config_json,
                 secret_values_json: "{}".into(),
@@ -8502,21 +8561,11 @@ async fn mcp_save_stages_literal_and_persists_reference_only_config() {
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();
     std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
-    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let ctx = persistent_layered_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
     trust_workspace_root(&ctx, tmp.path()).await;
     let mut state = owner_state();
     let root = tmp.path().to_string_lossy().into_owned();
-    let owner_digest = super::run_invocation::principal_digest(&state.principal);
-    let canonical_root = crate::secret_ownership::canonical_owner_root(&root);
-    let mcp_config_path = format!("{root}/.cockpit/mcp.json");
-    let expected_revision = mcp_layer_revision_for_test(&mcp_config_path);
-    super::dispatch::register_mcp_edit_capability_for_test(
-        "staged-mcp-save",
-        &owner_digest,
-        &canonical_root,
-        &mcp_config_path,
-        &expected_revision,
-    );
+    let authority = mint_mcp_edit_authority(&ctx, &mut state, &root, "staged-mcp-save").await;
     let config = serde_json::json!({
         "servers": {"staged": {
             "transport": "streamable", "endpoint": "https://mcp.example.test",
@@ -8524,23 +8573,15 @@ async fn mcp_save_stages_literal_and_persists_reference_only_config() {
         }}
     });
     let config_json = serde_json::to_string(&config).unwrap();
-    let mutation_intent_hash = super::dispatch::local_operation_request_hash_hex(
-        &super::dispatch::local_operation_request_hash(&(
-            "save_mcp_config",
-            root.as_str(),
-            &config_json,
-            "[]",
-        ))
-        .unwrap(),
-    );
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, "[]");
     let response = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "staged-mcp-save".into(),
             project_root: root,
-            snapshot_capability: "staged-mcp-save".into(),
-            owner_root: canonical_root,
-            config_path: mcp_config_path,
-            expected_revision,
+            snapshot_capability: authority.capability,
+            owner_root: authority.owner_root,
+            config_path: authority.config_path,
+            expected_revision: authority.revision,
             mutation_intent_hash,
             config_json,
             secret_values_json: serde_json::json!({
@@ -8573,7 +8614,7 @@ async fn mcp_save_cannot_overwrite_a_provider_claimed_named_secret() {
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();
     std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
-    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let ctx = persistent_layered_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
     let root = tmp.path().to_string_lossy().into_owned();
     trust_workspace_root(&ctx, tmp.path()).await;
 
@@ -8615,35 +8656,18 @@ async fn mcp_save_cannot_overwrite_a_provider_claimed_named_secret() {
         serde_json::Value::String("mcp-attacker-value".into()),
     );
     let mut state = owner_state();
-    let owner_digest = super::run_invocation::principal_digest(&state.principal);
-    let canonical_root = crate::secret_ownership::canonical_owner_root(&root);
-    let mcp_config_path = format!("{root}/.cockpit/mcp.json");
-    let expected_revision = mcp_layer_revision_for_test(&mcp_config_path);
-    super::dispatch::register_mcp_edit_capability_for_test(
-        "ownership-race-mcp-save",
-        &owner_digest,
-        &canonical_root,
-        &mcp_config_path,
-        &expected_revision,
-    );
+    let authority =
+        mint_mcp_edit_authority(&ctx, &mut state, &root, "ownership-race-mcp-save").await;
     let config_json = serde_json::to_string(&config).unwrap();
-    let mutation_intent_hash = super::dispatch::local_operation_request_hash_hex(
-        &super::dispatch::local_operation_request_hash(&(
-            "save_mcp_config",
-            root.as_str(),
-            &config_json,
-            "[]",
-        ))
-        .unwrap(),
-    );
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, "[]");
     let result = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "ownership-race-mcp-save".into(),
             project_root: root.clone(),
-            snapshot_capability: "ownership-race-mcp-save".into(),
-            owner_root: canonical_root.clone(),
-            config_path: mcp_config_path.clone(),
-            expected_revision: expected_revision.clone(),
+            snapshot_capability: authority.capability,
+            owner_root: authority.owner_root,
+            config_path: authority.config_path,
+            expected_revision: authority.revision,
             mutation_intent_hash,
             config_json,
             secret_values_json: serde_json::Value::Object(secret_values).to_string().into(),
@@ -9035,7 +9059,7 @@ async fn mcp_save_rejects_unstaged_reference_to_provider_claimed_secret() {
     let cockpit_dir = tmp.path().join(".cockpit");
     std::fs::create_dir_all(&cockpit_dir).unwrap();
     std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
-    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let ctx = persistent_layered_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
     let root = tmp.path().to_string_lossy().into_owned();
     trust_workspace_root(&ctx, tmp.path()).await;
 
@@ -9072,35 +9096,18 @@ async fn mcp_save_rejects_unstaged_reference_to_provider_claimed_secret() {
         }}
     });
     let mut state = owner_state();
-    let owner_digest = super::run_invocation::principal_digest(&state.principal);
-    let canonical_root = crate::secret_ownership::canonical_owner_root(&root);
-    let mcp_config_path = format!("{root}/.cockpit/mcp.json");
-    let expected_revision = mcp_layer_revision_for_test(&mcp_config_path);
-    super::dispatch::register_mcp_edit_capability_for_test(
-        "foreign-reference-mcp-save",
-        &owner_digest,
-        &canonical_root,
-        &mcp_config_path,
-        &expected_revision,
-    );
+    let authority =
+        mint_mcp_edit_authority(&ctx, &mut state, &root, "foreign-reference-mcp-save").await;
     let config_json = serde_json::to_string(&config).unwrap();
-    let mutation_intent_hash = super::dispatch::local_operation_request_hash_hex(
-        &super::dispatch::local_operation_request_hash(&(
-            "save_mcp_config",
-            root.as_str(),
-            &config_json,
-            "[]",
-        ))
-        .unwrap(),
-    );
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, "[]");
     let result = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "foreign-reference-mcp-save".into(),
             project_root: root.clone(),
-            snapshot_capability: "foreign-reference-mcp-save".into(),
-            owner_root: canonical_root.clone(),
-            config_path: mcp_config_path.clone(),
-            expected_revision: expected_revision.clone(),
+            snapshot_capability: authority.capability,
+            owner_root: authority.owner_root,
+            config_path: authority.config_path,
+            expected_revision: authority.revision,
             mutation_intent_hash,
             config_json,
             secret_values_json: "{}".into(),
@@ -9265,7 +9272,7 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
         .to_string(),
     )
     .unwrap();
-    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    let ctx = persistent_layered_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
     trust_workspace_root(&ctx, tmp.path()).await;
     let mut store =
         crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
@@ -9274,40 +9281,19 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
     store.save().unwrap();
     let mut state = owner_state();
     let root = tmp.path().to_string_lossy().into_owned();
-    let owner_digest = super::run_invocation::principal_digest(&state.principal);
-    let canonical_root = crate::secret_ownership::canonical_owner_root(&root);
-    let mcp_config_path = tmp
-        .path()
-        .join(".cockpit/mcp.json")
-        .to_string_lossy()
-        .into_owned();
-    let expected_revision = mcp_layer_revision_for_test(&mcp_config_path);
-    super::dispatch::register_mcp_edit_capability_for_test(
-        "cleanup-mcp-save",
-        &owner_digest,
-        &canonical_root,
-        &mcp_config_path,
-        &expected_revision,
-    );
+    let authority = mint_mcp_edit_authority(&ctx, &mut state, &root, "cleanup-mcp-save").await;
     let config_json = serde_json::json!({"servers": {}}).to_string();
     let cleanup_names_json = serde_json::json!(["unrelated"]).to_string();
-    let mutation_intent_hash = super::dispatch::local_operation_request_hash_hex(
-        &super::dispatch::local_operation_request_hash(&(
-            "save_mcp_config",
-            &root,
-            &config_json,
-            &cleanup_names_json,
-        ))
-        .unwrap(),
-    );
+    let mutation_intent_hash =
+        cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, &cleanup_names_json);
     let response = handle_request(
         Request::SaveMcpConfig {
             client_operation_id: "cleanup-mcp-save".into(),
             project_root: root,
-            snapshot_capability: "cleanup-mcp-save".into(),
-            owner_root: canonical_root,
-            config_path: mcp_config_path,
-            expected_revision,
+            snapshot_capability: authority.capability,
+            owner_root: authority.owner_root,
+            config_path: authority.config_path,
+            expected_revision: authority.revision,
             mutation_intent_hash,
             config_json,
             secret_values_json: "{}".into(),
@@ -9326,6 +9312,212 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
         "provider-layer reference must protect shared MCP named secret"
     );
     assert_eq!(store.named_secret("unrelated"), Some("must-survive"));
+}
+
+/// The capability gate's negative half: a save with no minted capability is
+/// refused before any mutation. An expired capability takes the same
+/// retain-then-lookup path through the registry, so eviction is covered by the
+/// same rejection.
+#[tokio::test]
+async fn mcp_save_rejects_missing_capability_before_any_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    let ctx = persistent_layered_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    trust_workspace_root(&ctx, tmp.path()).await;
+    let mut state = owner_state();
+    let root = tmp.path().to_string_lossy().into_owned();
+    let config_json = serde_json::json!({"servers": {}}).to_string();
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, "[]");
+    let error = handle_request(
+        Request::SaveMcpConfig {
+            client_operation_id: "missing-capability-mcp-save".into(),
+            project_root: root.clone(),
+            snapshot_capability: "never-minted".into(),
+            owner_root: crate::secret_ownership::canonical_owner_root(&root),
+            config_path: format!("{root}/.cockpit/mcp.json"),
+            expected_revision: "00".repeat(32),
+            mutation_intent_hash,
+            config_json,
+            secret_values_json: "{}".into(),
+            cleanup_names_json: "[]".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("a save without a minted capability must be refused");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(
+        error.message.contains("MCP edit capability is missing"),
+        "{}",
+        error.message
+    );
+    assert!(
+        !cockpit_dir.join("mcp.json").exists(),
+        "a refused save must not publish an MCP config"
+    );
+}
+
+/// The intent-hash gate runs first: a body that does not match the supplied
+/// `mutation_intent_hash` is refused even with a genuine minted capability.
+#[tokio::test]
+async fn mcp_save_rejects_mismatched_mutation_intent_hash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    let ctx = persistent_layered_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    trust_workspace_root(&ctx, tmp.path()).await;
+    let mut state = owner_state();
+    let root = tmp.path().to_string_lossy().into_owned();
+    let authority = mint_mcp_edit_authority(&ctx, &mut state, &root, "intent-mismatch-save").await;
+    let config_json = serde_json::json!({"servers": {}}).to_string();
+    let error = handle_request(
+        Request::SaveMcpConfig {
+            client_operation_id: "intent-mismatch-save".into(),
+            project_root: root.clone(),
+            snapshot_capability: authority.capability,
+            owner_root: authority.owner_root,
+            config_path: authority.config_path,
+            expected_revision: authority.revision,
+            mutation_intent_hash: "11".repeat(32),
+            config_json,
+            secret_values_json: "{}".into(),
+            cleanup_names_json: "[]".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect_err("a mismatched mutation intent must be refused");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(
+        error.message.contains("MCP mutation intent does not match"),
+        "{}",
+        error.message
+    );
+    assert!(
+        !cockpit_dir.join("mcp.json").exists(),
+        "a refused save must not publish an MCP config"
+    );
+}
+
+/// Each binding of the minted authority is enforced: a stale target-layer
+/// revision, a divergent config path, and a capability minted for another
+/// principal are all refused before any mutation.
+#[tokio::test]
+async fn mcp_save_rejects_stale_or_foreign_edit_authority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cockpit_dir = tmp.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    std::fs::write(cockpit_dir.join("config.json"), "{}\n").unwrap();
+    let ctx = persistent_layered_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    trust_workspace_root(&ctx, tmp.path()).await;
+    let mut state = owner_state();
+    let root = tmp.path().to_string_lossy().into_owned();
+    let authority =
+        mint_mcp_edit_authority(&ctx, &mut state, &root, "authority-mismatch-save").await;
+    let config_json = serde_json::json!({"servers": {}}).to_string();
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&root, &config_json, "[]");
+    // A capability fabricated for a different principal — the one legitimate
+    // use of the test-only registrar (a real mint always binds the caller).
+    super::dispatch::register_mcp_edit_capability_for_test(
+        "foreign-owner-capability",
+        "not-the-owner-digest",
+        &crate::secret_ownership::canonical_owner_root(&root),
+        &authority.config_path,
+        &authority.revision,
+    );
+    let cases = [
+        // Stale target-layer revision.
+        (
+            authority.capability.clone(),
+            authority.config_path.clone(),
+            "00".repeat(32),
+        ),
+        // Divergent config path.
+        (
+            authority.capability.clone(),
+            format!("{root}/.cockpit/elsewhere.json"),
+            authority.revision.clone(),
+        ),
+        // Capability owned by another principal.
+        (
+            "foreign-owner-capability".to_string(),
+            authority.config_path.clone(),
+            authority.revision.clone(),
+        ),
+    ];
+    for (i, (capability, config_path, expected_revision)) in cases.into_iter().enumerate() {
+        let error = handle_request(
+            Request::SaveMcpConfig {
+                client_operation_id: format!("authority-mismatch-save-{i}").into(),
+                project_root: root.clone(),
+                snapshot_capability: capability,
+                owner_root: authority.owner_root.clone(),
+                config_path,
+                expected_revision,
+                mutation_intent_hash: mutation_intent_hash.clone(),
+                config_json: config_json.clone(),
+                secret_values_json: "{}".into(),
+                cleanup_names_json: "[]".into(),
+            },
+            &mut state,
+            &ctx,
+        )
+        .await
+        .expect_err("a mismatched edit authority must be refused");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(
+            error.message.contains("MCP edit authority does not match"),
+            "{}",
+            error.message
+        );
+        assert!(
+            !cockpit_dir.join("mcp.json").exists(),
+            "a refused save must not publish an MCP config"
+        );
+    }
+}
+
+/// A catalog snapshot with no provider layer (a fresh install: no config
+/// directory exists anywhere) is still a successful read. No edit capability
+/// is minted — the view's capability/revision pair stays absent and
+/// `layer_id` is empty — but the redacted projection is returned instead of
+/// an error, so read surfaces (settings, `cockpit models`, `cockpit mcp`)
+/// keep working before first configuration.
+#[tokio::test]
+async fn provider_catalog_snapshot_survives_missing_provider_layer() {
+    let _env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    trust_workspace_root(&ctx, tmp.path()).await;
+    let mut state = owner_state();
+    let root = tmp.path().to_string_lossy().into_owned();
+    let response = handle_request(
+        Request::GetProviderCatalogSnapshot {
+            project_root: root,
+            provider_id: None,
+            snapshot_session_id: "fresh-install-snapshot".into(),
+        },
+        &mut state,
+        &ctx,
+    )
+    .await
+    .expect("a missing provider layer must not fail the catalog read");
+    let Response::ProviderCatalogSnapshot {
+        config: view,
+        layer_id,
+        ..
+    } = response
+    else {
+        panic!("expected ProviderCatalogSnapshot response");
+    };
+    assert_eq!(layer_id, "", "no editable layer may be advertised");
+    assert_eq!(view.mcp_edit_capability, None);
+    assert_eq!(view.mcp_revision, None);
 }
 
 // `#[tokio::test]`: `persistent_test_ctx` spawns the daemon scheduler loop,
@@ -11138,6 +11330,75 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
     assert!(
         ids.contains(&"openai-main") && ids.contains(&"backup-openai"),
         "both the pre-save and post-save endpoints must be present: {ids:?}"
+    );
+}
+
+/// The deeper payload validation the authz matrix cannot reach (its probes die
+/// at the generation CAS with `Conflict`): with a genuine generation, revision,
+/// and minted mutation capability, a malformed `endpoint_json` is rejected as
+/// `BadRequest` by the `ImageGenerationConfig::new` funnel before anything is
+/// written or the generation is bumped.
+#[tokio::test]
+async fn image_control_mutation_rejects_malformed_payload_after_generation_cas() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at_async(home.path()).await;
+    let cockpit_dir = project.path().join(".cockpit");
+    std::fs::create_dir_all(&cockpit_dir).unwrap();
+    let config_path = cockpit_dir.join("config.json");
+    std::fs::write(&config_path, "{}\n").unwrap();
+
+    let ctx = test_ctx_with_config_source(crate::daemon::config_source::ConfigSource::production());
+    trust_workspace_root(&ctx, project.path()).await;
+    let project_root = project.path().to_string_lossy().into_owned();
+
+    let trust_policy =
+        crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, project.path())
+            .await
+            .unwrap();
+    let layer = crate::daemon::server::image_control_mutations::authoritative_image_layer(
+        &ctx,
+        project.path(),
+        &trust_policy,
+    )
+    .unwrap();
+    let generation = inventory::current_config_generation();
+    let capability = crate::daemon::server::image_control_mutations::mint_mutation_capability(
+        &ctx,
+        project.path(),
+        &layer.target,
+        &layer.revision,
+        generation,
+    )
+    .unwrap();
+    let mut state = owner_state();
+    let error = dispatch_sealed_owner(
+        &ctx,
+        &mut state,
+        Request::ImageEndpointCreate {
+            client_operation_id: uuid::Uuid::new_v4().to_string(),
+            mutation_intent_hash: "aa".repeat(32),
+            project_root: project_root.clone(),
+            endpoint_json: cockpit_proto::SensitiveWirePayload::new(
+                "this is not an endpoint document".to_string(),
+            ),
+            expected_config_generation: generation,
+            expected_config_revision: layer.revision,
+            mutation_capability: capability,
+        },
+    )
+    .await
+    .expect_err("a malformed endpoint payload must be rejected");
+    assert_eq!(error.code, ErrorCode::BadRequest);
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        "{}\n",
+        "a rejected mutation must not write the registry"
+    );
+    assert_eq!(
+        inventory::current_config_generation(),
+        generation,
+        "a rejected mutation must not bump the config generation"
     );
 }
 
@@ -15733,10 +15994,11 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // the same way (no bytes) — a BadRequest, once past the owner gate.
         | "read_bulk_transfer_chunk"
         | "read_redacted_export_chunk" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
-        // `lsp_control` requires an attached session in the dispatch path;
-        // the matrix probe sends it without a prior attach, so the owner-
-        // allowed cell surfaces `NotAttached` after authz.
-        "lsp_control" | "get_inventory_bundle" => AuthzAllowedOutcome::Error(ErrorCode::NotAttached),
+        // Both attach first (`authz_kind_needs_attached_state`), so the owner
+        // cell exercises the attached handler: `lsp_control` always resolves to
+        // an `LspControlResult` message and `get_inventory_bundle` projects the
+        // attached session's inventory.
+        "lsp_control" | "get_inventory_bundle" => AuthzAllowedOutcome::Response,
         "terminal_ingress_begin"
         | "terminal_ingress_chunk"
         | "terminal_ingress_finish"
@@ -15802,9 +16064,13 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         // `Ok(McpOAuthCancelled { cancelled })` (false for the matrix's unknown
         // flow id), never an error, so the owner-allowed cell is a `Response`.
         "cancel_mcp_oauth" => AuthzAllowedOutcome::Response,
-        // The catalog snapshot probe has no Cockpit provider layer available.
-        "get_provider_catalog_snapshot" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
-        "get_provider_usage_snapshot" => AuthzAllowedOutcome::Response,
+        // The catalog snapshot is a read that must survive a missing provider
+        // layer (fresh install): the stub config source has no write target, so
+        // the response carries no edit capability, but the owner cell is still
+        // a `Response`.
+        "get_provider_catalog_snapshot" | "get_provider_usage_snapshot" => {
+            AuthzAllowedOutcome::Response
+        }
         // `fetch_provider_models` persists refreshed model config, so the
         // ephemeral matrix daemon rejects it with `bad_request` before any
         // fetch, exactly like the sibling provider-config owner mutations.
@@ -15833,14 +16099,14 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         "image_endpoint_get" | "image_target_get" | "image_workflow_get" => {
             AuthzAllowedOutcome::Error(ErrorCode::BadRequest)
         }
-        // LOCAL owner image-control MUTATIONS: after the owner gate the handler
-        // loads the (empty) registry and rejects the matrix's bogus input before
-        // any write — a malformed `endpoint_json`/`target_json` fails the
-        // `ImageGenerationConfig::new` funnel and a delete/set_default names an
-        // id absent from the empty registry — so the owner-allowed cell surfaces
-        // `BadRequest`.
-        // Image config mutations send expected_config_generation=1 but the
-        // matrix daemon has generation 0, so they surface `Conflict`.
+        // LOCAL owner image-control MUTATIONS: the unconditional generation CAS
+        // runs first after the owner gate, and the matrix probe fabricates
+        // `expected_config_generation: 1` against the fresh daemon's generation
+        // 0 — so the owner-allowed cell surfaces `Conflict` before the deeper
+        // payload validation. The `ImageGenerationConfig::new` `BadRequest`
+        // funnel is covered by the dedicated
+        // `image_control_mutation_rejects_malformed_payload_after_generation_cas`
+        // test below rather than by this matrix.
         "image_endpoint_create"
         | "image_endpoint_update"
         | "image_endpoint_delete"
@@ -15926,12 +16192,12 @@ fn authz_allowed_outcome(kind: &str) -> AuthzAllowedOutcome {
         | "complete_agent_editor_lease"
         | "apply_extended_config_patch"
         | "get_agent_edit_snapshot" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
-        // `get_agent_editor_lease_settlement` is in the concurrent set but has
-        // no handler in the concurrent dispatch path (pre-existing from #42);
-        // the probe surfaces `Internal` until the handler is moved.
-        "get_agent_editor_lease_settlement" => AuthzAllowedOutcome::Error(ErrorCode::Internal),
-        // `mutate_agent` with `ResetAllBuiltins` and no expected_revision fails
-        // with `Conflict` ("agent mutation requires an expected revision").
+        // `get_agent_editor_lease_settlement` rejects the probe's non-UUID
+        // lease id ("lease") before any registry lookup.
+        "get_agent_editor_lease_settlement" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
+        // `mutate_agent` rejects the probe's fabricated mutation intent hash
+        // (`"00" * 32`) before any other validation, so the owner-allowed cell
+        // surfaces `BadRequest`.
         "mutate_agent" => AuthzAllowedOutcome::Error(ErrorCode::BadRequest),
         other => panic!("unhandled authz allowed outcome for {other}"),
     }
@@ -16988,18 +17254,14 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "pin"
             | "refresh_env"
             | "refresh_config"
-    ) || authz_kind_needs_attached_state_remote(kind, level)
-}
-
-#[cfg(all(unix, feature = "remote"))]
-fn authz_kind_needs_attached_state_remote(kind: &str, level: AuthzLevel) -> bool {
-    (kind == "get_inventory_bundle" && level != AuthzLevel::NoAccess)
+    )
+        // Both kinds gate on `require_attached` before doing any work, in every
+        // build profile — the prelude must attach wherever the level can attach
+        // at all, so the owner cell exercises the attached dispatch path
+        // instead of re-proving the attach gate (which has its own dedicated
+        // negative tests).
+        || (kind == "get_inventory_bundle" && level != AuthzLevel::NoAccess)
         || (kind == "lsp_control" && matches!(level, AuthzLevel::Owner | AuthzLevel::Writer))
-}
-
-#[cfg(all(unix, not(feature = "remote")))]
-fn authz_kind_needs_attached_state_remote(_kind: &str, _level: AuthzLevel) -> bool {
-    false
 }
 
 #[cfg(unix)]
@@ -22988,9 +23250,6 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "list_failed_tool_calls",
         "get_session_compactions",
         "get_assistant",
-        "get_agent_edit_snapshot",
-        "get_agent_inventory",
-        "get_extended_config_snapshot",
         "diagnose_media_reservation",
         "get_doctor_snapshot",
         "get_agent_inventory",

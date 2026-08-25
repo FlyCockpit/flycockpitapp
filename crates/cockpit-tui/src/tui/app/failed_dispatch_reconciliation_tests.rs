@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -8,8 +7,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{App, DispatchOutcome, EphemeralSessionSwitchIntent, SideConversation};
 use crate::tui::agent_runner::{
-    AgentRunner, ClientTasks, ControlRequest, RunnerInput, SessionSwitchOutcome, SessionTarget,
-    UsageCounts,
+    AgentRunner, ControlRequest, RunnerInput, SessionSwitchOutcome, SessionTarget,
+    TestRunnerOverrides,
 };
 use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
@@ -40,48 +39,14 @@ fn runner_with_all_channels(
     control_tx: mpsc::Sender<ControlRequest>,
     events: Arc<Mutex<Vec<crate::tui::agent_runner::QueuedTurnEvent>>>,
 ) -> AgentRunner {
-    let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
-    AgentRunner {
-        input_tx,
-        record_tx,
-        control_tx,
-        attached_request_tx,
-        events,
-        event_notify: Arc::new(tokio::sync::Notify::new()),
-        active_agent: Arc::new(Mutex::new("Build".to_string())),
-        active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
-        skill_inventory_names: Arc::new(Mutex::new(None)),
-        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
-        active_model_state: None,
-        session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
-        attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        submission_session_tx: tokio::sync::watch::channel(
-            crate::tui::agent_runner::SubmissionSessionBinding::unbound(),
-        )
-        .0,
-        awaiting_durable: Default::default(),
-        short_id: "abc123".to_string(),
-        project_id: "project".to_string(),
-        usage: UsageCounts::default(),
-        owns_daemon: false,
-        owned_daemon_guard: None,
-        socket: PathBuf::from("/tmp/cockpit-test.sock"),
-        history: Vec::new(),
-        paused_work: Vec::new(),
-        repair_required: None,
-        btw_fork: None,
-        daemon_version: "test".to_string(),
-        daemon_compatible: true,
-        current_client: None,
-        attach_context: None,
+    AgentRunner::test_fixture(TestRunnerOverrides {
+        input_tx: Some(input_tx),
+        record_tx: Some(record_tx),
+        control_tx: Some(control_tx),
+        events: Some(events),
         last_applied_seq: Some(Arc::new(Mutex::new(Some(0)))),
-        client_tasks: ClientTasks::default(),
-        #[cfg(test)]
-        test_session_switch_rx: Arc::new(Mutex::new(None)),
-        #[cfg(test)]
-        test_force_can_switch: false,
-        test_advance_epoch_when_switch_task_created: false,
-    }
+        ..Default::default()
+    })
 }
 
 fn switch_outcome(session_id: uuid::Uuid) -> AsyncActionPayload {

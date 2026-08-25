@@ -71,14 +71,6 @@ impl SubmissionSessionBinding {
             attachment_epoch,
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn unbound() -> Self {
-        Self {
-            session_id: Uuid::nil(),
-            attachment_epoch: 0,
-        }
-    }
 }
 
 /// Handle the TUI keeps to talk to the engine (now via the daemon).
@@ -363,7 +355,7 @@ pub struct AgentRunner {
     /// Armed while the runner is still a provisional async attach result.
     /// Adoption transfers this guard to `App`; dropping a stale/replaced
     /// result therefore cannot orphan the ephemeral daemon it spawned.
-    pub(crate) owned_daemon_guard: Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard>,
+    owned_daemon_guard: Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard>,
     /// The socket of the daemon this runner is attached to. Carried so an
     /// owned ephemeral daemon can be reaped on exit via the guard.
     pub socket: PathBuf,
@@ -434,6 +426,27 @@ impl Drop for ClientTasks {
     }
 }
 
+/// The parts a test runner fixture actually varies. Everything else comes
+/// from [`AgentRunner::test_fixture`], so this file stays the single owner of
+/// the runner's field list: adding a field must not ripple back out into the
+/// per-module fixtures.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestRunnerOverrides {
+    pub(crate) input_tx: Option<mpsc::Sender<RunnerInput>>,
+    pub(crate) record_tx: Option<mpsc::Sender<Request>>,
+    pub(crate) control_tx: Option<mpsc::Sender<ControlRequest>>,
+    pub(crate) attached_request_tx: Option<mpsc::Sender<AttachedRequest>>,
+    pub(crate) events: Option<Arc<Mutex<Vec<QueuedTurnEvent>>>>,
+    /// Also seeds the submission-session binding, so a fixture that pins an
+    /// id keeps both halves consistent.
+    pub(crate) session_id: Option<uuid::Uuid>,
+    pub(crate) short_id: Option<String>,
+    pub(crate) socket: Option<PathBuf>,
+    pub(crate) last_applied_seq: Option<Arc<Mutex<Option<i64>>>>,
+    pub(crate) client_tasks: Option<ClientTasks>,
+}
+
 impl std::fmt::Debug for AgentRunner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -460,8 +473,10 @@ impl AgentRunner {
 
     #[cfg(test)]
     pub(crate) fn stub_with_control_tx(control_tx: mpsc::Sender<ControlRequest>) -> Self {
-        let (input_tx, _input_rx) = mpsc::channel(8);
-        Self::stub_with_channels(control_tx, input_tx)
+        Self::test_fixture(TestRunnerOverrides {
+            control_tx: Some(control_tx),
+            ..Default::default()
+        })
     }
 
     #[cfg(test)]
@@ -477,17 +492,48 @@ impl AgentRunner {
         control_tx: mpsc::Sender<ControlRequest>,
         input_tx: mpsc::Sender<RunnerInput>,
     ) -> (Self, watch::Receiver<SubmissionSessionBinding>) {
-        let (record_tx, _record_rx) = mpsc::channel(1);
-        let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
-        let session_id = uuid::Uuid::new_v4();
-        let (submission_session_tx, submission_session_rx) =
-            watch::channel(SubmissionSessionBinding::new(session_id, 0));
-        let runner = Self {
+        Self::test_fixture_with_submission_watch(TestRunnerOverrides {
+            input_tx: Some(input_tx),
+            control_tx: Some(control_tx),
+            ..Default::default()
+        })
+    }
+
+    /// The one authoritative test runner. Fixtures elsewhere in the crate hand
+    /// it only the channels/ids they assert against; the defaults below are
+    /// the inert "attached, idle, nothing owned" shape.
+    #[cfg(test)]
+    pub(crate) fn test_fixture(overrides: TestRunnerOverrides) -> Self {
+        Self::test_fixture_with_submission_watch(overrides).0
+    }
+
+    /// [`Self::test_fixture`] for callers that must observe dispatcher wakes on
+    /// the submission-session watch.
+    #[cfg(test)]
+    pub(crate) fn test_fixture_with_submission_watch(
+        overrides: TestRunnerOverrides,
+    ) -> (Self, watch::Receiver<SubmissionSessionBinding>) {
+        let TestRunnerOverrides {
             input_tx,
             record_tx,
             control_tx,
             attached_request_tx,
-            events: Arc::new(Mutex::new(Vec::new())),
+            events,
+            session_id,
+            short_id,
+            socket,
+            last_applied_seq,
+            client_tasks,
+        } = overrides;
+        let session_id = session_id.unwrap_or_else(uuid::Uuid::new_v4);
+        let (submission_session_tx, submission_session_rx) =
+            watch::channel(SubmissionSessionBinding::new(session_id, 0));
+        let runner = Self {
+            input_tx: input_tx.unwrap_or_else(|| mpsc::channel(8).0),
+            record_tx: record_tx.unwrap_or_else(|| mpsc::channel(1).0),
+            control_tx: control_tx.unwrap_or_else(|| mpsc::channel(1).0),
+            attached_request_tx: attached_request_tx.unwrap_or_else(|| mpsc::channel(1).0),
+            events: events.unwrap_or_else(|| Arc::new(Mutex::new(Vec::new()))),
             event_notify: Arc::new(Notify::new()),
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
@@ -498,12 +544,12 @@ impl AgentRunner {
             attachment_epoch: Arc::new(AtomicU64::new(0)),
             submission_session_tx,
             awaiting_durable: Default::default(),
-            short_id: "abc123".to_string(),
+            short_id: short_id.unwrap_or_else(|| "abc123".to_string()),
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
             owns_daemon: false,
             owned_daemon_guard: None,
-            socket: PathBuf::from("/tmp/cockpit-test.sock"),
+            socket: socket.unwrap_or_else(|| PathBuf::from("/tmp/cockpit-test.sock")),
             history: Vec::new(),
             paused_work: Vec::new(),
             repair_required: None,
@@ -512,13 +558,10 @@ impl AgentRunner {
             daemon_compatible: true,
             current_client: None,
             attach_context: None,
-            last_applied_seq: None,
-            client_tasks: ClientTasks::default(),
-            #[cfg(test)]
+            last_applied_seq,
+            client_tasks: client_tasks.unwrap_or_default(),
             test_session_switch_rx: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
             test_force_can_switch: false,
-            #[cfg(test)]
             test_advance_epoch_when_switch_task_created: false,
         };
         (runner, submission_session_rx)
@@ -6118,51 +6161,13 @@ mod tests {
         handle: JoinHandle<()>,
         events: Arc<Mutex<Vec<QueuedTurnEvent>>>,
     ) -> AgentRunner {
-        let (input_tx, _input_rx) = mpsc::channel(1);
-        let (record_tx, _record_rx) = mpsc::channel(1);
-        let (control_tx, _control_rx) = mpsc::channel(1);
-        let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
         let mut client_tasks = ClientTasks::default();
         client_tasks.push(handle);
-        AgentRunner {
-            input_tx,
-            record_tx,
-            control_tx,
-            attached_request_tx,
-            events,
-            event_notify: Arc::new(Notify::new()),
-            active_agent: Arc::new(Mutex::new("Build".to_string())),
-            active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
-            skill_inventory_names: Arc::new(Mutex::new(None)),
-            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
-            active_model_state: None,
-            session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
-            attachment_epoch: Arc::new(AtomicU64::new(0)),
-            submission_session_tx: watch::channel(SubmissionSessionBinding::unbound()).0,
-            awaiting_durable: Default::default(),
-            short_id: "abc123".to_string(),
-            project_id: "project".to_string(),
-            usage: UsageCounts::default(),
-            owns_daemon: false,
-            owned_daemon_guard: None,
-            socket: PathBuf::from("/tmp/cockpit-test.sock"),
-            history: Vec::new(),
-            paused_work: Vec::new(),
-            repair_required: None,
-            btw_fork: None,
-            daemon_version: "test".to_string(),
-            daemon_compatible: true,
-            current_client: None,
-            attach_context: None,
-            last_applied_seq: None,
-            client_tasks,
-            #[cfg(test)]
-            test_session_switch_rx: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            test_force_can_switch: false,
-            #[cfg(test)]
-            test_advance_epoch_when_switch_task_created: false,
-        }
+        AgentRunner::test_fixture(TestRunnerOverrides {
+            events: Some(events),
+            client_tasks: Some(client_tasks),
+            ..Default::default()
+        })
     }
 
     async fn assert_task_future_dropped(dropped: Arc<AtomicBool>) {

@@ -488,9 +488,18 @@ impl ImageSpendPage {
         };
     }
 
-    fn save(&mut self, cx: &mut SettingsCx) {
+    /// The one review gate every save path shares: an invalid draft never
+    /// reaches persistence, and both entry points report it identically.
+    fn validate_draft_or_status(&mut self) -> bool {
         if let Err(reason) = self.draft.validate() {
             self.status = format!("Not saved: {reason:?}. Review every required choice.");
+            return false;
+        }
+        true
+    }
+
+    fn save(&mut self, cx: &mut SettingsCx) {
+        if !self.validate_draft_or_status() {
             return;
         }
         if self.daemon_owned {
@@ -534,8 +543,7 @@ impl ImageSpendPage {
     /// [`Self::save`] without requiring a live [`SettingsCx`].
     #[cfg(test)]
     fn save_for_test(&mut self) {
-        if let Err(reason) = self.draft.validate() {
-            self.status = format!("Not saved: {reason:?}. Review every required choice.");
+        if !self.validate_draft_or_status() {
             return;
         }
         self.persist_locally();

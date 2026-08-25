@@ -274,6 +274,10 @@ pub enum Response {
     LeakRevealCapability {
         capability: LeakRevealCapability,
     },
+    /// An exact leak-reveal capability was spent without revealing a secret.
+    LeakRevealCancelled {
+        report_id: String,
+    },
     /// MarkLeakRotated response: the updated rotation disposition.
     LeakRotationUpdated {
         report_id: String,
@@ -338,6 +342,12 @@ pub enum Response {
     /// secret.
     #[serde(rename = "provider_oauth_started")]
     ProviderOAuthStarted {
+        client_operation_id: String,
+        /// Unkeyed SHA-256 of the canonical request tuple. The daemon uses a
+        /// separate keyed identity for durable idempotency; this wire value is
+        /// deliberately client-computable so direct and recovered receipts
+        /// can be bound to the exact request.
+        request_hash: String,
         flow_id: String,
         authorize_url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -346,9 +356,25 @@ pub enum Response {
     /// Completion/poll result for a daemon-owned provider OAuth flow.
     #[serde(rename = "provider_oauth_completed")]
     ProviderOAuthCompleted {
+        client_operation_id: String,
+        /// Public correlation over the non-secret client operation id and
+        /// flow id. Callback/code bytes are bound only by the daemon's keyed
+        /// durable-operation identity and never have an offline verifier.
+        request_hash: String,
+        flow_id: String,
         logged_in: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_seconds: Option<u64>,
+    },
+    /// Idempotent terminal cancellation receipt. `cancelled` is true only
+    /// when cancellation fenced credential persistence; false means the exact
+    /// flow had already reached another terminal state.
+    #[serde(rename = "provider_oauth_cancelled")]
+    ProviderOAuthCancelled {
+        client_operation_id: String,
+        request_hash: String,
+        flow_id: Option<String>,
+        cancelled: bool,
     },
     /// Owner-only instructions for a daemon-owned MCP OAuth flow. The
     /// `authorize_url` is the authorization endpoint the owner opens; by OAuth
@@ -357,25 +383,57 @@ pub enum Response {
     /// token, an authorization/callback code, or any credential secret.
     #[serde(rename = "mcp_oauth_started")]
     McpOAuthStarted {
+        client_operation_id: String,
+        /// Client-computable canonical request hash; never the daemon's keyed
+        /// durable-operation identity.
+        request_hash: String,
         flow_id: String,
         authorize_url: String,
     },
     /// Completion result for a daemon-owned MCP OAuth flow.
     #[serde(rename = "mcp_oauth_completed")]
     McpOAuthCompleted {
+        client_operation_id: String,
+        /// Public correlation over non-secret request identifiers only.
+        request_hash: String,
+        flow_id: String,
         authenticated: bool,
     },
     #[serde(rename = "mcp_oauth_cancelled")]
     McpOAuthCancelled {
+        client_operation_id: String,
+        request_hash: String,
+        flow_id: Option<String>,
         cancelled: bool,
     },
     /// Authoritative result of an MCP config publication. Credential refs are
     /// intentionally omitted; clients refresh their redacted view/inventory.
-    McpConfigSaved {
+    McpConfigCommitted {
+        client_operation_id: String,
+        /// Daemon-keyed digest binding the terminal receipt to the exact
+        /// request body. Older archived fixtures predate this field.
+        #[serde(default)]
+        request_hash: String,
+        /// Public SHA-256 over the project/config/cleanup intent with staged
+        /// secret values excluded.
+        #[serde(default)]
+        mutation_intent_hash: String,
+        project_root: String,
+        owner_root: String,
+        config_path: String,
+        consumed_revision: String,
+        result_revision: String,
+        config_generation: u64,
         credential_count: u32,
     },
     ProviderCatalogSnapshot {
         config: ProviderConfigView,
+        snapshot_session_id: String,
+        layer_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        owner_root: String,
+        base_revision: String,
+        config_generation: u64,
     },
     ProviderModelsFetched {
         results: Vec<ProviderModelFetchResult>,
@@ -387,11 +445,91 @@ pub enum Response {
     ProviderConfigUpserted {
         config: ProviderConfigView,
     },
-    /// Result of deleting a provider credential. `found` reports whether the
-    /// authorized OAuth record existed; `deleted` reports the mutation.
-    ProviderCredentialDeleted {
-        found: bool,
-        deleted: bool,
+    /// Exact receipt for one atomic provider-layer CAS mutation.
+    ProviderMutationCommitted {
+        client_operation_id: String,
+        snapshot_session_id: String,
+        layer_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        owner_root: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        mutation_intent_hash: String,
+        consumed_revision: String,
+        result_revision: String,
+        config_generation: u64,
+        config: ProviderConfigView,
+        status: crate::ConfigCommitStatus,
+        publication: crate::ConfigPublicationStatus,
+    },
+    /// Exact receipt for a daemon-owned provider credential mutation.
+    ProviderCredentialCommitted {
+        client_operation_id: String,
+        /// Public correlation over the operation, provider and owner scope;
+        /// secret credential bytes are deliberately excluded.
+        #[serde(default)]
+        mutation_intent_hash: String,
+        provider_id: String,
+        project_root: Option<String>,
+        owner_root: Option<String>,
+        /// Canonical authority identity: `global` or `project:<canonical-root>`.
+        #[serde(default)]
+        owner_scope: String,
+        stored: bool,
+        changed: bool,
+        #[serde(default)]
+        consumed_vault_generation: u64,
+        #[serde(default)]
+        result_vault_generation: u64,
+        config_generation: u64,
+    },
+    /// Exact durable receipt for a subscription disclosure acknowledgement.
+    SubscriptionAckCommitted {
+        client_operation_id: String,
+        provider_id: String,
+        /// Lowercase SHA-256 of the non-secret request identity.
+        request_hash: String,
+        changed: bool,
+        #[serde(default)]
+        consumed_vault_generation: u64,
+        #[serde(default)]
+        result_vault_generation: u64,
+    },
+    /// Owner-scoped resolution of a transport-ambiguous local mutation.
+    /// `response` is present only after the durable terminal receipt commits.
+    LocalOperationSettlement {
+        client_operation_id: String,
+        /// Daemon-recorded domain; prevents a reused operation id from being
+        /// accepted as settlement for a different mutation.
+        operation_kind: String,
+        /// Lowercase SHA-256 of the exact request identity recorded at begin.
+        request_hash: String,
+        pending: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response: Option<Box<Response>>,
+        /// Authoritative terminal rejection. Transport errors never populate
+        /// this field and therefore cannot be confused with a committed reject.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_error: Option<crate::ErrorPayload>,
+        /// True only for a durably recorded terminal cancellation.
+        #[serde(default)]
+        terminal_cancelled: bool,
+    },
+    CopilotAuthCommitted {
+        client_operation_id: String,
+        /// Public correlation over the exact setup target. The acquired token
+        /// remains covered only by the daemon-keyed operation identity.
+        #[serde(default)]
+        mutation_intent_hash: String,
+        project_root: String,
+        owner_root: String,
+        #[serde(default)]
+        owner_scope: String,
+        provider_id: String,
+        #[serde(default)]
+        consumed_vault_generation: u64,
+        #[serde(default)]
+        result_vault_generation: u64,
+        config_generation: u64,
     },
     StartupDisclosures {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -417,6 +555,9 @@ pub enum Response {
 
     Assistants {
         assistants: Vec<AssistantSummary>,
+        /// Shared daemon configuration generation used to pair this global
+        /// projection with a workspace agent-inventory projection.
+        config_generation: u64,
     },
 
     AssistantUpserted {
@@ -424,8 +565,17 @@ pub enum Response {
     },
 
     AssistantDefinitionSaved {
-        assistant: AssistantSummary,
-        consumed_definition_revision: String,
+        client_operation_id: String,
+        mutation_intent_hash: String,
+        project_root: String,
+        requested_project_root: String,
+        name: String,
+        assistant: Option<AssistantSummary>,
+        consumed_revision: String,
+        result_revision: String,
+        consumed_config_generation: u64,
+        result_config_generation: u64,
+        outcome: crate::AgentMutationOutcome,
     },
 
     AssistantSessionCreated {
@@ -561,6 +711,13 @@ pub enum Response {
     /// intentionally not echoed; callers receive only an opaque committed
     /// revision and can reload their own safe view.
     ExtendedConfigSaved {
+        #[serde(default)]
+        client_operation_id: String,
+        #[serde(default)]
+        request_hash: String,
+        /// Client-computable digest of the exact non-secret patch intent.
+        #[serde(default)]
+        mutation_intent_hash: String,
         hash: String,
         config_generation: u64,
         layer_id: String,
@@ -590,6 +747,10 @@ pub enum Response {
         entries: Vec<crate::AgentInventoryEntry>,
         /// Opaque revision covering the resettable workspace inventory.
         inventory_revision: String,
+        /// Canonical daemon-authoritative root used to resolve this inventory.
+        project_root: String,
+        /// Exact spelling supplied by the client for this read.
+        requested_project_root: String,
         config_generation: u64,
     },
 
@@ -599,7 +760,7 @@ pub enum Response {
 
     AgentEditorLeaseBegun(crate::AgentEditorLease),
 
-    AgentEditorLeaseCompleted(crate::AgentMutationResult),
+    AgentEditorLeaseCompleted(crate::AgentEditorCompletion),
 
     /// Safe outcome of a daemon-owned setup wizard mutation.
     SetupWizardApplied {
@@ -623,7 +784,12 @@ pub enum Response {
     },
 
     ImageSpendPolicySaved {
-        policy_version: u64,
+        client_operation_id: String,
+        project_key: String,
+        /// Lowercase SHA-256 of the exact non-secret request identity.
+        request_hash: String,
+        consumed_policy_version: Option<u64>,
+        result_policy_version: u64,
     },
 
     /// Redacted LOCAL image-generation control-plane read reply
@@ -848,9 +1014,16 @@ pub enum Response {
     },
     /// Result of deleting an assistant registry row.
     AssistantDeleted {
+        client_operation_id: String,
+        mutation_intent_hash: String,
+        project_root: String,
+        requested_project_root: String,
         name: String,
-        consumed_registration_revision: String,
-        deleted: bool,
+        consumed_revision: String,
+        result_revision: String,
+        consumed_config_generation: u64,
+        result_config_generation: u64,
+        outcome: crate::AgentMutationOutcome,
     },
     /// Media reservation accounting diagnosis as JSON.
     MediaReservationDiagnosis {
@@ -1143,6 +1316,7 @@ macro_rules! response_variants {
             (Response::SealedActionRetired { .. }, "sealed_action_retired");
             (Response::LeakReports { .. }, "leak_reports");
             (Response::LeakRevealCapability { .. }, "leak_reveal_capability");
+            (Response::LeakRevealCancelled { .. }, "leak_reveal_cancelled");
             (Response::LeakRotationUpdated { .. }, "leak_rotation_updated");
             (Response::LeakReportDeleted { .. }, "leak_report_deleted");
             (Response::ProjectNotes { .. }, "project_notes");
@@ -1165,15 +1339,19 @@ macro_rules! response_variants {
             (Response::FlycockpitAccount { .. }, "flycockpit_account");
             (Response::ProviderOAuthStarted { .. }, "provider_oauth_started");
             (Response::ProviderOAuthCompleted { .. }, "provider_oauth_completed");
+            (Response::ProviderOAuthCancelled { .. }, "provider_oauth_cancelled");
             (Response::McpOAuthStarted { .. }, "mcp_oauth_started");
             (Response::McpOAuthCompleted { .. }, "mcp_oauth_completed");
             (Response::McpOAuthCancelled { .. }, "mcp_oauth_cancelled");
-            (Response::McpConfigSaved { .. }, "mcp_config_saved");
+            (Response::McpConfigCommitted { .. }, "mcp_config_committed");
             (Response::ProviderCatalogSnapshot { .. }, "provider_catalog_snapshot");
             (Response::ProviderModelsFetched { .. }, "provider_models_fetched");
             (Response::ProviderUsageSnapshot { .. }, "provider_usage_snapshot");
             (Response::ProviderConfigUpserted { .. }, "provider_config_upserted");
-            (Response::ProviderCredentialDeleted { .. }, "provider_credential_deleted");
+            (Response::ProviderMutationCommitted { .. }, "provider_mutation_committed");
+            (Response::ProviderCredentialCommitted { .. }, "provider_credential_committed");
+            (Response::SubscriptionAckCommitted { .. }, "subscription_ack_committed");
+            (Response::CopilotAuthCommitted { .. }, "copilot_auth_committed");
             (Response::StartupDisclosures { .. }, "startup_disclosures");
             (Response::AppFlag { .. }, "app_flag");
             (Response::AppFlagSeen { .. }, "app_flag_seen");
@@ -1210,6 +1388,7 @@ macro_rules! response_variants {
             (Response::AgentMutated(..), "agent_mutated");
             (Response::AgentEditorLeaseBegun(..), "agent_editor_lease_begun");
             (Response::AgentEditorLeaseCompleted(..), "agent_editor_lease_completed");
+            (Response::LocalOperationSettlement { .. }, "local_operation_settlement");
             (Response::SetupWizardApplied { .. }, "setup_wizard_applied");
             (Response::PolicyExported { .. }, "policy_exported");
             (Response::PolicyImported { .. }, "policy_imported");
@@ -1303,6 +1482,8 @@ mod tests {
     #[test]
     fn mcp_oauth_wire_responses_are_opaque_to_tokens() {
         let started = serde_json::to_string(&Response::McpOAuthStarted {
+            client_operation_id: "begin".into(),
+            request_hash: "00".repeat(32),
             flow_id: "flow-opaque".into(),
             authorize_url: "https://auth.example.test/authorize?state=daemon-state".into(),
         })
@@ -1312,6 +1493,9 @@ mod tests {
         assert!(!started.contains("refresh_token"));
 
         let completed = serde_json::to_value(Response::McpOAuthCompleted {
+            client_operation_id: "complete".into(),
+            request_hash: "00".repeat(32),
+            flow_id: "flow-opaque".into(),
             authenticated: true,
         })
         .unwrap();
@@ -1583,13 +1767,20 @@ mod tests {
         assert_eq!(
             Response::LeakRevealCapability {
                 capability: LeakRevealCapability {
-                    capability: String::new(),
+                    capability: LeakRevealToken::new("00".repeat(32)),
                     report_id: String::new(),
                     expires_at_ms: 0,
                 }
             }
             .wire_tag(),
             "leak_reveal_capability"
+        );
+        assert_eq!(
+            Response::LeakRevealCancelled {
+                report_id: String::new(),
+            }
+            .wire_tag(),
+            "leak_reveal_cancelled"
         );
         assert_eq!(
             Response::LeakRotationUpdated {

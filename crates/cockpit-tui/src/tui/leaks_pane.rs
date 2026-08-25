@@ -179,6 +179,10 @@ pub enum LeaksPaneState {
 }
 
 pub struct LeaksPane {
+    /// Unique identity for this concrete pane lifetime.  A reveal worker from
+    /// a closed pane must never publish into a later pane whose local buffer
+    /// generation happens to match.
+    instance_id: uuid::Uuid,
     daemon_socket: Option<PathBuf>,
     reports: Vec<LeakReportMetadata>,
     selected: usize,
@@ -210,6 +214,7 @@ pub enum LeaksOutcome {
     /// payload path and installs the plaintext into this pane's buffer at
     /// `generation`.
     Reveal {
+        pane_instance_id: uuid::Uuid,
         report_id: String,
         generation: u64,
     },
@@ -251,7 +256,7 @@ pub struct LeaksRpcResult {
 }
 
 impl LeaksRpcAction {
-    pub async fn run(self) -> Result<LeaksRpcResult, String> {
+    pub fn run_blocking_rpc(self) -> Result<LeaksRpcResult, String> {
         let socket = self.daemon_socket;
         let send = |request| crate::tui::agent_runner::daemon_request_at_blocking(&socket, request);
         match self.kind {
@@ -335,6 +340,7 @@ impl LeaksPane {
     /// [`Self::initial_load_action`] so opening never blocks the runtime.
     pub fn open(daemon_socket: Option<PathBuf>) -> Self {
         Self {
+            instance_id: uuid::Uuid::new_v4(),
             daemon_socket,
             reports: Vec::new(),
             selected: 0,
@@ -348,6 +354,10 @@ impl LeaksPane {
             reveal_error: None,
             pending_clear: false,
         }
+    }
+
+    pub fn instance_id(&self) -> uuid::Uuid {
+        self.instance_id
     }
 
     /// The initial (first-page) list action, or `None` if the daemon socket is
@@ -528,6 +538,7 @@ impl LeaksPane {
             KeyCode::Enter | KeyCode::Char('r') => {
                 if let Some(report_id) = self.selected_report_id() {
                     LeaksOutcome::Reveal {
+                        pane_instance_id: self.instance_id,
                         report_id,
                         generation: self.reveal.generation(),
                     }
@@ -730,6 +741,16 @@ mod tests {
         // Zeroize on close scrubs it.
         assert!(pane.zeroize_reveal());
         assert!(!pane.reveal_buffer().is_active());
+    }
+
+    #[test]
+    fn reopened_pane_has_distinct_reveal_authority_identity() {
+        let first = LeaksPane::open(Some(PathBuf::from("/test.sock")));
+        let first_id = first.instance_id();
+        drop(first);
+        let second = LeaksPane::open(Some(PathBuf::from("/test.sock")));
+        assert_ne!(first_id, second.instance_id());
+        assert_eq!(second.reveal_buffer().generation(), 0);
     }
 
     /// TU1: the 30s TTL (injected clock) zeroizes the buffer AND flags a full

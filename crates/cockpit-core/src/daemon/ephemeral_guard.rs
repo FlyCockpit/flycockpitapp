@@ -56,6 +56,13 @@ impl EphemeralDaemonGuard {
             stop_daemon_blocking(&self.socket);
         }
     }
+
+    /// Transfer ownership away from this guard without stopping the daemon.
+    /// Until an explicit handoff, dropping a provisional owner remains
+    /// fail-safe and reaps the daemon it spawned.
+    pub fn disarm(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Drop for EphemeralDaemonGuard {

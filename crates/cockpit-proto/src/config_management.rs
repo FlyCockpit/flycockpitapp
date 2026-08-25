@@ -1,6 +1,7 @@
 //! Typed wire contract for daemon-owned Cockpit settings layers.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
@@ -100,6 +101,66 @@ pub struct ExtendedConfigPatch {
     /// Explicit authorization to replace/remove one redacted occurrence.
     /// Merely selecting its top-level field never grants this authority.
     pub redacted_mutations: Vec<RedactedOccurrenceMutation>,
+}
+
+impl ExtendedConfigPatch {
+    /// Public correlation for the exact non-secret patch intent. Dedicated
+    /// denylist/redacted secret literals are represented only by their
+    /// operation and pointer/nonce so clients can bind a recovered receipt
+    /// without learning or retaining the daemon's keyed durable digest.
+    pub fn sanitized_intent_hash(&self) -> Result<String, serde_json::Error> {
+        #[derive(Serialize)]
+        struct Sanitized<'a> {
+            operations: &'a [ExtendedConfigPathMutation],
+            materialize: bool,
+            denylist: Vec<SanitizedDenylist<'a>>,
+            redacted_mutations: Vec<SanitizedRedacted<'a>>,
+        }
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum SanitizedDenylist<'a> {
+            Existing { entry_id: &'a str },
+            New { client_nonce: &'a str },
+        }
+        #[derive(Serialize)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum SanitizedRedacted<'a> {
+            Set { pointer: &'a str },
+            Unset { pointer: &'a str },
+        }
+
+        let denylist = self
+            .denylist
+            .iter()
+            .map(|entry| match entry {
+                DesiredDenylistEntry::Existing { entry_id } => {
+                    SanitizedDenylist::Existing { entry_id }
+                }
+                DesiredDenylistEntry::New { client_nonce, .. } => {
+                    SanitizedDenylist::New { client_nonce }
+                }
+            })
+            .collect();
+        let redacted_mutations = self
+            .redacted_mutations
+            .iter()
+            .map(|mutation| match mutation {
+                RedactedOccurrenceMutation::Set { pointer, .. } => {
+                    SanitizedRedacted::Set { pointer }
+                }
+                RedactedOccurrenceMutation::Unset { pointer } => {
+                    SanitizedRedacted::Unset { pointer }
+                }
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&Sanitized {
+            operations: &self.operations,
+            materialize: self.materialize,
+            denylist,
+            redacted_mutations,
+        })?;
+        Ok(crate::hex_lower(Sha256::digest(bytes)))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,4 +422,47 @@ pub struct CommittedDenylistEntry {
     #[serde(deserialize_with = "deserialize_present_option")]
     pub client_nonce: Option<String>,
     pub display_mask: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secret_patch(denylist_literal: &str, redacted_value: &str) -> ExtendedConfigPatch {
+        ExtendedConfigPatch {
+            operations: vec![ExtendedConfigPathMutation::Set {
+                path: vec!["tui".into(), "mouse".into()],
+                value: serde_json::json!(true),
+            }],
+            materialize: true,
+            denylist: vec![DesiredDenylistEntry::New {
+                client_nonce: "nonce-1".into(),
+                literal: crate::SensitiveWireLiteral::new(denylist_literal.to_string()),
+            }],
+            redacted_mutations: vec![RedactedOccurrenceMutation::Set {
+                pointer: "/provider/token".into(),
+                value: crate::SensitiveWireLiteral::new(redacted_value.to_string()),
+            }],
+        }
+    }
+
+    #[test]
+    fn sanitized_patch_intent_excludes_secret_literals_but_binds_public_shape() {
+        let first = secret_patch("secret-a", "token-a");
+        let second = secret_patch("secret-b", "token-b");
+        assert_eq!(
+            first.sanitized_intent_hash().unwrap(),
+            second.sanitized_intent_hash().unwrap()
+        );
+
+        let mut different_target = second;
+        different_target.redacted_mutations = vec![RedactedOccurrenceMutation::Set {
+            pointer: "/provider/other-token".into(),
+            value: crate::SensitiveWireLiteral::new("token-b".to_string()),
+        }];
+        assert_ne!(
+            first.sanitized_intent_hash().unwrap(),
+            different_target.sanitized_intent_hash().unwrap()
+        );
+    }
 }

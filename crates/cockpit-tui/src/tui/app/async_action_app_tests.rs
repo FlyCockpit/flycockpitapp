@@ -36,6 +36,82 @@ async fn drain_until_idle(app: &mut App) {
     panic!("async action did not complete");
 }
 
+fn seed_pending_runner_attach(
+    app: &mut App,
+    id: u64,
+    continuations: Vec<super::RunnerAttachContinuation>,
+) {
+    app.pending_runner_attach = Some(super::PendingRunnerAttach {
+        action_id: crate::tui::async_action::AsyncActionId::from_raw_for_test(id),
+        generation: id,
+        cwd: app.launch.cwd.clone(),
+        requested_session_id: app.launch.session_id,
+        model_state_generation: app.active_model_state_generation,
+        config_generation: app.config_snapshot.generation,
+        latch_error: false,
+        continuations,
+    });
+}
+
+#[test]
+fn stale_and_duplicate_runner_attach_completions_are_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    seed_pending_runner_attach(
+        &mut app,
+        41,
+        vec![super::RunnerAttachContinuation::RetryRetainedSubmissions],
+    );
+
+    app.apply_runner_attach_result(
+        crate::tui::async_action::AsyncActionId::from_raw_for_test(40),
+        Err("stale".to_string()),
+    );
+    assert_eq!(app.pending_runner_attach.as_ref().unwrap().generation, 41);
+    assert!(app.agent_runner.is_none());
+
+    app.ensure_agent_runner();
+    app.ensure_agent_runner();
+    let pending = app.pending_runner_attach.as_ref().unwrap();
+    assert!(pending.latch_error);
+    assert_eq!(pending.continuations.len(), 1);
+}
+
+#[test]
+fn attach_coalescing_retains_typed_model_and_btw_continuations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = configured_app_body(&tmp);
+    seed_pending_runner_attach(&mut app, 51, Vec::new());
+    let active = cockpit_config::providers::ActiveModelRef {
+        provider: "p".to_string(),
+        model: "m".to_string(),
+        reasoning_effort: None,
+        thinking_mode: None,
+        prompt_cache_retention: None,
+    };
+
+    assert!(app.request_model_selection(
+        "/model",
+        active.clone(),
+        false,
+        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+    ));
+    app.start_runner_attach(
+        true,
+        super::RunnerAttachContinuation::BtwCommand("new explain this".to_string()),
+    );
+
+    let pending = app.pending_runner_attach.as_ref().unwrap();
+    assert!(pending.continuations.iter().any(|continuation| matches!(
+        continuation,
+        super::RunnerAttachContinuation::SelectModel { active: queued, .. } if queued == &active
+    )));
+    assert!(pending.continuations.iter().any(|continuation| matches!(
+        continuation,
+        super::RunnerAttachContinuation::BtwCommand(args) if args == "new explain this"
+    )));
+}
+
 #[tokio::test]
 async fn local_command_records_pending_without_final_output_until_completion() {
     let tmp = tempfile::tempdir().unwrap();

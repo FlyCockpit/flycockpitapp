@@ -1,52 +1,436 @@
 use super::*;
 
-async fn begin_provider_oauth(provider_id: &str) -> Result<AsyncActionPayload, String> {
+const OAUTH_BEGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const OAUTH_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const OAUTH_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const OAUTH_HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const OAUTH_SETTLEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn valid_settlement_request_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+async fn oauth_settlement(
+    client: &cockpit_core::daemon::client::DaemonClient,
+    client_operation_id: String,
+) -> anyhow::Result<
+    Result<cockpit_core::daemon::proto::Response, cockpit_core::daemon::proto::ErrorPayload>,
+> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 0..ATTEMPTS {
+        let response = tokio::time::timeout(
+            OAUTH_SETTLEMENT_TIMEOUT,
+            client.request(
+                cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                    client_operation_id: client_operation_id.clone(),
+                },
+            ),
+        )
+        .await;
+        if let Ok(result) = response {
+            if !matches!(
+                result,
+                Ok(Ok(
+                    cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+                        pending: true,
+                        ..
+                    }
+                ))
+            ) || attempt + 1 == ATTEMPTS
+            {
+                return result;
+            }
+        } else if attempt + 1 == ATTEMPTS {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Err(anyhow::anyhow!(
+        "OAuth settlement query timed out; the exact operation remains unsettled and must be retried"
+    ))
+}
+
+fn oauth_settlement_unknown(
+    error: impl std::fmt::Display,
+) -> crate::tui::async_action::OAuthAsyncResult {
+    crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error.to_string())
+}
+
+fn oauth_payload(
+    client_flow_id: crate::tui::settings::pointer_actions::OAuthFlowId,
+    operation_id: crate::tui::settings::shell::PointerOperationId,
+    result: Result<crate::tui::async_action::OAuthAsyncResult, String>,
+) -> AsyncActionPayload {
+    AsyncActionPayload::OAuth {
+        client_flow_id,
+        operation_id,
+        result: result.unwrap_or_else(crate::tui::async_action::OAuthAsyncResult::Failed),
+    }
+}
+
+fn oauth_operation_id(
+    client_flow_id: crate::tui::settings::pointer_actions::OAuthFlowId,
+    kind: &str,
+) -> String {
+    // UI pointer-operation IDs change when a user retries. The durable daemon
+    // key deliberately does not: an ambiguous operation must be queried or
+    // replayed with the exact same idempotency identity.
+    format!("tui-oauth-{}-{kind}", client_flow_id.0)
+}
+
+fn oauth_begin_operation_id(
+    client_flow_id: crate::tui::settings::pointer_actions::OAuthFlowId,
+) -> String {
+    format!("tui-oauth-{}-begin", client_flow_id.0)
+}
+
+async fn begin_provider_oauth(
+    provider_id: &str,
+    client_operation_id: String,
+) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
+    let expected_hash = oauth_request_hash(&("begin_provider_oauth", provider_id))?;
     let client = crate::tui::settings::settings_daemon_client()
         .await
         .map_err(|e| e.to_string())?;
-    match client
-        .request(cockpit_core::daemon::proto::Request::BeginProviderOAuth {
+    let response = tokio::time::timeout(
+        OAUTH_BEGIN_TIMEOUT,
+        client.request(cockpit_core::daemon::proto::Request::BeginProviderOAuth {
+            client_operation_id: client_operation_id.clone(),
             provider_id: provider_id.to_string(),
-        })
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
-            flow_id,
-            authorize_url,
-            user_code,
-        }) => Ok(AsyncActionPayload::OAuthProviderBegin {
-            flow_id,
-            authorize_url,
-            user_code,
         }),
-        Ok(other) => Err(format!(
-            "unexpected provider OAuth begin response: {other:?}"
-        )),
-        Err(error) => Err(error.to_string()),
+    )
+    .await;
+    let response = match response {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) | Err(_) => match oauth_settlement(&client, client_operation_id.clone()).await {
+            Ok(response @ Ok(_)) => response,
+            Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
+            Err(error) => return Ok(oauth_settlement_unknown(error)),
+        },
+    };
+    match response.map_err(|e| e.to_string())? {
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
+            pending: false,
+            response: Some(response),
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "begin_provider_oauth"
+            && valid_settlement_request_hash(&settlement_hash) =>
+        {
+            match *response {
+                cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
+                    client_operation_id: receipt_operation_id,
+                    request_hash,
+                    flow_id,
+                    authorize_url,
+                    user_code,
+                } if receipt_operation_id == client_operation_id
+                    && request_hash == expected_hash =>
+                {
+                    Ok(crate::tui::async_action::OAuthAsyncResult::Began {
+                        flow_id,
+                        authorize_url,
+                        user_code,
+                    })
+                }
+                other => Ok(oauth_settlement_unknown(format!(
+                    "OAuth begin receipt was malformed or unbound: {other:?}"
+                ))),
+            }
+        }
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
+            pending: false,
+            response: None,
+            terminal_error: Some(error),
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "begin_provider_oauth"
+            && valid_settlement_request_hash(&settlement_hash) =>
+        {
+            Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
+        }
+        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
+            client_operation_id: receipt_operation_id,
+            request_hash,
+            flow_id,
+            authorize_url,
+            user_code,
+        }) if receipt_operation_id == client_operation_id && request_hash == expected_hash => {
+            Ok(crate::tui::async_action::OAuthAsyncResult::Began {
+                flow_id,
+                authorize_url,
+                user_code,
+            })
+        }
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
+            pending: true,
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "begin_provider_oauth"
+            && valid_settlement_request_hash(&settlement_hash) =>
+        {
+            Ok(oauth_settlement_unknown(
+                "OAuth begin is still pending; retrying must use the same operation",
+            ))
+        }
+        Ok(other) => Ok(oauth_settlement_unknown(format!(
+            "provider OAuth begin response was malformed or unbound: {other:?}"
+        ))),
+        Err(error) => Ok(oauth_settlement_unknown(error)),
     }
 }
 
 async fn complete_provider_oauth(
+    client_operation_id: String,
     flow_id: String,
-    input: Option<String>,
-) -> Result<AsyncActionPayload, String> {
+    input: Option<zeroize::Zeroizing<String>>,
+) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
     let client = crate::tui::settings::settings_daemon_client()
         .await
         .map_err(|e| e.to_string())?;
-    match client
-        .request(cockpit_core::daemon::proto::Request::CompleteProviderOAuth { flow_id, input })
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCompleted { logged_in, .. }) => {
-            Ok(AsyncActionPayload::OAuthCodexComplete { logged_in })
+    let expected_hash = oauth_request_hash(&(
+        "complete_provider_oauth_receipt_v2",
+        &client_operation_id,
+        &flow_id,
+    ))?;
+    let request = cockpit_core::daemon::proto::Request::CompleteProviderOAuth {
+        client_operation_id: client_operation_id.clone(),
+        flow_id: flow_id.clone(),
+        input: input.map(|value| cockpit_proto::SensitiveWirePayload::new(value.take())),
+    };
+    let response = tokio::time::timeout(OAUTH_COMPLETE_TIMEOUT, client.request(request)).await;
+    let response = match response {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) | Err(_) => match oauth_settlement(&client, client_operation_id.clone()).await {
+            Ok(response @ Ok(_)) => response,
+            Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
+            Err(error) => return Ok(oauth_settlement_unknown(error)),
+        },
+    };
+    match response.map_err(|e| e.to_string())? {
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
+            pending: false,
+            response: Some(response),
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "complete_provider_oauth"
+            && valid_settlement_request_hash(&settlement_hash) =>
+        {
+            match *response {
+                cockpit_core::daemon::proto::Response::ProviderOAuthCompleted {
+                    client_operation_id: receipt_operation_id,
+                    request_hash,
+                    flow_id: receipt_flow_id,
+                    logged_in,
+                    ..
+                } if receipt_operation_id == client_operation_id
+                    && request_hash == expected_hash
+                    && receipt_flow_id == flow_id =>
+                {
+                    Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
+                }
+                other => Ok(oauth_settlement_unknown(format!(
+                    "OAuth completion receipt was malformed or unbound: {other:?}"
+                ))),
+            }
         }
-        Ok(other) => Err(format!(
-            "unexpected provider OAuth completion response: {other:?}"
-        )),
-        Err(error) => Err(error.to_string()),
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
+            pending: false,
+            response: None,
+            terminal_error: Some(error),
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "complete_provider_oauth"
+            && valid_settlement_request_hash(&settlement_hash) =>
+        {
+            Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
+        }
+        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCompleted {
+            client_operation_id: receipt_operation_id,
+            request_hash,
+            flow_id: receipt_flow_id,
+            logged_in,
+            ..
+        }) if receipt_operation_id == client_operation_id
+            && request_hash == expected_hash
+            && receipt_flow_id == flow_id =>
+        {
+            Ok(crate::tui::async_action::OAuthAsyncResult::Completed { logged_in })
+        }
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
+            pending: true,
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "complete_provider_oauth"
+            && valid_settlement_request_hash(&settlement_hash) =>
+        {
+            Ok(oauth_settlement_unknown(
+                "OAuth completion is still pending; retrying must use the same operation",
+            ))
+        }
+        Ok(other) => Ok(oauth_settlement_unknown(format!(
+            "provider OAuth completion response was malformed or unbound: {other:?}"
+        ))),
+        Err(error) => Ok(oauth_settlement_unknown(error)),
     }
+}
+
+async fn cancel_provider_oauth(
+    client_operation_id: String,
+    begin_client_operation_id: String,
+    flow_id: Option<String>,
+) -> Result<crate::tui::async_action::OAuthAsyncResult, String> {
+    let expected_hash = oauth_request_hash(&(
+        "cancel_provider_oauth",
+        &begin_client_operation_id,
+        &flow_id,
+    ))?;
+    let client = crate::tui::settings::settings_daemon_client()
+        .await
+        .map_err(|e| e.to_string())?;
+    let response = tokio::time::timeout(
+        OAUTH_CANCEL_TIMEOUT,
+        client.request(cockpit_core::daemon::proto::Request::CancelProviderOAuth {
+            client_operation_id: client_operation_id.clone(),
+            begin_client_operation_id: begin_client_operation_id.clone(),
+            flow_id: flow_id.clone(),
+        }),
+    )
+    .await;
+    let response = match response {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) | Err(_) => match oauth_settlement(&client, client_operation_id.clone()).await {
+            Ok(response @ Ok(_)) => response,
+            Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
+            Err(error) => return Ok(oauth_settlement_unknown(error)),
+        },
+    };
+    match response {
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
+            pending: false,
+            response: Some(response),
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "cancel_provider_oauth"
+            && settlement_hash == expected_hash =>
+        {
+            match *response {
+                cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+                    client_operation_id: receipt_operation_id,
+                    request_hash,
+                    flow_id: receipt_flow_id,
+                    cancelled: true,
+                } if receipt_operation_id == client_operation_id
+                    && request_hash == expected_hash
+                    && (flow_id.is_none() || receipt_flow_id == flow_id) =>
+                {
+                    Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
+                }
+                cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+                    client_operation_id: receipt_operation_id,
+                    request_hash,
+                    flow_id: receipt_flow_id,
+                    cancelled: false,
+                } if receipt_operation_id == client_operation_id
+                    && request_hash == expected_hash
+                    && (flow_id.is_none() || receipt_flow_id == flow_id) =>
+                {
+                    Ok(crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal)
+                }
+                other => Ok(oauth_settlement_unknown(format!(
+                    "OAuth cancellation receipt was malformed or unbound: {other:?}"
+                ))),
+            }
+        }
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
+            pending: false,
+            response: None,
+            terminal_error: Some(error),
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "cancel_provider_oauth"
+            && settlement_hash == expected_hash =>
+        {
+            Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
+        }
+        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+            client_operation_id: receipt_operation_id,
+            request_hash,
+            flow_id: receipt_flow_id,
+            cancelled: true,
+        }) if receipt_operation_id == client_operation_id
+            && request_hash == expected_hash
+            && (flow_id.is_none() || receipt_flow_id == flow_id) =>
+        {
+            Ok(crate::tui::async_action::OAuthAsyncResult::Cancelled)
+        }
+        Ok(cockpit_core::daemon::proto::Response::ProviderOAuthCancelled {
+            client_operation_id: receipt_operation_id,
+            request_hash,
+            flow_id: receipt_flow_id,
+            cancelled: false,
+        }) if receipt_operation_id == client_operation_id
+            && request_hash == expected_hash
+            && (flow_id.is_none() || receipt_flow_id == flow_id) =>
+        {
+            Ok(crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal)
+        }
+        Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+            client_operation_id: settlement_operation_id,
+            operation_kind,
+            request_hash: settlement_hash,
+            pending: true,
+            ..
+        }) if settlement_operation_id == client_operation_id
+            && operation_kind == "cancel_provider_oauth"
+            && settlement_hash == expected_hash =>
+        {
+            Ok(oauth_settlement_unknown(
+                "OAuth cancellation is still pending; retrying must use the same operation",
+            ))
+        }
+        Ok(other) => Ok(oauth_settlement_unknown(format!(
+            "provider OAuth cancel response was malformed or unbound: {other:?}"
+        ))),
+        Err(error) => Ok(oauth_settlement_unknown(error)),
+    }
+}
+
+fn oauth_request_hash<T: serde::Serialize>(value: &T) -> Result<String, String> {
+    use sha2::{Digest as _, Sha256};
+
+    let bytes = zeroize::Zeroizing::new(serde_json::to_vec(value).map_err(|e| e.to_string())?);
+    Ok(Sha256::digest(bytes.as_slice())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn provider_usage_from_wire(
@@ -171,11 +555,34 @@ impl App {
     }
 
     pub(super) fn drain_async_actions(&mut self) -> bool {
+        self.start_pending_goal_settings_effect();
+        self.start_pending_tools_effect();
+        self.start_pending_settings_daemon_effects();
+        self.start_pending_settings_blocking_effects();
         // Cancellation is a terminal runner outcome; most kinds intentionally
         // skip UI mutation. Session switch/resume must still settle provisional
         // buffers, order, and the cleared-view failure contract.
         let cancelled = self.async_actions.drain_cancelled();
         self.tombstone_cancelled_mouse_copies(&cancelled);
+        let mcp_local_cancellations = cancelled
+            .iter()
+            .filter(|result| matches!(result.kind, AsyncActionKind::DaemonRpc("mcp.local")))
+            .map(|result| result.id)
+            .collect::<Vec<_>>();
+        let settings_blocking_cancellations = cancelled
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result.kind,
+                    AsyncActionKind::Blocking("settings.blocking-effect")
+                )
+            })
+            .map(|result| AsyncActionResult {
+                id: result.id,
+                kind: result.kind.clone(),
+                payload: Err("operation cancelled".into()),
+            })
+            .collect::<Vec<_>>();
         let session_switch_cancellations = cancelled
             .into_iter()
             .filter(|result| {
@@ -190,7 +597,10 @@ impl App {
             std::time::Duration::from_secs(30),
         );
         results.extend(self.async_actions.drain_completed());
-        let changed = !results.is_empty() || !session_switch_cancellations.is_empty();
+        let changed = !results.is_empty()
+            || !session_switch_cancellations.is_empty()
+            || !settings_blocking_cancellations.is_empty()
+            || !mcp_local_cancellations.is_empty();
         let oauth_completed = results.iter().any(|result| {
             matches!(
                 result.kind,
@@ -200,9 +610,20 @@ impl App {
         for result in session_switch_cancellations {
             self.apply_async_action_result(result);
         }
+        for result in settings_blocking_cancellations {
+            self.apply_async_action_result(result);
+        }
+        for action_id in mcp_local_cancellations {
+            self.apply_mcp_local_cancellation(action_id);
+        }
         for result in results {
             self.apply_async_action_result(result);
         }
+        // Applying a correlated OAuth completion may enqueue its next typed
+        // effect (begin -> host presentation -> poll). Adopt it in this same
+        // event-loop turn; never require an unrelated keypress to advance or
+        // install the state machine.
+        self.drain_oauth_actions();
         // OAuth completion writes credentials asynchronously while its dialog
         // remains open. Fingerprint reconciliation is deliberately performed
         // after applying the result; failed/cancelled flows leave the stored
@@ -213,6 +634,191 @@ impl App {
         changed
     }
 
+    fn start_pending_goal_settings_effect(&mut self) {
+        let effect = match &mut self.overlay {
+            Overlay::GoalSettings(pane) => pane.take_effect(),
+            _ => None,
+        };
+        let Some(effect) = effect else {
+            return;
+        };
+        let operation_id = effect.operation_id;
+        let agent_name = effect.agent_name;
+        let project_root = effect.project_root;
+        let expected_revision = effect.expected_revision;
+        let request = effect.request;
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("goal-settings.effect"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let response = async {
+                    let client = crate::tui::settings::settings_daemon_client()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    client
+                        .request(request)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .map_err(|error| error.to_string())
+                }
+                .await;
+                Ok(AsyncActionPayload::GoalSettings(
+                    crate::tui::goal_settings_pane::GoalSettingsCompletion {
+                        operation_id,
+                        agent_name,
+                        project_root,
+                        expected_revision,
+                        response,
+                    },
+                ))
+            },
+        );
+    }
+
+    fn start_pending_tools_effect(&mut self) {
+        let effect = match &mut self.overlay {
+            Overlay::Tools(pane) => pane.take_effect(),
+            _ => None,
+        };
+        let Some(effect) = effect else {
+            return;
+        };
+        let operation_id = effect.operation_id;
+        let agent_name = effect.agent_name;
+        let project_root = effect.project_root;
+        let expected_revision = effect.expected_revision;
+        let request = effect.request;
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("tools.effect"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let response = async {
+                    let client = crate::tui::settings::settings_daemon_client()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    client
+                        .request(request)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .map_err(|error| error.to_string())
+                }
+                .await;
+                Ok(AsyncActionPayload::Tools(
+                    crate::tui::tools_pane::ToolsCompletion {
+                        operation_id,
+                        agent_name,
+                        project_root,
+                        expected_revision,
+                        response,
+                    },
+                ))
+            },
+        );
+    }
+
+    fn start_pending_settings_daemon_effects(&mut self) {
+        while let Some(effect) = self.dialog.take_settings_daemon_effect() {
+            let dialog_id = effect.dialog_id;
+            let operation_id = effect.operation_id;
+            let target = effect.target;
+            let work = effect.work;
+            self.async_actions.start(
+                AsyncActionKind::DaemonRpc("settings.effect"),
+                AsyncActionPolicy::AllowConcurrent,
+                async move {
+                    let outcome = crate::tui::settings::execute_settings_daemon_work(work).await;
+                    let (response, authoritative_rejection, committed_refresh_needed) =
+                        match outcome {
+                            Ok(outcome) => (
+                                outcome.response,
+                                outcome.authoritative_rejection,
+                                outcome.committed_refresh_needed,
+                            ),
+                            Err(error) => (Err(error), false, None),
+                        };
+                    Ok(AsyncActionPayload::SettingsDaemon(
+                        crate::tui::settings::SettingsDaemonEffectCompletion {
+                            dialog_id,
+                            operation_id,
+                            target,
+                            response,
+                            authoritative_rejection,
+                            committed_refresh_needed,
+                        },
+                    ))
+                },
+            );
+        }
+    }
+
+    fn start_pending_settings_blocking_effects(&mut self) {
+        while let Some(effect) = self.dialog.take_settings_blocking_effect() {
+            let dialog_id = effect.dialog_id;
+            let operation_id = effect.operation_id;
+            let target = effect.target;
+            let work = effect.work;
+            let metadata = crate::tui::settings::SettingsBlockingEffectMetadata {
+                dialog_id,
+                operation_id,
+                target: target.clone(),
+            };
+            let action_id = self
+                .async_actions
+                .start_blocking(
+                    AsyncActionKind::Blocking("settings.blocking-effect"),
+                    AsyncActionPolicy::AllowConcurrent,
+                    move || {
+                        let outcome = crate::tui::settings::execute_settings_blocking_work(work);
+                        Ok(AsyncActionPayload::SettingsBlocking(
+                            crate::tui::settings::SettingsBlockingEffectCompletion {
+                                dialog_id,
+                                operation_id,
+                                target,
+                                outcome,
+                            },
+                        ))
+                    },
+                )
+                .id();
+            self.settings_blocking_actions.insert(action_id, metadata);
+        }
+    }
+
+    pub(super) fn start_sessions_mutation_action(
+        &mut self,
+        effect: crate::tui::sessions_pane::SessionsMutationEffect,
+    ) {
+        let pane_id = effect.pane_id;
+        let operation_id = effect.operation_id;
+        let target = effect.target;
+        let request = effect.request;
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("sessions.mutation"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let response = async {
+                    let client = crate::tui::settings::settings_daemon_client()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    client
+                        .request(request)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .map_err(|error| error.to_string())
+                }
+                .await;
+                Ok(AsyncActionPayload::SessionsMutation(
+                    crate::tui::sessions_pane::SessionsMutationCompletion {
+                        pane_id,
+                        operation_id,
+                        target,
+                        response,
+                    },
+                ))
+            },
+        );
+    }
+
     pub(super) fn apply_async_action_result(&mut self, result: AsyncActionResult) {
         // Provisional `/new` owns a cleared view. Only the switch/resume
         // settlement path and outgoing delivery-receipt fence bookkeeping may
@@ -221,13 +827,114 @@ impl App {
         if self.provisional_new_session
             && !matches!(
                 result.kind,
-                AsyncActionKind::Internal("session.switch" | "session.resume")
-                    | AsyncActionKind::Blocking("paste.delivery_receipt")
+                AsyncActionKind::Internal(
+                    "session.switch" | "session.resume" | "runner.attach" | "btw.runner.attach"
+                ) | AsyncActionKind::Blocking("paste.delivery_receipt")
+                    | AsyncActionKind::DaemonRpc("sealed.effect" | "mcp.local")
             )
         {
+            if matches!(
+                result.kind,
+                AsyncActionKind::Blocking("settings.blocking-effect")
+            ) {
+                self.settings_blocking_actions.remove(&result.id);
+            }
             return;
         }
         match result.kind {
+            AsyncActionKind::Internal("runner.attach") => {
+                self.apply_runner_attach_result(result.id, result.payload);
+            }
+            AsyncActionKind::Internal("btw.runner.attach") => {
+                self.apply_btw_runner_attach(result.id, result.payload);
+            }
+            AsyncActionKind::DaemonRpc("settings.effect") => {
+                if let Ok(AsyncActionPayload::SettingsDaemon(completion)) = result.payload {
+                    self.dialog.apply_settings_daemon_completion(completion);
+                }
+            }
+            AsyncActionKind::Blocking("settings.blocking-effect") => {
+                let metadata = self.settings_blocking_actions.remove(&result.id);
+                let completion = match result.payload {
+                    Ok(AsyncActionPayload::SettingsBlocking(completion)) => Some(completion),
+                    Err(error) => metadata.map(|metadata| {
+                        crate::tui::settings::SettingsBlockingEffectCompletion {
+                            dialog_id: metadata.dialog_id,
+                            operation_id: metadata.operation_id,
+                            target: metadata.target,
+                            outcome: Err(error),
+                        }
+                    }),
+                    Ok(_) => metadata.map(|metadata| {
+                        crate::tui::settings::SettingsBlockingEffectCompletion {
+                            dialog_id: metadata.dialog_id,
+                            operation_id: metadata.operation_id,
+                            target: metadata.target,
+                            outcome: Err("unexpected settings blocking result".into()),
+                        }
+                    }),
+                };
+                if let Some(completion) = completion {
+                    self.dialog.apply_settings_blocking_completion(completion);
+                }
+            }
+            AsyncActionKind::DaemonRpc("sessions.mutation") => {
+                let mut reload = false;
+                if let Ok(AsyncActionPayload::SessionsMutation(completion)) = result.payload
+                    && let Overlay::Sessions(pane) = &mut self.overlay
+                {
+                    reload = pane.apply_mutation_completion(completion);
+                }
+                if reload {
+                    self.start_sessions_list_action();
+                }
+            }
+            AsyncActionKind::DaemonRpc("goal-settings.effect") => {
+                let outcome = match result.payload {
+                    Ok(AsyncActionPayload::GoalSettings(completion)) => match &mut self.overlay {
+                        Overlay::GoalSettings(pane) => pane.apply_completion(completion),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    self.handle_goal_settings_outcome(outcome);
+                }
+            }
+            AsyncActionKind::DaemonRpc("tools.effect") => {
+                let outcome = match result.payload {
+                    Ok(AsyncActionPayload::Tools(completion)) => match &mut self.overlay {
+                        Overlay::Tools(pane) => pane.apply_completion(completion),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    self.handle_tools_outcome(outcome);
+                }
+            }
+            AsyncActionKind::DaemonRpc("workspace-trust.effect") => {
+                if let Ok(AsyncActionPayload::WorkspaceTrust(completion)) = result.payload {
+                    self.apply_workspace_trust_completion(completion);
+                }
+            }
+            AsyncActionKind::DaemonRpc("sealed.effect") => {
+                if let Ok(AsyncActionPayload::Sealed(completion)) = result.payload {
+                    self.apply_sealed_completion(completion);
+                }
+            }
+            AsyncActionKind::DaemonRpc("mcp.local") => {
+                if let Ok(AsyncActionPayload::McpLocal(completion)) = result.payload {
+                    self.apply_mcp_local_completion(result.id, completion);
+                } else {
+                    self.apply_mcp_local_cancellation(result.id);
+                }
+            }
+            AsyncActionKind::DaemonRpc("btw.resolve-interrupt") => match result.payload {
+                Ok(AsyncActionPayload::Unit) => {}
+                Ok(_) => self.push_plain("question: unexpected daemon response".to_string()),
+                Err(error) => self.push_plain(format!("question: {error}")),
+            },
             AsyncActionKind::DaemonRpc("sessions.list") => {
                 let mut live_ids = None;
                 let mut preview_request = None;
@@ -1196,64 +1903,273 @@ impl App {
                 }
             },
             AsyncActionKind::Internal("oauth.acknowledge") => {
-                let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthAcknowledged) => Ok(()),
-                    Ok(_) => Err("unexpected OAuth acknowledgement response".to_string()),
-                    Err(e) => Err(e),
-                };
-                self.dialog.apply_oauth_acknowledgement(payload);
+                if let Ok(AsyncActionPayload::OAuth {
+                    client_flow_id,
+                    operation_id,
+                    result,
+                }) = result.payload
+                {
+                    let Some(provider) = self.dialog.oauth_provider() else {
+                        return;
+                    };
+                    let outcome = match result {
+                        crate::tui::async_action::OAuthAsyncResult::Acknowledged => Ok(()),
+                        crate::tui::async_action::OAuthAsyncResult::Failed(error)
+                        | crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error) => {
+                            Err(error)
+                        }
+                        crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error) => {
+                            self.dialog.apply_oauth_acknowledgement_settlement_unknown(
+                                provider,
+                                client_flow_id,
+                                operation_id,
+                                error,
+                            );
+                            return;
+                        }
+                        _ => Err("unexpected OAuth acknowledgement result".into()),
+                    };
+                    self.dialog.apply_oauth_acknowledgement(
+                        provider,
+                        client_flow_id,
+                        operation_id,
+                        outcome,
+                    );
+                }
             }
             AsyncActionKind::Internal("oauth.codex.begin") => {
-                let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthProviderBegin {
-                        flow_id,
-                        authorize_url,
-                        user_code,
-                    }) => Ok(settings::OAuthPublicBegin {
-                        flow_id,
-                        authorize_url,
-                        user_code,
-                    }),
-                    Ok(_) => Err("unexpected OAuth response".to_string()),
-                    Err(e) => Err(e),
+                let (client_flow_id, operation_id, payload) = match result.payload {
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result:
+                            crate::tui::async_action::OAuthAsyncResult::Began {
+                                flow_id,
+                                authorize_url,
+                                user_code,
+                            },
+                    }) => (
+                        client_flow_id,
+                        operation_id,
+                        Ok(settings::OAuthPublicBegin {
+                            flow_id,
+                            authorize_url,
+                            user_code,
+                        }),
+                    ),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result:
+                            crate::tui::async_action::OAuthAsyncResult::Failed(error)
+                            | crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error),
+                    }) => (client_flow_id, operation_id, Err(error)),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error),
+                    }) => {
+                        self.dialog.apply_oauth_settlement_unknown(
+                            OAuthProvider::Codex,
+                            client_flow_id,
+                            operation_id,
+                            error,
+                        );
+                        return;
+                    }
+                    _ => return,
                 };
-                self.dialog
-                    .apply_oauth_begin(OAuthProvider::Codex, OAuthBeginResult::Public(payload));
+                self.dialog.apply_oauth_begin(
+                    OAuthProvider::Codex,
+                    client_flow_id,
+                    operation_id,
+                    OAuthBeginResult::Public(payload),
+                );
             }
             AsyncActionKind::Internal("oauth.codex.poll") => {
-                let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthCodexComplete { logged_in }) => Ok(logged_in),
-                    Ok(_) => Err("unexpected OAuth response".to_string()),
-                    Err(e) => Err(e),
+                let (client_flow_id, operation_id, payload) = match result.payload {
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::Completed { logged_in },
+                    }) => (client_flow_id, operation_id, Ok(logged_in)),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result:
+                            crate::tui::async_action::OAuthAsyncResult::Failed(error)
+                            | crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error),
+                    }) => (client_flow_id, operation_id, Err(error)),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error),
+                    }) => {
+                        self.dialog.apply_oauth_settlement_unknown(
+                            OAuthProvider::Codex,
+                            client_flow_id,
+                            operation_id,
+                            error,
+                        );
+                        return;
+                    }
+                    _ => return,
                 };
-                self.dialog
-                    .apply_oauth_complete(OAuthProvider::Codex, payload);
+                self.dialog.apply_oauth_complete(
+                    OAuthProvider::Codex,
+                    client_flow_id,
+                    operation_id,
+                    payload,
+                );
             }
             AsyncActionKind::Internal("oauth.grok.begin") => {
-                let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthProviderBegin {
-                        flow_id,
-                        authorize_url,
-                        user_code,
-                    }) => Ok(settings::OAuthPublicBegin {
-                        flow_id,
-                        authorize_url,
-                        user_code,
-                    }),
-                    Ok(_) => Err("unexpected OAuth response".to_string()),
-                    Err(e) => Err(e),
+                let (client_flow_id, operation_id, payload) = match result.payload {
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result:
+                            crate::tui::async_action::OAuthAsyncResult::Began {
+                                flow_id,
+                                authorize_url,
+                                user_code,
+                            },
+                    }) => (
+                        client_flow_id,
+                        operation_id,
+                        Ok(settings::OAuthPublicBegin {
+                            flow_id,
+                            authorize_url,
+                            user_code,
+                        }),
+                    ),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result:
+                            crate::tui::async_action::OAuthAsyncResult::Failed(error)
+                            | crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error),
+                    }) => (client_flow_id, operation_id, Err(error)),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error),
+                    }) => {
+                        self.dialog.apply_oauth_settlement_unknown(
+                            OAuthProvider::Grok,
+                            client_flow_id,
+                            operation_id,
+                            error,
+                        );
+                        return;
+                    }
+                    _ => return,
                 };
-                self.dialog
-                    .apply_oauth_begin(OAuthProvider::Grok, OAuthBeginResult::Public(payload));
+                self.dialog.apply_oauth_begin(
+                    OAuthProvider::Grok,
+                    client_flow_id,
+                    operation_id,
+                    OAuthBeginResult::Public(payload),
+                );
             }
             AsyncActionKind::Internal("oauth.grok.complete") => {
-                let payload = match result.payload {
-                    Ok(AsyncActionPayload::OAuthGrokComplete { logged_in }) => Ok(logged_in),
-                    Ok(_) => Err("unexpected OAuth response".to_string()),
-                    Err(e) => Err(e),
+                let (client_flow_id, operation_id, payload) = match result.payload {
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::Completed { logged_in },
+                    }) => (client_flow_id, operation_id, Ok(logged_in)),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result:
+                            crate::tui::async_action::OAuthAsyncResult::Failed(error)
+                            | crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error),
+                    }) => (client_flow_id, operation_id, Err(error)),
+                    Ok(AsyncActionPayload::OAuth {
+                        client_flow_id,
+                        operation_id,
+                        result: crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error),
+                    }) => {
+                        self.dialog.apply_oauth_settlement_unknown(
+                            OAuthProvider::Grok,
+                            client_flow_id,
+                            operation_id,
+                            error,
+                        );
+                        return;
+                    }
+                    _ => return,
                 };
-                self.dialog
-                    .apply_oauth_complete(OAuthProvider::Grok, payload);
+                self.dialog.apply_oauth_complete(
+                    OAuthProvider::Grok,
+                    client_flow_id,
+                    operation_id,
+                    payload,
+                );
+            }
+            AsyncActionKind::Internal("oauth.host.present") => {
+                if let Ok(AsyncActionPayload::OAuth {
+                    client_flow_id,
+                    operation_id,
+                    result,
+                }) = result.payload
+                    && let Some(provider) = self.dialog.oauth_provider()
+                {
+                    let outcome = match result {
+                        crate::tui::async_action::OAuthAsyncResult::Presented(payload) => {
+                            Ok(payload)
+                        }
+                        crate::tui::async_action::OAuthAsyncResult::Failed(error)
+                        | crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error) => {
+                            Err(error)
+                        }
+                        crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error) => {
+                            self.dialog.apply_oauth_settlement_unknown(
+                                provider,
+                                client_flow_id,
+                                operation_id,
+                                error,
+                            );
+                            return;
+                        }
+                        _ => Err("unexpected OAuth host result".into()),
+                    };
+                    self.dialog.apply_oauth_present(
+                        provider,
+                        client_flow_id,
+                        operation_id,
+                        outcome,
+                    );
+                }
+            }
+            AsyncActionKind::Internal("oauth.cancel") => {
+                if let Ok(AsyncActionPayload::OAuth {
+                    client_flow_id,
+                    operation_id,
+                    result,
+                }) = result.payload
+                    && let Some(provider) = self.dialog.oauth_provider()
+                {
+                    if let crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error) =
+                        result
+                    {
+                        self.dialog.apply_oauth_cancel_authoritative_failure(
+                            provider,
+                            client_flow_id,
+                            operation_id,
+                            error,
+                        );
+                        return;
+                    }
+                    let outcome = match result {
+                        crate::tui::async_action::OAuthAsyncResult::Cancelled => Ok(true),
+                        crate::tui::async_action::OAuthAsyncResult::AlreadyTerminal => Ok(false),
+                        crate::tui::async_action::OAuthAsyncResult::Failed(error) => Err(error),
+                        _ => Err("unexpected OAuth cancellation result".into()),
+                    };
+                    self.dialog
+                        .apply_oauth_cancel(provider, client_flow_id, operation_id, outcome);
+                }
             }
             _ => self.completed_async_actions.push(result),
         }
@@ -1523,40 +2439,119 @@ impl App {
 
     pub(super) fn drain_oauth_actions(&mut self) {
         while let Some(action) = self.dialog.take_oauth_action() {
+            let provider = action.provider;
+            let client_flow_id = action.client_flow_id;
+            let operation_id = action.operation_id;
             match (action.provider, action.op) {
                 (provider, OAuthFlowOp::Acknowledge) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.acknowledge"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.acknowledge")),
                         async move {
-                            let provider_id = match provider {
-                                OAuthProvider::Grok => {
-                                    cockpit_core::auth::subscription_ack::GROK_OAUTH_PROVIDER
-                                }
-                                OAuthProvider::Codex => {
-                                    cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER
-                                }
-                            };
-                            let client = crate::tui::settings::settings_daemon_client()
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            match client
-                                .request(cockpit_core::daemon::proto::Request::PutSubscriptionAck {
+                            let outcome = async {
+                                let provider_id = match provider {
+                                    OAuthProvider::Grok => {
+                                        cockpit_core::auth::subscription_ack::GROK_OAUTH_PROVIDER
+                                    }
+                                    OAuthProvider::Codex => {
+                                        cockpit_core::auth::subscription_ack::CODEX_OAUTH_PROVIDER
+                                    }
+                                };
+                                let client = crate::tui::settings::settings_daemon_client()
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                // Retrying acknowledgement for the same visible
+                                // OAuth pane reuses the exact daemon operation.
+                                let client_operation_id =
+                                    client_flow_id.subscription_ack_operation_id();
+                                let expected_hash =
+                                    oauth_request_hash(&("put_subscription_ack", provider_id))?;
+                                let request = cockpit_core::daemon::proto::Request::PutSubscriptionAck {
+                                    client_operation_id: client_operation_id.clone(),
                                     provider_id: provider_id.to_string(),
-                                })
-                                .await
-                                .map_err(|e| e.to_string())?
-                            {
-                                Ok(cockpit_core::daemon::proto::Response::Ack) => {
-                                    Ok(AsyncActionPayload::OAuthAcknowledged)
-                                }
-                                Ok(other) => {
-                                    Err(format!("unexpected acknowledgement response: {other:?}"))
-                                }
-                                Err(error) => {
-                                    Err(format!("daemon rejected acknowledgement: {error}"))
+                                };
+                                let direct = tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    client.request(request),
+                                )
+                                .await;
+                                let response = match direct {
+                                    Ok(Ok(Ok(response))) => response,
+                                    // A generic request error is not a typed
+                                    // terminal receipt: the acknowledgement
+                                    // may have committed before the transport
+                                    // carried that error. Resolve every such
+                                    // result through the durable settlement
+                                    // journal before releasing TUI authority.
+                                    Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
+                                        let settlement = match tokio::time::timeout(
+                                            std::time::Duration::from_secs(10),
+                                            client.request(cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                                                client_operation_id: client_operation_id.clone(),
+                                            }),
+                                        )
+                                        .await {
+                                            Ok(Ok(Ok(response))) => response,
+                                            Ok(Ok(Err(error))) => return Ok(oauth_settlement_unknown(error)),
+                                            Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
+                                            Err(_) => return Ok(oauth_settlement_unknown(
+                                                "acknowledgement settlement query timed out; retry to query the same durable operation",
+                                            )),
+                                        };
+                                        match settlement {
+                                            cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+                                                client_operation_id: returned_id,
+                                                operation_kind,
+                                                request_hash,
+                                                pending: false,
+                                                response: Some(response),
+                                                terminal_error: None,
+                                                terminal_cancelled: false,
+                                            } if returned_id == client_operation_id
+                                                && operation_kind == "put_subscription_ack"
+                                                && request_hash == expected_hash => *response,
+                                            cockpit_core::daemon::proto::Response::LocalOperationSettlement {
+                                                client_operation_id: returned_id,
+                                                operation_kind,
+                                                request_hash,
+                                                pending: false,
+                                                terminal_error: Some(error),
+                                                ..
+                                            } if returned_id == client_operation_id
+                                                && operation_kind == "put_subscription_ack"
+                                                && request_hash == expected_hash => {
+                                                return Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(
+                                                    format!("acknowledgement was authoritatively rejected: {error}"),
+                                                ));
+                                            }
+                                            other => return Ok(oauth_settlement_unknown(format!(
+                                                "acknowledgement settlement remains unknown or unbound; retry the same operation: {other:?}"
+                                            ))),
+                                        }
+                                    }
+                                };
+                                match response {
+                                    cockpit_core::daemon::proto::Response::SubscriptionAckCommitted {
+                                        client_operation_id: returned_id,
+                                        provider_id: returned_provider,
+                                        request_hash,
+                                        consumed_vault_generation,
+                                        result_vault_generation,
+                                        changed,
+                                    } if returned_id == client_operation_id
+                                        && returned_provider == provider_id
+                                        && request_hash == expected_hash
+                                        && result_vault_generation > 0
+                                        && if changed { result_vault_generation > consumed_vault_generation } else { result_vault_generation == consumed_vault_generation } => {
+                                        Ok(crate::tui::async_action::OAuthAsyncResult::Acknowledged)
+                                    }
+                                    other => Ok(oauth_settlement_unknown(format!(
+                                        "acknowledgement receipt was malformed or unbound: {other:?}"
+                                    ))),
                                 }
                             }
+                            .await;
+                            Ok(oauth_payload(client_flow_id, operation_id, outcome))
                         },
                     );
                 }
@@ -1564,37 +2559,131 @@ impl App {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.codex.begin"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.codex")),
-                        async { begin_provider_oauth("codex-oauth").await },
+                        async move {
+                            Ok(oauth_payload(
+                                client_flow_id,
+                                operation_id,
+                                begin_provider_oauth(
+                                    "codex-oauth",
+                                    oauth_begin_operation_id(client_flow_id),
+                                )
+                                .await,
+                            ))
+                        },
                     );
                 }
                 (OAuthProvider::Codex, OAuthFlowOp::Poll { flow_id }) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.codex.poll"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.codex")),
-                        async move { complete_provider_oauth(flow_id, None).await },
+                        async move {
+                            Ok(oauth_payload(
+                                client_flow_id,
+                                operation_id,
+                                complete_provider_oauth(
+                                    oauth_operation_id(client_flow_id, "complete"),
+                                    flow_id,
+                                    None,
+                                )
+                                .await,
+                            ))
+                        },
                     );
-                }
-                (OAuthProvider::Codex, OAuthFlowOp::Cancel) => {
-                    self.async_actions
-                        .abort_key(&AsyncActionKey::new("oauth.codex"));
                 }
                 (OAuthProvider::Grok, OAuthFlowOp::Begin) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.grok.begin"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
-                        async move { begin_provider_oauth("grok-oauth").await },
+                        async move {
+                            Ok(oauth_payload(
+                                client_flow_id,
+                                operation_id,
+                                begin_provider_oauth(
+                                    "grok-oauth",
+                                    oauth_begin_operation_id(client_flow_id),
+                                )
+                                .await,
+                            ))
+                        },
                     );
                 }
                 (OAuthProvider::Grok, OAuthFlowOp::Complete { flow_id, input }) => {
                     self.async_actions.start(
                         AsyncActionKind::Internal("oauth.grok.complete"),
                         AsyncActionPolicy::Replace(AsyncActionKey::new("oauth.grok")),
-                        async move { complete_provider_oauth(flow_id, Some(input)).await },
+                        async move {
+                            Ok(oauth_payload(
+                                client_flow_id,
+                                operation_id,
+                                complete_provider_oauth(
+                                    oauth_operation_id(client_flow_id, "complete"),
+                                    flow_id,
+                                    Some(input),
+                                )
+                                .await,
+                            ))
+                        },
                     );
                 }
-                (OAuthProvider::Grok, OAuthFlowOp::Cancel) => {
-                    self.async_actions
-                        .abort_key(&AsyncActionKey::new("oauth.grok"));
+                (
+                    _,
+                    OAuthFlowOp::Present {
+                        authorize_url,
+                        user_code,
+                        open_browser,
+                        advance_flow,
+                    },
+                ) => {
+                    let key = match provider {
+                        OAuthProvider::Codex => "oauth.codex",
+                        OAuthProvider::Grok => "oauth.grok",
+                    };
+                    self.async_actions.start(
+                        AsyncActionKind::Internal("oauth.host.present"),
+                        AsyncActionPolicy::Replace(AsyncActionKey::new(key)),
+                        async move {
+                            let worker = tokio::task::spawn_blocking(move || {
+                                settings::providers::present_oauth_on_blocking_worker(
+                                    authorize_url,
+                                    user_code,
+                                    open_browser,
+                                    advance_flow,
+                                )
+                            });
+                            let result = match tokio::time::timeout(OAUTH_HOST_TIMEOUT, worker)
+                                .await
+                            {
+                                Ok(Ok(result)) => result
+                                    .map(crate::tui::async_action::OAuthAsyncResult::Presented),
+                                Ok(Err(error)) => Err(format!("OAuth host worker failed: {error}")),
+                                Err(_) => Err("OAuth browser/clipboard operation timed out".into()),
+                            };
+                            Ok(oauth_payload(client_flow_id, operation_id, result))
+                        },
+                    );
+                }
+                (_, OAuthFlowOp::Cancel { flow_id }) => {
+                    let key = match provider {
+                        OAuthProvider::Codex => AsyncActionKey::new("oauth.codex"),
+                        OAuthProvider::Grok => AsyncActionKey::new("oauth.grok"),
+                    };
+                    self.async_actions.abort_key(&key);
+                    self.async_actions.start(
+                        AsyncActionKind::Internal("oauth.cancel"),
+                        AsyncActionPolicy::Replace(key),
+                        async move {
+                            Ok(oauth_payload(
+                                client_flow_id,
+                                operation_id,
+                                cancel_provider_oauth(
+                                    oauth_operation_id(client_flow_id, "cancel"),
+                                    oauth_begin_operation_id(client_flow_id),
+                                    flow_id,
+                                )
+                                .await,
+                            ))
+                        },
+                    );
                 }
                 (OAuthProvider::Codex, OAuthFlowOp::Complete { .. })
                 | (OAuthProvider::Grok, OAuthFlowOp::Poll { .. }) => {}
@@ -1842,5 +2931,23 @@ mod startup_disclosure_generation_tests {
             identity("/repo", 8, socket, None, current),
             completed,
         ));
+    }
+}
+
+#[cfg(test)]
+mod oauth_settlement_source_tests {
+    #[test]
+    fn oauth_fallbacks_are_bounded_and_already_terminal_is_not_called_cancelled() {
+        let source = include_str!("async_actions.rs");
+        assert!(source.contains("OAUTH_SETTLEMENT_TIMEOUT"));
+        assert!(source.contains("oauth_settlement(&client"));
+        assert!(source.contains("OAuthAsyncResult::AlreadyTerminal"));
+        assert!(source.contains("OAuthAsyncResult::AlreadyTerminal => Ok(false)"));
+        assert!(source.contains("result: Result<bool, String>"));
+        assert!(source.contains("operation_kind == \"cancel_provider_oauth\""));
+        assert!(source.contains("Ok(Ok("));
+        assert!(source.contains("receipt was malformed or unbound"));
+        assert!(source.contains("request_hash == expected_hash"));
+        assert!(source.contains("acknowledgement settlement remains unknown or unbound"));
     }
 }

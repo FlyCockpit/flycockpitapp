@@ -235,6 +235,96 @@ fn obscured_authority_findings(source: &str) -> Vec<String> {
     visitor.0
 }
 
+/// Syntax-aware filesystem authority inventory. Fully-qualified call paths
+/// are classified by segments, so comments, string literals, whitespace, and
+/// substring tricks cannot hide or manufacture a mutation. Method calls are
+/// intentionally conservative because `OpenOptions`/`File` receivers lose
+/// their concrete type in the AST; reviewed host-I/O exceptions remain bound
+/// to an exact source line below.
+fn filesystem_authority_sites(source: &str) -> Vec<(usize, String)> {
+    const CALL_PATHS: &[&[&str]] = &[
+        &["std", "fs", "write"],
+        &["std", "fs", "remove_file"],
+        &["std", "fs", "remove_dir"],
+        &["std", "fs", "remove_dir_all"],
+        &["std", "fs", "rename"],
+        &["std", "fs", "copy"],
+        &["std", "fs", "hard_link"],
+        &["std", "fs", "create_dir"],
+        &["std", "fs", "create_dir_all"],
+        &["std", "fs", "set_permissions"],
+        &["std", "fs", "try_exists"],
+        &["std", "fs", "File", "create"],
+        &["std", "fs", "OpenOptions", "new"],
+        &["std", "os", "unix", "fs", "symlink"],
+        &["std", "os", "windows", "fs", "symlink_file"],
+        &["std", "os", "windows", "fs", "symlink_dir"],
+        &["tokio", "fs", "write"],
+        &["tokio", "fs", "remove_file"],
+        &["tokio", "fs", "remove_dir"],
+        &["tokio", "fs", "remove_dir_all"],
+        &["tokio", "fs", "rename"],
+        &["tokio", "fs", "copy"],
+        &["tokio", "fs", "hard_link"],
+        &["tokio", "fs", "create_dir"],
+        &["tokio", "fs", "create_dir_all"],
+        &["tokio", "fs", "set_permissions"],
+        &["tokio", "fs", "try_exists"],
+        &["tokio", "fs", "File", "create"],
+        &["tokio", "fs", "OpenOptions", "new"],
+        &["tokio", "fs", "symlink"],
+        &["tokio", "fs", "symlink_file"],
+        &["tokio", "fs", "symlink_dir"],
+        &["cockpit_config", "config", "write_config_bytes_atomic"],
+    ];
+    const SHORT_CALL_PATHS: &[&[&str]] = &[&["File", "create"], &["OpenOptions", "new"]];
+    const IO_METHODS: &[&str] = &["write", "write_all", "set_len"];
+    const OPEN_OPTIONS_METHODS: &[&str] = &["write", "append", "truncate", "create", "create_new"];
+
+    struct Visitor(Vec<(usize, String)>);
+    impl<'ast> Visit<'ast> for Visitor {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref() {
+                let segments = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>();
+                if CALL_PATHS.iter().chain(SHORT_CALL_PATHS).any(|candidate| {
+                    segments.len() == candidate.len()
+                        && segments
+                            .iter()
+                            .zip(candidate.iter())
+                            .all(|(actual, expected)| actual.as_str() == *expected)
+                }) {
+                    self.0.push((call.span().start().line, segments.join("::")));
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            let method = call.method.to_string();
+            let receiver = call.receiver.to_token_stream().to_string();
+            let io_method = IO_METHODS.contains(&method.as_str());
+            let options_method = OPEN_OPTIONS_METHODS.contains(&method.as_str())
+                && receiver.contains("OpenOptions")
+                && receiver.contains("new");
+            if (io_method || options_method) && call.args.len() == 1 {
+                self.0
+                    .push((call.span().start().line, format!(".{method}")));
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+    }
+
+    let file = syn::parse_file(source).expect("production source remains parseable");
+    let mut visitor = Visitor(Vec::new());
+    visitor.visit_file(&file);
+    visitor.0
+}
+
 /// A `*_tests.rs` spelling is not evidence that a module is test-only. Accept
 /// the exclusion only when syn finds an owning `mod` item with `#[cfg(test)]`.
 fn is_explicit_cfg_test_module(path: &Path) -> bool {
@@ -272,6 +362,318 @@ fn tui_sources() -> String {
     let mut sources = String::new();
     collect(&repo_root().join("crates/cockpit-tui/src"), &mut sources);
     sources
+}
+
+const BLOCKING_TRANSPORT_ROOTS: &[&str] = &[
+    "daemon_request_blocking",
+    "daemon_request_at_blocking",
+    "daemon_request_from_blocking_worker",
+    "daemon_reveal_leak_blocking",
+    "request_on_socket",
+    "resource_snapshot_blocking",
+];
+
+// Reviewed transport adapters in `tui/agent_runner.rs`. This list is
+// intentionally explicit: deriving wrappers from the call graph would let a
+// reducer become self-exempting merely by calling a forbidden primitive.
+const APPROVED_BLOCKING_ADAPTERS: &[&str] = &[
+    "daemon_request_from_blocking_worker",
+    "fork_session_blocking",
+    "discard_session_blocking",
+    "list_sessions_blocking",
+    "read_session_messages_blocking",
+    "read_client_submission_receipt_blocking",
+    "read_history_page_blocking",
+    "read_subagent_history_page_blocking",
+    "resource_snapshot_blocking",
+    "promote_resource_blocking",
+    "session_live_status_blocking",
+];
+
+fn call_name(call: &syn::ExprCall) -> Option<String> {
+    match call.func.as_ref() {
+        syn::Expr::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn path_is_spawn_blocking(path: &syn::Path) -> bool {
+    let parts = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+    matches!(
+        parts.as_slice(),
+        [task, spawn] if task == "task" && spawn == "spawn_blocking"
+    ) || matches!(
+        parts.as_slice(),
+        [tokio, task, spawn]
+            if tokio == "tokio" && task == "task" && spawn == "spawn_blocking"
+    ) || matches!(
+        parts.as_slice(),
+        [thread, spawn] if thread == "thread" && spawn == "spawn"
+    ) || matches!(
+        parts.as_slice(),
+        [std, thread, spawn]
+            if std == "std" && thread == "thread" && spawn == "spawn"
+    )
+}
+
+fn method_is_worker_boundary(call: &syn::ExprMethodCall) -> bool {
+    let receiver = call
+        .receiver
+        .to_token_stream()
+        .to_string()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    (call.method == "start_blocking" && receiver == "self.async_actions")
+        || (call.method == "start_owned_blocking_action" && receiver == "self")
+}
+
+fn blocking_authority_functions(_sources: &[String]) -> std::collections::HashSet<String> {
+    BLOCKING_TRANSPORT_ROOTS
+        .iter()
+        .chain(APPROVED_BLOCKING_ADAPTERS)
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn blocking_worker_transport_findings_with_authority(
+    source: &str,
+    authority: &std::collections::HashSet<String>,
+    approved_adapter_module: bool,
+) -> Vec<String> {
+    struct WorkerVisitor {
+        worker_depth: usize,
+        current_function: Option<String>,
+        authority: std::collections::HashSet<String>,
+        approved_adapter_module: bool,
+        findings: Vec<String>,
+    }
+
+    impl WorkerVisitor {
+        fn visit_worker_closure(&mut self, closure: &syn::ExprClosure) {
+            self.worker_depth += 1;
+            syn::visit::visit_expr_closure(self, closure);
+            self.worker_depth -= 1;
+        }
+
+        fn audit_call(&mut self, name: &str, line: usize) {
+            if !self.authority.contains(name) {
+                return;
+            }
+            let inside_approved_adapter = self.approved_adapter_module
+                && self.current_function.as_ref().is_some_and(|function| {
+                    APPROVED_BLOCKING_ADAPTERS.contains(&function.as_str())
+                });
+            if self.worker_depth == 0 && !inside_approved_adapter {
+                self.findings.push(format!(
+                    "line {line}: blocking daemon transport `{name}` escapes an approved worker closure"
+                ));
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for WorkerVisitor {
+        fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+            let previous = self
+                .current_function
+                .replace(function.sig.ident.to_string());
+            syn::visit::visit_block(self, &function.block);
+            self.current_function = previous;
+        }
+
+        fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
+            let previous = self
+                .current_function
+                .replace(function.sig.ident.to_string());
+            syn::visit::visit_block(self, &function.block);
+            self.current_function = previous;
+        }
+
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            let approved = method_is_worker_boundary(call);
+            self.visit_expr(&call.receiver);
+            for argument in &call.args {
+                if approved {
+                    if let syn::Expr::Closure(closure) = argument {
+                        self.visit_worker_closure(closure);
+                        continue;
+                    }
+                }
+                self.visit_expr(argument);
+            }
+            if !approved {
+                self.audit_call(&call.method.to_string(), call.span().start().line);
+            }
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            let approved = matches!(call.func.as_ref(), syn::Expr::Path(path) if path_is_spawn_blocking(&path.path));
+            self.visit_expr(&call.func);
+            for argument in &call.args {
+                if approved {
+                    if let syn::Expr::Closure(closure) = argument {
+                        self.visit_worker_closure(closure);
+                        continue;
+                    }
+                }
+                self.visit_expr(argument);
+            }
+            if !approved && let Some(name) = call_name(call) {
+                self.audit_call(&name, call.span().start().line);
+            }
+        }
+
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if let Some(name) = path.path.segments.last().map(|part| part.ident.to_string()) {
+                self.audit_call(&name, path.span().start().line);
+            }
+            syn::visit::visit_expr_path(self, path);
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            let imported = flattened_use_paths(&item.tree);
+            if imported.iter().any(|path| {
+                path.rsplit("::")
+                    .next()
+                    .is_some_and(|name| self.authority.contains(name))
+            }) {
+                self.findings.push(format!(
+                    "line {}: blocking daemon transport may not be imported, aliased, or re-exported",
+                    item.span().start().line
+                ));
+            }
+            syn::visit::visit_item_use(self, item);
+        }
+
+        fn visit_macro(&mut self, value: &'ast syn::Macro) {
+            let tokens = value.tokens.to_string();
+            if self.authority.iter().any(|name| tokens.contains(name)) {
+                self.findings.push(format!(
+                    "line {}: macro obscures blocking daemon transport",
+                    value.span().start().line
+                ));
+            }
+            syn::visit::visit_macro(self, value);
+        }
+    }
+
+    let source = production_source(source);
+    let file = syn::parse_file(&source).expect("production source remains parseable");
+    let mut visitor = WorkerVisitor {
+        worker_depth: 0,
+        current_function: None,
+        authority: authority.clone(),
+        approved_adapter_module,
+        findings: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.findings
+}
+
+fn blocking_worker_transport_findings(source: &str) -> Vec<String> {
+    let sources = vec![source.to_string()];
+    let authority = blocking_authority_functions(&sources);
+    blocking_worker_transport_findings_with_authority(source, &authority, false)
+}
+
+#[test]
+fn blocking_daemon_transport_is_structurally_worker_owned() {
+    fn visit_sources(path: &Path, sources: &mut Vec<(PathBuf, String)>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit_sources(&path, sources);
+            } else if path.extension().and_then(|value| value.to_str()) == Some("rs")
+                && !is_explicit_cfg_test_module(&path)
+            {
+                sources.push((path.clone(), fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+
+    let mut sources = Vec::new();
+    visit_sources(&repo_root().join("crates/cockpit-tui/src"), &mut sources);
+    let authority = blocking_authority_functions(
+        &sources
+            .iter()
+            .map(|(_, source)| source.clone())
+            .collect::<Vec<_>>(),
+    );
+    let mut findings = Vec::new();
+    for (path, source) in sources {
+        findings.extend(
+            blocking_worker_transport_findings_with_authority(
+                &source,
+                &authority,
+                path.ends_with("agent_runner.rs"),
+            )
+            .into_iter()
+            .map(|finding| format!("{}: {finding}", path.display())),
+        );
+    }
+    assert!(
+        findings.is_empty(),
+        "blocking daemon authority must remain inside an approved worker boundary:\n{}",
+        findings.join("\n")
+    );
+}
+
+#[test]
+fn blocking_daemon_transport_gate_rejects_obscured_and_reducer_calls() {
+    for invalid in [
+        "fn reducer() { agent_runner::daemon_request_from_blocking_worker(req); }",
+        "fn reducer() { agent_runner::daemon_request_blocking(req); }",
+        "fn reducer() { agent_runner::daemon_request_at_blocking(socket, req); }",
+        "fn reducer() { agent_runner::daemon_reveal_leak_blocking(socket, token); }",
+        "fn reducer() { agent_runner::request_on_socket(socket, req); }",
+        "fn reducer() { agent_runner::resource_snapshot_blocking(); }",
+        "use agent_runner::daemon_request_from_blocking_worker as rpc; fn reducer() { rpc(req); }",
+        "fn reducer() { let rpc = agent_runner::daemon_request_from_blocking_worker; rpc(req); }",
+        "fn wrapper() { daemon_request_at_blocking(socket, req); } fn reducer() { wrapper(); }",
+        "fn wrapper() { request_on_socket(socket, req); } fn alias() { wrapper(); } fn reducer() { alias(); }",
+        "fn fork_session_blocking() { daemon_request_blocking(req); }",
+        "fn reducer() { fake.start_blocking(move || agent_runner::daemon_request_from_blocking_worker(req)); }",
+        "fn reducer() { macro_rules! hidden { () => { agent_runner::daemon_request_from_blocking_worker(req) } } }",
+    ] {
+        assert!(
+            !blocking_worker_transport_findings(invalid).is_empty(),
+            "negative fixture unexpectedly passed: {invalid}"
+        );
+    }
+    for valid in [
+        "fn effect(&mut self) { self.async_actions.start_blocking(kind, policy, move || agent_runner::daemon_request_from_blocking_worker(req)); }",
+        "fn effect() { tokio::task::spawn_blocking(move || agent_runner::daemon_request_from_blocking_worker(req)); }",
+        "fn effect() { std::thread::spawn(move || agent_runner::daemon_request_from_blocking_worker(req)); }",
+    ] {
+        assert!(
+            blocking_worker_transport_findings(valid).is_empty(),
+            "approved worker fixture rejected: {valid}"
+        );
+    }
+}
+
+#[test]
+fn raw_blocking_transport_primitives_are_not_public_api() {
+    let source = production_source(&read("crates/cockpit-tui/src/tui/agent_runner.rs"));
+    for primitive in ["daemon_request_blocking", "request_on_socket"] {
+        assert!(source.contains(&format!("fn {primitive}(")));
+        assert!(!source.contains(&format!("pub fn {primitive}(")));
+        assert!(!source.contains(&format!("pub(crate) fn {primitive}(")));
+    }
+    for primitive in BLOCKING_TRANSPORT_ROOTS {
+        assert!(
+            source.contains(primitive),
+            "blocking transport root vanished without updating the structural catalog: {primitive}"
+        );
+    }
 }
 
 #[test]
@@ -360,12 +762,22 @@ fn tui_agent_authority_is_daemon_owned() {
         "MutateAgent",
         "BeginAgentEditorLease",
         "CompleteAgentEditorLease",
+        "GetAgentEditorLeaseSettlement",
         "SaveAssistantDefinition",
         "DeleteAssistant",
     ] {
         assert!(production.contains(rpc), "missing agent owner RPC: {rpc}");
     }
     assert!(!production.contains("std::fs::write("));
+    assert!(agents.contains("Uuid::new_v4().to_string()"));
+    assert!(agents.contains("Request::GetAgentEditorLeaseSettlement"));
+    assert!(agents.contains("client_operation_id: client_operation_id.clone()"));
+    assert!(agents.contains("authoritative_rejection"));
+    assert!(agents.contains("AgentEditorSettlementStatus::Rejected"));
+    assert!(
+        !agents.contains("client_operation_id: \"editor-operation\""),
+        "each editor handoff needs a fresh idempotency identity"
+    );
     assert_eq!(
         production
             .matches("cockpit_config::config::write_config_bytes_atomic(&staging.path")
@@ -492,6 +904,21 @@ fn production_process_and_network_authority_is_exactly_allowlisted() {
             let source = fs::read_to_string(&path).unwrap();
             let production = production_source(&source);
             let relative = path.strip_prefix(repo_root()).unwrap().to_string_lossy();
+            let production_lines = production.lines().collect::<Vec<_>>();
+            for (line_number, authority) in filesystem_authority_sites(&production) {
+                let line = production_lines
+                    .get(line_number.saturating_sub(1))
+                    .copied()
+                    .unwrap_or_default();
+                let allowed = ALLOWED_LINES
+                    .iter()
+                    .any(|(file, exact)| relative == *file && line.trim() == *exact);
+                if !allowed {
+                    findings.push(format!(
+                        "{relative}:{line_number}: syntax-classified filesystem authority: {authority}"
+                    ));
+                }
+            }
             for (line_number, line) in production.lines().enumerate() {
                 for authority in AUTHORITY {
                     if !line.contains(authority) {
@@ -620,8 +1047,20 @@ fn production_filesystem_mutations_have_device_ui_owners() {
         "lock.write(",
         "tokio::fs::write",
         "tokio::fs::remove_file",
+        "tokio::fs::remove_dir",
+        "tokio::fs::remove_dir_all",
+        "tokio::fs::rename",
+        "tokio::fs::copy",
+        "tokio::fs::hard_link",
+        "tokio::fs::create_dir",
         "tokio::fs::create_dir_all",
         "tokio::fs::set_permissions",
+        "tokio::fs::try_exists",
+        "tokio::fs::File::create",
+        "tokio::fs::OpenOptions",
+        "tokio::fs::symlink",
+        "tokio::fs::symlink_file",
+        "tokio::fs::symlink_dir",
         "cockpit_config::config::write_config_bytes_atomic",
         ".write_all(",
     ];
@@ -646,6 +1085,10 @@ fn production_filesystem_mutations_have_device_ui_owners() {
             "let mut file = std::fs::OpenOptions::new()",
         ),
         ("crates/cockpit-tui/src/tui/async_action.rs", ".write(true)"),
+        (
+            "crates/cockpit-tui/src/tui/async_action.rs",
+            ".create_new(true)",
+        ),
         (
             "crates/cockpit-tui/src/tui/image_path_probe.rs",
             "std::fs::OpenOptions::new() // Unix no-follow read-only handle.",
@@ -779,10 +1222,19 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                         "write",
                         "remove_file",
                         "remove_dir",
+                        "remove_dir_all",
                         "rename",
+                        "copy",
+                        "hard_link",
                         "create_dir",
                         "create_dir_all",
                         "set_permissions",
+                        "try_exists",
+                        "symlink",
+                        "symlink_file",
+                        "symlink_dir",
+                        "File",
+                        "OpenOptions",
                     ]
                     .iter()
                     .any(|name| line.contains(name));
@@ -810,10 +1262,18 @@ fn production_filesystem_mutations_have_device_ui_owners() {
                     "write",
                     "remove_file",
                     "remove_dir",
+                    "remove_dir_all",
                     "rename",
+                    "copy",
+                    "hard_link",
                     "create_dir",
                     "create_dir_all",
                     "set_permissions",
+                    "try_exists",
+                    "symlink",
+                    "symlink_file",
+                    "symlink_dir",
+                    "File",
                     "OpenOptions",
                 ]
                 .iter()
@@ -859,6 +1319,72 @@ fn tui_settings_use_revisioned_typed_mutation() {
 }
 
 #[test]
+fn every_tui_agent_mutation_is_exactly_receipted_and_recoverable() {
+    let agents = read("crates/cockpit-tui/src/tui/settings/agents_page.rs");
+    let goals = read("crates/cockpit-tui/src/tui/goal_settings_pane.rs");
+    let tools = read("crates/cockpit-tui/src/tui/tools_pane.rs");
+    for (surface, source) in [("agents", agents), ("goals", goals), ("tools", tools)] {
+        assert!(
+            source.contains("agent_mutation_intent_hash"),
+            "{surface} must hash the exact public mutation intent"
+        );
+        assert!(
+            source.contains("GetLocalOperationSettlement"),
+            "{surface} must reconcile an ambiguous transport outcome"
+        );
+        assert!(
+            source.contains("bind_agent_mutation_settlement"),
+            "{surface} must bind replayed receipts to the exact operation"
+        );
+        assert!(
+            source.contains("client_operation_id"),
+            "{surface} must retain the owner operation id"
+        );
+        assert!(
+            source.contains("this pane cannot close yet")
+                || source.contains("uncertain_agent_operation"),
+            "{surface} must fence close while settlement is unknown"
+        );
+    }
+}
+
+#[test]
+fn assistant_definition_mutations_are_durable_and_close_gated() {
+    let agents = read("crates/cockpit-tui/src/tui/settings/agents_page.rs");
+    for required in [
+        "assistant_mutation_intent_hash",
+        "client_operation_id",
+        "GetLocalOperationSettlement",
+        "bind_assistant_mutation_settlement",
+        "PendingAgentOperation::AssistantSave { .. }",
+        "PendingAgentOperation::AssistantDelete { .. }",
+        "assistant save outcome is unknown",
+        "assistant delete outcome is unknown",
+    ] {
+        assert!(
+            agents.contains(required),
+            "missing assistant authority gate {required}"
+        );
+    }
+    assert!(agents.contains("stale or malformed read-only agent completion was discarded"));
+    assert!(!agents.contains("self.pending_daemon.insert(completion.operation_id, pending)"));
+    for required in [
+        "staged_inventory",
+        "staged_assistants",
+        "publish_paired_load",
+        "inventory.config_generation != assistants.config_generation",
+        "canonical_project_root == project_root",
+        "request_hash != mutation_intent_hash",
+        "terminal_shapes != 1",
+    ] {
+        assert!(
+            agents.contains(required),
+            "missing paired authority gate {required}"
+        );
+    }
+}
+
+#[test]
 fn tui_db_boundary_gate_first_has_real_negative_alias_fixtures() {
     for fixture in ["direct_alias.rs", "core_alias.rs"] {
         let source = read(&format!("scripts/fixtures/tui-db-boundary/{fixture}"));
@@ -898,4 +1424,49 @@ fn syntax_aware_authority_filter_has_negative_fixtures() {
         );
     }
     assert!(obscured_authority_findings("use std::process::{Command, Stdio};").is_empty());
+}
+
+#[test]
+fn filesystem_authority_classifier_has_path_complete_negative_fixtures() {
+    let source = r#"
+        async fn forbidden(path: &std::path::Path) {
+            tokio::fs::rename(path, path).await.unwrap();
+            tokio::fs::copy(path, path).await.unwrap();
+            tokio::fs::create_dir(path).await.unwrap();
+            tokio::fs::remove_dir_all(path).await.unwrap();
+            tokio::fs::hard_link(path, path).await.unwrap();
+            tokio::fs::File::create(path).await.unwrap();
+            tokio::fs::OpenOptions::new().create(true).open(path).await.unwrap();
+            let _ = tokio::fs::try_exists(path).await.unwrap();
+            #[cfg(unix)] tokio::fs::symlink(path, path).await.unwrap();
+            #[cfg(windows)] tokio::fs::symlink_file(path, path).await.unwrap();
+        }
+        const DECOY: &str = "tokio::fs::remove_file";
+    "#;
+    let sites = filesystem_authority_sites(source);
+    for expected in [
+        "tokio::fs::rename",
+        "tokio::fs::copy",
+        "tokio::fs::create_dir",
+        "tokio::fs::remove_dir_all",
+        "tokio::fs::hard_link",
+        "tokio::fs::File::create",
+        "tokio::fs::OpenOptions::new",
+        "tokio::fs::try_exists",
+        "tokio::fs::symlink",
+        "tokio::fs::symlink_file",
+    ] {
+        assert!(
+            sites.iter().any(|(_, actual)| actual == expected),
+            "missing AST-classified negative fixture {expected}"
+        );
+    }
+    assert_eq!(
+        sites
+            .iter()
+            .filter(|(_, actual)| actual == "tokio::fs::remove_file")
+            .count(),
+        0,
+        "string literals must not manufacture an authority site"
+    );
 }

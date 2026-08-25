@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use crate::tui::settings::secret_display::{MASKED_VALUE, mask_value};
 use crate::tui::textfield::TextField;
 use cockpit_config::extended::{ToolCommandTemplate, WebConfig, WebProvider as ConfigWebProvider};
-use cockpit_core::daemon::proto::{Request, Response, SecretInventoryKind};
+use cockpit_core::daemon::proto::{Request, SecretInventoryKind};
 use cockpit_core::engine::builtin::{builtin_tool_inventory, is_reserved_custom_tool_name};
 use cockpit_core::mcp::cache;
 use cockpit_core::mcp::protocol::{ToolDescriptor, sanitize_tool_descriptor};
@@ -79,7 +79,7 @@ enum WebKeyStatus {
     Stored,
 }
 
-fn web_key_provider_id(provider: WebKeyProvider) -> &'static str {
+pub(super) fn web_key_provider_id(provider: WebKeyProvider) -> &'static str {
     match provider {
         WebKeyProvider::Firecrawl => "firecrawl",
         WebKeyProvider::TinyFish => "tinyfish",
@@ -218,14 +218,9 @@ impl SettingsCx {
                     p.status = Some("Paste a non-empty API key.".to_string());
                 } else {
                     p.status = Some(match self.save_web_api_key(provider, &key) {
-                        Ok(()) => format!(
-                            "{} key saved to credentials.",
-                            web_key_provider_label(provider)
-                        ),
+                        Ok(()) => "saving credential…".to_string(),
                         Err(e) => format!("Save failed: {e}"),
                     });
-                    p.buf = TextField::default();
-                    p.editing = None;
                 }
             }
             ToolField::FirecrawlBaseUrl => {
@@ -453,37 +448,31 @@ impl SettingsCx {
             .or_else(|| self.stored_web_key(provider).map(|_| WebKeyStatus::Stored))
     }
 
-    fn save_web_api_key(&self, provider: WebKeyProvider, key: &str) -> Result<(), String> {
+    fn save_web_api_key(&mut self, provider: WebKeyProvider, key: &str) -> Result<(), String> {
         let provider_id = web_key_provider_id(provider).to_string();
         let record = serde_json::json!({ "api_key": key }).to_string();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let client = crate::tui::settings::settings_daemon_client()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                match client
-                    .request(Request::PutProviderCredential {
-                        provider_id,
-                        record,
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    Ok(Response::Ack) => Ok(()),
-                    Ok(other) => Err(format!(
-                        "daemon returned unexpected web credential response: {other:?}"
-                    )),
-                    Err(error) => Err(format!("daemon rejected web credential: {error}")),
-                }
-            })
-        });
-        if result.is_ok() {
-            self.invalidate_secret_inventory_entry(
-                web_key_provider_id(provider),
-                Some(SecretInventoryKind::CredentialRecord),
-            );
-        }
-        result
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
+        let expected_request_intent_hash =
+            super::local_receipt_request_hash(&("put_provider_credential", &provider_id))?;
+        self.queue_simple_secret_mutation(
+            super::SettingsEffectTarget {
+                surface: "settings.web-credential",
+                owner: provider_id.clone(),
+                revision: Some(client_operation_id.clone()),
+            },
+            super::SettingsDaemonEffectWork::ProviderCredentialPut {
+                client_operation_id: client_operation_id.clone(),
+                provider_id: provider_id.clone(),
+                record: super::SecretPayload::new(record),
+            },
+            super::SettingsMutationAction::WebCredentialPut {
+                provider_id,
+                client_operation_id,
+                expected_request_intent_hash,
+            },
+        );
+        self.extended_warnings = vec!["saving web credential…".into()];
+        Ok(())
     }
 
     fn tools_page_rows(&self) -> Vec<ToolRow> {

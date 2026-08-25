@@ -399,7 +399,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         #[cfg(feature = "remote")]
         proto::Response::RemoteGoalOutcome { .. } => {}
         proto::Response::GoalCleared { cleared: _ } => {}
-        proto::Response::Assistants { assistants } => {
+        proto::Response::Assistants { assistants, .. } => {
             for assistant in assistants {
                 scrub_assistant_summary(assistant, redact);
             }
@@ -495,7 +495,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::AgentInventory {
             entries,
             inventory_revision,
-            config_generation: _,
+            ..
         } => {
             for entry in entries {
                 scrub_agent_inventory_entry(entry, redact);
@@ -505,12 +505,12 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::AgentEditSnapshot(snapshot) => {
             scrub_agent_edit_snapshot(snapshot, redact);
         }
-        proto::Response::AgentMutated(result)
-        | proto::Response::AgentEditorLeaseCompleted(result) => {
+        proto::Response::AgentMutated(result) => {
             if let Some(snapshot) = &mut result.snapshot {
                 scrub_agent_edit_snapshot(snapshot, redact);
             }
         }
+        proto::Response::AgentEditorLeaseCompleted(_) => {}
         proto::Response::AgentEditorLeaseBegun(lease) => {
             scrub_agent_edit_snapshot(&mut lease.snapshot, redact);
         }
@@ -592,6 +592,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // free text to scrub.
         proto::Response::LeakReports { page: _ }
         | proto::Response::LeakRevealCapability { capability: _ }
+        | proto::Response::LeakRevealCancelled { report_id: _ }
         | proto::Response::LeakRotationUpdated {
             report_id: _,
             rotation: _,
@@ -619,9 +620,34 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         | proto::Response::ProviderModelsFetched { .. }
         | proto::Response::ProviderUsageSnapshot { .. }
         | proto::Response::ProviderConfigUpserted { .. }
-        | proto::Response::ProviderCredentialDeleted { .. }
+        | proto::Response::ProviderMutationCommitted { .. }
+        | proto::Response::SubscriptionAckCommitted { .. }
         | proto::Response::AppFlag { .. }
         | proto::Response::AppFlagSeen { .. } => {}
+        proto::Response::LocalOperationSettlement {
+            response,
+            terminal_error,
+            ..
+        } => {
+            // Settlement is an envelope around another response. Apply the
+            // same backstop recursively so an owner-only nested response can
+            // never bypass the principal-specific scrubber when that receipt
+            // is later queried by another allowed principal.
+            if let Some(response) = response {
+                scrub_response_free_text(response, redact);
+            }
+            if let Some(error) = terminal_error {
+                scrub_string(&mut error.message, redact);
+            }
+        }
+        proto::Response::ProviderCredentialCommitted { project_root, .. } => {
+            if let Some(root) = project_root {
+                scrub_string(root, redact);
+            }
+        }
+        proto::Response::CopilotAuthCommitted { project_root, .. } => {
+            scrub_string(project_root, redact);
+        }
         #[cfg(feature = "remote")]
         proto::Response::FlycockpitStored
         | proto::Response::FlycockpitNotLoggedIn
@@ -663,9 +689,13 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         } => {
             scrub_session_summary(session, redact);
         }
-        proto::Response::AssistantUpserted { assistant }
-        | proto::Response::AssistantDefinitionSaved { assistant, .. } => {
+        proto::Response::AssistantUpserted { assistant } => {
             scrub_assistant_summary(assistant, redact)
+        }
+        proto::Response::AssistantDefinitionSaved { assistant, .. } => {
+            if let Some(assistant) = assistant {
+                scrub_assistant_summary(assistant, redact);
+            }
         }
         proto::Response::ImportSessionArchive { .. } => {}
         // Opaque staged transfer bytes. Redaction is applied when the
@@ -677,9 +707,17 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::RunInvocationStatus { .. }
         | proto::Response::RunInvocationCancelResult { .. }
         | proto::Response::ProviderOAuthCompleted { .. }
+        | proto::Response::ProviderOAuthCancelled { .. }
         | proto::Response::McpOAuthCompleted { .. }
-        | proto::Response::McpOAuthCancelled { .. }
-        | proto::Response::McpConfigSaved { .. } => {}
+        | proto::Response::McpOAuthCancelled { .. } => {}
+        proto::Response::McpConfigCommitted {
+            project_root,
+            config_path,
+            ..
+        } => {
+            scrub_string(project_root, redact);
+            scrub_string(config_path, redact);
+        }
         #[cfg(feature = "remote")]
         proto::Response::RemoteOperationStatus { .. } => {}
         proto::Response::ProviderOAuthStarted { authorize_url, .. } => {
@@ -1602,39 +1640,66 @@ fn scrub_agent_edit_snapshot(snapshot: &mut proto::AgentEditSnapshot, redact: &R
 /// Mint presentation digests only after the final socket-bound redaction
 /// pass. This is infallible and therefore cannot turn a committed mutation
 /// into a post-commit response error.
-fn finalize_response_projections(response: &mut proto::Response) {
-    fn assistant(value: &mut proto::AssistantSummary) {
-        value.definition_presentation_hash = value.definition_markdown.as_ref().map(|markdown| {
-            use sha2::Digest as _;
-            crate::computer::frame::hex::encode(&sha2::Sha256::digest(markdown.as_bytes()))
-        });
-        value.projection_digest = proto::assistant_projection_digest(value);
+fn finalize_response_projections(
+    response: &mut proto::Response,
+    vault: &crate::secure_key::SecretVault,
+) {
+    fn keyed(vault: &crate::secure_key::SecretVault, domain: &[u8], value: &[u8]) -> String {
+        crate::intel::hex_lower(&vault.keyed_identity(domain, value))
     }
-    fn agent(value: &mut proto::AgentEditSnapshot) {
-        value.projection_digest = proto::agent_edit_projection_digest(value);
+    fn assistant(value: &mut proto::AssistantSummary, vault: &crate::secure_key::SecretVault) {
+        value.definition_presentation_hash = value.definition_markdown.as_ref().map(|markdown| {
+            keyed(
+                vault,
+                b"flycockpit.assistant.presentation.v1",
+                markdown.as_bytes(),
+            )
+        });
+        let material = proto::assistant_projection_material(value);
+        value.projection_digest = keyed(
+            vault,
+            b"flycockpit.assistant.projection.v1",
+            material.as_bytes(),
+        );
+    }
+    fn agent(value: &mut proto::AgentEditSnapshot, vault: &crate::secure_key::SecretVault) {
+        let material = proto::agent_edit_projection_material(value);
+        value.projection_digest = keyed(
+            vault,
+            b"flycockpit.agent.edit-projection.v1",
+            material.as_bytes(),
+        );
     }
     match response {
         proto::Response::Assistant {
             assistant: Some(value),
-        } => assistant(value),
-        proto::Response::Assistants { assistants } => assistants.iter_mut().for_each(assistant),
-        proto::Response::AssistantUpserted { assistant: value }
-        | proto::Response::AssistantDefinitionSaved {
-            assistant: value, ..
-        } => assistant(value),
+        } => assistant(value, vault),
+        proto::Response::Assistants { assistants, .. } => assistants
+            .iter_mut()
+            .for_each(|value| assistant(value, vault)),
+        proto::Response::AssistantUpserted { assistant: value } => assistant(value, vault),
+        proto::Response::AssistantDefinitionSaved {
+            assistant: Some(value),
+            ..
+        } => assistant(value, vault),
         proto::Response::AgentInventory { entries, .. } => {
             for entry in entries {
-                entry.projection_digest = proto::agent_inventory_entry_projection_digest(entry);
+                let material = proto::agent_inventory_entry_projection_material(entry);
+                entry.projection_digest = keyed(
+                    vault,
+                    b"flycockpit.agent.inventory-projection.v1",
+                    material.as_bytes(),
+                );
             }
         }
-        proto::Response::AgentEditSnapshot(value) => agent(value),
-        proto::Response::AgentMutated(result)
-        | proto::Response::AgentEditorLeaseCompleted(result) => {
+        proto::Response::AgentEditSnapshot(value) => agent(value, vault),
+        proto::Response::AgentMutated(result) => {
             if let Some(value) = &mut result.snapshot {
-                agent(value);
+                agent(value, vault);
             }
         }
-        proto::Response::AgentEditorLeaseBegun(lease) => agent(&mut lease.snapshot),
+        proto::Response::AgentEditorLeaseCompleted(_) => {}
+        proto::Response::AgentEditorLeaseBegun(lease) => agent(&mut lease.snapshot, vault),
         _ => {}
     }
 }
@@ -3673,6 +3738,94 @@ async fn run_boot_housekeeping(db: &Db) {
     }
 }
 
+/// Complete fail-closed local authority recovery before either daemon socket
+/// is bound. A published socket promises an immediately responsive protocol;
+/// recovery therefore belongs to boot, never the accept loop.
+#[cfg(unix)]
+pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    dispatch::recover_all_provider_config_journals(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup provider-config journal recovery failed")?;
+    dispatch::recover_all_mcp_config_journals(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup MCP-config journal recovery failed")?;
+    crate::daemon::fs_api::recover_extended_config_patch_journals(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup typed-settings journal recovery failed")?;
+    let recovered_image_config =
+        image_control_mutations::recover_image_config_mutation_journals(ctx)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))
+            .context("startup image-config mutation journal recovery failed")?;
+    if recovered_image_config > 0 {
+        tracing::info!(
+            count = recovered_image_config,
+            "reconciled committed image configuration before socket publication"
+        );
+    }
+    crate::daemon::agent_management::recover_known_workspace_resets(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup agent reset journal recovery failed")?;
+    let recovered_agent_mutations =
+        crate::daemon::agent_management::recover_agent_mutation_journals(ctx)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))
+            .context("startup agent-mutation journal recovery failed")?;
+    if recovered_agent_mutations > 0 {
+        tracing::info!(
+            count = recovered_agent_mutations,
+            "reconciled committed agent mutations before socket publication"
+        );
+    }
+    dispatch::recover_committed_oauth_settlements(ctx)
+        .await
+        .context("reconciling committed OAuth authority operations")?;
+    crate::assistants::recover_definition_journals(&ctx.db)
+        .await
+        .context("startup assistant-definition journal recovery failed")?;
+    let recovered_assistants = dispatch::recover_assistant_mutation_journals(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup assistant-mutation receipt recovery failed")?;
+    if recovered_assistants > 0 {
+        tracing::info!(
+            count = recovered_assistants,
+            "reconciled committed assistant mutations before socket publication"
+        );
+    }
+    let interrupted = ctx
+        .db
+        .settle_interrupted_local_operations()
+        .await
+        .context("settling interrupted local authority operations")?;
+    if interrupted > 0 {
+        tracing::warn!(
+            count = interrupted,
+            "settled interrupted local operations without re-execution"
+        );
+    }
+    crate::daemon::agent_management::recover_editor_leases_before_publish(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup editor completion recovery failed")?;
+    crate::daemon::agent_management::maintain_editor_leases(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup editor lease recovery failed")?;
+    let recovered = crate::daemon::effective_default_recovery::recover_effective_default_journals(
+        &ctx.db, &cwd, None,
+    )
+    .await
+    .context("startup effective-default journal recovery failed")?;
+    crate::daemon::effective_default_recovery::deliver_recovered_terminals(ctx, recovered).await;
+    Ok(())
+}
+
 /// Bind the Unix socket and run the accept loop until the daemon's
 /// graceful-shutdown gate leaves `Running`. Each accepted connection spawns
 /// a detached client task. Breaking the loop hands control back to
@@ -3683,47 +3836,6 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
     // exactly cover the remotely-admissible transactional_mutation commands.
     #[cfg(feature = "remote")]
     dispatch::debug_assert_ledger_site_registry_consistent();
-    // Startup recovery: converge any effective-default journal left behind by
-    // an unclean shutdown before the first client can read a config snapshot.
-    // Per-attach recovery re-runs this with the attached project root and
-    // trust policy; startup covers the non-project layers.
-    {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        if let Err(error) = dispatch::recover_all_provider_config_journals(&ctx).await {
-            tracing::error!(%error, "startup provider-config journal recovery failed; provider requests will retry it");
-        }
-        if let Err(error) = dispatch::recover_all_mcp_config_journals(&ctx).await {
-            tracing::error!(%error, "startup MCP-config journal recovery failed; MCP requests will retry it");
-        }
-        crate::assistants::recover_definition_journals(&ctx.db)
-            .await
-            .context("startup assistant-definition journal recovery failed")?;
-        crate::daemon::agent_management::recover_known_workspace_resets(&ctx)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.message))
-            .context("startup agent reset journal recovery failed")?;
-        match crate::daemon::effective_default_recovery::recover_effective_default_journals(
-            &ctx.db, &cwd, None,
-        )
-        .await
-        {
-            // No worker exists yet at startup, so this only logs undelivered
-            // correlations; a client waiting across a daemon restart has lost
-            // its connection anyway, and attach re-runs recovery per project.
-            Ok(recovered) => {
-                crate::daemon::effective_default_recovery::deliver_recovered_terminals(
-                    &ctx, recovered,
-                )
-                .await;
-            }
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    "startup effective-default journal recovery failed; attach will retry and fail closed"
-                );
-            }
-        }
-    }
     let mut shutdown = ctx.shutdown.subscribe();
     let retention_cfg = retention_config();
     let mut retention_interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -3731,6 +3843,9 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
     ));
     retention_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retention_interval.tick().await;
+    let mut editor_maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    editor_maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    editor_maintenance_interval.tick().await;
     // A drain may already have begun before we subscribed (begin_drain on a
     // very fast StopDaemon); break immediately if so.
     if ctx.shutdown.is_draining() {
@@ -3750,6 +3865,14 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
             }
             _ = retention_interval.tick() => {
                 run_retention_tick(ctx.clone(), retention_cfg).await;
+            }
+            _ = editor_maintenance_interval.tick() => {
+                if let Err(error) = crate::daemon::agent_management::maintain_editor_leases(&ctx).await {
+                    tracing::warn!(message = %error.message, "editor lease maintenance failed");
+                }
+                if let Err(error) = dispatch::maintain_durable_oauth_flows(&ctx).await {
+                    tracing::warn!(message = %error.message, "OAuth flow maintenance failed");
+                }
             }
             accepted = listener.accept() => {
                 match accepted {
@@ -3786,10 +3909,15 @@ fn retention_config() -> RetentionConfig {
 }
 
 fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
-    if outcome.sessions_expired > 0 || outcome.payload_rows_deleted > 0 || outcome.vacuumed {
+    if outcome.sessions_expired > 0
+        || outcome.payload_rows_deleted > 0
+        || outcome.local_authority_rows_purged > 0
+        || outcome.vacuumed
+    {
         tracing::info!(
             sessions_expired = outcome.sessions_expired,
             payload_rows_deleted = outcome.payload_rows_deleted,
+            local_authority_rows_purged = outcome.local_authority_rows_purged,
             vacuumed = outcome.vacuumed,
             "session payload retention pass completed"
         );
@@ -3806,6 +3934,9 @@ async fn run_retention_pass(db: Db, cfg: RetentionConfig, now_secs: i64) {
 #[cfg(any(unix, test))]
 async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
     run_retention_tick_db(ctx.db.clone(), cfg).await;
+    if let Err(error) = crate::daemon::agent_management::maintain_editor_leases(&ctx).await {
+        tracing::warn!(message = %error.message, "editor lease maintenance failed");
+    }
 }
 
 #[cfg(any(unix, test))]
@@ -4221,11 +4352,12 @@ async fn run_in_process_client(
     event_tx: mpsc::Sender<proto::Event>,
 ) {
     let _client_guard = ctx.track_client();
+    let client_instance_id = Uuid::new_v4();
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
         ctx.terminal_host.clone(),
-        Uuid::new_v4(),
+        client_instance_id,
         next_terminal_connection_epoch(),
     );
     let mut shared = state.shared_snapshot();
@@ -4235,49 +4367,134 @@ async fn run_in_process_client(
     let mut concurrent_tasks = JoinSet::new();
     let mut pending_lag = PendingEventLag::default();
 
-    match event_tx.try_send(ctx.caffeinate_state_event()) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => return,
-        Err(mpsc::error::TrySendError::Closed(_)) => return,
-    }
+    let client_ready = match event_tx.try_send(ctx.caffeinate_state_event()) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
+            false
+        }
+    };
 
-    'client: loop {
-        let event_branch = async {
-            match session_event_rx.as_mut() {
-                Some(rx) => Some(rx.recv().await),
-                None => std::future::pending().await,
-            }
-        };
+    if client_ready {
+        'client: loop {
+            let event_branch = async {
+                match session_event_rx.as_mut() {
+                    Some(rx) => Some(rx.recv().await),
+                    None => std::future::pending().await,
+                }
+            };
 
-        tokio::select! {
-            biased;
-            permit = event_tx.reserve(), if pending_lag.has_dropped() => {
-                match permit {
-                    Ok(permit) => {
-                        if let Some(event) = pending_lag.take_event() {
-                            permit.send(event);
+            tokio::select! {
+                biased;
+                permit = event_tx.reserve(), if pending_lag.has_dropped() => {
+                    match permit {
+                        Ok(permit) => {
+                            if let Some(event) = pending_lag.take_event() {
+                                permit.send(event);
+                            }
                         }
+                        Err(_) => break 'client,
                     }
-                    Err(_) => break 'client,
                 }
-            }
-            Some(joined) = concurrent_tasks.join_next(), if !concurrent_tasks.is_empty() => {
-                if let Err(error) = joined {
-                    tracing::warn!(%error, "in-process concurrent request task failed");
+                Some(joined) = concurrent_tasks.join_next(), if !concurrent_tasks.is_empty() => {
+                    if let Err(error) = joined {
+                        tracing::warn!(%error, "in-process concurrent request task failed");
+                    }
                 }
-            }
-            global = global_rx.recv() => {
-                match global {
-                    Ok(envelope) => {
-                        if !try_send_in_process_event(&event_tx, envelope.event, None, &mut pending_lag) {
-                            break 'client;
+                global = global_rx.recv() => {
+                    match global {
+                        Ok(envelope) => {
+                            if !try_send_in_process_event(&event_tx, envelope.event, None, &mut pending_lag) {
+                                break 'client;
+                            }
                         }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(missed = n, "in-process client global event stream lagged");
+                            pending_lag.record_many(n, None);
+                            if !try_send_in_process_event(&event_tx, ctx.caffeinate_state_event(), None, &mut pending_lag) {
+                                break 'client;
+                            }
+                            if let Some(event) = ctx.drain_state_event()
+                                && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
+                            {
+                                break 'client;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {}
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(missed = n, "in-process client global event stream lagged");
-                        pending_lag.record_many(n, None);
-                        if !try_send_in_process_event(&event_tx, ctx.caffeinate_state_event(), None, &mut pending_lag) {
+                }
+                event = event_branch => {
+                    match event {
+                        Some(Ok(envelope)) => {
+                            let session_id = state
+                                .attached
+                                .as_ref()
+                                .map(|attached| attached.handle.session_id);
+                            if !try_send_in_process_event(
+                                &event_tx,
+                                envelope.event,
+                                session_id,
+                                &mut pending_lag,
+                            ) {
+                                break 'client;
+                            }
+                        }
+                        Some(Err(broadcast::error::RecvError::Lagged(n))) => {
+                            tracing::warn!(missed = n, "in-process client event stream lagged; reattach to resync");
+                            let session_id = state
+                                .attached
+                                .as_ref()
+                                .map(|attached| attached.handle.session_id);
+                            pending_lag.record_many(n, session_id);
+                        }
+                        Some(Err(broadcast::error::RecvError::Closed)) => {
+                            state.attached = None;
+                            shared = state.shared_snapshot();
+                            session_event_rx = None;
+                        }
+                        None => unreachable!("event_branch is pending when not attached"),
+                    }
+                }
+                cmd = request_rx.recv() => {
+                    let Some(InProcessRequest { request, reply }) = cmd else {
+                        break 'client;
+                    };
+                    if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
+                        let Ok(permit) = concurrent_permits.clone().acquire_owned().await else {
                             break 'client;
+                        };
+                        let shared = shared.clone();
+                        let ctx = ctx.clone();
+                        concurrent_tasks.spawn(async move {
+                            let _permit = permit;
+                            let result = run_concurrent_request_catching_panic(request, shared, ctx).await;
+                            let _ = reply.send(result);
+                        });
+                        continue;
+                    }
+                    let is_attach = matches!(&request, Request::Attach { .. });
+                    let mut effects = ClientRequestEffects::default();
+                    let result = dispatch::handle_serialized_request(
+                        request,
+                        &mut state,
+                        &shared,
+                        &ctx,
+                        &mut effects,
+                    )
+                    .await;
+                    let attached = matches!(&result, Ok(Response::Attached { .. }));
+                    if (is_attach && attached) || state.attached.is_none() {
+                        shared = state.shared_snapshot();
+                    }
+                    let _ = reply.send(result);
+                    if is_attach && attached {
+                        let session_id = state
+                            .attached
+                            .as_ref()
+                            .map(|attached| attached.handle.session_id);
+                        for event in std::mem::take(&mut state.pending_replay) {
+                            if !try_send_in_process_event(&event_tx, event, session_id, &mut pending_lag) {
+                                break 'client;
+                            }
                         }
                         if let Some(event) = ctx.drain_state_event()
                             && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
@@ -4285,101 +4502,36 @@ async fn run_in_process_client(
                             break 'client;
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => {}
-                }
-            }
-            event = event_branch => {
-                match event {
-                    Some(Ok(envelope)) => {
-                        let session_id = state
-                            .attached
-                            .as_ref()
-                            .map(|attached| attached.handle.session_id);
-                        if !try_send_in_process_event(
-                            &event_tx,
-                            envelope.event,
-                            session_id,
-                            &mut pending_lag,
-                        ) {
-                            break 'client;
-                        }
-                    }
-                    Some(Err(broadcast::error::RecvError::Lagged(n))) => {
-                        tracing::warn!(missed = n, "in-process client event stream lagged; reattach to resync");
-                        let session_id = state
-                            .attached
-                            .as_ref()
-                            .map(|attached| attached.handle.session_id);
-                        pending_lag.record_many(n, session_id);
-                    }
-                    Some(Err(broadcast::error::RecvError::Closed)) => {
-                        state.attached = None;
-                        shared = state.shared_snapshot();
+                    if let Some(rx) = effects.session_event_rx.take() {
+                        session_event_rx = Some(rx);
+                    } else if state.attached.is_none() {
                         session_event_rx = None;
                     }
-                    None => unreachable!("event_branch is pending when not attached"),
-                }
-            }
-            cmd = request_rx.recv() => {
-                let Some(InProcessRequest { request, reply }) = cmd else {
-                    break 'client;
-                };
-                if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
-                    let Ok(permit) = concurrent_permits.clone().acquire_owned().await else {
-                        break 'client;
-                    };
-                    let shared = shared.clone();
-                    let ctx = ctx.clone();
-                    concurrent_tasks.spawn(async move {
-                        let _permit = permit;
-                        let result = run_concurrent_request_catching_panic(request, shared, ctx).await;
-                        let _ = reply.send(result);
-                    });
-                    continue;
-                }
-                let is_attach = matches!(&request, Request::Attach { .. });
-                let mut effects = ClientRequestEffects::default();
-                let result = dispatch::handle_serialized_request(
-                    request,
-                    &mut state,
-                    &shared,
-                    &ctx,
-                    &mut effects,
-                )
-                .await;
-                let attached = matches!(&result, Ok(Response::Attached { .. }));
-                if (is_attach && attached) || state.attached.is_none() {
-                    shared = state.shared_snapshot();
-                }
-                let _ = reply.send(result);
-                if is_attach && attached {
-                    let session_id = state
-                        .attached
-                        .as_ref()
-                        .map(|attached| attached.handle.session_id);
-                    for event in std::mem::take(&mut state.pending_replay) {
-                        if !try_send_in_process_event(&event_tx, event, session_id, &mut pending_lag) {
-                            break 'client;
-                        }
-                    }
-                    if let Some(event) = ctx.drain_state_event()
-                        && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
-                    {
-                        break 'client;
-                    }
-                }
-                if let Some(rx) = effects.session_event_rx.take() {
-                    session_event_rx = Some(rx);
-                } else if state.attached.is_none() {
-                    session_event_rx = None;
                 }
             }
         }
     }
+    // Concurrent dispatch owns the only tasks that can mint sealed
+    // capabilities. Abort and join them before cancellation so teardown is a
+    // hard insertion fence, matching the socket transport.
+    concurrent_tasks.abort_all();
+    while concurrent_tasks.join_next().await.is_some() {}
     if let Err(error) =
         attachments::drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await
     {
         tracing::warn!(message=%error.message,"in-process attachment ownership drain failed; durable charges remain for startup recovery");
+    }
+    let cancelled_capabilities = ctx
+        .sealed_owner_capabilities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .cancel_for_session(client_instance_id);
+    if cancelled_capabilities > 0 {
+        tracing::debug!(
+            client_instance_id = %client_instance_id,
+            cancelled_capabilities,
+            "cancelled sealed capabilities at in-process client teardown"
+        );
     }
 }
 
@@ -4547,7 +4699,7 @@ where
         Ok::<(), anyhow::Error>(())
     });
     let executor_task = tokio::spawn(run_client_executor(
-        ctx,
+        ctx.clone(),
         principal,
         client_instance_id,
         next_terminal_connection_epoch(),
@@ -4569,12 +4721,52 @@ where
     )
     .await;
 
+    // The executor is the only transport task able to mint a sealed
+    // capability. Terminate and join it before settling the connection's
+    // capability set so no dispatch child can insert after cancellation.
+    if completed.kind != ClientTaskKind::Executor {
+        executor_task.abort();
+        let _ = (&mut executor_task).await;
+    }
     reader_task.abort();
     writer_task.abort();
     event_task.abort();
-    executor_task.abort();
-    completed?;
+    if completed.kind != ClientTaskKind::Reader {
+        let _ = (&mut reader_task).await;
+    }
+    if completed.kind != ClientTaskKind::Writer {
+        let _ = (&mut writer_task).await;
+    }
+    if completed.kind != ClientTaskKind::Event {
+        let _ = (&mut event_task).await;
+    }
+    let cancelled_capabilities = ctx
+        .sealed_owner_capabilities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .cancel_for_session(client_instance_id);
+    if cancelled_capabilities > 0 {
+        tracing::debug!(
+            client_instance_id = %client_instance_id,
+            cancelled_capabilities,
+            "cancelled sealed capabilities at client transport teardown"
+        );
+    }
+    completed.result?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientTaskKind {
+    Reader,
+    Writer,
+    Event,
+    Executor,
+}
+
+struct CompletedClientTask {
+    kind: ClientTaskKind,
+    result: Result<()>,
 }
 
 async fn select_client_task(
@@ -4582,13 +4774,13 @@ async fn select_client_task(
     writer: &mut tokio::task::JoinHandle<Result<()>>,
     event: &mut tokio::task::JoinHandle<Result<()>>,
     executor: &mut tokio::task::JoinHandle<Result<()>>,
-) -> Result<()> {
+) -> CompletedClientTask {
     tokio::select! {
         biased;
-        result = executor => flatten_client_task(result, "client executor task", false),
-        result = reader => flatten_client_task(result, "client reader task", true),
-        result = writer => flatten_client_task(result, "client writer task", false),
-        result = event => flatten_client_task(result, "client event task", false),
+        result = executor => CompletedClientTask { kind: ClientTaskKind::Executor, result: flatten_client_task(result, "client executor task", false) },
+        result = reader => CompletedClientTask { kind: ClientTaskKind::Reader, result: flatten_client_task(result, "client reader task", true) },
+        result = writer => CompletedClientTask { kind: ClientTaskKind::Writer, result: flatten_client_task(result, "client writer task", false) },
+        result = event => CompletedClientTask { kind: ClientTaskKind::Event, result: flatten_client_task(result, "client event task", false) },
     }
 }
 
@@ -5431,7 +5623,7 @@ fn response_envelope_for_shared(
             };
             match response {
                 Some(mut response) => {
-                    finalize_response_projections(&mut response);
+                    finalize_response_projections(&mut response, &ctx.secret_vault);
                     bounded_response_envelope(id, response)
                 }
                 None => bounded_error_envelope(
@@ -5490,17 +5682,89 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
             .all(|value| value.len() <= proto::MAX_AGENT_METADATA_BYTES)
             && proto::is_opaque_authority_token(&entry.source_identity)
             && proto::is_opaque_authority_token(&entry.revision)
-            && entry.projection_digest == proto::agent_inventory_entry_projection_digest(entry)
+            && proto::is_opaque_authority_token(&entry.projection_digest)
+    };
+    let assistant_receipt = |operation: &str,
+                             intent: &str,
+                             root: &str,
+                             requested_root: &str,
+                             name: &str,
+                             consumed: &str,
+                             result: &str,
+                             consumed_generation: u64,
+                             result_generation: u64,
+                             outcome: &proto::AgentMutationOutcome| {
+        !operation.is_empty()
+            && operation.len() <= 128
+            && proto::is_opaque_authority_token(intent)
+            && !root.is_empty()
+            && root.len() <= proto::MAX_OWNER_PROJECT_ROOT_BYTES
+            && !requested_root.is_empty()
+            && requested_root.len() <= proto::MAX_OWNER_PROJECT_ROOT_BYTES
+            && !name.is_empty()
+            && name.len() <= proto::MAX_AGENT_NAME_BYTES
+            && !consumed.is_empty()
+            && consumed.len() <= 128
+            && proto::is_opaque_authority_token(result)
+            && (matches!(outcome, proto::AgentMutationOutcome::Reconciled)
+                || result_generation > consumed_generation)
     };
     match response {
         proto::Response::Assistant { assistant: value } => value.as_ref().is_none_or(assistant),
-        proto::Response::Assistants { assistants } => {
+        proto::Response::Assistants { assistants, .. } => {
             assistants.len() <= proto::MAX_ASSISTANT_SUMMARIES && assistants.iter().all(assistant)
         }
-        proto::Response::AssistantUpserted { assistant: value }
-        | proto::Response::AssistantDefinitionSaved {
-            assistant: value, ..
-        } => assistant(value),
+        proto::Response::AssistantUpserted { assistant: value } => assistant(value),
+        proto::Response::AssistantDefinitionSaved {
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            requested_project_root,
+            name,
+            assistant: value,
+            consumed_revision,
+            result_revision,
+            consumed_config_generation,
+            result_config_generation,
+            outcome,
+        } => {
+            value.as_ref().is_none_or(assistant)
+                && assistant_receipt(
+                    client_operation_id,
+                    mutation_intent_hash,
+                    project_root,
+                    requested_project_root,
+                    name,
+                    consumed_revision,
+                    result_revision,
+                    *consumed_config_generation,
+                    *result_config_generation,
+                    outcome,
+                )
+        }
+        proto::Response::AssistantDeleted {
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            requested_project_root,
+            name,
+            consumed_revision,
+            result_revision,
+            consumed_config_generation,
+            result_config_generation,
+            outcome,
+        } => assistant_receipt(
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            requested_project_root,
+            name,
+            consumed_revision,
+            result_revision,
+            *consumed_config_generation,
+            *result_config_generation,
+            outcome,
+        ),
         proto::Response::ExtendedConfigSnapshot { layers, .. } => {
             layers.len() <= proto::MAX_EXTENDED_CONFIG_LAYERS
                 && layers.iter().all(|layer| {
@@ -5539,11 +5803,34 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
                 && entries.iter().all(inventory_entry)
         }
         proto::Response::AgentEditSnapshot(value) => agent_snapshot(value),
-        proto::Response::AgentMutated(result)
-        | proto::Response::AgentEditorLeaseCompleted(result) => {
+        proto::Response::AgentMutated(result) => {
             result.snapshot.as_ref().is_none_or(agent_snapshot)
         }
-        proto::Response::AgentEditorLeaseBegun(lease) => agent_snapshot(&lease.snapshot),
+        proto::Response::AgentEditorLeaseCompleted(result) => {
+            proto::is_opaque_authority_token(&result.consumed_revision)
+                && result.client_operation_id.len() <= 128
+                && result.lease_id.len() <= 128
+                && result.agent_name.len() <= proto::MAX_AGENT_NAME_BYTES
+                && result.project_root.len() <= proto::MAX_OWNER_PROJECT_ROOT_BYTES
+                && match &result.status {
+                    proto::AgentEditorSettlementStatus::Saved {
+                        result_revision, ..
+                    } => proto::is_opaque_authority_token(result_revision),
+                    proto::AgentEditorSettlementStatus::Rejected { error } => {
+                        error.message.len() <= proto::MAX_AGENT_METADATA_BYTES
+                    }
+                    proto::AgentEditorSettlementStatus::NotStarted
+                    | proto::AgentEditorSettlementStatus::Pending
+                    | proto::AgentEditorSettlementStatus::Cancelled => true,
+                }
+        }
+        proto::Response::AgentEditorLeaseBegun(lease) => {
+            !lease.client_operation_id.is_empty()
+                && lease.client_operation_id.len() <= 128
+                && !lease.lease_id.is_empty()
+                && lease.lease_id.len() <= 128
+                && agent_snapshot(&lease.snapshot)
+        }
         _ => true,
     }
 }

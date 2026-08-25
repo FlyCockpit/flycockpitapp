@@ -61,6 +61,7 @@ pub enum AsyncActionPayload {
     #[allow(dead_code)]
     DaemonResponse(Box<cockpit_core::daemon::proto::Response>),
     Sessions(Vec<cockpit_core::daemon::proto::SessionSummary>),
+    SessionsMutation(crate::tui::sessions_pane::SessionsMutationCompletion),
     SessionMessages {
         session_id: uuid::Uuid,
         before_seq: Option<i64>,
@@ -230,10 +231,10 @@ pub enum AsyncActionPayload {
     /// Daemon-issued, display-safe OAuth instructions.  No PKCE state,
     /// device authorization id, callback code, or token record crosses this
     /// frontend boundary.
-    OAuthProviderBegin {
-        flow_id: String,
-        authorize_url: String,
-        user_code: Option<String>,
+    OAuth {
+        client_flow_id: crate::tui::settings::pointer_actions::OAuthFlowId,
+        operation_id: crate::tui::settings::shell::PointerOperationId,
+        result: OAuthAsyncResult,
     },
     OAuthAcknowledged,
     OAuthCodexComplete {
@@ -268,7 +269,47 @@ pub enum AsyncActionPayload {
         question: Option<String>,
         error: Option<String>,
     },
+    GoalSettings(crate::tui::goal_settings_pane::GoalSettingsCompletion),
+    Tools(crate::tui::tools_pane::ToolsCompletion),
+    WorkspaceTrust(crate::tui::app::WorkspaceTrustCompletion),
+    Sealed(crate::tui::app::slash::SealedCompletion),
+    SettingsDaemon(crate::tui::settings::SettingsDaemonEffectCompletion),
+    SettingsBlocking(crate::tui::settings::SettingsBlockingEffectCompletion),
+    McpLocal(crate::tui::app::McpLocalCompletion),
+    AgentRunnerAttached(Box<crate::tui::agent_runner::AgentRunner>),
+    BtwRunnerAttached {
+        session_id: uuid::Uuid,
+        runner: Box<crate::tui::agent_runner::AgentRunner>,
+    },
     MouseCopy(MouseCopyResult),
+}
+
+#[derive(Debug, Clone)]
+pub enum OAuthAsyncResult {
+    Failed(String),
+    /// A correlated durable receipt proves that the daemon rejected or
+    /// cancelled the operation. Unlike transport failure this releases the
+    /// owning authority gate.
+    AuthoritativeFailure(String),
+    /// The daemon may have committed the exact operation, but its terminal
+    /// receipt was not observable within the bounded settlement query. The
+    /// owning flow must stay fenced and retry the same daemon operation.
+    SettlementUnknown(String),
+    Acknowledged,
+    Began {
+        flow_id: String,
+        authorize_url: String,
+        user_code: Option<String>,
+    },
+    Completed {
+        logged_in: bool,
+    },
+    Presented(crate::tui::settings::providers::OAuthPresentationResult),
+    Cancelled,
+    /// The exact daemon flow was proven terminal before cancellation won.
+    /// This is terminal for navigation but deliberately distinct from a
+    /// cancellation receipt so the UI never claims that it fenced a commit.
+    AlreadyTerminal,
 }
 
 #[derive(Debug)]
@@ -1074,7 +1115,8 @@ impl AsyncActionRunner {
             // `advance_view_generation`, non-blocking work, etc.) must still
             // release pending/keyed ownership so a later same-key action is
             // not permanently stuck behind a discarded result.
-            if stale_view {
+            if stale_view && !matches!(&completed.kind, AsyncActionKind::DaemonRpc("sealed.effect"))
+            {
                 continue;
             }
             results.push(AsyncActionResult {

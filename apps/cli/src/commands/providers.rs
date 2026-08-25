@@ -37,23 +37,58 @@ async fn logout(args: ProviderLogoutArgs) -> Result<()> {
     let daemon = ensure_persistent_daemon()
         .await
         .map_err(|error| anyhow!("starting persistent daemon for provider logout: {error}"))?;
+    let client_operation_id = uuid::Uuid::new_v4().to_string();
     let response = daemon
         .client
         .request(Request::DeleteProviderCredential {
+            client_operation_id: client_operation_id.clone(),
             provider_id: args.provider.clone(),
-            project_root: Some(project_root),
+            project_root: Some(project_root.clone()),
         })
         .await
         .map_err(|error| anyhow!("provider logout RPC failed: {error}"))?
         .map_err(|error| anyhow!("daemon rejected provider logout request: {error}"))?;
     match response {
-        Response::ProviderCredentialDeleted { deleted: true, .. } => {
+        Response::ProviderCredentialCommitted {
+            client_operation_id: returned_operation_id,
+            provider_id,
+            project_root: Some(returned_root),
+            owner_root: Some(owner_root),
+            owner_scope,
+            consumed_vault_generation,
+            result_vault_generation,
+            changed: true,
+            stored: false,
+            ..
+        } if returned_operation_id == client_operation_id
+            && provider_id == args.provider
+            && returned_root == project_root
+            && owner_scope == format!("project:{owner_root}")
+            && result_vault_generation > consumed_vault_generation
+            && result_vault_generation > 0 =>
+        {
             println!("signed out `{}`", args.provider)
         }
-        Response::ProviderCredentialDeleted { deleted: false, .. } => {
+        Response::ProviderCredentialCommitted {
+            client_operation_id: returned_operation_id,
+            provider_id,
+            project_root: Some(returned_root),
+            owner_root: Some(owner_root),
+            owner_scope,
+            consumed_vault_generation,
+            result_vault_generation,
+            changed: false,
+            stored: false,
+            ..
+        } if returned_operation_id == client_operation_id
+            && provider_id == args.provider
+            && returned_root == project_root
+            && owner_scope == format!("project:{owner_root}")
+            && result_vault_generation == consumed_vault_generation
+            && result_vault_generation > 0 =>
+        {
             println!("`{}` was already signed out", args.provider)
         }
-        Response::Ack => println!("signed out `{}`", args.provider),
         other => {
             bail!("daemon returned unexpected response to provider logout request: {other:?}")
         }

@@ -36,7 +36,7 @@ use oauth_flow::handle_oauth_flow_key_with;
 pub(crate) use oauth_flow::prepare_grok_browser_start;
 pub(crate) use oauth_flow::{
     OAuthBeginResult, OAuthEffects, OAuthFlowOp, OAuthFlowRequest, OAuthFlowState, OAuthOption,
-    OAuthProvider, OAuthPublicBegin,
+    OAuthPresentationResult, OAuthProvider, OAuthPublicBegin, present_oauth_on_blocking_worker,
 };
 use oauth_flow::{
     OAuthFlowView, OAuthHost, OAuthNav, handle_oauth_flow_key, oauth_help_legend, oauth_options,
@@ -527,6 +527,50 @@ impl ProvidersPointerSurface {
 }
 
 impl ProvidersPage {
+    pub(super) fn has_unsettled_oauth_operation(&self) -> bool {
+        match self {
+            Self::OAuthSetup { state, .. } => state.has_unsettled_authority(),
+            Self::Add(state) => state
+                .oauth_auth
+                .as_ref()
+                .is_some_and(|oauth| oauth.has_unsettled_authority()),
+            _ => false,
+        }
+    }
+
+    pub(super) fn has_unsettled_authority_operation(&self) -> bool {
+        match self {
+            Self::OAuthSetup { state, .. } => state.has_unsettled_authority(),
+            Self::Add(state) => {
+                state.fetch.is_some()
+                    || state
+                        .oauth_auth
+                        .as_ref()
+                        .is_some_and(|oauth| oauth.has_unsettled_authority())
+            }
+            Self::Edit(state) => state.fetch.is_some(),
+            Self::Headers { parent, .. }
+            | Self::Models { parent, .. }
+            | Self::ModelSettings { parent, .. }
+            | Self::ProviderSettings { parent, .. } => parent.fetch.is_some(),
+            Self::FetchAll(state) => state.is_fetching(),
+            Self::DeepFetch { state, .. } => state.is_running(),
+            Self::CopilotSetup { state, .. } => state.operation.pending().is_some(),
+            Self::List { .. } | Self::FetchOnePrompt(_) | Self::FetchFallbackPrompt(_) => false,
+        }
+    }
+
+    pub(super) fn has_unsettled_oauth_acknowledgement(&self) -> bool {
+        match self {
+            Self::OAuthSetup { state, .. } => state.has_unsettled_acknowledgement(),
+            Self::Add(state) => state
+                .oauth_auth
+                .as_ref()
+                .is_some_and(|oauth| oauth.has_unsettled_acknowledgement()),
+            _ => false,
+        }
+    }
+
     /// Sealed compile-time inventory for provider pointer fixtures. There is
     /// intentionally no wildcard: a new provider state cannot compile until
     /// it declares which semantic pointer surface it renders.
@@ -782,35 +826,63 @@ impl CopilotSetupState {
 
     /// Ask the daemon to acquire and persist Copilot auth. The daemon returns
     /// only an acknowledgement; the TUI never receives or handles the token.
-    fn submit_daemon(&mut self, project_root: &std::path::Path, provider_id: &str) {
+    fn submit_daemon(
+        &mut self,
+        cx: &mut super::SettingsCx,
+        project_root: &std::path::Path,
+        provider_id: &str,
+    ) {
         if self.already_configured || self.outcome.is_some() || self.operation.pending().is_some() {
             return;
         }
         let operation_id = self.operation.begin();
-        let project_root = project_root.display().to_string();
+        let project_root = super::canonical_project_root(project_root);
         let provider_id = provider_id.to_string();
-        let result = super::run_settings_daemon(async move {
-            let client = super::settings_daemon_client()
-                .await
-                .map_err(|error| error.to_string())?;
-            match client
-                .request(cockpit_core::daemon::proto::Request::SetupCopilotAuth {
-                    project_root,
-                    provider_id,
-                })
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                Ok(cockpit_core::daemon::proto::Response::Ack) => {
-                    Ok("Copilot token configured in the daemon vault".into())
-                }
-                Ok(other) => Err(format!(
-                    "unexpected daemon Copilot setup response: {other:?}"
-                )),
-                Err(error) => Err(error.to_string()),
+        let client_operation_id = operation_id.0.to_string();
+        let expected_request_hash = match super::local_receipt_request_hash(&(
+            "setup_copilot_auth",
+            &project_root,
+            &provider_id,
+        )) {
+            Ok(hash) => hash,
+            Err(error) => {
+                self.complete(operation_id, Err(error));
+                return;
             }
-        });
-        self.complete(operation_id, result);
+        };
+        cx.queue_simple_mutation(
+            super::SettingsEffectTarget {
+                surface: "settings.copilot-setup",
+                owner: provider_id.clone(),
+                revision: Some(operation_id.0.to_string()),
+            },
+            cockpit_core::daemon::proto::Request::SetupCopilotAuth {
+                client_operation_id: client_operation_id.clone(),
+                project_root: project_root.clone(),
+                provider_id: provider_id.clone(),
+            },
+            super::SettingsMutationAction::CopilotSetup {
+                provider_id,
+                client_operation_id,
+                project_root,
+                expected_request_hash,
+            },
+        );
+        self.outcome = Some(Ok("Copilot setup pending…".into()));
+    }
+
+    pub(super) fn apply_daemon_result(&mut self, provider_id: String, result: Result<(), String>) {
+        let Some(operation_id) = self.operation.pending() else {
+            self.outcome = Some(Err(format!(
+                "ignored stale Copilot setup receipt for {provider_id}"
+            )));
+            return;
+        };
+        self.outcome = None;
+        self.complete(
+            operation_id,
+            result.map(|()| format!("Copilot authentication configured for {provider_id}")),
+        );
     }
 
     fn complete(
@@ -1042,7 +1114,10 @@ impl SettingsDialog {
                 entry.mark_model_fetch_success(catalog);
                 let count = entry.models.len();
                 message = match self.save_config() {
-                    Ok(()) => fetch_success_message(count, catalog),
+                    Ok(()) => format!(
+                        "{}; saving provider catalog…",
+                        fetch_success_message(count, catalog)
+                    ),
                     Err(e) => format!("save failed: {e}"),
                 };
             }
@@ -1071,16 +1146,22 @@ impl SettingsDialog {
                     if let Some(entry) = self.config.providers.get_mut(provider_id) {
                         entry.mark_model_fetch_unsupported();
                     }
-                    let _ = self.save_config();
-                    message = "provider has no /models endpoint (skipped)".to_string();
+                    message = match self.save_config() {
+                        Ok(()) => "provider has no /models endpoint; saving fetch status…".into(),
+                        Err(error) => format!("fetch status save failed: {error}"),
+                    };
                 }
                 Err(e) => {
                     let reason = redact_model_fetch_reason(e.as_str());
                     if let Some(entry) = self.config.providers.get_mut(provider_id) {
                         entry.mark_model_fetch_failed_kept_existing(reason.clone());
                     }
-                    let _ = self.save_config();
-                    message = format!("fetch failed: {reason}");
+                    message = match self.save_config() {
+                        Ok(()) => format!("fetch failed: {reason}; saving failure status…"),
+                        Err(error) => {
+                            format!("fetch failed: {reason}; status save failed: {error}")
+                        }
+                    };
                 }
                 Ok(FetchOutcome::Models { .. }) | Ok(FetchOutcome::FallbackAvailable { .. }) => {
                     unreachable!()
@@ -1213,7 +1294,7 @@ impl SettingsCx {
                     Some(cycle_on_unlisted(self.config.on_unlisted_models_fetch));
                 *status = Some(match self.save_config() {
                     Ok(()) => format!(
-                        "on unlisted models: {}",
+                        "saving on-unlisted-models policy ({})…",
                         on_unlisted_label(self.config.on_unlisted_models_fetch)
                     ),
                     Err(e) => format!("save failed: {e}"),
@@ -1354,45 +1435,60 @@ impl SettingsCx {
         template: &'static ProviderTemplate,
     ) {
         self.config.providers.insert(id.clone(), entry.clone());
+        self.pending_provider_add = Some((id, entry, template.supports_models_endpoint));
         match self.save_config() {
             Ok(()) => {
-                s.saved_provider_id = Some(id.clone());
-                let notice = self.last_secret_notice.take();
-                if !s.is_step("saving") {
-                    let _ = s.run.submit(WizardAnswer::Acknowledged);
-                }
-                if s.is_step("saving") {
-                    let _ = s.run.submit(WizardAnswer::Acknowledged);
-                }
-                if s.is_step("fetching") {
-                    s.error = Some(match notice {
-                        Some(notice) => format!("saved. {notice} Fetching /models…"),
-                        None => "saved. Fetching /models…".into(),
-                    });
-                    s.fetch = Some(FetchHandle::spawn(id, entry, self.provider_fetch_root()));
-                    let _ = s.run.submit(WizardAnswer::Acknowledged);
-                } else if s.is_step("test-key-choice") {
-                    s.error = Some(match notice {
-                        Some(notice) => format!("saved. {notice}"),
-                        None => "saved.".into(),
-                    });
-                } else if !template.supports_models_endpoint {
-                    s.error = Some(match notice {
-                        Some(notice) => {
-                            format!("saved. {notice} Provider has no /models endpoint")
-                        }
-                        None => "saved. provider has no /models endpoint".into(),
-                    });
-                } else {
-                    s.error = Some(match notice {
-                        Some(notice) => format!("saved. {notice}"),
-                        None => "saved.".into(),
-                    });
-                }
+                s.error = Some("saving provider…".into());
             }
             Err(e) => {
+                self.pending_provider_add = None;
                 s.error = Some(format!("save failed: {e}"));
             }
+        }
+    }
+
+    pub(super) fn adopt_provider_add_completion(
+        &mut self,
+        s: &mut AddState,
+        completion: Result<(String, ProviderEntry, bool), String>,
+    ) {
+        let (id, entry, supports_models_endpoint) = match completion {
+            Ok(committed) => committed,
+            Err(error) => {
+                s.error = Some(format!("save failed: {error}"));
+                return;
+            }
+        };
+        s.saved_provider_id = Some(id.clone());
+        let notice = self.last_secret_notice.take();
+        if !s.is_step("saving") {
+            let _ = s.run.submit(WizardAnswer::Acknowledged);
+        }
+        if s.is_step("saving") {
+            let _ = s.run.submit(WizardAnswer::Acknowledged);
+        }
+        if s.is_step("fetching") {
+            s.error = Some(match notice {
+                Some(notice) => format!("saved. {notice} Fetching /models…"),
+                None => "saved. Fetching /models…".into(),
+            });
+            s.fetch = Some(FetchHandle::spawn(id, entry, self.provider_fetch_root()));
+            let _ = s.run.submit(WizardAnswer::Acknowledged);
+        } else if s.is_step("test-key-choice") {
+            s.error = Some(match notice {
+                Some(notice) => format!("saved. {notice}"),
+                None => "saved.".into(),
+            });
+        } else if !supports_models_endpoint {
+            s.error = Some(match notice {
+                Some(notice) => format!("saved. {notice} Provider has no /models endpoint"),
+                None => "saved. provider has no /models endpoint".into(),
+            });
+        } else {
+            s.error = Some(match notice {
+                Some(notice) => format!("saved. {notice}"),
+                None => "saved.".into(),
+            });
         }
     }
 
@@ -1732,18 +1828,7 @@ impl SettingsCx {
             .providers
             .insert(s.provider_id.clone(), (*s.entry).clone());
         match self.save_config() {
-            Ok(()) => {
-                // Bump the live resolution generation so subsequent editors
-                // observe a new config epoch after a successful write.
-                self.config.resolution_generation =
-                    self.config.resolution_generation.saturating_add(1);
-                Some(
-                    self.last_secret_notice
-                        .take()
-                        .map(|notice| format!("saved. {notice}"))
-                        .unwrap_or_else(|| "saved".to_string()),
-                )
-            }
+            Ok(()) => Some("saving provider…".to_string()),
             Err(error) => {
                 match previous {
                     Some(entry) => {
@@ -1790,7 +1875,7 @@ impl SettingsCx {
         .to_string()
     }
 
-    fn logout_provider_oauth(&self, provider: OAuthProvider) -> Result<(), String> {
+    fn logout_provider_oauth(&mut self, provider: OAuthProvider) -> Result<(), String> {
         let provider_id = match provider {
             OAuthProvider::Grok => cockpit_core::auth::xai_oauth::CREDENTIAL_KEY,
             OAuthProvider::Codex => cockpit_core::auth::codex_oauth::CREDENTIAL_KEY,
@@ -1801,40 +1886,33 @@ impl SettingsCx {
             .as_deref()
             .or(self.picker_cwd.as_deref())
             .or_else(|| self.config_path.parent())
-            .ok_or_else(|| "resolving provider logout workspace: no project context".to_string())?
-            .display()
-            .to_string();
-        let inventory_provider_id = provider_id.clone();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let client = super::settings_daemon_client()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                match client
-                    .request(
-                        cockpit_core::daemon::proto::Request::DeleteProviderCredential {
-                            provider_id,
-                            project_root: Some(project_root),
-                        },
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    Ok(cockpit_core::daemon::proto::Response::ProviderCredentialDeleted {
-                        ..
-                    })
-                    | Ok(cockpit_core::daemon::proto::Response::Ack) => Ok(()),
-                    Ok(other) => Err(format!(
-                        "unexpected daemon OAuth logout response: {other:?}"
-                    )),
-                    Err(error) => Err(error.to_string()),
-                }
-            })
-        });
-        if result.is_ok() {
-            self.invalidate_secret_inventory_entry(&inventory_provider_id, None);
-        }
-        result
+            .ok_or_else(|| "resolving provider logout workspace: no project context".to_string())?;
+        let project_root = super::canonical_project_root(project_root);
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
+        let expected_request_hash = super::local_receipt_request_hash(&(
+            "delete_provider_credential",
+            &provider_id,
+            &Some(project_root.clone()),
+        ))?;
+        self.queue_simple_mutation(
+            super::SettingsEffectTarget {
+                surface: "settings.provider-logout",
+                owner: provider_id.clone(),
+                revision: Some(client_operation_id.clone()),
+            },
+            cockpit_core::daemon::proto::Request::DeleteProviderCredential {
+                client_operation_id: client_operation_id.clone(),
+                provider_id: provider_id.clone(),
+                project_root: Some(project_root.clone()),
+            },
+            super::SettingsMutationAction::ProviderCredentialDelete {
+                provider_id,
+                client_operation_id,
+                project_root,
+                expected_request_hash,
+            },
+        );
+        Ok(())
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent, s: &mut EditState) -> Nav {
@@ -2014,10 +2092,7 @@ impl SettingsCx {
             Some(EditAction::OAuthAuth(provider)) => {
                 if self.provider_oauth_logged_in(provider) == Some(true) {
                     s.status = Some(match self.logout_provider_oauth(provider) {
-                        Ok(()) => match provider {
-                            OAuthProvider::Grok => "signed out of Grok subscription auth".into(),
-                            OAuthProvider::Codex => "signed out of Codex subscription auth".into(),
-                        },
+                        Ok(()) => "signing out…".into(),
                         Err(error) => format!("sign out failed: {error}"),
                     });
                     return Nav::Stay;
@@ -2645,19 +2720,22 @@ impl SettingsCx {
                     .get(&s.provider_id)
                     .map(|entry| entry.models.len())
                     .unwrap_or(0);
-                let status = match self.save_config() {
-                    Ok(()) => fetch_success_message(count, s.catalog),
-                    Err(e) => format!("save failed: {e}"),
-                };
-                let entry = self
-                    .config
-                    .providers
-                    .get(&s.provider_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let mut edit = EditState::new(s.provider_id.clone(), entry);
-                edit.status = Some(status);
-                return Nav::Replace(super::providers_page(ProvidersPage::Edit(edit)));
+                match self.save_config() {
+                    Ok(()) => {
+                        self.pending_provider_mutation_navigation =
+                            Some(super::ProviderMutationNavigation::Edit {
+                                provider_id: s.provider_id.clone(),
+                                status: fetch_success_message(count, s.catalog),
+                            });
+                        self.extended_warnings = vec!["saving fetched provider catalog…".into()];
+                    }
+                    Err(error) => {
+                        self.extended_warnings = vec![format!(
+                            "save failed: {error}; fetched catalog choice remains open for retry"
+                        )];
+                    }
+                }
+                return Nav::Stay;
             }
             _ => {}
         }
@@ -2706,19 +2784,22 @@ impl SettingsCx {
                     if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
                         entry.mark_model_fetch_failed_kept_existing(s.reason.clone());
                     }
-                    let status = match self.save_config() {
-                        Ok(()) => "kept existing catalog after live fetch failure".to_string(),
-                        Err(e) => format!("save failed: {e}"),
-                    };
-                    let entry = self
-                        .config
-                        .providers
-                        .get(&s.provider_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut edit = EditState::new(s.provider_id.clone(), entry);
-                    edit.status = Some(status);
-                    return Nav::Replace(super::providers_page(ProvidersPage::Edit(edit)));
+                    match self.save_config() {
+                        Ok(()) => {
+                            self.pending_provider_mutation_navigation =
+                                Some(super::ProviderMutationNavigation::Edit {
+                                    provider_id: s.provider_id.clone(),
+                                    status: "kept existing catalog after live fetch failure".into(),
+                                });
+                            self.extended_warnings = vec!["saving provider fetch status…".into()];
+                        }
+                        Err(error) => {
+                            self.extended_warnings = vec![format!(
+                                "save failed: {error}; fallback choice remains open for retry"
+                            )];
+                        }
+                    }
+                    return Nav::Stay;
                 }
                 2 => {
                     if let Some(entry) = self.config.providers.get_mut(&s.provider_id) {
@@ -2738,19 +2819,23 @@ impl SettingsCx {
                         .get(&s.provider_id)
                         .map(|entry| entry.models.len())
                         .unwrap_or(0);
-                    let status = match self.save_config() {
-                        Ok(()) => fetch_success_message(count, s.catalog),
-                        Err(e) => format!("save failed: {e}"),
-                    };
-                    let entry = self
-                        .config
-                        .providers
-                        .get(&s.provider_id)
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut edit = EditState::new(s.provider_id.clone(), entry);
-                    edit.status = Some(status);
-                    return Nav::Replace(super::providers_page(ProvidersPage::Edit(edit)));
+                    match self.save_config() {
+                        Ok(()) => {
+                            self.pending_provider_mutation_navigation =
+                                Some(super::ProviderMutationNavigation::Edit {
+                                    provider_id: s.provider_id.clone(),
+                                    status: fetch_success_message(count, s.catalog),
+                                });
+                            self.extended_warnings =
+                                vec!["saving fallback provider catalog…".into()];
+                        }
+                        Err(error) => {
+                            self.extended_warnings = vec![format!(
+                                "save failed: {error}; fallback choice remains open for retry"
+                            )];
+                        }
+                    }
+                    return Nav::Stay;
                 }
                 _ => {
                     return Nav::Replace(super::providers_page(ProvidersPage::List {
@@ -2815,7 +2900,9 @@ impl SettingsCx {
                     s.outcome = Some(Err("unable to resolve the provider workspace".into()));
                     return Nav::Stay;
                 };
-                s.submit_daemon(project_root, &parent.provider_id);
+                let project_root = project_root.to_path_buf();
+                let provider_id = parent.provider_id.clone();
+                s.submit_daemon(self, &project_root, &provider_id);
             }
             _ => {}
         }
@@ -5230,7 +5317,9 @@ impl SettingsPage for ProvidersPage {
             super::pointer_actions::ProvidersAction::CopyOAuth(flow_id, kind),
         ) = (&mut *self, &provider_action)
         {
-            state.submit_pointer_copy(*flow_id, *kind);
+            if let Some(action) = state.submit_pointer_copy(*flow_id, *kind) {
+                cx.pending_oauth_action = Some(action);
+            }
             return Nav::Stay;
         }
         if let (

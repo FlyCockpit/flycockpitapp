@@ -96,6 +96,16 @@ pub(crate) struct AttachedRequestBinding {
     intended_attachment_epoch: u64,
 }
 
+impl std::fmt::Debug for AttachedRequestBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AttachedRequestBinding")
+            .field("session_id", &self.intended_session_id)
+            .field("attachment_epoch", &self.intended_attachment_epoch)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AttachedRequestBinding {
     pub(crate) fn new(
         sender: mpsc::Sender<AttachedRequest>,
@@ -111,6 +121,10 @@ impl AttachedRequestBinding {
 
     pub(crate) fn session_id(&self) -> Uuid {
         self.intended_session_id
+    }
+
+    pub(crate) fn attachment_epoch(&self) -> u64 {
+        self.intended_attachment_epoch
     }
 
     pub(crate) async fn request(&self, request: Request) -> Result<Response, String> {
@@ -346,6 +360,10 @@ pub struct AgentRunner {
     /// from this. `false` when it attached to a pre-existing (canonical or
     /// auto-promoted persistent) daemon, which it must never stop.
     pub owns_daemon: bool,
+    /// Armed while the runner is still a provisional async attach result.
+    /// Adoption transfers this guard to `App`; dropping a stale/replaced
+    /// result therefore cannot orphan the ephemeral daemon it spawned.
+    owned_daemon_guard: Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard>,
     /// The socket of the daemon this runner is attached to. Carried so an
     /// owned ephemeral daemon can be reaped on exit via the guard.
     pub socket: PathBuf,
@@ -416,6 +434,18 @@ impl Drop for ClientTasks {
     }
 }
 
+impl std::fmt::Debug for AgentRunner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgentRunner")
+            .field("session_id", &self.session_id())
+            .field("short_id", &self.short_id)
+            .field("project_id", &self.project_id)
+            .field("owns_daemon", &self.owns_daemon)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AgentRunner {
     /// Retry exact submissions retained after a deterministic pre-acceptance
     /// rejection. Reusing the attachment watch gives the dispatcher a
@@ -472,6 +502,7 @@ impl AgentRunner {
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
             owns_daemon: false,
+            owned_daemon_guard: None,
             socket: PathBuf::from("/tmp/cockpit-test.sock"),
             history: Vec::new(),
             paused_work: Vec::new(),
@@ -497,6 +528,12 @@ impl AgentRunner {
     /// daemon-owned session.
     pub fn shutdown(&mut self) {
         self.client_tasks.shutdown();
+    }
+
+    pub(crate) fn take_owned_daemon_guard(
+        &mut self,
+    ) -> Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard> {
+        self.owned_daemon_guard.take()
     }
 
     pub fn event_notifier(&self) -> Arc<Notify> {
@@ -2026,21 +2063,25 @@ impl Drop for AgentRunner {
 /// Returns `Err(String)` instead of `anyhow::Error` so `app.rs` can
 /// render the message in its fallback "input captured" stub without
 /// having to format an anyhow chain.
-pub fn try_spawn(cwd: &Path, no_sandbox: bool, mode: LifecycleMode) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, None, None, no_sandbox, mode)
+pub async fn try_spawn(
+    cwd: &Path,
+    no_sandbox: bool,
+    mode: LifecycleMode,
+) -> Result<AgentRunner, String> {
+    try_spawn_inner(cwd, None, None, no_sandbox, mode).await
 }
 
 /// Attach a fresh or model-less existing session seeded with the complete
 /// selection accepted by the picker. An existing durable selection is never
 /// overwritten during attach; the correlated SetActiveModel request does that.
-pub fn try_spawn_with_model(
+pub async fn try_spawn_with_model(
     cwd: &Path,
     session_id: Option<uuid::Uuid>,
     initial_model: cockpit_config::providers::ActiveModelRef,
     no_sandbox: bool,
     mode: LifecycleMode,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, session_id, Some(initial_model), no_sandbox, mode)
+    try_spawn_inner(cwd, session_id, Some(initial_model), no_sandbox, mode).await
 }
 
 /// Re-attach to an existing session by id (the `/compact` commit path,
@@ -2049,75 +2090,82 @@ pub fn try_spawn_with_model(
 /// channel onto the new compaction-handoff session. `no_sandbox` is
 /// ignored by the daemon on resume (the session keeps its own state),
 /// passed only to keep the attach shape uniform.
-pub fn attach_to_session(
+pub async fn attach_to_session(
     cwd: &Path,
     session_id: uuid::Uuid,
     no_sandbox: bool,
     mode: LifecycleMode,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, Some(session_id), None, no_sandbox, mode)
+    try_spawn_inner(cwd, Some(session_id), None, no_sandbox, mode).await
 }
 
-fn try_spawn_inner(
+async fn try_spawn_inner(
     cwd: &Path,
     session_id: Option<uuid::Uuid>,
     initial_model: Option<cockpit_config::providers::ActiveModelRef>,
     no_sandbox: bool,
     mode: LifecycleMode,
 ) -> Result<AgentRunner, String> {
-    let runtime = tokio::runtime::Handle::try_current()
-        .map_err(|_| "no tokio runtime — cockpit must be invoked from main".to_string())?;
-
-    // probe_or_spawn is async; we block the (async) caller on it so
-    // try_spawn returns a fully-attached handle to the TUI. We're
-    // already in a tokio context (`main` is `#[tokio::main]`), so we
-    // use `block_in_place` to run a `block_on` without panicking.
-    let attached = tokio::task::block_in_place(|| {
-        runtime.block_on(async {
-            let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
-            let daemon = probe_or_spawn(mode)
-                .await
-                .map_err(|e| format!("daemon probe: {e}"))?;
-            timer.phase("probe_or_spawn");
-            let owns_daemon = daemon.owns_daemon;
-            let socket = daemon.socket.clone();
-            let startup_notice = daemon.startup_notice.clone();
-            let project_root = cwd.to_string_lossy().into_owned();
-            let (env_snapshot, _env_diagnostic) =
-                cockpit_core::env_snapshot::capture_tui_shell_env();
-            let attached = match daemon
-                .client
-                .request(Request::Attach {
-                    session_id,
-                    since_seq: None,
-                    project_root: Some(project_root),
-                    initial_model,
-                    no_sandbox,
-                    // The TUI can answer interrupts (approval / loop-guard /
-                    // `question` prompts) — mark this attach interactive so
-                    // the loop guard prompts here instead of auto-rejecting.
-                    interactive: true,
-                    // The interactive TUI uses the session's active model; the
-                    // plan-level override is only for the headless plan-run
-                    // path (`cockpit run --model`).
-                    model_override: None,
-                    client_protocol_version: daemon.client.negotiated().version,
-                    env_snapshot: Some(env_snapshot.to_wire()),
-                    env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
-                })
-                .await
-            {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) if error.code == ErrorCode::ProtocolVersion => {
-                    return Err(incompatible_protocol_chip().to_string());
-                }
-                Ok(Err(error)) => return Err(format!("attach: daemon error: {error}")),
-                Err(e) => return Err(format!("attach: {e}")),
-            };
-            let (
+    let attached = {
+        let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
+        let mut daemon = probe_or_spawn(mode)
+            .await
+            .map_err(|e| format!("daemon probe: {e}"))?;
+        timer.phase("probe_or_spawn");
+        let owns_daemon = daemon.owns_daemon;
+        let owned_daemon_guard = daemon.take_owned_daemon_guard();
+        let socket = daemon.socket.clone();
+        let startup_notice = daemon.startup_notice.clone();
+        let project_root = cwd.to_string_lossy().into_owned();
+        let (env_snapshot, _env_diagnostic) = cockpit_core::env_snapshot::capture_tui_shell_env();
+        let attached = match daemon
+            .client
+            .request(Request::Attach {
+                session_id,
+                since_seq: None,
+                project_root: Some(project_root),
+                initial_model,
+                no_sandbox,
+                // The TUI can answer interrupts (approval / loop-guard /
+                // `question` prompts) — mark this attach interactive so
+                // the loop guard prompts here instead of auto-rejecting.
+                interactive: true,
+                // The interactive TUI uses the session's active model; the
+                // plan-level override is only for the headless plan-run
+                // path (`cockpit run --model`).
+                model_override: None,
+                client_protocol_version: daemon.client.negotiated().version,
+                env_snapshot: Some(env_snapshot.to_wire()),
+                env_policy: cockpit_core::env_snapshot::EnvDriftPolicy::Client,
+            })
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) if error.code == ErrorCode::ProtocolVersion => {
+                return Err(incompatible_protocol_chip().to_string());
+            }
+            Ok(Err(error)) => return Err(format!("attach: daemon error: {error}")),
+            Err(e) => return Err(format!("attach: {e}")),
+        };
+        let (
+            session_id,
+            short_id,
+            active_agent_name,
+            active_agent_path,
+            foreground_target,
+            active_model_state,
+            project_id,
+            history,
+            paused_work,
+            repair_required,
+            btw_fork,
+            daemon_version,
+            daemon_compatible,
+        ) = match attached {
+            Response::Attached {
                 session_id,
                 short_id,
-                active_agent_name,
+                active_agent,
                 active_agent_path,
                 foreground_target,
                 active_model_state,
@@ -2127,103 +2175,88 @@ fn try_spawn_inner(
                 repair_required,
                 btw_fork,
                 daemon_version,
-                daemon_compatible,
-            ) = match attached {
-                Response::Attached {
-                    session_id,
-                    short_id,
-                    active_agent,
-                    active_agent_path,
-                    foreground_target,
-                    active_model_state,
-                    project_id,
-                    history,
-                    paused_work,
-                    repair_required,
-                    btw_fork,
-                    daemon_version,
-                    compatible,
-                    ..
-                } => (
-                    session_id,
-                    short_id,
-                    active_agent,
-                    active_agent_path,
-                    foreground_target,
-                    active_model_state,
-                    project_id,
-                    history,
-                    paused_work,
-                    repair_required.map(|repair| *repair),
-                    btw_fork,
-                    daemon_version,
-                    compatible,
-                ),
-                other => return Err(format!("unexpected attach response: {other:?}")),
-            };
-            // Fetch the autocomplete frequency maps for this session's
-            // project. Best-effort: a daemon that doesn't speak
-            // `GetUsageCounts` just leaves the maps empty (no ranking).
-            let usage = match daemon
-                .client
-                .request_ok(Request::GetUsageCounts {
-                    project_id: Some(project_id.clone()),
-                })
-                .await
-            {
-                Ok(Response::UsageCounts {
-                    models,
-                    slash,
-                    tags,
-                }) => UsageCounts {
-                    models,
-                    slash,
-                    tags,
-                },
-                _ => UsageCounts::default(),
-            };
-            let skill_inventory_names = match daemon
-                .client
-                .request_ok(Request::GetInventoryBundle {
-                    project_root: cwd.to_string_lossy().into_owned(),
-                    session_id,
-                    selected_agent: active_agent_name.clone(),
-                })
-                .await
-            {
-                Ok(Response::InventoryBundle { skills, .. }) => Some(
-                    skills
-                        .into_iter()
-                        .map(|skill| skill.name)
-                        .collect::<std::collections::HashSet<_>>(),
-                ),
-                _ => None,
-            };
-            timer.phase("attach_and_usage");
-            timer.done();
-            Ok::<_, String>((
-                daemon.client,
+                compatible,
+                ..
+            } => (
                 session_id,
                 short_id,
-                active_agent_name,
+                active_agent,
                 active_agent_path,
                 foreground_target,
                 active_model_state,
                 project_id,
-                usage,
-                skill_inventory_names,
-                owns_daemon,
-                socket,
-                startup_notice,
                 history,
                 paused_work,
-                repair_required,
+                repair_required.map(|repair| *repair),
                 btw_fork,
                 daemon_version,
-                daemon_compatible,
-            ))
-        })
-    })?;
+                compatible,
+            ),
+            other => return Err(format!("unexpected attach response: {other:?}")),
+        };
+        // Fetch the autocomplete frequency maps for this session's
+        // project. Best-effort: a daemon that doesn't speak
+        // `GetUsageCounts` just leaves the maps empty (no ranking).
+        let usage = match daemon
+            .client
+            .request_ok(Request::GetUsageCounts {
+                project_id: Some(project_id.clone()),
+            })
+            .await
+        {
+            Ok(Response::UsageCounts {
+                models,
+                slash,
+                tags,
+            }) => UsageCounts {
+                models,
+                slash,
+                tags,
+            },
+            _ => UsageCounts::default(),
+        };
+        let skill_inventory_names = match daemon
+            .client
+            .request_ok(Request::GetInventoryBundle {
+                project_root: cwd.to_string_lossy().into_owned(),
+                session_id,
+                selected_agent: active_agent_name.clone(),
+            })
+            .await
+        {
+            Ok(Response::InventoryBundle { skills, .. }) => Some(
+                skills
+                    .into_iter()
+                    .map(|skill| skill.name)
+                    .collect::<std::collections::HashSet<_>>(),
+            ),
+            _ => None,
+        };
+        timer.phase("attach_and_usage");
+        timer.done();
+        Ok::<_, String>((
+            daemon.client,
+            session_id,
+            short_id,
+            active_agent_name,
+            active_agent_path,
+            foreground_target,
+            active_model_state,
+            project_id,
+            usage,
+            skill_inventory_names,
+            owns_daemon,
+            socket,
+            startup_notice,
+            history,
+            paused_work,
+            repair_required,
+            btw_fork,
+            daemon_version,
+            daemon_compatible,
+            owned_daemon_guard,
+        ))
+    }?;
     let (
         client,
         session_id,
@@ -2244,6 +2277,7 @@ fn try_spawn_inner(
         btw_fork,
         daemon_version,
         daemon_compatible,
+        owned_daemon_guard,
     ) = attached;
 
     let (input_tx, input_rx) = mpsc::channel::<RunnerInput>(32);
@@ -2713,6 +2747,7 @@ fn try_spawn_inner(
         project_id,
         usage,
         owns_daemon,
+        owned_daemon_guard,
         socket,
         history,
         paused_work,
@@ -2923,28 +2958,14 @@ fn local_guidance_estimate(
     }
 }
 
-/// Run one request-response RPC over the runner's already-attached daemon
-/// client. Unlike socket helpers, this preserves daemon-side per-client
-/// attached session state.
-pub(crate) fn attached_request_tx_blocking(
-    binding: AttachedRequestBinding,
-    req: Request,
-) -> Result<Response, String> {
-    let runtime =
-        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
-    tokio::task::block_in_place(|| runtime.block_on(async move { binding.request(req).await }))
-}
-
 /// Run one blocking daemon request against an already-running daemon and
 /// return the typed response. Connects only — never spawns — so the
 /// `/sessions` browser degrades gracefully (no live data, no DB writes,
-/// no crash) when the daemon isn't up. Mirrors `try_spawn_inner`'s
-/// `block_in_place` pattern so it's callable from the synchronous TUI
-/// key handlers. `Err(String)` for any transport/typed failure.
-pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
-    // Unit reducers are synchronous and have no daemon to connect to, so they
-    // share the settings transport seam instead of failing before the request
-    // can be exercised.
+/// no crash) when the daemon isn't up. This adapter may be called only from an
+/// `AsyncActionRunner::start_blocking`/`spawn_blocking` worker; reducers and
+/// event handlers use typed async effects. `Err(String)` for any
+/// transport/typed failure.
+pub(crate) fn daemon_request_blocking(req: Request) -> Result<Response, String> {
     #[cfg(test)]
     {
         return crate::tui::settings::test_daemon_request(req);
@@ -2973,6 +2994,16 @@ pub fn daemon_request_blocking(req: Request) -> Result<Response, String> {
     }
 }
 
+/// Blocking daemon transport for an [`AsyncActionRunner::start_blocking`]
+/// worker only. Naming this boundary distinctly lets source ratchets forbid
+/// accidental use from reducers and the async event-loop thread.
+///
+/// [`AsyncActionRunner::start_blocking`]: crate::tui::async_action::AsyncActionRunner::start_blocking
+pub(crate) fn daemon_request_from_blocking_worker(req: Request) -> Result<Response, String> {
+    daemon_request_blocking(req)
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum BlockingDaemonRequestError {
     Conflict(String),
@@ -2980,6 +3011,7 @@ pub(crate) enum BlockingDaemonRequestError {
 }
 
 /// Blocking request variant that preserves optimistic-concurrency conflicts.
+#[cfg(test)]
 pub(crate) fn daemon_request_blocking_classified(
     req: Request,
 ) -> Result<Response, BlockingDaemonRequestError> {
@@ -3021,7 +3053,7 @@ pub(crate) fn daemon_request_blocking_classified(
 /// auto-spawn paths) whose socket env is set only in the daemon child, not
 /// in this client process. Connects only — never spawns. `Err(String)` on
 /// any transport/typed failure.
-pub fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Response, String> {
+pub(crate) fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Response, String> {
     let runtime =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
     let socket = socket.to_path_buf();
@@ -3038,32 +3070,13 @@ pub fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Respons
     })
 }
 
-/// Run one request-response RPC over the *attached* session's persistent daemon
-/// connection, blocking the current thread until the reply arrives.
-///
-/// Unlike [`daemon_request_at_blocking`] (which opens a FRESH connection per
-/// call, and so is assigned a fresh `client_instance_id`), this reuses the one
-/// connection the attached runner already owns. The sealed-owner capability
-/// channel binds each capability to its minting connection's
-/// `client_instance_id`, so `begin`, `apply`, and `cancel` MUST all travel this
-/// same binding — a fresh-connection apply would be rejected fail-closed as
-/// "minted in a different session".
-pub(crate) fn attached_request_blocking(
-    binding: &AttachedRequestBinding,
-    req: Request,
-) -> Result<Response, String> {
-    let runtime =
-        tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
-    tokio::task::block_in_place(|| runtime.block_on(async { binding.request(req).await }))
-}
-
 /// Reveal a leak secret over the sensitive local channel (in-process handoff or
 /// the Unix peer-authenticated reveal socket, chosen off the control socket).
 /// Returns the revealed `Zeroizing` plaintext **directly** to the caller — it
 /// never rides an `AsyncActionPayload` or any ordinary daemon codec.
-pub fn daemon_reveal_leak_blocking(
+pub(crate) fn daemon_reveal_leak_blocking(
     control_socket: &Path,
-    capability: &str,
+    capability: &proto::LeakRevealToken,
 ) -> Result<
     cockpit_core::daemon::leak_reveal::RevealedLeakSecret,
     cockpit_core::daemon::leak_reveal::LeakRevealDenied,
@@ -3075,10 +3088,9 @@ pub fn daemon_reveal_leak_blocking(
         }
     };
     let socket = control_socket.to_path_buf();
-    let capability = capability.to_owned();
     tokio::task::block_in_place(|| {
-        runtime.block_on(async move {
-            cockpit_core::daemon::leak_reveal::reveal_leak_secret(&socket, &capability).await
+        runtime.block_on(async {
+            cockpit_core::daemon::leak_reveal::reveal_leak_secret(&socket, capability).await
         })
     })
 }
@@ -3269,7 +3281,7 @@ pub fn read_subagent_history_page_blocking(
     }
 }
 
-pub fn resource_snapshot_blocking() -> Result<proto::Response, String> {
+pub(crate) fn resource_snapshot_blocking() -> Result<proto::Response, String> {
     match daemon_request_blocking(Request::ResourceSnapshot)? {
         response @ Response::ResourceSnapshot { .. } => Ok(response),
         other => Err(format!("unexpected resource_snapshot response: {other:?}")),
@@ -6132,6 +6144,7 @@ mod tests {
             project_id: "project".to_string(),
             usage: UsageCounts::default(),
             owns_daemon: false,
+            owned_daemon_guard: None,
             socket: PathBuf::from("/tmp/cockpit-test.sock"),
             history: Vec::new(),
             paused_work: Vec::new(),
@@ -6599,6 +6612,11 @@ mod tests {
             event: proto::image_control::ImageControlEventV1::config_changed(
                 "daemon".into(),
                 "project".into(),
+                "/canonical/project".into(),
+                "/canonical/project/config.json".into(),
+                "revision".into(),
+                proto::image_control::ImageConfigMutationCapabilityV1::new("cc".repeat(32)),
+                1,
                 proto::image_control::ImageConfigChangeSetSafeV1::new("1".into(), vec![]),
             ),
         };

@@ -202,6 +202,7 @@ impl App {
     pub(super) fn handle_tools_outcome(&mut self, outcome: crate::tui::tools_pane::ToolsOutcome) {
         match outcome {
             crate::tui::tools_pane::ToolsOutcome::Close => {}
+            crate::tui::tools_pane::ToolsOutcome::Pending => {}
             crate::tui::tools_pane::ToolsOutcome::Apply {
                 override_json,
                 persist_session,
@@ -233,6 +234,7 @@ impl App {
     ) {
         match outcome {
             crate::tui::goal_settings_pane::GoalSettingsOutcome::Close => {}
+            crate::tui::goal_settings_pane::GoalSettingsOutcome::Pending => {}
             crate::tui::goal_settings_pane::GoalSettingsOutcome::Apply {
                 override_json,
                 persist_session,
@@ -460,6 +462,19 @@ impl App {
             self.show_model_selection_error(&active, trigger, message);
             return false;
         }
+        if self.pending_runner_attach.as_ref().is_some_and(|pending| {
+            pending.continuations.iter().any(|continuation| {
+                matches!(continuation, RunnerAttachContinuation::SelectModel { .. })
+            })
+        }) {
+            self.show_model_selection_error(
+                &active,
+                trigger,
+                "A model selection is waiting for the daemon connection; wait for it to finish."
+                    .to_string(),
+            );
+            return false;
+        }
         if let Some(retry) = self.current_model_selection_retry()
             && retry.requested != active
             && !matches!(
@@ -474,21 +489,16 @@ impl App {
             return false;
         }
         if !matches!(self.agent_runner.as_ref(), Some(Ok(_))) {
-            let runner = agent_runner::try_spawn_with_model(
-                &self.launch.cwd,
-                self.launch.session_id,
-                active.clone(),
-                self.no_sandbox,
-                self.lifecycle_mode(),
+            self.start_runner_attach(
+                true,
+                RunnerAttachContinuation::SelectModel {
+                    label: label.to_string(),
+                    active,
+                    persist_as_default,
+                    trigger,
+                },
             );
-            match runner {
-                Ok(runner) => self.adopt_runner(Ok(runner)),
-                Err(error) => {
-                    let message = format!("{label}: could not start a session — {error}");
-                    self.show_model_selection_error(&active, trigger, message);
-                    return false;
-                }
-            }
+            return true;
         }
         let selection_id = uuid::Uuid::new_v4();
         let Ok(sequence) = self.submission_order.enqueue(

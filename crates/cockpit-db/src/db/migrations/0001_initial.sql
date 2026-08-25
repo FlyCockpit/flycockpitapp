@@ -23,6 +23,9 @@ CREATE TABLE assistants (
         json_valid(config_json) AND json_type(config_json) = 'object'
         AND length(CAST(config_json AS BLOB)) <= 1048576
     ),
+    -- Historical column name retained inside the prerelease squash; values
+    -- are HMAC-SHA-256 identities under the installation vault DEK, never
+    -- unkeyed definition digests.
     content_hash TEXT    NOT NULL CHECK (
         length(content_hash) = 64
         AND content_hash = lower(content_hash)
@@ -6250,30 +6253,411 @@ CREATE TABLE secret_vault_sagas (
 -- private bytes are staged in secret_vault_items in the same transaction.
 CREATE TABLE provider_config_journals (
     journal_id       TEXT PRIMARY KEY,
+    owner_digest     TEXT,
+    client_operation_id TEXT,
+    request_hash     BLOB CHECK (request_hash IS NULL OR (typeof(request_hash) = 'blob' AND length(request_hash) = 32)),
+    fencing_generation INTEGER CHECK (fencing_generation IS NULL OR fencing_generation > 0),
+    terminal_response_json TEXT CHECK (terminal_response_json IS NULL OR json_valid(terminal_response_json)),
     project_root     TEXT NOT NULL,
     provider_id      TEXT NOT NULL,
-    action           TEXT NOT NULL CHECK (action IN ('save', 'delete')),
+    action           TEXT NOT NULL CHECK (action IN ('save', 'delete', 'batch')),
     entry_json       TEXT,
-    cleanup_named_json TEXT NOT NULL,
-    cleanup_credential_json TEXT NOT NULL,
-    created_at       INTEGER NOT NULL
+    cleanup_named_json TEXT NOT NULL
+        CHECK (json_valid(cleanup_named_json) AND json_type(cleanup_named_json) = 'array'),
+    cleanup_credential_json TEXT NOT NULL
+        CHECK (json_valid(cleanup_credential_json) AND json_type(cleanup_credential_json) = 'array'),
+    created_at       INTEGER NOT NULL,
+    CHECK (length(trim(journal_id)) > 0),
+    CHECK (length(trim(project_root)) > 0),
+    CHECK ((owner_digest IS NOT NULL) = (client_operation_id IS NOT NULL)
+       AND (owner_digest IS NOT NULL) = (request_hash IS NOT NULL)
+       AND (owner_digest IS NOT NULL) = (fencing_generation IS NOT NULL)
+       AND (owner_digest IS NOT NULL) = (terminal_response_json IS NOT NULL)),
+    CHECK (
+        (action = 'save' AND provider_id <> '__provider_batch__'
+            AND entry_json IS NOT NULL AND json_valid(entry_json))
+        OR (action = 'delete' AND provider_id <> '__provider_batch__'
+            AND entry_json IS NULL)
+        OR (action = 'batch' AND provider_id = '__provider_batch__'
+            AND entry_json IS NOT NULL AND json_valid(entry_json)
+            AND json_type(entry_json) = 'object')
+    )
 );
 CREATE INDEX provider_config_journals_scope
 ON provider_config_journals(project_root, provider_id, created_at);
+CREATE UNIQUE INDEX provider_config_journals_operation
+ON provider_config_journals(owner_digest, client_operation_id);
 
 -- Recoverable bridge between the owner vault and the MCP configuration file.
 -- `config_json` is reference-only; private bytes remain in vault rows.
 CREATE TABLE mcp_config_journals (
     journal_id        TEXT PRIMARY KEY,
+    owner_digest      TEXT NOT NULL,
+    client_operation_id TEXT NOT NULL,
+    request_hash      BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
+    fencing_generation INTEGER NOT NULL CHECK (fencing_generation > 0),
+    terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
     project_root      TEXT NOT NULL,
     config_path       TEXT NOT NULL,
     config_json       TEXT NOT NULL,
+    consumed_revision TEXT NOT NULL CHECK (length(consumed_revision) = 64),
+    intended_revision TEXT NOT NULL CHECK (length(intended_revision) = 64),
     cleanup_names_json TEXT NOT NULL,
     phase             TEXT NOT NULL CHECK (phase IN ('staged', 'published')),
     created_at        INTEGER NOT NULL
 );
 CREATE INDEX mcp_config_journals_scope
 ON mcp_config_journals(project_root, created_at);
+CREATE UNIQUE INDEX mcp_config_journals_operation
+ON mcp_config_journals(owner_digest, client_operation_id);
+
+-- Owner-scoped durable settlement ledger for local daemon mutations. Request
+-- bodies and secret material never enter this table: `request_hash` binds the
+-- authenticated owner/idempotency key to the exact request, while the terminal
+-- response is a deliberately secret-free protocol receipt. A prepared row is
+-- retained across restart so clients never receive permission to blindly
+-- repeat an operation whose response was lost.
+CREATE TABLE local_operation_receipts (
+    owner_digest        TEXT NOT NULL,
+    client_operation_id TEXT NOT NULL,
+    operation_kind      TEXT NOT NULL,
+    request_hash        BLOB NOT NULL
+        CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
+    state               TEXT NOT NULL CHECK (state IN (
+        'prepared', 'executing', 'terminal_success', 'terminal_error', 'terminal_cancelled'
+    )),
+    fencing_generation  INTEGER NOT NULL CHECK (fencing_generation > 0),
+    execution_started_at_unix_ms INTEGER,
+    execution_expires_at_unix_ms INTEGER,
+    terminal_outcome_json TEXT
+        CHECK (terminal_outcome_json IS NULL OR json_valid(terminal_outcome_json)),
+    created_at_unix_ms  INTEGER NOT NULL,
+    updated_at_unix_ms  INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    CHECK (length(trim(owner_digest)) > 0),
+    CHECK (length(trim(client_operation_id)) > 0),
+    CHECK (length(trim(operation_kind)) > 0),
+    CHECK ((state LIKE 'terminal_%') = (terminal_outcome_json IS NOT NULL)),
+    CHECK ((state = 'executing') = (execution_expires_at_unix_ms IS NOT NULL)),
+    CHECK (execution_started_at_unix_ms IS NULL OR execution_started_at_unix_ms >= created_at_unix_ms),
+    CHECK (execution_expires_at_unix_ms IS NULL OR execution_expires_at_unix_ms >= execution_started_at_unix_ms),
+    CHECK (updated_at_unix_ms >= created_at_unix_ms)
+);
+CREATE INDEX local_operation_receipts_unsettled
+ON local_operation_receipts(updated_at_unix_ms)
+WHERE state IN ('prepared', 'executing');
+CREATE INDEX local_operation_receipts_terminal_retention
+ON local_operation_receipts(updated_at_unix_ms)
+WHERE state LIKE 'terminal_%';
+CREATE TRIGGER local_operation_receipts_identity_immutable
+BEFORE UPDATE ON local_operation_receipts
+WHEN NEW.owner_digest <> OLD.owner_digest
+  OR NEW.client_operation_id <> OLD.client_operation_id
+  OR NEW.operation_kind <> OLD.operation_kind
+  OR NEW.request_hash <> OLD.request_hash
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'local operation identity is immutable');
+END;
+CREATE TRIGGER local_operation_receipts_terminal_is_final
+BEFORE UPDATE ON local_operation_receipts
+WHEN OLD.state LIKE 'terminal_%'
+BEGIN
+    SELECT RAISE(ABORT, 'local operation terminal receipt is final');
+END;
+
+-- Hash-only recovery bridge for the global assistant registry mutations used
+-- by the daemon-connected TUI and CLI. Definition markdown is deliberately
+-- absent: the existing no-follow filesystem journal owns byte recovery, while
+-- this row binds its resulting projection to the authenticated local receipt.
+CREATE TABLE assistant_mutation_journals (
+    owner_digest          TEXT NOT NULL,
+    client_operation_id   TEXT NOT NULL,
+    request_hash          BLOB NOT NULL CHECK (
+        typeof(request_hash) = 'blob' AND length(request_hash) = 32
+    ),
+    fencing_generation    INTEGER NOT NULL CHECK (fencing_generation > 0),
+    mutation_intent_hash  TEXT NOT NULL CHECK (
+        length(mutation_intent_hash) = 64
+        AND mutation_intent_hash = lower(mutation_intent_hash)
+    ),
+    requested_project_root TEXT NOT NULL,
+    project_root          TEXT NOT NULL,
+    assistant_name        TEXT NOT NULL,
+    action                TEXT NOT NULL CHECK (action IN ('save', 'delete')),
+    consumed_revision     TEXT NOT NULL,
+    intended_content_identity BLOB CHECK (
+        intended_content_identity IS NULL OR (
+            typeof(intended_content_identity) = 'blob'
+            AND length(intended_content_identity) = 32
+        )
+    ),
+    consumed_config_generation INTEGER NOT NULL CHECK (consumed_config_generation >= 0),
+    created_at_unix_ms    INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    FOREIGN KEY (owner_digest, client_operation_id)
+        REFERENCES local_operation_receipts(owner_digest, client_operation_id)
+        ON UPDATE RESTRICT ON DELETE CASCADE,
+    CHECK (length(trim(owner_digest)) > 0),
+    CHECK (length(trim(client_operation_id)) > 0),
+    CHECK (length(trim(requested_project_root)) > 0),
+    CHECK (length(trim(project_root)) > 0),
+    CHECK (length(trim(assistant_name)) > 0),
+    CHECK (length(trim(consumed_revision)) > 0),
+    CHECK ((action = 'save') = (intended_content_identity IS NOT NULL))
+);
+CREATE INDEX assistant_mutation_journals_created
+ON assistant_mutation_journals(created_at_unix_ms);
+CREATE TRIGGER assistant_mutation_journals_identity_immutable
+BEFORE UPDATE ON assistant_mutation_journals
+WHEN NEW.owner_digest <> OLD.owner_digest
+  OR NEW.client_operation_id <> OLD.client_operation_id
+  OR NEW.request_hash <> OLD.request_hash
+  OR NEW.fencing_generation <> OLD.fencing_generation
+  OR NEW.mutation_intent_hash <> OLD.mutation_intent_hash
+  OR NEW.requested_project_root <> OLD.requested_project_root
+  OR NEW.project_root <> OLD.project_root
+  OR NEW.assistant_name <> OLD.assistant_name
+  OR NEW.action <> OLD.action
+  OR NEW.consumed_revision <> OLD.consumed_revision
+  OR NEW.intended_content_identity IS NOT OLD.intended_content_identity
+  OR NEW.consumed_config_generation <> OLD.consumed_config_generation
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'assistant mutation journal identity is immutable');
+END;
+
+-- Hash-only recovery bridge for daemon-owned agent definition mutations.
+-- Agent markdown never enters SQLite.  The journal is inserted before the
+-- authoritative atomic file publication and binds the owner receipt fence to
+-- the consumed and intended filesystem projections.  Boot reconciliation can
+-- therefore prove a commit after a lost response without replaying a stale
+-- create/save/delete/reset against a different document revision.
+CREATE TABLE agent_mutation_journals (
+    owner_digest          TEXT NOT NULL,
+    client_operation_id   TEXT NOT NULL,
+    request_hash          BLOB NOT NULL CHECK (
+        typeof(request_hash) = 'blob' AND length(request_hash) = 32
+    ),
+    keyed_request_identity BLOB NOT NULL CHECK (
+        typeof(keyed_request_identity) = 'blob' AND length(keyed_request_identity) = 32
+    ),
+    fencing_generation    INTEGER NOT NULL CHECK (fencing_generation > 0),
+    project_root          TEXT NOT NULL,
+    request_project_root  TEXT NOT NULL,
+    agent_name            TEXT,
+    action                TEXT NOT NULL CHECK (action IN (
+        'eject_builtin', 'save_definition', 'create_definition',
+        'delete_custom', 'reset_builtin', 'reset_all_builtins',
+        'save_goal_supervision'
+    )),
+    consumed_revision     TEXT,
+    affected_hint         INTEGER NOT NULL CHECK (affected_hint >= 0),
+    changed_hint          INTEGER NOT NULL CHECK (changed_hint IN (0, 1)),
+    consumed_config_generation INTEGER NOT NULL CHECK (consumed_config_generation >= 0),
+    mutation_intent_hash  TEXT NOT NULL CHECK (
+        length(mutation_intent_hash) = 64
+        AND mutation_intent_hash = lower(mutation_intent_hash)
+    ),
+    consumed_projection_identity TEXT NOT NULL CHECK (
+        length(consumed_projection_identity) = 64
+        AND consumed_projection_identity = lower(consumed_projection_identity)
+    ),
+    intended_projection_identity TEXT NOT NULL CHECK (
+        length(intended_projection_identity) = 64
+        AND intended_projection_identity = lower(intended_projection_identity)
+    ),
+    terminal_response_json TEXT CHECK (
+        terminal_response_json IS NULL OR json_valid(terminal_response_json)
+    ),
+    created_at_unix_ms    INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    CHECK (length(trim(owner_digest)) > 0),
+    CHECK (length(trim(client_operation_id)) > 0),
+    CHECK (length(trim(project_root)) > 0),
+    CHECK (length(trim(request_project_root)) > 0),
+    CHECK ((action = 'reset_all_builtins') = (agent_name IS NULL)),
+    CHECK (agent_name IS NULL OR length(trim(agent_name)) > 0),
+    CHECK (consumed_revision IS NULL OR length(trim(consumed_revision)) > 0)
+);
+CREATE INDEX agent_mutation_journals_created
+ON agent_mutation_journals(created_at_unix_ms);
+CREATE TRIGGER agent_mutation_journals_identity_immutable
+BEFORE UPDATE ON agent_mutation_journals
+WHEN NEW.owner_digest <> OLD.owner_digest
+  OR NEW.client_operation_id <> OLD.client_operation_id
+  OR NEW.request_hash <> OLD.request_hash
+  OR NEW.keyed_request_identity <> OLD.keyed_request_identity
+  OR NEW.fencing_generation <> OLD.fencing_generation
+  OR NEW.project_root <> OLD.project_root
+  OR NEW.request_project_root <> OLD.request_project_root
+  OR NEW.agent_name IS NOT OLD.agent_name
+  OR NEW.action <> OLD.action
+  OR NEW.consumed_revision IS NOT OLD.consumed_revision
+  OR NEW.affected_hint <> OLD.affected_hint
+  OR NEW.changed_hint <> OLD.changed_hint
+  OR NEW.consumed_config_generation <> OLD.consumed_config_generation
+  OR NEW.mutation_intent_hash <> OLD.mutation_intent_hash
+  OR NEW.consumed_projection_identity <> OLD.consumed_projection_identity
+  OR NEW.intended_projection_identity <> OLD.intended_projection_identity
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'agent mutation journal identity is immutable');
+END;
+
+-- External editor leases are durable authority, not frontend/UI state. The
+-- markdown submitted at completion is represented only by an installation-
+-- and vault-keyed identity; a retry must supply the same bytes. An open lease
+-- references an owner-bound AEAD payload in the secret vault by opaque handle;
+-- plaintext edit snapshots never enter this table. Terminal rows retain only
+-- target/revision metadata, the completion identity, and a secret-free
+-- result/error receipt until bounded retention removes them. Reservation
+-- atomically replaces the edit snapshot with an owner-bound sealed completion
+-- payload so daemon and client crashes cannot strand an unverifiable write.
+CREATE TABLE agent_editor_leases (
+    owner_digest        TEXT NOT NULL,
+    client_operation_id TEXT NOT NULL,
+    lease_id            TEXT NOT NULL UNIQUE,
+    project_root        TEXT NOT NULL,
+    agent_name          TEXT NOT NULL,
+    consumed_revision   TEXT NOT NULL,
+    snapshot_handle     TEXT,
+    snapshot_identity   BLOB NOT NULL CHECK (
+        typeof(snapshot_identity) = 'blob' AND length(snapshot_identity) = 32
+    ),
+    state               TEXT NOT NULL CHECK (state IN ('open', 'completing', 'terminal')),
+    completion_identity BLOB CHECK (
+        completion_identity IS NULL OR
+        (typeof(completion_identity) = 'blob' AND length(completion_identity) = 32)
+    ),
+    completion_handle TEXT,
+    completion_operation_id TEXT,
+    publication_result_revision TEXT CHECK (
+        publication_result_revision IS NULL OR length(trim(publication_result_revision)) > 0
+    ),
+    terminal_result_json TEXT CHECK (
+        terminal_result_json IS NULL OR json_valid(terminal_result_json)
+    ),
+    terminal_error_json TEXT CHECK (
+        terminal_error_json IS NULL OR json_valid(terminal_error_json)
+    ),
+    expires_at_unix_ms  INTEGER NOT NULL,
+    created_at_unix_ms  INTEGER NOT NULL,
+    updated_at_unix_ms  INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    CHECK (length(trim(owner_digest)) > 0),
+    CHECK (length(trim(client_operation_id)) > 0),
+    CHECK (length(trim(project_root)) > 0),
+    CHECK (length(trim(agent_name)) > 0),
+    CHECK (length(trim(consumed_revision)) > 0),
+    CHECK (snapshot_handle IS NULL OR length(trim(snapshot_handle)) > 0),
+    CHECK (completion_handle IS NULL OR length(trim(completion_handle)) > 0),
+    CHECK (completion_operation_id IS NULL OR length(trim(completion_operation_id)) > 0),
+    CHECK ((state = 'open') = (completion_operation_id IS NULL)),
+    CHECK ((state = 'open') = (completion_identity IS NULL)),
+    CHECK ((state = 'completing') = (completion_handle IS NOT NULL)),
+    CHECK (publication_result_revision IS NULL OR state IN ('completing', 'terminal')),
+    CHECK ((state = 'terminal') = ((terminal_result_json IS NOT NULL) OR (terminal_error_json IS NOT NULL))),
+    CHECK (terminal_result_json IS NULL OR terminal_error_json IS NULL),
+    CHECK ((state = 'open') = (snapshot_handle IS NOT NULL)),
+    CHECK (updated_at_unix_ms >= created_at_unix_ms)
+);
+CREATE INDEX agent_editor_leases_open
+ON agent_editor_leases(expires_at_unix_ms)
+WHERE state <> 'terminal';
+CREATE INDEX agent_editor_leases_terminal_retention
+ON agent_editor_leases(updated_at_unix_ms)
+WHERE state = 'terminal';
+CREATE TRIGGER agent_editor_leases_identity_immutable
+BEFORE UPDATE ON agent_editor_leases
+WHEN NEW.owner_digest <> OLD.owner_digest
+  OR NEW.client_operation_id <> OLD.client_operation_id
+  OR NEW.lease_id <> OLD.lease_id
+  OR NEW.project_root <> OLD.project_root
+  OR NEW.agent_name <> OLD.agent_name
+  OR NEW.consumed_revision <> OLD.consumed_revision
+  OR NEW.snapshot_identity <> OLD.snapshot_identity
+  OR (OLD.completion_operation_id IS NOT NULL AND NEW.completion_operation_id IS NOT OLD.completion_operation_id)
+  OR (OLD.completion_handle IS NOT NULL AND NEW.completion_handle IS NOT OLD.completion_handle AND NEW.state <> 'terminal')
+  OR (OLD.publication_result_revision IS NOT NULL AND NEW.publication_result_revision IS NOT OLD.publication_result_revision)
+  OR (NEW.snapshot_handle IS NOT OLD.snapshot_handle AND NEW.state NOT IN ('completing', 'terminal'))
+  OR NEW.expires_at_unix_ms <> OLD.expires_at_unix_ms
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'agent editor lease identity is immutable');
+END;
+CREATE TRIGGER agent_editor_leases_terminal_is_final
+BEFORE UPDATE ON agent_editor_leases
+WHEN OLD.state = 'terminal'
+BEGIN
+    SELECT RAISE(ABORT, 'agent editor terminal receipt is final');
+END;
+
+-- Secret-safe recovery intent for typed extended-config publication. Raw
+-- merged configuration (which may contain unknown secret-bearing keys) never
+-- enters SQLite: recovery compares only authoritative file hashes and replays
+-- the already-redacted terminal response.
+CREATE TABLE extended_config_patch_journals (
+    owner_digest          TEXT NOT NULL,
+    client_operation_id   TEXT NOT NULL,
+    request_hash          BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
+    fencing_generation    INTEGER NOT NULL CHECK (fencing_generation > 0),
+    project_root          TEXT NOT NULL,
+    target_path           TEXT NOT NULL,
+    consumed_content_hash TEXT NOT NULL CHECK (length(consumed_content_hash) = 64 AND consumed_content_hash = lower(consumed_content_hash)),
+    intended_content_hash TEXT NOT NULL CHECK (length(intended_content_hash) = 64 AND intended_content_hash = lower(intended_content_hash)),
+    terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
+    created_at_unix_ms    INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    CHECK (length(trim(project_root)) > 0),
+    CHECK (length(trim(target_path)) > 0)
+);
+CREATE INDEX extended_config_patch_journals_created
+ON extended_config_patch_journals(created_at_unix_ms);
+
+-- Secret-safe recovery intent for the dedicated image-generation registry
+-- writer. The registry can contain credential references, headers, signed
+-- evidence URLs, and opaque workflow graphs, so SQLite retains hashes and the
+-- redacted terminal receipt only; raw intended configuration stays solely in
+-- the atomically-published config document.
+CREATE TABLE image_config_mutation_journals (
+    owner_digest           TEXT NOT NULL,
+    client_operation_id    TEXT NOT NULL,
+    request_hash           BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
+    fencing_generation     INTEGER NOT NULL CHECK (fencing_generation > 0),
+    mutation_intent_hash   TEXT NOT NULL CHECK (length(mutation_intent_hash) = 64 AND mutation_intent_hash = lower(mutation_intent_hash)),
+    project_root           TEXT NOT NULL,
+    target_path            TEXT NOT NULL,
+    consumed_revision      TEXT NOT NULL CHECK (length(consumed_revision) = 64 AND consumed_revision = lower(consumed_revision)),
+    intended_revision      TEXT NOT NULL CHECK (length(intended_revision) = 64 AND intended_revision = lower(intended_revision)),
+    consumed_generation    INTEGER NOT NULL CHECK (consumed_generation >= 0),
+    terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
+    created_at_unix_ms     INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    FOREIGN KEY (owner_digest, client_operation_id)
+        REFERENCES local_operation_receipts(owner_digest, client_operation_id)
+        ON DELETE CASCADE,
+    CHECK (length(trim(project_root)) > 0),
+    CHECK (length(trim(target_path)) > 0)
+);
+CREATE INDEX image_config_mutation_journals_created
+ON image_config_mutation_journals(created_at_unix_ms);
+CREATE TRIGGER image_config_mutation_journals_identity_immutable
+BEFORE UPDATE ON image_config_mutation_journals
+WHEN NEW.owner_digest <> OLD.owner_digest
+  OR NEW.client_operation_id <> OLD.client_operation_id
+  OR NEW.request_hash <> OLD.request_hash
+  OR NEW.fencing_generation <> OLD.fencing_generation
+  OR NEW.mutation_intent_hash <> OLD.mutation_intent_hash
+  OR NEW.project_root <> OLD.project_root
+  OR NEW.target_path <> OLD.target_path
+  OR NEW.consumed_revision <> OLD.consumed_revision
+  OR NEW.intended_revision <> OLD.intended_revision
+  OR NEW.consumed_generation <> OLD.consumed_generation
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'image config mutation journal is immutable');
+END;
 
 -- Durable ownership claims for daemon-generated provider/MCP named secrets.
 -- Claims survive journal retirement so cleanup decisions do not depend on a

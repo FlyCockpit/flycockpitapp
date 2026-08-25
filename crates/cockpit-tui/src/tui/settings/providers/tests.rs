@@ -99,8 +99,9 @@ fn seed_oauth_credential_via_daemon(credential_ref: &str) {
         let response = client
             .request(
                 cockpit_core::daemon::proto::Request::PutProviderCredential {
+                    client_operation_id: "oauth-seed".into(),
                     provider_id: credential_ref,
-                    record: r#"{"api_key":"test-oauth-token"}"#.to_string(),
+                    record: r#"{"api_key":"test-oauth-token"}"#.to_string().into(),
                 },
             )
             .await
@@ -1926,6 +1927,7 @@ fn pointer_grok_oauth_sources_render_and_dispatch_from_fresh_state() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Grok,
             op: OAuthFlowOp::Acknowledge,
+            ..
         })
     ));
     acknowledge.apply_oauth_acknowledgement(Ok(()));
@@ -2998,6 +3000,7 @@ fn pointer_add_codex_login_renders_and_dispatches_from_fresh_state() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Codex,
             op: OAuthFlowOp::Begin,
+            ..
         })
     ));
     assert!(matches!(
@@ -3165,6 +3168,7 @@ fn pointer_add_grok_acknowledge_renders_and_dispatches_from_fresh_state() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Grok,
             op: OAuthFlowOp::Acknowledge,
+            ..
         })
     ));
     fresh.apply_oauth_acknowledgement(Ok(()));
@@ -3235,6 +3239,7 @@ fn pointer_add_codex_acknowledge_renders_and_dispatches_from_fresh_state() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Codex,
             op: OAuthFlowOp::Acknowledge,
+            ..
         })
     ));
     fresh.apply_oauth_acknowledgement(Ok(()));
@@ -5322,12 +5327,17 @@ fn provider_delete_removes_grok_oauth_provider_via_daemon() {
         })
     });
     let seeded = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(client.request(
-            cockpit_core::daemon::proto::Request::PutProviderCredential {
-                provider_id: provider_id.to_string(),
-                record: json!({"access_token": "opaque-fixture-token"}).to_string(),
-            },
-        ))
+        tokio::runtime::Handle::current().block_on(
+            client.request(
+                cockpit_core::daemon::proto::Request::PutProviderCredential {
+                    client_operation_id: "provider-delete-seed".into(),
+                    provider_id: provider_id.to_string(),
+                    record: json!({"access_token": "opaque-fixture-token"})
+                        .to_string()
+                        .into(),
+                },
+            ),
+        )
     })
     .expect("provider credential seed transport")
     .expect("provider credential seed response");
@@ -6164,6 +6174,7 @@ fn subscription_oauth_acknowledgement_blocks_login_until_chosen() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Codex,
             op: OAuthFlowOp::Acknowledge,
+            ..
         })
     ));
     state.apply_acknowledgement(Ok(()));
@@ -6220,6 +6231,7 @@ fn oauth_grok_manual_paste_starts_session_then_focuses_input() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Grok,
             op: OAuthFlowOp::Begin,
+            ..
         })
     ));
     assert!(state.pending);
@@ -6317,6 +6329,7 @@ fn codex_apply_begin_queues_poll_and_uses_injected_effects() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Codex,
             op: OAuthFlowOp::Poll { .. },
+            ..
         })
     ));
     assert_eq!(
@@ -6563,6 +6576,7 @@ fn oauth_grok_login_option_still_begins() {
         Some(OAuthFlowRequest {
             provider: OAuthProvider::Grok,
             op: OAuthFlowOp::Begin,
+            ..
         })
     ));
     assert!(state.pending);
@@ -7307,17 +7321,17 @@ pub(crate) fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
         )
     );
     click_rendered_provider_action(&mut dialog, &action);
-    assert_eq!(
-        oauth_effects_log(),
-        vec!["copy:https://example.test/oauth".to_string()]
+    assert!(
+        oauth_effects_log().is_empty(),
+        "pointer reducer must not touch host clipboard"
     );
     assert!(matches!(
-        dialog.test_page(),
-        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
-            if state.flow_id == visible_flow_id
-                && state.status.as_ref().is_some_and(|status| {
-                    status.as_ref().is_ok_and(|message| message.contains("copied OAuth URL"))
-                })
+        dialog.cx.pending_oauth_action.take(),
+        Some(OAuthFlowRequest {
+            client_flow_id,
+            op: OAuthFlowOp::Present { user_code: None, open_browser: false, advance_flow: false, .. },
+            ..
+        }) if client_flow_id == visible_flow_id
     ));
     drop(tmp);
 
@@ -7345,20 +7359,17 @@ pub(crate) fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
         )
     );
     click_rendered_provider_action(&mut dialog, &action);
-    assert_eq!(
-        oauth_effects_log(),
-        vec![
-            "copy:CODE-123".to_string(),
-            "open:https://example.test/device".to_string(),
-        ]
+    assert!(
+        oauth_effects_log().is_empty(),
+        "pointer reducer must not open browser or copy"
     );
     assert!(matches!(
-        dialog.test_page(),
-        TestPageRef::Providers(ProvidersPage::OAuthSetup { state, .. })
-            if state.flow_id == visible_flow_id
-                && state.status.as_ref().is_some_and(|status| status.as_deref() == Ok(
-                    "copied device code (unverified — also reachable via the Open link above)"
-                ))
+        dialog.cx.pending_oauth_action.take(),
+        Some(OAuthFlowRequest {
+            client_flow_id,
+            op: OAuthFlowOp::Present { user_code: Some(code), open_browser: true, advance_flow: false, .. },
+            ..
+        }) if client_flow_id == visible_flow_id && code == "CODE-123"
     ));
     drop(tmp);
 
@@ -7386,4 +7397,81 @@ pub(crate) fn oauth_copy_completion_is_flow_scoped_and_exactly_once() {
         Err("wrong flow".into()),
     );
     assert_eq!(state.status.as_ref().unwrap().as_deref(), Ok("copied"));
+}
+
+#[test]
+fn pending_oauth_accepts_only_correlated_cancel_and_unlocks_on_terminal_result() {
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Codex);
+    let begin = handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::AddWizard)
+        .action
+        .expect("login starts a correlated begin");
+    assert!(state.polling);
+
+    for key in [
+        KeyCode::Enter,
+        KeyCode::Char('s'),
+        KeyCode::Char('c'),
+        KeyCode::Down,
+    ] {
+        let blocked = handle_oauth_flow_key(press(key), &mut state, OAuthHost::AddWizard);
+        assert!(
+            blocked.action.is_none(),
+            "pending OAuth must reject {key:?}"
+        );
+        assert_eq!(blocked.nav, OAuthNav::Stay);
+    }
+
+    let cancel = handle_oauth_flow_key(press(KeyCode::Esc), &mut state, OAuthHost::AddWizard)
+        .action
+        .expect("escape emits a correlated cancellation");
+    assert_eq!(cancel.client_flow_id, begin.client_flow_id);
+    assert_ne!(cancel.operation_id, begin.operation_id);
+    assert!(matches!(cancel.op, OAuthFlowOp::Cancel { flow_id: None }));
+    assert!(
+        state.polling,
+        "the surface remains locked until cancellation settles"
+    );
+    assert!(state.accepts_result(cancel.client_flow_id, cancel.operation_id));
+    state.apply_cancel(Ok(true));
+    assert!(!state.polling);
+    assert!(!state.pending);
+}
+
+#[test]
+fn oauth_authoritative_cancel_failure_retains_live_session_and_navigation_gate() {
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
+    let _ = handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::Standalone);
+    let _ = handle_oauth_flow_key(press(KeyCode::Esc), &mut state, OAuthHost::Standalone);
+    state.apply_cancel_authoritative_failure("rejected".into());
+    assert!(!state.polling);
+    assert!(state.pending);
+    assert!(state.status.as_ref().is_some_and(|status| status.is_err()));
+}
+
+#[test]
+fn oauth_action_completion_rejects_wrong_flow_and_superseded_operation() {
+    let mut state = OAuthFlowState::new_without_acknowledgement_for_test(OAuthProvider::Grok);
+    let first = handle_oauth_flow_key(press(KeyCode::Enter), &mut state, OAuthHost::Standalone)
+        .action
+        .expect("begin action");
+    let cancel = handle_oauth_flow_key(press(KeyCode::Esc), &mut state, OAuthHost::Standalone)
+        .action
+        .expect("cancel action");
+    assert!(!state.accepts_result(first.client_flow_id, first.operation_id));
+    assert!(!state.accepts_result(
+        super::super::pointer_actions::OAuthFlowId(cancel.client_flow_id.0.saturating_add(1)),
+        cancel.operation_id,
+    ));
+    assert!(state.accepts_result(cancel.client_flow_id, cancel.operation_id));
+    assert!(!state.accepts_result(cancel.client_flow_id, cancel.operation_id));
+}
+
+#[test]
+fn oauth_false_completion_is_not_rendered_as_success() {
+    for provider in [OAuthProvider::Codex, OAuthProvider::Grok] {
+        let mut state = OAuthFlowState::new_without_acknowledgement_for_test(provider);
+        state.apply_complete(Ok(false));
+        assert!(!state.logged_in);
+        assert!(state.status.as_ref().is_some_and(|status| status.is_err()));
+    }
 }

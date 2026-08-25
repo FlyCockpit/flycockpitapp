@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 83,
-    "request": 221,
-    "response": 145
+    "request": 223,
+    "response": 149
   },
   "messages": {
     "event": [
@@ -1359,6 +1359,12 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
+        "tag": "get_local_operation_settlement"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
         "tag": "delete_provider_credential"
       },
       {
@@ -1414,6 +1420,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "complete_provider_oauth"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "cancel_provider_oauth"
       },
       {
         "class": "bounded_request_response",
@@ -2495,13 +2507,31 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "provider_credential_deleted"
+        "tag": "provider_credential_committed"
       },
       {
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "mcp_config_saved"
+        "tag": "subscription_ack_committed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "mcp_config_committed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "local_operation_settlement"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "copilot_auth_committed"
       },
       {
         "class": "bounded_request_response",
@@ -2562,6 +2592,12 @@
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
         "tag": "provider_oauth_completed"
+      },
+      {
+        "class": "bounded_request_response",
+        "inlinePayloadBound": "bounded",
+        "lane": "interactive",
+        "tag": "provider_oauth_cancelled"
       },
       {
         "class": "bounded_request_response",

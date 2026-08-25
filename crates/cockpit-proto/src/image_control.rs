@@ -23,6 +23,7 @@
 //! config generation, which advances on every config mutation.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use cockpit_config::config::image_generation::{
     ImageAdapterKind, ImageBillableUnit, ImageDimensionDescriptor, ImageEndpoint, ImageFormat,
@@ -33,6 +34,97 @@ use cockpit_config::config::image_generation::{
 
 /// The schema version for every image-control-plane V1 wire structure.
 pub const IMAGE_CONTROL_SCHEMA_VERSION: u8 = 1;
+
+/// Opaque daemon-issued authority for one exact image-config document state.
+///
+/// The daemon keys this value over the canonical project root, authoritative
+/// target path, target revision, and config generation. Clients must treat it
+/// as an indivisible bearer value and return it with the matching CAS fields.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ImageConfigMutationCapabilityV1(pub String);
+
+const IMAGE_MUTATION_CAPABILITY_HEX_BYTES: usize = 64;
+
+fn valid_mutation_capability(value: &str) -> bool {
+    value.len() == IMAGE_MUTATION_CAPABILITY_HEX_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+impl ImageConfigMutationCapabilityV1 {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ImageConfigMutationCapabilityV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ImageConfigMutationCapabilityV1([REDACTED])")
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageConfigMutationCapabilityV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CapabilityVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for CapabilityVisitor {
+            type Value = ImageConfigMutationCapabilityV1;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("exactly 64 lowercase hexadecimal characters")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if !valid_mutation_capability(value) {
+                    return Err(E::invalid_value(serde::de::Unexpected::Str(value), &self));
+                }
+                Ok(ImageConfigMutationCapabilityV1(value.to_owned()))
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(value)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if !valid_mutation_capability(&value) {
+                    return Err(E::invalid_value(serde::de::Unexpected::Str(&value), &self));
+                }
+                Ok(ImageConfigMutationCapabilityV1(value))
+            }
+        }
+
+        deserializer.deserialize_str(CapabilityVisitor)
+    }
+}
+
+#[cfg(feature = "remote")]
+impl crate::remote_operation_fcor::CanonicalFcorValueV1 for ImageConfigMutationCapabilityV1 {
+    fn encode_fcor_value_v1(
+        &self,
+        out: &mut crate::remote_operation_fcor::CanonicalParamsV1,
+    ) -> anyhow::Result<()> {
+        let digest = Sha256::digest(self.as_str().as_bytes());
+        out.push_bytes(digest.as_slice())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Endpoint
@@ -295,27 +387,45 @@ pub enum ImageControlReadResultV1 {
 
 /// The daemon reply for a LOCAL image-control read: the redacted result plus
 /// the daemon instance and project the snapshot was taken under. Mirrors the
-/// settled `ImageControlResponseV1 {schemaVersion,daemonInstanceId,projectId,
-/// result}` envelope for the read subset.
+/// settled authority envelope for the read subset. Requested and canonical
+/// roots remain distinct, and the mutation capability is bound to the exact
+/// target path/revision/generation returned alongside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageControlReadResponseV1 {
     pub schema_version: u8,
     pub daemon_instance_id: String,
-    pub project_id: String,
+    /// Caller-supplied project spelling retained for correlation/display.
+    pub requested_project_root: String,
+    /// Canonical workspace identity authenticated and used by the daemon.
+    pub canonical_project_root: String,
+    pub target_path: String,
+    pub target_revision: String,
+    pub mutation_capability: ImageConfigMutationCapabilityV1,
+    pub config_generation: u64,
     pub result: ImageControlReadResultV1,
 }
 
 impl ImageControlReadResponseV1 {
     pub fn new(
         daemon_instance_id: String,
-        project_id: String,
+        requested_project_root: String,
+        canonical_project_root: String,
+        target_path: String,
+        target_revision: String,
+        mutation_capability: ImageConfigMutationCapabilityV1,
+        config_generation: u64,
         result: ImageControlReadResultV1,
     ) -> Self {
         Self {
             schema_version: IMAGE_CONTROL_SCHEMA_VERSION,
             daemon_instance_id,
-            project_id,
+            requested_project_root,
+            canonical_project_root,
+            target_path,
+            target_revision,
+            mutation_capability,
+            config_generation,
             result,
         }
     }
@@ -378,6 +488,33 @@ pub struct ImageConfigChangeSetSafeV1 {
     pub changes: Vec<ImageConfigChangeV1>,
 }
 
+/// Canonical, secret-free identity of one image registry mutation. Clients and
+/// the daemon use the same typed projection so the public receipt hash cannot
+/// accidentally absorb endpoint credentials, headers, evidence URLs, or raw
+/// workflow graph bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageConfigMutationIntentV1 {
+    pub project_id: String,
+    pub expected_config_generation: u64,
+    pub expected_config_revision: String,
+    pub changes: Vec<ImageConfigChangeV1>,
+}
+
+impl ImageConfigMutationIntentV1 {
+    pub fn sha256(&self) -> Result<String, serde_json::Error> {
+        let encoded = serde_json::to_vec(&(
+            "image_config_mutation_v1",
+            &self.project_id,
+            self.expected_config_generation,
+            &self.expected_config_revision,
+            &self.changes,
+        ))?;
+        let digest = Sha256::digest(encoded);
+        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+}
+
 impl ImageConfigChangeSetSafeV1 {
     pub fn new(config_generation: String, changes: Vec<ImageConfigChangeV1>) -> Self {
         Self {
@@ -405,7 +542,12 @@ pub enum ImageControlEventKindV1 {
 pub struct ImageControlEventV1 {
     pub schema_version: u8,
     pub daemon_instance_id: String,
-    pub project_id: String,
+    pub requested_project_root: String,
+    pub canonical_project_root: String,
+    pub target_path: String,
+    pub result_revision: String,
+    pub mutation_capability: ImageConfigMutationCapabilityV1,
+    pub config_generation: u64,
     pub kind: ImageControlEventKindV1,
     pub change_set: ImageConfigChangeSetSafeV1,
 }
@@ -413,13 +555,23 @@ pub struct ImageControlEventV1 {
 impl ImageControlEventV1 {
     pub fn config_changed(
         daemon_instance_id: String,
-        project_id: String,
+        requested_project_root: String,
+        canonical_project_root: String,
+        target_path: String,
+        result_revision: String,
+        mutation_capability: ImageConfigMutationCapabilityV1,
+        config_generation: u64,
         change_set: ImageConfigChangeSetSafeV1,
     ) -> Self {
         Self {
             schema_version: IMAGE_CONTROL_SCHEMA_VERSION,
             daemon_instance_id,
-            project_id,
+            requested_project_root,
+            canonical_project_root,
+            target_path,
+            result_revision,
+            mutation_capability,
+            config_generation,
             kind: ImageControlEventKindV1::ConfigChanged,
             change_set,
         }
@@ -433,23 +585,54 @@ impl ImageControlEventV1 {
 #[serde(rename_all = "camelCase")]
 pub struct ImageControlMutationResponseV1 {
     pub schema_version: u8,
+    pub client_operation_id: String,
+    /// Hash of the public, redacted mutation intent. Secret-bearing endpoint
+    /// headers, credential references, and workflow graph bytes are excluded.
+    pub mutation_intent_hash: String,
     pub daemon_instance_id: String,
-    pub project_id: String,
-    pub config_generation: String,
+    pub requested_project_root: String,
+    pub canonical_project_root: String,
+    pub target_path: String,
+    pub consumed_revision: String,
+    pub result_revision: String,
+    pub consumed_config_generation: u64,
+    pub result_config_generation: u64,
+    pub mutation_capability: ImageConfigMutationCapabilityV1,
+    pub status: crate::ConfigCommitStatus,
+    pub publication: crate::ConfigPublicationStatus,
     pub change_set: ImageConfigChangeSetSafeV1,
 }
 
 impl ImageControlMutationResponseV1 {
     pub fn new(
+        client_operation_id: String,
+        mutation_intent_hash: String,
         daemon_instance_id: String,
-        project_id: String,
+        requested_project_root: String,
+        canonical_project_root: String,
+        target_path: String,
+        consumed_revision: String,
+        result_revision: String,
+        consumed_config_generation: u64,
+        result_config_generation: u64,
+        mutation_capability: ImageConfigMutationCapabilityV1,
         change_set: ImageConfigChangeSetSafeV1,
     ) -> Self {
         Self {
             schema_version: IMAGE_CONTROL_SCHEMA_VERSION,
+            client_operation_id,
+            mutation_intent_hash,
             daemon_instance_id,
-            project_id,
-            config_generation: change_set.config_generation.clone(),
+            requested_project_root,
+            canonical_project_root,
+            target_path,
+            consumed_revision,
+            result_revision,
+            consumed_config_generation,
+            result_config_generation,
+            mutation_capability,
+            status: crate::ConfigCommitStatus::Committed,
+            publication: crate::ConfigPublicationStatus::Published,
             change_set,
         }
     }

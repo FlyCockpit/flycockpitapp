@@ -253,7 +253,14 @@ pub(super) enum WizardControlId {
     EditText,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct OAuthFlowId(pub u64);
+pub(super) struct OAuthFlowId(pub u128);
+
+impl OAuthFlowId {
+    /// Stable owner idempotency key for acknowledgement retries in this pane.
+    pub(crate) fn subscription_ack_operation_id(self) -> String {
+        format!("subscription-ack-{:032x}", self.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ConfirmationChoice {

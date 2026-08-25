@@ -306,6 +306,18 @@ impl LeakRevealState {
         });
     }
 
+    /// Spend the exact pending capability without revealing its value.
+    /// Malformed, mismatched, or expired tokens fail closed and do not consume
+    /// a different caller's newly minted slot.
+    pub fn cancel_exact(&mut self, capability_hex: &str, now_ms: i64) -> Option<String> {
+        let decoded = decode_hex_32(capability_hex)?;
+        let pending = self.pending.as_ref()?;
+        if now_ms >= pending.expires_at_ms || !ct_eq_32(&decoded, &pending.token) {
+            return None;
+        }
+        self.pending.take().map(|capability| capability.report_id)
+    }
+
     fn prune(&mut self, now_ms: i64) {
         // Only confirmed successes age out (by their own confirm time). In-flight
         // reservations are NEVER aged by time — a stalled reveal stays counted
@@ -356,6 +368,34 @@ impl LeakRevealState {
     #[cfg(test)]
     pub fn pending_is_some(&self) -> bool {
         self.pending.is_some()
+    }
+}
+
+#[cfg(test)]
+mod cancel_capability_tests {
+    use super::*;
+
+    #[test]
+    fn cancel_spends_only_the_exact_live_capability() {
+        let mut state = LeakRevealState::new();
+        let token = [0xabu8; 32];
+        let encoded = "ab".repeat(32);
+        state.mint(token, "report-a".to_string(), 2_000);
+
+        assert_eq!(state.cancel_exact(&"cd".repeat(32), 1_000), None);
+        assert_eq!(
+            state.cancel_exact(&encoded, 1_000),
+            Some("report-a".to_string())
+        );
+        assert_eq!(state.cancel_exact(&encoded, 1_000), None);
+    }
+
+    #[test]
+    fn cancel_rejects_malformed_and_expired_tokens_without_cross_spending() {
+        let mut state = LeakRevealState::new();
+        state.mint([0xabu8; 32], "report-a".to_string(), 2_000);
+        assert_eq!(state.cancel_exact("AB", 1_000), None);
+        assert_eq!(state.cancel_exact(&"ab".repeat(32), 2_000), None);
     }
 }
 

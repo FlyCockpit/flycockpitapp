@@ -2,9 +2,6 @@ use super::super::pointer_actions::OAuthFlowId;
 use super::*;
 #[cfg(test)]
 use cockpit_core::auth::{codex_oauth, xai_oauth};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_OAUTH_FLOW_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn render_copilot_body(lines: &mut Vec<Line<'static>>, s: &CopilotSetupState) {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
@@ -54,6 +51,8 @@ pub(crate) enum OAuthProvider {
 #[derive(Debug, Clone)]
 pub(crate) struct OAuthFlowRequest {
     pub(crate) provider: OAuthProvider,
+    pub(crate) client_flow_id: OAuthFlowId,
+    pub(crate) operation_id: super::super::shell::PointerOperationId,
     pub(crate) op: OAuthFlowOp,
 }
 
@@ -61,9 +60,22 @@ pub(crate) struct OAuthFlowRequest {
 pub(crate) enum OAuthFlowOp {
     Acknowledge,
     Begin,
-    Poll { flow_id: String },
-    Complete { flow_id: String, input: String },
-    Cancel,
+    Poll {
+        flow_id: String,
+    },
+    Complete {
+        flow_id: String,
+        input: zeroize::Zeroizing<String>,
+    },
+    Present {
+        authorize_url: String,
+        user_code: Option<String>,
+        open_browser: bool,
+        advance_flow: bool,
+    },
+    Cancel {
+        flow_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +91,63 @@ pub(crate) struct OAuthPublicBegin {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct OAuthPresentationResult {
+    pub(crate) copied: bool,
+    pub(crate) copy_unverified: bool,
+    pub(crate) opened: bool,
+    pub(crate) advance_flow: bool,
+}
+
+impl OAuthPresentationResult {
+    fn status(&self, device_code: bool) -> String {
+        let subject = if device_code {
+            "device code"
+        } else {
+            "OAuth URL"
+        };
+        let copied = if self.copied {
+            if self.copy_unverified {
+                format!("{subject} copied (unverified)")
+            } else {
+                format!("{subject} copied")
+            }
+        } else {
+            format!("{subject} copy failed")
+        };
+        if self.opened {
+            format!("Opened browser; {copied}. Waiting for approval...")
+        } else {
+            format!("{copied}. Open the displayed link manually; waiting for approval...")
+        }
+    }
+}
+
+/// Run justified host-UI integration away from the synchronous input/reducer
+/// path. The caller must bind the returned value to the originating OAuth
+/// flow and operation before displaying it.
+pub(crate) fn present_oauth_on_blocking_worker(
+    authorize_url: String,
+    user_code: Option<String>,
+    open_browser: bool,
+    advance_flow: bool,
+) -> Result<OAuthPresentationResult, String> {
+    let effects = OAuthEffects::production();
+    let copy_value = user_code.as_deref().unwrap_or(&authorize_url);
+    let copy = (effects.copy)(copy_value);
+    let copied = copy.is_ok();
+    let copy_unverified = copy
+        .as_ref()
+        .is_ok_and(|result| crate::clipboard::feedback::classify(result).is_unverified());
+    let opened = open_browser && (effects.open)(&authorize_url).is_ok();
+    Ok(OAuthPresentationResult {
+        copied,
+        copy_unverified,
+        opened,
+        advance_flow,
+    })
+}
+
+#[derive(Debug, Clone)]
 #[cfg(test)]
 pub(crate) struct OAuthBrowserBegin {
     pub(crate) login: xai_oauth::ManualLogin,
@@ -88,7 +157,6 @@ pub(crate) struct OAuthBrowserBegin {
     ssh: bool,
 }
 
-#[cfg(test)]
 #[cfg(test)]
 impl OAuthBrowserBegin {
     pub(crate) fn for_test(listening: bool, ssh: bool) -> Self {
@@ -338,8 +406,13 @@ pub(crate) struct OAuthFlowState {
     pub(crate) ssh: bool,
     pub(crate) spinner_tick: usize,
     acknowledgement_required: bool,
+    /// A durable acknowledgement mutation has been submitted and this pane
+    /// still owns its authority. This is deliberately independent of the
+    /// transport action gate: an ambiguous result completes one transport
+    /// attempt but must not release navigation or permit the pane to close.
+    acknowledgement_authority_pending: bool,
     copy_operation: super::super::shell::PointerOperationGate,
-    effects: OAuthEffects,
+    action_operation: super::super::shell::PointerOperationGate,
 }
 
 impl OAuthFlowState {
@@ -408,7 +481,10 @@ impl OAuthFlowState {
             OAuthProvider::Codex => FlowShape::DeviceCode,
         };
         Self {
-            flow_id: OAuthFlowId(NEXT_OAUTH_FLOW_ID.fetch_add(1, Ordering::Relaxed)),
+            // This identity survives long-lived async work and is included in
+            // retained retry state. A process-reset counter could alias a late
+            // completion from a previous TUI instance after reconnect.
+            flow_id: OAuthFlowId(uuid::Uuid::new_v4().as_u128()),
             provider,
             shape,
             cursor: 0,
@@ -426,8 +502,9 @@ impl OAuthFlowState {
             spinner_tick: 0,
             // Fail closed until the asynchronous inventory answer arrives.
             acknowledgement_required: true,
+            acknowledgement_authority_pending: false,
             copy_operation: super::super::shell::PointerOperationGate::default(),
-            effects,
+            action_operation: super::super::shell::PointerOperationGate::default(),
         }
     }
 
@@ -435,9 +512,9 @@ impl OAuthFlowState {
         &mut self,
         flow_id: OAuthFlowId,
         kind: super::super::pointer_actions::OAuthCopyKind,
-    ) -> bool {
+    ) -> Option<OAuthFlowRequest> {
         if self.flow_id != flow_id {
-            return false;
+            return None;
         }
         let (value, open_after_copy) = match kind {
             super::super::pointer_actions::OAuthCopyKind::AuthorizationUrl => {
@@ -454,17 +531,20 @@ impl OAuthFlowState {
             }
         };
         let Some(value) = value else {
-            return false;
+            return None;
         };
-        match kind {
-            super::super::pointer_actions::OAuthCopyKind::AuthorizationUrl => {
-                self.submit_copy(Some(&value), open_after_copy.as_deref(), self.effects);
-            }
-            super::super::pointer_actions::OAuthCopyKind::DeviceCode => {
-                self.submit_device_code(Some(&value), open_after_copy.as_deref(), self.effects);
-            }
-        }
-        true
+        Some(
+            self.request(OAuthFlowOp::Present {
+                authorize_url: open_after_copy.clone().unwrap_or_else(|| value.clone()),
+                user_code: matches!(
+                    kind,
+                    super::super::pointer_actions::OAuthCopyKind::DeviceCode
+                )
+                .then_some(value),
+                open_browser: open_after_copy.is_some(),
+                advance_flow: false,
+            }),
+        )
     }
 
     pub(super) fn complete_copy(
@@ -478,6 +558,7 @@ impl OAuthFlowState {
         }
     }
 
+    #[cfg(test)]
     fn submit_copy(
         &mut self,
         value: Option<&str>,
@@ -503,6 +584,7 @@ impl OAuthFlowState {
         );
     }
 
+    #[cfg(test)]
     fn submit_device_code(
         &mut self,
         value: Option<&str>,
@@ -517,6 +599,104 @@ impl OAuthFlowState {
 
     pub(super) fn cancel_copy_effect(&mut self) {
         self.copy_operation.cancel();
+    }
+
+    fn request(&mut self, op: OAuthFlowOp) -> OAuthFlowRequest {
+        if matches!(op, OAuthFlowOp::Acknowledge) {
+            self.acknowledgement_authority_pending = true;
+        }
+        OAuthFlowRequest {
+            provider: self.provider,
+            client_flow_id: self.flow_id,
+            operation_id: self.action_operation.begin(),
+            op,
+        }
+    }
+
+    pub(crate) fn accepts_result(
+        &mut self,
+        client_flow_id: OAuthFlowId,
+        operation_id: super::super::shell::PointerOperationId,
+    ) -> bool {
+        self.flow_id == client_flow_id && self.action_operation.complete(operation_id)
+    }
+
+    fn remote_flow_id(&self) -> Option<String> {
+        match &self.session {
+            OAuthSession::Browser { flow_id, .. } | OAuthSession::Device { flow_id, .. } => {
+                Some(flow_id.clone())
+            }
+            OAuthSession::None => None,
+        }
+    }
+
+    fn begin_cancel(&mut self) -> OAuthFlowRequest {
+        self.action_operation.cancel();
+        self.cancel_copy_effect();
+        self.status = Some(Ok("Cancelling OAuth login...".to_string()));
+        self.request(OAuthFlowOp::Cancel {
+            flow_id: self.remote_flow_id(),
+        })
+    }
+
+    pub(crate) fn apply_cancel(&mut self, result: Result<bool, String>) {
+        match result {
+            Ok(cancelled) => {
+                self.pending = false;
+                self.polling = false;
+                self.paste_focused = false;
+                self.focus_paste_after_begin = false;
+                self.manual_input.set("");
+                self.session = OAuthSession::None;
+                self.status = Some(Ok(if cancelled {
+                    "OAuth login cancelled".to_string()
+                } else {
+                    "OAuth login had already reached a terminal outcome".to_string()
+                }));
+            }
+            Err(error) => {
+                // Lost/ambiguous cancellation must retain surface ownership.
+                // Escape retries the exact begin target with a fresh cancel
+                // idempotency key; navigation stays fenced meanwhile.
+                self.pending = true;
+                self.polling = false;
+                self.status = Some(Err(format!(
+                    "OAuth cancellation is not settled; press Esc to retry: {error}"
+                )));
+            }
+        }
+    }
+
+    pub(crate) fn apply_cancel_authoritative_failure(&mut self, error: String) {
+        // A rejected cancel is proof only that this cancel attempt did not
+        // terminate the original flow. Retain the daemon flow/session and the
+        // authority fence; Escape can issue another correlated cancellation.
+        self.pending = true;
+        self.polling = false;
+        self.status = Some(Err(format!(
+            "OAuth cancellation was authoritatively rejected; the login remains live. Press Esc to retry: {error}"
+        )));
+    }
+
+    pub(crate) fn apply_settlement_unknown(&mut self, error: String) {
+        // Do not clear pending/polling/session state: the daemon operation may
+        // already be committed. Navigation remains fenced, and the next user
+        // retry derives the same durable operation ID from this flow.
+        self.pending = true;
+        self.status = Some(Err(format!(
+            "OAuth settlement is unknown; retry the exact operation: {error}"
+        )));
+    }
+
+    pub(crate) fn apply_acknowledgement_settlement_unknown(&mut self, error: String) {
+        // The transport attempt is complete, but the durable acknowledgement
+        // may already have committed. Keep the explicit authority fence and
+        // the acknowledgement option so Enter replays the same flow-derived
+        // daemon operation id.
+        self.acknowledgement_authority_pending = true;
+        self.status = Some(Err(format!(
+            "Subscription acknowledgement settlement is unknown; press Enter to retry the exact operation: {error}"
+        )));
     }
 
     #[cfg(test)]
@@ -565,71 +745,28 @@ impl OAuthFlowState {
         }
     }
 
-    pub(crate) fn apply_begin(
+    pub(crate) fn apply_begin_deferred(
         &mut self,
         result: OAuthBeginResult,
-        effects: OAuthEffects,
     ) -> Option<OAuthFlowRequest> {
         match result {
             OAuthBeginResult::Public(Ok(begin)) if self.provider == OAuthProvider::Codex => {
                 let code = begin.user_code.unwrap_or_default();
-                let copy_result = (effects.copy)(&code);
-                let copied = copy_result.is_ok();
-                // `copied` alone used to collapse Confirmed and Unverified
-                // into the same "Code copied" wording — the same gap
-                // `describe_delivered` exists to close for the toast-based
-                // copy paths elsewhere in the crate. This status line has
-                // no toast/`ToastKind` of its own, so the fix here is a
-                // wording qualifier rather than a shared helper; the code
-                // itself is also always rendered on screen (see the
-                // `Span::styled(login.user_code...)` a few lines below in
-                // the render path), so an unverified copy still leaves the
-                // user able to read and type it, unlike the chat-copy
-                // toast paths where the clipboard is the only way out.
-                let unverified = copy_result
-                    .as_ref()
-                    .is_ok_and(|r| crate::clipboard::feedback::classify(r).is_unverified());
-                let ssh = (effects.is_ssh)();
-                self.ssh = ssh;
-                let opened = ssh || (effects.open)(&begin.authorize_url).is_ok();
-                let copied_suffix = if unverified {
-                    " (unverified — also shown above if the paste doesn't work)"
-                } else {
-                    ""
-                };
-                let status = if ssh {
-                    if copied {
-                        format!(
-                            "Code copied{copied_suffix}. Open the link and enter the code. Waiting for approval..."
-                        )
-                    } else {
-                        "Open the link and enter the code. Waiting for approval (code copy failed)."
-                            .to_string()
-                    }
-                } else if copied && opened {
-                    format!("Opened browser; code copied{copied_suffix}. Waiting for approval...")
-                } else if opened {
-                    "Opened browser. Waiting for approval (code copy failed).".to_string()
-                } else if copied {
-                    format!(
-                        "Code copied{copied_suffix}. Open the link manually. Waiting for approval..."
-                    )
-                } else {
-                    "Open the link manually. Waiting for approval (code copy failed).".to_string()
-                };
                 self.polling = true;
-                self.status = Some(Ok(status));
+                self.status = Some(Ok(
+                    "Device code ready; preparing browser and clipboard...".to_string()
+                ));
                 self.session = OAuthSession::Device {
                     flow_id: begin.flow_id.clone(),
-                    verification_uri: begin.authorize_url,
-                    user_code: code,
+                    verification_uri: begin.authorize_url.clone(),
+                    user_code: code.clone(),
                 };
-                Some(OAuthFlowRequest {
-                    provider: OAuthProvider::Codex,
-                    op: OAuthFlowOp::Poll {
-                        flow_id: begin.flow_id,
-                    },
-                })
+                Some(self.request(OAuthFlowOp::Present {
+                    authorize_url: begin.authorize_url,
+                    user_code: Some(code),
+                    open_browser: !self.ssh,
+                    advance_flow: true,
+                }))
             }
             OAuthBeginResult::Public(Err(e)) if self.provider == OAuthProvider::Codex => {
                 self.polling = false;
@@ -642,16 +779,14 @@ impl OAuthFlowState {
                     flow_id: begin.flow_id,
                     authorize_url: begin.authorize_url.clone(),
                 };
-                self.ssh = (effects.is_ssh)();
-                let opened = self.ssh || (effects.open)(&begin.authorize_url).is_ok();
-                self.paste_focused = focus_paste_after_begin || !opened;
-                self.pending = false;
-                self.status = Some(Ok(if opened {
-                    "Opened browser; paste callback/code here when complete.".into()
-                } else {
-                    "Open the URL manually and paste callback/code here.".into()
-                }));
-                None
+                self.status = Some(Ok("Login URL ready; preparing browser...".into()));
+                self.focus_paste_after_begin = focus_paste_after_begin;
+                Some(self.request(OAuthFlowOp::Present {
+                    authorize_url: begin.authorize_url,
+                    user_code: None,
+                    open_browser: !self.ssh,
+                    advance_flow: true,
+                }))
             }
             OAuthBeginResult::Public(Err(e)) if self.provider == OAuthProvider::Grok => {
                 self.pending = false;
@@ -666,7 +801,92 @@ impl OAuthFlowState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn apply_begin(
+        &mut self,
+        result: OAuthBeginResult,
+        effects: OAuthEffects,
+    ) -> Option<OAuthFlowRequest> {
+        let next = self.apply_begin_deferred(result);
+        let Some(OAuthFlowRequest {
+            client_flow_id,
+            operation_id,
+            op:
+                OAuthFlowOp::Present {
+                    authorize_url,
+                    user_code,
+                    open_browser,
+                    advance_flow,
+                },
+            ..
+        }) = next
+        else {
+            return next;
+        };
+        let value = user_code.as_deref().unwrap_or(&authorize_url);
+        let copy = (effects.copy)(value);
+        let presentation = OAuthPresentationResult {
+            copied: copy.is_ok(),
+            copy_unverified: copy
+                .as_ref()
+                .is_ok_and(|result| crate::clipboard::feedback::classify(result).is_unverified()),
+            opened: open_browser && (effects.open)(&authorize_url).is_ok(),
+            advance_flow,
+        };
+        assert!(self.accepts_result(client_flow_id, operation_id));
+        self.apply_present(Ok(presentation))
+    }
+
+    pub(crate) fn apply_present(
+        &mut self,
+        result: Result<OAuthPresentationResult, String>,
+    ) -> Option<OAuthFlowRequest> {
+        if result.as_ref().is_ok_and(|result| !result.advance_flow) {
+            self.status = Some(
+                result.map(|result| result.status(matches!(self.provider, OAuthProvider::Codex))),
+            );
+            return None;
+        }
+        match self.provider {
+            OAuthProvider::Codex => {
+                let status = match result {
+                    Ok(result) => result.status(true),
+                    Err(error) => format!(
+                        "Open the link and enter the displayed code. Host integration failed: {error}"
+                    ),
+                };
+                self.status = Some(Ok(status));
+                let Some(flow_id) = self.remote_flow_id() else {
+                    self.polling = false;
+                    self.status = Some(Err("OAuth flow lost its daemon identity".into()));
+                    return None;
+                };
+                Some(self.request(OAuthFlowOp::Poll { flow_id }))
+            }
+            OAuthProvider::Grok => {
+                let opened = result.as_ref().is_ok_and(|value| value.opened);
+                self.pending = false;
+                self.paste_focused = std::mem::take(&mut self.focus_paste_after_begin) || !opened;
+                self.status = Some(match result {
+                    Ok(_) if opened => {
+                        Ok("Opened browser; paste callback/code here when complete.".into())
+                    }
+                    Ok(_) => Ok("Open the URL manually and paste callback/code here.".into()),
+                    Err(error) => Err(format!(
+                        "Could not open the browser; open the displayed URL manually: {error}"
+                    )),
+                });
+                None
+            }
+        }
+    }
+
     pub(crate) fn apply_complete(&mut self, result: Result<bool, String>) {
+        let result = result.and_then(|logged_in| {
+            logged_in
+                .then_some(true)
+                .ok_or_else(|| "provider did not confirm OAuth login".to_string())
+        });
         match self.provider {
             OAuthProvider::Codex => {
                 self.polling = false;
@@ -701,11 +921,17 @@ impl OAuthFlowState {
             self.logged_in = logged_in;
         }
         if let Some(acknowledged) = acknowledged {
-            self.acknowledgement_required = !acknowledged;
+            // Inventory refresh is advisory while this visible pane owns an
+            // acknowledgement mutation. Only its exact typed settlement may
+            // release that authority fence.
+            if !self.acknowledgement_authority_pending {
+                self.acknowledgement_required = !acknowledged;
+            }
         }
     }
 
     pub(crate) fn apply_acknowledgement(&mut self, result: Result<(), String>) {
+        self.acknowledgement_authority_pending = false;
         match result {
             Ok(()) => {
                 self.acknowledgement_required = false;
@@ -715,6 +941,14 @@ impl OAuthFlowState {
                 self.status = Some(Err(format!("Could not record acknowledgement: {error}")));
             }
         }
+    }
+
+    pub(crate) fn has_unsettled_authority(&self) -> bool {
+        self.pending || self.polling || self.acknowledgement_authority_pending
+    }
+
+    pub(crate) fn has_unsettled_acknowledgement(&self) -> bool {
+        self.acknowledgement_authority_pending
     }
 }
 
@@ -798,8 +1032,19 @@ pub(super) fn handle_oauth_flow_key_with(
     key: KeyEvent,
     s: &mut OAuthFlowState,
     host: OAuthHost,
-    effects: OAuthEffects,
+    _effects: OAuthEffects,
 ) -> OAuthKeyOutcome {
+    // A provider flow owns this settings surface until its exact terminal
+    // completion (including cancellation) is applied.  In particular, do not
+    // let navigation, another login, acknowledgement, paste editing, or a
+    // wizard save race a live begin/poll/exchange.
+    if s.pending || s.polling {
+        return if matches!(key.code, KeyCode::Esc) {
+            OAuthKeyOutcome::stay(Some(s.begin_cancel()))
+        } else {
+            OAuthKeyOutcome::stay(None)
+        };
+    }
     if !matches!(key.code, KeyCode::Char('c') | KeyCode::Char('y')) {
         // Any option/focus/navigation change invalidates an outstanding copy
         // completion for this flow generation.
@@ -824,15 +1069,13 @@ pub(super) fn handle_oauth_flow_key_with(
                     s.status = Some(Err("paste callback URL or code first".to_string()));
                     return OAuthKeyOutcome::stay(None);
                 }
+                s.manual_input.set("");
                 s.pending = true;
                 s.status = Some(Ok("Completing xAI OAuth login...".to_string()));
-                return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                    provider: OAuthProvider::Grok,
-                    op: OAuthFlowOp::Complete {
-                        flow_id: flow_id.clone(),
-                        input,
-                    },
-                }));
+                return OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Complete {
+                    flow_id: flow_id.clone(),
+                    input: zeroize::Zeroizing::new(input),
+                })));
             }
             _ => {
                 s.manual_input.handle_key(key);
@@ -844,52 +1087,63 @@ pub(super) fn handle_oauth_flow_key_with(
     match (s.provider, key.code) {
         (OAuthProvider::Grok, KeyCode::Char('c')) => {
             let url = s.authorize_url().map(ToOwned::to_owned);
-            s.submit_copy(url.as_deref(), None, effects);
-            return OAuthKeyOutcome::stay(None);
+            let action = url.map(|authorize_url| {
+                s.request(OAuthFlowOp::Present {
+                    authorize_url,
+                    user_code: None,
+                    open_browser: false,
+                    advance_flow: false,
+                })
+            });
+            return OAuthKeyOutcome::stay(action);
         }
         (OAuthProvider::Codex, KeyCode::Char('c')) => {
-            if s.ssh {
-                let url = s.device_login().map(|(_, url, _)| url.to_string());
-                s.submit_copy(url.as_deref(), None, effects);
-            } else {
-                let (code, url) = match s.device_login() {
-                    Some((_, url, code)) => (Some(code.to_string()), Some(url.to_string())),
-                    None => (None, None),
-                };
-                s.submit_device_code(code.as_deref(), url.as_deref(), effects);
-            }
-            return OAuthKeyOutcome::stay(None);
+            let login = s
+                .device_login()
+                .map(|(_, url, code)| (url.to_string(), code.to_string()));
+            let action = login.map(|(url, code)| {
+                s.request(OAuthFlowOp::Present {
+                    authorize_url: url,
+                    user_code: (!s.ssh).then_some(code),
+                    open_browser: !s.ssh,
+                    advance_flow: false,
+                })
+            });
+            return OAuthKeyOutcome::stay(action);
         }
         (OAuthProvider::Codex, KeyCode::Char('y')) => {
-            let code = s.device_login().map(|(_, _, code)| code.to_string());
-            s.submit_device_code(code.as_deref(), None, effects);
-            return OAuthKeyOutcome::stay(None);
+            let login = s
+                .device_login()
+                .map(|(_, url, code)| (url.to_string(), code.to_string()));
+            let action = login.map(|(url, code)| {
+                s.request(OAuthFlowOp::Present {
+                    authorize_url: url,
+                    user_code: Some(code),
+                    open_browser: false,
+                    advance_flow: false,
+                })
+            });
+            return OAuthKeyOutcome::stay(action);
         }
         _ => {}
     }
 
-    if s.provider == OAuthProvider::Grok && s.pending && matches!(key.code, KeyCode::Esc) {
-        s.pending = false;
-        s.status = Some(Ok("OAuth login cancelled".to_string()));
-        return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-            provider: OAuthProvider::Grok,
-            op: OAuthFlowOp::Cancel,
-        }));
-    }
-    if s.provider == OAuthProvider::Codex && s.polling && matches!(key.code, KeyCode::Esc) {
-        s.polling = false;
-        s.status = Some(Ok("Codex OAuth polling cancelled".to_string()));
-        return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-            provider: OAuthProvider::Codex,
-            op: OAuthFlowOp::Cancel,
-        }));
-    }
-
     match key.code {
-        KeyCode::Esc => OAuthKeyOutcome::back(Some(OAuthFlowRequest {
-            provider: s.provider,
-            op: OAuthFlowOp::Cancel,
-        })),
+        KeyCode::Esc => {
+            if s.acknowledgement_authority_pending {
+                s.status = Some(Err(
+                    "Subscription acknowledgement is still settling; press Enter to retry the exact operation"
+                        .into(),
+                ));
+                OAuthKeyOutcome::stay(None)
+            } else if matches!(s.session, OAuthSession::None) {
+                OAuthKeyOutcome::back(None)
+            } else {
+                // The OAuth surface remains the owner until the exact cancel
+                // receipt settles; only apply_cancel may release navigation.
+                OAuthKeyOutcome::stay(Some(s.begin_cancel()))
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             s.cursor = oauth_option_cursor_prev(s.cursor, s.option_count(host));
             OAuthKeyOutcome::stay(None)
@@ -917,10 +1171,7 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
             s.status = Some(Ok(
                 "Recording subscription OAuth acknowledgement...".to_string()
             ));
-            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                provider: s.provider,
-                op: OAuthFlowOp::Acknowledge,
-            }))
+            OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Acknowledge)))
         }
         (_, OAuthOption::Continue | OAuthOption::SkipContinue) => OAuthKeyOutcome::confirm(),
         (OAuthProvider::Grok, OAuthOption::ManualPaste) => {
@@ -931,10 +1182,7 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
                 s.pending = true;
                 s.focus_paste_after_begin = true;
                 s.status = Some(Ok("Preparing xAI OAuth login...".to_string()));
-                OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                    provider: OAuthProvider::Grok,
-                    op: OAuthFlowOp::Begin,
-                }))
+                OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Begin)))
             }
         }
         (OAuthProvider::Grok, OAuthOption::Login) => {
@@ -948,44 +1196,29 @@ fn handle_oauth_enter(s: &mut OAuthFlowState, host: OAuthHost) -> OAuthKeyOutcom
             } else {
                 "Preparing manual xAI OAuth login...".to_string()
             }));
-            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                provider: OAuthProvider::Grok,
-                op: OAuthFlowOp::Begin,
-            }))
+            OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Begin)))
         }
         (OAuthProvider::Grok, OAuthOption::Poll) => {
             s.pending = true;
             s.paste_focused = false;
             s.status = Some(Ok("Checking xAI OAuth callback...".to_string()));
-            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                provider: OAuthProvider::Grok,
-                op: OAuthFlowOp::Begin,
-            }))
+            OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Begin)))
         }
         (OAuthProvider::Codex, OAuthOption::Login) => {
             s.polling = true;
             s.status = Some(Ok("Requesting Codex device code...".to_string()));
-            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                provider: OAuthProvider::Codex,
-                op: OAuthFlowOp::Begin,
-            }))
+            OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Begin)))
         }
         (OAuthProvider::Codex, OAuthOption::Poll) => {
             let Some((flow_id, _, _)) = s.device_login() else {
                 s.polling = true;
                 s.status = Some(Ok("Requesting Codex device code...".to_string()));
-                return OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                    provider: OAuthProvider::Codex,
-                    op: OAuthFlowOp::Begin,
-                }));
+                return OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Begin)));
             };
             let flow_id = flow_id.to_string();
             s.polling = true;
             s.status = Some(Ok("Waiting for Codex approval...".to_string()));
-            OAuthKeyOutcome::stay(Some(OAuthFlowRequest {
-                provider: OAuthProvider::Codex,
-                op: OAuthFlowOp::Poll { flow_id },
-            }))
+            OAuthKeyOutcome::stay(Some(s.request(OAuthFlowOp::Poll { flow_id })))
         }
         _ => OAuthKeyOutcome::stay(None),
     }

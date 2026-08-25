@@ -39,13 +39,16 @@ pub use agent_installation::{
     AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
 };
 pub use agent_management::{
-    AgentEditSnapshot, AgentEditTarget, AgentEditorLease, AgentEntryKind, AgentInventoryEntry,
-    AgentMutation, AgentMutationOutcome, AgentMutationResult, AgentSourceLayer,
-    GoalSupervisionPatch, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
+    AgentEditSnapshot, AgentEditTarget, AgentEditorCompletion, AgentEditorLease,
+    AgentEditorSettlementStatus, AgentEntryKind, AgentInventoryEntry, AgentMutation,
+    AgentMutationOutcome, AgentMutationResult, AgentSourceLayer, GoalSupervisionPatch,
+    MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
     MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES, MAX_ASSISTANT_HOME_BYTES,
-    agent_edit_projection_digest, agent_inventory_entry_projection_digest,
-    validate_agent_edit_snapshot, validate_agent_mutation_envelope, validate_agent_source_identity,
-    validate_goal_supervision_projection,
+    agent_edit_projection_material, agent_inventory_entry_projection_material,
+    agent_mutation_intent_hash, agent_mutation_name, assistant_mutation_intent_hash,
+    validate_agent_edit_snapshot,
+    validate_agent_editor_completion, validate_agent_mutation_envelope,
+    validate_agent_source_identity, validate_goal_supervision_projection,
 };
 pub use config_management::{
     CockpitConfigLayer, CommittedDenylistEntry, ConfigCommitStatus, ConfigPublicationStatus,
@@ -56,10 +59,15 @@ pub use config_management::{
 pub mod bulk_transfer;
 pub mod host_capabilities;
 pub mod image_control;
+pub mod provider_management;
 pub use host_capabilities::{
     CatalogDependencyImportance, CatalogDependencyRow, CatalogDependencyState,
     CatalogExecutionTarget, FeatureCapabilityRow, FeatureCapabilityState, HostCapabilitySnapshot,
     SecretStoreIntent, SecretStorePlacement, SecretStoreSnapshot,
+};
+pub use provider_management::{
+    ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,
+    ProviderMutationUpsert, ProviderSecretValue,
 };
 #[cfg(feature = "remote")]
 pub mod remote_connection_metadata;
@@ -268,6 +276,22 @@ pub struct ProviderConfigView {
     /// contains no header/env literals or credential values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_config_json: Option<String>,
+    /// Daemon-selected canonical MCP authority root and write target for this
+    /// snapshot. These bind a later save receipt without making the frontend
+    /// rediscover layered config paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_owner_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_config_path: Option<String>,
+    /// Opaque, daemon-issued capability binding the MCP owner, target path,
+    /// target-layer revision, and authenticated client that received this
+    /// snapshot. A save must present it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_edit_capability: Option<String>,
+    /// SHA-256 revision of the authoritative target layer (not the merged
+    /// effective projection in `mcp_config_json`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_revision: Option<String>,
     /// Optional daemon-redacted extended settings projection. JSON keeps the
     /// settings crate out of the wire/core protocol while ensuring clients do
     /// not load legacy config.json literals locally.
@@ -1020,16 +1044,18 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v14 adds exact identity-bearing settings,
-/// workspace-agent, and assistant-definition authority RPCs, including
-/// occurrence-bound denylist edits with nonce-bound committed receipts.
-/// (`assistant_display_*`) the live chip/stream path and retires the v9/v10
-/// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 14.
-pub const PROTOCOL_VERSION: u32 = 14;
+/// Current wire schema version. v17 adds explicit, owner-scoped provider OAuth
+/// cancellation so local frontends can terminally settle timed-out or dismissed
+/// daemon-owned PKCE/device flows. It also adds correlated durable configuration
+/// receipts, including atomic image-spend policy receipts, and operation-bound
+/// external-editor settlement/status receipts. Agent and assistant inventory
+/// reads also carry one shared configuration generation, while agent inventory
+/// binds its canonical and requested workspace roots.
+pub const PROTOCOL_VERSION: u32 = 17;
 
-/// Oldest wire schema version this binary accepts. v14 is current-only: the
-/// display-event breaking change has no v9/v10-compatible fallback.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 14;
+/// Oldest wire schema version this binary accepts. v17 is current-only: the
+/// authority lifecycle changes have no safe compatibility fallback.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 17;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1763,7 +1789,7 @@ pub use event::{
 /// Structured error response. The model and the TUI both render
 /// `message` directly; `code` lets the client branch on
 /// machine-readable kinds without parsing the message.
-#[derive(Debug, Clone, Serialize, Deserialize, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
 #[error("{code}: {message}")]
 pub struct ErrorPayload {
     pub code: ErrorCode,
@@ -2215,8 +2241,9 @@ pub struct AssistantSummary {
     pub created_at: i64,
     pub home_dir: String,
     pub config_json: String,
-    /// Digest of the already-redacted definition presentation. This is a UI
-    /// integrity hint only, never the daemon's raw file-integrity hash.
+    /// Vault-keyed identity of the already-redacted definition presentation.
+    /// It is opaque to clients and cannot be used as an offline markdown
+    /// guessing oracle.
     #[serde(deserialize_with = "deserialize_present_option")]
     pub definition_presentation_hash: Option<String>,
     /// Opaque CAS token for the raw registry binding itself. It is request-bound
@@ -2233,8 +2260,7 @@ pub struct AssistantSummary {
     pub definition_revision: Option<String>,
     #[serde(deserialize_with = "deserialize_present_option")]
     pub definition_diagnostic: Option<String>,
-    /// Digest over the exact already-redacted presentation returned to this
-    /// client. Authority revisions above remain opaque CAS tokens.
+    /// Vault-keyed identity over the exact already-redacted presentation.
     pub projection_digest: String,
 }
 
@@ -2288,17 +2314,11 @@ pub fn validate_assistant_summary(summary: &AssistantSummary) -> Result<(), &'st
             if !diagnostic.trim().is_empty() && summary.definition_presentation_hash.is_none() => {}
         _ => return Err("assistant definition snapshot is incoherent"),
     }
-    if let (Some(markdown), Some(presentation_hash)) = (
-        summary.definition_markdown.as_deref(),
-        summary.definition_presentation_hash.as_deref(),
-    ) {
-        use sha2::Digest as _;
-        if hex_lower(sha2::Sha256::digest(markdown.as_bytes())) != presentation_hash {
-            return Err("assistant definition presentation hash is invalid");
-        }
-    }
-    if summary.projection_digest != assistant_projection_digest(summary) {
-        return Err("assistant projection digest is invalid");
+    // Both identities are vault-keyed and intentionally unrecomputable by a
+    // client. Their opaque shape and response/receipt binding are the public
+    // contract.
+    if !lower_hex_digest(&summary.projection_digest) {
+        return Err("assistant projection identity is invalid");
     }
     Ok(())
 }
@@ -2315,7 +2335,8 @@ pub(crate) fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     out
 }
 
-pub fn assistant_projection_digest(summary: &AssistantSummary) -> String {
+#[doc(hidden)]
+pub fn assistant_projection_material(summary: &AssistantSummary) -> String {
     use sha2::Digest as _;
     let mut digest = sha2::Sha256::new();
     digest.update(b"cockpit-assistant-projection-v1\0");
@@ -2474,6 +2495,185 @@ mod tui_ownership_rpc_contract_tests {
 /// `cockpit_core::sealed::owner::MAX_SENSITIVE_FRAME_BYTES`; a larger literal
 /// fails closed on deserialize before it reaches any handler.
 pub const MAX_SENSITIVE_FRAME_BYTES: usize = 16 * 1024;
+
+/// A secret-bearing JSON/string payload transported over the owner wire.
+///
+/// The serialized shape remains a JSON string, while the in-memory buffer is
+/// zeroized on drop and `Debug` never exposes its contents. Field-specific
+/// deserializers remain responsible for their tighter size/shape bounds.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SensitiveWirePayload(zeroize::Zeroizing<String>);
+
+impl SensitiveWirePayload {
+    pub fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn into_zeroizing(self) -> zeroize::Zeroizing<String> {
+        self.0
+    }
+}
+
+impl From<String> for SensitiveWirePayload {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for SensitiveWirePayload {
+    fn from(value: &str) -> Self {
+        Self::new(value.to_owned())
+    }
+}
+
+impl std::ops::Deref for SensitiveWirePayload {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Debug for SensitiveWirePayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "SensitiveWirePayload([REDACTED; {} bytes])",
+            self.0.len()
+        )
+    }
+}
+
+impl Serialize for SensitiveWirePayload {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SensitiveWirePayload {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::new)
+    }
+}
+
+#[cfg(feature = "remote")]
+impl crate::remote_operation_fcor::CanonicalFcorValueV1 for SensitiveWirePayload {
+    fn encode_fcor_value_v1(
+        &self,
+        out: &mut crate::remote_operation_fcor::CanonicalParamsV1,
+    ) -> Result<()> {
+        use sha2::Digest as _;
+
+        // Preserve replay identity without copying plaintext into FCOR's
+        // ordinary byte buffer. A different secret payload produces a
+        // different operation digest; only this one-way digest leaves the
+        // zeroizing wrapper.
+        let digest = sha2::Sha256::digest(self.as_str().as_bytes());
+        out.push_bytes(digest.as_slice())
+    }
+}
+
+/// Opaque one-use token for the local leak-reveal channel.
+///
+/// Although this is not the revealed plaintext, possession authorizes a
+/// plaintext read. It therefore has the same memory/logging discipline as a
+/// secret: zeroizing storage, redacted `Debug`, and no conversion API that
+/// produces an ordinary `String` copy.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LeakRevealToken(zeroize::Zeroizing<String>);
+
+impl LeakRevealToken {
+    pub fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    pub fn from_zeroizing(value: zeroize::Zeroizing<String>) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn into_zeroizing(self) -> zeroize::Zeroizing<String> {
+        self.0
+    }
+}
+
+impl fmt::Debug for LeakRevealToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "LeakRevealToken([REDACTED; {} bytes])",
+            self.0.len()
+        )
+    }
+}
+
+impl Serialize for LeakRevealToken {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LeakRevealToken {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        // Historical response fixtures used an empty placeholder before the
+        // live v16 contract required canonical tokens. Keep deserialization
+        // bounded and zeroizing; live request semantics and the reveal frame
+        // enforce the exact 64-byte lowercase-hex shape.
+        if value.len() > 64 {
+            return Err(serde::de::Error::custom(
+                "leak reveal token exceeds 64 bytes",
+            ));
+        }
+        Ok(Self(zeroize::Zeroizing::new(value)))
+    }
+}
+
+#[cfg(feature = "remote")]
+impl crate::remote_operation_fcor::CanonicalFcorValueV1 for LeakRevealToken {
+    fn encode_fcor_value_v1(
+        &self,
+        out: &mut crate::remote_operation_fcor::CanonicalParamsV1,
+    ) -> Result<()> {
+        // CancelLeakReveal is local-only, but the command registry still
+        // verifies every parameter has a closed canonical codec. Never copy a
+        // bearer token into the ordinary FCOR byte buffer.
+        out.push_bytes(b"[leak-reveal-token-redacted]")
+    }
+}
 
 /// A sealed-value plaintext literal on the sensitive owner channel.
 ///
@@ -2713,7 +2913,7 @@ pub struct LeakReportsPage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeakRevealCapability {
     /// The opaque capability token; never derived from the secret.
-    pub capability: String,
+    pub capability: LeakRevealToken,
     /// The single report id this capability is bound to.
     pub report_id: String,
     /// When this capability expires (unix ms). A reveal after this is
@@ -2745,6 +2945,17 @@ mod sensitive_wire_literal_tests {
         assert_eq!(serde_json::to_string(&literal).unwrap(), "\"s3cr3t\"");
         let back: SensitiveWireLiteral = serde_json::from_str("\"s3cr3t\"").unwrap();
         assert_eq!(back.as_str(), "s3cr3t");
+    }
+
+    #[test]
+    fn leak_reveal_token_redacts_debug_and_keeps_zeroizing_ownership() {
+        let marker = "0123456789abcdef".repeat(4);
+        let token = LeakRevealToken::new(marker.clone());
+        let debug = format!("{token:?}");
+        assert!(!debug.contains(&marker));
+        assert!(debug.contains("REDACTED"));
+        let owned = token.into_zeroizing();
+        assert_eq!(owned.as_str(), marker);
     }
 
     #[test]
@@ -3040,50 +3251,55 @@ pub enum InterruptRaiseReason {
 
 /// Return the first protocol version that can carry a typed body. This gate
 /// is intentionally applied after negotiation and before serialization: a
-/// v10 client can use the v9 compatibility window, but must never serialize a
-/// v10-only RPC with a v9 envelope and leave an older daemon to interpret it.
+/// A compatibility-window client must never serialize a newer RPC with an
+/// older envelope and leave an older daemon to interpret it.
 fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
     match body {
         Body::Request { request, .. } => {
             let tag = request.wire_tag();
             let version = match tag {
-                "list_secret_inventory"
-                | "put_named_secret"
-                | "put_subscription_ack"
-                | "delete_named_secret"
+                "begin_provider_oauth"
+                | "complete_provider_oauth"
+                | "cancel_provider_oauth"
+                | "begin_mcp_oauth"
+                | "complete_mcp_oauth"
+                | "cancel_mcp_oauth"
                 | "put_provider_credential"
                 | "delete_provider_credential"
+                | "save_mcp_config"
+                | "apply_extended_config_patch"
+                | "get_local_operation_settlement"
+                | "setup_copilot_auth"
+                | "put_subscription_ack"
+                | "apply_provider_mutation"
+                | "save_image_spend_policy"
+                | "begin_agent_editor_lease"
+                | "complete_agent_editor_lease"
+                | "get_agent_editor_lease_settlement" => 17,
+                "mutate_agent" | "save_assistant_definition" | "delete_assistant" => 17,
+                "cancel_leak_reveal" => 16,
+                "get_provider_catalog_snapshot" => 15,
+                "list_secret_inventory"
+                | "put_named_secret"
+                | "delete_named_secret"
                 | "get_flycockpit_account"
                 | "set_flycockpit_connector_enabled"
                 | "sync_flycockpit_org_policy"
                 | "enroll_flycockpit_org_sync"
-                | "get_provider_catalog_snapshot"
                 | "fetch_provider_models"
                 | "get_provider_usage_snapshot"
                 | "upsert_provider_config"
                 | "delete_provider_config"
                 | "set_provider_layer_metadata"
                 | "save_provider_config"
-                | "save_mcp_config"
-                | "begin_provider_oauth"
-                | "complete_provider_oauth"
-                | "begin_mcp_oauth"
-                | "complete_mcp_oauth"
-                | "cancel_mcp_oauth"
-                | "setup_copilot_auth"
                 | "apply_setup_wizard"
                 | "get_agent_inventory"
                 | "get_agent_edit_snapshot"
-                | "mutate_agent"
-                | "begin_agent_editor_lease"
-                | "complete_agent_editor_lease"
                 | "get_extended_config_snapshot"
-                | "apply_extended_config_patch"
                 | "save_extended_config"
                 | "export_policy"
                 | "import_policy"
                 | "get_image_spend_policy"
-                | "save_image_spend_policy"
                 | "list_packages"
                 | "add_package"
                 | "import_package"
@@ -3095,7 +3311,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "get_session_compactions"
                 | "purge_ended_sessions"
                 | "get_assistant"
-                | "delete_assistant"
                 | "diagnose_media_reservation"
                 | "repair_media_reservation"
                 | "get_doctor_snapshot"
@@ -3140,26 +3355,35 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
         Body::Response { response, .. } => {
             let tag = response.wire_tag();
             let version = match tag {
-                "flycockpit_org_sync"
+                "provider_oauth_started"
+                | "provider_oauth_completed"
+                | "provider_oauth_cancelled"
+                | "mcp_oauth_started"
+                | "mcp_oauth_completed"
+                | "mcp_oauth_cancelled"
+                | "provider_credential_committed"
+                | "subscription_ack_committed"
+                | "local_operation_settlement"
+                | "copilot_auth_committed"
+                | "mcp_config_committed"
                 | "provider_catalog_snapshot"
+                | "provider_mutation_committed"
+                | "image_spend_policy_saved"
+                | "agent_editor_lease_begun"
+                | "agent_editor_lease_completed"
+                | "extended_config_saved" => 17,
+                "agent_mutated" | "assistant_definition_saved" | "assistant_deleted" => 17,
+                "leak_reveal_cancelled" => 16,
+                "flycockpit_org_sync"
                 | "provider_models_fetched"
                 | "provider_usage_snapshot"
                 | "provider_config_upserted"
                 | "secret_inventory"
                 | "flycockpit_account"
-                | "provider_oauth_started"
-                | "provider_oauth_completed"
-                | "mcp_oauth_started"
-                | "mcp_oauth_completed"
-                | "mcp_oauth_cancelled"
-                | "provider_credential_deleted"
-                | "mcp_config_saved"
-                | "extended_config_saved"
                 | "setup_wizard_applied"
                 | "policy_exported"
                 | "policy_imported"
                 | "image_spend_policy"
-                | "image_spend_policy_saved"
                 | "packages"
                 | "package_added"
                 | "package_imported"
@@ -3171,7 +3395,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "session_compactions"
                 | "ended_sessions_purged"
                 | "assistant"
-                | "assistant_deleted"
                 | "media_reservation_diagnosis"
                 | "media_reservation_repaired"
                 | "doctor_snapshot"
@@ -3509,8 +3732,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[14];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[17];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -6267,22 +6490,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_only_provider_credential_response_is_not_sent_to_v9_daemon() {
+    async fn v17_provider_credential_receipt_is_not_sent_to_v9_daemon() {
         let (a, _b) = duplex(4096);
         let mut v9 = ProtoStream::with_version(a, 9);
         let response = Envelope::response(
             Uuid::new_v4(),
-            Response::ProviderCredentialDeleted {
-                found: true,
-                deleted: true,
+            Response::ProviderCredentialCommitted {
+                client_operation_id: "put-provider".into(),
+                mutation_intent_hash: "00".repeat(32),
+                provider_id: "example".into(),
+                project_root: None,
+                owner_root: None,
+                owner_scope: "global".into(),
+                stored: true,
+                changed: true,
+                consumed_vault_generation: 6,
+                result_vault_generation: 7,
+                config_generation: 7,
             },
         );
         let error = v9
             .send(&response)
             .await
-            .expect_err("v10-only response must be gated on a v9 connection");
-        assert!(error.to_string().contains("provider_credential_deleted"));
-        assert!(error.to_string().contains("requires v10"));
+            .expect_err("v17 response must be gated on a v9 connection");
+        assert!(error.to_string().contains("provider_credential_committed"));
+        assert!(error.to_string().contains("requires v17"));
     }
 
     #[tokio::test]
@@ -6323,9 +6555,18 @@ mod tests {
         let forged = Envelope::response_at(
             9,
             id,
-            Response::ProviderCredentialDeleted {
-                found: true,
-                deleted: true,
+            Response::ProviderCredentialCommitted {
+                client_operation_id: "put-provider".into(),
+                mutation_intent_hash: "00".repeat(32),
+                provider_id: "example".into(),
+                project_root: None,
+                owner_root: None,
+                owner_scope: "global".into(),
+                stored: true,
+                changed: true,
+                consumed_vault_generation: 6,
+                result_vault_generation: 7,
+                config_generation: 7,
             },
         );
         sender
@@ -6406,6 +6647,122 @@ mod tests {
     }
 
     #[test]
+    fn current_protocol_gates_provider_catalog_leak_and_oauth_cancellation() {
+        let provider_requests = [
+            (
+                Request::GetProviderCatalogSnapshot {
+                    project_root: "/project".into(),
+                    provider_id: None,
+                    snapshot_session_id: "snapshot".into(),
+                },
+                15,
+            ),
+            (
+                Request::ApplyProviderMutation {
+                    snapshot_session_id: "snapshot".into(),
+                    layer_id: "layer".into(),
+                    expected_revision: "revision".into(),
+                    client_operation_id: "operation".into(),
+                    mutation_intent_hash: "00".repeat(32),
+                    mutation: ProviderMutationBatch {
+                        upserts: Vec::new(),
+                        deletes: Vec::new(),
+                        metadata: None,
+                    },
+                },
+                17,
+            ),
+        ];
+        for (request, expected_version) in provider_requests {
+            assert_eq!(
+                body_required_protocol_version(&Body::Request {
+                    id: Uuid::nil(),
+                    #[cfg(feature = "remote")]
+                    operation: None,
+                    request,
+                })
+                .0,
+                expected_version
+            );
+        }
+        for (response, expected_version) in [
+            (
+                Response::ProviderCatalogSnapshot {
+                    config: ProviderConfigView::default(),
+                    snapshot_session_id: "snapshot".into(),
+                    layer_id: "layer".into(),
+                    owner_root: "/project".into(),
+                    base_revision: "revision".into(),
+                    config_generation: 1,
+                },
+                17,
+            ),
+            (
+                Response::ProviderMutationCommitted {
+                    client_operation_id: "operation".into(),
+                    snapshot_session_id: "snapshot".into(),
+                    layer_id: "layer".into(),
+                    owner_root: "/project".into(),
+                    mutation_intent_hash: "00".repeat(32),
+                    consumed_revision: "revision".into(),
+                    result_revision: "next".into(),
+                    config_generation: 2,
+                    config: ProviderConfigView::default(),
+                    status: ConfigCommitStatus::Committed,
+                    publication: ConfigPublicationStatus::Published,
+                },
+                17,
+            ),
+        ] {
+            assert_eq!(
+                body_required_protocol_version(&Body::Response {
+                    id: Uuid::nil(),
+                    response: Box::new(response),
+                })
+                .0,
+                expected_version
+            );
+        }
+
+        assert_eq!(
+            body_required_protocol_version(&Body::Request {
+                id: Uuid::nil(),
+                #[cfg(feature = "remote")]
+                operation: None,
+                request: Request::CancelLeakReveal {
+                    capability: LeakRevealToken::new("00".repeat(32)),
+                },
+            })
+            .0,
+            16
+        );
+        assert_eq!(
+            body_required_protocol_version(&Body::Request {
+                id: Uuid::nil(),
+                #[cfg(feature = "remote")]
+                operation: None,
+                request: Request::CancelProviderOAuth {
+                    client_operation_id: "cancel".into(),
+                    begin_client_operation_id: "begin".into(),
+                    flow_id: Some("flow".into()),
+                },
+            })
+            .0,
+            17
+        );
+        assert_eq!(
+            body_required_protocol_version(&Body::Response {
+                id: Uuid::nil(),
+                response: Box::new(Response::LeakRevealCancelled {
+                    report_id: "report".into(),
+                }),
+            })
+            .0,
+            16
+        );
+    }
+
+    #[test]
     fn redacted_export_request_response_and_reader_require_v10() {
         // #3: even the DEFAULT (redacted) export request is v10-only now — it
         // returns the v10-only `redacted_export` bulk kind and requires the
@@ -6474,29 +6831,142 @@ mod tests {
     }
 
     #[test]
-    fn every_new_oauth_and_durable_save_surface_requires_v10() {
+    fn durable_owner_receipts_and_mutations_require_v17() {
         for request in [
+            Request::PutProviderCredential {
+                client_operation_id: "put-provider".into(),
+                provider_id: "example".into(),
+                record: SensitiveWirePayload::new("{}".into()),
+            },
+            Request::DeleteProviderCredential {
+                client_operation_id: "delete-provider".into(),
+                provider_id: "example".into(),
+                project_root: None,
+            },
+            Request::GetLocalOperationSettlement {
+                client_operation_id: "settlement".into(),
+            },
+            Request::SaveMcpConfig {
+                client_operation_id: "save-mcp".into(),
+                project_root: "/tmp/project".into(),
+                snapshot_capability: "snapshot".into(),
+                owner_root: "/tmp/project".into(),
+                config_path: "/tmp/project/.cockpit/mcp.json".into(),
+                expected_revision: "00".repeat(32),
+                mutation_intent_hash: "11".repeat(32),
+                config_json: "{}".into(),
+                secret_values_json: SensitiveWirePayload::new("{}".into()),
+                cleanup_names_json: "[]".into(),
+            },
+            Request::ApplyExtendedConfigPatch {
+                client_operation_id: "patch-config".into(),
+                project_root: "/tmp/project".into(),
+                layer_id: "layer".into(),
+                patch: ExtendedConfigPatch {
+                    operations: Vec::new(),
+                    materialize: true,
+                    denylist: Vec::new(),
+                    redacted_mutations: Vec::new(),
+                },
+                expected_revision: "00".repeat(32),
+                snapshot_session_id: "snapshot".into(),
+            },
             Request::BeginProviderOAuth {
+                client_operation_id: "begin-provider".into(),
                 provider_id: "codex-oauth".into(),
             },
             Request::CompleteProviderOAuth {
+                client_operation_id: "complete-provider".into(),
                 flow_id: "flow".into(),
                 input: None,
             },
+            Request::CancelProviderOAuth {
+                client_operation_id: "cancel-provider".into(),
+                begin_client_operation_id: "begin-provider".into(),
+                flow_id: Some("flow".into()),
+            },
             Request::BeginMcpOAuth {
+                client_operation_id: "begin-mcp".into(),
                 project_root: "/tmp/project".into(),
                 server: "server".into(),
             },
             Request::CompleteMcpOAuth {
+                client_operation_id: "complete-mcp".into(),
                 flow_id: "flow".into(),
                 input: None,
             },
             Request::CancelMcpOAuth {
-                flow_id: "flow".into(),
+                client_operation_id: "cancel-mcp".into(),
+                begin_client_operation_id: "begin-mcp".into(),
+                flow_id: Some("flow".into()),
+            },
+            Request::SaveImageSpendPolicy {
+                client_operation_id: "save-image-spend".into(),
+                project_key: "project".into(),
+                settings_json: "{}".into(),
+                expected_policy_version: None,
             },
             Request::SetupCopilotAuth {
+                client_operation_id: "setup-copilot".into(),
                 project_root: "/tmp/project".into(),
                 provider_id: "copilot".into(),
+            },
+            Request::BeginAgentEditorLease {
+                client_operation_id: "begin-editor".into(),
+                project_root: "/tmp/project".into(),
+                name: "build".into(),
+                expected_revision: "00".repeat(32),
+            },
+            Request::CompleteAgentEditorLease {
+                client_operation_id: "complete-editor".into(),
+                project_root: "/tmp/project".into(),
+                lease_id: Uuid::nil().to_string(),
+                markdown: None,
+            },
+            Request::GetAgentEditorLeaseSettlement {
+                client_operation_id: "complete-editor".into(),
+                project_root: "/tmp/project".into(),
+                lease_id: Uuid::nil().to_string(),
+            },
+            Request::MutateAgent {
+                client_operation_id: "mutate-agent".into(),
+                mutation_intent_hash: agent_mutation_intent_hash(
+                    "/tmp/project",
+                    &AgentMutation::ResetAllBuiltins,
+                    Some(&"00".repeat(32)),
+                ),
+                project_root: "/tmp/project".into(),
+                mutation: AgentMutation::ResetAllBuiltins,
+                expected_revision: Some("00".repeat(32)),
+            },
+            Request::SaveAssistantDefinition {
+                client_operation_id: "save-assistant".into(),
+                mutation_intent_hash: assistant_mutation_intent_hash(
+                    "/tmp/project",
+                    "save",
+                    "build",
+                    &"00".repeat(32),
+                    Some("# build"),
+                ),
+                project_root: "/tmp/project".into(),
+                name: "build".into(),
+                markdown: "# build".into(),
+                expected_revision: "00".repeat(32),
+                expected_config_generation: 7,
+            },
+            Request::DeleteAssistant {
+                client_operation_id: "delete-assistant".into(),
+                mutation_intent_hash: assistant_mutation_intent_hash(
+                    "/tmp/project",
+                    "delete",
+                    "build",
+                    &"00".repeat(32),
+                    None,
+                ),
+                project_root: "/tmp/project".into(),
+                name: "build".into(),
+                expected_revision: "00".repeat(32),
+                expected_config_generation: 7,
             },
         ] {
             assert_eq!(
@@ -6507,33 +6977,165 @@ mod tests {
                     request,
                 })
                 .0,
-                10
+                17
             );
         }
         for response in [
             Response::ProviderOAuthStarted {
+                client_operation_id: "begin-provider".into(),
+                request_hash: "00".repeat(32),
                 flow_id: "flow".into(),
                 authorize_url: "https://example.test".into(),
                 user_code: None,
             },
             Response::ProviderOAuthCompleted {
+                client_operation_id: "complete-provider".into(),
+                request_hash: "00".repeat(32),
+                flow_id: "flow".into(),
                 logged_in: true,
                 retry_after_seconds: None,
             },
+            Response::ProviderOAuthCancelled {
+                client_operation_id: "cancel-provider".into(),
+                request_hash: "00".repeat(32),
+                flow_id: Some("flow".into()),
+                cancelled: true,
+            },
             Response::McpOAuthStarted {
+                client_operation_id: "begin-mcp".into(),
+                request_hash: "00".repeat(32),
                 flow_id: "flow".into(),
                 authorize_url: "https://example.test".into(),
             },
             Response::McpOAuthCompleted {
+                client_operation_id: "complete-mcp".into(),
+                request_hash: "00".repeat(32),
+                flow_id: "flow".into(),
                 authenticated: true,
             },
-            Response::McpOAuthCancelled { cancelled: true },
-            Response::McpConfigSaved {
+            Response::McpOAuthCancelled {
+                client_operation_id: "cancel-mcp".into(),
+                request_hash: "00".repeat(32),
+                flow_id: Some("flow".into()),
+                cancelled: true,
+            },
+            Response::McpConfigCommitted {
+                client_operation_id: "save-mcp".into(),
+                request_hash: "22".repeat(32),
+                mutation_intent_hash: "33".repeat(32),
+                project_root: "/workspace".into(),
+                owner_root: "/workspace".into(),
+                config_path: "/workspace/.cockpit/mcp.json".into(),
+                consumed_revision: "00".repeat(32),
+                result_revision: "11".repeat(32),
+                config_generation: 7,
                 credential_count: 0,
             },
-            Response::ProviderCredentialDeleted {
-                found: true,
-                deleted: true,
+            Response::ImageSpendPolicySaved {
+                client_operation_id: "save-image-spend".into(),
+                project_key: "project".into(),
+                request_hash: "99".repeat(32),
+                consumed_policy_version: None,
+                result_policy_version: 1,
+            },
+            Response::ProviderCredentialCommitted {
+                client_operation_id: "delete-provider".into(),
+                mutation_intent_hash: "22".repeat(32),
+                provider_id: "example".into(),
+                project_root: None,
+                owner_root: None,
+                owner_scope: "global".into(),
+                stored: false,
+                changed: true,
+                consumed_vault_generation: 6,
+                result_vault_generation: 7,
+                config_generation: 7,
+            },
+            Response::SubscriptionAckCommitted {
+                client_operation_id: "subscription-ack".into(),
+                provider_id: "codex-oauth".into(),
+                request_hash: "33".repeat(32),
+                changed: true,
+                consumed_vault_generation: 6,
+                result_vault_generation: 7,
+            },
+            Response::ExtendedConfigSaved {
+                client_operation_id: "patch-config".into(),
+                request_hash: "44".repeat(32),
+                mutation_intent_hash: "45".repeat(32),
+                hash: "55".repeat(32),
+                config_generation: 7,
+                layer_id: "layer".into(),
+                layer: CockpitConfigLayer::Project,
+                consumed_revision: "66".repeat(32),
+                result_revision: "77".repeat(32),
+                status: ConfigCommitStatus::Committed,
+                publication: ConfigPublicationStatus::Published,
+                denylist: Vec::new(),
+            },
+            Response::CopilotAuthCommitted {
+                client_operation_id: "setup-copilot".into(),
+                mutation_intent_hash: "78".repeat(32),
+                project_root: "/tmp/project".into(),
+                owner_root: "/tmp/project".into(),
+                owner_scope: "project:/tmp/project".into(),
+                provider_id: "copilot".into(),
+                consumed_vault_generation: 6,
+                result_vault_generation: 7,
+                config_generation: 7,
+            },
+            Response::LocalOperationSettlement {
+                client_operation_id: "settlement".into(),
+                operation_kind: "save_mcp_config".into(),
+                request_hash: "88".repeat(32),
+                pending: true,
+                response: None,
+                terminal_error: None,
+                terminal_cancelled: false,
+            },
+            Response::AgentMutated(AgentMutationResult {
+                client_operation_id: "mutate-agent".into(),
+                mutation_intent_hash: "98".repeat(32),
+                project_root: "/tmp/project".into(),
+                requested_project_root: "/tmp/project".into(),
+                owner_scope: "project:/tmp/project".into(),
+                agent_name: None,
+                changed: true,
+                affected: 1,
+                snapshot: None,
+                consumed_config_generation: 6,
+                result_config_generation: 7,
+                config_generation: 7,
+                inventory_revision: Some("99".repeat(32)),
+                consumed_revision: Some("00".repeat(32)),
+                result_revision: "99".repeat(32),
+                completed_lease_id: None,
+                outcome: AgentMutationOutcome::Reconciled,
+            }),
+            Response::AssistantDefinitionSaved {
+                client_operation_id: "save-assistant".into(),
+                mutation_intent_hash: "aa".repeat(32),
+                project_root: "/tmp/project".into(),
+                requested_project_root: "/tmp/project".into(),
+                name: "build".into(),
+                assistant: None,
+                consumed_revision: "00".repeat(32),
+                result_revision: "11".repeat(32),
+                consumed_config_generation: 6,
+                result_config_generation: 7,
+                outcome: AgentMutationOutcome::Reconciled,
+            },
+            Response::AssistantDeleted {
+                client_operation_id: "delete-assistant".into(),
+                mutation_intent_hash: "bb".repeat(32),
+                project_root: "/tmp/project".into(),
+                requested_project_root: "/tmp/project".into(),
+                name: "build".into(),
+                consumed_revision: "00".repeat(32),
+                result_revision: "22".repeat(32),
+                consumed_config_generation: 6,
+                result_config_generation: 7,
+                outcome: AgentMutationOutcome::Reconciled,
             },
         ] {
             assert_eq!(
@@ -6542,7 +7144,7 @@ mod tests {
                     response: Box::new(response),
                 })
                 .0,
-                10
+                17
             );
         }
     }
@@ -6591,8 +7193,18 @@ mod tests {
                 name: "helper-bot".into(),
             },
             Request::DeleteAssistant {
+                client_operation_id: "delete-assistant".into(),
+                mutation_intent_hash: assistant_mutation_intent_hash(
+                    "/tmp/project",
+                    "delete",
+                    "helper-bot",
+                    "revision",
+                    None,
+                ),
+                project_root: "/tmp/project".into(),
                 name: "helper-bot".into(),
                 expected_revision: "revision".into(),
+                expected_config_generation: 7,
             },
             Request::DiagnoseMediaReservation {
                 scope: "session".into(),
@@ -6664,9 +7276,16 @@ mod tests {
             },
             Response::Assistant { assistant: None },
             Response::AssistantDeleted {
+                client_operation_id: "delete-assistant".into(),
+                mutation_intent_hash: "11".repeat(32),
+                project_root: "/tmp/project".into(),
+                requested_project_root: "/tmp/project".into(),
                 name: "helper".into(),
-                consumed_registration_revision: "revision".into(),
-                deleted: true,
+                consumed_revision: "revision".into(),
+                result_revision: "22".repeat(32),
+                consumed_config_generation: 1,
+                result_config_generation: 2,
+                outcome: AgentMutationOutcome::Reconciled,
             },
             Response::MediaReservationDiagnosis {
                 diagnosis_json: "{}".into(),
@@ -6927,7 +7546,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v14_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v17_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -6978,13 +7597,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 14);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 14);
+        assert_eq!(PROTOCOL_VERSION, 17);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 17);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v14 config_refreshed fixture")
+                .expect("current v17 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -6999,20 +7618,20 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 14);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 14);
+        assert_eq!(PROTOCOL_VERSION, 17);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 17);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v14 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v17 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v14 {response_name} must freeze the inclusive verification cap"
+                "current v17 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v14 {response_name} must deserialize: {error}")
+                panic!("current v17 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -7025,18 +7644,33 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v14 {response_name} assistant identity is invalid: {error}")
+                panic!("current v17 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v14 assistant inventory must carry bounded opaque revisions");
+            .expect("current v17 assistant inventory must carry bounded opaque revisions");
+        assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
+        assert_eq!(
+            fixture["agent_inventory"]["data"]["config_generation"],
+            fixture["assistants"]["data"]["config_generation"]
+        );
+        assert_eq!(
+            fixture["agent_inventory"]["data"]["project_root"],
+            fixture["agent_inventory"]["data"]["requested_project_root"]
+        );
     }
 
     #[test]
     fn authority_commit_receipts_are_frozen_in_current_response_fixtures() {
         let fixture = proto_fixture_files::read_fixture("response.json");
+        assert!(
+            fixture["app_flag"]["data"]
+                .get("client_operation_id")
+                .is_none()
+        );
+        assert!(fixture["app_flag"]["data"].get("request_hash").is_none());
         let denylist = &fixture["extended_config_saved"]["data"]["denylist"];
         assert_eq!(
             denylist[0]["consumed_entry_id"],
@@ -7052,10 +7686,140 @@ mod tests {
             fixture["agent_mutated"]["data"]["outcome"]["status"],
             "reconciled"
         );
+        for receipt in ["assistant_definition_saved", "assistant_deleted"] {
+            let data = &fixture[receipt]["data"];
+            assert!(data["client_operation_id"].is_string());
+            assert_eq!(data["mutation_intent_hash"].as_str().unwrap().len(), 64);
+            assert!(data["project_root"].is_string());
+            assert!(data["requested_project_root"].is_string());
+            assert!(data["name"].is_string());
+            assert!(data["consumed_revision"].is_string());
+            assert!(data["result_revision"].is_string());
+            assert!(
+                data["result_config_generation"].as_u64().unwrap()
+                    > data["consumed_config_generation"].as_u64().unwrap()
+            );
+        }
+        let agent = &fixture["agent_mutated"]["data"];
+        assert!(agent["client_operation_id"].is_string());
         assert_eq!(
-            fixture["agent_editor_lease_completed"]["data"]["outcome"]["status"],
+            agent["mutation_intent_hash"].as_str().map(str::len),
+            Some(64)
+        );
+        assert!(agent["project_root"].is_string());
+        assert!(agent["requested_project_root"].is_string());
+        assert_eq!(agent["owner_scope"], "project:/tmp/project");
+        assert!(agent["result_revision"].is_string());
+        assert_eq!(agent["consumed_config_generation"], 7);
+        assert_eq!(agent["result_config_generation"], 8);
+        assert_eq!(agent["config_generation"], 8);
+        assert_eq!(
+            fixture["agent_editor_lease_completed"]["data"]["status"]["outcome"]["status"],
             "reconciled"
         );
+    }
+
+    #[test]
+    fn oauth_v17_receipts_are_correlated_and_recoverable() {
+        let requests = proto_fixture_files::read_fixture("request.json");
+        for tag in [
+            "begin_provider_oauth",
+            "complete_provider_oauth",
+            "cancel_provider_oauth",
+            "begin_mcp_oauth",
+            "complete_mcp_oauth",
+            "cancel_mcp_oauth",
+        ] {
+            assert!(requests[tag]["params"]["client_operation_id"].is_string());
+        }
+        let mcp = &requests["save_mcp_config"]["params"];
+        for field in [
+            "snapshot_capability",
+            "owner_root",
+            "config_path",
+            "expected_revision",
+            "mutation_intent_hash",
+        ] {
+            assert!(
+                mcp[field].is_string(),
+                "current v17 MCP CAS fixture must carry {field}"
+            );
+        }
+        assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
+        assert_eq!(mcp["mutation_intent_hash"].as_str().map(str::len), Some(64));
+        for tag in ["cancel_provider_oauth", "cancel_mcp_oauth"] {
+            assert!(requests[tag]["params"]["begin_client_operation_id"].is_string());
+        }
+
+        let responses = proto_fixture_files::read_fixture("response.json");
+        for tag in [
+            "provider_oauth_started",
+            "provider_oauth_completed",
+            "provider_oauth_cancelled",
+            "mcp_oauth_started",
+            "mcp_oauth_completed",
+            "mcp_oauth_cancelled",
+        ] {
+            assert!(responses[tag]["data"]["client_operation_id"].is_string());
+            assert_eq!(
+                responses[tag]["data"]["request_hash"]
+                    .as_str()
+                    .map(str::len),
+                Some(64)
+            );
+        }
+    }
+
+    #[test]
+    fn settings_v17_receipts_bind_exact_operations_and_content() {
+        let requests = proto_fixture_files::read_fixture("request.json");
+        for tag in [
+            "put_provider_credential",
+            "delete_provider_credential",
+            "save_mcp_config",
+            "apply_extended_config_patch",
+            "get_local_operation_settlement",
+            "setup_copilot_auth",
+        ] {
+            assert!(
+                requests[tag]["params"]["client_operation_id"].is_string(),
+                "current v17 fixture must carry an operation id for {tag}"
+            );
+        }
+        let responses = proto_fixture_files::read_fixture("response.json");
+        let receipt = &responses["extended_config_saved"]["data"];
+        assert!(receipt["client_operation_id"].is_string());
+        assert_eq!(receipt["request_hash"].as_str().map(str::len), Some(64));
+        let mcp = &responses["mcp_config_committed"]["data"];
+        assert_eq!(mcp["request_hash"].as_str().map(str::len), Some(64));
+    }
+
+    #[test]
+    fn editor_v17_settlement_is_correlated_and_document_free() {
+        let requests = proto_fixture_files::read_fixture("request.json");
+        for tag in [
+            "complete_agent_editor_lease",
+            "get_agent_editor_lease_settlement",
+        ] {
+            assert!(requests[tag]["params"]["client_operation_id"].is_string());
+            assert!(requests[tag]["params"]["lease_id"].is_string());
+        }
+        assert!(
+            requests["get_agent_editor_lease_settlement"]["params"]
+                .get("markdown")
+                .is_none()
+        );
+
+        let responses = proto_fixture_files::read_fixture("response.json");
+        let begun = &responses["agent_editor_lease_begun"]["data"];
+        assert!(begun["client_operation_id"].is_string());
+        let receipt = &responses["agent_editor_lease_completed"]["data"];
+        assert!(receipt["client_operation_id"].is_string());
+        assert!(receipt["lease_id"].is_string());
+        assert!(receipt["consumed_revision"].is_string());
+        assert!(receipt["status"]["result_revision"].is_string());
+        assert!(receipt.get("markdown").is_none());
+        assert!(receipt.get("snapshot").is_none());
     }
 
     #[test]

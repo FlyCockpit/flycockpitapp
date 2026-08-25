@@ -94,11 +94,16 @@ async fn leak_reveal_capability_single_use_and_expiry() {
     let cap = begin_capability(&ctx, &report_id).await;
     // Returned as 64 lowercase hex chars (32 raw token bytes at rest).
     assert_eq!(cap.capability.len(), 64);
-    assert!(cap.capability.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(
+        cap.capability
+            .as_str()
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+    );
     assert_eq!(cap.report_id, report_id);
 
     let now = cap.expires_at_ms - 1_000;
-    let revealed = consume_leak_reveal(&ctx, &cap.capability, now)
+    let revealed = consume_leak_reveal(&ctx, cap.capability.as_str(), now)
         .await
         .expect("first reveal succeeds");
     assert_eq!(revealed.plaintext.as_str(), secret);
@@ -106,7 +111,7 @@ async fn leak_reveal_capability_single_use_and_expiry() {
 
     // Second reveal with the same capability -> consumed -> Unauthorized.
     assert_eq!(
-        consume_leak_reveal(&ctx, &cap.capability, now)
+        consume_leak_reveal(&ctx, cap.capability.as_str(), now)
             .await
             .unwrap_err(),
         LeakRevealDenied::Unauthorized
@@ -115,7 +120,7 @@ async fn leak_reveal_capability_single_use_and_expiry() {
     // Expiry: a fresh capability revealed after its expiry -> Unauthorized.
     let cap2 = begin_capability(&ctx, &report_id).await;
     assert_eq!(
-        consume_leak_reveal(&ctx, &cap2.capability, cap2.expires_at_ms)
+        consume_leak_reveal(&ctx, cap2.capability.as_str(), cap2.expires_at_ms)
             .await
             .unwrap_err(),
         LeakRevealDenied::Unauthorized
@@ -135,7 +140,7 @@ async fn leak_reveal_capability_single_use_and_expiry() {
         "the replacement must mint a fresh token"
     );
     assert_eq!(
-        consume_leak_reveal(&ctx, &cap_a.capability, cap_b.expires_at_ms - 1_000)
+        consume_leak_reveal(&ctx, cap_a.capability.as_str(), cap_b.expires_at_ms - 1_000)
             .await
             .unwrap_err(),
         LeakRevealDenied::Unauthorized,
@@ -143,17 +148,22 @@ async fn leak_reveal_capability_single_use_and_expiry() {
     );
     // A freshly minted token reveals — the slot mechanism recovers.
     let cap_c = begin_capability(&ctx, &report_id).await;
-    let revealed = consume_leak_reveal(&ctx, &cap_c.capability, cap_c.expires_at_ms - 1_000)
-        .await
-        .expect("a freshly minted token reveals");
+    let revealed =
+        consume_leak_reveal(&ctx, cap_c.capability.as_str(), cap_c.expires_at_ms - 1_000)
+            .await
+            .expect("a freshly minted token reveals");
     assert_eq!(revealed.plaintext.as_str(), secret);
 
     // Restart: a fresh context (empty slot) rejects a previously minted token.
     let fresh = test_context_for_daemon_modules();
     assert_eq!(
-        consume_leak_reveal(&fresh, &cap_c.capability, cap_c.expires_at_ms - 1_000)
-            .await
-            .unwrap_err(),
+        consume_leak_reveal(
+            &fresh,
+            cap_c.capability.as_str(),
+            cap_c.expires_at_ms - 1_000,
+        )
+        .await
+        .unwrap_err(),
         LeakRevealDenied::Unauthorized
     );
 }
@@ -216,7 +226,7 @@ async fn leak_reveal_denied_indistinguishable_unauthorized() {
 
     // Tampered token: flip one hex nibble of a valid capability.
     let cap = begin_capability(&ctx, &report_id).await;
-    let mut tampered = cap.capability.clone();
+    let mut tampered = cap.capability.clone().into_zeroizing();
     let first = tampered.remove(0);
     tampered.insert(0, if first == '0' { '1' } else { '0' });
     let tampered_err = consume_leak_reveal(&ctx, &tampered, cap.expires_at_ms - 1)
@@ -225,16 +235,16 @@ async fn leak_reveal_denied_indistinguishable_unauthorized() {
 
     // Expired token.
     let cap = begin_capability(&ctx, &report_id).await;
-    let expired = consume_leak_reveal(&ctx, &cap.capability, cap.expires_at_ms)
+    let expired = consume_leak_reveal(&ctx, cap.capability.as_str(), cap.expires_at_ms)
         .await
         .unwrap_err();
 
     // Consumed token (second use).
     let cap = begin_capability(&ctx, &report_id).await;
-    consume_leak_reveal(&ctx, &cap.capability, cap.expires_at_ms - 1)
+    consume_leak_reveal(&ctx, cap.capability.as_str(), cap.expires_at_ms - 1)
         .await
         .unwrap();
-    let consumed = consume_leak_reveal(&ctx, &cap.capability, cap.expires_at_ms - 1)
+    let consumed = consume_leak_reveal(&ctx, cap.capability.as_str(), cap.expires_at_ms - 1)
         .await
         .unwrap_err();
 
@@ -243,7 +253,7 @@ async fn leak_reveal_denied_indistinguishable_unauthorized() {
     super::dispatch::delete_leak_report(&ctx, report_id.clone())
         .await
         .unwrap();
-    let after_delete = consume_leak_reveal(&ctx, &cap.capability, cap.expires_at_ms - 1)
+    let after_delete = consume_leak_reveal(&ctx, cap.capability.as_str(), cap.expires_at_ms - 1)
         .await
         .unwrap_err();
 
@@ -388,9 +398,12 @@ async fn leak_reveal_unix_peercred_end_to_end() {
     // A wrong-length / non-hex capability fails closed (the client rejects a
     // non-64 capability before contacting the daemon).
     assert_eq!(
-        crate::daemon::leak_reveal_socket::reveal_leak_secret_over_socket(&reveal_path, "abcd")
-            .await
-            .unwrap_err(),
+        crate::daemon::leak_reveal_socket::reveal_leak_secret_over_socket(
+            &reveal_path,
+            &proto::LeakRevealToken::new("abcd".into()),
+        )
+        .await
+        .unwrap_err(),
         LeakRevealDenied::Unauthorized
     );
     // A structurally valid but non-hex 64-char capability -> Unauthorized after
@@ -400,7 +413,7 @@ async fn leak_reveal_unix_peercred_end_to_end() {
     assert_eq!(
         crate::daemon::leak_reveal_socket::reveal_leak_secret_over_socket(
             &reveal_path,
-            &"z".repeat(64),
+            &proto::LeakRevealToken::new("z".repeat(64)),
         )
         .await
         .unwrap_err(),

@@ -172,6 +172,7 @@ impl App {
 
     pub(super) fn drain_async_actions(&mut self) -> bool {
         self.start_pending_goal_settings_effect();
+        self.start_pending_settings_daemon_effects();
         // Cancellation is a terminal runner outcome; most kinds intentionally
         // skip UI mutation. Session switch/resume must still settle provisional
         // buffers, order, and the cleared-view failure contract.
@@ -255,6 +256,40 @@ impl App {
         );
     }
 
+    fn start_pending_settings_daemon_effects(&mut self) {
+        while let Some(effect) = self.dialog.take_settings_daemon_effect() {
+            let dialog_id = effect.dialog_id;
+            let operation_id = effect.operation_id;
+            let target = effect.target;
+            let request = effect.request;
+            self.async_actions.start(
+                AsyncActionKind::DaemonRpc("settings.effect"),
+                AsyncActionPolicy::AllowConcurrent,
+                async move {
+                    let response = async {
+                        let client = crate::tui::settings::settings_daemon_client()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        client
+                            .request(request)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .map_err(|error| error.to_string())
+                    }
+                    .await;
+                    Ok(AsyncActionPayload::SettingsDaemon(
+                        crate::tui::settings::SettingsDaemonEffectCompletion {
+                            dialog_id,
+                            operation_id,
+                            target,
+                            response,
+                        },
+                    ))
+                },
+            );
+        }
+    }
+
     pub(super) fn apply_async_action_result(&mut self, result: AsyncActionResult) {
         // Provisional `/new` owns a cleared view. Only the switch/resume
         // settlement path and outgoing delivery-receipt fence bookkeeping may
@@ -270,6 +305,11 @@ impl App {
             return;
         }
         match result.kind {
+            AsyncActionKind::DaemonRpc("settings.effect") => {
+                if let Ok(AsyncActionPayload::SettingsDaemon(completion)) = result.payload {
+                    self.dialog.apply_settings_daemon_completion(completion);
+                }
+            }
             AsyncActionKind::DaemonRpc("goal-settings.effect") => {
                 let outcome = match result.payload {
                     Ok(AsyncActionPayload::GoalSettings(completion)) => match &mut self.overlay {

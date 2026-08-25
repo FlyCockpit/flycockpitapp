@@ -67,7 +67,7 @@ mod tools_page;
 mod ui_page;
 
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -97,6 +97,32 @@ pub(crate) async fn settings_daemon_client()
     Ok(cockpit_core::daemon::client::ensure_persistent_daemon()
         .await?
         .client)
+}
+
+/// A daemon request emitted by a synchronous settings reducer. The target is
+/// explicit authority context rather than display text, allowing the
+/// completion reducer to reject stale results before interpreting the body.
+#[derive(Debug)]
+pub(crate) struct SettingsDaemonEffectRequest {
+    pub(crate) dialog_id: uuid::Uuid,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) target: SettingsEffectTarget,
+    pub(crate) request: Request,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettingsEffectTarget {
+    pub(crate) surface: &'static str,
+    pub(crate) owner: String,
+    pub(crate) revision: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SettingsDaemonEffectCompletion {
+    pub(crate) dialog_id: uuid::Uuid,
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) target: SettingsEffectTarget,
+    pub(crate) response: Result<Response, String>,
 }
 
 /// Run a short daemon RPC from an input reducer. Production reducers execute
@@ -1321,6 +1347,8 @@ impl std::fmt::Debug for TestPageMut<'_> {
 }
 
 pub struct SettingsCx {
+    dialog_id: uuid::Uuid,
+    daemon_effects: VecDeque<SettingsDaemonEffectRequest>,
     pub config_path: PathBuf,
     /// Path to the cockpit-only config keys. Same `config.json` as
     /// [`config_path`](Self::config_path) (GOALS §2a) — the provider/model
@@ -1417,6 +1445,24 @@ pub struct SettingsCx {
 }
 
 impl SettingsCx {
+    fn enqueue_daemon_effect(
+        &mut self,
+        target: SettingsEffectTarget,
+        request: Request,
+    ) -> uuid::Uuid {
+        let operation_id = uuid::Uuid::new_v4();
+        self.daemon_effects.push_back(SettingsDaemonEffectRequest {
+            dialog_id: self.dialog_id,
+            operation_id,
+            target,
+            request,
+        });
+        operation_id
+    }
+
+    fn take_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
+        self.daemon_effects.pop_front()
+    }
     /// Return a cached metadata-only inventory answer and arrange a background
     /// refresh on a cache miss.  This is deliberately safe to call from a
     /// renderer: it never waits on the daemon or opens a local secret store.
@@ -2533,6 +2579,26 @@ impl Dialog {
         }
     }
 
+    pub(crate) fn take_settings_daemon_effect(&mut self) -> Option<SettingsDaemonEffectRequest> {
+        match self {
+            Dialog::Settings(settings) => settings.cx.take_daemon_effect(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn apply_settings_daemon_completion(
+        &mut self,
+        completion: SettingsDaemonEffectCompletion,
+    ) {
+        let Dialog::Settings(settings) = self else {
+            return;
+        };
+        if completion.dialog_id != settings.cx.dialog_id {
+            return;
+        }
+        settings.apply_daemon_completion(completion);
+    }
+
     pub fn apply_host_capabilities(
         &mut self,
         snapshot: cockpit_proto::HostCapabilitySnapshot,
@@ -2690,6 +2756,11 @@ fn dispatch_from_settings_action(
 }
 
 impl SettingsDialog {
+    fn apply_daemon_completion(&mut self, completion: SettingsDaemonEffectCompletion) {
+        if let Some(page) = self.page.downcast_mut::<AgentsPage>() {
+            page.apply_daemon_completion(&mut self.cx, completion);
+        }
+    }
     #[cfg(test)]
     pub(crate) fn pointer_test_target_rects(&self) -> Vec<Rect> {
         self.cx
@@ -2996,6 +3067,8 @@ impl SettingsDialog {
             page: root_page(0),
             stack: Vec::new(),
             cx: SettingsCx {
+                dialog_id: uuid::Uuid::new_v4(),
+                daemon_effects: VecDeque::new(),
                 config_path,
                 extended_path,
                 scroll_states: SettingsScrollStates::default(),
@@ -3721,11 +3794,10 @@ impl SettingsDialog {
         outcome: pointer_actions::ExternalEditOutcome,
         detail: Option<String>,
     ) {
-        let cwd = self.agents_cwd();
         let Some(page) = self.page.downcast_mut::<AgentsPage>() else {
             return;
         };
-        page.finish_external_edit(&cwd, operation_id, outcome, detail);
+        page.finish_external_edit(&mut self.cx, operation_id, outcome, detail);
     }
 
     // ── Rendering ────────────────────────────────────────────────────────
@@ -3859,7 +3931,11 @@ impl SettingsPage for RootPage {
                     "Dependencies" => {
                         Some(dependencies_page::page(cx.agents_cwd(), cx.sandbox_enabled))
                     }
-                    "Agents" => Some(agents_page(AgentsPage::new(&cx.agents_cwd()))),
+                    "Agents" => {
+                        let mut page = AgentsPage::new(&cx.agents_cwd());
+                        page.queue_load(cx);
+                        Some(agents_page(page))
+                    }
                     "Interface" => {
                         cx.reload_extended();
                         Some(category_page(CategoryPage::new(Category::Interface)))

@@ -3079,7 +3079,7 @@ pub fn daemon_reveal_leak_blocking(
         }
     };
     let socket = control_socket.to_path_buf();
-    let capability = capability.to_owned();
+    let capability = zeroize::Zeroizing::new(capability.to_owned());
     tokio::task::block_in_place(|| {
         runtime.block_on(async move {
             cockpit_core::daemon::leak_reveal::reveal_leak_secret(&socket, &capability).await

@@ -161,13 +161,18 @@ impl App {
                         cockpit_core::daemon::leak_reveal::LeakRevealDenied::Internal
                     });
                 }
-                let token = capability.capability;
-                let reveal = crate::tui::agent_runner::daemon_reveal_leak_blocking(&socket, &token);
+                let token = zeroize::Zeroizing::new(capability.capability);
+                let reveal =
+                    crate::tui::agent_runner::daemon_reveal_leak_blocking(&socket, token.as_str());
                 if reveal.is_err() {
                     // `RateLimited` and unavailable-channel paths do not consume
                     // the slot. An authorization failure may already have spent
                     // it; exact cancel then harmlessly fails closed.
-                    let _ = cancel_leak_capability_blocking(&socket, token, &worker_report_id);
+                    let _ = cancel_leak_capability_blocking(
+                        &socket,
+                        token.to_string(),
+                        &worker_report_id,
+                    );
                 }
                 reveal
             })();

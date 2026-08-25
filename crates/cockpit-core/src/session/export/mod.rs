@@ -609,10 +609,10 @@ pub async fn write_bundle_zip(
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        crate::private_fs::ensure_output_parent_private(parent)
+        cockpit_host::private_fs::ensure_output_parent_private(parent)
             .with_context(|| format!("securing export directory `{}`", parent.display()))?;
     }
-    crate::private_fs::write_private_export_file(out_path, &bundle.bytes)
+    cockpit_host::private_fs::write_private_export_file(out_path, &bundle.bytes)
         .with_context(|| format!("writing private export to `{}`", out_path.display()))?;
 
     Ok(bundle.summary)
@@ -644,10 +644,10 @@ pub async fn write_bundle_zip_raw_local(
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        crate::private_fs::ensure_output_parent_private(parent)
+        cockpit_host::private_fs::ensure_output_parent_private(parent)
             .with_context(|| format!("securing export directory `{}`", parent.display()))?;
     }
-    crate::private_fs::write_private_export_file(out_path, &bundle.bytes)
+    cockpit_host::private_fs::write_private_export_file(out_path, &bundle.bytes)
         .with_context(|| format!("writing private export to `{}`", out_path.display()))?;
 
     Ok(bundle.summary)

@@ -5,5 +5,7 @@
 //! SQLite ledger, so both the CLI host and `cockpit-core` can depend on it
 //! without creating an authority inversion.
 
+pub mod goal_scratch;
 pub mod path_containment;
+pub mod private_fs;
 pub mod process;

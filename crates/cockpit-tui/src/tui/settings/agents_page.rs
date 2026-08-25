@@ -291,7 +291,7 @@ fn agent_external_edit_staging() -> Result<AgentExternalEditStaging, String> {
         .prefix("cockpit-agent-edit-")
         .tempdir()
         .map_err(|error| format!("failed to create private external-edit directory: {error}"))?;
-    cockpit_core::private_fs::ensure_private_dir(directory.path())
+    cockpit_host::private_fs::ensure_private_dir(directory.path())
         .map_err(|error| format!("failed to secure external-edit directory: {error:#}"))?;
     let path = directory.path().join("assistant.md");
     let directory_handle = cockpit_config::config::open_config_directory_nofollow(directory.path())

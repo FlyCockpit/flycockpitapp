@@ -5297,7 +5297,7 @@ fn open_project_source(root: &Path, relative: &str) -> Result<File> {
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     let mut current = root.canonicalize()?;
     let mut held = Vec::new();
-    crate::goal_scratch::verify_private_dacl(&current)
+    cockpit_host::goal_scratch::verify_private_dacl(&current)
         .context("project root DACL is not protected")?;
     for component in Path::new(relative).components() {
         let Component::Normal(name) = component else {
@@ -5324,7 +5324,7 @@ fn open_project_source(root: &Path, relative: &str) -> Result<File> {
             meta.file_attributes() & 0x400 == 0,
             "media_attachment_unavailable"
         );
-        crate::goal_scratch::verify_private_dacl(&current)
+        cockpit_host::goal_scratch::verify_private_dacl(&current)
             .context("source component DACL is not protected")?;
         held.push(file);
     }

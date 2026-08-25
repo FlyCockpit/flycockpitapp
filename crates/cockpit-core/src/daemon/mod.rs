@@ -87,8 +87,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::private_fs::ensure_private_dir;
 use anyhow::{Context, Result};
+use cockpit_host::private_fs::ensure_private_dir;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
@@ -1086,7 +1086,7 @@ fn spawn_detached_inner(
 #[cfg(unix)]
 fn open_detach_child_log() -> Option<std::fs::File> {
     let dir = dirs::cache_dir()?.join("cockpit");
-    crate::private_fs::ensure_private_dir(&dir).ok()?;
+    cockpit_host::private_fs::ensure_private_dir(&dir).ok()?;
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)

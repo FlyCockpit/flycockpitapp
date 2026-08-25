@@ -1132,7 +1132,7 @@ fn save_mcp_config(
     if mutation_intent_hash != supplied_mutation_intent_hash {
         return Err("MCP mutation intent does not match its typed patch".into());
     }
-    cockpit_core::private_fs::ensure_parent_dir_private(&path)
+    cockpit_host::private_fs::ensure_parent_dir_private(&path)
         .map_err(|error| error.to_string())?;
     let _file_lock = cockpit_config::config::hold_config_mutation_lock(&path)
         .map_err(|error| error.to_string())?;
@@ -1263,9 +1263,9 @@ fn save_mcp_config(
     if mcp_revision(root) != consumed_revision {
         return Err("MCP target changed before publication".into());
     }
-    cockpit_core::private_fs::ensure_parent_dir_private(&path)
+    cockpit_host::private_fs::ensure_parent_dir_private(&path)
         .map_err(|error| error.to_string())?;
-    cockpit_core::private_fs::write_private_file(&path, format!("{body}\n").as_bytes())
+    cockpit_host::private_fs::write_private_file(&path, format!("{body}\n").as_bytes())
         .map_err(|error| format!("writing mcp.json: {error}"))?;
     let credential_count = 0;
     let config_generation = publish_config_generation();

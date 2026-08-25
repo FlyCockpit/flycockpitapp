@@ -210,7 +210,7 @@ fn create_assistant_with_installation_id_sync(
     if spec.home_dir != canonical_home {
         bail!("assistant creation requires the daemon-owned canonical home");
     }
-    crate::private_fs::ensure_private_dir(&spec.home_dir)
+    cockpit_host::private_fs::ensure_private_dir(&spec.home_dir)
         .with_context(|| format!("creating assistant home {}", spec.home_dir.display()))?;
     let path = assistant_definition_path(&spec.home_dir);
     let _guard = cockpit_config::config::hold_config_mutation_lock(&path)?;
@@ -1107,7 +1107,7 @@ fn build_unregister_journal(
 
 fn persist_unregister_journal(journal: &UnregisterJournal) -> Result<()> {
     let root = unregister_journal_root()?;
-    crate::private_fs::ensure_private_dir(&root)?;
+    cockpit_host::private_fs::ensure_private_dir(&root)?;
     let bytes = serde_json::to_vec_pretty(journal)?;
     cockpit_config::config::write_config_bytes_atomic(&unregister_journal_path(journal)?, &bytes)?;
     cockpit_config::config::sync_directory_nofollow(&root)
@@ -1129,9 +1129,9 @@ fn quarantine_unregister_journals(
     journal: &UnregisterJournal,
 ) -> Result<()> {
     let root = home.join(".assistant-unregister-quarantine");
-    crate::private_fs::ensure_private_dir(&root)?;
+    cockpit_host::private_fs::ensure_private_dir(&root)?;
     let operation = quarantine_operation_dir(home, journal);
-    crate::private_fs::ensure_private_dir(&operation)?;
+    cockpit_host::private_fs::ensure_private_dir(&operation)?;
     cockpit_config::config::sync_directory_nofollow(&root)?;
     cockpit_config::config::sync_directory_nofollow(&operation)?;
     for artifact in &journal.artifacts {

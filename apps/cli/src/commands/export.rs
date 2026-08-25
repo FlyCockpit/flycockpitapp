@@ -70,13 +70,13 @@ pub async fn run(args: ExportArgs) -> Result<()> {
     if let Some(parent) = out_path.parent()
         && !parent.as_os_str().is_empty()
     {
-        cockpit_core::private_fs::ensure_output_parent_private(parent)
+        cockpit_host::private_fs::ensure_output_parent_private(parent)
             .with_context(|| format!("securing export directory `{}`", parent.display()))?;
     }
     // `write_private_export_file` fails closed on any build that cannot enforce
     // the private-file discipline (0600 / ownership / no-follow), so a secret
     // export never lands world-readable.
-    cockpit_core::private_fs::write_private_export_file(&out_path, &bytes)
+    cockpit_host::private_fs::write_private_export_file(&out_path, &bytes)
         .with_context(|| format!("writing private export to `{}`", out_path.display()))?;
 
     if args.include_sensitive {

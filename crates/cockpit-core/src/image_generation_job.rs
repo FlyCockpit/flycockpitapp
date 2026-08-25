@@ -47,10 +47,6 @@ use crate::media_reservation::{
     definitive_rejection_retry_conn, finish_external_handoff_conn, handoff_external_conn,
 };
 
-pub use crate::private_fs::held_directory::{
-    HeldArtifactEvidence, HeldDirectoryEffectEvidence, HeldDirectoryEffectOutcome,
-    HeldDirectoryRecovery, HeldSealOutcome, HeldSealedArtifact, HeldTemporaryArtifact,
-};
 pub use cockpit_db::image_generation_plan::{
     AttemptPlanV1, CapabilityProvenanceV1, GrantRequirementV1, ImageGenerationPlanV1,
     MAX_IMAGE_GENERATION_ATTEMPTS_PER_SLOT, MAX_IMAGE_GENERATION_DIMENSION,
@@ -58,6 +54,10 @@ pub use cockpit_db::image_generation_plan::{
     OutputSlotPlanV1, ReferenceArtifactV1, RequestedOutputV1, ResolvedOutputV1,
     ResourceReservationV1, SpendReservationPlanV1, TargetDestinationV1, TargetPlanV1,
     TypedParameterV1, VectorSanitizerProvenanceV1,
+};
+pub use cockpit_host::private_fs::held_directory::{
+    HeldArtifactEvidence, HeldDirectoryEffectEvidence, HeldDirectoryEffectOutcome,
+    HeldDirectoryRecovery, HeldSealOutcome, HeldSealedArtifact, HeldTemporaryArtifact,
 };
 
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
@@ -3887,13 +3887,13 @@ impl VerifiedOutputDirectoryAuthority {
 
 #[derive(Debug)]
 pub struct HeldImageGenerationOutputDirectory {
-    guard: crate::private_fs::held_directory::HeldDirectoryAuthority,
+    guard: cockpit_host::private_fs::held_directory::HeldDirectoryAuthority,
     authority: VerifiedOutputDirectoryAuthority,
 }
 
 #[derive(Debug)]
 pub struct HeldImageGenerationArtifactRoot {
-    guard: crate::private_fs::held_directory::HeldDirectoryAuthority,
+    guard: cockpit_host::private_fs::held_directory::HeldDirectoryAuthority,
 }
 
 impl HeldImageGenerationArtifactRoot {
@@ -4195,7 +4195,9 @@ fn held_artifact_evidence_json(evidence: &HeldArtifactEvidence) -> Result<String
 
 pub fn open_image_generation_artifact_root(path: &Path) -> Result<HeldImageGenerationArtifactRoot> {
     Ok(HeldImageGenerationArtifactRoot {
-        guard: crate::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?,
+        guard: cockpit_host::private_fs::held_directory::HeldDirectoryAuthority::open_existing(
+            path,
+        )?,
     })
 }
 
@@ -5018,7 +5020,8 @@ pub fn open_image_generation_output_directory(
     filename_prefix: String,
     extension: String,
 ) -> Result<HeldImageGenerationOutputDirectory> {
-    let guard = crate::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?;
+    let guard =
+        cockpit_host::private_fs::held_directory::HeldDirectoryAuthority::open_existing(path)?;
     let parent_identity_digest = guard.identity().stable_digest.clone();
     let canonical_destination_digest = digest_fields(&[
         guard.identity().platform,
@@ -10225,7 +10228,7 @@ mod tests {
         let temporary = tempfile::TempDir::new().unwrap();
         let output = temporary.path().join("output");
         std::fs::create_dir(&output).unwrap();
-        crate::goal_scratch::set_private(&output).unwrap();
+        cockpit_host::goal_scratch::set_private(&output).unwrap();
         assert!(
             open_image_generation_output_directory(&output, 1, "generated".into(), "png".into())
                 .is_ok()

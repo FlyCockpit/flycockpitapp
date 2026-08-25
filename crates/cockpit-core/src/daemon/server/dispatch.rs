@@ -16115,8 +16115,8 @@ fn mcp_target_layer_revision(path: &std::path::Path) -> std::result::Result<Stri
 fn write_mcp_raw_private(path: &std::path::Path, json: &str) -> anyhow::Result<()> {
     let value: serde_json::Value = serde_json::from_str(json)?;
     let body = serde_json::to_string_pretty(&value)?;
-    crate::private_fs::ensure_parent_dir_private(path)?;
-    crate::private_fs::write_private_file(path, format!("{body}\n").as_bytes())
+    cockpit_host::private_fs::ensure_parent_dir_private(path)?;
+    cockpit_host::private_fs::write_private_file(path, format!("{body}\n").as_bytes())
 }
 
 // Model fetch is parameterized by provider/model selectors plus the fetch-mode
@@ -17842,7 +17842,7 @@ fn classify_provider_journal_file(
             ..
         } => (path, consumed_revision, intended_revision),
     };
-    crate::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+    cockpit_host::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
     let doc = crate::config::providers::ConfigDoc::load(path).map_err(internal)?;
     let actual = provider_config_revision_with_vault(vault, path, &doc.providers())?;
     Ok(if actual == *intended {
@@ -17863,7 +17863,7 @@ fn reconcile_provider_journal_file(
                      intended_revision: &str,
                      desired: Option<crate::config::providers::ProvidersConfig>|
      -> std::result::Result<(), ErrorPayload> {
-        crate::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+        cockpit_host::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
         let mut doc = crate::config::providers::ConfigDoc::load(path).map_err(internal)?;
         let actual = provider_config_revision_with_vault(vault, path, &doc.providers())?;
         if actual == intended_revision {
@@ -19087,7 +19087,7 @@ async fn save_mcp_config(
         ctx.poison_redaction_publication(&error);
         return Err(internal(error));
     }
-    crate::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
+    cockpit_host::private_fs::ensure_parent_dir_private(&path).map_err(internal)?;
     let commit_path = path.clone();
     let commit_config = config_json_owned.clone();
     let commit_consumed = consumed_revision.clone();
@@ -19998,7 +19998,7 @@ fn reconcile_mcp_journal_file(
     consumed_revision: &str,
     intended_revision: &str,
 ) -> std::result::Result<(), ErrorPayload> {
-    crate::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
+    cockpit_host::private_fs::ensure_parent_dir_private(path).map_err(internal)?;
     if canonical_mcp_target_path(path)? != path {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,

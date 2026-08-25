@@ -3425,13 +3425,14 @@ fn reset_all_builtins_atomic_locked(
         return Ok(0);
     }
     let trash_root = trash.parent().expect("trash has parent");
-    crate::private_fs::ensure_private_dir(trash_root).map_err(internal)?;
+    cockpit_host::private_fs::ensure_private_dir(trash_root).map_err(internal)?;
     #[cfg(unix)]
     let _trash_root_handle =
-        crate::private_fs::open_private_dir_handle(trash_root).map_err(internal)?;
-    crate::private_fs::ensure_private_dir(&trash).map_err(internal)?;
+        cockpit_host::private_fs::open_private_dir_handle(trash_root).map_err(internal)?;
+    cockpit_host::private_fs::ensure_private_dir(&trash).map_err(internal)?;
     #[cfg(unix)]
-    let _trash_handle = crate::private_fs::open_private_dir_handle(&trash).map_err(internal)?;
+    let _trash_handle =
+        cockpit_host::private_fs::open_private_dir_handle(&trash).map_err(internal)?;
     // The prepared journal may refer to this staging directory immediately
     // after publication, so persist both the directory itself and its parent
     // first. Recovery must never observe a durable journal naming a directory

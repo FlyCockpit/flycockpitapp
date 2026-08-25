@@ -904,7 +904,7 @@ fn open_log_file_at(dir: PathBuf) -> Option<RotatingLog> {
     // Logging stays non-fatal: an insecure cache directory disables logging
     // rather than aborting the CLI, but the typed error is logged, not
     // silently discarded.
-    if let Err(error) = cockpit_core::private_fs::ensure_private_dir(&dir) {
+    if let Err(error) = cockpit_host::private_fs::ensure_private_dir(&dir) {
         tracing::warn!(%error, dir = %dir.display(), "log directory could not be secured; logging disabled");
         return None;
     }
@@ -924,13 +924,13 @@ fn rotate_log_state(state: &mut RotatingLogState) -> std::io::Result<()> {
         // single held fd. An attacker who swaps the log-directory entry with a
         // symlink between steps cannot redirect the deletes/renames/open into an
         // attacker-selected directory, because nothing is re-resolved by name.
-        let dir_fd = cockpit_core::private_fs::open_private_dir_handle(&state.dir)
+        let dir_fd = cockpit_host::private_fs::open_private_dir_handle(&state.dir)
             .map_err(std::io::Error::other)?;
         rotate_log_files_fd(&dir_fd)?;
-        state.file = cockpit_core::private_fs::open_private_file_in_dir_fd(
+        state.file = cockpit_host::private_fs::open_private_file_in_dir_fd(
             &dir_fd,
             std::ffi::OsStr::new("cockpit.log"),
-            cockpit_core::private_fs::PrivateFileAccess::Append,
+            cockpit_host::private_fs::PrivateFileAccess::Append,
             "cockpit log",
         )
         .map_err(std::io::Error::other)?;
@@ -1023,10 +1023,10 @@ fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
     let name = path
         .file_name()
         .ok_or_else(|| std::io::Error::other("log path has no file name"))?;
-    cockpit_core::private_fs::open_private_file_at(
+    cockpit_host::private_fs::open_private_file_at(
         parent,
         name,
-        cockpit_core::private_fs::PrivateFileAccess::Append,
+        cockpit_host::private_fs::PrivateFileAccess::Append,
         "cockpit log",
     )
     .map_err(std::io::Error::other)
@@ -1248,7 +1248,7 @@ mod tests {
         std::fs::write(log_dir.join("cockpit.log"), b"CURRENT").unwrap();
         std::fs::write(log_dir.join("cockpit.log.1"), b"BACKUP-1").unwrap();
 
-        let dir_fd = cockpit_core::private_fs::open_private_dir_handle(&log_dir).unwrap();
+        let dir_fd = cockpit_host::private_fs::open_private_dir_handle(&log_dir).unwrap();
         rotate_log_files_fd(&dir_fd).unwrap();
 
         assert_eq!(

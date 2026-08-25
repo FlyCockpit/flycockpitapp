@@ -73,15 +73,16 @@ pub fn seed_identity_files(home_dir: &Path) -> Result<()> {
 }
 
 fn seed_file(path: &Path, body: &str) -> Result<()> {
-    if crate::private_fs::read_private_file(path, "assistant identity")?.is_some() {
+    if cockpit_host::private_fs::read_private_file(path, "assistant identity")?.is_some() {
         return Ok(());
     }
-    match crate::private_fs::write_private_file_exclusive(path, body.as_bytes()) {
+    match cockpit_host::private_fs::write_private_file_exclusive(path, body.as_bytes()) {
         Ok(()) => Ok(()),
         // Another creator may have won the exclusive publish. Accept only an
         // audited no-follow re-open of the resulting private regular file.
         Err(error)
-            if crate::private_fs::read_private_file(path, "assistant identity")?.is_some() =>
+            if cockpit_host::private_fs::read_private_file(path, "assistant identity")?
+                .is_some() =>
         {
             tracing::debug!(path = %path.display(), %error, "identity seed already published");
             Ok(())
@@ -92,7 +93,7 @@ fn seed_file(path: &Path, body: &str) -> Result<()> {
 
 pub fn hash_optional_file(path: &Path) -> Result<Option<String>> {
     Ok(
-        crate::private_fs::read_private_file(path, "assistant identity")?
+        cockpit_host::private_fs::read_private_file(path, "assistant identity")?
             .map(|bytes| crate::assistants::sha256_hex(&bytes)),
     )
 }
@@ -225,8 +226,8 @@ struct IdentityPiece {
 }
 
 fn load_piece(path: &Path, label: &'static str, max_tokens: usize) -> Result<IdentityPiece> {
-    let bytes =
-        crate::private_fs::read_private_file(path, "assistant identity")?.unwrap_or_default();
+    let bytes = cockpit_host::private_fs::read_private_file(path, "assistant identity")?
+        .unwrap_or_default();
     let hash = if bytes.is_empty() {
         None
     } else {

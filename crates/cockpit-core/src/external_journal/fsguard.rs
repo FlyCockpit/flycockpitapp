@@ -168,7 +168,7 @@ fn check_component(name: &str) -> Result<(), ExternalJournalError> {
 #[cfg(unix)]
 mod imp {
     use super::*;
-    use crate::private_fs::held_fd;
+    use cockpit_host::private_fs::held_fd;
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
@@ -750,14 +750,14 @@ mod imp {
                 reject_reparse(&resolved)?;
                 #[cfg(windows)]
                 if created {
-                    crate::goal_scratch::set_private(&resolved).map_err(|error| {
+                    cockpit_host::goal_scratch::set_private(&resolved).map_err(|error| {
                         ExternalJournalError::InsecurePermissions(error.to_string())
                     })?;
                 }
             }
             reject_reparse(&resolved)?;
             #[cfg(windows)]
-            crate::goal_scratch::verify_private_dacl(&resolved)
+            cockpit_host::goal_scratch::verify_private_dacl(&resolved)
                 .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
             if !resolved.is_dir() {
                 return Err(ExternalJournalError::Containment(format!(
@@ -779,7 +779,7 @@ mod imp {
                 match std::fs::create_dir(&path) {
                     Ok(()) => {
                         #[cfg(windows)]
-                        crate::goal_scratch::set_private(&path).map_err(|error| {
+                        cockpit_host::goal_scratch::set_private(&path).map_err(|error| {
                             ExternalJournalError::InsecurePermissions(error.to_string())
                         })?;
                     }
@@ -806,7 +806,7 @@ mod imp {
         pub fn verify_private(&self) -> Result<(), ExternalJournalError> {
             reject_reparse(&self.path)?;
             #[cfg(windows)]
-            crate::goal_scratch::verify_private_dacl(&self.path)
+            cockpit_host::goal_scratch::verify_private_dacl(&self.path)
                 .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
             Ok(())
         }
@@ -823,7 +823,7 @@ mod imp {
             reject_reparse(&path)?;
             verify_open_file(&file, name)?;
             #[cfg(windows)]
-            crate::goal_scratch::set_private(&path)
+            cockpit_host::goal_scratch::set_private(&path)
                 .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
             Ok(file)
         }
@@ -853,7 +853,7 @@ mod imp {
                 })?;
             verify_open_file(&file, name)?;
             #[cfg(windows)]
-            crate::goal_scratch::verify_private_dacl(&path)
+            cockpit_host::goal_scratch::verify_private_dacl(&path)
                 .map_err(|error| ExternalJournalError::InsecurePermissions(error.to_string()))?;
             Ok(file)
         }
@@ -998,15 +998,15 @@ mod tests {
         root.verify_private().unwrap();
         root.open_file_verified("component.v1").unwrap();
 
-        crate::goal_scratch::apply_test_windows_dacl(&root_path, "D:P(A;;FA;;;WD)").unwrap();
+        cockpit_host::goal_scratch::apply_test_windows_dacl(&root_path, "D:P(A;;FA;;;WD)").unwrap();
         assert!(root.verify_private().is_err());
-        crate::goal_scratch::set_private(&root_path).unwrap();
+        cockpit_host::goal_scratch::set_private(&root_path).unwrap();
 
         let file_path = root_path.join("component.v1");
-        crate::goal_scratch::apply_test_windows_dacl(&file_path, "D:P(A;;FA;;;BU)").unwrap();
+        cockpit_host::goal_scratch::apply_test_windows_dacl(&file_path, "D:P(A;;FA;;;BU)").unwrap();
         assert!(root.open_file_verified("component.v1").is_err());
-        crate::goal_scratch::set_private(&file_path).unwrap();
-        crate::goal_scratch::apply_test_windows_dacl(&file_path, "D:P(A;;FA;;;AU)").unwrap();
+        cockpit_host::goal_scratch::set_private(&file_path).unwrap();
+        cockpit_host::goal_scratch::apply_test_windows_dacl(&file_path, "D:P(A;;FA;;;AU)").unwrap();
         assert!(root.open_file_verified("component.v1").is_err());
     }
 

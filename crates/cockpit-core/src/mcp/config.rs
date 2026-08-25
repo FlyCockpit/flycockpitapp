@@ -398,9 +398,9 @@ impl McpConfig {
     }
 
     pub fn write_private(&self, path: &Path) -> Result<()> {
-        crate::private_fs::ensure_parent_dir_private(path)?;
+        cockpit_host::private_fs::ensure_parent_dir_private(path)?;
         let body = serde_json::to_string_pretty(self).context("serializing mcp.json")?;
-        crate::private_fs::write_private_file(path, format!("{body}\n").as_bytes())
+        cockpit_host::private_fs::write_private_file(path, format!("{body}\n").as_bytes())
     }
 
     /// Enabled servers, sorted by name.

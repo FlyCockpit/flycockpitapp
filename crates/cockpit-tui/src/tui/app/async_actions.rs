@@ -172,6 +172,7 @@ impl App {
 
     pub(super) fn drain_async_actions(&mut self) -> bool {
         self.start_pending_goal_settings_effect();
+        self.start_pending_tools_effect();
         self.start_pending_settings_daemon_effects();
         // Cancellation is a terminal runner outcome; most kinds intentionally
         // skip UI mutation. Session switch/resume must still settle provisional
@@ -245,6 +246,47 @@ impl App {
                 .await;
                 Ok(AsyncActionPayload::GoalSettings(
                     crate::tui::goal_settings_pane::GoalSettingsCompletion {
+                        operation_id,
+                        agent_name,
+                        project_root,
+                        expected_revision,
+                        response,
+                    },
+                ))
+            },
+        );
+    }
+
+    fn start_pending_tools_effect(&mut self) {
+        let effect = match &mut self.overlay {
+            Overlay::Tools(pane) => pane.take_effect(),
+            _ => None,
+        };
+        let Some(effect) = effect else {
+            return;
+        };
+        let operation_id = effect.operation_id;
+        let agent_name = effect.agent_name;
+        let project_root = effect.project_root;
+        let expected_revision = effect.expected_revision;
+        let request = effect.request;
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("tools.effect"),
+            AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let response = async {
+                    let client = crate::tui::settings::settings_daemon_client()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    client
+                        .request(request)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .map_err(|error| error.to_string())
+                }
+                .await;
+                Ok(AsyncActionPayload::Tools(
+                    crate::tui::tools_pane::ToolsCompletion {
                         operation_id,
                         agent_name,
                         project_root,
@@ -345,6 +387,18 @@ impl App {
                 };
                 if let Some(outcome) = outcome {
                     self.handle_goal_settings_outcome(outcome);
+                }
+            }
+            AsyncActionKind::DaemonRpc("tools.effect") => {
+                let outcome = match result.payload {
+                    Ok(AsyncActionPayload::Tools(completion)) => match &mut self.overlay {
+                        Overlay::Tools(pane) => pane.apply_completion(completion),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    self.handle_tools_outcome(outcome);
                 }
             }
             AsyncActionKind::DaemonRpc("sessions.list") => {

@@ -21,6 +21,7 @@ pub(crate) enum ToolsSaveTarget {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ToolsOutcome {
     Close,
+    Pending,
     Apply {
         override_json: String,
         persist_session: bool,
@@ -34,8 +35,8 @@ pub(crate) struct ToolsPane {
     cwd: PathBuf,
     root_foreground: bool,
     original: ToolSurfaceSelection,
-    def: AgentDef,
-    revision: String,
+    def: Option<AgentDef>,
+    revision: Option<String>,
     editable: bool,
     draft: ToolSurfaceDraft,
     picker: ToolSurfacePicker,
@@ -43,52 +44,240 @@ pub(crate) struct ToolsPane {
     row_errors: BTreeMap<String, String>,
     confirm: Option<ToolsSaveTarget>,
     nudge_monty: bool,
+    pending_effect: Option<ToolsEffect>,
+    in_flight: Option<ToolsPending>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ToolsEffect {
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) agent_name: String,
+    pub(crate) project_root: String,
+    pub(crate) expected_revision: Option<String>,
+    pub(crate) request: cockpit_core::daemon::proto::Request,
+}
+
+#[derive(Debug)]
+enum ToolsPending {
+    Load {
+        operation_id: uuid::Uuid,
+        agent_name: String,
+        project_root: String,
+    },
+    SaveAgent {
+        operation_id: uuid::Uuid,
+        agent_name: String,
+        project_root: String,
+        expected_revision: String,
+        mutation: cockpit_core::daemon::proto::AgentMutation,
+        def: AgentDef,
+        selection: ToolSurfaceSelection,
+        override_json: String,
+        cache_break: bool,
+        monty_nudge: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct ToolsCompletion {
+    pub(crate) operation_id: uuid::Uuid,
+    pub(crate) agent_name: String,
+    pub(crate) project_root: String,
+    pub(crate) expected_revision: Option<String>,
+    pub(crate) response: Result<cockpit_core::daemon::proto::Response, String>,
 }
 
 impl ToolsPane {
     pub(crate) fn open(cwd: &Path, agent_name: &str, root_foreground: bool) -> Result<Self> {
-        let response = crate::tui::agent_runner::daemon_request_blocking(
-            cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
-                project_root: cwd.to_string_lossy().into_owned(),
-                name: agent_name.to_string(),
-            },
-        )
-        .map_err(anyhow::Error::msg)?;
-        let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) = response else {
-            anyhow::bail!("daemon returned an unexpected agent snapshot");
+        let operation_id = uuid::Uuid::new_v4();
+        let project_root = cwd.to_string_lossy().into_owned();
+        let request = cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+            project_root: project_root.clone(),
+            name: agent_name.to_string(),
         };
-        cockpit_proto::validate_agent_source_identity(&snapshot, cwd.to_string_lossy().as_ref())
-            .map_err(anyhow::Error::msg)?;
-        if snapshot.name != agent_name
-            || snapshot.markdown.len() > cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES
-        {
-            anyhow::bail!("daemon returned a misrouted or oversized agent snapshot");
-        }
-        let def = cockpit_core::agents::parse_agent(
-            &snapshot.markdown,
-            agent_name,
-            PathBuf::from("<daemon-agent-snapshot>"),
-        )?;
-        let draft = ToolSurfaceDraft::from_def(&def);
+        let draft = ToolSurfaceDraft::empty();
         let original = draft.selection().clone();
-        let status = (!root_foreground).then(|| {
-            "Apply is disabled while an interactive subagent holds the foreground.".to_string()
-        });
+        let status = (!root_foreground)
+            .then(|| {
+                "Apply is disabled while an interactive subagent holds the foreground.".to_string()
+            })
+            .or_else(|| Some("loading daemon-owned tool settings…".to_string()));
         Ok(Self {
             agent_name: agent_name.to_string(),
             cwd: cwd.to_path_buf(),
             root_foreground,
             original,
-            def,
-            revision: snapshot.revision,
-            editable: snapshot.editable,
+            def: None,
+            revision: None,
+            editable: false,
             draft,
             picker: ToolSurfacePicker::default(),
             status,
             row_errors: BTreeMap::new(),
             confirm: None,
             nudge_monty: true,
+            pending_effect: Some(ToolsEffect {
+                operation_id,
+                agent_name: agent_name.to_string(),
+                project_root: project_root.clone(),
+                expected_revision: None,
+                request,
+            }),
+            in_flight: Some(ToolsPending::Load {
+                operation_id,
+                agent_name: agent_name.to_string(),
+                project_root,
+            }),
         })
+    }
+
+    pub(crate) fn take_effect(&mut self) -> Option<ToolsEffect> {
+        self.pending_effect.take()
+    }
+
+    pub(crate) fn apply_completion(&mut self, completion: ToolsCompletion) -> Option<ToolsOutcome> {
+        let Some(pending) = self.in_flight.take() else {
+            return None;
+        };
+        let (operation_id, agent_name, project_root, expected_revision) = match &pending {
+            ToolsPending::Load {
+                operation_id,
+                agent_name,
+                project_root,
+            } => (
+                *operation_id,
+                agent_name.as_str(),
+                project_root.as_str(),
+                None,
+            ),
+            ToolsPending::SaveAgent {
+                operation_id,
+                agent_name,
+                project_root,
+                expected_revision,
+                ..
+            } => (
+                *operation_id,
+                agent_name.as_str(),
+                project_root.as_str(),
+                Some(expected_revision.as_str()),
+            ),
+        };
+        if completion.operation_id != operation_id
+            || completion.agent_name != agent_name
+            || completion.project_root != project_root
+            || completion.expected_revision.as_deref() != expected_revision
+        {
+            self.in_flight = Some(pending);
+            return None;
+        }
+        match pending {
+            ToolsPending::Load {
+                agent_name,
+                project_root,
+                ..
+            } => {
+                if self.agent_name != agent_name
+                    || self.cwd.to_string_lossy().as_ref() != project_root
+                {
+                    return None;
+                }
+                let loaded = completion.response.and_then(|response| {
+                    let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) =
+                        response
+                    else {
+                        return Err("daemon returned an unexpected agent snapshot".to_string());
+                    };
+                    crate::tui::settings::agents_page::validate_agent_snapshot(
+                        &snapshot,
+                        &self.cwd,
+                        &self.agent_name,
+                        None,
+                    )?;
+                    if snapshot.markdown.len()
+                        > cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES
+                    {
+                        return Err("daemon returned an oversized agent snapshot".to_string());
+                    }
+                    let def = cockpit_core::agents::parse_agent(
+                        &snapshot.markdown,
+                        &self.agent_name,
+                        PathBuf::from("<daemon-agent-snapshot>"),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    Ok((snapshot, def))
+                });
+                match loaded {
+                    Ok((snapshot, def)) => {
+                        let draft = ToolSurfaceDraft::from_def(&def);
+                        self.original = draft.selection().clone();
+                        self.draft = draft;
+                        self.def = Some(def);
+                        self.revision = Some(snapshot.revision);
+                        self.editable = snapshot.editable;
+                        self.status = (!self.root_foreground).then(|| {
+                            "Apply is disabled while an interactive subagent holds the foreground.".to_string()
+                        });
+                    }
+                    Err(error) => self.status = Some(format!("load failed: {error}")),
+                }
+                None
+            }
+            ToolsPending::SaveAgent {
+                agent_name,
+                project_root,
+                expected_revision,
+                mutation,
+                def,
+                selection,
+                override_json,
+                cache_break,
+                monty_nudge,
+                ..
+            } => {
+                if self.agent_name != agent_name
+                    || self.cwd.to_string_lossy().as_ref() != project_root
+                    || self.revision.as_deref() != Some(expected_revision.as_str())
+                {
+                    return None;
+                }
+                let saved = completion.response.and_then(|response| {
+                    let cockpit_core::daemon::proto::Response::AgentMutated(result) = response
+                    else {
+                        return Err("daemon returned an unexpected agent-save response".to_string());
+                    };
+                    crate::tui::settings::agents_page::validate_agent_mutation_result(
+                        &result,
+                        &self.cwd,
+                        &mutation,
+                        Some(&expected_revision),
+                        None,
+                    )?;
+                    let snapshot = result
+                        .snapshot
+                        .ok_or_else(|| "daemon omitted the saved snapshot".to_string())?;
+                    Ok(snapshot.revision)
+                });
+                match saved {
+                    Ok(revision) => {
+                        self.revision = Some(revision);
+                        self.def = Some(def);
+                        self.original = selection;
+                        self.status = Some("agent tool settings committed".to_string());
+                        Some(ToolsOutcome::Apply {
+                            override_json,
+                            persist_session: false,
+                            cache_break,
+                            monty_nudge,
+                        })
+                    }
+                    Err(error) => {
+                        self.status = Some(format!("save failed: {error}"));
+                        None
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -97,6 +286,13 @@ impl ToolsPane {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<ToolsOutcome> {
+        if self.in_flight.is_some() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                return Some(ToolsOutcome::Close);
+            }
+            self.status = Some("tool settings operation is still pending".to_string());
+            return None;
+        }
         if self.confirm.is_some() {
             return self.handle_confirm_key(key);
         }
@@ -213,20 +409,24 @@ impl ToolsPane {
         // `toolTiers` authority. Refuse before ejecting so the UI cannot
         // report a successful agent save whose canonical markdown omits the
         // selected surface.
-        if target == ToolsSaveTarget::Agent && self.def.vnext.is_some() {
+        if target == ToolsSaveTarget::Agent
+            && self.def.as_ref().is_some_and(|def| def.vnext.is_some())
+        {
             anyhow::bail!(
                 "agent-scoped tool settings are unavailable for vNext agents; save them for this session instead"
             );
         }
-        let mut def = self.def.clone();
+        let mut def = self
+            .def
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("agent tool settings are not loaded"))?;
         self.draft.write_to_def(&mut def);
         cockpit_core::agents::validate_invariants(&def)?;
         let selection = self.draft.selection().clone();
         let override_json = serde_json::to_string(&selection)?;
         if target == ToolsSaveTarget::Agent {
-            self.write_agent_def(&def)?;
-            self.def = def;
-            self.original = selection.clone();
+            self.queue_agent_save(def, selection, override_json)?;
+            return Ok(ToolsOutcome::Pending);
         }
         Ok(ToolsOutcome::Apply {
             override_json,
@@ -236,37 +436,52 @@ impl ToolsPane {
         })
     }
 
-    fn write_agent_def(&mut self, def: &AgentDef) -> Result<()> {
+    fn queue_agent_save(
+        &mut self,
+        def: AgentDef,
+        selection: ToolSurfaceSelection,
+        override_json: String,
+    ) -> Result<()> {
+        if !self.editable {
+            anyhow::bail!("this daemon-owned agent definition is not editable");
+        }
         let markdown = def.to_markdown()?;
-        let prior_revision = self.revision.clone();
+        let prior_revision = self
+            .revision
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("agent revision is unavailable"))?;
         let mutation = cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
             name: self.agent_name.clone(),
             markdown,
         };
-        let response = crate::tui::agent_runner::daemon_request_blocking(
-            cockpit_core::daemon::proto::Request::MutateAgent {
-                project_root: self.cwd.to_string_lossy().into_owned(),
+        let operation_id = uuid::Uuid::new_v4();
+        let project_root = self.cwd.to_string_lossy().into_owned();
+        let cache_break = self.cache_break_delta();
+        let monty_nudge = self.monty_nudge_text();
+        self.pending_effect = Some(ToolsEffect {
+            operation_id,
+            agent_name: self.agent_name.clone(),
+            project_root: project_root.clone(),
+            expected_revision: Some(prior_revision.clone()),
+            request: cockpit_core::daemon::proto::Request::MutateAgent {
+                project_root: project_root.clone(),
                 mutation: mutation.clone(),
                 expected_revision: Some(prior_revision.clone()),
             },
-        )
-        .map_err(anyhow::Error::msg)?;
-        let cockpit_core::daemon::proto::Response::AgentMutated(result) = response else {
-            anyhow::bail!("daemon returned an unexpected agent-save response");
-        };
-        crate::tui::settings::agents_page::validate_agent_mutation_result(
-            &result,
-            &self.cwd,
-            &mutation,
-            Some(&prior_revision),
-            None,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let snapshot = result
-            .snapshot
-            .ok_or_else(|| anyhow::anyhow!("daemon omitted the saved snapshot"))?;
-        self.revision = snapshot.revision;
-        self.editable = snapshot.editable;
+        });
+        self.in_flight = Some(ToolsPending::SaveAgent {
+            operation_id,
+            agent_name: self.agent_name.clone(),
+            project_root,
+            expected_revision: prior_revision,
+            mutation,
+            def,
+            selection,
+            override_json,
+            cache_break,
+            monty_nudge,
+        });
+        self.status = Some("saving daemon-owned agent tool settings…".to_string());
         Ok(())
     }
 
@@ -408,8 +623,8 @@ mod tests {
             cwd: tmp.keep(),
             root_foreground: true,
             original: draft.selection().clone(),
-            def,
-            revision: "test-revision".into(),
+            def: Some(def),
+            revision: Some("test-revision".into()),
             editable: true,
             draft,
             picker: ToolSurfacePicker::default(),
@@ -417,6 +632,8 @@ mod tests {
             row_errors: BTreeMap::new(),
             confirm: None,
             nudge_monty: true,
+            pending_effect: None,
+            in_flight: None,
         }
     }
 
@@ -487,7 +704,7 @@ mod tests {
     #[test]
     fn tools_session_save_persists_and_does_not_eject() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut pane = ToolsPane::open(tmp.path(), "Build", true).unwrap();
+        let mut pane = pane_with_tools(&["read"], &[]);
         focus_tool(&mut pane, "skill");
         pane.handle_key(KeyEvent::from(KeyCode::Char(' ')));
         pane.start_confirm(ToolsSaveTarget::Session);
@@ -514,7 +731,16 @@ mod tests {
     #[test]
     fn tools_agent_save_refuses_vnext_builtin_without_ejecting() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut pane = ToolsPane::open(tmp.path(), "Build", true).unwrap();
+        let mut pane = pane_with_tools(&["read"], &[]);
+        pane.def.as_mut().unwrap().vnext = Some(cockpit_core::agents::VnextAgentDef {
+            schema_version: cockpit_core::agents::SCHEMA_VERSION,
+            agent_id: "local:test".to_string(),
+            execution_kind: cockpit_core::agents::ExecutionKind::Coding,
+            model_slots: BTreeMap::new(),
+            delegation: cockpit_core::agents::DelegationPolicy::default(),
+            questions: None,
+            verification: None,
+        });
         focus_tool(&mut pane, "skill");
         pane.handle_key(KeyEvent::from(KeyCode::Char(' ')));
         pane.start_confirm(ToolsSaveTarget::Agent);

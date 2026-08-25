@@ -880,7 +880,11 @@ impl App {
             }
             Overlay::Tools(mut pane) => {
                 if let Some(outcome) = pane.handle_key(key) {
-                    self.handle_tools_outcome(outcome);
+                    if matches!(outcome, crate::tui::tools_pane::ToolsOutcome::Pending) {
+                        self.overlay = Overlay::Tools(pane);
+                    } else {
+                        self.handle_tools_outcome(outcome);
+                    }
                 } else {
                     self.overlay = Overlay::Tools(pane);
                 }

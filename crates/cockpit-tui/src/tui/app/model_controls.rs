@@ -202,6 +202,7 @@ impl App {
     pub(super) fn handle_tools_outcome(&mut self, outcome: crate::tui::tools_pane::ToolsOutcome) {
         match outcome {
             crate::tui::tools_pane::ToolsOutcome::Close => {}
+            crate::tui::tools_pane::ToolsOutcome::Pending => {}
             crate::tui::tools_pane::ToolsOutcome::Apply {
                 override_json,
                 persist_session,

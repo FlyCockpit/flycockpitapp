@@ -140,7 +140,9 @@ After the provider wizard finishes, the model wizard opens so you can choose the
 cockpit models openai
 ```
 
-`cockpit provider` manages model-provider credentials and model catalogs. `cockpit account` signs you in to Flycockpit account services for sync and relay features.
+`cockpit provider` manages model-provider credentials and model catalogs. The
+public v0.1 binary is local-only and does not require or expose a FlyCockpit
+account, organization sync, or relay connection.
 
 ### First Message
 
@@ -246,18 +248,22 @@ cockpit packages prune --dry-run
 | `cockpit debug context` | Print bounded, redacted assembled diagnostic context. |
 | `cockpit config export-policy` | Export portable non-secret provider/model policy JSON. |
 | `cockpit mcp list` | List configured MCP servers. |
-| `cockpit sync status` | Show session-log sync and remote-audit upload state. |
-| `cockpit connect status` | Show outbound relay connector status. |
 | `cockpit packages add <id> --git <url>` | Register dependency package source for the docs agent. |
 | `cockpit kcl import` | Import packages from a local `kcl` registry. |
 | `cockpit init` | Explore the project and write an instructions file. |
 | `cockpit bash-hints list` | List built-in shell post-result hint rules. |
 | `cockpit completion <shell>` | Generate shell completions. |
-| `cockpit account whoami` | Show the active Flycockpit account and instance. |
-| `cockpit account logout` | Sign out of Flycockpit on this machine. |
 | `cockpit provider add [template]` | Add a model provider using the terminal wizard. |
 | `cockpit provider usage` | Show vendor plan limits and quota where supported. |
 | `cockpit packages prune [--days <n>] [--dry-run]` | Delete stale Cockpit-owned package clone directories. |
+
+### Internal remote profile
+
+Account, organization-sync, and relay-control commands are compiled only for
+internal builds using the opt-in Cargo `remote` feature. They are not part of
+the public v0.1 command or compatibility surface. Remote-profile operators use
+`cockpit account`, `cockpit sync`, and `cockpit connect`; public local installs
+must not depend on those commands or FlyCockpit service reachability.
 | `cockpit config import-policy <file>` | Import portable provider/model policy JSON. |
 | `cockpit session show <session> [--json]` | Show durable compaction handoffs and their token/tail statistics. |
 | `cockpit trust set [path] --mode trust` | Store a workspace trust decision. |

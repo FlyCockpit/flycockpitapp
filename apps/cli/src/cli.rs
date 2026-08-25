@@ -154,14 +154,17 @@ pub enum Command {
     Mcp(McpCommand),
 
     /// Removed: use `cockpit account login` or `cockpit provider add`.
+    #[cfg(feature = "remote")]
     #[command(hide = true)]
     Login(RemovedCommandArgs),
 
     /// Removed: use `cockpit account logout` or `cockpit provider add`.
+    #[cfg(feature = "remote")]
     #[command(hide = true)]
     Logout,
 
     /// Removed: use `cockpit account whoami` or `cockpit provider add`.
+    #[cfg(feature = "remote")]
     #[command(hide = true)]
     Whoami,
 
@@ -1731,7 +1734,7 @@ mod tests {
     #[cfg(not(feature = "remote"))]
     #[test]
     fn local_release_rejects_remote_command_surface() {
-        for command in ["account", "sync", "connect"] {
+        for command in ["account", "sync", "connect", "login", "logout", "whoami"] {
             assert!(
                 Cli::try_parse_from(["cockpit", command]).is_err(),
                 "local release unexpectedly exposed `{command}`"
@@ -1739,6 +1742,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn provider_aliases_parse() {
         for root in ["provider", "providers", "auth"] {

@@ -779,8 +779,11 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Debug(sub)) => commands::debug::run(sub).await,
         Some(Command::Config(sub)) => commands::config::run(sub).await,
         Some(Command::Mcp(cmd)) => commands::mcp::run(cmd).await,
+        #[cfg(feature = "remote")]
         Some(Command::Login(_)) => Err(commands::RemovedCommandError::new("login").into()),
+        #[cfg(feature = "remote")]
         Some(Command::Logout) => Err(commands::RemovedCommandError::new("logout").into()),
+        #[cfg(feature = "remote")]
         Some(Command::Whoami) => Err(commands::RemovedCommandError::new("whoami").into()),
         #[cfg(feature = "remote")]
         Some(Command::Sync(sub)) => commands::sync::run(sub).await,

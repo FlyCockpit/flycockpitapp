@@ -1523,6 +1523,41 @@ pub(crate) async fn recover_image_config_mutation_journals(
             receipt_state.as_str(),
             "terminal_error" | "terminal_cancelled"
         ) {
+            // The terminal outcome is final, but an authorized atomic replace
+            // may have reached disk before that outcome was recorded. Inspect
+            // publication evidence under the same bounded filesystem
+            // authority used by executing recovery. This may reconcile the
+            // generation; it must never rewrite the terminal receipt.
+            if publication_phase == "publication_authorized" {
+                let terminal_target = PathBuf::from(&target);
+                let observed_target = terminal_target.clone();
+                let revision_ctx = Arc::clone(ctx);
+                let actual = publication
+                    .with_target(&terminal_target, move |_| {
+                        let actual_bytes = read_document(&observed_target)
+                            .map_err(|error| anyhow::anyhow!(error.message))?;
+                        Ok(content_revision(&revision_ctx, actual_bytes.as_slice()))
+                    })
+                    .await
+                    .map_err(|error| ErrorPayload {
+                        code: ErrorCode::Shutdown,
+                        message: format!(
+                            "bounded terminal image recovery could not acquire publication authority: {error:#}"
+                        ),
+                    })?;
+                if actual == intended {
+                    let response: Response =
+                        serde_json::from_str(&response_json).map_err(internal)?;
+                    let Response::ImageControlMutated(committed) = response else {
+                        return Err(internal(
+                            "terminal image journal has the wrong publication receipt",
+                        ));
+                    };
+                    inventory::publish_committed_config_generation_at_least(
+                        committed.result_config_generation,
+                    );
+                }
+            }
             let retire_owner = owner;
             let retire_operation = operation;
             ctx.db

@@ -62,6 +62,30 @@ fn provider_config_journal_actions_have_strict_payload_shapes() {
     assert!(insert("provider", "save", Some("not-json")).is_err());
 }
 
+#[test]
+fn authority_journals_bind_exact_fenced_terminal_receipts() {
+    let sql = include_str!("../src/db/migrations/0001_initial.sql");
+    for table in ["provider_config_journals", "mcp_config_journals"] {
+        let declaration = sql
+            .split(&format!("CREATE TABLE {table}"))
+            .nth(1)
+            .and_then(|tail| tail.split(");").next())
+            .unwrap_or_else(|| panic!("missing {table}"));
+        for field in [
+            "owner_digest",
+            "client_operation_id",
+            "request_hash",
+            "fencing_generation",
+            "terminal_response_json",
+        ] {
+            assert!(
+                declaration.contains(field),
+                "{table} must bind {field} for exact crash recovery"
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Ownership {
     status: String,

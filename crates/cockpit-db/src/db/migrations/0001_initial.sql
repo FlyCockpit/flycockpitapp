@@ -6250,6 +6250,11 @@ CREATE TABLE secret_vault_sagas (
 -- private bytes are staged in secret_vault_items in the same transaction.
 CREATE TABLE provider_config_journals (
     journal_id       TEXT PRIMARY KEY,
+    owner_digest     TEXT,
+    client_operation_id TEXT,
+    request_hash     BLOB CHECK (request_hash IS NULL OR (typeof(request_hash) = 'blob' AND length(request_hash) = 32)),
+    fencing_generation INTEGER CHECK (fencing_generation IS NULL OR fencing_generation > 0),
+    terminal_response_json TEXT CHECK (terminal_response_json IS NULL OR json_valid(terminal_response_json)),
     project_root     TEXT NOT NULL,
     provider_id      TEXT NOT NULL,
     action           TEXT NOT NULL CHECK (action IN ('save', 'delete', 'batch')),
@@ -6261,6 +6266,10 @@ CREATE TABLE provider_config_journals (
     created_at       INTEGER NOT NULL,
     CHECK (length(trim(journal_id)) > 0),
     CHECK (length(trim(project_root)) > 0),
+    CHECK ((owner_digest IS NOT NULL) = (client_operation_id IS NOT NULL)
+       AND (owner_digest IS NOT NULL) = (request_hash IS NOT NULL)
+       AND (owner_digest IS NOT NULL) = (fencing_generation IS NOT NULL)
+       AND (owner_digest IS NOT NULL) = (terminal_response_json IS NOT NULL)),
     CHECK (
         (action = 'save' AND provider_id <> '__provider_batch__'
             AND entry_json IS NOT NULL AND json_valid(entry_json))
@@ -6273,11 +6282,18 @@ CREATE TABLE provider_config_journals (
 );
 CREATE INDEX provider_config_journals_scope
 ON provider_config_journals(project_root, provider_id, created_at);
+CREATE UNIQUE INDEX provider_config_journals_operation
+ON provider_config_journals(owner_digest, client_operation_id);
 
 -- Recoverable bridge between the owner vault and the MCP configuration file.
 -- `config_json` is reference-only; private bytes remain in vault rows.
 CREATE TABLE mcp_config_journals (
     journal_id        TEXT PRIMARY KEY,
+    owner_digest      TEXT NOT NULL,
+    client_operation_id TEXT NOT NULL,
+    request_hash      BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
+    fencing_generation INTEGER NOT NULL CHECK (fencing_generation > 0),
+    terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
     project_root      TEXT NOT NULL,
     config_path       TEXT NOT NULL,
     config_json       TEXT NOT NULL,
@@ -6287,6 +6303,8 @@ CREATE TABLE mcp_config_journals (
 );
 CREATE INDEX mcp_config_journals_scope
 ON mcp_config_journals(project_root, created_at);
+CREATE UNIQUE INDEX mcp_config_journals_operation
+ON mcp_config_journals(owner_digest, client_operation_id);
 
 -- Owner-scoped durable settlement ledger for local daemon mutations. Request
 -- bodies and secret material never enter this table: `request_hash` binds the

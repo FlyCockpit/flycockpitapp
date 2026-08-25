@@ -107,7 +107,17 @@ impl Db {
                 "UPDATE local_operation_receipts
                  SET state='terminal_error',terminal_outcome_json=?1,
                      execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?2
-                 WHERE state IN ('prepared','executing')",
+                 WHERE state IN ('prepared','executing')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM provider_config_journals journal
+                       WHERE journal.owner_digest=local_operation_receipts.owner_digest
+                         AND journal.client_operation_id=local_operation_receipts.client_operation_id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM mcp_config_journals journal
+                       WHERE journal.owner_digest=local_operation_receipts.owner_digest
+                         AND journal.client_operation_id=local_operation_receipts.client_operation_id
+                   )",
                 params![outcome, now],
             )? as u64)
         })

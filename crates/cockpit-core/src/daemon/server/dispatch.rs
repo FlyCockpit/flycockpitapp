@@ -9833,7 +9833,10 @@ async fn handle_serialized_request_impl(
                 }
                 let operation_result = save_mcp_config(
                     ctx,
+                    &settlement_owner,
                     &client_operation_id,
+                    request_hash,
+                    fencing_generation,
                     &project_root,
                     &config_json,
                     &secret_values_json,
@@ -12238,17 +12241,20 @@ async fn apply_provider_mutation(
             }
         }
 
-        stage_and_recover_provider_batch(
+        let commit = stage_and_recover_provider_batch(
             ctx,
             &capability.project_root,
             &capability.target_path,
             mutation,
+            &capability_owner,
+            &client_operation_id,
+            request_hash,
+            fencing_generation,
+            &snapshot_session_id,
+            &layer_id,
+            &expected_revision,
         )
         .await?;
-
-        let (_, _, committed) = daemon_provider_config(ctx, &capability.project_root).await?;
-        let result_revision = provider_config_revision(&committed)?;
-        let config_generation = inventory::publish_committed_config_generation();
         {
             let mut capabilities = PROVIDER_EDIT_CAPABILITIES
                 .lock()
@@ -12260,23 +12266,13 @@ async fn apply_provider_mutation(
                     project_root: capability.project_root,
                     target_path: capability.target_path,
                     layer_id: layer_id.clone(),
-                    revision: result_revision.clone(),
-                    config_generation,
+                    revision: commit.result_revision.clone(),
+                    config_generation: commit.config_generation,
                     expires_at: Instant::now() + PROVIDER_EDIT_CAPABILITY_TTL,
                 },
             );
         }
-        let response = Response::ProviderMutationCommitted {
-            client_operation_id: client_operation_id.clone(),
-            snapshot_session_id,
-            layer_id,
-            consumed_revision: expected_revision,
-            result_revision,
-            config_generation,
-            config: crate::secret_ref::redact_provider_view(&committed),
-            status: cockpit_proto::ConfigCommitStatus::Committed,
-            publication: cockpit_proto::ConfigPublicationStatus::Published,
-        };
+        let response = commit.response;
         finish_local_operation(
             ctx,
             capability_owner.clone(),
@@ -12392,6 +12388,33 @@ async fn finish_local_operation_error(
     fencing_generation: i64,
     error: &ErrorPayload,
 ) -> std::result::Result<(), ErrorPayload> {
+    let linked_owner = owner.clone();
+    let linked_operation = client_operation_id.clone();
+    let has_recovery_intent = ctx
+        .db
+        .read(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM provider_config_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                    UNION ALL
+                    SELECT 1 FROM mcp_config_journals
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                 )",
+                rusqlite::params![linked_owner, linked_operation],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+        })
+        .await
+        .map_err(internal)?;
+    if has_recovery_intent {
+        tracing::warn!(
+            client_operation_id,
+            "local operation remains settlement-unknown behind a durable recovery intent"
+        );
+        return Ok(());
+    }
     let error_json = serde_json::to_string(error).map_err(internal)?;
     ctx.db
         .finish_local_operation(
@@ -12674,7 +12697,14 @@ async fn stage_and_recover_provider_batch(
     project_root: &str,
     capability_target: &std::path::Path,
     mutation: cockpit_proto::ProviderMutationBatch,
-) -> std::result::Result<(), ErrorPayload> {
+    owner_digest: &str,
+    client_operation_id: &str,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    snapshot_session_id: &str,
+    layer_id: &str,
+    consumed_revision: &str,
+) -> std::result::Result<ProviderMutationJournalCommit, ErrorPayload> {
     recover_provider_config_journals(ctx, project_root, None).await?;
     let (cwd, trust_policy, effective) = daemon_provider_config(ctx, project_root).await?;
     let target = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
@@ -12815,12 +12845,30 @@ async fn stage_and_recover_provider_batch(
     // retiring this provider's claim would still break its next resolution.
     retain_only_stale_provider_credentials(&desired, &mut cleanup_credentials);
 
+    let result_revision = provider_config_revision(&desired)?;
+    let config_generation = inventory::publish_committed_config_generation();
+    let response = Response::ProviderMutationCommitted {
+        client_operation_id: client_operation_id.to_owned(),
+        snapshot_session_id: snapshot_session_id.to_owned(),
+        layer_id: layer_id.to_owned(),
+        consumed_revision: consumed_revision.to_owned(),
+        result_revision: result_revision.clone(),
+        config_generation,
+        config: crate::secret_ref::redact_provider_view(&desired),
+        status: cockpit_proto::ConfigCommitStatus::Committed,
+        publication: cockpit_proto::ConfigPublicationStatus::Published,
+    };
+    let terminal_response_json = serde_json::to_string(&response).map_err(internal)?;
     let journal_id = format!("provider-batch-{batch_id}");
     let cleanup_named_json = serde_json::to_string(&cleanup_named).map_err(internal)?;
     let project_root_owned = project_root.to_string();
     let vault = ctx.secret_vault.clone();
     let journal_id_for_tx = journal_id.clone();
     let config_path = target.to_string_lossy().into_owned();
+    let receipt_owner = owner_digest.to_owned();
+    let receipt_operation_id = client_operation_id.to_owned();
+    let journal_owner = receipt_owner.clone();
+    let journal_operation_id = receipt_operation_id.clone();
     ctx.db
         .transaction(move |conn| {
             let mut inserted_named_claims = std::collections::BTreeSet::new();
@@ -12886,11 +12934,19 @@ async fn stage_and_recover_provider_batch(
             })?;
             conn.execute(
                 "INSERT INTO provider_config_journals
-                 (journal_id, project_root, provider_id, action, entry_json,
-                  cleanup_named_json, cleanup_credential_json, created_at)
-                 VALUES (?1, ?2, '__provider_batch__', 'batch', ?3, ?4, '[]', ?5)",
+                 (journal_id, owner_digest, client_operation_id, request_hash,
+                  fencing_generation, terminal_response_json, project_root,
+                  provider_id, action, entry_json, cleanup_named_json,
+                  cleanup_credential_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                         '__provider_batch__', 'batch', ?8, ?9, '[]', ?10)",
                 rusqlite::params![
                     journal_id_for_tx,
+                    journal_owner,
+                    journal_operation_id,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    terminal_response_json,
                     project_root_owned,
                     payload_json,
                     cleanup_named_json,
@@ -12915,7 +12971,45 @@ async fn stage_and_recover_provider_batch(
     // The single durable batch intent is visible before any file changes.
     // Recovery writes the complete desired layer and retires cleanup only
     // after every provider file and metadata field converges.
-    recover_provider_config_journals(ctx, project_root, None).await
+    recover_provider_config_journals(ctx, project_root, None).await?;
+    let response = match ctx
+        .db
+        .local_operation_settlement(receipt_owner, receipt_operation_id)
+        .await
+        .map_err(internal)?
+    {
+        Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
+            json,
+        )) => serde_json::from_str::<Response>(&json).map_err(internal)?,
+        _ => {
+            return Err(internal(anyhow::anyhow!(
+                "provider journal retired without an exact terminal receipt"
+            )));
+        }
+    };
+    let (result_revision, config_generation) = match &response {
+        Response::ProviderMutationCommitted {
+            result_revision,
+            config_generation,
+            ..
+        } => (result_revision.clone(), *config_generation),
+        _ => {
+            return Err(internal(anyhow::anyhow!(
+                "provider journal produced the wrong terminal response"
+            )));
+        }
+    };
+    Ok(ProviderMutationJournalCommit {
+        response,
+        result_revision,
+        config_generation,
+    })
+}
+
+struct ProviderMutationJournalCommit {
+    response: Response,
+    result_revision: String,
+    config_generation: u64,
 }
 
 async fn compensate_provider_batch_staging(
@@ -13720,6 +13814,11 @@ async fn setup_copilot_auth(
 #[derive(serde::Deserialize)]
 struct ProviderConfigJournal {
     journal_id: String,
+    owner_digest: Option<String>,
+    client_operation_id: Option<String>,
+    request_hash: Option<Vec<u8>>,
+    fencing_generation: Option<i64>,
+    terminal_response_json: Option<String>,
     provider_id: String,
     action: String,
     entry_json: Option<String>,
@@ -14056,7 +14155,9 @@ pub(super) async fn recover_provider_config_journals(
         .db
         .read(move |conn| {
             let mut statement = conn.prepare(
-                "SELECT journal_id, provider_id, action, entry_json, cleanup_named_json, cleanup_credential_json
+                "SELECT journal_id, owner_digest, client_operation_id, request_hash,
+                        fencing_generation, terminal_response_json, provider_id,
+                        action, entry_json, cleanup_named_json, cleanup_credential_json
                  FROM provider_config_journals
                  WHERE project_root = ?1
                    AND (?2 IS NULL OR action = 'batch' OR provider_id = ?2)
@@ -14067,11 +14168,16 @@ pub(super) async fn recover_provider_config_journals(
                 .query_map(rusqlite::params![project_root_query, provider_id], |row| {
                     Ok(ProviderConfigJournal {
                         journal_id: row.get(0)?,
-                        provider_id: row.get(1)?,
-                        action: row.get(2)?,
-                        entry_json: row.get(3)?,
-                        cleanup_named_json: row.get(4)?,
-                        cleanup_credential_json: row.get(5)?,
+                        owner_digest: row.get(1)?,
+                        client_operation_id: row.get(2)?,
+                        request_hash: row.get(3)?,
+                        fencing_generation: row.get(4)?,
+                        terminal_response_json: row.get(5)?,
+                        provider_id: row.get(6)?,
+                        action: row.get(7)?,
+                        entry_json: row.get(8)?,
+                        cleanup_named_json: row.get(9)?,
+                        cleanup_credential_json: row.get(10)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -14153,6 +14259,24 @@ pub(super) async fn recover_provider_config_journals(
             _ => return Err(bad_request("provider config journal has an invalid action")),
         }
         let (_, _, effective) = daemon_provider_config(ctx, project_root.as_str()).await?;
+        if journal.action == "batch"
+            && let Some(response_json) = journal.terminal_response_json.as_mut()
+        {
+            let mut response: Response = serde_json::from_str(response_json).map_err(internal)?;
+            let Response::ProviderMutationCommitted {
+                result_revision,
+                config,
+                ..
+            } = &mut response
+            else {
+                return Err(internal(anyhow::anyhow!(
+                    "provider batch journal has the wrong terminal response"
+                )));
+            };
+            *result_revision = provider_config_revision(&effective)?;
+            *config = crate::secret_ref::redact_provider_view(&effective);
+            *response_json = serde_json::to_string(&response).map_err(internal)?;
+        }
         let mut named: std::collections::BTreeSet<String> =
             serde_json::from_str(&journal.cleanup_named_json).map_err(internal)?;
         let mut credentials: std::collections::BTreeSet<String> =
@@ -14235,8 +14359,36 @@ pub(super) async fn recover_provider_config_journals(
             }
         }
         let journal_id = journal.journal_id;
+        let settlement = match (
+            journal.owner_digest,
+            journal.client_operation_id,
+            journal.request_hash,
+            journal.fencing_generation,
+            journal.terminal_response_json,
+        ) {
+            (Some(owner), Some(operation_id), Some(hash), Some(fence), Some(response)) => {
+                Some((owner, operation_id, hash, fence, response))
+            }
+            (None, None, None, None, None) => None,
+            _ => {
+                return Err(internal(anyhow::anyhow!(
+                    "provider journal has partial receipt binding"
+                )));
+            }
+        };
         ctx.db
             .write(move |conn| {
+                if let Some((owner, operation_id, request_hash, fence, response)) = settlement {
+                    settle_journaled_local_success_on_conn(
+                        conn,
+                        "apply_provider_mutation",
+                        &owner,
+                        &operation_id,
+                        &request_hash,
+                        fence,
+                        &response,
+                    )?;
+                }
                 conn.execute(
                     "DELETE FROM provider_config_journals WHERE journal_id = ?1",
                     rusqlite::params![journal_id],
@@ -14245,6 +14397,63 @@ pub(super) async fn recover_provider_config_journals(
             })
             .await
             .map_err(internal)?;
+    }
+    Ok(())
+}
+
+fn settle_journaled_local_success_on_conn(
+    conn: &rusqlite::Connection,
+    expected_operation_kind: &str,
+    owner: &str,
+    operation_id: &str,
+    request_hash: &[u8],
+    fencing_generation: i64,
+    response_json: &str,
+) -> anyhow::Result<()> {
+    let existing: (String, Vec<u8>, String, i64, Option<String>) = conn.query_row(
+        "SELECT operation_kind,request_hash,state,fencing_generation,terminal_outcome_json
+         FROM local_operation_receipts
+         WHERE owner_digest=?1 AND client_operation_id=?2",
+        rusqlite::params![owner, operation_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    if existing.0 != expected_operation_kind
+        || existing.1 != request_hash
+        || existing.3 != fencing_generation
+    {
+        anyhow::bail!("journal receipt binding does not match its authenticated execution fence");
+    }
+    if existing.2 == "terminal_success" && existing.4.as_deref() == Some(response_json) {
+        return Ok(());
+    }
+    if existing.2 != "executing" {
+        anyhow::bail!("journal commit conflicts with an existing terminal settlement");
+    }
+    let changed = conn.execute(
+        "UPDATE local_operation_receipts
+         SET state='terminal_success',terminal_outcome_json=?5,
+             execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+         WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3
+           AND fencing_generation=?4 AND state='executing'",
+        rusqlite::params![
+            owner,
+            operation_id,
+            request_hash,
+            fencing_generation,
+            response_json,
+            chrono::Utc::now().timestamp_millis()
+        ],
+    )?;
+    if changed != 1 {
+        anyhow::bail!("journal commit lost its durable execution fence");
     }
     Ok(())
 }
@@ -14584,7 +14793,10 @@ async fn provider_config_save_under_lock(
 /// cleanup of refs made stale by delete/rename edits.
 async fn save_mcp_config(
     ctx: &DaemonContext,
+    owner_digest: &str,
     client_operation_id: &str,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
     project_root: &str,
     config_json: &str,
     secret_values_json: &str,
@@ -14690,6 +14902,23 @@ async fn save_mcp_config(
         .filter(|reference| !oauth_keys.contains(*reference) && !staged_names.contains(*reference))
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
+    let result_revision = crate::intel::hex_lower(&Sha256::digest(config_json_owned.as_bytes()));
+    let credential_count = config
+        .servers
+        .iter()
+        .flat_map(|(name, server)| mcp_secret_references(name, server))
+        .count();
+    let terminal_response = Response::McpConfigCommitted {
+        client_operation_id: client_operation_id.to_owned(),
+        project_root: requested_project_root,
+        owner_root: project_root.to_owned(),
+        config_path: path.to_string_lossy().into_owned(),
+        consumed_revision,
+        result_revision,
+        config_generation: inventory::publish_committed_config_generation(),
+        credential_count: u32::try_from(credential_count).unwrap_or(u32::MAX),
+    };
+    let terminal_response_json = serde_json::to_string(&terminal_response).map_err(internal)?;
     let staged_for_tx = staged_values.clone();
     let staged_mutations = ctx
         .db
@@ -14700,15 +14929,25 @@ async fn save_mcp_config(
             let config_path = path.to_string_lossy().into_owned();
             let config_json = config_json_owned.clone();
             let cleanup_json = cleanup_json.clone();
+            let owner_digest = owner_digest.to_owned();
+            let client_operation_id = client_operation_id.to_owned();
+            let terminal_response_json = terminal_response_json.clone();
             let all_refs = all_refs.clone();
             let static_nonstaged_refs = static_nonstaged_refs.clone();
             move |conn| {
                 conn.execute(
                     "INSERT INTO mcp_config_journals
-                     (journal_id, project_root, config_path, config_json, cleanup_names_json, phase, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'staged', ?6)",
+                     (journal_id, owner_digest, client_operation_id, request_hash,
+                      fencing_generation, terminal_response_json, project_root,
+                      config_path, config_json, cleanup_names_json, phase, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'staged', ?11)",
                     rusqlite::params![
                         journal_id,
+                        owner_digest,
+                        client_operation_id,
+                        request_hash.as_slice(),
+                        fencing_generation,
+                        terminal_response_json,
                         project_root,
                         config_path,
                         config_json,
@@ -14744,12 +14983,7 @@ async fn save_mcp_config(
                     // and the enclosing transaction rolls back. Do NOT rely on
                     // `INSERT OR IGNORE` to let cross-kind claims silently
                     // coexist.
-                    reject_conflicting_named_ownership_on_conn(
-                        conn,
-                        name,
-                        "mcp",
-                        &project_root,
-                    )?;
+                    reject_conflicting_named_ownership_on_conn(conn, name, "mcp", &project_root)?;
                     let mutation = vault.mutate_item_on_conn(
                         conn,
                         cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
@@ -14818,22 +15052,7 @@ async fn save_mcp_config(
         delete_owned_named_secret(ctx, &name, "mcp", project_root).await?;
     }
     delete_mcp_journal(ctx, &journal_id).await?;
-    let credential_count = config
-        .servers
-        .iter()
-        .flat_map(|(name, server)| mcp_secret_references(name, server))
-        .count();
-    let result_revision = crate::intel::hex_lower(&Sha256::digest(config_json_owned.as_bytes()));
-    Ok(Response::McpConfigCommitted {
-        client_operation_id: client_operation_id.to_owned(),
-        project_root: requested_project_root,
-        owner_root: project_root.to_owned(),
-        config_path: path.to_string_lossy().into_owned(),
-        consumed_revision,
-        result_revision,
-        config_generation: inventory::publish_committed_config_generation(),
-        credential_count: u32::try_from(credential_count).unwrap_or(u32::MAX),
-    })
+    Ok(terminal_response)
 }
 
 async fn delete_mcp_journal(
@@ -14843,6 +15062,36 @@ async fn delete_mcp_journal(
     let journal_id = journal_id.to_owned();
     ctx.db
         .write(move |conn| {
+            let (owner, operation_id, request_hash, fence, response): (
+                String,
+                String,
+                Vec<u8>,
+                i64,
+                String,
+            ) = conn.query_row(
+                "SELECT owner_digest,client_operation_id,request_hash,
+                        fencing_generation,terminal_response_json
+                 FROM mcp_config_journals WHERE journal_id = ?1",
+                rusqlite::params![journal_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+            settle_journaled_local_success_on_conn(
+                conn,
+                "save_mcp_config",
+                &owner,
+                &operation_id,
+                &request_hash,
+                fence,
+                &response,
+            )?;
             conn.execute(
                 "DELETE FROM mcp_config_journals WHERE journal_id = ?1",
                 rusqlite::params![journal_id],

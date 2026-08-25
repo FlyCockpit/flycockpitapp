@@ -3692,12 +3692,14 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
     // trust policy; startup covers the non-project layers.
     {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        if let Err(error) = dispatch::recover_all_provider_config_journals(&ctx).await {
-            tracing::error!(%error, "startup provider-config journal recovery failed; provider requests will retry it");
-        }
-        if let Err(error) = dispatch::recover_all_mcp_config_journals(&ctx).await {
-            tracing::error!(%error, "startup MCP-config journal recovery failed; MCP requests will retry it");
-        }
+        dispatch::recover_all_provider_config_journals(&ctx)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))
+            .context("startup provider-config journal recovery failed")?;
+        dispatch::recover_all_mcp_config_journals(&ctx)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))
+            .context("startup MCP-config journal recovery failed")?;
         dispatch::recover_committed_oauth_settlements(&ctx)
             .await
             .context("reconciling committed OAuth authority operations")?;

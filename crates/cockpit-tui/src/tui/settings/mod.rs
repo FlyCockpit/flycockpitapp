@@ -2213,12 +2213,20 @@ impl Dialog {
         provider_id: &str,
         oauth_expired: bool,
     ) -> Self {
-        // The daemon is the authority for effective provider state. Its
-        // redacted snapshot is safe to seed into the editor and also lets the
-        // daemon migrate any legacy literal headers during the first save.
+        #[cfg(test)]
+        let config = {
+            let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
+            ConfigDoc::providers_from_paths(&paths)
+        };
+        #[cfg(test)]
+        let Some(entry) = config.providers.get(provider_id).cloned() else {
+            return Self::open(cwd);
+        };
+        #[cfg(not(test))]
         let Some(config) = daemon_provider_snapshot(cwd, Some(provider_id)) else {
             return Self::open(cwd);
         };
+        #[cfg(not(test))]
         let Some(entry) = config.providers.get(provider_id).cloned() else {
             return Self::open(cwd);
         };

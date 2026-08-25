@@ -314,6 +314,86 @@ pub enum AuthorizationRequest<'a> {
         /// verified output-directory digest).
         output_path_authority: &'a crate::image_generation_job::OutputPathAuthorityId,
     },
+    /// The single central authorization for an external audio-transcription
+    /// media egress (purpose `transcription`). It is the one decision issuer for
+    /// transcription dispatch; the free-standing
+    /// [`crate::audio_transcription::authorization::MediaEgressTranscriptionRequest`]
+    /// is only a builder that constructs this central request.
+    ///
+    /// It carries only secret-free redacted facts plus the versioned canonical
+    /// [`crate::audio_transcription::authorization::transcription_request_digest`]
+    /// that binds every caller-context field (provider, model, credential
+    /// fingerprint, origin/location, project, session, attachment checksum,
+    /// media interval, prompt bytes, keywords, languages, timestamp/diarization
+    /// options, and purpose). It carries **no** prompt text, **no** keyword or
+    /// language strings, **no** credential token, and **no** audio bytes — those
+    /// never reach this seam. Every use independently authorizes and audits the
+    /// exact digest; there is no global grant.
+    MediaEgress {
+        /// The exact `transcription_request_digest` under decision. Full
+        /// lowercase 64-hex; identifies the request without carrying its prompt
+        /// text or a provider secret. The
+        /// [`crate::audio_transcription::authorization::MediaEgressRequestDigest`]
+        /// newtype makes a raw token/prompt string unrepresentable here (its only
+        /// prod constructor is the canonical-encode-and-hash of a request).
+        request_digest: &'a crate::audio_transcription::authorization::MediaEgressRequestDigest,
+        /// Always `"transcription"` for this module.
+        purpose: &'a str,
+        /// Provider identity (safe label, e.g. `"openai"`).
+        provider_id: &'a str,
+        /// Selected model id (`gpt-transcribe` / `whisper-1` /
+        /// `gpt-4o-transcribe-diarize`).
+        model_id: &'a str,
+        /// Credential FINGERPRINT digest — never the token itself. The
+        /// [`crate::image_sidecar::CredentialFingerprintDigest`] newtype makes a
+        /// raw credential token unrepresentable here (its only prod constructor
+        /// binds to the real fingerprint computation).
+        credential_fingerprint_digest: &'a crate::image_sidecar::CredentialFingerprintDigest,
+        /// Canonical project digest (safe digest, not a raw path).
+        project_digest: &'a str,
+        /// Session identity.
+        session_id: &'a str,
+        /// Attachment identity and content checksum (safe digests).
+        attachment_id: &'a str,
+        attachment_checksum: &'a str,
+        /// The exact selected media interval, in microseconds.
+        interval_start_us: u64,
+        interval_end_us: u64,
+        /// Redacted request shape: whether a prompt is present and the ordered
+        /// keyword/language counts. The strings themselves stay behind the
+        /// digest and never reach this seam.
+        prompt_present: bool,
+        keyword_count: u32,
+        language_count: u32,
+        /// Requested timestamp mode: `"off"` / `"segment"` / `"word"`.
+        timestamps: &'a str,
+        /// Whether diarization was requested.
+        diarization: bool,
+    },
+}
+
+/// Secret-free facts the media-egress transcription decision consumes. It is the
+/// destructured [`AuthorizationRequest::MediaEgress`] payload, threaded to
+/// [`Approver::approve_media_egress_inner`] so the arm stays a thin dispatch.
+/// Every field mirrors the variant's redacted contract — no prompt text, keyword
+/// or language strings, credential token, or audio bytes.
+pub(super) struct MediaEgressAuthzFacts<'a> {
+    pub request_digest: &'a crate::audio_transcription::authorization::MediaEgressRequestDigest,
+    pub purpose: &'a str,
+    pub provider_id: &'a str,
+    pub model_id: &'a str,
+    pub credential_fingerprint_digest: &'a crate::image_sidecar::CredentialFingerprintDigest,
+    pub project_digest: &'a str,
+    pub session_id: &'a str,
+    pub attachment_id: &'a str,
+    pub attachment_checksum: &'a str,
+    pub interval_start_us: u64,
+    pub interval_end_us: u64,
+    pub prompt_present: bool,
+    pub keyword_count: u32,
+    pub language_count: u32,
+    pub timestamps: &'a str,
+    pub diarization: bool,
 }
 
 /// Secret-free facts the image-generation composite decision consumes. It is
@@ -429,6 +509,46 @@ impl Approver {
                     capability_fresh,
                     insecure_transport_allowed,
                     output_path_authority,
+                })
+                .await
+            }
+            AuthorizationRequest::MediaEgress {
+                request_digest,
+                purpose,
+                provider_id,
+                model_id,
+                credential_fingerprint_digest,
+                project_digest,
+                session_id,
+                attachment_id,
+                attachment_checksum,
+                interval_start_us,
+                interval_end_us,
+                prompt_present,
+                keyword_count,
+                language_count,
+                timestamps,
+                diarization,
+            } => {
+                // The one transcription decision issuer. Every use independently
+                // authorizes the exact request digest; there is no global grant.
+                self.approve_media_egress_inner(MediaEgressAuthzFacts {
+                    request_digest,
+                    purpose,
+                    provider_id,
+                    model_id,
+                    credential_fingerprint_digest,
+                    project_digest,
+                    session_id,
+                    attachment_id,
+                    attachment_checksum,
+                    interval_start_us,
+                    interval_end_us,
+                    prompt_present,
+                    keyword_count,
+                    language_count,
+                    timestamps,
+                    diarization,
                 })
                 .await
             }

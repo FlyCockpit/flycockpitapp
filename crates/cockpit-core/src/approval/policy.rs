@@ -663,6 +663,131 @@ impl Approver {
         Ok(decision)
     }
 
+    /// The single central authorization for an external audio-transcription
+    /// media egress (purpose `transcription`).
+    ///
+    /// This is the one decision issuer for transcription dispatch. The decision
+    /// binds the exact `transcription_request_digest`, so every use independently
+    /// re-authorizes the exact request — there is no global grant, and a standing
+    /// grant identity is destination/project/purpose policy, never a blanket
+    /// allow. The layers:
+    ///
+    /// 1. **Yolo** opens no human prompt and allows once after reaching this seam
+    ///    (agent discretion; no grant persisted).
+    /// 2. **Manual/Auto** honor a matching standing grant (fails closed this
+    ///    increment; see [`Self::media_egress_grant_matches`]), else ask the
+    ///    human, disclosing only the redacted provider/model/interval facts and
+    ///    the digest prefix.
+    ///
+    /// Fail-closed everywhere: a missing grant never fakes an allow.
+    pub(super) async fn approve_media_egress_inner(
+        &self,
+        facts: MediaEgressAuthzFacts<'_>,
+    ) -> Result<Decision> {
+        // Redacted audit of the exact request under decision. Every field is a
+        // safe digest, identity, count, or boolean — the credential FINGERPRINT
+        // digest is not the token, and no prompt/keyword/language string or
+        // audio byte is present.
+        tracing::debug!(
+            purpose = facts.purpose,
+            provider_id = facts.provider_id,
+            model_id = facts.model_id,
+            credential_fingerprint_digest = facts.credential_fingerprint_digest.as_str(),
+            project_digest = facts.project_digest,
+            session_id = facts.session_id,
+            attachment_id = facts.attachment_id,
+            attachment_checksum = facts.attachment_checksum,
+            interval_start_us = facts.interval_start_us,
+            interval_end_us = facts.interval_end_us,
+            prompt_present = facts.prompt_present,
+            keyword_count = facts.keyword_count,
+            language_count = facts.language_count,
+            timestamps = facts.timestamps,
+            diarization = facts.diarization,
+            request_digest = facts.request_digest.as_str(),
+            "authorizing transcription media egress"
+        );
+        match self.approval_mode() {
+            crate::config::extended::ApprovalMode::Yolo => {
+                Ok(Decision::Allow { scope: Scope::Once })
+            }
+            crate::config::extended::ApprovalMode::Manual
+            | crate::config::extended::ApprovalMode::Auto => {
+                if self.media_egress_grant_matches(&facts) {
+                    Ok(Decision::Allow { scope: Scope::Once })
+                } else {
+                    self.raise_media_egress_prompt(&facts).await
+                }
+            }
+        }
+    }
+
+    /// Grant-matching hook for transcription media egress. A matching persisted
+    /// grant lets Manual/Auto short-circuit to a standing allow without a prompt.
+    ///
+    /// TODO(audio-transcription-grant-persistence): this increment ships no
+    /// session/project transcription grant store, so the seam fails closed — no
+    /// grant ever matches, and Manual/Auto always ask the human, re-authorizing
+    /// the exact digest each time. A later increment consults the store keyed by
+    /// destination/project/purpose (never a global grant) and must fail closed on
+    /// any lookup error and never fake a match.
+    fn media_egress_grant_matches(&self, _facts: &MediaEgressAuthzFacts<'_>) -> bool {
+        false
+    }
+
+    /// Raise the human transcription media-egress approval prompt (Manual/Auto
+    /// without a matching grant). A single approve/deny question carrying only
+    /// secret-free facts: provider/model, the media interval, and the digest
+    /// prefix. No prompt text, keyword/language strings, credential token, or
+    /// audio bytes are ever disclosed. Approve → allow once; deny/dismiss → deny.
+    async fn raise_media_egress_prompt(
+        &self,
+        facts: &MediaEgressAuthzFacts<'_>,
+    ) -> Result<Decision> {
+        let digest_prefix: String = facts.request_digest.as_str().chars().take(12).collect();
+        let prompt = format!(
+            "Approve {} egress to `{}` model `{}` for attachment interval {}..{}us (request {})?",
+            facts.purpose,
+            facts.provider_id,
+            facts.model_id,
+            facts.interval_start_us,
+            facts.interval_end_us,
+            digest_prefix,
+        );
+        let question = InterruptQuestion::Single {
+            prompt,
+            options: vec![
+                opt(ApprovalOptionId::ApproveOnce, "Yes, transcribe"),
+                opt(ApprovalOptionId::Reject, "Deny"),
+            ],
+            allow_freetext: false,
+            command_detail: None,
+            permission: true,
+            approval_class: None,
+            sandbox_escalation: None,
+        };
+        let description = format!(
+            "{} egress to `{}` model `{}` (request {})",
+            facts.purpose, facts.provider_id, facts.model_id, digest_prefix,
+        );
+        let set = ApprovalOptionSet::new(
+            "media_egress_approval",
+            [ApprovalOptionId::ApproveOnce, ApprovalOptionId::Reject],
+        );
+        self.raise_and_decode(&description, question, |response| {
+            // Dismissal (no selection) denies, fail closed.
+            let Some(id) = decode_option_response(response, &set)? else {
+                return Ok(Decision::Deny);
+            };
+            match id {
+                ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
+                ApprovalOptionId::Reject => Ok(Decision::Deny),
+                _ => Err(ForeignOptionId::new(&set, id.as_str())),
+            }
+        })
+        .await
+    }
+
     /// The single composite authorization for an image-generation dispatch.
     ///
     /// This is the one decision issuer for image generation — the deleted

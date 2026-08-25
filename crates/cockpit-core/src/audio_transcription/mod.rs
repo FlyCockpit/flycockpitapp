@@ -38,6 +38,7 @@
 
 pub mod authorization;
 pub mod catalogs;
+pub mod dispatch;
 pub mod request;
 pub mod response;
 pub mod result;

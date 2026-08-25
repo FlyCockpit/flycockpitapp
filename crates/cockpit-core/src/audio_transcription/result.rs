@@ -15,44 +15,86 @@ use serde::{Deserialize, Serialize};
 // Language codecs
 // ---------------------------------------------------------------------------
 
-/// A caller-requested language: exactly `{kind:"requested",code}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename = "requested", deny_unknown_fields)]
-pub struct RequestedLanguageV1 {
-    pub code: String,
+// The three language codecs each serialize as exactly `{kind:<tag>,code}` and
+// reject any other tag value, a missing tag, unknown fields, or a missing code
+// on the way back in. A derive with `#[serde(tag = "kind", rename = ...)]`
+// cannot express this: on a struct it adds the tag on serialize but ignores its
+// value on deserialize (so a wrong tag would silently round-trip), and pairing
+// it with `deny_unknown_fields` breaks deserialize entirely because the injected
+// `kind` field is rejected as unknown. The manual impls below — mirroring
+// [`DiarizedSegmentV1`] — pin the exact tag value in both directions. The
+// `codec_serde!` macro keeps the three noninterchangeable codecs byte-identical
+// in shape while preserving their distinct tag values and Rust types.
+macro_rules! codec_serde {
+    ($ty:ident, $tag:literal, $variant:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct $ty {
+            pub code: String,
+        }
+
+        impl $ty {
+            pub fn new(code: String) -> Self {
+                Self { code }
+            }
+
+            /// The fixed local tag emitted for this codec.
+            pub const KIND: &'static str = $tag;
+        }
+
+        impl Serialize for $ty {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeStruct;
+                let mut s = serializer.serialize_struct(stringify!($ty), 2)?;
+                s.serialize_field("kind", $tag)?;
+                s.serialize_field("code", &self.code)?;
+                s.end()
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                // An internally-tagged single-variant enum pins the tag VALUE:
+                // any other `kind`, a missing `kind`, a missing `code`, or an
+                // unknown field rejects. The renamed variant carries the exact
+                // tag string ($tag), never the field name "kind".
+                #[derive(Deserialize)]
+                #[serde(tag = "kind", deny_unknown_fields)]
+                enum Helper {
+                    #[serde(rename = $tag)]
+                    $variant { code: String },
+                }
+                let Helper::$variant { code } = Helper::deserialize(deserializer)?;
+                Ok(Self::new(code))
+            }
+        }
+    };
 }
 
-impl RequestedLanguageV1 {
-    pub fn new(code: String) -> Self {
-        Self { code }
-    }
-}
-
-/// An applied (sent) language: exactly `{kind:"applied",code}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename = "applied", deny_unknown_fields)]
-pub struct AppliedLanguageV1 {
-    pub code: String,
-}
-
-impl AppliedLanguageV1 {
-    pub fn new(code: String) -> Self {
-        Self { code }
-    }
-}
-
-/// A provider-detected language: exactly `{kind:"detected",code}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename = "detected", deny_unknown_fields)]
-pub struct DetectedLanguageV1 {
-    pub code: String,
-}
-
-impl DetectedLanguageV1 {
-    pub fn new(code: String) -> Self {
-        Self { code }
-    }
-}
+codec_serde!(
+    RequestedLanguageV1,
+    "requested",
+    Requested,
+    "A caller-requested language: exactly `{kind:\"requested\",code}`."
+);
+codec_serde!(
+    AppliedLanguageV1,
+    "applied",
+    Applied,
+    "An applied (sent) language: exactly `{kind:\"applied\",code}`."
+);
+codec_serde!(
+    DetectedLanguageV1,
+    "detected",
+    Detected,
+    "A provider-detected language: exactly `{kind:\"detected\",code}`."
+);
 
 /// Tag-convert a requested language to an applied language (same code, new tag).
 pub fn requested_to_applied(req: &RequestedLanguageV1) -> AppliedLanguageV1 {

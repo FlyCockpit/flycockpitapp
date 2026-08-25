@@ -245,6 +245,9 @@ pub enum SessionsOutcome {
         session_id: Uuid,
         before_seq: Option<i64>,
     },
+    /// Execute a daemon-owned archive/delete/unarchive mutation without
+    /// waiting in the input reducer, then reload this browser level.
+    Mutate(cockpit_core::daemon::proto::Request),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1070,21 +1073,9 @@ impl SessionsPane {
             },
             ConfirmChoice::Delete => Request::DeleteSession { session_id },
         };
-        match agent_runner::daemon_request_blocking(req) {
-            Ok(_) => {
-                self.error = None;
-            }
-            Err(e) => {
-                self.error = Some(e);
-            }
-        }
         self.step = Step::Browse;
-        self.reload_current_level();
-        if self.daemon_connected {
-            Some(SessionsOutcome::LoadList)
-        } else {
-            None
-        }
+        self.error = None;
+        Some(SessionsOutcome::Mutate(req))
     }
 
     fn unarchive_selected(&mut self) -> Option<SessionsOutcome> {
@@ -1095,16 +1086,17 @@ impl SessionsPane {
         }
         let s = self.selected().cloned()?;
         s.archived_at?;
-        match agent_runner::daemon_request_blocking(
+        self.error = None;
+        Some(SessionsOutcome::Mutate(
             cockpit_core::daemon::proto::Request::UnarchiveSession {
                 session_id: s.session_id,
             },
-        ) {
-            Ok(_) => self.error = None,
-            Err(e) => self.error = Some(e),
-        }
+        ))
+    }
+
+    pub(crate) fn apply_mutation_result(&mut self, result: Result<(), String>) {
+        self.error = result.err();
         self.reload_current_level();
-        Some(SessionsOutcome::LoadList)
     }
 
     /// Mouse-wheel scroll (one row).

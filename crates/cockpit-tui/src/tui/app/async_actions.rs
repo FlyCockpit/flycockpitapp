@@ -232,7 +232,7 @@ impl App {
             AsyncActionKind::DaemonRpc("goal-settings.effect"),
             AsyncActionPolicy::AllowConcurrent,
             async move {
-                let response = async {
+                async {
                     let client = crate::tui::settings::settings_daemon_client()
                         .await
                         .map_err(|error| error.to_string())?;
@@ -280,6 +280,30 @@ impl App {
         }
     }
 
+    pub(super) fn start_sessions_mutation_action(
+        &mut self,
+        request: cockpit_core::daemon::proto::Request,
+    ) {
+        self.async_actions.start(
+            AsyncActionKind::DaemonRpc("sessions.mutation"),
+            AsyncActionPolicy::Dedupe(AsyncActionKey::new("sessions.mutation")),
+            async move {
+                let response = async {
+                    let client = crate::tui::settings::settings_daemon_client()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    client
+                        .request(request)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .map_err(|error| error.to_string())
+                }
+                .await?;
+                Ok(AsyncActionPayload::Text(String::new()))
+            },
+        );
+    }
+
     pub(super) fn apply_async_action_result(&mut self, result: AsyncActionResult) {
         // Provisional `/new` owns a cleared view. Only the switch/resume
         // settlement path and outgoing delivery-receipt fence bookkeeping may
@@ -298,6 +322,17 @@ impl App {
             AsyncActionKind::DaemonRpc("settings.effect") => {
                 if let Ok(AsyncActionPayload::SettingsDaemon(completion)) = result.payload {
                     self.dialog.apply_settings_daemon_completion(completion);
+                }
+            }
+            AsyncActionKind::DaemonRpc("sessions.mutation") => {
+                let mutation = result.payload.map(|_| ());
+                let mut reload = false;
+                if let Overlay::Sessions(pane) = &mut self.overlay {
+                    pane.apply_mutation_result(mutation);
+                    reload = true;
+                }
+                if reload {
+                    self.start_sessions_list_action();
                 }
             }
             AsyncActionKind::DaemonRpc("goal-settings.effect") => {

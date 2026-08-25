@@ -415,43 +415,45 @@ impl Db {
             return Ok((Some(body.to_string()), None, None));
         }
         #[cfg(not(windows))]
-        let Some(_db_path) = self.path() else {
-            return Ok((Some(body.to_string()), None, None));
-        };
-        // Each durable payload gets a non-reusable pathname. Cleanup can then
-        // never unlink a freshly prepared row which happens to have the same
-        // content hash as a deleted predecessor.
-        let rel = delegation_payload_relative_path(session_id, hash, Uuid::now_v7());
-        let abs = self.delegation_payload_base_dir()?.join(&rel);
-        let relative = rel_to_string(&rel);
-        let intent_relative = relative.clone();
-        self.transaction(move |conn| {
-            conn.execute(
-                "INSERT INTO task_delegation_sidecar_prepare_intents(sidecar_path,session_id,created_at_unix_ms)
-                 VALUES(?1,?2,?3)",
-                params![intent_relative, session_id.to_string(), Utc::now().timestamp_millis()],
-            )?;
-            Ok(())
-        })
-        .await
-        .context("recording delegation sidecar prepare intent")?;
-        crate::db::files::ensure_parent_dir_private(&abs)?;
-        if abs.exists() {
-            let existing = std::fs::read_to_string(&abs).with_context(|| {
-                format!("reading existing delegation payload {}", abs.display())
-            })?;
-            let existing_hash = delegation_payload_hash(&existing);
-            if existing_hash != hash {
-                bail!(
-                    "delegation payload sidecar hash mismatch for {}",
-                    abs.display()
-                );
+        {
+            let Some(_db_path) = self.path() else {
+                return Ok((Some(body.to_string()), None, None));
+            };
+            // Each durable payload gets a non-reusable pathname. Cleanup can
+            // then never unlink a freshly prepared row which happens to have
+            // the same content hash as a deleted predecessor.
+            let rel = delegation_payload_relative_path(session_id, hash, Uuid::now_v7());
+            let abs = self.delegation_payload_base_dir()?.join(&rel);
+            let relative = rel_to_string(&rel);
+            let intent_relative = relative.clone();
+            self.transaction(move |conn| {
+                conn.execute(
+                    "INSERT INTO task_delegation_sidecar_prepare_intents(sidecar_path,session_id,created_at_unix_ms)
+                     VALUES(?1,?2,?3)",
+                    params![intent_relative, session_id.to_string(), Utc::now().timestamp_millis()],
+                )?;
+                Ok(())
+            })
+            .await
+            .context("recording delegation sidecar prepare intent")?;
+            crate::db::files::ensure_parent_dir_private(&abs)?;
+            if abs.exists() {
+                let existing = std::fs::read_to_string(&abs).with_context(|| {
+                    format!("reading existing delegation payload {}", abs.display())
+                })?;
+                let existing_hash = delegation_payload_hash(&existing);
+                if existing_hash != hash {
+                    bail!(
+                        "delegation payload sidecar hash mismatch for {}",
+                        abs.display()
+                    );
+                }
+            } else {
+                crate::db::files::publish_private_file_durable(&abs, body.as_bytes())
+                    .with_context(|| format!("publishing delegation payload {}", abs.display()))?;
             }
-        } else {
-            crate::db::files::publish_private_file_durable(&abs, body.as_bytes())
-                .with_context(|| format!("publishing delegation payload {}", abs.display()))?;
+            Ok((None, Some(relative), Some(abs)))
         }
-        Ok((None, Some(relative), Some(abs)))
     }
 
     fn load_task_delegation_payload_body(&self, row: &TaskDelegationPayloadRow) -> Result<String> {

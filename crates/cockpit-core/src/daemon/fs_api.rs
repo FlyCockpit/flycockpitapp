@@ -1056,10 +1056,14 @@ fn apply_denylist_sequence(
                         "new denylist occurrence nonce is invalid or duplicated",
                     ));
                 }
-                validate_new_denylist_literal(&literal)?;
+                validate_new_denylist_literal(literal.as_str())?;
                 // The post-commit occurrence ID is derived only after the
                 // resulting document revision is known.
-                result.push((String::new(), Some(client_nonce), literal));
+                result.push((
+                    String::new(),
+                    Some(client_nonce),
+                    literal.as_str().to_owned(),
+                ));
             }
         }
     }
@@ -1136,8 +1140,8 @@ fn apply_redacted_occurrence_mutations(
         }
         if let cockpit_proto::RedactedOccurrenceMutation::Set { value, .. } = &mutation
             && (value.len() > 64 * 1024
-                || value.contains('\0')
-                || value.contains(SETTINGS_REDACTED_OCCURRENCE_PREFIX))
+                || value.as_str().contains('\0')
+                || value.as_str().contains(SETTINGS_REDACTED_OCCURRENCE_PREFIX))
         {
             return Err(bad_request("redacted setting replacement is invalid"));
         }
@@ -1147,7 +1151,7 @@ fn apply_redacted_occurrence_mutations(
                 serde_json::Value::Object(object),
                 cockpit_proto::RedactedOccurrenceMutation::Set { value, .. },
             ) => {
-                object.insert(leaf, serde_json::Value::String(value));
+                object.insert(leaf, serde_json::Value::String(value.as_str().to_owned()));
             }
             (
                 serde_json::Value::Object(object),
@@ -1167,7 +1171,7 @@ fn apply_redacted_occurrence_mutations(
                 let slot = array
                     .get_mut(index)
                     .ok_or_else(|| conflict("redacted mutation target changed"))?;
-                *slot = serde_json::Value::String(value);
+                *slot = serde_json::Value::String(value.as_str().to_owned());
             }
             (
                 serde_json::Value::Array(array),
@@ -1905,7 +1909,9 @@ mod tests {
     #![allow(deprecated)]
 
     use super::*;
-    use crate::daemon::principal::{ClientPrincipal, PrincipalGrant, PrincipalScope};
+    use crate::daemon::principal::ClientPrincipal;
+    #[cfg(feature = "remote")]
+    use crate::daemon::principal::{PrincipalGrant, PrincipalScope};
 
     fn test_ctx(root: &Path) -> crate::daemon::server::DaemonContext {
         let db = crate::db::Db::open_in_memory().expect("in-memory db");
@@ -2436,7 +2442,7 @@ mod tests {
                 },
                 cockpit_proto::DesiredDenylistEntry::New {
                     client_nonce: "replacement-occurrence".into(),
-                    literal: "new-value".into(),
+                    literal: cockpit_proto::SensitiveWireLiteral::new("new-value".into()),
                 },
             ],
             &["first".into(), "second".into()],
@@ -2462,7 +2468,7 @@ mod tests {
                 document.as_object_mut().unwrap(),
                 vec![cockpit_proto::DesiredDenylistEntry::New {
                     client_nonce: format!("00000000-0000-4000-8000-{index:012}"),
-                    literal: literal.into(),
+                    literal: cockpit_proto::SensitiveWireLiteral::new(literal.into()),
                 }],
                 &[],
             )

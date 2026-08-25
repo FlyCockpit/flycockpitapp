@@ -690,8 +690,12 @@ fn apply_denylist_sequence(
                         "new denylist occurrence nonce is invalid or duplicated".to_string()
                     );
                 }
-                validate_new_denylist_literal(&literal)?;
-                result.push((String::new(), Some(client_nonce), literal));
+                validate_new_denylist_literal(literal.as_str())?;
+                result.push((
+                    String::new(),
+                    Some(client_nonce),
+                    literal.as_str().to_owned(),
+                ));
             }
         }
     }

@@ -105,8 +105,16 @@ pub struct ExtendedConfigPatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RedactedOccurrenceMutation {
-    Set { pointer: String, value: String },
-    Unset { pointer: String },
+    /// The replacement plaintext. Wire shape is an unchanged JSON string; the
+    /// newtype keeps it out of the non-zeroizing FCOR canonical buffer and out
+    /// of `Debug`.
+    Set {
+        pointer: String,
+        value: crate::SensitiveWireLiteral,
+    },
+    Unset {
+        pointer: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -319,15 +327,19 @@ impl ExtendedConfigField {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Deliberately not `PartialEq`/`Eq`: the new-entry literal is a secret, and a
+/// derived comparison would be a value-derived equality oracle over it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum DesiredDenylistEntry {
     Existing {
         entry_id: String,
     },
+    /// Wire shape is an unchanged JSON string; the newtype keeps the plaintext
+    /// out of the non-zeroizing FCOR canonical buffer and out of `Debug`.
     New {
         client_nonce: String,
-        literal: String,
+        literal: crate::SensitiveWireLiteral,
     },
 }
 

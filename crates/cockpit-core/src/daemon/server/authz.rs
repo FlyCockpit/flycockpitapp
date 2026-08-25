@@ -1484,7 +1484,7 @@ pub(super) async fn authorize_request_shared(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod remote_attempt_authz_tests {
     use super::*;
 
@@ -1542,7 +1542,6 @@ mod remote_attempt_authz_tests {
         }};
     }
 
-    #[cfg(feature = "remote")]
     #[test]
     fn remote_attempt_request_authz_table_exhaustive() {
         let rows = proto::command!(remote_attempt_authz_rows);

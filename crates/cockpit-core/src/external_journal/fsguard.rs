@@ -899,8 +899,10 @@ mod imp {
 }
 
 pub use imp::DirGuard;
+#[cfg(all(unix, feature = "remote"))]
+pub use imp::HeldEntryIdentity;
 #[cfg(all(unix, any(feature = "remote", test)))]
-pub use imp::{HeldEntryIdentity, HeldRenameEffect};
+pub use imp::HeldRenameEffect;
 
 impl DirGuard {
     /// Enumerate candidate file names. The names are untrusted: every caller

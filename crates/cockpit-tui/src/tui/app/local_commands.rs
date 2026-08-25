@@ -990,11 +990,18 @@ impl App {
             .map(|d| d.path.join("mcp.json"))
     }
 
-    pub(super) fn mcp_load(&self) -> cockpit_core::mcp::config::McpConfig {
+    /// The daemon-owned MCP projection for the launch cwd. `None` means the
+    /// daemon could not answer; callers that write back must not mistake that
+    /// for an empty config.
+    pub(super) fn mcp_snapshot(&self) -> Option<cockpit_core::mcp::config::McpConfig> {
         #[cfg(test)]
         MCP_LOAD_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        cockpit_core::mcp::config::McpConfig::discover(&self.launch.cwd)
+        crate::tui::settings::daemon_mcp_snapshot_for_root(&self.launch.cwd)
+    }
+
+    pub(super) fn mcp_load(&self) -> cockpit_core::mcp::config::McpConfig {
+        self.mcp_snapshot().unwrap_or_default()
     }
 
     pub(super) fn mcp_save(&mut self, cfg: &cockpit_core::mcp::config::McpConfig) -> bool {
@@ -1037,7 +1044,10 @@ impl App {
     /// `/mcp on|off|toggle [id]`. `enable=None` toggles; a mixed set toggled
     /// in bulk turns all **off** (spec). `id=None` applies to every server.
     pub(super) fn mcp_set_enabled(&mut self, id: Option<&str>, enable: Option<bool>) {
-        let mut cfg = self.mcp_load();
+        let Some(mut cfg) = self.mcp_snapshot() else {
+            self.push_plain("Failed to read MCP config".to_string());
+            return;
+        };
         if let Some(id) = id {
             let Some(server) = cfg.servers.get_mut(id) else {
                 self.push_plain(format!("Unknown MCP server `{id}`"));

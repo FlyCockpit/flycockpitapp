@@ -1773,7 +1773,12 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Login(_))));
 
         let help = Cli::command().render_help().to_string();
+        // The account surface is remote-only: the local artifact must not
+        // advertise it, and the remote build must.
+        #[cfg(feature = "remote")]
         assert!(help.contains("account"), "{help}");
+        #[cfg(not(feature = "remote"))]
+        assert!(!help.contains("account"), "{help}");
         assert!(help.contains("provider"), "{help}");
         assert!(!help.contains("  login"), "{help}");
         assert!(!help.contains("  logout"), "{help}");

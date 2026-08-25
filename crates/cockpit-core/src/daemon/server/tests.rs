@@ -15736,6 +15736,7 @@ async fn authz_default_profile_owner_traverses_every_controlled_socket_path() {
             authz_matrix_request(case.kind, session_id, tmp.path()),
         )
         .await;
+        #[cfg_attr(not(feature = "remote"), allow(irrefutable_let_patterns))]
         let AuthzExpectation::Allow(expected) = case.expectation(AuthzLevel::Owner) else {
             panic!("{} must authorize the local owner", case.kind);
         };

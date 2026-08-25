@@ -11,9 +11,11 @@
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
+#[cfg(feature = "remote")]
+use crate::tui::theme::PLAN_YELLOW;
 use crate::tui::theme::{
-    FAVORITE_MODEL, MUTED_COLOR_INDEX, PLAN_YELLOW, STATUS_BRANCH_BADGE, WARNING_TEXT,
-    button_focus_style, button_hover_style, button_idle_style,
+    FAVORITE_MODEL, MUTED_COLOR_INDEX, STATUS_BRANCH_BADGE, WARNING_TEXT, button_focus_style,
+    button_hover_style, button_idle_style,
 };
 use cockpit_config::{extended::LlmMode, sandbox_mode::SandboxMode};
 #[cfg(feature = "remote")]
@@ -666,12 +668,11 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "remote"))]
 mod connector_tests {
     use super::*;
 
     #[test]
-    #[cfg(feature = "remote")]
     fn connector_spans_render_enabled_state() {
         let disclosure = ConnectorDisclosure {
             enabled: true,

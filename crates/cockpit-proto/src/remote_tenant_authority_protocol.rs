@@ -1835,12 +1835,15 @@ pub fn foundation_consumption_guard() {
     let _ = policy::TUPLE_SET_MIN;
     let _ = policy::PERMISSION_CEILING_MAX_BYTES;
     let _ = magic::parse_registry as fn(&str) -> _;
+    // The ceiling codec owns its own error type; digest failures reach this
+    // protocol's policy error surface through the foundation's
+    // `From<CapabilityCeilingError>` bridge.
     let _: fn(
         &RemotePermissionCeilingV1,
     ) -> std::result::Result<
         RemotePermissionCeilingDigestV1,
         policy::RemotePublicPolicyError,
-    > = permission_ceiling_digest;
+    > = |ceiling| permission_ceiling_digest(ceiling).map_err(Into::into);
 }
 
 // Closed-surface guard

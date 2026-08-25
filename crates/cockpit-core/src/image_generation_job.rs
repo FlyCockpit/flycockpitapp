@@ -8638,6 +8638,7 @@ mod tests {
 
     #[test]
     fn owner_recovery_authority_rejects_every_remote_write_mode() {
+        #[cfg(feature = "remote")]
         use crate::daemon::principal::{PrincipalGrant, PrincipalScope};
         #[cfg(feature = "remote")]
         {

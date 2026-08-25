@@ -101,8 +101,8 @@ fn ceiling_err<T>(s: impl Into<String>) -> Result<T> {
 // Neutral capability DTOs/codecs are always compiled for local daemon
 // authorization. This remote module adds only signed service-policy concerns.
 pub use crate::capability_ceiling::{
-    RemoteAttachmentCapabilityV1, RemotePermissionCeilingDigestV1, RemotePermissionCeilingV1,
-    RemoteProjectCapabilityV1, permission_ceiling_digest,
+    PERMISSION_CEILING_MAX_BYTES, RemoteAttachmentCapabilityV1, RemotePermissionCeilingDigestV1,
+    RemotePermissionCeilingV1, RemoteProjectCapabilityV1, permission_ceiling_digest,
 };
 
 impl From<crate::capability_ceiling::CapabilityCeilingError> for RemotePublicPolicyError {
@@ -2723,6 +2723,9 @@ mod tests {
             if file.file_name().and_then(|n| n.to_str()) == Some("remote_public_service_policy.rs")
             {
                 continue; // the sole definition site
+            }
+            if file.file_name().and_then(|n| n.to_str()) == Some("capability_ceiling.rs") {
+                continue; // definition site for the extracted permission-ceiling codec (PR #36, commit 13c61d38)
             }
             let content = std::fs::read_to_string(file).unwrap_or_default();
             if let Some(reason) = scan_for_guarded_definition(&content) {

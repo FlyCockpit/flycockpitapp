@@ -242,7 +242,7 @@ fn denylist_commit_receipt_binds_consumed_and_created_occurrences_exactly() {
         },
         cockpit_core::daemon::proto::DesiredDenylistEntry::New {
             client_nonce: nonce.into(),
-            literal: "secret".into(),
+            literal: cockpit_core::daemon::proto::SensitiveWireLiteral::new("secret".into()),
         },
     ];
     let committed = vec![

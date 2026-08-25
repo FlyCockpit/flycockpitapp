@@ -112,15 +112,37 @@ fn local_release_cfg_gates_commands_modules_workers_and_protocol() {
 #[test]
 fn remote_conformance_is_opt_in_and_release_declares_local_profile() {
     let ci = source(".github/workflows/cli-ci.yml");
-    assert!(ci.contains("remote_conformance:"));
+    assert!(!ci.contains("remote-workspace-static:"));
     assert_eq!(
         ci.matches("if: github.event_name == 'workflow_dispatch' && inputs.remote_conformance")
             .count(),
         2,
         "the two external-service remote conformance jobs must remain manual opt-ins"
     );
+    let remote = source(".github/workflows/remote-profile-checks.yml");
+    assert!(remote.contains("schedule:"));
+    assert!(remote.contains("workflow_dispatch:"));
+    assert!(remote.contains("continue-on-error: true"));
+    assert!(remote.contains("cargo check --locked -p cockpit-cli --all-targets --features remote"));
     let release = source(".github/workflows/release.yml");
     assert!(release.contains("FLYCOCKPIT_RELEASE_PROFILE: local-v0.1"));
+}
+
+#[test]
+fn public_v0_1_allowlist_is_exact_and_single_source() {
+    let cli = source("apps/cli/src/cli.rs");
+    let fixture: serde_json::Value = serde_json::from_str(&source(
+        "apps/cli/tests/fixtures/public-v0.1-command-snapshot.json",
+    ))
+    .unwrap();
+    let commands = fixture["commands"].as_array().unwrap();
+    for command in commands {
+        let command = command.as_str().unwrap();
+        assert!(cli.contains(&format!("\"{command}\"")), "missing {command}");
+    }
+    assert_eq!(commands.len(), 13);
+    assert!(cli.contains("PUBLIC_V0_1_COMMANDS.contains"));
+    assert!(source("apps/cli/src/lib.rs").contains("public_v0_1_command()"));
 }
 
 #[test]

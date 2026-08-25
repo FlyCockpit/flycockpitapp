@@ -16088,13 +16088,13 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
     ) || authz_kind_needs_attached_state_remote(kind, level)
 }
 
-#[cfg(feature = "remote")]
+#[cfg(all(unix, feature = "remote"))]
 fn authz_kind_needs_attached_state_remote(kind: &str, level: AuthzLevel) -> bool {
     (kind == "get_inventory_bundle" && level != AuthzLevel::NoAccess)
         || (kind == "lsp_control" && matches!(level, AuthzLevel::Owner | AuthzLevel::Writer))
 }
 
-#[cfg(not(feature = "remote"))]
+#[cfg(all(unix, not(feature = "remote")))]
 fn authz_kind_needs_attached_state_remote(_kind: &str, _level: AuthzLevel) -> bool {
     false
 }

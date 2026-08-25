@@ -19,11 +19,16 @@
 //!   - tokens are domain-separated SHA-256 digests rather than process-keyed
 //!     HMACs; only the format and internal consistency are contractual,
 //!   - there is no workspace-trust gate, no redaction table (so settings and
-//!     MCP projections carry their authored values), no capability TTL, and no
-//!     reset-all journal,
+//!     provider projections carry their authored values — the MCP projection
+//!     IS owner-view redacted, through the shared
+//!     `cockpit_core::mcp::config::redact_config_for_owner_view`), no
+//!     capability TTL, and no reset-all journal,
+//!   - `SaveMcpConfig` restores redaction sentinels like the daemon (shared
+//!     helper) but has no secret vault: credential literals stay in the
+//!     written `mcp.json` instead of migrating to references,
 //!   - file-identity CAS is reduced to content CAS.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -107,6 +112,12 @@ impl SettingsDaemonEffect for DiskDaemonFake {
                 project_root,
                 provider_id,
             } => provider_catalog_snapshot(Path::new(&project_root), provider_id.as_deref()),
+            Request::SaveMcpConfig {
+                project_root,
+                config_json,
+                secret_values_json,
+                cleanup_names_json: _,
+            } => save_mcp_config(Path::new(&project_root), &config_json, &secret_values_json),
             Request::GetAgentInventory { project_root } => {
                 agent_inventory(Path::new(&project_root))
             }
@@ -917,8 +928,13 @@ fn provider_catalog_snapshot(root: &Path, provider_id: Option<&str>) -> Result<R
             )
         })
         .collect();
-    let mcp_config_json =
-        serde_json::to_string(&cockpit_core::mcp::config::McpConfig::discover(root)).ok();
+    // Same owner-view redaction the daemon applies, through the shared
+    // helper, so /mcp tests exercise the real sentinel round-trip.
+    let mcp_config_json = {
+        let mut config = cockpit_core::mcp::config::McpConfig::discover(root);
+        cockpit_core::mcp::config::redact_config_for_owner_view(&mut config);
+        serde_json::to_string(&config).ok()
+    };
     Ok(Response::ProviderCatalogSnapshot {
         config: cockpit_core::daemon::proto::ProviderConfigView {
             providers,
@@ -930,6 +946,42 @@ fn provider_catalog_snapshot(root: &Path, provider_id: Option<&str>) -> Result<R
             // settings loads it through its own layer snapshot instead.
             extended_config_json: None,
         },
+    })
+}
+
+/// Disk-backed `SaveMcpConfig`. Runs the daemon's sentinel-restore contract
+/// through the shared [`cockpit_core::mcp::config::restore_owner_view_redactions`]
+/// helper, then publishes to the most specific `mcp.json` layer.
+///
+/// Divergences from production: there is no secret vault, so restored or
+/// staged credential literals stay in the written config instead of migrating
+/// to credential references, and none of the ownership-claim, journal, or
+/// redaction-publication machinery runs.
+fn save_mcp_config(
+    root: &Path,
+    config_json: &str,
+    secret_values_json: &str,
+) -> Result<Response, String> {
+    let mut config = cockpit_core::mcp::config::McpConfig::parse(config_json)
+        .map_err(|error| format!("invalid MCP config: {error}"))?;
+    let secret_values: BTreeMap<String, String> = serde_json::from_str(secret_values_json)
+        .map_err(|error| format!("invalid MCP secret values: {error}"))?;
+    let prior = cockpit_core::mcp::config::McpConfig::discover(root);
+    let restored = cockpit_core::mcp::config::restore_owner_view_redactions(&mut config, &prior);
+    let path = cockpit_config::dirs::mcp_file_paths_for_load(root)
+        .last()
+        .cloned()
+        .unwrap_or_else(|| root.join(".cockpit").join("mcp.json"));
+    config
+        .write_private(&path)
+        .map_err(|error| format!("writing mcp.json: {error}"))?;
+    let credential_count = secret_values
+        .keys()
+        .chain(restored.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    Ok(Response::McpConfigSaved {
+        credential_count: u32::try_from(credential_count).unwrap_or(u32::MAX),
     })
 }
 

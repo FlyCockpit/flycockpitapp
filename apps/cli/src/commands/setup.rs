@@ -393,12 +393,13 @@ async fn request_durable_local_mutation(
     operation_kind: &str,
     request: Request,
 ) -> Result<Response> {
-    let initial_rejection = match client.request(request).await {
+    let mut initial_rejection = match client.request(request.clone()).await {
         Ok(Ok(response)) => return Ok(response),
         Ok(Err(error)) => Some(error.to_string()),
         Err(_) => None,
     };
-    for _ in 0..40 {
+    let mut attempts = 0_u32;
+    loop {
         let settlement = client
             .request(Request::GetLocalOperationSettlement {
                 client_operation_id: client_operation_id.to_string(),
@@ -432,19 +433,36 @@ async fn request_durable_local_mutation(
             Ok(Ok(other)) => {
                 bail!("daemon returned an unbound settlement for {operation_kind}: {other:?}")
             }
-            Ok(Err(error)) => bail!("daemon rejected {operation_kind} settlement: {error}"),
+            Ok(Err(error)) => {
+                if let Some(rejection) = initial_rejection.as_deref() {
+                    bail!("daemon rejected {operation_kind}: {rejection}");
+                }
+                // A response can be lost after the daemon accepted the
+                // mutation but before its receipt became queryable. Re-submit
+                // the exact same operation id/body periodically; daemon-side
+                // fencing makes this an idempotent reconciliation, never a
+                // second mutation.
+                if attempts.is_multiple_of(40) {
+                    match client.request(request.clone()).await {
+                        Ok(Ok(response)) => return Ok(response),
+                        Ok(Err(rejection)) => initial_rejection = Some(rejection.to_string()),
+                        Err(_) => {}
+                    }
+                }
+                let _ = error;
+            }
             Err(_) => {}
         }
+        attempts = attempts.wrapping_add(1);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    if let Some(rejection) = initial_rejection {
-        bail!(
-            "daemon reported {operation_kind} error `{rejection}`, but its durable outcome is still unknown; retry the command to reconcile it"
-        );
-    }
-    bail!(
-        "{operation_kind} may have committed, but its durable outcome is still unknown; retry the command to reconcile it"
-    )
+}
+
+fn is_provider_revision(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(not(test))]
@@ -611,6 +629,7 @@ async fn apply_model_wizard_via_daemon(
         layer_id,
         owner_root,
         base_revision,
+        config_generation: consumed_config_generation,
         ..
     } = response
     else {
@@ -719,8 +738,11 @@ async fn apply_model_wizard_via_daemon(
             owner_root: returned_owner_root,
             mutation_intent_hash: returned_intent_hash,
             consumed_revision,
+            result_revision,
+            config_generation,
             config: result,
             status: cockpit_proto::ConfigCommitStatus::Committed,
+            publication: cockpit_proto::ConfigPublicationStatus::Published,
             ..
         } if returned_operation_id == client_operation_id
             && returned_session_id == snapshot_session_id
@@ -728,6 +750,9 @@ async fn apply_model_wizard_via_daemon(
             && returned_owner_root == owner_root
             && returned_intent_hash == mutation_intent_hash
             && consumed_revision == base_revision
+            && is_provider_revision(&result_revision)
+            && result_revision != consumed_revision
+            && config_generation == consumed_config_generation.saturating_add(1)
             && (!model_changed
                 || result
                     .providers
@@ -933,6 +958,7 @@ impl ProviderSetupActions {
             layer_id,
             owner_root,
             base_revision,
+            config_generation: consumed_config_generation,
             ..
         } = snapshot
         else {
@@ -977,8 +1003,11 @@ impl ProviderSetupActions {
                 owner_root: returned_owner_root,
                 mutation_intent_hash: returned_intent_hash,
                 consumed_revision,
+                result_revision,
+                config_generation,
                 config,
                 status: cockpit_proto::ConfigCommitStatus::Committed,
+                publication: cockpit_proto::ConfigPublicationStatus::Published,
                 ..
             } if returned_operation_id == client_operation_id
                 && returned_session_id == snapshot_session_id
@@ -986,6 +1015,9 @@ impl ProviderSetupActions {
                 && returned_owner_root == owner_root
                 && returned_intent_hash == mutation_intent_hash
                 && consumed_revision == base_revision
+                && is_provider_revision(&result_revision)
+                && result_revision != consumed_revision
+                && config_generation == consumed_config_generation.saturating_add(1)
                 && config
                     .providers
                     .get(&id)

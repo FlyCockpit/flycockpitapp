@@ -17228,26 +17228,6 @@ pub(super) async fn recover_provider_config_journals(
         let (cwd, trust_policy, _) = daemon_provider_config(ctx, project_root.as_str()).await?;
         match journal.action.as_str() {
             "save" => {
-                let entry: crate::config::providers::ProviderEntry =
-                    serde_json::from_str(journal.entry_json.as_deref().ok_or_else(|| {
-                        bad_request("provider save journal is missing its reference-only entry")
-                    })?)
-                    .map_err(internal)?;
-                // Recovery re-applies a journaled entry, but a journaled entry
-                // is NOT trusted to still be valid at replay time — it must run
-                // the SAME validation funnel as the create path
-                // (`provider_config_save`). Between journaling and recovery a
-                // referenced credential record or named secret can be logged
-                // out / deleted (dead reference), and the URL/header invariants
-                // must still hold. On any validation failure we FAIL CLOSED:
-                // the `?` aborts before the journal-deletion below, so the
-                // journal is RETAINED for a later attempt rather than
-                // republishing config that points at a dead reference.
-                validate_daemon_provider_url(&entry.url)?;
-                validate_unique_provider_header_names(&entry.headers)?;
-                ensure_provider_named_references_claimed(ctx, project_root.as_str(), &entry)
-                    .await?;
-                ensure_provider_credential_reference_available(ctx, &entry).await?;
                 let path = std::path::PathBuf::from(
                     journal
                         .config_path
@@ -17281,6 +17261,20 @@ pub(super) async fn recover_provider_config_journals(
                     // Publication already completed; amend only the exact
                     // authenticated receipt below.
                 } else if actual_revision == consumed_revision {
+                    let entry: crate::config::providers::ProviderEntry =
+                        serde_json::from_str(journal.entry_json.as_deref().ok_or_else(|| {
+                            bad_request("provider save journal is missing its reference-only entry")
+                        })?)
+                        .map_err(internal)?;
+                    // Only the consumed-state branch may replay the desired
+                    // payload. Revalidate every reference immediately before
+                    // publishing it. Divergence was classified above so a
+                    // dead desired reference cannot mask settlement-unknown.
+                    validate_daemon_provider_url(&entry.url)?;
+                    validate_unique_provider_header_names(&entry.headers)?;
+                    ensure_provider_named_references_claimed(ctx, project_root.as_str(), &entry)
+                        .await?;
+                    ensure_provider_credential_reference_available(ctx, &entry).await?;
                     let mut layer = doc.providers();
                     layer.providers.insert(journal.provider_id.clone(), entry);
                     doc.write(&layer).map_err(internal)?;
@@ -17312,23 +17306,6 @@ pub(super) async fn recover_provider_config_journals(
                 }
             }
             "batch" => {
-                let payload: ProviderBatchJournalPayload = serde_json::from_str(
-                    journal
-                        .entry_json
-                        .as_deref()
-                        .ok_or_else(|| bad_request("provider batch journal is missing payload"))?,
-                )
-                .map_err(internal)?;
-                for (provider_id, entry) in &payload.config.providers {
-                    validate_daemon_provider_url(&entry.url)?;
-                    validate_unique_provider_header_names(&entry.headers)?;
-                    ensure_provider_named_references_claimed(ctx, project_root.as_str(), entry)
-                        .await?;
-                    ensure_provider_credential_reference_available(ctx, entry).await?;
-                    if provider_id.trim().is_empty() {
-                        return Err(bad_request("provider batch journal contains an empty id"));
-                    }
-                }
                 let path = std::path::PathBuf::from(
                     journal
                         .config_path
@@ -17362,6 +17339,21 @@ pub(super) async fn recover_provider_config_journals(
                     // Publication completed before a crash. Never rewrite it;
                     // recovery only amends the exact authenticated receipt.
                 } else if actual_revision == consumed_revision {
+                    let payload: ProviderBatchJournalPayload =
+                        serde_json::from_str(journal.entry_json.as_deref().ok_or_else(|| {
+                            bad_request("provider batch journal is missing payload")
+                        })?)
+                        .map_err(internal)?;
+                    for (provider_id, entry) in &payload.config.providers {
+                        validate_daemon_provider_url(&entry.url)?;
+                        validate_unique_provider_header_names(&entry.headers)?;
+                        ensure_provider_named_references_claimed(ctx, project_root.as_str(), entry)
+                            .await?;
+                        ensure_provider_credential_reference_available(ctx, entry).await?;
+                        if provider_id.trim().is_empty() {
+                            return Err(bad_request("provider batch journal contains an empty id"));
+                        }
+                    }
                     doc.write(&payload.config).map_err(internal)?;
                     let published = crate::config::providers::ConfigDoc::load(&path)
                         .map_err(internal)?

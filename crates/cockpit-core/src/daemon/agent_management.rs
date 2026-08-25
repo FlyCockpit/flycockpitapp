@@ -374,16 +374,13 @@ pub async fn begin_editor_lease(
     expected_revision: String,
     principal_digest: String,
 ) -> Result<Response, ErrorPayload> {
-    let root = trusted_root(ctx, &project_root).await?;
-    maintain_editor_leases(ctx).await?;
-    let root_text = root.to_string_lossy().into_owned();
     if let Some(existing) = ctx
         .db
         .agent_editor_lease_by_operation(principal_digest.clone(), client_operation_id.clone())
         .await
         .map_err(internal)?
     {
-        if existing.project_root != root_text
+        if existing.project_root != project_root
             || existing.agent_name != name
             || existing.consumed_revision != expected_revision
         {
@@ -412,6 +409,12 @@ pub async fn begin_editor_lease(
             snapshot,
         }));
     }
+    // Exact durable replay is independent of the workspace's current trust
+    // configuration. Only issuance of new filesystem authority is trust-gated.
+    maintain_editor_leases(ctx).await?;
+    let root = crate::daemon::fs_api::canonical_project_root(&project_root)?;
+    let root_text = root.to_string_lossy().into_owned();
+    let root = trusted_canonical_root(ctx, root).await?;
     let snapshot = tokio::task::spawn_blocking({
         let root = root.clone();
         let name = name.clone();
@@ -556,22 +559,7 @@ async fn complete_editor_lease_inner(
     principal_digest: String,
     force_reclaim: bool,
 ) -> Result<Response, ErrorPayload> {
-    let root = trusted_root(ctx, &project_root).await?;
     Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
-    let completion_plaintext = zeroize::Zeroizing::new(
-        serde_json::to_vec(&(
-            "complete_agent_editor_lease",
-            &client_operation_id,
-            &project_root,
-            &lease_id,
-            markdown.as_deref(),
-        ))
-        .map_err(internal)?,
-    );
-    let completion_identity = ctx.secret_vault.keyed_identity(
-        b"flycockpit.agent-editor.completion.v2",
-        completion_plaintext.as_slice(),
-    );
     let known_lease = ctx
         .db
         .agent_editor_lease_by_id(lease_id.clone())
@@ -588,13 +576,33 @@ async fn complete_editor_lease_inner(
     // lease state. A typo, stale workspace selection, or malformed persisted
     // snapshot must not poison an otherwise reusable lease by reserving its
     // one completion slot.
-    if known_lease.project_root != root.to_string_lossy() {
+    if known_lease.project_root != project_root {
         return Err(bad_request("editor lease belongs to another workspace"));
     }
+    let root_text = known_lease.project_root.clone();
+    let completion_plaintext = zeroize::Zeroizing::new(
+        serde_json::to_vec(&(
+            "complete_agent_editor_lease",
+            &client_operation_id,
+            &root_text,
+            &lease_id,
+            markdown.as_deref(),
+        ))
+        .map_err(internal)?,
+    );
+    let completion_identity = ctx.secret_vault.keyed_identity(
+        b"flycockpit.agent-editor.completion.v2",
+        completion_plaintext.as_slice(),
+    );
     if known_lease.state == "open" {
         load_editor_replay(ctx, &known_lease)?;
     }
     if known_lease.state == "terminal" {
+        if known_lease.completion_identity != Some(completion_identity) {
+            return Err(conflict(
+                "agent editor lease was settled by a different completion request",
+            ));
+        }
         let json = known_lease
             .terminal_result_json
             .as_deref()
@@ -606,8 +614,12 @@ async fn complete_editor_lease_inner(
                 "agent editor lease was settled by a different client operation",
             ));
         }
+        validate_editor_completion_receipt(&known_lease, &result)?;
         return Ok(Response::AgentEditorLeaseCompleted(result));
     }
+    // Durable terminal replay and identity conflicts above do not depend on
+    // mutable trust. A new or resumed filesystem mutation still does.
+    let root = trusted_canonical_root(ctx, PathBuf::from(&root_text)).await?;
     // Expiry prevents an unacknowledged Begin from being replayed as apparent
     // success forever; it must not make an already-issued capability
     // impossible to settle. Completion remains exact-hash and owner bound, so
@@ -617,7 +629,7 @@ async fn complete_editor_lease_inner(
         serde_json::to_vec(&SealedEditorCompletion {
             owner_digest: principal_digest.clone(),
             client_operation_id: client_operation_id.clone(),
-            project_root: root.to_string_lossy().into_owned(),
+            project_root: root_text.clone(),
             lease_id: lease_id.clone(),
             markdown: markdown.clone(),
         })
@@ -675,7 +687,7 @@ async fn complete_editor_lease_inner(
             return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
                 &known_lease,
                 &client_operation_id,
-                &project_root,
+                &root_text,
                 AgentEditorSettlementStatus::Pending,
             )));
         }
@@ -711,7 +723,7 @@ async fn complete_editor_lease_inner(
                     let receipt = terminalize_editor_failure(
                         ctx,
                         &lease,
-                        &project_root,
+                        &root_text,
                         completion_identity,
                         &error,
                     )
@@ -776,7 +788,7 @@ async fn complete_editor_lease_inner(
                             let receipt = terminalize_editor_failure(
                                 ctx,
                                 &lease,
-                                &project_root,
+                                &root_text,
                                 completion_identity,
                                 &error,
                             )
@@ -811,7 +823,7 @@ async fn complete_editor_lease_inner(
             return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
                 &lease,
                 &client_operation_id,
-                &project_root,
+                &root_text,
                 AgentEditorSettlementStatus::Pending,
             )));
         };
@@ -824,13 +836,13 @@ async fn complete_editor_lease_inner(
     };
     // Durable settlement is a typed metadata receipt, not another copy of the
     // agent document. A replay can refresh the authoritative snapshot.
-    let receipt = editor_completion(&lease, &client_operation_id, &project_root, status);
+    let receipt = editor_completion(&lease, &client_operation_id, &root_text, status);
     let result_json = match serde_json::to_string(&receipt) {
         Ok(json) => json,
         Err(error) => {
             let error = internal(error);
             if let Ok(receipt) =
-                terminalize_editor_failure(ctx, &lease, &project_root, completion_identity, &error)
+                terminalize_editor_failure(ctx, &lease, &root_text, completion_identity, &error)
                     .await
             {
                 return Ok(Response::AgentEditorLeaseCompleted(receipt));
@@ -838,7 +850,7 @@ async fn complete_editor_lease_inner(
             return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
                 &lease,
                 &client_operation_id,
-                &project_root,
+                &root_text,
                 AgentEditorSettlementStatus::Pending,
             )));
         }
@@ -874,7 +886,7 @@ async fn complete_editor_lease_inner(
         return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
             &lease,
             &client_operation_id,
-            &project_root,
+            &root_text,
             AgentEditorSettlementStatus::Pending,
         )));
     }
@@ -888,7 +900,6 @@ pub async fn editor_lease_settlement(
     lease_id: String,
     principal_digest: String,
 ) -> Result<Response, ErrorPayload> {
-    let root = trusted_root(ctx, &project_root).await?;
     Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
     let row = ctx
         .db
@@ -902,9 +913,10 @@ pub async fn editor_lease_settlement(
             message: "agent editor lease belongs to another client principal".into(),
         });
     }
-    if row.project_root != root.to_string_lossy() {
+    if row.project_root != project_root {
         return Err(bad_request("editor lease belongs to another workspace"));
     }
+    let root_text = row.project_root.clone();
     let status = match row.completion_operation_id.as_deref() {
         None => AgentEditorSettlementStatus::NotStarted,
         Some(operation) if operation != client_operation_id => {
@@ -928,13 +940,14 @@ pub async fn editor_lease_settlement(
                 .or(row.terminal_error_json.as_deref())
                 .ok_or_else(|| internal("terminal editor lease omitted its receipt"))?;
             let receipt: AgentEditorCompletion = serde_json::from_str(json).map_err(internal)?;
+            validate_editor_completion_receipt(&row, &receipt)?;
             return Ok(Response::AgentEditorLeaseCompleted(receipt));
         }
     };
     Ok(Response::AgentEditorLeaseCompleted(editor_completion(
         &row,
         &client_operation_id,
-        &project_root,
+        &root_text,
         status,
     )))
 }
@@ -955,6 +968,21 @@ fn editor_completion(
     }
 }
 
+fn validate_editor_completion_receipt(
+    row: &crate::db::agent_editor_leases::AgentEditorLeaseRow,
+    receipt: &AgentEditorCompletion,
+) -> Result<(), ErrorPayload> {
+    if receipt.client_operation_id != row.completion_operation_id.as_deref().unwrap_or_default()
+        || receipt.project_root != row.project_root
+        || receipt.agent_name != row.agent_name
+        || receipt.lease_id != row.lease_id
+        || receipt.consumed_revision != row.consumed_revision
+    {
+        return Err(internal("editor completion receipt binding mismatch"));
+    }
+    Ok(())
+}
+
 fn safe_editor_rejection(error: &ErrorPayload) -> ErrorPayload {
     let message = match &error.code {
         ErrorCode::Conflict => {
@@ -973,6 +1001,13 @@ fn safe_editor_rejection(error: &ErrorPayload) -> ErrorPayload {
 
 async fn trusted_root(ctx: &DaemonContext, root: &str) -> Result<PathBuf, ErrorPayload> {
     let root = crate::daemon::fs_api::canonical_project_root(root)?;
+    trusted_canonical_root(ctx, root).await
+}
+
+async fn trusted_canonical_root(
+    ctx: &DaemonContext,
+    root: PathBuf,
+) -> Result<PathBuf, ErrorPayload> {
     let policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &root)
         .await
         .map_err(|error| ErrorPayload {

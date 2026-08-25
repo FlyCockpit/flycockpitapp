@@ -29,7 +29,9 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;
 const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OAUTH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// Clone is intentionally retained for the generic refresh guard, which keeps
+// the previous token set alive until a replacement has been validated.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredTokens {
     pub access_token: String,
     pub refresh_token: String,
@@ -38,6 +40,31 @@ pub struct StoredTokens {
     #[serde(default)]
     pub account_id: Option<String>,
     pub expires_at: i64,
+}
+
+impl std::fmt::Debug for StoredTokens {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredTokens")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("id_token", &self.id_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "account_id",
+                &self.account_id.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl Drop for StoredTokens {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+        self.id_token.zeroize();
+        self.account_id.zeroize();
+    }
 }
 
 impl StoredTokens {
@@ -378,12 +405,14 @@ fn oauth_timeout_config() -> (Duration, Duration) {
     (OAUTH_CONNECT_TIMEOUT, OAUTH_TOTAL_TIMEOUT)
 }
 
-fn merge_refresh_tokens(previous: &StoredTokens, fresh: StoredTokens) -> StoredTokens {
-    StoredTokens {
-        id_token: fresh.id_token.or_else(|| previous.id_token.clone()),
-        account_id: fresh.account_id.or_else(|| previous.account_id.clone()),
-        ..fresh
+fn merge_refresh_tokens(previous: &StoredTokens, mut fresh: StoredTokens) -> StoredTokens {
+    if fresh.id_token.is_none() {
+        fresh.id_token = previous.id_token.clone();
     }
+    if fresh.account_id.is_none() {
+        fresh.account_id = previous.account_id.clone();
+    }
+    fresh
 }
 
 impl StoredTokens {

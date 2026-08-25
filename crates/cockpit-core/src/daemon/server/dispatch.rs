@@ -697,6 +697,7 @@ async fn commit_oauth_cancel(
     ctx: &DaemonContext,
     flow_id: Option<String>,
     delete_ready_flow: bool,
+    begin_client_operation_id: String,
     owner: String,
     client_operation_id: String,
     request_hash: [u8; 32],
@@ -720,13 +721,8 @@ async fn commit_oauth_cancel(
                     )
                     .map_err(|error| anyhow::anyhow!(error))?;
                 let current: DurableOAuthFlow = serde_json::from_slice(current.as_slice())?;
-                let (marker_owner, begin_client_operation_id) = match current {
+                let (marker_owner, marker_begin_operation_id, exchanging_identity) = match current {
                     DurableOAuthFlow::Provider {
-                        owner,
-                        begin_client_operation_id,
-                        ..
-                    }
-                    | DurableOAuthFlow::ProviderExchanging {
                         owner,
                         begin_client_operation_id,
                         ..
@@ -735,25 +731,45 @@ async fn commit_oauth_cancel(
                         owner,
                         begin_client_operation_id,
                         ..
+                    } => (owner, begin_client_operation_id, None),
+                    DurableOAuthFlow::ProviderExchanging {
+                        owner,
+                        begin_client_operation_id,
+                        completion_client_operation_id,
+                        completion_request_hash,
+                        completion_fencing_generation,
+                        ..
                     }
                     | DurableOAuthFlow::McpExchanging {
                         owner,
                         begin_client_operation_id,
+                        completion_client_operation_id,
+                        completion_request_hash,
+                        completion_fencing_generation,
                         ..
-                    } => (owner, begin_client_operation_id),
+                    } => (
+                        owner,
+                        begin_client_operation_id,
+                        Some((
+                            completion_client_operation_id,
+                            completion_request_hash,
+                            completion_fencing_generation,
+                        )),
+                    ),
                     _ => anyhow::bail!("OAuth cancellation target is not live"),
                 };
-                if marker_owner != owner {
-                    anyhow::bail!("OAuth cancellation target belongs to another owner");
+                if marker_owner != owner || marker_begin_operation_id != begin_client_operation_id {
+                    anyhow::bail!("OAuth cancellation target identity does not match");
                 }
+                let terminal_error = ErrorPayload {
+                    code: ErrorCode::Conflict,
+                    message: "the OAuth flow was cancelled; start a new login".to_owned(),
+                };
                 let tombstone =
                     zeroize::Zeroizing::new(serde_json::to_vec(&DurableOAuthFlow::Cancelled {
                         owner: marker_owner,
-                        begin_client_operation_id,
-                        terminal_error: ErrorPayload {
-                            code: ErrorCode::Conflict,
-                            message: "the OAuth flow was cancelled; start a new login".to_owned(),
-                        },
+                        begin_client_operation_id: marker_begin_operation_id,
+                        terminal_error: terminal_error.clone(),
                         cancelled_at_unix_ms: oauth_wall_ms(),
                     })?);
                 vault
@@ -764,6 +780,28 @@ async fn commit_oauth_cancel(
                         Some(tombstone.as_slice()),
                     )
                     .map_err(|error| anyhow::anyhow!(error))?;
+                if let Some((operation_id, exchange_hash, exchange_fence)) = exchanging_identity {
+                    let exchange_error_json = serde_json::to_string(&terminal_error)?;
+                    let settled_exchange = conn.execute(
+                        "UPDATE local_operation_receipts
+                         SET state='terminal_cancelled',terminal_outcome_json=?5,
+                             execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                         WHERE owner_digest=?1 AND client_operation_id=?2
+                           AND request_hash=?3 AND fencing_generation=?4
+                           AND state='executing'",
+                        rusqlite::params![
+                            owner,
+                            operation_id,
+                            exchange_hash.as_slice(),
+                            exchange_fence,
+                            exchange_error_json,
+                            oauth_wall_ms()
+                        ],
+                    )?;
+                    if settled_exchange != 1 {
+                        anyhow::bail!("OAuth cancellation lost the exact exchange receipt fence");
+                    }
+                }
             }
             let settled = conn.execute(
                 "UPDATE local_operation_receipts
@@ -807,12 +845,11 @@ async fn settle_failed_oauth_begin(
         error_code = %error.code,
         error = %error.message,
         operation_id = %client_operation_id,
-        "provider OAuth begin failed after receipt admission"
+        "OAuth begin failed after receipt admission"
     );
     let terminal_error = ErrorPayload {
         code: error.code.clone(),
-        message: "provider OAuth could not be started; inspect daemon diagnostics for details"
-            .to_owned(),
+        message: "OAuth could not be started; inspect daemon diagnostics for details".to_owned(),
     };
     finish_local_operation_error(
         ctx,
@@ -8813,15 +8850,69 @@ async fn handle_serialized_request_impl(
                     })
                 }
                 crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(identity, json) => {
-                    let response = serde_json::from_str(&json).map_err(internal)?;
+                    let mut response: Response = serde_json::from_str(&json).map_err(internal)?;
+                    let expired_error = match &mut response {
+                        Response::ProviderOAuthStarted {
+                            flow_id,
+                            authorize_url,
+                            user_code,
+                            ..
+                        } => {
+                            match load_oauth_flow(ctx, flow_id)? {
+                                Some(DurableOAuthFlow::Provider {
+                                    authorize_url: durable_url,
+                                    user_code: durable_code,
+                                    ..
+                                }) => {
+                                    *authorize_url = durable_url;
+                                    *user_code = durable_code;
+                                    None
+                                }
+                                Some(DurableOAuthFlow::Expired { terminal_error, .. })
+                                | Some(DurableOAuthFlow::Cancelled { terminal_error, .. }) => {
+                                    Some(terminal_error)
+                                }
+                                _ => Some(ErrorPayload {
+                                    code: ErrorCode::Conflict,
+                                    message: "provider OAuth begin no longer has a live flow; start a new login".to_owned(),
+                                }),
+                            }
+                        }
+                        Response::McpOAuthStarted {
+                            flow_id,
+                            authorize_url,
+                            ..
+                        } => match load_oauth_flow(ctx, flow_id)? {
+                            Some(DurableOAuthFlow::Mcp {
+                                authorize_url: durable_url,
+                                ..
+                            }) => {
+                                *authorize_url = durable_url;
+                                None
+                            }
+                            Some(DurableOAuthFlow::Expired { terminal_error, .. })
+                            | Some(DurableOAuthFlow::Cancelled { terminal_error, .. }) => {
+                                Some(terminal_error)
+                            }
+                            _ => Some(ErrorPayload {
+                                code: ErrorCode::Conflict,
+                                message: "MCP OAuth begin no longer has a live flow; start a new login".to_owned(),
+                            }),
+                        },
+                        _ => None,
+                    };
                     Ok(Response::LocalOperationSettlement {
                         client_operation_id,
                         operation_kind: identity.operation_kind,
                         request_hash: local_operation_stored_hash_hex(&identity.request_hash)?,
                         pending: false,
-                        response: Some(Box::new(response)),
-                        terminal_error: None,
-                        terminal_cancelled: false,
+                        response: expired_error.is_none().then(|| Box::new(response)),
+                        terminal_cancelled: matches!(
+                            expired_error.as_ref(),
+                            Some(ErrorPayload { code: ErrorCode::Conflict, message })
+                                if message.contains("cancelled")
+                        ),
+                        terminal_error: expired_error,
                     })
                 }
                 crate::db::local_operation_receipts::LocalOperationSettlement::TerminalError(identity, json) => {
@@ -9195,19 +9286,23 @@ async fn handle_serialized_request_impl(
                 }
                 if let Some(DurableOAuthFlow::ProviderCommitted {
                     owner: durable_owner,
-                    provider_id,
+                    completion_client_operation_id,
+                    completion_request_hash,
+                    completion_fencing_generation,
+                    terminal_response,
                     ..
                 }) = &durable_flow
                     && durable_owner == &owner
                 {
-                    return Ok(Response::ProviderOAuthCompleted {
-                        client_operation_id: client_operation_id.clone(),
-                        request_hash: local_operation_request_hash_hex(&receipt_request_hash),
-                        flow_id: flow_id.clone(),
-                        logged_in: provider_id == crate::auth::xai_oauth::CREDENTIAL_KEY
-                            || provider_id == crate::auth::codex_oauth::CREDENTIAL_KEY,
-                        retry_after_seconds: None,
-                    });
+                    if completion_client_operation_id != &client_operation_id
+                        || completion_request_hash != &request_hash
+                        || completion_fencing_generation != &fencing_generation
+                    {
+                        return Err(conflict(
+                            "provider OAuth flow was committed by a different completion operation",
+                        ));
+                    }
+                    return Ok(terminal_response.as_ref().clone());
                 }
                 let durable_begin_client_operation_id = match &durable_flow {
                     Some(DurableOAuthFlow::Provider {
@@ -9350,6 +9445,34 @@ async fn handle_serialized_request_impl(
                 let receipt_json = serde_json::to_string(&terminal_response).map_err(internal)?;
                 ctx.db
                     .transaction(move |conn| {
+                        let marker = vault
+                            .get_item_on_conn(
+                                conn,
+                                cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                                &flow_vault_id,
+                            )
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        let marker: DurableOAuthFlow = serde_json::from_slice(marker.as_slice())?;
+                        let owns_exact_exchange = matches!(
+                            marker,
+                            DurableOAuthFlow::ProviderExchanging {
+                                owner: marker_owner,
+                                provider_id: marker_provider,
+                                completion_client_operation_id: marker_operation,
+                                completion_request_hash: marker_hash,
+                                completion_fencing_generation: marker_fence,
+                                ..
+                            } if marker_owner == receipt_owner
+                                && marker_provider == provider_id_owned
+                                && marker_operation == receipt_operation_id
+                                && marker_hash == request_hash
+                                && marker_fence == fencing_generation
+                        );
+                        if !owns_exact_exchange {
+                            anyhow::bail!(
+                                "provider OAuth commit lost its exact durable exchange fence"
+                            );
+                        }
                         vault
                             .mutate_item_on_conn(
                                 conn,
@@ -9602,6 +9725,7 @@ async fn handle_serialized_request_impl(
                 ctx,
                 resolved_flow_id.clone(),
                 cancelled,
+                begin_client_operation_id.clone(),
                 owner.clone(),
                 client_operation_id.clone(),
                 request_hash,
@@ -9762,7 +9886,7 @@ async fn handle_serialized_request_impl(
             {
                 Ok(config) => config,
                 Err(error) => {
-                    finish_local_operation_error(
+                    let terminal_error = settle_failed_oauth_begin(
                         ctx,
                         owner,
                         client_operation_id,
@@ -9771,7 +9895,7 @@ async fn handle_serialized_request_impl(
                         &error,
                     )
                     .await?;
-                    return Err(error);
+                    return Err(terminal_error);
                 }
             };
             if let Some((flow_id, authorize_url)) = ctx
@@ -9805,6 +9929,21 @@ async fn handle_serialized_request_impl(
                 .await?;
                 return Ok(response);
             }
+            let durable_replay = match find_durable_oauth_flow(ctx, &owner, &client_operation_id) {
+                Ok(replay) => replay,
+                Err(error) => {
+                    let terminal_error = settle_failed_oauth_begin(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(terminal_error);
+                }
+            };
             if let Some((
                 flow_id,
                 DurableOAuthFlow::Mcp {
@@ -9812,7 +9951,7 @@ async fn handle_serialized_request_impl(
                     pending,
                     ..
                 },
-            )) = find_durable_oauth_flow(ctx, &owner, &client_operation_id)?
+            )) = durable_replay
             {
                 ctx.oauth_flows
                     .insert_mcp(
@@ -9864,7 +10003,7 @@ async fn handle_serialized_request_impl(
                     Ok(started) => started,
                     Err(cause) => {
                         let error = internal(cause);
-                        finish_local_operation_error(
+                        let terminal_error = settle_failed_oauth_begin(
                             ctx,
                             owner,
                             client_operation_id,
@@ -9873,7 +10012,7 @@ async fn handle_serialized_request_impl(
                             &error,
                         )
                         .await?;
-                        return Err(error);
+                        return Err(terminal_error);
                     }
                 };
             let flow_id = uuid::Uuid::new_v4().to_string();
@@ -9895,7 +10034,30 @@ async fn handle_serialized_request_impl(
                 flow_id: flow_id.clone(),
                 authorize_url: String::new(),
             };
-            commit_oauth_begin(
+            let durable_flow_copy_result = match serde_json::to_vec(&pending.flow).map_err(internal)
+            {
+                Ok(bytes) => {
+                    let bytes = zeroize::Zeroizing::new(bytes);
+                    serde_json::from_slice(bytes.as_slice()).map_err(internal)
+                }
+                Err(error) => Err(error),
+            };
+            let durable_flow_copy = match durable_flow_copy_result {
+                Ok(flow) => flow,
+                Err(error) => {
+                    let terminal_error = settle_failed_oauth_begin(
+                        ctx,
+                        owner,
+                        client_operation_id,
+                        request_hash,
+                        fencing_generation,
+                        &error,
+                    )
+                    .await?;
+                    return Err(terminal_error);
+                }
+            };
+            if let Err(error) = commit_oauth_begin(
                 ctx,
                 flow_id.clone(),
                 DurableOAuthFlow::Mcp {
@@ -9907,10 +10069,7 @@ async fn handle_serialized_request_impl(
                     pending: McpOAuthPending {
                         project_root: pending.project_root.clone(),
                         server: pending.server.clone(),
-                        flow: serde_json::from_slice(
-                            &serde_json::to_vec(&pending.flow).map_err(internal)?,
-                        )
-                        .map_err(internal)?,
+                        flow: durable_flow_copy,
                     },
                     created_at_unix_ms,
                     expires_at_unix_ms: oauth_expiry_ms(created_at_unix_ms),
@@ -9921,7 +10080,19 @@ async fn handle_serialized_request_impl(
                 fencing_generation,
                 receipt,
             )
-            .await?;
+            .await
+            {
+                let terminal_error = settle_failed_oauth_begin(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &error,
+                )
+                .await?;
+                return Err(terminal_error);
+            }
             ctx.oauth_flows
                 .insert_mcp(
                     flow_id.clone(),
@@ -9995,16 +10166,23 @@ async fn handle_serialized_request_impl(
                 }
                 if let Some(DurableOAuthFlow::McpCommitted {
                     owner: durable_owner,
+                    completion_client_operation_id,
+                    completion_request_hash,
+                    completion_fencing_generation,
+                    terminal_response,
                     ..
                 }) = &durable_flow
                     && durable_owner == &owner
                 {
-                    return Ok(Response::McpOAuthCompleted {
-                        client_operation_id: client_operation_id.clone(),
-                        request_hash: local_operation_request_hash_hex(&receipt_request_hash),
-                        flow_id: flow_id.clone(),
-                        authenticated: true,
-                    });
+                    if completion_client_operation_id != &client_operation_id
+                        || completion_request_hash != &request_hash
+                        || completion_fencing_generation != &fencing_generation
+                    {
+                        return Err(conflict(
+                            "MCP OAuth flow was committed by a different completion operation",
+                        ));
+                    }
+                    return Ok(terminal_response.as_ref().clone());
                 }
                 let durable_begin_client_operation_id = match &durable_flow {
                     Some(DurableOAuthFlow::Mcp {
@@ -10110,6 +10288,34 @@ async fn handle_serialized_request_impl(
                 let receipt_json = serde_json::to_string(&terminal_response).map_err(internal)?;
                 ctx.db
                     .transaction(move |conn| {
+                        let marker = vault
+                            .get_item_on_conn(
+                                conn,
+                                cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                                &flow_vault_id,
+                            )
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        let marker: DurableOAuthFlow = serde_json::from_slice(marker.as_slice())?;
+                        let owns_exact_exchange = matches!(
+                            marker,
+                            DurableOAuthFlow::McpExchanging {
+                                owner: marker_owner,
+                                project_root: marker_root,
+                                server: marker_server,
+                                completion_client_operation_id: marker_operation,
+                                completion_request_hash: marker_hash,
+                                completion_fencing_generation: marker_fence,
+                                ..
+                            } if marker_owner == receipt_owner
+                                && marker_root == owner_root
+                                && marker_server == pending.server
+                                && marker_operation == receipt_operation_id
+                                && marker_hash == request_hash
+                                && marker_fence == fencing_generation
+                        );
+                        if !owns_exact_exchange {
+                            anyhow::bail!("MCP OAuth commit lost its exact durable exchange fence");
+                        }
                         // ATOMIC cross-kind admission for the flow-managed OAuth
                         // token key. The `ensure_mcp_ownership_available` check ran
                         // back at `StartMcpOAuth`; a provider (or another workspace)
@@ -10334,6 +10540,7 @@ async fn handle_serialized_request_impl(
                 ctx,
                 resolved_flow_id.clone(),
                 cancelled,
+                begin_client_operation_id.clone(),
                 owner.clone(),
                 client_operation_id,
                 request_hash,

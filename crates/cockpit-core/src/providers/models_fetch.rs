@@ -483,8 +483,8 @@ fn resolve_provider_request_inner_with_sources(
             name: "Authorization".to_string(),
             value: format!("Bearer {token}"),
         });
-        if let OAuthCredential::Codex(tokens) = credential {
-            let account_id = tokens.account_id.ok_or_else(|| {
+        if let OAuthCredential::Codex(mut tokens) = credential {
+            let account_id = tokens.account_id.take().ok_or_else(|| {
                 anyhow!(
                     "Codex subscription auth is missing chatgpt-account-id; set up OAuth in /settings → Providers."
                 )
@@ -573,19 +573,19 @@ fn validate_resolved_provider_headers(provider_id: &str, headers: &[ResolvedHead
 pub(crate) fn resolve_codex_model_list_request(
     provider_id: &str,
     entry: &ProviderEntry,
-    tokens: crate::auth::codex_oauth::StoredTokens,
+    mut tokens: crate::auth::codex_oauth::StoredTokens,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRequest> {
     let mut headers: Vec<ResolvedHeader> = Vec::with_capacity(2);
 
-    let account_id = tokens.account_id.ok_or_else(|| {
+    let account_id = tokens.account_id.take().ok_or_else(|| {
         anyhow!(
             "Codex subscription auth is missing chatgpt-account-id; set up OAuth in /settings → Providers."
         )
     })?;
     headers.push(ResolvedHeader {
         name: "Authorization".to_string(),
-        value: format!("Bearer {}", tokens.access_token),
+        value: format!("Bearer {}", std::mem::take(&mut tokens.access_token)),
     });
     headers.push(ResolvedHeader {
         name: "ChatGPT-Account-ID".to_string(),

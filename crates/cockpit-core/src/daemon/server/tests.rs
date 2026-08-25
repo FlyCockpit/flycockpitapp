@@ -11278,12 +11278,68 @@ fn oauth_exchange_failure_and_cancellation_have_atomic_receipt_cleanup() {
     assert!(cancellation.contains("mutate_item_on_conn"));
     assert!(cancellation.contains("DurableOAuthFlow::Cancelled"));
     assert!(cancellation.contains("UPDATE local_operation_receipts"));
+    assert!(cancellation.contains("marker_begin_operation_id != begin_client_operation_id"));
+    assert!(cancellation.contains("state='terminal_cancelled'"));
+    assert!(cancellation.contains("exchange_hash.as_slice()"));
+    assert!(cancellation.contains("exchange_fence"));
     for branch in ["Request::CancelProviderOAuth", "Request::CancelMcpOAuth"] {
         let body = source
             .split(branch)
             .nth(1)
             .expect("OAuth cancellation handler must exist");
         assert!(body.contains("terminalize_local_operation("));
+    }
+}
+
+#[test]
+fn oauth_token_commit_requires_the_exact_durable_exchange_marker() {
+    let source = include_str!("dispatch.rs");
+    for (kind, marker) in [
+        ("provider", "DurableOAuthFlow::ProviderExchanging"),
+        ("MCP", "DurableOAuthFlow::McpExchanging"),
+    ] {
+        let commit_error = format!("{kind} OAuth commit lost its exact durable exchange fence");
+        let body = source
+            .split(&commit_error)
+            .next()
+            .unwrap_or_else(|| panic!("missing {kind} OAuth exact commit fence"));
+        let body = body
+            .rsplit("ctx.db")
+            .next()
+            .expect("OAuth commit transaction must exist");
+        for required in [
+            "get_item_on_conn",
+            marker,
+            "completion_client_operation_id",
+            "completion_request_hash",
+            "completion_fencing_generation",
+        ] {
+            assert!(body.contains(required), "{kind} commit omitted {required}");
+        }
+    }
+}
+
+#[test]
+fn oauth_settlement_hydrates_public_begin_receipts_and_terminalizes_tombstones() {
+    let source = include_str!("dispatch.rs");
+    let settlement = source
+        .split("Request::GetLocalOperationSettlement")
+        .nth(1)
+        .and_then(|tail| tail.split("Request::BeginProviderOAuth").next())
+        .expect("local settlement handler must exist");
+    for required in [
+        "Response::ProviderOAuthStarted",
+        "Response::McpOAuthStarted",
+        "DurableOAuthFlow::Expired",
+        "DurableOAuthFlow::Cancelled",
+        "*authorize_url = durable_url",
+        "response: expired_error.is_none()",
+        "terminal_error: expired_error",
+    ] {
+        assert!(
+            settlement.contains(required),
+            "settlement omitted {required}"
+        );
     }
 }
 
@@ -11343,6 +11399,55 @@ fn oauth_ready_expiry_and_exchange_recovery_are_exact_and_capacity_releasing() {
         "state='terminal_cancelled'",
     ] {
         assert!(recovery.contains(marker), "recovery omitted {marker}");
+    }
+}
+
+#[test]
+fn editor_replay_precedes_mutable_trust_and_terminal_replay_is_exact() {
+    let source = include_str!("../agent_management.rs");
+    let begin = source
+        .split("pub async fn begin_editor_lease")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn complete_editor_lease").next())
+        .expect("begin editor lease handler must exist");
+    assert!(
+        begin.find("agent_editor_lease_by_operation").unwrap()
+            < begin.find("trusted_canonical_root").unwrap()
+    );
+    let complete = source
+        .split("async fn complete_editor_lease_inner")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn editor_lease_settlement").next())
+        .expect("complete editor lease handler must exist");
+    assert!(complete.contains("known_lease.completion_identity != Some(completion_identity)"));
+    assert!(
+        complete.find("known_lease.state == \"terminal\"").unwrap()
+            < complete.find("trusted_canonical_root").unwrap()
+    );
+    let settlement = source
+        .split("pub async fn editor_lease_settlement")
+        .nth(1)
+        .and_then(|tail| tail.split("fn editor_completion").next())
+        .expect("editor settlement handler must exist");
+    assert!(!settlement.contains("trusted_root("));
+}
+
+#[test]
+fn oauth_stored_token_debug_and_drop_are_secret_safe() {
+    for source in [
+        include_str!("../../auth/xai_oauth.rs"),
+        include_str!("../../auth/codex_oauth.rs"),
+        include_str!("../../mcp/auth.rs"),
+    ] {
+        let tokens = source
+            .split("pub struct StoredTokens")
+            .nth(1)
+            .expect("StoredTokens must exist");
+        assert!(tokens.contains("impl std::fmt::Debug for StoredTokens"));
+        assert!(tokens.contains("[REDACTED]"));
+        assert!(tokens.contains("impl Drop for StoredTokens"));
+        assert!(tokens.contains("access_token.zeroize()"));
+        assert!(tokens.contains("refresh_token.zeroize()"));
     }
 }
 

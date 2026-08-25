@@ -40,11 +40,31 @@ pub enum CallbackSource {
     ManualPaste,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// Clone is intentionally retained for the generic refresh guard, which keeps
+// the previous token set alive until a replacement has been validated.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredTokens {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at: i64,
+}
+
+impl std::fmt::Debug for StoredTokens {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredTokens")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl Drop for StoredTokens {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
 }
 
 impl StoredTokens {
@@ -165,7 +185,7 @@ async fn complete_login(
 }
 
 pub async fn bearer_token_from_store(store: crate::credentials::CredentialStore) -> Result<String> {
-    let tokens = crate::auth::refresh_guard::credential_with_refresh(
+    let mut tokens = crate::auth::refresh_guard::credential_with_refresh(
         store,
         CREDENTIAL_KEY,
         "parsing stored xAI OAuth tokens",
@@ -181,7 +201,7 @@ pub async fn bearer_token_from_store(store: crate::credentials::CredentialStore)
         xai_terminal_refresh_error,
     )
     .await?;
-    Ok(tokens.access_token)
+    Ok(std::mem::take(&mut tokens.access_token))
 }
 
 pub fn is_logged_in() -> bool {

@@ -121,7 +121,7 @@ async fn begin_provider_oauth(
             ..
         }) if settlement_operation_id == client_operation_id
             && operation_kind == "begin_provider_oauth"
-            && settlement_hash == expected_hash =>
+            && valid_settlement_request_hash(&settlement_hash) =>
         {
             match *response {
                 cockpit_core::daemon::proto::Response::ProviderOAuthStarted {
@@ -154,7 +154,7 @@ async fn begin_provider_oauth(
             ..
         }) if settlement_operation_id == client_operation_id
             && operation_kind == "begin_provider_oauth"
-            && settlement_hash == expected_hash =>
+            && valid_settlement_request_hash(&settlement_hash) =>
         {
             Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(error.to_string()))
         }
@@ -179,7 +179,7 @@ async fn begin_provider_oauth(
             ..
         }) if settlement_operation_id == client_operation_id
             && operation_kind == "begin_provider_oauth"
-            && settlement_hash == expected_hash =>
+            && valid_settlement_request_hash(&settlement_hash) =>
         {
             Ok(oauth_settlement_unknown(
                 "OAuth begin is still pending; retrying must use the same operation",

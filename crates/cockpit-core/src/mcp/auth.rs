@@ -76,7 +76,9 @@ pub fn base_env_cred_key(server: &str, env_name: &str) -> String {
 }
 
 /// Stored OAuth tokens for an MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Clone is intentionally retained because refresh replacement must preserve
+// the previous set until the provider response has been validated.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredTokens {
     pub access_token: String,
     #[serde(default)]
@@ -84,6 +86,27 @@ pub struct StoredTokens {
     /// Unix seconds at which `access_token` expires (0 = unknown/never).
     #[serde(default)]
     pub expires_at: i64,
+}
+
+impl std::fmt::Debug for StoredTokens {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredTokens")
+            .field("access_token", &"[REDACTED]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl Drop for StoredTokens {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
 }
 
 impl StoredTokens {

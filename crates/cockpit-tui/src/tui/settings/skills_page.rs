@@ -592,13 +592,12 @@ mod tests {
         }
     }
 
-    /// A genuinely fresh install: no `config.json` on disk yet — so
-    /// [`SettingsDialog::open`] seeds the two default scan-dir entries. The
-    /// first persist materializes the file. Tests that want an empty list
-    /// clear it.
+    /// A genuinely fresh install: no `config.json` on disk yet. The layer is
+    /// registered so the daemon can snapshot and materialize it; the first
+    /// persist creates the file.
     fn fresh_skills_dialog(tmp: &TempDir) -> SettingsDialog {
         let path = tmp.path().join("config.json");
-        let mut d = SettingsDialog::open(path);
+        let mut d = super::super::tests::open_fixture_dialog(&path);
         d.set_test_page(Page::Skills(SkillsPage {
             cursor: 0,
             grabbed: None,
@@ -614,7 +613,7 @@ mod tests {
     fn existing_empty_skills_dialog(tmp: &TempDir) -> SettingsDialog {
         let path = tmp.path().join("config.json");
         std::fs::write(&path, "{}").unwrap();
-        let mut d = SettingsDialog::open(path);
+        let mut d = super::super::tests::open_fixture_dialog(&path);
         d.set_test_page(Page::Skills(SkillsPage {
             cursor: 0,
             grabbed: None,
@@ -626,16 +625,15 @@ mod tests {
     }
 
     #[test]
-    fn fresh_install_seeds_two_entries() {
+    fn fresh_install_shows_only_authored_scan_dirs() {
         let tmp = TempDir::new().unwrap();
         let d = fresh_skills_dialog(&tmp);
-        assert_eq!(
-            d.extended.skills.scan_dirs,
-            vec![
-                "~/.agents/skills".to_string(),
-                "./.agents/skills".to_string()
-            ],
-            "a fresh install seeds the two default scan dirs"
+        // Materializing [`SEEDED_SCAN_DIRS`] belongs to the skills loader. The
+        // page edits the authoritative layer, which authors nothing until the
+        // user (or a page-level reset) writes it.
+        assert!(
+            d.extended.skills.scan_dirs.is_empty(),
+            "an unauthored layer contributes no scan dirs"
         );
         assert!(
             !d.extended.skills.ancestor_walk,

@@ -43,6 +43,8 @@ mod auth;
 mod category;
 mod dependencies_page;
 mod descriptor;
+#[cfg(test)]
+pub(crate) mod disk_daemon_fake;
 mod grab;
 mod harnesses_page;
 mod image_generation;
@@ -81,17 +83,11 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::tui::textfield::TextField;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-#[cfg(test)]
-use cockpit_config::dirs::scaffold_config_dir;
 use cockpit_config::dirs::{
     CONFIG_FILE, ConfigDir, ConfigDirKind, config_write_target_for_provider, creatable_config_dirs,
     cwd_scoped_creatable_dirs, discover_config_dirs,
 };
 use cockpit_config::extended::ExtendedConfig;
-#[cfg(test)]
-use cockpit_config::extended::ExtendedConfigDoc;
-#[cfg(test)]
-use cockpit_config::providers::ConfigDoc;
 use cockpit_config::providers::{OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig};
 
 /// Settings-side operations that need provider secrets must use the persistent
@@ -138,7 +134,7 @@ fn run_settings_daemon<T>(
 /// client and tests feed responses through the same snapshot/patch/receipt
 /// validation below; a test double may replace only transport, never config
 /// loading or persistence.
-trait SettingsDaemonEffect: Send + Sync {
+pub(crate) trait SettingsDaemonEffect: Send + Sync {
     fn request(&self, request: Request) -> Result<Response, String>;
 }
 
@@ -165,21 +161,31 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-fn settings_daemon_request(request: Request) -> Result<Response, String> {
-    #[cfg(test)]
+/// Single test-mode entry point for every daemon transport the settings and
+/// agent surfaces use.  A thread-installed effect wins so a test can script
+/// exact wire responses; otherwise the shared disk-backed fake answers the
+/// request against the real filesystem, which keeps the production reducers —
+/// snapshot decoding, receipt validation, and refresh reconciliation — on the
+/// path under test.
+#[cfg(test)]
+pub(crate) fn test_daemon_request(request: Request) -> Result<Response, String> {
     if let Some(effect) = TEST_SETTINGS_DAEMON_EFFECT.with(|slot| slot.borrow().clone()) {
         return effect.request(request);
     }
+    disk_daemon_fake::default_effect().request(request)
+}
+
+fn settings_daemon_request(request: Request) -> Result<Response, String> {
     #[cfg(test)]
     {
-        return Err("no test settings daemon effect is installed".to_string());
+        return test_daemon_request(request);
     }
     #[cfg(not(test))]
     ProductionSettingsDaemonEffect.request(request)
 }
 
 #[cfg(test)]
-fn with_settings_daemon_effect<T>(
+pub(crate) fn with_settings_daemon_effect<T>(
     effect: Arc<dyn SettingsDaemonEffect>,
     operation: impl FnOnce() -> T,
 ) -> T {
@@ -2087,12 +2093,6 @@ impl Dialog {
     /// first-run flow to auto-route into the Add wizard after the
     /// daemon prompt resolves.
     pub fn has_no_providers(cwd: &std::path::Path) -> bool {
-        #[cfg(test)]
-        {
-            let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
-            ConfigDoc::providers_from_paths(&paths).providers.is_empty()
-        }
-        #[cfg(not(test))]
         daemon_provider_snapshot(cwd, None).is_none_or(|config| config.providers.is_empty())
     }
 
@@ -2213,20 +2213,9 @@ impl Dialog {
         provider_id: &str,
         oauth_expired: bool,
     ) -> Self {
-        #[cfg(test)]
-        let config = {
-            let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
-            ConfigDoc::providers_from_paths(&paths)
-        };
-        #[cfg(test)]
-        let Some(entry) = config.providers.get(provider_id).cloned() else {
-            return Self::open(cwd);
-        };
-        #[cfg(not(test))]
         let Some(config) = daemon_provider_snapshot(cwd, Some(provider_id)) else {
             return Self::open(cwd);
         };
-        #[cfg(not(test))]
         let Some(entry) = config.providers.get(provider_id).cloned() else {
             return Self::open(cwd);
         };
@@ -2264,12 +2253,6 @@ impl Dialog {
     /// Open the existing provider-model editor directly for one configured provider.
     /// This is the canonical add-model surface used by scoped model recovery.
     pub fn open_provider_models(cwd: &std::path::Path, provider_id: &str) -> Self {
-        #[cfg(test)]
-        let cfg = {
-            let paths = cockpit_config::dirs::config_file_paths_for_load(cwd);
-            ConfigDoc::providers_from_paths(&paths)
-        };
-        #[cfg(not(test))]
         let Some(cfg) = daemon_provider_snapshot(cwd, None) else {
             return Self::open(cwd);
         };
@@ -2997,11 +2980,6 @@ impl SettingsDialog {
 
 impl SettingsDialog {
     pub fn open(config_path: PathBuf) -> Self {
-        #[cfg(test)]
-        let config = ConfigDoc::load(&config_path)
-            .map(|document| document.providers())
-            .unwrap_or_default();
-        #[cfg(not(test))]
         let config = {
             let project_root = config_path
                 .parent()
@@ -3020,22 +2998,6 @@ impl SettingsDialog {
         // The cockpit-only keys live in the same `config.json` as the
         // layer-wide provider metadata (GOALS §2a).
         let extended_path = config_path.clone();
-        #[cfg(test)]
-        let (mut extended, extended_base, extended_revision, extended_warnings) = {
-            let (ext, warnings) = ExtendedConfigDoc::load(&extended_path)
-                .map(|d| d.config_with_warnings())
-                .unwrap_or_default();
-            let base = serde_json::to_value(&ext).unwrap_or_default();
-            (ext, base, None, warnings)
-        };
-        #[cfg(test)]
-        if !extended_path.exists() {
-            extended.skills.scan_dirs = cockpit_config::extended::SEEDED_SCAN_DIRS
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-        }
-        #[cfg(not(test))]
         let (extended, extended_base, extended_revision, extended_warnings) =
             extended_config_layer_snapshot(&extended_path, None)
                 .map(|(config, value, revision)| (config, value, Some(revision), Vec::new()))
@@ -3044,10 +3006,6 @@ impl SettingsDialog {
                     let value = serde_json::to_value(&config).unwrap_or_default();
                     (config, value, None, Vec::new())
                 });
-        // Fresh install (no config at this location yet): seed the
-        // skills scan-dir list with the defaults so they show as ordinary
-        // editable rows. Materialization-only — an existing config whose
-        // `scan_dirs` is absent/empty stays empty (clean break).
         let mcp_config = daemon_mcp_snapshot(&config_path).unwrap_or_default();
         Self {
             page: root_page(0),
@@ -3098,22 +3056,10 @@ impl SettingsDialog {
     /// Same as [`Self::open`] but records the cwd of the picker that
     /// opened this dialog so Root's back keybind can reopen it.
     pub fn open_from_picker(config_path: PathBuf, cwd: PathBuf) -> Self {
-        #[cfg(test)]
-        let config = ConfigDoc::load(&config_path)
-            .map(|document| document.providers())
-            .unwrap_or_default();
-        #[cfg(not(test))]
         let config = daemon_provider_snapshot(&cwd, None).unwrap_or_default();
         let mut s = Self::open_with_config(config_path, config);
         s.picker_cwd = Some(cwd.clone());
         s.active_project_root = Some(cwd);
-        #[cfg(test)]
-        {
-            s.cx.mcp_config = cockpit_core::mcp::config::McpConfig::discover(
-                s.active_project_root.as_deref().expect("picker cwd"),
-            );
-        }
-        #[cfg(not(test))]
         if let Some(snapshot) = s
             .active_project_root
             .as_deref()
@@ -3128,15 +3074,6 @@ impl SettingsDialog {
 
     /// Reload the authoritative extended-config snapshot after saving.
     fn reload_extended(&mut self) {
-        #[cfg(test)]
-        if let Ok(doc) = ExtendedConfigDoc::load(&self.extended_path) {
-            let (extended, warnings) = doc.config_with_warnings();
-            self.extended = extended;
-            self.extended_base = serde_json::to_value(&self.extended).unwrap_or_default();
-            self.extended_revision = None;
-            self.extended_warnings = warnings;
-        }
-        #[cfg(not(test))]
         if let Ok((extended, base, revision)) = extended_config_layer_snapshot(
             &self.extended_path,
             self.active_project_root
@@ -3152,49 +3089,39 @@ impl SettingsDialog {
 
     /// Persist the cached extended-config through daemon authority.
     pub(super) fn save_extended(&mut self) -> Result<SettingsSaveOutcome, String> {
-        #[cfg(test)]
-        {
-            let doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
-            let mut doc = doc;
-            doc.write(&self.extended).map_err(|e| e.to_string())?;
-            return Ok(SettingsSaveOutcome::Saved);
-        }
-        #[cfg(not(test))]
-        {
-            let revision = self.extended_revision.as_deref().ok_or_else(|| {
-                "settings snapshot has no revision; reload before saving".to_string()
-            })?;
-            let outcome = apply_settings_patch_via_daemon(
-                &self.extended_path,
-                self.active_project_root
-                    .as_deref()
-                    .or(self.picker_cwd.as_deref()),
-                &self.extended_base,
-                &self.extended,
-                revision,
-            )?;
-            match outcome {
-                SettingsPatchOutcome::Reconciled {
-                    layer,
-                    config_generation,
-                } => {
-                    let (extended, base, revision) =
-                        decode_extended_layer(layer, config_generation)?;
-                    self.extended = extended;
-                    self.extended_base = base;
-                    self.extended_revision = Some(revision);
-                    self.extended_warnings.clear();
-                    return Ok(SettingsSaveOutcome::Saved);
-                }
-                SettingsPatchOutcome::CommittedRefreshNeeded {
-                    result_revision: _,
-                    config_generation: _,
-                    warning,
-                } => {
-                    self.extended_revision = None;
-                    self.extended_warnings = vec![warning.clone()];
-                    return Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning));
-                }
+        let revision = self
+            .extended_revision
+            .as_deref()
+            .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
+        let outcome = apply_settings_patch_via_daemon(
+            &self.extended_path,
+            self.active_project_root
+                .as_deref()
+                .or(self.picker_cwd.as_deref()),
+            &self.extended_base,
+            &self.extended,
+            revision,
+        )?;
+        match outcome {
+            SettingsPatchOutcome::Reconciled {
+                layer,
+                config_generation,
+            } => {
+                let (extended, base, revision) = decode_extended_layer(layer, config_generation)?;
+                self.extended = extended;
+                self.extended_base = base;
+                self.extended_revision = Some(revision);
+                self.extended_warnings.clear();
+                Ok(SettingsSaveOutcome::Saved)
+            }
+            SettingsPatchOutcome::CommittedRefreshNeeded {
+                result_revision: _,
+                config_generation: _,
+                warning,
+            } => {
+                self.extended_revision = None;
+                self.extended_warnings = vec![warning.clone()];
+                Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning))
             }
         }
     }
@@ -4361,15 +4288,6 @@ impl SettingsCx {
     }
 
     fn reload_extended(&mut self) {
-        #[cfg(test)]
-        if let Ok(doc) = ExtendedConfigDoc::load(&self.extended_path) {
-            let (extended, warnings) = doc.config_with_warnings();
-            self.extended = extended;
-            self.extended_base = serde_json::to_value(&self.extended).unwrap_or_default();
-            self.extended_revision = None;
-            self.extended_warnings = warnings;
-        }
-        #[cfg(not(test))]
         if let Ok((extended, base, revision)) = extended_config_layer_snapshot(
             &self.extended_path,
             self.active_project_root
@@ -4384,49 +4302,39 @@ impl SettingsCx {
     }
 
     pub(super) fn save_extended(&mut self) -> Result<SettingsSaveOutcome, String> {
-        #[cfg(test)]
-        {
-            let doc = ExtendedConfigDoc::load(&self.extended_path).map_err(|e| e.to_string())?;
-            let mut doc = doc;
-            doc.write(&self.extended).map_err(|e| e.to_string())?;
-            return Ok(SettingsSaveOutcome::Saved);
-        }
-        #[cfg(not(test))]
-        {
-            let revision = self.extended_revision.as_deref().ok_or_else(|| {
-                "settings snapshot has no revision; reload before saving".to_string()
-            })?;
-            let outcome = apply_settings_patch_via_daemon(
-                &self.extended_path,
-                self.active_project_root
-                    .as_deref()
-                    .or(self.picker_cwd.as_deref()),
-                &self.extended_base,
-                &self.extended,
-                revision,
-            )?;
-            match outcome {
-                SettingsPatchOutcome::Reconciled {
-                    layer,
-                    config_generation,
-                } => {
-                    let (extended, base, revision) =
-                        decode_extended_layer(layer, config_generation)?;
-                    self.extended = extended;
-                    self.extended_base = base;
-                    self.extended_revision = Some(revision);
-                    self.extended_warnings.clear();
-                    return Ok(SettingsSaveOutcome::Saved);
-                }
-                SettingsPatchOutcome::CommittedRefreshNeeded {
-                    result_revision: _,
-                    config_generation: _,
-                    warning,
-                } => {
-                    self.extended_revision = None;
-                    self.extended_warnings = vec![warning.clone()];
-                    return Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning));
-                }
+        let revision = self
+            .extended_revision
+            .as_deref()
+            .ok_or_else(|| "settings snapshot has no revision; reload before saving".to_string())?;
+        let outcome = apply_settings_patch_via_daemon(
+            &self.extended_path,
+            self.active_project_root
+                .as_deref()
+                .or(self.picker_cwd.as_deref()),
+            &self.extended_base,
+            &self.extended,
+            revision,
+        )?;
+        match outcome {
+            SettingsPatchOutcome::Reconciled {
+                layer,
+                config_generation,
+            } => {
+                let (extended, base, revision) = decode_extended_layer(layer, config_generation)?;
+                self.extended = extended;
+                self.extended_base = base;
+                self.extended_revision = Some(revision);
+                self.extended_warnings.clear();
+                Ok(SettingsSaveOutcome::Saved)
+            }
+            SettingsPatchOutcome::CommittedRefreshNeeded {
+                result_revision: _,
+                config_generation: _,
+                warning,
+            } => {
+                self.extended_revision = None;
+                self.extended_warnings = vec![warning.clone()];
+                Ok(SettingsSaveOutcome::CommittedRefreshNeeded(warning))
             }
         }
     }
@@ -4782,11 +4690,6 @@ fn daemon_mcp_snapshot(
         .and_then(std::path::Path::parent)
         .or_else(|| config_path.parent())
         .unwrap_or_else(|| std::path::Path::new("."));
-    #[cfg(test)]
-    {
-        Some(cockpit_core::mcp::config::McpConfig::discover(cwd))
-    }
-    #[cfg(not(test))]
     daemon_provider_view_snapshot(cwd, None)
         .and_then(|config| config.mcp_config_json)
         .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
@@ -5653,25 +5556,18 @@ fn nearest_project_config_path(cwd: &std::path::Path) -> PathBuf {
 }
 
 fn scaffold_config_dir_owned(dir: &std::path::Path) -> Result<PathBuf, String> {
-    #[cfg(test)]
-    {
-        scaffold_config_dir(dir).map_err(|error| error.to_string())
-    }
-    #[cfg(not(test))]
-    {
-        let config_path = dir.join(CONFIG_FILE);
-        match apply_typed_settings_document_edit(
-            &config_path,
-            None,
-            serde_json::json!({ "agents": {}, "tools": {} }),
-        )? {
-            SettingsPatchOutcome::Reconciled { .. } => {}
-            SettingsPatchOutcome::CommittedRefreshNeeded { warning, .. } => {
-                return Err(format!("committed; refresh needed: {warning}"));
-            }
+    let config_path = dir.join(CONFIG_FILE);
+    match apply_typed_settings_document_edit(
+        &config_path,
+        None,
+        serde_json::json!({ "agents": {}, "tools": {} }),
+    )? {
+        SettingsPatchOutcome::Reconciled { .. } => {}
+        SettingsPatchOutcome::CommittedRefreshNeeded { warning, .. } => {
+            return Err(format!("committed; refresh needed: {warning}"));
         }
-        Ok(config_path)
     }
+    Ok(config_path)
 }
 
 fn scaffold_error(path: &std::path::Path, error: &dyn std::fmt::Display) -> String {

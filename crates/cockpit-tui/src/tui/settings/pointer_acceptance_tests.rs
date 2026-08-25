@@ -46,6 +46,33 @@ pub(super) fn record_rendered_surface(surface: SettingsPointerSurfaceKind) {
     });
 }
 
+/// Action coverage is per action kind and agent name, never per occurrence
+/// token: a rendered agent row's occurrence binds to the workspace's live
+/// source identity and revision, which no fixture dispatch can reproduce.
+fn coverage_identity(action: &SettingsPointerAction) -> SettingsPointerAction {
+    let SettingsPointerAction::Agents(action) = action else {
+        return action.clone();
+    };
+    let canonical = |id: &AgentId| id.canonical_for_coverage();
+    SettingsPointerAction::Agents(match action {
+        AgentsAction::Open(id) => AgentsAction::Open(canonical(id)),
+        AgentsAction::Edit(id) => AgentsAction::Edit(canonical(id)),
+        AgentsAction::Delete(id) => AgentsAction::Delete(canonical(id)),
+        AgentsAction::Reset(id) => AgentsAction::Reset(canonical(id)),
+        AgentsAction::ResetAll => AgentsAction::ResetAll,
+        AgentsAction::ToggleTool(id, tool) => AgentsAction::ToggleTool(canonical(id), tool.clone()),
+        AgentsAction::CycleTier(id, tool) => AgentsAction::CycleTier(canonical(id), tool.clone()),
+        AgentsAction::Save(id) => AgentsAction::Save(canonical(id)),
+        AgentsAction::OpenRawEditor(id) => AgentsAction::OpenRawEditor(canonical(id)),
+        AgentsAction::EditText(id) => AgentsAction::EditText(canonical(id)),
+        AgentsAction::Cancel(id) => AgentsAction::Cancel(canonical(id)),
+        AgentsAction::ExternalEditBegin(id) => AgentsAction::ExternalEditBegin(canonical(id)),
+        AgentsAction::ExternalEditResult(id, outcome) => {
+            AgentsAction::ExternalEditResult(canonical(id), *outcome)
+        }
+    })
+}
+
 pub(super) fn record_rendered_action(action: &SettingsPointerAction, enabled: bool) {
     use super::pointer_action_fixtures::ExpectedReducerOutcome;
     let expected = super::pointer_action_fixtures::key_for(action).expected();
@@ -61,7 +88,7 @@ pub(super) fn record_rendered_action(action: &SettingsPointerAction, enabled: bo
         } else {
             &mut coverage.2
         }
-        .insert(action.clone());
+        .insert(coverage_identity(action));
     });
     FIXTURE_COVERAGE.with(|coverage| {
         let key = super::pointer_action_fixtures::key_for(action);
@@ -92,7 +119,7 @@ pub(super) fn record_source_action(action: &SettingsPointerAction) {
 
 pub(super) fn record_dispatched_action(action: &SettingsPointerAction) {
     ACTION_COVERAGE.with(|coverage| {
-        coverage.borrow_mut().1.insert(action.clone());
+        coverage.borrow_mut().1.insert(coverage_identity(action));
     });
     FIXTURE_COVERAGE.with(|coverage| {
         coverage

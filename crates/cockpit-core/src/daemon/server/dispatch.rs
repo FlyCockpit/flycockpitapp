@@ -155,6 +155,10 @@ enum DurableOAuthFlow {
         owner: String,
         begin_client_operation_id: String,
         provider_id: String,
+        completion_client_operation_id: String,
+        completion_request_hash: [u8; 32],
+        completion_fencing_generation: i64,
+        terminal_response: Box<Response>,
         committed_at_unix_ms: i64,
     },
     McpCommitted {
@@ -162,6 +166,10 @@ enum DurableOAuthFlow {
         begin_client_operation_id: String,
         project_root: String,
         server: String,
+        completion_client_operation_id: String,
+        completion_request_hash: [u8; 32],
+        completion_fencing_generation: i64,
+        terminal_response: Box<Response>,
         committed_at_unix_ms: i64,
     },
 }
@@ -328,6 +336,67 @@ fn persist_oauth_flow(
             Some(bytes.as_slice()),
         )
         .map_err(|error| internal(anyhow::anyhow!(error)))?;
+    Ok(())
+}
+
+/// Reconcile token commits that became durable before their owner receipt was
+/// acknowledged. The encrypted marker contains the exact admitted operation,
+/// keyed request identity, fence, and secret-free terminal response, so this
+/// runs before the generic interrupted-operation fail-closed sweep.
+pub(super) async fn recover_committed_oauth_settlements(
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    let item_ids = ctx
+        .secret_vault
+        .list_item_ids(cockpit_db::secret_vault::SecretVaultKind::SealedState)
+        .map_err(|error| internal(anyhow::anyhow!(error)))?;
+    for item_id in item_ids
+        .into_iter()
+        .filter(|id| id.starts_with("oauth-flow:"))
+    {
+        let flow_id = item_id.trim_start_matches("oauth-flow:");
+        let Some(flow) = load_oauth_flow(ctx, flow_id)? else {
+            continue;
+        };
+        let settlement = match flow {
+            DurableOAuthFlow::ProviderCommitted {
+                owner,
+                completion_client_operation_id,
+                completion_request_hash,
+                completion_fencing_generation,
+                terminal_response,
+                ..
+            }
+            | DurableOAuthFlow::McpCommitted {
+                owner,
+                completion_client_operation_id,
+                completion_request_hash,
+                completion_fencing_generation,
+                terminal_response,
+                ..
+            } => Some((
+                owner,
+                completion_client_operation_id,
+                completion_request_hash,
+                completion_fencing_generation,
+                terminal_response,
+            )),
+            _ => None,
+        };
+        let Some((owner, operation_id, request_hash, fence, response)) = settlement else {
+            continue;
+        };
+        finish_local_operation(
+            ctx,
+            owner,
+            operation_id,
+            request_hash,
+            fence,
+            response.as_ref(),
+        )
+        .await?;
+        delete_oauth_flow(ctx, flow_id)?;
+    }
     Ok(())
 }
 
@@ -8350,11 +8419,22 @@ async fn handle_serialized_request_impl(
                 if cancellation_fence.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(conflict("provider OAuth completion was cancelled"));
                 }
+                let terminal_response = Response::ProviderOAuthCompleted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id: flow_id.clone(),
+                    logged_in: true,
+                    retry_after_seconds: None,
+                };
                 let committed_marker = zeroize::Zeroizing::new(
                     serde_json::to_vec(&DurableOAuthFlow::ProviderCommitted {
                         owner: owner.clone(),
                         begin_client_operation_id: durable_begin_client_operation_id,
                         provider_id: provider_id.to_owned(),
+                        completion_client_operation_id: client_operation_id.clone(),
+                        completion_request_hash: request_hash,
+                        completion_fencing_generation: fencing_generation,
+                        terminal_response: Box::new(terminal_response.clone()),
                         committed_at_unix_ms: oauth_wall_ms(),
                     })
                     .map_err(internal)?,
@@ -8362,6 +8442,9 @@ async fn handle_serialized_request_impl(
                 let vault = ctx.secret_vault.clone();
                 let flow_vault_id = oauth_flow_vault_id(&flow_id);
                 let provider_id_owned = provider_id.to_owned();
+                let receipt_owner = owner.clone();
+                let receipt_operation_id = client_operation_id.clone();
+                let receipt_json = serde_json::to_string(&terminal_response).map_err(internal)?;
                 ctx.db
                     .transaction(move |conn| {
                         vault
@@ -8380,24 +8463,37 @@ async fn handle_serialized_request_impl(
                                 Some(committed_marker.as_slice()),
                             )
                             .map_err(|error| anyhow::anyhow!(error))?;
+                        let settled = conn.execute(
+                            "UPDATE local_operation_receipts
+                             SET state='terminal_success',terminal_outcome_json=?5,
+                                 execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                             WHERE owner_digest=?1 AND client_operation_id=?2
+                               AND request_hash=?3 AND fencing_generation=?4
+                               AND state='executing'",
+                            rusqlite::params![
+                                receipt_owner,
+                                receipt_operation_id,
+                                request_hash.as_slice(),
+                                fencing_generation,
+                                receipt_json,
+                                chrono::Utc::now().timestamp_millis()
+                            ],
+                        )?;
+                        if settled != 1 {
+                            anyhow::bail!("provider OAuth completion lost its receipt fence");
+                        }
                         Ok(())
                     })
                     .await
                     .map_err(internal)?;
                 if let Err(error) = ctx.publish_owner_redaction_table() {
                     ctx.poison_redaction_publication(&error);
-                    return Err(internal(error));
+                    tracing::error!(%error, "provider OAuth committed but redaction publication failed; daemon poisoned");
                 }
                 // The token record is now durable; consuming the one-time flow
                 // prevents a duplicate exchange after a successful completion.
                 ctx.oauth_flows.remove_provider(&flow_id, &owner).await;
-                Ok(Response::ProviderOAuthCompleted {
-                    client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
-                    flow_id: flow_id.clone(),
-                    logged_in: true,
-                    retry_after_seconds: None,
-                })
+                Ok(terminal_response)
             };
             let response = match mutation.await {
                 Ok(response) => response,
@@ -8903,18 +8999,31 @@ async fn handle_serialized_request_impl(
                 }
                 let credential_key = crate::mcp::auth::cred_key(&pending.server);
                 let owner_root = pending.project_root.clone();
+                let terminal_response = Response::McpOAuthCompleted {
+                    client_operation_id: client_operation_id.clone(),
+                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
+                    flow_id: flow_id.clone(),
+                    authenticated: true,
+                };
                 let committed_marker = zeroize::Zeroizing::new(
                     serde_json::to_vec(&DurableOAuthFlow::McpCommitted {
                         owner: owner.clone(),
                         begin_client_operation_id: durable_begin_client_operation_id,
                         project_root: owner_root.clone(),
                         server: pending.server.clone(),
+                        completion_client_operation_id: client_operation_id.clone(),
+                        completion_request_hash: request_hash,
+                        completion_fencing_generation: fencing_generation,
+                        terminal_response: Box::new(terminal_response.clone()),
                         committed_at_unix_ms: oauth_wall_ms(),
                     })
                     .map_err(internal)?,
                 );
                 let flow_vault_id = oauth_flow_vault_id(&flow_id);
                 let vault = ctx.secret_vault.clone();
+                let receipt_owner = owner.clone();
+                let receipt_operation_id = client_operation_id.clone();
+                let receipt_json = serde_json::to_string(&terminal_response).map_err(internal)?;
                 ctx.db
                     .transaction(move |conn| {
                         // ATOMIC cross-kind admission for the flow-managed OAuth
@@ -8957,6 +9066,25 @@ async fn handle_serialized_request_impl(
                                 chrono::Utc::now().timestamp_millis()
                             ],
                         )?;
+                        let settled = conn.execute(
+                            "UPDATE local_operation_receipts
+                             SET state='terminal_success',terminal_outcome_json=?5,
+                                 execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                             WHERE owner_digest=?1 AND client_operation_id=?2
+                               AND request_hash=?3 AND fencing_generation=?4
+                               AND state='executing'",
+                            rusqlite::params![
+                                receipt_owner,
+                                receipt_operation_id,
+                                request_hash.as_slice(),
+                                fencing_generation,
+                                receipt_json,
+                                chrono::Utc::now().timestamp_millis()
+                            ],
+                        )?;
+                        if settled != 1 {
+                            anyhow::bail!("MCP OAuth completion lost its receipt fence");
+                        }
                         Ok(())
                     })
                     .await
@@ -8966,14 +9094,9 @@ async fn handle_serialized_request_impl(
                     // so rollback could orphan the already-authorized token;
                     // poison and fail closed until the daemon is restarted.
                     ctx.poison_redaction_publication(&error);
-                    return Err(internal(error));
+                    tracing::error!(%error, "MCP OAuth committed but redaction publication failed; daemon poisoned");
                 }
-                Ok(Response::McpOAuthCompleted {
-                    client_operation_id: client_operation_id.clone(),
-                    request_hash: local_operation_request_hash_hex(&receipt_request_hash),
-                    flow_id: flow_id.clone(),
-                    authenticated: true,
-                })
+                Ok(terminal_response)
             };
             let response = match mutation.await {
                 Ok(response) => response,

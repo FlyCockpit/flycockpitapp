@@ -3698,6 +3698,9 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
         if let Err(error) = dispatch::recover_all_mcp_config_journals(&ctx).await {
             tracing::error!(%error, "startup MCP-config journal recovery failed; MCP requests will retry it");
         }
+        dispatch::recover_committed_oauth_settlements(&ctx)
+            .await
+            .context("reconciling committed OAuth authority operations")?;
         // Provider/MCP journals above get the first opportunity to reconcile
         // a proven commit. Any remaining generic local receipt is ambiguous;
         // fail it closed rather than time-taking-over and repeating an

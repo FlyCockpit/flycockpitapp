@@ -2108,11 +2108,12 @@ async fn try_spawn_inner(
 ) -> Result<AgentRunner, String> {
     let attached = {
         let mut timer = cockpit_core::startup::PhaseTimer::start("agent_runner::try_spawn");
-        let daemon = probe_or_spawn(mode)
+        let mut daemon = probe_or_spawn(mode)
             .await
             .map_err(|e| format!("daemon probe: {e}"))?;
         timer.phase("probe_or_spawn");
         let owns_daemon = daemon.owns_daemon;
+        let owned_daemon_guard = daemon.take_owned_daemon_guard();
         let socket = daemon.socket.clone();
         let startup_notice = daemon.startup_notice.clone();
         let project_root = cwd.to_string_lossy().into_owned();
@@ -2253,6 +2254,7 @@ async fn try_spawn_inner(
             btw_fork,
             daemon_version,
             daemon_compatible,
+            owned_daemon_guard,
         ))
     }?;
     let (
@@ -2275,6 +2277,7 @@ async fn try_spawn_inner(
         btw_fork,
         daemon_version,
         daemon_compatible,
+        owned_daemon_guard,
     ) = attached;
 
     let (input_tx, input_rx) = mpsc::channel::<RunnerInput>(32);
@@ -2724,8 +2727,6 @@ async fn try_spawn_inner(
         }));
     }
 
-    let owned_daemon_guard = owns_daemon
-        .then(|| cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard::new(socket.clone()));
     Ok(AgentRunner {
         input_tx,
         record_tx,
@@ -3067,7 +3068,7 @@ pub fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Respons
 /// never rides an `AsyncActionPayload` or any ordinary daemon codec.
 pub fn daemon_reveal_leak_blocking(
     control_socket: &Path,
-    capability: &str,
+    capability: &proto::LeakRevealToken,
 ) -> Result<
     cockpit_core::daemon::leak_reveal::RevealedLeakSecret,
     cockpit_core::daemon::leak_reveal::LeakRevealDenied,
@@ -3079,10 +3080,9 @@ pub fn daemon_reveal_leak_blocking(
         }
     };
     let socket = control_socket.to_path_buf();
-    let capability = zeroize::Zeroizing::new(capability.to_owned());
     tokio::task::block_in_place(|| {
-        runtime.block_on(async move {
-            cockpit_core::daemon::leak_reveal::reveal_leak_secret(&socket, &capability).await
+        runtime.block_on(async {
+            cockpit_core::daemon::leak_reveal::reveal_leak_secret(&socket, capability).await
         })
     })
 }

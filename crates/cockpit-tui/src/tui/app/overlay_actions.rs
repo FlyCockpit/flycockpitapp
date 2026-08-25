@@ -28,7 +28,7 @@ fn canonical_leak_capability(value: &str) -> bool {
 
 fn cancel_leak_capability_blocking(
     socket: &std::path::Path,
-    capability: String,
+    capability: cockpit_core::daemon::proto::LeakRevealToken,
     expected_report_id: &str,
 ) -> bool {
     matches!(
@@ -144,7 +144,7 @@ impl App {
                 };
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 let binding_valid = capability.report_id == worker_report_id
-                    && canonical_leak_capability(&capability.capability)
+                    && canonical_leak_capability(capability.capability.as_str())
                     && capability.expires_at_ms > now_ms
                     && capability.expires_at_ms
                         <= now_ms
@@ -161,18 +161,13 @@ impl App {
                         cockpit_core::daemon::leak_reveal::LeakRevealDenied::Internal
                     });
                 }
-                let token = zeroize::Zeroizing::new(capability.capability);
-                let reveal =
-                    crate::tui::agent_runner::daemon_reveal_leak_blocking(&socket, token.as_str());
+                let token = capability.capability;
+                let reveal = crate::tui::agent_runner::daemon_reveal_leak_blocking(&socket, &token);
                 if reveal.is_err() {
                     // `RateLimited` and unavailable-channel paths do not consume
                     // the slot. An authorization failure may already have spent
                     // it; exact cancel then harmlessly fails closed.
-                    let _ = cancel_leak_capability_blocking(
-                        &socket,
-                        token.to_string(),
-                        &worker_report_id,
-                    );
+                    let _ = cancel_leak_capability_blocking(&socket, token, &worker_report_id);
                 }
                 reveal
             })();

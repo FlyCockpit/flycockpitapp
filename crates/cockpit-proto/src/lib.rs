@@ -2466,6 +2466,91 @@ mod tui_ownership_rpc_contract_tests {
 /// fails closed on deserialize before it reaches any handler.
 pub const MAX_SENSITIVE_FRAME_BYTES: usize = 16 * 1024;
 
+/// Opaque one-use token for the local leak-reveal channel.
+///
+/// Although this is not the revealed plaintext, possession authorizes a
+/// plaintext read. It therefore has the same memory/logging discipline as a
+/// secret: zeroizing storage, redacted `Debug`, and no conversion API that
+/// produces an ordinary `String` copy.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LeakRevealToken(zeroize::Zeroizing<String>);
+
+impl LeakRevealToken {
+    pub fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    pub fn from_zeroizing(value: zeroize::Zeroizing<String>) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn into_zeroizing(self) -> zeroize::Zeroizing<String> {
+        self.0
+    }
+}
+
+impl fmt::Debug for LeakRevealToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "LeakRevealToken([REDACTED; {} bytes])",
+            self.0.len()
+        )
+    }
+}
+
+impl Serialize for LeakRevealToken {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LeakRevealToken {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        // Historical response fixtures used an empty placeholder before the
+        // live v16 contract required canonical tokens. Keep deserialization
+        // bounded and zeroizing; live request semantics and the reveal frame
+        // enforce the exact 64-byte lowercase-hex shape.
+        if value.len() > 64 {
+            return Err(serde::de::Error::custom(
+                "leak reveal token exceeds 64 bytes",
+            ));
+        }
+        Ok(Self(zeroize::Zeroizing::new(value)))
+    }
+}
+
+#[cfg(feature = "remote")]
+impl crate::remote_operation_fcor::CanonicalFcorValueV1 for LeakRevealToken {
+    fn encode_fcor_value_v1(
+        &self,
+        out: &mut crate::remote_operation_fcor::CanonicalParamsV1,
+    ) -> Result<()> {
+        // CancelLeakReveal is local-only, but the command registry still
+        // verifies every parameter has a closed canonical codec. Never copy a
+        // bearer token into the ordinary FCOR byte buffer.
+        out.push_bytes(b"[leak-reveal-token-redacted]")
+    }
+}
+
 /// A sealed-value plaintext literal on the sensitive owner channel.
 ///
 /// It rides exactly two wire frames and nowhere else: the apply request
@@ -2704,7 +2789,7 @@ pub struct LeakReportsPage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeakRevealCapability {
     /// The opaque capability token; never derived from the secret.
-    pub capability: String,
+    pub capability: LeakRevealToken,
     /// The single report id this capability is bound to.
     pub report_id: String,
     /// When this capability expires (unix ms). A reveal after this is
@@ -6460,7 +6545,7 @@ mod tests {
                 #[cfg(feature = "remote")]
                 operation: None,
                 request: Request::CancelLeakReveal {
-                    capability: "capability".into(),
+                    capability: LeakRevealToken::new("00".repeat(32)),
                 },
             })
             .0,

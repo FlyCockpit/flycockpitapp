@@ -22,6 +22,7 @@
 use zeroize::Zeroizing;
 
 use crate::daemon::leak_reveal::LeakRevealDenied;
+use crate::daemon::proto::LeakRevealToken;
 use crate::leaks::LEAK_REVEAL_MAX_PLAINTEXT_BYTES;
 
 /// Frame protocol version.
@@ -46,7 +47,7 @@ pub struct FrameError;
 pub struct LeakRevealSocketRequest {
     /// Exactly 64 ASCII hex chars (validated structurally; hex/token validity is
     /// the consumption core's constant-time job).
-    pub capability_hex: String,
+    pub capability_hex: LeakRevealToken,
 }
 
 /// The status-tagged reveal response.
@@ -86,7 +87,7 @@ pub fn encode_request(req: &LeakRevealSocketRequest) -> Result<Vec<u8>, FrameErr
     let mut buf = Vec::with_capacity(LEAK_REVEAL_REQUEST_FRAME_LEN);
     buf.push(LEAK_REVEAL_FRAME_VERSION);
     buf.extend_from_slice(&(LEAK_REVEAL_CAPABILITY_HEX_LEN as u16).to_be_bytes());
-    buf.extend_from_slice(req.capability_hex.as_bytes());
+    buf.extend_from_slice(req.capability_hex.as_str().as_bytes());
     Ok(buf)
 }
 
@@ -104,11 +105,16 @@ pub fn decode_request(buf: &[u8]) -> Result<LeakRevealSocketRequest, FrameError>
         return Err(FrameError);
     }
     let hex_bytes = &buf[3..];
-    if !hex_bytes.iter().all(|b| b.is_ascii()) {
+    if !hex_bytes
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
         return Err(FrameError);
     }
     let capability_hex = String::from_utf8(hex_bytes.to_vec()).map_err(|_| FrameError)?;
-    Ok(LeakRevealSocketRequest { capability_hex })
+    Ok(LeakRevealSocketRequest {
+        capability_hex: LeakRevealToken::new(capability_hex),
+    })
 }
 
 /// Encode a reveal response. An `Ok` whose report id or plaintext exceeds its
@@ -207,7 +213,7 @@ mod tests {
     #[test]
     fn leak_reveal_frame_request_round_trips() {
         let req = LeakRevealSocketRequest {
-            capability_hex: "a".repeat(64),
+            capability_hex: LeakRevealToken::new("a".repeat(64)),
         };
         let bytes = encode_request(&req).unwrap();
         assert_eq!(bytes.len(), LEAK_REVEAL_REQUEST_FRAME_LEN);
@@ -218,14 +224,14 @@ mod tests {
     fn leak_reveal_frame_request_rejects_bad_shapes() {
         // Wrong version.
         let mut bytes = encode_request(&LeakRevealSocketRequest {
-            capability_hex: "b".repeat(64),
+            capability_hex: LeakRevealToken::new("b".repeat(64)),
         })
         .unwrap();
         bytes[0] = 2;
         assert!(decode_request(&bytes).is_err());
         // Trailing byte.
         let mut bytes = encode_request(&LeakRevealSocketRequest {
-            capability_hex: "b".repeat(64),
+            capability_hex: LeakRevealToken::new("b".repeat(64)),
         })
         .unwrap();
         bytes.push(0);
@@ -233,7 +239,7 @@ mod tests {
         // Wrong capability length must not encode.
         assert!(
             encode_request(&LeakRevealSocketRequest {
-                capability_hex: "b".repeat(63),
+                capability_hex: LeakRevealToken::new("b".repeat(63)),
             })
             .is_err()
         );

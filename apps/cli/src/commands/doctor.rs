@@ -27,7 +27,6 @@ pub struct DoctorCouldNotRun(#[source] pub anyhow::Error);
 
 use crate::cli::DoctorArgs;
 use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::EphemeralDaemonGuard;
 use crate::daemon::proto::{Request, Response};
 
 const DIAGNOSTIC_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -74,7 +73,7 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
             })?;
         return finish_snapshot(worker.rendered, worker.has_failures);
     }
-    let daemon = match probe_or_spawn(LifecycleMode::AttachOrEphemeral).await {
+    let mut daemon = match probe_or_spawn(LifecycleMode::AttachOrEphemeral).await {
         Ok(daemon) => daemon,
         Err(daemon_error) if ephemeral_boot_attempted => {
             return recover_ephemeral_database_boot_failure(&args, no_sandbox, daemon_error).await;
@@ -84,9 +83,7 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
     // A diagnostic-only invocation must never auto-promote a persistent
     // daemon. The guard owns only a daemon this command spawned, and reaps it
     // on every return path after the socket RPC has been attempted.
-    let guard = daemon
-        .owns_daemon
-        .then(|| EphemeralDaemonGuard::new(daemon.socket.clone()));
+    let guard = daemon.take_owned_daemon_guard();
     let response = daemon
         .client
         .request(build_doctor_request(&args, no_sandbox))

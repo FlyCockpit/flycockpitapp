@@ -19,7 +19,7 @@ use cockpit_core::init::{InitMode, build_init_prompt, display_target, resolve_ta
 
 use crate::cli::InitArgs;
 use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::{EphemeralDaemonGuard, spawn_signal_shutdown};
+use crate::daemon::ephemeral_guard::spawn_signal_shutdown;
 
 /// `cockpit init [path]` — headless. Resolves the target, refuses to
 /// clobber an existing file unless `--force` (no interactive prompt in
@@ -58,12 +58,10 @@ pub async fn run(args: InitArgs, no_sandbox: bool) -> Result<()> {
     } else {
         LifecycleMode::AttachOrEphemeral
     };
-    let daemon = probe_or_spawn(mode_lc).await?;
+    let mut daemon = probe_or_spawn(mode_lc).await?;
     let client = daemon.client.clone();
 
-    let guard = daemon
-        .owns_daemon
-        .then(|| EphemeralDaemonGuard::new(daemon.socket.clone()));
+    let guard = daemon.take_owned_daemon_guard();
     let signal_task = spawn_signal_shutdown(guard.as_ref(), true);
 
     eprintln!("Exploring the project and writing `{shown}`…");

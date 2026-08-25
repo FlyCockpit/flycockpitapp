@@ -16750,7 +16750,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             report_id: "missing".into(),
         },
         "cancel_leak_reveal" => Request::CancelLeakReveal {
-            capability: "00".repeat(32),
+            capability: proto::LeakRevealToken::new("00".repeat(32)),
         },
         "mark_leak_rotated" => Request::MarkLeakRotated {
             report_id: "missing".into(),
@@ -23362,7 +23362,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
         CommandMetadataCase {
             request: Request::CancelLeakReveal {
-                capability: "00".repeat(32),
+                capability: proto::LeakRevealToken::new("00".repeat(32)),
             },
             kind: "cancel_leak_reveal",
             session_id: None,

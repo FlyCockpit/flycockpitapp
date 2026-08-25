@@ -1605,7 +1605,7 @@ mod tests {
         assert_eq!(
             Response::LeakRevealCapability {
                 capability: LeakRevealCapability {
-                    capability: String::new(),
+                    capability: LeakRevealToken::new("00".repeat(32)),
                     report_id: String::new(),
                     expires_at_ms: 0,
                 }

@@ -91,7 +91,7 @@ async fn handle_reveal_connection(mut stream: UnixStream, ctx: Arc<DaemonContext
         _ => return,
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let response = match consume_leak_reveal(&ctx, &request.capability_hex, now_ms).await {
+    let response = match consume_leak_reveal(&ctx, request.capability_hex.as_str(), now_ms).await {
         Ok(RevealedLeakSecret {
             report_id,
             plaintext,
@@ -141,10 +141,10 @@ async fn read_request_frame(stream: &mut UnixStream) -> Option<LeakRevealSocketR
 /// socket after restart) is `UnavailablePlatform`.
 pub async fn reveal_leak_secret_over_socket(
     reveal_socket: &Path,
-    capability: &str,
+    capability: &crate::daemon::proto::LeakRevealToken,
 ) -> Result<RevealedLeakSecret, LeakRevealDenied> {
     let request = LeakRevealSocketRequest {
-        capability_hex: capability.to_owned(),
+        capability_hex: capability.clone(),
     };
     let bytes = match encode_request(&request) {
         Ok(bytes) => bytes,

@@ -4209,11 +4209,12 @@ async fn run_in_process_client(
     event_tx: mpsc::Sender<proto::Event>,
 ) {
     let _client_guard = ctx.track_client();
+    let client_instance_id = Uuid::new_v4();
     let mut state = MutableClientState::detached_with_principal(
         ctx.upload_accounting.clone(),
         ClientPrincipal::owner(),
         ctx.terminal_host.clone(),
-        Uuid::new_v4(),
+        client_instance_id,
         next_terminal_connection_epoch(),
     );
     let mut shared = state.shared_snapshot();
@@ -4223,49 +4224,134 @@ async fn run_in_process_client(
     let mut concurrent_tasks = JoinSet::new();
     let mut pending_lag = PendingEventLag::default();
 
-    match event_tx.try_send(ctx.caffeinate_state_event()) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => return,
-        Err(mpsc::error::TrySendError::Closed(_)) => return,
-    }
+    let client_ready = match event_tx.try_send(ctx.caffeinate_state_event()) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
+            false
+        }
+    };
 
-    'client: loop {
-        let event_branch = async {
-            match session_event_rx.as_mut() {
-                Some(rx) => Some(rx.recv().await),
-                None => std::future::pending().await,
-            }
-        };
+    if client_ready {
+        'client: loop {
+            let event_branch = async {
+                match session_event_rx.as_mut() {
+                    Some(rx) => Some(rx.recv().await),
+                    None => std::future::pending().await,
+                }
+            };
 
-        tokio::select! {
-            biased;
-            permit = event_tx.reserve(), if pending_lag.has_dropped() => {
-                match permit {
-                    Ok(permit) => {
-                        if let Some(event) = pending_lag.take_event() {
-                            permit.send(event);
+            tokio::select! {
+                biased;
+                permit = event_tx.reserve(), if pending_lag.has_dropped() => {
+                    match permit {
+                        Ok(permit) => {
+                            if let Some(event) = pending_lag.take_event() {
+                                permit.send(event);
+                            }
                         }
+                        Err(_) => break 'client,
                     }
-                    Err(_) => break 'client,
                 }
-            }
-            Some(joined) = concurrent_tasks.join_next(), if !concurrent_tasks.is_empty() => {
-                if let Err(error) = joined {
-                    tracing::warn!(%error, "in-process concurrent request task failed");
+                Some(joined) = concurrent_tasks.join_next(), if !concurrent_tasks.is_empty() => {
+                    if let Err(error) = joined {
+                        tracing::warn!(%error, "in-process concurrent request task failed");
+                    }
                 }
-            }
-            global = global_rx.recv() => {
-                match global {
-                    Ok(envelope) => {
-                        if !try_send_in_process_event(&event_tx, envelope.event, None, &mut pending_lag) {
-                            break 'client;
+                global = global_rx.recv() => {
+                    match global {
+                        Ok(envelope) => {
+                            if !try_send_in_process_event(&event_tx, envelope.event, None, &mut pending_lag) {
+                                break 'client;
+                            }
                         }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(missed = n, "in-process client global event stream lagged");
+                            pending_lag.record_many(n, None);
+                            if !try_send_in_process_event(&event_tx, ctx.caffeinate_state_event(), None, &mut pending_lag) {
+                                break 'client;
+                            }
+                            if let Some(event) = ctx.drain_state_event()
+                                && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
+                            {
+                                break 'client;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {}
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(missed = n, "in-process client global event stream lagged");
-                        pending_lag.record_many(n, None);
-                        if !try_send_in_process_event(&event_tx, ctx.caffeinate_state_event(), None, &mut pending_lag) {
+                }
+                event = event_branch => {
+                    match event {
+                        Some(Ok(envelope)) => {
+                            let session_id = state
+                                .attached
+                                .as_ref()
+                                .map(|attached| attached.handle.session_id);
+                            if !try_send_in_process_event(
+                                &event_tx,
+                                envelope.event,
+                                session_id,
+                                &mut pending_lag,
+                            ) {
+                                break 'client;
+                            }
+                        }
+                        Some(Err(broadcast::error::RecvError::Lagged(n))) => {
+                            tracing::warn!(missed = n, "in-process client event stream lagged; reattach to resync");
+                            let session_id = state
+                                .attached
+                                .as_ref()
+                                .map(|attached| attached.handle.session_id);
+                            pending_lag.record_many(n, session_id);
+                        }
+                        Some(Err(broadcast::error::RecvError::Closed)) => {
+                            state.attached = None;
+                            shared = state.shared_snapshot();
+                            session_event_rx = None;
+                        }
+                        None => unreachable!("event_branch is pending when not attached"),
+                    }
+                }
+                cmd = request_rx.recv() => {
+                    let Some(InProcessRequest { request, reply }) = cmd else {
+                        break 'client;
+                    };
+                    if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
+                        let Ok(permit) = concurrent_permits.clone().acquire_owned().await else {
                             break 'client;
+                        };
+                        let shared = shared.clone();
+                        let ctx = ctx.clone();
+                        concurrent_tasks.spawn(async move {
+                            let _permit = permit;
+                            let result = run_concurrent_request_catching_panic(request, shared, ctx).await;
+                            let _ = reply.send(result);
+                        });
+                        continue;
+                    }
+                    let is_attach = matches!(&request, Request::Attach { .. });
+                    let mut effects = ClientRequestEffects::default();
+                    let result = dispatch::handle_serialized_request(
+                        request,
+                        &mut state,
+                        &shared,
+                        &ctx,
+                        &mut effects,
+                    )
+                    .await;
+                    let attached = matches!(&result, Ok(Response::Attached { .. }));
+                    if (is_attach && attached) || state.attached.is_none() {
+                        shared = state.shared_snapshot();
+                    }
+                    let _ = reply.send(result);
+                    if is_attach && attached {
+                        let session_id = state
+                            .attached
+                            .as_ref()
+                            .map(|attached| attached.handle.session_id);
+                        for event in std::mem::take(&mut state.pending_replay) {
+                            if !try_send_in_process_event(&event_tx, event, session_id, &mut pending_lag) {
+                                break 'client;
+                            }
                         }
                         if let Some(event) = ctx.drain_state_event()
                             && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
@@ -4273,101 +4359,36 @@ async fn run_in_process_client(
                             break 'client;
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => {}
-                }
-            }
-            event = event_branch => {
-                match event {
-                    Some(Ok(envelope)) => {
-                        let session_id = state
-                            .attached
-                            .as_ref()
-                            .map(|attached| attached.handle.session_id);
-                        if !try_send_in_process_event(
-                            &event_tx,
-                            envelope.event,
-                            session_id,
-                            &mut pending_lag,
-                        ) {
-                            break 'client;
-                        }
-                    }
-                    Some(Err(broadcast::error::RecvError::Lagged(n))) => {
-                        tracing::warn!(missed = n, "in-process client event stream lagged; reattach to resync");
-                        let session_id = state
-                            .attached
-                            .as_ref()
-                            .map(|attached| attached.handle.session_id);
-                        pending_lag.record_many(n, session_id);
-                    }
-                    Some(Err(broadcast::error::RecvError::Closed)) => {
-                        state.attached = None;
-                        shared = state.shared_snapshot();
+                    if let Some(rx) = effects.session_event_rx.take() {
+                        session_event_rx = Some(rx);
+                    } else if state.attached.is_none() {
                         session_event_rx = None;
                     }
-                    None => unreachable!("event_branch is pending when not attached"),
-                }
-            }
-            cmd = request_rx.recv() => {
-                let Some(InProcessRequest { request, reply }) = cmd else {
-                    break 'client;
-                };
-                if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
-                    let Ok(permit) = concurrent_permits.clone().acquire_owned().await else {
-                        break 'client;
-                    };
-                    let shared = shared.clone();
-                    let ctx = ctx.clone();
-                    concurrent_tasks.spawn(async move {
-                        let _permit = permit;
-                        let result = run_concurrent_request_catching_panic(request, shared, ctx).await;
-                        let _ = reply.send(result);
-                    });
-                    continue;
-                }
-                let is_attach = matches!(&request, Request::Attach { .. });
-                let mut effects = ClientRequestEffects::default();
-                let result = dispatch::handle_serialized_request(
-                    request,
-                    &mut state,
-                    &shared,
-                    &ctx,
-                    &mut effects,
-                )
-                .await;
-                let attached = matches!(&result, Ok(Response::Attached { .. }));
-                if (is_attach && attached) || state.attached.is_none() {
-                    shared = state.shared_snapshot();
-                }
-                let _ = reply.send(result);
-                if is_attach && attached {
-                    let session_id = state
-                        .attached
-                        .as_ref()
-                        .map(|attached| attached.handle.session_id);
-                    for event in std::mem::take(&mut state.pending_replay) {
-                        if !try_send_in_process_event(&event_tx, event, session_id, &mut pending_lag) {
-                            break 'client;
-                        }
-                    }
-                    if let Some(event) = ctx.drain_state_event()
-                        && !try_send_in_process_event(&event_tx, event, None, &mut pending_lag)
-                    {
-                        break 'client;
-                    }
-                }
-                if let Some(rx) = effects.session_event_rx.take() {
-                    session_event_rx = Some(rx);
-                } else if state.attached.is_none() {
-                    session_event_rx = None;
                 }
             }
         }
     }
+    // Concurrent dispatch owns the only tasks that can mint sealed
+    // capabilities. Abort and join them before cancellation so teardown is a
+    // hard insertion fence, matching the socket transport.
+    concurrent_tasks.abort_all();
+    while concurrent_tasks.join_next().await.is_some() {}
     if let Err(error) =
         attachments::drain_client_attachment_ownership(&mut state, &ctx, "disconnect").await
     {
         tracing::warn!(message=%error.message,"in-process attachment ownership drain failed; durable charges remain for startup recovery");
+    }
+    let cancelled_capabilities = ctx
+        .sealed_owner_capabilities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .cancel_for_session(client_instance_id);
+    if cancelled_capabilities > 0 {
+        tracing::debug!(
+            client_instance_id = %client_instance_id,
+            cancelled_capabilities,
+            "cancelled sealed capabilities at in-process client teardown"
+        );
     }
 }
 
@@ -4557,10 +4578,25 @@ where
     )
     .await;
 
+    // The executor is the only transport task able to mint a sealed
+    // capability. Terminate and join it before settling the connection's
+    // capability set so no dispatch child can insert after cancellation.
+    if completed.kind != ClientTaskKind::Executor {
+        executor_task.abort();
+        let _ = (&mut executor_task).await;
+    }
     reader_task.abort();
     writer_task.abort();
     event_task.abort();
-    executor_task.abort();
+    if completed.kind != ClientTaskKind::Reader {
+        let _ = (&mut reader_task).await;
+    }
+    if completed.kind != ClientTaskKind::Writer {
+        let _ = (&mut writer_task).await;
+    }
+    if completed.kind != ClientTaskKind::Event {
+        let _ = (&mut event_task).await;
+    }
     let cancelled_capabilities = ctx
         .sealed_owner_capabilities
         .lock()
@@ -4573,8 +4609,21 @@ where
             "cancelled sealed capabilities at client transport teardown"
         );
     }
-    completed?;
+    completed.result?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientTaskKind {
+    Reader,
+    Writer,
+    Event,
+    Executor,
+}
+
+struct CompletedClientTask {
+    kind: ClientTaskKind,
+    result: Result<()>,
 }
 
 async fn select_client_task(
@@ -4582,13 +4631,13 @@ async fn select_client_task(
     writer: &mut tokio::task::JoinHandle<Result<()>>,
     event: &mut tokio::task::JoinHandle<Result<()>>,
     executor: &mut tokio::task::JoinHandle<Result<()>>,
-) -> Result<()> {
+) -> CompletedClientTask {
     tokio::select! {
         biased;
-        result = executor => flatten_client_task(result, "client executor task", false),
-        result = reader => flatten_client_task(result, "client reader task", true),
-        result = writer => flatten_client_task(result, "client writer task", false),
-        result = event => flatten_client_task(result, "client event task", false),
+        result = executor => CompletedClientTask { kind: ClientTaskKind::Executor, result: flatten_client_task(result, "client executor task", false) },
+        result = reader => CompletedClientTask { kind: ClientTaskKind::Reader, result: flatten_client_task(result, "client reader task", true) },
+        result = writer => CompletedClientTask { kind: ClientTaskKind::Writer, result: flatten_client_task(result, "client writer task", false) },
+        result = event => CompletedClientTask { kind: ClientTaskKind::Event, result: flatten_client_task(result, "client event task", false) },
     }
 }
 

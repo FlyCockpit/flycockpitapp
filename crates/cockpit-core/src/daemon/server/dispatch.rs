@@ -9288,7 +9288,7 @@ pub(super) async fn begin_leak_reveal(
         .mint(token, report_id.clone(), expires_at_ms);
     Ok(Response::LeakRevealCapability {
         capability: proto::LeakRevealCapability {
-            capability: hex,
+            capability: proto::LeakRevealToken::new(hex),
             report_id,
             expires_at_ms,
         },
@@ -9298,7 +9298,7 @@ pub(super) async fn begin_leak_reveal(
 fn cancel_leak_reveal(
     ctx: &Arc<DaemonContext>,
     principal: &ClientPrincipal,
-    capability: String,
+    capability: proto::LeakRevealToken,
 ) -> std::result::Result<Response, ErrorPayload> {
     if !principal.is_owner() {
         return Err(authorization_error(
@@ -9309,7 +9309,7 @@ fn cancel_leak_reveal(
         .leak_reveal_state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .cancel_exact(&capability, chrono::Utc::now().timestamp_millis())
+        .cancel_exact(capability.as_str(), chrono::Utc::now().timestamp_millis())
         .ok_or_else(|| ErrorPayload {
             code: ErrorCode::Authorization,
             message: "unauthorized".to_string(),

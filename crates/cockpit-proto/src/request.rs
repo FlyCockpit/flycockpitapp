@@ -641,7 +641,7 @@ pub enum Request {
     /// protected value. The daemon validates the exact opaque token and
     /// returns a report-bound settlement receipt.
     CancelLeakReveal {
-        capability: String,
+        capability: LeakRevealToken,
     },
     /// Update the rotation disposition of a leak record. Metadata-only and
     /// reversible.
@@ -2461,6 +2461,7 @@ impl Request {
             Self::CancelLeakReveal { capability }
                 if capability.len() != 64
                     || !capability
+                        .as_str()
                         .as_bytes()
                         .iter()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)) =>
@@ -3341,7 +3342,7 @@ macro_rules! command {
             (Request::RetireSealedAction { action_id, confirm }, "retire_sealed_action", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "action_id:String|confirm:String", [action_id: String => param, confirm: String => param]);
             (Request::ListLeakReports { cursor, limit, project_root, session_id, rotation }, "list_leak_reports", owner_only, none, false, local_only, none, concurrent, none, "cursor:Option<String>|limit:Option<u32>|project_root:Option<String>|session_id:Option<Uuid>|rotation:Option<LeakRotationState>", [cursor: Option<String> => param, limit: Option<u32> => param, project_root: Option<String> => project_root_effective, session_id: Option<Uuid> => param, rotation: Option<LeakRotationState> => param]);
             (Request::BeginLeakReveal { report_id }, "begin_leak_reveal", owner_only, none, false, local_only, none, serialized, none, "report_id:String", [report_id: String => param]);
-            (Request::CancelLeakReveal { capability }, "cancel_leak_reveal", owner_only, none, true, local_only, none, serialized, none, "capability:String", [capability: String => param]);
+            (Request::CancelLeakReveal { capability }, "cancel_leak_reveal", owner_only, none, true, local_only, none, serialized, none, "capability:LeakRevealToken", [capability: LeakRevealToken => param]);
             (Request::MarkLeakRotated { report_id, rotation }, "mark_leak_rotated", owner_only, none, true, local_only, none, serialized, none, "report_id:String|rotation:LeakRotationDisposition", [report_id: String => param, rotation: LeakRotationDisposition => param]);
             (Request::DeleteLeakReport { report_id }, "delete_leak_report", owner_only, none, true, local_only, none, serialized, none, "report_id:String", [report_id: String => param]);
             (Request::ListProjectNotes { project_root }, "list_project_notes", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
@@ -3890,6 +3891,7 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         // reaches the non-zeroizing canonical buffer. The `redacted` codec makes
         // that redaction explicit in the cross-language schema.
         "Option<SensitiveWireLiteral>" => "option<redacted>",
+        "LeakRevealToken" => "redacted",
         "Option<Uuid>" => "option<uuid>",
         "Option<bool>" => "option<bool>",
         "Option<i64>" => "option<i64>",
@@ -5480,7 +5482,7 @@ mod tests {
                 report_id: "r1".into(),
             },
             Request::CancelLeakReveal {
-                capability: "00".repeat(32),
+                capability: LeakRevealToken::new("00".repeat(32)),
             },
             Request::MarkLeakRotated {
                 report_id: "r1".into(),

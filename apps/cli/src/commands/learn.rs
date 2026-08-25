@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::LearnArgs;
 use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::{EphemeralDaemonGuard, spawn_signal_shutdown};
+use crate::daemon::ephemeral_guard::spawn_signal_shutdown;
 pub use crate::skills::{build_learn_prompt, subject_from_parts};
 
 pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
@@ -20,11 +20,9 @@ pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
     } else {
         LifecycleMode::AttachOrEphemeral
     };
-    let daemon = probe_or_spawn(mode).await?;
+    let mut daemon = probe_or_spawn(mode).await?;
     let client = daemon.client.clone();
-    let guard = daemon
-        .owns_daemon
-        .then(|| EphemeralDaemonGuard::new(daemon.socket.clone()));
+    let guard = daemon.take_owned_daemon_guard();
     let signal_task = spawn_signal_shutdown(guard.as_ref(), true);
 
     eprintln!("Authoring a reusable skill from the supplied sources…");

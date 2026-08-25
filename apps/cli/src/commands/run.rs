@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
 use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::{EphemeralDaemonGuard, spawn_signal_shutdown};
+use crate::daemon::ephemeral_guard::spawn_signal_shutdown;
 use crate::daemon::proto::{self, Request, Response};
 
 #[derive(Debug, thiserror::Error)]
@@ -223,7 +223,7 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
         LifecycleMode::AttachOrEphemeral
     };
 
-    let daemon = match probe_or_spawn(mode).await {
+    let mut daemon = match probe_or_spawn(mode).await {
         Ok(daemon) => daemon,
         Err(error) => exit_run_error(format, 4, "daemon_connection", &format!("{error:#}")),
     };
@@ -250,9 +250,7 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
 
     // Layer A: arm the shutdown backstop *only* when we own the daemon.
     // Held across every `?` below so an error return still reaps it.
-    let guard = daemon
-        .owns_daemon
-        .then(|| EphemeralDaemonGuard::new(daemon.socket.clone()));
+    let guard = daemon.take_owned_daemon_guard();
 
     // A signal handler so Ctrl-C / SIGTERM during the run reaps the
     // daemon instead of orphaning it. Shares the guard's armed flag and

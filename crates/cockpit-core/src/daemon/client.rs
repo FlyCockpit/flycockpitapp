@@ -622,6 +622,19 @@ pub struct ConnectedDaemon {
     pub owns_daemon: bool,
     pub socket: PathBuf,
     pub startup_notice: Option<String>,
+    /// Provisional ownership begins in `probe_or_spawn` immediately after an
+    /// ephemeral child is created. Callers must explicitly take this guard
+    /// when publishing a longer-lived owner; every abandoned/error path drops
+    /// it and reaps the child.
+    owned_daemon_guard: Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard>,
+}
+
+impl ConnectedDaemon {
+    pub fn take_owned_daemon_guard(
+        &mut self,
+    ) -> Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard> {
+        self.owned_daemon_guard.take()
+    }
 }
 
 /// Attach to the canonical persistent daemon, spawning one if needed.
@@ -672,6 +685,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                                     None => "daemon version skew resolved by restarting the daemon"
                                         .to_string(),
                                 }),
+                                owned_daemon_guard: None,
                             });
                         }
                         Ok(crate::daemon::skew_restart::SkewRestartOutcome::Refused {
@@ -692,6 +706,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                                 owns_daemon: false,
                                 socket: discovered.paths.socket,
                                 startup_notice,
+                                owned_daemon_guard: None,
                             });
                         }
                         Ok(crate::daemon::skew_restart::SkewRestartOutcome::NoticeOnly {
@@ -705,6 +720,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                                 socket: discovered.paths.socket,
                                 startup_notice: reason
                                     .map(|reason| format!("daemon version skew: {reason}")),
+                                owned_daemon_guard: None,
                             });
                         }
                         Ok(
@@ -722,6 +738,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                     owns_daemon: false,
                     socket: discovered.paths.socket,
                     startup_notice: None,
+                    owned_daemon_guard: None,
                 });
             }
             if matches!(
@@ -759,6 +776,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
                 owns_daemon: false,
                 socket: own.socket,
                 startup_notice: None,
+                owned_daemon_guard: None,
             });
         }
         LifecycleMode::AlwaysEphemeral => {
@@ -783,7 +801,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
             | LifecycleMode::AttachOwnEphemeral
     );
 
-    let (paths, pid) = if ephemeral {
+    let (paths, pid, owned_daemon_guard) = if ephemeral {
         // Allocate the exact ephemeral path set in the parent, then hand it
         // to the spawned daemon to bind. Daemonless TUI reattachments reuse
         // their cached owned path; `AlwaysEphemeral` allocates fresh here.
@@ -792,7 +810,11 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
             _ => DaemonPaths::allocate_ephemeral()?,
         };
         let pid = spawn_detached_ephemeral(&paths)?;
-        (paths, pid)
+        // Arm ownership before any await or other cancellation point. From
+        // here onward every early return owns a guard whose Drop stops exactly
+        // this pid+nonce daemon.
+        let guard = crate::daemon::ephemeral_guard::EphemeralDaemonGuard::new(paths.socket.clone());
+        (paths, pid, Some(guard))
     } else {
         // Auto-promoted persistent daemon: never `--no-sandbox` from a
         // client flag (that's a per-session default passed at attach;
@@ -807,7 +829,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
         };
         #[cfg(not(any(test, feature = "test-support")))]
         let pid = spawn_detached(false)?;
-        (canonical, pid)
+        (canonical, pid, None)
     };
     tracing::info!(pid = pid, ephemeral = ephemeral, "daemon spawned");
 
@@ -819,6 +841,7 @@ pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {
         owns_daemon: ephemeral,
         socket: paths.socket,
         startup_notice: None,
+        owned_daemon_guard,
     })
 }
 

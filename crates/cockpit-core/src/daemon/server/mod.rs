@@ -3676,6 +3676,58 @@ async fn run_boot_housekeeping(db: &Db) {
     }
 }
 
+/// Complete fail-closed local authority recovery before either daemon socket
+/// is bound. A published socket promises an immediately responsive protocol;
+/// recovery therefore belongs to boot, never the accept loop.
+#[cfg(unix)]
+pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    dispatch::recover_all_provider_config_journals(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup provider-config journal recovery failed")?;
+    dispatch::recover_all_mcp_config_journals(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup MCP-config journal recovery failed")?;
+    crate::daemon::fs_api::recover_extended_config_patch_journals(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup typed-settings journal recovery failed")?;
+    dispatch::recover_committed_oauth_settlements(ctx)
+        .await
+        .context("reconciling committed OAuth authority operations")?;
+    let interrupted = ctx
+        .db
+        .settle_interrupted_local_operations()
+        .await
+        .context("settling interrupted local authority operations")?;
+    if interrupted > 0 {
+        tracing::warn!(
+            count = interrupted,
+            "settled interrupted local operations without re-execution"
+        );
+    }
+    crate::assistants::recover_definition_journals(&ctx.db)
+        .await
+        .context("startup assistant-definition journal recovery failed")?;
+    crate::daemon::agent_management::recover_known_workspace_resets(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup agent reset journal recovery failed")?;
+    crate::daemon::agent_management::maintain_editor_leases(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup editor lease recovery failed")?;
+    let recovered = crate::daemon::effective_default_recovery::recover_effective_default_journals(
+        &ctx.db, &cwd, None,
+    )
+    .await
+    .context("startup effective-default journal recovery failed")?;
+    crate::daemon::effective_default_recovery::deliver_recovered_terminals(ctx, recovered).await;
+    Ok(())
+}
+
 /// Bind the Unix socket and run the accept loop until the daemon's
 /// graceful-shutdown gate leaves `Running`. Each accepted connection spawns
 /// a detached client task. Breaking the loop hands control back to
@@ -3686,71 +3738,6 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
     // exactly cover the remotely-admissible transactional_mutation commands.
     #[cfg(feature = "remote")]
     dispatch::debug_assert_ledger_site_registry_consistent();
-    // Startup recovery: converge any effective-default journal left behind by
-    // an unclean shutdown before the first client can read a config snapshot.
-    // Per-attach recovery re-runs this with the attached project root and
-    // trust policy; startup covers the non-project layers.
-    {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        dispatch::recover_all_provider_config_journals(&ctx)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.message))
-            .context("startup provider-config journal recovery failed")?;
-        dispatch::recover_all_mcp_config_journals(&ctx)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.message))
-            .context("startup MCP-config journal recovery failed")?;
-        crate::daemon::fs_api::recover_extended_config_patch_journals(&ctx)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.message))
-            .context("startup typed-settings journal recovery failed")?;
-        dispatch::recover_committed_oauth_settlements(&ctx)
-            .await
-            .context("reconciling committed OAuth authority operations")?;
-        // Provider/MCP/typed-settings journals above get the first opportunity to reconcile
-        // a proven commit. Any remaining generic local receipt is ambiguous;
-        // fail it closed rather than time-taking-over and repeating an
-        // external side effect from the previous daemon process.
-        let interrupted = ctx
-            .db
-            .settle_interrupted_local_operations()
-            .await
-            .context("settling interrupted local authority operations")?;
-        if interrupted > 0 {
-            tracing::warn!(
-                count = interrupted,
-                "settled interrupted local operations without re-execution"
-            );
-        }
-        crate::assistants::recover_definition_journals(&ctx.db)
-            .await
-            .context("startup assistant-definition journal recovery failed")?;
-        crate::daemon::agent_management::recover_known_workspace_resets(&ctx)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.message))
-            .context("startup agent reset journal recovery failed")?;
-        match crate::daemon::effective_default_recovery::recover_effective_default_journals(
-            &ctx.db, &cwd, None,
-        )
-        .await
-        {
-            // No worker exists yet at startup, so this only logs undelivered
-            // correlations; a client waiting across a daemon restart has lost
-            // its connection anyway, and attach re-runs recovery per project.
-            Ok(recovered) => {
-                crate::daemon::effective_default_recovery::deliver_recovered_terminals(
-                    &ctx, recovered,
-                )
-                .await;
-            }
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    "startup effective-default journal recovery failed; attach will retry and fail closed"
-                );
-            }
-        }
-    }
     let mut shutdown = ctx.shutdown.subscribe();
     let retention_cfg = retention_config();
     let mut retention_interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -3758,6 +3745,9 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
     ));
     retention_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     retention_interval.tick().await;
+    let mut editor_maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    editor_maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    editor_maintenance_interval.tick().await;
     // A drain may already have begun before we subscribed (begin_drain on a
     // very fast StopDaemon); break immediately if so.
     if ctx.shutdown.is_draining() {
@@ -3777,6 +3767,11 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
             }
             _ = retention_interval.tick() => {
                 run_retention_tick(ctx.clone(), retention_cfg).await;
+            }
+            _ = editor_maintenance_interval.tick() => {
+                if let Err(error) = crate::daemon::agent_management::maintain_editor_leases(&ctx).await {
+                    tracing::warn!(message = %error.message, "editor lease maintenance failed");
+                }
             }
             accepted = listener.accept() => {
                 match accepted {
@@ -3838,6 +3833,9 @@ async fn run_retention_pass(db: Db, cfg: RetentionConfig, now_secs: i64) {
 #[cfg(any(unix, test))]
 async fn run_retention_tick(ctx: Arc<DaemonContext>, cfg: RetentionConfig) {
     run_retention_tick_db(ctx.db.clone(), cfg).await;
+    if let Err(error) = crate::daemon::agent_management::maintain_editor_leases(&ctx).await {
+        tracing::warn!(message = %error.message, "editor lease maintenance failed");
+    }
 }
 
 #[cfg(any(unix, test))]

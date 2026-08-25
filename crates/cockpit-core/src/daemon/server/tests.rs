@@ -11206,8 +11206,41 @@ fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
         .and_then(|tail| tail.split("CREATE INDEX agent_editor_leases_open").next())
         .expect("agent editor lease schema must exist");
     assert!(lease_table.contains("snapshot_handle"));
-    assert!(lease_table.contains("snapshot_digest"));
+    assert!(lease_table.contains("snapshot_identity"));
+    assert!(!lease_table.contains("snapshot_digest"));
     assert!(!lease_table.contains("snapshot_json"));
+}
+
+#[test]
+fn authority_recovery_precedes_both_socket_binds() {
+    let daemon = include_str!("../mod.rs");
+    let recovery = daemon
+        .find("server::recover_before_socket_publish(&ctx).await?")
+        .expect("foreground boot must await authority recovery");
+    let control_bind = daemon[recovery..]
+        .find("bind_private_socket(&paths.socket)")
+        .expect("control socket bind must follow recovery");
+    let reveal_bind = daemon[recovery..]
+        .find("leak_reveal_socket::bind_reveal_socket(&ctx)")
+        .expect("reveal socket bind must follow recovery");
+    assert!(control_bind < reveal_bind);
+
+    let server = include_str!("mod.rs");
+    let recovery_body = server
+        .split("pub async fn recover_before_socket_publish")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn run_accept_loop").next())
+        .expect("startup recovery must be structurally separate from accept");
+    for required in [
+        "recover_all_provider_config_journals",
+        "recover_all_mcp_config_journals",
+        "recover_extended_config_patch_journals",
+        "recover_committed_oauth_settlements",
+        "settle_interrupted_local_operations",
+        "maintain_editor_leases",
+    ] {
+        assert!(recovery_body.contains(required), "missing {required}");
+    }
 }
 
 #[tokio::test]

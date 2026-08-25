@@ -7414,6 +7414,12 @@ mod tests {
     #[test]
     fn authority_commit_receipts_are_frozen_in_current_response_fixtures() {
         let fixture = proto_fixture_tests::read_fixture("response.json");
+        assert!(
+            fixture["app_flag"]["data"]
+                .get("client_operation_id")
+                .is_none()
+        );
+        assert!(fixture["app_flag"]["data"].get("request_hash").is_none());
         let denylist = &fixture["extended_config_saved"]["data"]["denylist"];
         assert_eq!(
             denylist[0]["consumed_entry_id"],

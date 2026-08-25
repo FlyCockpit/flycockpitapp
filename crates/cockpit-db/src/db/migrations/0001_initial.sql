@@ -6362,13 +6362,13 @@ BEGIN
 END;
 
 -- External editor leases are durable authority, not frontend/UI state. The
--- markdown submitted at completion is represented only by a digest; a retry
--- must supply the same bytes. An open lease references an owner-bound AEAD
--- payload in the secret vault by opaque handle; plaintext edit snapshots never
--- enter this table. The handle is cleared atomically at terminal settlement;
--- terminal rows retain
--- only target/revision metadata, the completion digest, and a secret-free
--- result receipt until bounded retention removes them.
+-- markdown submitted at completion is represented only by an installation-
+-- and vault-keyed identity; a retry must supply the same bytes. An open lease
+-- references an owner-bound AEAD payload in the secret vault by opaque handle;
+-- plaintext edit snapshots never enter this table. Terminal rows retain only
+-- target/revision metadata, the completion identity, and a secret-free
+-- result/error receipt until bounded retention removes them. The sealed replay
+-- is removed atomically immediately after completion authority is reserved.
 CREATE TABLE agent_editor_leases (
     owner_digest        TEXT NOT NULL,
     client_operation_id TEXT NOT NULL,
@@ -6377,16 +6377,19 @@ CREATE TABLE agent_editor_leases (
     agent_name          TEXT NOT NULL,
     consumed_revision   TEXT NOT NULL,
     snapshot_handle     TEXT,
-    snapshot_digest     TEXT NOT NULL CHECK (
-        length(snapshot_digest) = 64 AND snapshot_digest = lower(snapshot_digest)
+    snapshot_identity   BLOB NOT NULL CHECK (
+        typeof(snapshot_identity) = 'blob' AND length(snapshot_identity) = 32
     ),
     state               TEXT NOT NULL CHECK (state IN ('open', 'completing', 'terminal')),
-    completion_hash     BLOB CHECK (
-        completion_hash IS NULL OR
-        (typeof(completion_hash) = 'blob' AND length(completion_hash) = 32)
+    completion_identity BLOB CHECK (
+        completion_identity IS NULL OR
+        (typeof(completion_identity) = 'blob' AND length(completion_identity) = 32)
     ),
     terminal_result_json TEXT CHECK (
         terminal_result_json IS NULL OR json_valid(terminal_result_json)
+    ),
+    terminal_error_json TEXT CHECK (
+        terminal_error_json IS NULL OR json_valid(terminal_error_json)
     ),
     expires_at_unix_ms  INTEGER NOT NULL,
     created_at_unix_ms  INTEGER NOT NULL,
@@ -6398,9 +6401,10 @@ CREATE TABLE agent_editor_leases (
     CHECK (length(trim(agent_name)) > 0),
     CHECK (length(trim(consumed_revision)) > 0),
     CHECK (snapshot_handle IS NULL OR length(trim(snapshot_handle)) > 0),
-    CHECK ((state = 'open') = (completion_hash IS NULL)),
-    CHECK ((state = 'terminal') = (terminal_result_json IS NOT NULL)),
-    CHECK ((state <> 'terminal') = (snapshot_handle IS NOT NULL)),
+    CHECK ((state = 'open') = (completion_identity IS NULL)),
+    CHECK ((state = 'terminal') = ((terminal_result_json IS NOT NULL) OR (terminal_error_json IS NOT NULL))),
+    CHECK (terminal_result_json IS NULL OR terminal_error_json IS NULL),
+    CHECK ((state = 'open') = (snapshot_handle IS NOT NULL)),
     CHECK (updated_at_unix_ms >= created_at_unix_ms)
 );
 CREATE INDEX agent_editor_leases_open
@@ -6417,8 +6421,8 @@ WHEN NEW.owner_digest <> OLD.owner_digest
   OR NEW.project_root <> OLD.project_root
   OR NEW.agent_name <> OLD.agent_name
   OR NEW.consumed_revision <> OLD.consumed_revision
-  OR NEW.snapshot_digest <> OLD.snapshot_digest
-  OR (NEW.snapshot_handle IS NOT OLD.snapshot_handle AND NEW.state <> 'terminal')
+  OR NEW.snapshot_identity <> OLD.snapshot_identity
+  OR (NEW.snapshot_handle IS NOT OLD.snapshot_handle AND NEW.state NOT IN ('completing', 'terminal'))
   OR NEW.expires_at_unix_ms <> OLD.expires_at_unix_ms
   OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
 BEGIN

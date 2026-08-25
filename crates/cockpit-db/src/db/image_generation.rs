@@ -2558,17 +2558,18 @@ impl Db {
             [job_id.to_string()],
             |row| row.get(0),
         )?;
-        let terminal = Self::replay_image_generation_terminal_event_conn(conn, job_id)?.map(
-            |event| ImageGenerationJobSafeTerminalCounts {
-                terminal_state: event.terminal_state,
-                published_count: event.published_count,
-                failed_count: event.failed_count,
-                cancelled_count: event.cancelled_count,
-                late_published_count: event.late_published_count,
-                late_quarantined_count: event.late_quarantined_count,
-                discarded_count: event.discarded_count,
-            },
-        );
+        let terminal =
+            Self::replay_image_generation_terminal_event_conn(conn, job_id)?.map(|event| {
+                ImageGenerationJobSafeTerminalCounts {
+                    terminal_state: event.terminal_state,
+                    published_count: event.published_count,
+                    failed_count: event.failed_count,
+                    cancelled_count: event.cancelled_count,
+                    late_published_count: event.late_published_count,
+                    late_quarantined_count: event.late_quarantined_count,
+                    discarded_count: event.discarded_count,
+                }
+            });
         Ok(OwnedImageGenerationJobStatus::Status(
             ImageGenerationJobSafeStatus {
                 state,

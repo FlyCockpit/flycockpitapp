@@ -8391,6 +8391,10 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
     let prior_config = "{\"servers\":{}}\n";
     std::fs::write(&mcp_path, prior_config).unwrap();
     let ctx = persistent_test_ctx_with_credential_path(tmp.path().join("credentials.json"));
+    // Trust the workspace so the save proceeds past the trust gate (which now
+    // resolves before content validation, for sentinel restoration) and the
+    // literal check is what rejects each case.
+    trust_workspace_root(&ctx, tmp.path()).await;
     let mut store =
         crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
     store.set_named_secret("prior-mcp-secret", "prior-value");
@@ -10791,7 +10795,7 @@ async fn remote_owner_save_extended_config_commits_and_replays() {
     )
     .await
     .unwrap();
-    assert!(matches!(first, Response::ExtendedConfigSaved { .. }));
+    assert!(matches!(first, Response::ExtendedConfigWritten { .. }));
     assert!(
         std::fs::read_to_string(&config_path)
             .unwrap()
@@ -10958,7 +10962,7 @@ async fn image_generation_survives_save_extended_config_and_stays_rpc_mutable() 
     )
     .await
     .expect("save extended config succeeds");
-    assert!(matches!(saved, Response::ExtendedConfigSaved { .. }));
+    assert!(matches!(saved, Response::ExtendedConfigWritten { .. }));
     let after_save = std::fs::read_to_string(&config_path).unwrap();
     assert!(
         after_save.contains("openai-main"),
@@ -22772,6 +22776,10 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "get_assistant",
         "diagnose_media_reservation",
         "get_doctor_snapshot",
+        "get_agent_inventory",
+        "get_agent_edit_snapshot",
+        "get_extended_config_snapshot",
+        "get_agent_editor_lease_settlement",
     ];
     #[cfg(not(feature = "remote"))]
     let expected = BTreeSet::from(expected_base);
@@ -24635,6 +24643,15 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::UpsertProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default() }, kind: "upsert_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SaveProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), entry: crate::config::providers::ProviderEntry::default(), header_secrets: Vec::new() }, kind: "save_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SaveMcpConfig { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), snapshot_capability: "snapshot".into(), owner_root: "/tmp/project".into(), config_path: "/tmp/project/.cockpit/mcp.json".into(), expected_revision: "00".repeat(32), mutation_intent_hash: "11".repeat(32), config_json: "{}".into(), secret_values_json: "{}".into(), cleanup_names_json: "[]".into() }, kind: "save_mcp_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::SaveAssistantDefinition { client_operation_id: "fixture-operation".into(), mutation_intent_hash: "22".repeat(32), project_root: "/tmp/project".into(), name: "helper".into(), markdown: "---\n---\n".into(), expected_revision: "rev-1".into(), expected_config_generation: 7 }, kind: "save_assistant_definition", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::GetAgentInventory { project_root: "/tmp/project".into() }, kind: "get_agent_inventory", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::GetAgentEditSnapshot { project_root: "/tmp/project".into(), name: "builder".into() }, kind: "get_agent_edit_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::MutateAgent { client_operation_id: "fixture-operation".into(), mutation_intent_hash: "33".repeat(32), project_root: "/tmp/project".into(), mutation: cockpit_proto::AgentMutation::ResetAllBuiltins, expected_revision: None }, kind: "mutate_agent", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::BeginAgentEditorLease { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), name: "builder".into(), expected_revision: "rev-1".into() }, kind: "begin_agent_editor_lease", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::CompleteAgentEditorLease { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), lease_id: "lease-1".into(), markdown: None }, kind: "complete_agent_editor_lease", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        CommandMetadataCase { request: Request::GetAgentEditorLeaseSettlement { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), lease_id: "lease-1".into() }, kind: "get_agent_editor_lease_settlement", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::GetExtendedConfigSnapshot { project_root: "/tmp/project".into(), snapshot_session_id: "snap-1".into() }, kind: "get_extended_config_snapshot", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
+        CommandMetadataCase { request: Request::ApplyExtendedConfigPatch { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), layer_id: "layer-1".into(), patch: cockpit_proto::ExtendedConfigPatch { operations: vec![], materialize: false, denylist: vec![], redacted_mutations: vec![] }, expected_revision: "rev-1".into(), snapshot_session_id: "snap-1".into() }, kind: "apply_extended_config_patch", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::DeleteProviderConfig { project_root: "/tmp/project".into(), provider_id: "example".into(), delete_stored_secrets: false }, kind: "delete_provider_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SetProviderLayerMetadata { project_root: "/tmp/project".into(), category_defaults_json: "{}".into(), on_unlisted_models_fetch: crate::config::providers::OnUnlistedModelsFetch::Keep }, kind: "set_provider_layer_metadata", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::SetupCopilotAuth { client_operation_id: "fixture-operation".into(), project_root: "/tmp/project".into(), provider_id: "example".into() }, kind: "setup_copilot_auth", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
@@ -24885,6 +24902,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         #[cfg(feature = "remote")]
         GetFlycockpitAccount,
         GetProviderCatalogSnapshot,
+        ApplyProviderMutation,
         FetchProviderModels,
         GetProviderUsageSnapshot,
         UpsertProviderConfig,
@@ -24948,6 +24966,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         MutateAgent,
         BeginAgentEditorLease,
         CompleteAgentEditorLease,
+        GetAgentEditorLeaseSettlement,
         GetExtendedConfigSnapshot,
         ApplyExtendedConfigPatch,
         DiagnoseMediaReservation,

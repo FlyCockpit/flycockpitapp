@@ -1193,10 +1193,9 @@ impl QuestionDialog {
                 format!("fanout: {fanout}  slots: {slots}"),
                 muted,
             ))),
-            (Some(fanout), None) => out.push(Line::from(Span::styled(
-                format!("fanout: {fanout}"),
-                muted,
-            ))),
+            (Some(fanout), None) => {
+                out.push(Line::from(Span::styled(format!("fanout: {fanout}"), muted)))
+            }
             (None, Some(slots)) => {
                 out.push(Line::from(Span::styled(format!("slots: {slots}"), muted)))
             }

@@ -937,7 +937,10 @@ mod tests {
             .find("wait_for_daemon(&paths.socket).await")
             .map(|offset| spawn + offset)
             .expect("daemon readiness wait");
-        assert!(spawn < arm && arm < wait, "no cancellation window before RAII");
+        assert!(
+            spawn < arm && arm < wait,
+            "no cancellation window before RAII"
+        );
     }
 
     fn lsp_event(text: impl Into<String>) -> proto::Event {

@@ -1799,7 +1799,9 @@ pub struct OutputPathAuthorityId(String);
 impl OutputPathAuthorityId {
     /// The sole production constructor: the opened, verified output directory's
     /// canonical-destination digest — never a raw path.
-    pub(crate) fn from_verified_output_directory(authority: &VerifiedOutputDirectoryAuthority) -> Self {
+    pub(crate) fn from_verified_output_directory(
+        authority: &VerifiedOutputDirectoryAuthority,
+    ) -> Self {
         Self(authority.0.canonical_destination_digest.clone())
     }
 
@@ -1959,8 +1961,11 @@ impl ImageGenerationDispatchService {
                 })
                 .collect(),
             formats: {
-                let mut formats: Vec<String> =
-                    args.targets.iter().map(|target| target.format.clone()).collect();
+                let mut formats: Vec<String> = args
+                    .targets
+                    .iter()
+                    .map(|target| target.format.clone())
+                    .collect();
                 formats.sort();
                 formats.dedup();
                 formats
@@ -2071,15 +2076,17 @@ impl ImageGenerationDispatchService {
                     state: safe.state.as_str().to_string(),
                     slot_count: safe.slot_count,
                     cancellation_requested: safe.cancellation_requested,
-                    terminal: safe.terminal.map(|counts| ImageGenerationJobTerminalSummary {
-                        terminal_state: counts.terminal_state.as_str().to_string(),
-                        published: counts.published_count,
-                        failed: counts.failed_count,
-                        cancelled: counts.cancelled_count,
-                        late_published: counts.late_published_count,
-                        late_quarantined: counts.late_quarantined_count,
-                        discarded: counts.discarded_count,
-                    }),
+                    terminal: safe
+                        .terminal
+                        .map(|counts| ImageGenerationJobTerminalSummary {
+                            terminal_state: counts.terminal_state.as_str().to_string(),
+                            published: counts.published_count,
+                            failed: counts.failed_count,
+                            cancelled: counts.cancelled_count,
+                            late_published: counts.late_published_count,
+                            late_quarantined: counts.late_quarantined_count,
+                            discarded: counts.discarded_count,
+                        }),
                 }
             }
             cockpit_db::db::image_generation::OwnedImageGenerationJobStatus::NotFound => {
@@ -2291,8 +2298,11 @@ impl ImageGenerationDispatchService {
         held: HeldImageGenerationOutputDirectory,
     ) -> Result<GenerateImageDispatchOutcome> {
         // Immutable request: target + reference ids strictly increasing.
-        let mut target_ids: Vec<String> =
-            args.targets.iter().map(|target| target.target_id.clone()).collect();
+        let mut target_ids: Vec<String> = args
+            .targets
+            .iter()
+            .map(|target| target.target_id.clone())
+            .collect();
         target_ids.sort();
         target_ids.dedup();
         let mut reference_attachment_ids: Vec<Uuid> = args

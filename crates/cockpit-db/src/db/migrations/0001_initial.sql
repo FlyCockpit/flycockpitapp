@@ -6261,6 +6261,9 @@ CREATE TABLE provider_config_journals (
     project_root     TEXT NOT NULL,
     provider_id      TEXT NOT NULL,
     action           TEXT NOT NULL CHECK (action IN ('save', 'delete', 'batch')),
+    config_path      TEXT,
+    consumed_revision TEXT CHECK (consumed_revision IS NULL OR length(consumed_revision) = 64),
+    intended_revision TEXT CHECK (intended_revision IS NULL OR length(intended_revision) = 64),
     entry_json       TEXT,
     cleanup_named_json TEXT NOT NULL
         CHECK (json_valid(cleanup_named_json) AND json_type(cleanup_named_json) = 'array'),
@@ -6281,7 +6284,11 @@ CREATE TABLE provider_config_journals (
         OR (action = 'batch' AND provider_id = '__provider_batch__'
             AND entry_json IS NOT NULL AND json_valid(entry_json)
             AND json_type(entry_json) = 'object')
-    )
+    ),
+    CHECK ((action IN ('save', 'batch')) = (config_path IS NOT NULL)
+       AND (action IN ('save', 'batch')) = (consumed_revision IS NOT NULL)
+       AND (action IN ('save', 'batch')) = (intended_revision IS NOT NULL)),
+    CHECK (config_path IS NULL OR length(trim(config_path)) > 0)
 );
 CREATE INDEX provider_config_journals_scope
 ON provider_config_journals(project_root, provider_id, created_at);

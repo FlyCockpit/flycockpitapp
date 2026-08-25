@@ -46,9 +46,14 @@ fn provider_config_journal_actions_have_strict_payload_shapes() {
     let insert = |provider_id: &str, action: &str, entry: Option<&str>| {
         conn.execute(
             "INSERT INTO provider_config_journals
-             (journal_id, project_root, provider_id, action, entry_json,
+             (journal_id, project_root, provider_id, action, config_path,
+              consumed_revision, intended_revision, entry_json,
               cleanup_named_json, cleanup_credential_json, created_at)
-             VALUES (lower(hex(randomblob(16))), '/project', ?1, ?2, ?3, '[]', '[]', 1)",
+             VALUES (lower(hex(randomblob(16))), '/project', ?1, ?2,
+                     CASE WHEN ?2 IN ('save', 'batch') THEN '/project/.cockpit/config.json' END,
+                     CASE WHEN ?2 IN ('save', 'batch') THEN lower(hex(zeroblob(32))) END,
+                     CASE WHEN ?2 IN ('save', 'batch') THEN lower(hex(zeroblob(32))) END,
+                     ?3, '[]', '[]', 1)",
             rusqlite::params![provider_id, action, entry],
         )
     };

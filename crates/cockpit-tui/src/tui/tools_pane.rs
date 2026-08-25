@@ -64,11 +64,8 @@ impl ToolsPane {
         {
             anyhow::bail!("daemon returned a misrouted or oversized agent snapshot");
         }
-        let def = cockpit_core::agents::parse_agent(
-            &snapshot.markdown,
-            agent_name,
-            PathBuf::from("<daemon-agent-snapshot>"),
-        )?;
+        let def = cockpit_core::agents::resolve(cwd, agent_name)?
+            .ok_or_else(|| anyhow::anyhow!("agent `{agent_name}` could not be resolved"))?;
         let draft = ToolSurfaceDraft::from_def(&def);
         let original = draft.selection().clone();
         let status = (!root_foreground).then(|| {

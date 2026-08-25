@@ -99,8 +99,9 @@ fn seed_oauth_credential_via_daemon(credential_ref: &str) {
         let response = client
             .request(
                 cockpit_core::daemon::proto::Request::PutProviderCredential {
+                    client_operation_id: "oauth-seed".into(),
                     provider_id: credential_ref,
-                    record: r#"{"api_key":"test-oauth-token"}"#.to_string(),
+                    record: r#"{"api_key":"test-oauth-token"}"#.to_string().into(),
                 },
             )
             .await
@@ -5326,12 +5327,17 @@ fn provider_delete_removes_grok_oauth_provider_via_daemon() {
         })
     });
     let seeded = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(client.request(
-            cockpit_core::daemon::proto::Request::PutProviderCredential {
-                provider_id: provider_id.to_string(),
-                record: json!({"access_token": "opaque-fixture-token"}).to_string(),
-            },
-        ))
+        tokio::runtime::Handle::current().block_on(
+            client.request(
+                cockpit_core::daemon::proto::Request::PutProviderCredential {
+                    client_operation_id: "provider-delete-seed".into(),
+                    provider_id: provider_id.to_string(),
+                    record: json!({"access_token": "opaque-fixture-token"})
+                        .to_string()
+                        .into(),
+                },
+            ),
+        )
     })
     .expect("provider credential seed transport")
     .expect("provider credential seed response");

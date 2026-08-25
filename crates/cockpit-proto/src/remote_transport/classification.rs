@@ -1869,12 +1869,22 @@ pub const RESPONSE_CLASSIFICATION: &[RemoteMessageClassification] = &[
     // Owner-remoted settings/policy/mcp mutation acknowledgements. Bounded
     // status responses; they never carry secret bytes.
     row(
-        "provider_credential_deleted",
+        "provider_credential_committed",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),
     row(
-        "mcp_config_saved",
+        "mcp_config_committed",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "local_operation_settlement",
+        RemoteMessageClass::BoundedRequestResponse,
+        RemoteInlinePayloadBound::Bounded,
+    ),
+    row(
+        "copilot_auth_committed",
         RemoteMessageClass::BoundedRequestResponse,
         RemoteInlinePayloadBound::Bounded,
     ),

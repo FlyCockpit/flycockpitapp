@@ -2880,7 +2880,7 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "client_operation_id:string|provider_id:string|record:string",
+      "fcorCanonicalSchema": "client_operation_id:string|provider_id:string|record:sha256-redacted",
       "fcorRoles": [
         {
           "field": "client_operation_id",
@@ -2895,10 +2895,10 @@
         {
           "field": "record",
           "role": "param",
-          "type": "String"
+          "type": "SensitiveWirePayload"
         }
       ],
-      "fcorSchema": "client_operation_id:String|provider_id:String|record:String",
+      "fcorSchema": "client_operation_id:String|provider_id:String|record:SensitiveWirePayload",
       "strategy": "nonrepeatable_dispatch",
       "tag": "put_provider_credential"
     },
@@ -3284,7 +3284,7 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|config_json:string|secret_values_json:string|cleanup_names_json:string",
+      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|config_json:string|secret_values_json:sha256-redacted|cleanup_names_json:string",
       "fcorRoles": [
         {
           "field": "client_operation_id",
@@ -3304,7 +3304,7 @@
         {
           "field": "secret_values_json",
           "role": "param",
-          "type": "String"
+          "type": "SensitiveWirePayload"
         },
         {
           "field": "cleanup_names_json",
@@ -3312,7 +3312,7 @@
           "type": "String"
         }
       ],
-      "fcorSchema": "client_operation_id:String|project_root:String|config_json:String|secret_values_json:String|cleanup_names_json:String",
+      "fcorSchema": "client_operation_id:String|project_root:String|config_json:String|secret_values_json:SensitiveWirePayload|cleanup_names_json:String",
       "strategy": "nonrepeatable_dispatch",
       "tag": "save_mcp_config"
     },

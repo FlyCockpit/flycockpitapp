@@ -104,11 +104,12 @@ where
 
 fn deserialize_owner_provider_record<'de, D>(
     deserializer: D,
-) -> std::result::Result<String, D::Error>
+) -> std::result::Result<SensitiveWirePayload, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     deserialize_bounded_string::<MAX_OWNER_PROVIDER_RECORD_BYTES, D>(deserializer)
+        .map(SensitiveWirePayload::new)
 }
 
 fn deserialize_owner_project_root<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
@@ -204,11 +205,14 @@ where
     deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
 }
 
-fn deserialize_owner_mcp_json<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+fn deserialize_owner_mcp_secret_json<'de, D>(
+    deserializer: D,
+) -> std::result::Result<SensitiveWirePayload, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
+        .map(SensitiveWirePayload::new)
 }
 
 /// Client-owned immutable options attached to a `cockpit run` submission.
@@ -1469,7 +1473,7 @@ pub enum Request {
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         provider_id: String,
         #[serde(deserialize_with = "deserialize_owner_provider_record")]
-        record: String,
+        record: SensitiveWirePayload,
     },
 
     /// Query an owner-scoped durable local mutation after its transport
@@ -1699,8 +1703,8 @@ pub enum Request {
         project_root: String,
         #[serde(deserialize_with = "deserialize_owner_mcp_json")]
         config_json: String,
-        #[serde(deserialize_with = "deserialize_owner_mcp_json")]
-        secret_values_json: String,
+        #[serde(deserialize_with = "deserialize_owner_mcp_secret_json")]
+        secret_values_json: SensitiveWirePayload,
         #[serde(deserialize_with = "deserialize_owner_mcp_json")]
         cleanup_names_json: String,
     },
@@ -3556,7 +3560,7 @@ macro_rules! command {
             (Request::PutNamedSecret { name, value }, "put_named_secret", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String|value:String", [name: String => param, value: String => param]);
             (Request::PutSubscriptionAck { provider_id }, "put_subscription_ack", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "provider_id:String", [provider_id: String => param]);
             (Request::DeleteNamedSecret { name }, "delete_named_secret", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "name:String", [name: String => param]);
-            (Request::PutProviderCredential { client_operation_id, provider_id, record }, "put_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|provider_id:String|record:String", [client_operation_id: String => param, provider_id: String => param, record: String => param]);
+            (Request::PutProviderCredential { client_operation_id, provider_id, record }, "put_provider_credential", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|provider_id:String|record:SensitiveWirePayload", [client_operation_id: String => param, provider_id: String => param, record: SensitiveWirePayload => param]);
             (Request::GetLocalOperationSettlement { client_operation_id }, "get_local_operation_settlement", owner_only, none, false, local_only, none, serialized, none, "client_operation_id:String", [client_operation_id: String => param]);
             // OAuth is deliberately local-only as one coherent flow. Begin,
             // completion, and cancellation all carry owner idempotency keys and
@@ -3581,7 +3585,7 @@ macro_rules! command {
             // Composite MCP publication is reserved in the remote ledger
             // before dispatch. The daemon's journal + staged vault commit
             // makes the nonrepeatable outcome replay-safe.
-            (Request::SaveMcpConfig { client_operation_id, project_root, config_json, secret_values_json, cleanup_names_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|config_json:String|secret_values_json:String|cleanup_names_json:String", [client_operation_id: String => param, project_root: String => project_root, config_json: String => param, secret_values_json: String => param, cleanup_names_json: String => param]);
+            (Request::SaveMcpConfig { client_operation_id, project_root, config_json, secret_values_json, cleanup_names_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|config_json:String|secret_values_json:SensitiveWirePayload|cleanup_names_json:String", [client_operation_id: String => param, project_root: String => project_root, config_json: String => param, secret_values_json: SensitiveWirePayload => param, cleanup_names_json: String => param]);
             (Request::GetAgentInventory { project_root }, "get_agent_inventory", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAgentEditSnapshot { project_root, name }, "get_agent_edit_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|name:String", [project_root: String => project_root, name: String => param]);
             (Request::MutateAgent { project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [project_root: String => project_root, mutation: crate::AgentMutation => param, expected_revision: Option<String> => param]);
@@ -3980,6 +3984,9 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         "i64" => "i64",
         "bool" => "bool",
         "String" => "string",
+        // Secret-bearing JSON payloads contribute only a SHA-256 digest, never
+        // plaintext, to FCOR's ordinary canonical byte buffer.
+        "SensitiveWirePayload" => "sha256-redacted",
         "Uuid" => "uuid",
         "Vec<u8>" => "bytes",
         "Option<String>" => "option<string>",
@@ -4472,10 +4479,12 @@ mod tests {
     fn semantic_validation_reserves_flycockpit_provider_credential_key() {
         for request in [
             Request::PutProviderCredential {
+                client_operation_id: "reserved-provider-put".into(),
                 provider_id: RESERVED_FLYCOCKPIT_PROVIDER_ID.to_string(),
-                record: "{}".to_string(),
+                record: "{}".to_string().into(),
             },
             Request::DeleteProviderCredential {
+                client_operation_id: "reserved-provider-delete".into(),
                 provider_id: RESERVED_FLYCOCKPIT_PROVIDER_ID.to_string(),
                 project_root: None,
             },
@@ -4487,6 +4496,7 @@ mod tests {
     #[test]
     fn provider_credential_delete_keeps_direct_ref_compatibility_and_can_bind_a_workspace() {
         let direct = Request::DeleteProviderCredential {
+            client_operation_id: "direct-provider-delete".into(),
             provider_id: "legacy-record-ref".into(),
             project_root: None,
         };
@@ -4494,6 +4504,7 @@ mod tests {
         assert!(direct_wire["params"].get("project_root").is_none());
 
         let configured = Request::DeleteProviderCredential {
+            client_operation_id: "configured-provider-delete".into(),
             provider_id: "custom-oauth".into(),
             project_root: Some("/workspace".into()),
         };

@@ -406,7 +406,7 @@ pub(crate) async fn execute_settings_daemon_work(
                 .request(Request::PutProviderCredential {
                     client_operation_id,
                     provider_id,
-                    record: record.take(),
+                    record: cockpit_proto::SensitiveWirePayload::new(record.take()),
                 })
                 .await
                 .map_err(|error| error.to_string())?
@@ -441,7 +441,9 @@ pub(crate) async fn execute_settings_daemon_work(
                     client_operation_id,
                     project_root,
                     config_json,
-                    secret_values_json: secret_values_json.take(),
+                    secret_values_json: cockpit_proto::SensitiveWirePayload::new(
+                        secret_values_json.take(),
+                    ),
                     cleanup_names_json,
                 })
                 .await

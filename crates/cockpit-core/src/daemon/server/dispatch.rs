@@ -7474,13 +7474,16 @@ async fn handle_serialized_request_impl(
             {
                 return Ok(response);
             }
-            let record_value: serde_json::Value = serde_json::from_str(&record).map_err(|_| {
-                // Malformed caller-supplied JSON is a client error, not an
-                // internal fault. Keep the message field-only so a partially
-                // parsed record cannot leak secret bytes through the error.
-                bad_request("provider credential record is not valid JSON")
-            })?;
-            let record_bytes = serde_json::to_vec(&record_value).map_err(internal)?;
+            let mut record_value: serde_json::Value = serde_json::from_str(record.as_str())
+                .map_err(|_| {
+                    // Malformed caller-supplied JSON is a client error, not an
+                    // internal fault. Keep the message field-only so a partially
+                    // parsed record cannot leak secret bytes through the error.
+                    bad_request("provider credential record is not valid JSON")
+                })?;
+            let encoded_record = serde_json::to_vec(&record_value);
+            zeroize_json_strings(&mut record_value);
+            let record_bytes = zeroize::Zeroizing::new(encoded_record.map_err(internal)?);
             if let Some(replay) = begin_local_operation(
                 ctx,
                 &settlement_owner,
@@ -10764,7 +10767,7 @@ fn validate_request_semantics(request: &Request) -> std::result::Result<(), Erro
                 || provider_id.starts_with(crate::auth::subscription_ack::PREFIX)
             {
                 Some("provider id is reserved")
-            } else if serde_json::from_str::<serde_json::Value>(record).is_err() {
+            } else if serde_json::from_str::<serde_json::Value>(record.as_str()).is_err() {
                 Some("provider credential record must be valid JSON")
             } else {
                 None
@@ -13123,7 +13126,7 @@ async fn save_mcp_config(
     recover_mcp_config_journals(ctx, project_root).await?;
     let mut config: crate::mcp::config::McpConfig =
         crate::mcp::config::McpConfig::parse(config_json).map_err(internal)?;
-    let secret_values: std::collections::BTreeMap<String, String> =
+    let secret_values: std::collections::BTreeMap<String, proto::SensitiveWirePayload> =
         serde_json::from_str(secret_values_json)
             .map_err(|error| bad_request(format!("invalid MCP secret values: {error}")))?;
     for (name, value) in &secret_values {
@@ -14035,7 +14038,7 @@ pub(super) async fn recover_all_mcp_config_journals(
 /// before any vault transaction or filesystem write.
 fn validate_and_normalize_mcp_credentials(
     config: &mut crate::mcp::config::McpConfig,
-    staged: &std::collections::BTreeMap<String, String>,
+    staged: &std::collections::BTreeMap<String, proto::SensitiveWirePayload>,
 ) -> std::result::Result<(), ErrorPayload> {
     let mut consumed = std::collections::BTreeSet::new();
 
@@ -14063,12 +14066,12 @@ fn validate_and_normalize_mcp_credentials(
                                 "MCP server `{server_name}` header must use a staged secret or reference"
                             ))
                         })?;
-                        if value != header.value.trim() {
+                        if value.as_str() != header.value.trim() {
                             return Err(bad_request(format!(
                                 "MCP server `{server_name}` header literal does not match its staged secret"
                             )));
                         }
-                        header.value.clear();
+                        zeroize::Zeroize::zeroize(&mut header.value);
                     } else if !header.value.trim().is_empty() {
                         return Err(bad_request(format!(
                             "MCP server `{server_name}` header cannot combine an environment reference with a credential reference"
@@ -14081,12 +14084,12 @@ fn validate_and_normalize_mcp_credentials(
                             "MCP server `{server_name}` header value must be a reference or staged secret"
                         ))
                     })?;
-                    if value != header.value.trim() {
+                    if value.as_str() != header.value.trim() {
                         return Err(bad_request(format!(
                             "MCP server `{server_name}` header literal does not match its staged secret"
                         )));
                     }
-                    header.value.clear();
+                    zeroize::Zeroize::zeroize(&mut header.value);
                     header.credential_ref = Some(reference.clone());
                     consumed.insert(reference);
                 }
@@ -14134,7 +14137,7 @@ fn normalize_mcp_env_map(
     values: &mut std::collections::BTreeMap<String, String>,
     refs: &mut std::collections::BTreeMap<String, String>,
     key_fn: fn(&str, &str) -> String,
-    staged: &std::collections::BTreeMap<String, String>,
+    staged: &std::collections::BTreeMap<String, proto::SensitiveWirePayload>,
     consumed: &mut std::collections::BTreeSet<String>,
     field: &str,
 ) -> std::result::Result<(), ErrorPayload> {
@@ -14161,7 +14164,7 @@ fn normalize_mcp_env_map(
                 "MCP server `{server_name}` {field} `{name}` must use a reference or staged secret"
             ))
         })?;
-        if staged_value != value {
+        if staged_value.as_str() != value {
             return Err(bad_request(format!(
                 "MCP server `{server_name}` {field} `{name}` literal does not match its staged secret"
             )));
@@ -14171,9 +14174,31 @@ fn normalize_mcp_env_map(
         remove.push(name.clone());
     }
     for name in remove {
-        values.remove(&name);
+        if let Some(mut literal) = values.remove(&name) {
+            zeroize::Zeroize::zeroize(&mut literal);
+        }
     }
     Ok(())
+}
+
+/// Scrub strings materialized by `serde_json::Value` before its ordinary
+/// allocations are released. The encoded vault handoff is separately held in
+/// a `Zeroizing<Vec<u8>>`.
+fn zeroize_json_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => zeroize::Zeroize::zeroize(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                zeroize_json_strings(value);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                zeroize_json_strings(value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
 }
 
 fn validate_mcp_secret_ref(reference: &str) -> std::result::Result<(), ErrorPayload> {

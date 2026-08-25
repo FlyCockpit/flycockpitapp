@@ -7836,6 +7836,7 @@ async fn owner_secret_rpcs_dispatch_vault_persistence_redaction_and_safe_project
     assert!(matches!(
         handle_request(
             Request::PutProviderCredential {
+                client_operation_id: "rpc-provider-put".into(),
                 provider_id: "rpc-provider".into(),
                 record: r#"{"api_key":"rpc-provider-value"}"#.into(),
             },
@@ -7863,6 +7864,7 @@ async fn owner_secret_rpcs_dispatch_vault_persistence_redaction_and_safe_project
     // vault, leaving the existing record untouched.
     let invalid = handle_request(
         Request::PutProviderCredential {
+            client_operation_id: "invalid-provider-put".into(),
             provider_id: "rpc-provider".into(),
             record: "not-json".into(),
         },
@@ -7894,6 +7896,7 @@ async fn owner_secret_rpcs_dispatch_vault_persistence_redaction_and_safe_project
     assert!(matches!(
         handle_request(
             Request::DeleteProviderCredential {
+                client_operation_id: "rpc-provider-delete".into(),
                 provider_id: "rpc-provider".into(),
                 project_root: None,
             },
@@ -8404,6 +8407,7 @@ async fn mcp_save_rejects_literal_credentials_before_any_mutation() {
     for config in cases {
         let result = handle_request(
             Request::SaveMcpConfig {
+                client_operation_id: "reject-literal-mcp-save".into(),
                 project_root: root.clone(),
                 config_json: serde_json::to_string(&config).unwrap(),
                 secret_values_json: "{}".into(),
@@ -8443,12 +8447,14 @@ async fn mcp_save_stages_literal_and_persists_reference_only_config() {
     });
     let response = handle_request(
         Request::SaveMcpConfig {
+            client_operation_id: "staged-mcp-save".into(),
             project_root: root,
             config_json: serde_json::to_string(&config).unwrap(),
             secret_values_json: serde_json::json!({
                 "mcp:staged:header": "Bearer staged-value"
             })
-            .to_string(),
+            .to_string()
+            .into(),
             cleanup_names_json: "[]".into(),
         },
         &mut state,
@@ -8456,7 +8462,7 @@ async fn mcp_save_stages_literal_and_persists_reference_only_config() {
     )
     .await
     .expect("staged MCP credential save succeeds");
-    assert!(matches!(response, Response::McpConfigSaved { .. }));
+    assert!(matches!(response, Response::McpConfigCommitted { .. }));
     let wire = std::fs::read_to_string(cockpit_dir.join("mcp.json")).unwrap();
     assert!(!wire.contains("Bearer staged-value"));
     assert!(wire.contains("mcp:staged:header"));
@@ -8518,9 +8524,10 @@ async fn mcp_save_cannot_overwrite_a_provider_claimed_named_secret() {
     let mut state = owner_state();
     let result = handle_request(
         Request::SaveMcpConfig {
+            client_operation_id: "ownership-race-mcp-save".into(),
             project_root: root.clone(),
             config_json: serde_json::to_string(&config).unwrap(),
-            secret_values_json: serde_json::Value::Object(secret_values).to_string(),
+            secret_values_json: serde_json::Value::Object(secret_values).to_string().into(),
             cleanup_names_json: "[]".into(),
         },
         &mut state,
@@ -8948,6 +8955,7 @@ async fn mcp_save_rejects_unstaged_reference_to_provider_claimed_secret() {
     let mut state = owner_state();
     let result = handle_request(
         Request::SaveMcpConfig {
+            client_operation_id: "foreign-reference-mcp-save".into(),
             project_root: root.clone(),
             config_json: serde_json::to_string(&config).unwrap(),
             secret_values_json: "{}".into(),
@@ -9122,6 +9130,7 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
     let mut state = owner_state();
     let response = handle_request(
         Request::SaveMcpConfig {
+            client_operation_id: "cleanup-mcp-save".into(),
             project_root: tmp.path().to_string_lossy().into_owned(),
             config_json: serde_json::json!({"servers": {}}).to_string(),
             secret_values_json: "{}".into(),
@@ -9132,7 +9141,7 @@ async fn mcp_save_derives_cleanup_from_prior_config_not_caller_names() {
     )
     .await
     .expect("MCP save succeeds");
-    assert!(matches!(response, Response::McpConfigSaved { .. }));
+    assert!(matches!(response, Response::McpConfigCommitted { .. }));
     let store = crate::credentials::CredentialStore::from_vault(ctx.secret_vault.clone()).unwrap();
     assert_eq!(
         store.named_secret("mcp:old:header"),
@@ -9194,6 +9203,7 @@ async fn owner_provider_rpc_rejects_subscription_ack_namespace_before_failure_in
     ctx.set_force_daemon_redaction_refresh_failure(true);
     let result = handle_request(
         Request::PutProviderCredential {
+            client_operation_id: "reserved-subscription-put".into(),
             provider_id: "subscription-oauth-ack:codex-oauth".into(),
             record: r#"{"api_key":"must-not-store"}"#.into(),
         },
@@ -9291,6 +9301,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
     expect_failed(
         handle_request(
             Request::PutProviderCredential {
+                client_operation_id: "rollback-provider-put".into(),
                 provider_id: "rollback-provider".into(),
                 record: r#"{"api_key":"new-provider"}"#.into(),
             },
@@ -9316,6 +9327,7 @@ async fn owner_secret_redaction_failure_rolls_back_every_vault_namespace() {
     expect_failed(
         handle_request(
             Request::DeleteProviderCredential {
+                client_operation_id: "rollback-provider-delete".into(),
                 provider_id: "rollback-provider".into(),
                 project_root: None,
             },
@@ -10538,6 +10550,7 @@ async fn remote_setup_copilot_auth_refuses_ambient_github_token_read() {
     let build = |remote: bool| {
         (
             Request::SetupCopilotAuth {
+                client_operation_id: "remote-setup-copilot".into(),
                 project_root: project_root.path().to_string_lossy().into_owned(),
                 provider_id: "attacker-controlled-provider".into(),
             },
@@ -10982,6 +10995,7 @@ async fn remote_owner_setup_mutations_reserve_and_close_ledger() {
             answers_json: "{}".into(),
         },
         Request::SetupCopilotAuth {
+            client_operation_id: "setup-copilot-failure".into(),
             project_root: tempfile::tempdir()
                 .unwrap()
                 .path()
@@ -11244,10 +11258,12 @@ async fn ephemeral_daemon_rejects_persistent_secret_writes() {
             name: "ephemeral-name".into(),
         },
         Request::PutProviderCredential {
+            client_operation_id: "ephemeral-provider-put".into(),
             provider_id: "ephemeral-provider".into(),
             record: "{\"api_key\":\"ephemeral-value\"}".into(),
         },
         Request::DeleteProviderCredential {
+            client_operation_id: "ephemeral-provider-delete".into(),
             provider_id: "ephemeral-provider".into(),
             project_root: None,
         },
@@ -11285,10 +11301,12 @@ async fn owner_secret_rpcs_reject_non_owner_principal() {
             name: "name".into(),
         },
         Request::PutProviderCredential {
+            client_operation_id: "unauthorized-provider-put".into(),
             provider_id: "provider".into(),
             record: "{}".into(),
         },
         Request::DeleteProviderCredential {
+            client_operation_id: "unauthorized-provider-delete".into(),
             provider_id: "provider".into(),
             project_root: None,
         },
@@ -23110,6 +23128,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
         CommandMetadataCase {
             request: Request::PutProviderCredential {
+                client_operation_id: "metadata-provider-put".into(),
                 provider_id: "example".into(),
                 record: "{}".into(),
             },
@@ -23120,6 +23139,7 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         },
         CommandMetadataCase {
             request: Request::DeleteProviderCredential {
+                client_operation_id: "metadata-provider-delete".into(),
                 provider_id: "example".into(),
                 project_root: None,
             },

@@ -2466,6 +2466,100 @@ mod tui_ownership_rpc_contract_tests {
 /// fails closed on deserialize before it reaches any handler.
 pub const MAX_SENSITIVE_FRAME_BYTES: usize = 16 * 1024;
 
+/// A secret-bearing JSON/string payload transported over the owner wire.
+///
+/// The serialized shape remains a JSON string, while the in-memory buffer is
+/// zeroized on drop and `Debug` never exposes its contents. Field-specific
+/// deserializers remain responsible for their tighter size/shape bounds.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SensitiveWirePayload(zeroize::Zeroizing<String>);
+
+impl SensitiveWirePayload {
+    pub fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn into_zeroizing(self) -> zeroize::Zeroizing<String> {
+        self.0
+    }
+}
+
+impl From<String> for SensitiveWirePayload {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for SensitiveWirePayload {
+    fn from(value: &str) -> Self {
+        Self::new(value.to_owned())
+    }
+}
+
+impl std::ops::Deref for SensitiveWirePayload {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Debug for SensitiveWirePayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "SensitiveWirePayload([REDACTED; {} bytes])",
+            self.0.len()
+        )
+    }
+}
+
+impl Serialize for SensitiveWirePayload {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SensitiveWirePayload {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::new)
+    }
+}
+
+#[cfg(feature = "remote")]
+impl crate::remote_operation_fcor::CanonicalFcorValueV1 for SensitiveWirePayload {
+    fn encode_fcor_value_v1(
+        &self,
+        out: &mut crate::remote_operation_fcor::CanonicalParamsV1,
+    ) -> Result<()> {
+        use sha2::Digest as _;
+
+        // Preserve replay identity without copying plaintext into FCOR's
+        // ordinary byte buffer. A different secret payload produces a
+        // different operation digest; only this one-way digest leaves the
+        // zeroizing wrapper.
+        let digest = sha2::Sha256::digest(self.as_str().as_bytes());
+        out.push_bytes(digest.as_slice())
+    }
+}
+
 /// Opaque one-use token for the local leak-reveal channel.
 ///
 /// Although this is not the revealed plaintext, possession authorizes a
@@ -3234,7 +3328,11 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "provider_oauth_cancelled"
                 | "mcp_oauth_started"
                 | "mcp_oauth_completed"
-                | "mcp_oauth_cancelled" => 17,
+                | "mcp_oauth_cancelled"
+                | "provider_credential_committed"
+                | "local_operation_settlement"
+                | "copilot_auth_committed"
+                | "mcp_config_committed" => 17,
                 "leak_reveal_cancelled" => 16,
                 "provider_catalog_snapshot" | "provider_mutation_committed" => 15,
                 "flycockpit_org_sync"
@@ -3243,8 +3341,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "provider_config_upserted"
                 | "secret_inventory"
                 | "flycockpit_account"
-                | "provider_credential_deleted"
-                | "mcp_config_saved"
                 | "extended_config_saved"
                 | "setup_wizard_applied"
                 | "policy_exported"
@@ -6364,22 +6460,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_only_provider_credential_response_is_not_sent_to_v9_daemon() {
+    async fn v17_provider_credential_receipt_is_not_sent_to_v9_daemon() {
         let (a, _b) = duplex(4096);
         let mut v9 = ProtoStream::with_version(a, 9);
         let response = Envelope::response(
             Uuid::new_v4(),
-            Response::ProviderCredentialDeleted {
-                found: true,
-                deleted: true,
+            Response::ProviderCredentialCommitted {
+                client_operation_id: "put-provider".into(),
+                provider_id: "example".into(),
+                project_root: None,
+                owner_root: None,
+                stored: true,
+                changed: true,
+                config_generation: 7,
             },
         );
         let error = v9
             .send(&response)
             .await
-            .expect_err("v10-only response must be gated on a v9 connection");
-        assert!(error.to_string().contains("provider_credential_deleted"));
-        assert!(error.to_string().contains("requires v10"));
+            .expect_err("v17 response must be gated on a v9 connection");
+        assert!(error.to_string().contains("provider_credential_committed"));
+        assert!(error.to_string().contains("requires v17"));
     }
 
     #[tokio::test]
@@ -6420,9 +6521,14 @@ mod tests {
         let forged = Envelope::response_at(
             9,
             id,
-            Response::ProviderCredentialDeleted {
-                found: true,
-                deleted: true,
+            Response::ProviderCredentialCommitted {
+                client_operation_id: "put-provider".into(),
+                provider_id: "example".into(),
+                project_root: None,
+                owner_root: None,
+                stored: true,
+                changed: true,
+                config_generation: 7,
             },
         );
         sender
@@ -6698,6 +6804,7 @@ mod tests {
                 flow_id: Some("flow".into()),
             },
             Request::SetupCopilotAuth {
+                client_operation_id: "setup-copilot".into(),
                 project_root: "/tmp/project".into(),
                 provider_id: "copilot".into(),
             },
@@ -6752,12 +6859,24 @@ mod tests {
                 flow_id: Some("flow".into()),
                 cancelled: true,
             },
-            Response::McpConfigSaved {
+            Response::McpConfigCommitted {
+                client_operation_id: "save-mcp".into(),
+                project_root: "/workspace".into(),
+                owner_root: "/workspace".into(),
+                config_path: "/workspace/.cockpit/mcp.json".into(),
+                consumed_revision: "00".repeat(32),
+                result_revision: "11".repeat(32),
+                config_generation: 7,
                 credential_count: 0,
             },
-            Response::ProviderCredentialDeleted {
-                found: true,
-                deleted: true,
+            Response::ProviderCredentialCommitted {
+                client_operation_id: "delete-provider".into(),
+                provider_id: "example".into(),
+                project_root: None,
+                owner_root: None,
+                stored: false,
+                changed: true,
+                config_generation: 7,
             },
         ] {
             let expected = if matches!(

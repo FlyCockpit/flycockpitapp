@@ -285,6 +285,12 @@ impl HermeticLaunchSpec {
         self.profile
     }
 
+    pub fn set_extra_env(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let key = key.into();
+        self.extra_env.retain(|(existing, _)| existing != &key);
+        self.extra_env.push((key, value.into()));
+    }
+
     pub fn config_dir(&self) -> PathBuf {
         self.home.join(".config").join("cockpit")
     }
@@ -482,6 +488,10 @@ impl HermeticCockpit {
 
     pub fn home(&self) -> &IsolatedHome {
         &self.home
+    }
+
+    pub fn set_extra_env(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.spec.set_extra_env(key, value);
     }
 
     /// Start a private-bus Secret Service so the isolated daemon can attach.

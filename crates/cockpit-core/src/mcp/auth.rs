@@ -329,6 +329,13 @@ struct Pkce {
     challenge: String,
 }
 
+impl Drop for Pkce {
+    fn drop(&mut self) {
+        self.verifier.zeroize();
+        self.challenge.zeroize();
+    }
+}
+
 /// Fixed loopback redirect used for the REMOTE begin path, where the daemon
 /// binds no listener. The remote client is responsible for capturing the
 /// provider's redirect and returning the callback code over `CompleteMcpOAuth`;
@@ -397,10 +404,12 @@ pub async fn begin_oauth_flow(
     let Auth::Oauth(oauth) = &cfg.auth else {
         bail!("MCP server `{server}` is not configured for OAuth");
     };
-    let pkce = generate_pkce();
+    let mut pkce = generate_pkce();
     let mut state_bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut state_bytes);
-    let state = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(state_bytes);
+    let mut state = zeroize::Zeroizing::new(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(state_bytes),
+    );
     let (listener, redirect_uri) = if local_display {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
@@ -420,8 +429,8 @@ pub async fn begin_oauth_flow(
     Ok((
         McpOAuthFlow {
             oauth: oauth.clone(),
-            verifier: pkce.verifier,
-            state,
+            verifier: std::mem::take(&mut pkce.verifier),
+            state: std::mem::take(&mut *state),
             redirect_uri,
             listener,
         },
@@ -504,11 +513,18 @@ struct TokenResp {
     expires_in: Option<i64>,
 }
 
-fn into_stored(resp: TokenResp) -> StoredTokens {
+impl Drop for TokenResp {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
+}
+
+fn into_stored(mut resp: TokenResp) -> StoredTokens {
     let expires_at = resp.expires_in.map(|s| now_unix() + s).unwrap_or(0);
     StoredTokens {
-        access_token: resp.access_token,
-        refresh_token: resp.refresh_token,
+        access_token: std::mem::take(&mut resp.access_token),
+        refresh_token: std::mem::take(&mut resp.refresh_token),
         expires_at,
     }
 }
@@ -525,24 +541,26 @@ async fn exchange_code(
         .as_deref()
         .context("OAuth server has no `token_url`")?;
     let client_id = oauth.client_id.as_deref().unwrap_or("");
-    let body = form_body(&[
+    let body = zeroize::Zeroizing::new(form_body(&[
         ("grant_type", "authorization_code"),
         ("code", code),
         ("redirect_uri", redirect_uri),
         ("client_id", client_id),
         ("code_verifier", verifier),
-    ]);
+    ]));
     let resp = oauth_http_client()?
         .post(token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body)
+        .body(body.as_bytes().to_vec())
         .send()
         .await?;
     if !resp.status().is_success() {
         let status = resp.status();
         return Err(oauth_token_endpoint_error("exchange", status));
     }
-    Ok(into_stored(resp.json::<TokenResp>().await?))
+    let response_body = zeroize::Zeroizing::new(resp.bytes().await?.to_vec());
+    let parsed: TokenResp = serde_json::from_slice(&response_body)?;
+    Ok(into_stored(parsed))
 }
 
 /// Refresh an access token using a stored refresh token.
@@ -552,22 +570,24 @@ async fn refresh_token(oauth: &OauthAuth, refresh: &str) -> Result<StoredTokens>
         .as_deref()
         .context("OAuth server has no `token_url`")?;
     let client_id = oauth.client_id.as_deref().unwrap_or("");
-    let body = form_body(&[
+    let body = zeroize::Zeroizing::new(form_body(&[
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh),
         ("client_id", client_id),
-    ]);
+    ]));
     let resp = oauth_http_client()?
         .post(token_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(body)
+        .body(body.as_bytes().to_vec())
         .send()
         .await?;
     if !resp.status().is_success() {
         let status = resp.status();
         return Err(oauth_token_endpoint_error("refresh", status));
     }
-    let mut tokens = into_stored(resp.json::<TokenResp>().await?);
+    let response_body = zeroize::Zeroizing::new(resp.bytes().await?.to_vec());
+    let parsed: TokenResp = serde_json::from_slice(&response_body)?;
+    let mut tokens = into_stored(parsed);
     // Some servers omit the refresh token on refresh — keep the old one.
     if tokens.refresh_token.is_none() {
         tokens.refresh_token = Some(refresh.to_string());
@@ -634,12 +654,14 @@ fn parse_callback_target(target: &str) -> Result<(String, String)> {
     let mut state = None;
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
-            let val = urlencoding::decode(v)
-                .map(|c| c.into_owned())
-                .unwrap_or_default();
+            let mut val = zeroize::Zeroizing::new(
+                urlencoding::decode(v)
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default(),
+            );
             match k {
-                "code" => code = Some(val),
-                "state" => state = Some(val),
+                "code" => code = Some(std::mem::take(&mut *val)),
+                "state" => state = Some(std::mem::take(&mut *val)),
                 _ => {}
             }
         }

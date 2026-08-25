@@ -79,12 +79,24 @@ struct Discovery {
     token_endpoint: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ManualLogin {
     pub authorize_url: String,
     state: String,
     verifier: String,
     token_endpoint: String,
+}
+
+impl std::fmt::Debug for ManualLogin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManualLogin")
+            .field("authorize_url", &"[REDACTED]")
+            .field("state", &"[REDACTED]")
+            .field("verifier", &"[REDACTED]")
+            .field("token_endpoint", &self.token_endpoint)
+            .finish()
+    }
 }
 
 impl Drop for ManualLogin {
@@ -112,7 +124,7 @@ impl ManualLogin {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     #[serde(default)]
@@ -121,15 +133,24 @@ struct TokenResponse {
     expires_in: Option<i64>,
 }
 
+impl Drop for TokenResponse {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
+}
+
 pub async fn begin_manual_login() -> Result<ManualLogin> {
     let discovery = fetch_discovery().await?;
     let (verifier, challenge) = generate_pkce();
-    let state = random_urlsafe(32);
+    let mut verifier = zeroize::Zeroizing::new(verifier);
+    let challenge = zeroize::Zeroizing::new(challenge);
+    let mut state = zeroize::Zeroizing::new(random_urlsafe(32));
     let authorize_url = build_authorize_url(&discovery.authorization_endpoint, &state, &challenge);
     Ok(ManualLogin {
         authorize_url,
-        state,
-        verifier,
+        state: std::mem::take(&mut *state),
+        verifier: std::mem::take(&mut *verifier),
         token_endpoint: discovery.token_endpoint,
     })
 }
@@ -323,29 +344,29 @@ async fn token_request(
     params: &[(&str, &str)],
     fallback_refresh: Option<&str>,
 ) -> Result<StoredTokens> {
+    let request_body = zeroize::Zeroizing::new(form_body(params));
     let resp = oauth_http_client()?
         .post(token_endpoint)
         .header(
             reqwest::header::CONTENT_TYPE,
             "application/x-www-form-urlencoded",
         )
-        .body(form_body(params))
+        .body(request_body.as_bytes().to_vec())
         .send()
         .await
         .with_context(|| format!("POST {token_endpoint}"))?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = zeroize::Zeroizing::new(resp.text().await.unwrap_or_default());
     if !status.is_success() {
         return Err(classify_token_error(status, &body));
     }
-    let parsed: TokenResponse =
+    let mut parsed: TokenResponse =
         serde_json::from_str(&body).context("parsing xAI OAuth token response")?;
-    let refresh_token = parsed
-        .refresh_token
+    let refresh_token = std::mem::take(&mut parsed.refresh_token)
         .or_else(|| fallback_refresh.map(str::to_string))
         .context("xAI OAuth token response missing refresh_token")?;
     Ok(StoredTokens {
-        access_token: parsed.access_token,
+        access_token: std::mem::take(&mut parsed.access_token),
         refresh_token,
         expires_at: unix_now() + parsed.expires_in.unwrap_or(3600),
     })

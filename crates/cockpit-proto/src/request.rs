@@ -1713,6 +1713,7 @@ pub enum Request {
 
     /// Persist non-secret provider configuration through the daemon's
     /// trust-aware config writer.
+    #[cfg(feature = "remote")]
     UpsertProviderConfig {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -1725,13 +1726,14 @@ pub enum Request {
     /// and persist the corresponding reference-only provider configuration.
     /// `header_secrets` is positional with `entry.headers`; only the daemon
     /// assigns durable vault record names.
+    #[cfg(feature = "remote")]
     SaveProviderConfig {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         provider_id: String,
         entry: cockpit_config::config::providers::ProviderEntry,
-        header_secrets: Vec<Option<String>>,
+        header_secrets: Vec<Option<crate::ProviderSecretValue>>,
     },
 
     /// Ask the daemon to acquire Copilot credentials from its own environment
@@ -1749,6 +1751,7 @@ pub enum Request {
     /// Apply the security or model setup wizard through the daemon owner.
     /// Answers are validated against the daemon's current descriptor; the
     /// descriptor itself never crosses the wire.
+    #[cfg(feature = "remote")]
     ApplySetupWizard {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -2126,6 +2129,7 @@ pub enum Request {
     },
 
     /// Remove a provider entry through the daemon's trust-aware writer.
+    #[cfg(feature = "remote")]
     DeleteProviderConfig {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -2139,6 +2143,7 @@ pub enum Request {
     },
 
     /// Persist layer-wide non-secret provider metadata through the daemon.
+    #[cfg(feature = "remote")]
     SetProviderLayerMetadata {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -2812,6 +2817,7 @@ impl Request {
                     validate_owner_project_root(project_root)?;
                 }
             }
+            #[cfg(feature = "remote")]
             Self::UpsertProviderConfig {
                 project_root,
                 provider_id,
@@ -2867,6 +2873,7 @@ impl Request {
                     }
                 }
             }
+            #[cfg(feature = "remote")]
             Self::SaveProviderConfig {
                 project_root,
                 provider_id,
@@ -2905,6 +2912,7 @@ impl Request {
                 validate_owner_project_root(project_root)?;
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
             }
+            #[cfg(feature = "remote")]
             Self::ApplySetupWizard {
                 project_root,
                 wizard_id,
@@ -3446,6 +3454,7 @@ impl Request {
                     }
                 }
             }
+            #[cfg(feature = "remote")]
             Self::SetProviderLayerMetadata {
                 project_root,
                 category_defaults_json,
@@ -3456,6 +3465,7 @@ impl Request {
                     return Err("provider metadata exceeds maximum length".to_string());
                 }
             }
+            #[cfg(feature = "remote")]
             Self::DeleteProviderConfig {
                 project_root,
                 provider_id,
@@ -3649,9 +3659,12 @@ macro_rules! request_variants {
             (Request::ApplyProviderMutation { .. }, "apply_provider_mutation");
             (Request::FetchProviderModels { .. }, "fetch_provider_models");
             (Request::GetProviderUsageSnapshot { .. }, "get_provider_usage_snapshot");
+            #[cfg(feature = "remote")]
             (Request::UpsertProviderConfig { .. }, "upsert_provider_config");
+            #[cfg(feature = "remote")]
             (Request::SaveProviderConfig { .. }, "save_provider_config");
             (Request::SetupCopilotAuth { .. }, "setup_copilot_auth");
+            #[cfg(feature = "remote")]
             (Request::ApplySetupWizard { .. }, "apply_setup_wizard");
             (Request::SaveMcpConfig { .. }, "save_mcp_config");
             (Request::GetAgentInventory { .. }, "get_agent_inventory");
@@ -3683,7 +3696,9 @@ macro_rules! request_variants {
             (Request::ImageWorkflowUpload { .. }, "image_workflow_upload");
             (Request::ImageWorkflowBind { .. }, "image_workflow_bind");
             (Request::ImageWorkflowDelete { .. }, "image_workflow_delete");
+            #[cfg(feature = "remote")]
             (Request::DeleteProviderConfig { .. }, "delete_provider_config");
+            #[cfg(feature = "remote")]
             (Request::SetProviderLayerMetadata { .. }, "set_provider_layer_metadata");
             (Request::DaemonStatus, "daemon_status");
             (Request::RefreshEnv { .. }, "refresh_env");
@@ -3940,9 +3955,12 @@ macro_rules! command {
             (Request::ApplyProviderMutation { snapshot_session_id, layer_id, expected_revision, client_operation_id, mutation_intent_hash, mutation }, "apply_provider_mutation", owner_only, none, true, local_only, none, serialized, none, "snapshot_session_id:String|layer_id:String|expected_revision:String|client_operation_id:String|mutation_intent_hash:String|mutation:crate::ProviderMutationBatch", [snapshot_session_id: String => param, layer_id: String => param, expected_revision: String => param, client_operation_id: String => param, mutation_intent_hash: String => param, mutation: crate::ProviderMutationBatch => param]);
             (Request::FetchProviderModels { project_root, provider_id, model_id, deep, on_unlisted, allow_fallback }, "fetch_provider_models", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:Option<String>|model_id:Option<String>|deep:bool|on_unlisted:Option<cockpit_config::config::providers::OnUnlistedModelsFetch>|allow_fallback:bool", [project_root: String => project_root, provider_id: Option<String> => param, model_id: Option<String> => param, deep: bool => param, on_unlisted: Option<cockpit_config::config::providers::OnUnlistedModelsFetch> => param, allow_fallback: bool => param]);
             (Request::GetProviderUsageSnapshot { project_root, provider_id }, "get_provider_usage_snapshot", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String|provider_id:Option<String>", [project_root: String => project_root, provider_id: Option<String> => param]);
+            #[cfg(feature = "remote")]
             (Request::UpsertProviderConfig { project_root, provider_id, entry }, "upsert_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param]);
-            (Request::SaveProviderConfig { project_root, provider_id, entry, header_secrets }, "save_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<String>>", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param, header_secrets: Vec<Option<String>> => param]);
+            #[cfg(feature = "remote")]
+            (Request::SaveProviderConfig { project_root, provider_id, entry, header_secrets }, "save_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<crate::ProviderSecretValue>>", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param, header_secrets: Vec<Option<crate::ProviderSecretValue>> => param]);
             (Request::SetupCopilotAuth { client_operation_id, project_root, provider_id }, "setup_copilot_auth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|provider_id:String", [client_operation_id: String => param, project_root: String => project_root, provider_id: String => param]);
+            #[cfg(feature = "remote")]
             (Request::ApplySetupWizard { project_root, wizard_id, answers_json }, "apply_setup_wizard", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|wizard_id:String|answers_json:String", [project_root: String => project_root, wizard_id: String => param, answers_json: String => param]);
             // Composite MCP publication is reserved in the remote ledger
             // before dispatch. The daemon's journal + staged vault commit
@@ -3977,7 +3995,9 @@ macro_rules! command {
             (Request::ImageWorkflowUpload { client_operation_id, mutation_intent_hash, project_root, workflow_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_upload", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
             (Request::ImageWorkflowBind { client_operation_id, mutation_intent_hash, project_root, workflow_id, bindings_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_bind", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|bindings_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_id: String => param, bindings_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
             (Request::ImageWorkflowDelete { client_operation_id, mutation_intent_hash, project_root, workflow_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
+            #[cfg(feature = "remote")]
             (Request::DeleteProviderConfig { project_root, provider_id, delete_stored_secrets }, "delete_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|delete_stored_secrets:bool", [project_root: String => project_root, provider_id: String => param, delete_stored_secrets: bool => param]);
+            #[cfg(feature = "remote")]
             (Request::SetProviderLayerMetadata { project_root, category_defaults_json, on_unlisted_models_fetch }, "set_provider_layer_metadata", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|category_defaults_json:String|on_unlisted_models_fetch:cockpit_config::config::providers::OnUnlistedModelsFetch", [project_root: String => project_root, category_defaults_json: String => param, on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch => param]);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-", []);
             (Request::RefreshEnv { vars }, "refresh_env", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "vars:HashMap<String,String>", [vars: HashMap<String,String> => param]);
@@ -5366,27 +5386,6 @@ mod tests {
             .is_err()
         );
 
-        let oversized_metadata = "x".repeat(MAX_OWNER_PROVIDER_METADATA_JSON_BYTES + 1);
-        assert!(
-            Request::SetProviderLayerMetadata {
-                project_root: "/repo".into(),
-                category_defaults_json: oversized_metadata.clone(),
-                on_unlisted_models_fetch:
-                    cockpit_config::config::providers::OnUnlistedModelsFetch::Keep,
-            }
-            .validate_semantics()
-            .is_err()
-        );
-        assert!(
-            Request::SetProviderLayerMetadata {
-                project_root: "".into(),
-                category_defaults_json: "{}".into(),
-                on_unlisted_models_fetch:
-                    cockpit_config::config::providers::OnUnlistedModelsFetch::Keep,
-            }
-            .validate_semantics()
-            .is_err()
-        );
         assert!(
             Request::FetchProviderModels {
                 project_root: "/repo".into(),
@@ -5433,6 +5432,7 @@ mod tests {
         assert!(serde_json::from_value::<Request>(fetch_wire).is_err());
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn provider_config_owner_ingress_rejects_credential_bearing_urls() {
         let request = Request::UpsertProviderConfig {
@@ -5458,6 +5458,37 @@ mod tests {
         let error = request.validate_semantics().unwrap_err();
         assert!(error.contains("query string"));
         assert!(!error.contains("secret"));
+    }
+
+    #[cfg(not(feature = "remote"))]
+    #[test]
+    fn local_v17_rejects_revisionless_provider_mutation_tags() {
+        for tag in [
+            "upsert_provider_config",
+            "save_provider_config",
+            "delete_provider_config",
+            "set_provider_layer_metadata",
+            "apply_setup_wizard",
+        ] {
+            let wire = serde_json::json!({ "request": tag, "params": {} });
+            assert!(
+                serde_json::from_value::<Request>(wire).is_err(),
+                "local protocol unexpectedly accepts legacy provider mutation `{tag}`"
+            );
+        }
+        let current = include_str!("../tests/fixtures/daemon_proto/v17/request.json");
+        for tag in [
+            "upsert_provider_config",
+            "save_provider_config",
+            "delete_provider_config",
+            "set_provider_layer_metadata",
+            "apply_setup_wizard",
+        ] {
+            assert!(
+                !current.contains(&format!("\"request\": \"{tag}\"")),
+                "current local fixture still advertises legacy provider mutation `{tag}`"
+            );
+        }
     }
 
     #[cfg(feature = "remote")]

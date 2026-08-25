@@ -11640,6 +11640,7 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        #[cfg(feature = "remote")]
         Request::UpsertProviderConfig {
             project_root,
             provider_id,
@@ -11673,6 +11674,7 @@ async fn handle_serialized_request_impl(
             )
         }
 
+        #[cfg(feature = "remote")]
         Request::SaveProviderConfig {
             project_root,
             provider_id,
@@ -11836,6 +11838,7 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        #[cfg(feature = "remote")]
         Request::ApplySetupWizard {
             project_root,
             wizard_id,
@@ -11975,6 +11978,7 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        #[cfg(feature = "remote")]
         Request::DeleteProviderConfig {
             project_root,
             provider_id,
@@ -12009,6 +12013,7 @@ async fn handle_serialized_request_impl(
             )
         }
 
+        #[cfg(feature = "remote")]
         Request::SetProviderLayerMetadata {
             project_root,
             category_defaults_json,
@@ -15510,6 +15515,9 @@ async fn stage_and_recover_provider_batch(
     if let Some(metadata) = mutation.metadata {
         desired.category_defaults = metadata.category_defaults;
         desired.on_unlisted_models_fetch = Some(metadata.on_unlisted_models_fetch);
+        if let Some(active_model) = metadata.active_model {
+            desired.active_model = Some(active_model);
+        }
     }
 
     // Cleanup is pair-scoped. A reference retained by the same provider in
@@ -16495,6 +16503,7 @@ pub(super) fn scrub_provider_response(
     serde_json::from_value(value).map_err(internal)
 }
 
+#[cfg(feature = "remote")]
 async fn provider_config_upsert(
     ctx: &DaemonContext,
     project_root: &str,
@@ -16563,7 +16572,7 @@ async fn setup_copilot_auth(
         header_secrets.push(None);
         entry.headers.len() - 1
     };
-    header_secrets[index] = Some(token);
+    header_secrets[index] = Some(cockpit_proto::ProviderSecretValue::new(token));
     let owner = journal_binding.owner_digest.clone();
     let operation_id = journal_binding.client_operation_id.clone();
     provider_config_save_under_lock(
@@ -17517,12 +17526,13 @@ async fn compensate_provider_config_save(
         .map_err(internal)
 }
 
+#[cfg(feature = "remote")]
 async fn provider_config_save(
     ctx: &DaemonContext,
     project_root: &str,
     provider_id: &str,
     entry: crate::config::providers::ProviderEntry,
-    header_secrets: Vec<Option<String>>,
+    header_secrets: Vec<Option<cockpit_proto::ProviderSecretValue>>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     provider_config_save_under_lock(ctx, project_root, provider_id, entry, header_secrets, None)
@@ -17543,7 +17553,7 @@ async fn provider_config_save_under_lock(
     project_root: &str,
     provider_id: &str,
     mut entry: crate::config::providers::ProviderEntry,
-    mut header_secrets: Vec<Option<String>>,
+    mut header_secrets: Vec<Option<cockpit_proto::ProviderSecretValue>>,
     copilot_binding: Option<CopilotJournalBinding>,
 ) -> std::result::Result<Response, ErrorPayload> {
     // Canonicalize the workspace root once, at this daemon boundary, so every
@@ -17606,7 +17616,9 @@ async fn provider_config_save_under_lock(
                     &header.value,
                 )
             {
-                header_secrets[index] = Some(header.value.clone());
+                header_secrets[index] = Some(cockpit_proto::ProviderSecretValue::new(
+                    header.value.clone(),
+                ));
             }
         }
     }
@@ -17619,6 +17631,7 @@ async fn provider_config_save_under_lock(
     let mut staged = Vec::new();
     for (index, (header, secret)) in entry.headers.iter_mut().zip(header_secrets).enumerate() {
         if let Some(secret) = secret {
+            let secret = secret.into_zeroizing();
             if secret.is_empty() {
                 return Err(bad_request("provider header secret must not be empty"));
             }
@@ -19334,6 +19347,7 @@ fn persist_daemon_provider(
     doc.write(&layer).map_err(internal)
 }
 
+#[cfg(feature = "remote")]
 async fn provider_config_delete(
     ctx: &DaemonContext,
     project_root: &str,
@@ -19344,6 +19358,7 @@ async fn provider_config_delete(
     provider_config_delete_under_lock(ctx, project_root, provider_id, delete_stored_secrets).await
 }
 
+#[cfg(feature = "remote")]
 async fn provider_config_delete_under_lock(
     ctx: &DaemonContext,
     project_root: &str,
@@ -19395,6 +19410,7 @@ async fn provider_config_delete_under_lock(
     })
 }
 
+#[cfg(feature = "remote")]
 async fn provider_layer_metadata_set(
     ctx: &DaemonContext,
     project_root: &str,
@@ -19411,6 +19427,7 @@ async fn provider_layer_metadata_set(
     .await
 }
 
+#[cfg(feature = "remote")]
 async fn provider_layer_metadata_set_under_lock(
     ctx: &DaemonContext,
     project_root: &str,

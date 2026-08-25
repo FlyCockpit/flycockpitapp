@@ -78,6 +78,10 @@ pub struct ProviderMutationDelete {
 pub struct ProviderLayerMetadataPatch {
     pub category_defaults: BTreeMap<String, cockpit_config::config::providers::ProviderModelRef>,
     pub on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch,
+    /// Optional owner-selected default model. Absence preserves the current
+    /// layer value; setup uses `Some` to make its selected model authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<cockpit_config::config::providers::ActiveModelRef>,
 }
 
 #[derive(Clone)]

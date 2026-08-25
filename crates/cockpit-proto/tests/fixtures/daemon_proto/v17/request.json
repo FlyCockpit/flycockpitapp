@@ -1471,55 +1471,6 @@
     },
     "request": "get_provider_usage_snapshot"
   },
-  "upsert_provider_config": {
-    "params": {
-      "entry": {
-        "cache": {
-          "mode": "none",
-          "ttl_secs": 300
-        },
-        "context": {
-          "auto_compact_pct": null,
-          "auto_prune_pct": 50,
-          "auto_prune_prunable_pct": 30,
-          "compact_keep_recent_turns": 4,
-          "compact_nudge_pct": 60,
-          "compact_shadow": true,
-          "compact_shadow_margin_pct": 10
-        },
-        "headers": [],
-        "models": [],
-        "shrink": {
-          "margin_secs": 30,
-          "strategy": "prune"
-        },
-        "timeout": {
-          "idle_secs": 90,
-          "ttft_secs": 120
-        },
-        "url": "https://example.test"
-      },
-      "project_root": "/tmp/project",
-      "provider_id": "example"
-    },
-    "request": "upsert_provider_config"
-  },
-  "delete_provider_config": {
-    "params": {
-      "delete_stored_secrets": false,
-      "project_root": "/tmp/project",
-      "provider_id": "example"
-    },
-    "request": "delete_provider_config"
-  },
-  "set_provider_layer_metadata": {
-    "params": {
-      "category_defaults_json": "{}",
-      "on_unlisted_models_fetch": "ask",
-      "project_root": "/tmp/project"
-    },
-    "request": "set_provider_layer_metadata"
-  },
   "begin_provider_oauth": {
     "params": {
       "client_operation_id": "begin-provider",
@@ -1567,40 +1518,6 @@
     },
     "request": "cancel_mcp_oauth"
   },
-  "save_provider_config": {
-    "params": {
-      "project_root": "/tmp/project",
-      "provider_id": "example",
-      "entry": {
-        "cache": {
-          "mode": "none",
-          "ttl_secs": 300
-        },
-        "context": {
-          "auto_compact_pct": null,
-          "auto_prune_pct": 50,
-          "auto_prune_prunable_pct": 30,
-          "compact_keep_recent_turns": 4,
-          "compact_nudge_pct": 60,
-          "compact_shadow": true,
-          "compact_shadow_margin_pct": 10
-        },
-        "headers": [],
-        "models": [],
-        "shrink": {
-          "margin_secs": 30,
-          "strategy": "prune"
-        },
-        "timeout": {
-          "idle_secs": 90,
-          "ttft_secs": 120
-        },
-        "url": "https://example.test"
-      },
-      "header_secrets": []
-    },
-    "request": "save_provider_config"
-  },
   "save_mcp_config": {
     "params": {
       "client_operation_id": "11111111-1111-4111-8111-111111111111",
@@ -1623,14 +1540,6 @@
       "provider_id": "copilot"
     },
     "request": "setup_copilot_auth"
-  },
-  "apply_setup_wizard": {
-    "params": {
-      "project_root": "/tmp/project",
-      "wizard_id": "security",
-      "answers_json": "{}"
-    },
-    "request": "apply_setup_wizard"
   },
   "save_extended_config": {
     "params": {

@@ -477,6 +477,7 @@ fn provider_plan_intent_hash(
                 cockpit_proto::ProviderLayerMetadataPatch {
                     category_defaults: category_defaults.clone(),
                     on_unlisted_models_fetch: *on_unlisted_models_fetch,
+                    active_model: None,
                 }
             }),
     }
@@ -645,6 +646,7 @@ pub(crate) async fn execute_settings_daemon_work(
                         cockpit_proto::ProviderLayerMetadataPatch {
                             category_defaults,
                             on_unlisted_models_fetch,
+                            active_model: None,
                         }
                     }),
             };

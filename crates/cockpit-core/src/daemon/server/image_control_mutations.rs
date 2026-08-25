@@ -7,11 +7,10 @@
 //! mutations `image_workflow_upload/bind/delete`) that edit the secret-bearing
 //! image-generation registry. Each one:
 //!
-//! 1. loads the registry through the SAME trust-gated daemon config contract the
-//!    read surface uses (`resolve_workspace_trust_policy_from_db` +
-//!    `load_effective_for_daemon`), so remote-injected `image_generation` is
-//!    stripped and `project_root` is only a config cwd, never authority — the
-//!    RPC is already `owner_only`-gated;
+//! 1. resolves workspace trust and loads the registry from the exact,
+//!    most-specific local layer that authors `image_generation` (or a newly
+//!    selected most-specific write layer when none does). It never mutates a
+//!    merged/effective projection;
 //! 2. applies the edit to a clone of the accessor `Vec` and RECONSTRUCTS the
 //!    registry through the single [`ImageGenerationConfig::new`] validation
 //!    funnel, which enforces every invariant (unique ids, enabled-target →
@@ -41,9 +40,9 @@ use cockpit_config::config::image_generation::{
     ImageGenerationTarget, ImageTargetIdentity, RegisteredComfyWorkflow,
 };
 use cockpit_proto::image_control::{
-    ImageConfigChangeSetSafeV1, ImageConfigChangeV1, ImageConfigMutationIntentV1,
-    ImageControlEventV1, ImageControlMutationResponseV1, ImageEndpointSafeV1, ImageTargetSafeV1,
-    ImageWorkflowSafeV1,
+    ImageConfigChangeSetSafeV1, ImageConfigChangeV1, ImageConfigMutationCapabilityV1,
+    ImageConfigMutationIntentV1, ImageControlEventV1, ImageControlMutationResponseV1,
+    ImageEndpointSafeV1, ImageTargetSafeV1, ImageWorkflowSafeV1,
 };
 
 use crate::daemon::proto::{ErrorCode, ErrorPayload, Request, Response};
@@ -67,8 +66,8 @@ fn conflict(message: impl Into<String>) -> ErrorPayload {
 /// Every `ImageGenerationConfig::new` validation failure maps to a client
 /// `BadRequest` (the control-plane `malformed`/`invalid_state` class). A config
 /// that fails validation is never persisted.
-fn map_config_error(error: ImageGenerationConfigError) -> ErrorPayload {
-    bad_request(format!("invalid image generation configuration: {error:?}"))
+fn map_config_error(_error: ImageGenerationConfigError) -> ErrorPayload {
+    bad_request("invalid image generation configuration")
 }
 
 /// The entity that one change-set member describes, resolved to its safe
@@ -88,31 +87,37 @@ enum PendingChange {
 /// is only ever built through `::new`, so an invalid edit returns `Err` and
 /// nothing is persisted.
 enum Edit {
-    EndpointCreate(String),
-    EndpointUpdate { endpoint_id: String, json: String },
+    EndpointCreate(zeroize::Zeroizing<String>),
+    EndpointUpdate {
+        endpoint_id: String,
+        json: zeroize::Zeroizing<String>,
+    },
     EndpointDelete(String),
-    TargetCreate(String),
-    TargetUpdate { target_id: String, json: String },
+    TargetCreate(zeroize::Zeroizing<String>),
+    TargetUpdate {
+        target_id: String,
+        json: zeroize::Zeroizing<String>,
+    },
     TargetDelete(String),
     TargetSetDefault(String),
-    WorkflowUpload(String),
-    WorkflowBind { workflow_id: String, json: String },
+    WorkflowUpload(zeroize::Zeroizing<String>),
+    WorkflowBind {
+        workflow_id: String,
+        json: zeroize::Zeroizing<String>,
+    },
     WorkflowDelete(String),
 }
 
 fn parse_endpoint(json: &str) -> Result<ImageEndpoint, ErrorPayload> {
-    serde_json::from_str(json)
-        .map_err(|error| bad_request(format!("invalid image endpoint: {error}")))
+    serde_json::from_str(json).map_err(|_| bad_request("invalid image endpoint"))
 }
 
 fn parse_target(json: &str) -> Result<ImageGenerationTarget, ErrorPayload> {
-    serde_json::from_str(json)
-        .map_err(|error| bad_request(format!("invalid image target: {error}")))
+    serde_json::from_str(json).map_err(|_| bad_request("invalid image target"))
 }
 
 fn parse_workflow(json: &str) -> Result<RegisteredComfyWorkflow, ErrorPayload> {
-    serde_json::from_str(json)
-        .map_err(|error| bad_request(format!("invalid image workflow: {error}")))
+    serde_json::from_str(json).map_err(|_| bad_request("invalid image workflow"))
 }
 
 fn rebuild(
@@ -441,13 +446,28 @@ fn project_changes(
     changes
 }
 
-fn amend_response_generation(response: &mut Response, generation: u64) {
+fn amend_response_generation(
+    ctx: &DaemonContext,
+    response: &mut Response,
+    generation: u64,
+) -> anyhow::Result<()> {
     let Response::ImageControlMutated(receipt) = response else {
-        return;
+        return Ok(());
     };
-    let generation = generation.to_string();
-    receipt.config_generation.clone_from(&generation);
-    receipt.change_set.config_generation.clone_from(&generation);
+    receipt.daemon_instance_id = inventory::daemon_instance_id().to_string();
+    receipt.result_config_generation = generation;
+    receipt.mutation_capability = mint_mutation_capability(
+        ctx,
+        Path::new(&receipt.canonical_project_root),
+        Path::new(&receipt.target_path),
+        &receipt.result_revision,
+        generation,
+    )?;
+    let generation_text = generation.to_string();
+    receipt
+        .change_set
+        .config_generation
+        .clone_from(&generation_text);
     for change in &mut receipt.change_set.changes {
         match change {
             ImageConfigChangeV1::EndpointUpserted {
@@ -455,8 +475,8 @@ fn amend_response_generation(response: &mut Response, generation: u64) {
                 item,
                 ..
             } => {
-                entity_generation.clone_from(&generation);
-                item.entity_generation.clone_from(&generation);
+                entity_generation.clone_from(&generation_text);
+                item.entity_generation.clone_from(&generation_text);
             }
             ImageConfigChangeV1::EndpointDeleted {
                 entity_generation, ..
@@ -466,39 +486,35 @@ fn amend_response_generation(response: &mut Response, generation: u64) {
             }
             | ImageConfigChangeV1::WorkflowDeleted {
                 entity_generation, ..
-            } => entity_generation.clone_from(&generation),
+            } => entity_generation.clone_from(&generation_text),
             ImageConfigChangeV1::TargetUpserted {
                 entity_generation,
                 item,
                 ..
             } => {
-                entity_generation.clone_from(&generation);
-                item.entity_generation.clone_from(&generation);
+                entity_generation.clone_from(&generation_text);
+                item.entity_generation.clone_from(&generation_text);
             }
             ImageConfigChangeV1::WorkflowUpserted {
                 entity_generation,
                 item,
                 ..
             } => {
-                entity_generation.clone_from(&generation);
-                item.entity_generation.clone_from(&generation);
+                entity_generation.clone_from(&generation_text);
+                item.entity_generation.clone_from(&generation_text);
             }
         }
     }
+    Ok(())
 }
 
-/// Persist the new registry to the most-specific existing `config.json` on the
-/// discovered layer path (scaffolding one in the project `.cockpit/` when none
-/// exists), preserving unknown/sibling keys. `image_generation` is an atomic
-/// registry, so `ExtendedConfigDoc::write` whole-replaces it under the
-/// `ConfigMutationLock`.
-fn target_path(project_root: &Path) -> PathBuf {
-    use crate::config::dirs::{CONFIG_FILE, discover_config_dirs};
-    discover_config_dirs(project_root)
-        .into_iter()
-        .map(|dir| dir.path.join(CONFIG_FILE))
-        .find(|path| path.exists())
-        .unwrap_or_else(|| project_root.join(".cockpit").join(CONFIG_FILE))
+/// The exact local layer that owns the atomic image registry.  A mutation must
+/// never start from the merged `ExtendedConfig`: doing so would copy inherited
+/// values into an unrelated layer and silently change future inheritance.
+pub(crate) struct AuthoritativeImageLayer {
+    pub(crate) target: PathBuf,
+    pub(crate) registry: ImageGenerationConfig,
+    pub(crate) revision: String,
 }
 
 fn digest_hex(digest: impl AsRef<[u8]>) -> String {
@@ -513,21 +529,167 @@ fn content_revision(ctx: &DaemonContext, bytes: &[u8]) -> String {
     )
 }
 
-fn read_document(path: &Path) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn mint_mutation_capability(
+    ctx: &DaemonContext,
+    canonical_project_root: &Path,
+    target: &Path,
+    target_revision: &str,
+    config_generation: u64,
+) -> anyhow::Result<ImageConfigMutationCapabilityV1> {
+    let material = zeroize::Zeroizing::new(serde_json::to_vec(&(
+        "flycockpit.image-config.mutation-capability.v1",
+        canonical_project_root.to_string_lossy().as_ref(),
+        target.to_string_lossy().as_ref(),
+        target_revision,
+        config_generation,
+    ))?);
+    Ok(ImageConfigMutationCapabilityV1::new(digest_hex(
+        ctx.secret_vault.keyed_request_identity(
+            b"flycockpit.image-config.mutation-capability.v1\0",
+            material.as_slice(),
+        ),
+    )))
+}
+
+fn verify_mutation_capability(
+    ctx: &DaemonContext,
+    presented: &ImageConfigMutationCapabilityV1,
+    canonical_project_root: &Path,
+    target: &Path,
+    target_revision: &str,
+    config_generation: u64,
+) -> std::result::Result<(), ErrorPayload> {
+    let expected = mint_mutation_capability(
+        ctx,
+        canonical_project_root,
+        target,
+        target_revision,
+        config_generation,
+    )
+    .map_err(internal)?;
+    let presented = crate::leaks::decode_hex_32(presented.as_str())
+        .ok_or_else(|| conflict("image mutation capability is malformed"))?;
+    let expected = crate::leaks::decode_hex_32(expected.as_str())
+        .ok_or_else(|| internal("daemon minted a malformed image mutation capability"))?;
+    if !crate::leaks::ct_eq_32(&presented, &expected) {
+        return Err(conflict(
+            "image mutation capability does not match the authoritative target",
+        ));
+    }
+    Ok(())
+}
+
+fn read_document(path: &Path) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
     match std::fs::read(path) {
-        Ok(bytes) => Ok(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(b"{}".to_vec()),
+        Ok(bytes) => Ok(zeroize::Zeroizing::new(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(zeroize::Zeroizing::new(b"{}".to_vec()))
+        }
         Err(error) => Err(error.into()),
     }
 }
 
-pub(crate) fn authoritative_target_revision(
+/// Resolve the most-specific layer that actually authors `image_generation`.
+/// When no layer authors it, choose the normal most-specific write target and
+/// start from the empty registry. `config_file_paths_for_load` is already
+/// ordered least-specific to most-specific and honors `COCKPIT_CONFIG`.
+pub(crate) fn authoritative_image_layer(
     ctx: &DaemonContext,
     project_root: &Path,
-) -> anyhow::Result<(PathBuf, String)> {
-    let target = target_path(project_root);
-    let revision = content_revision(ctx, &read_document(&target)?);
-    Ok((target, revision))
+    trust_policy: &crate::config::trust::WorkspaceTrustPolicy,
+) -> anyhow::Result<AuthoritativeImageLayer> {
+    crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
+        authoritative_image_layer_trusted(ctx, project_root)
+    })
+}
+
+fn authoritative_image_layer_trusted(
+    ctx: &DaemonContext,
+    project_root: &Path,
+) -> anyhow::Result<AuthoritativeImageLayer> {
+    use cockpit_config::config::dirs::{CONFIG_FILE, config_file_paths_for_load};
+
+    let paths = config_file_paths_for_load(project_root);
+    let defining = most_specific_authored_registry(&paths)?;
+    let selected = defining
+        .or_else(|| cockpit_config::config::dirs::most_specific_config_write_target(project_root))
+        .unwrap_or_else(|| project_root.join(".cockpit").join(CONFIG_FILE));
+    let target = exact_target_path(&selected)?;
+    let raw = read_document(&target)?;
+    let registry = registry_from_document(raw.as_slice())?;
+    let revision = content_revision(ctx, raw.as_slice());
+    Ok(AuthoritativeImageLayer {
+        target,
+        registry,
+        revision,
+    })
+}
+
+/// Canonicalize the existing prefix of a possibly-not-yet-created config path,
+/// then append only the daemon-selected missing components. This gives the
+/// capability and receipt one stable target identity even through project-root
+/// aliases, without requiring the scaffold file to exist yet.
+fn exact_target_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    let mut cursor = normalized.as_path();
+    let mut missing = Vec::new();
+    while !cursor.exists() {
+        let name = cursor
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("image config target has no existing ancestor"))?;
+        missing.push(name.to_os_string());
+        cursor = cursor
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("image config target has no existing ancestor"))?;
+    }
+    let mut canonical = std::fs::canonicalize(cursor)?;
+    for component in missing.into_iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
+}
+
+fn most_specific_authored_registry(paths: &[PathBuf]) -> anyhow::Result<Option<PathBuf>> {
+    let mut defining = None;
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let raw = read_document(path)?;
+        let document: serde_json::Value = serde_json::from_slice(raw.as_slice())?;
+        let object = document
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("authoritative config root must be an object"))?;
+        if object.contains_key("image_generation") {
+            defining = Some(path.clone());
+        }
+    }
+    Ok(defining)
+}
+
+fn registry_from_document(raw: &[u8]) -> anyhow::Result<ImageGenerationConfig> {
+    let document: serde_json::Value = serde_json::from_slice(raw)?;
+    let object = document
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("authoritative config root must be an object"))?;
+    match object.get("image_generation") {
+        Some(value) => serde_json::from_value(value.clone()).map_err(Into::into),
+        None => Ok(ImageGenerationConfig::default()),
+    }
 }
 
 fn render_registry_patch(
@@ -535,7 +697,7 @@ fn render_registry_patch(
     registry: &ImageGenerationConfig,
 ) -> Result<Vec<u8>, ErrorPayload> {
     let mut document: serde_json::Value = serde_json::from_slice(raw)
-        .map_err(|error| bad_request(format!("invalid authoritative config document: {error}")))?;
+        .map_err(|_| bad_request("invalid authoritative config document"))?;
     let object = document
         .as_object_mut()
         .ok_or_else(|| bad_request("authoritative config root must be an object"))?;
@@ -552,16 +714,18 @@ struct ExtractedMutation {
     project_root: String,
     expected_generation: u64,
     expected_revision: String,
+    mutation_capability: ImageConfigMutationCapabilityV1,
     edit: Edit,
 }
 
-fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
+fn extract(request: Request) -> Result<ExtractedMutation, ErrorPayload> {
     let (
         client_operation_id,
         mutation_intent_hash,
         project_root,
         expected,
         expected_revision,
+        mutation_capability,
         edit,
     ) = match request {
         Request::ImageEndpointCreate {
@@ -571,13 +735,15 @@ fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
             endpoint_json,
             expected_config_generation,
             expected_config_revision,
+            mutation_capability,
         } => (
-            client_operation_id.clone(),
-            mutation_intent_hash.clone(),
-            project_root.clone(),
-            *expected_config_generation,
-            expected_config_revision.clone(),
-            Edit::EndpointCreate(endpoint_json.clone()),
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            expected_config_generation,
+            expected_config_revision,
+            mutation_capability,
+            Edit::EndpointCreate(endpoint_json.into_zeroizing()),
         ),
         Request::ImageEndpointUpdate {
             client_operation_id,
@@ -587,15 +753,17 @@ fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
             endpoint_json,
             expected_config_generation,
             expected_config_revision,
+            mutation_capability,
         } => (
-            client_operation_id.clone(),
-            mutation_intent_hash.clone(),
-            project_root.clone(),
-            *expected_config_generation,
-            expected_config_revision.clone(),
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            expected_config_generation,
+            expected_config_revision,
+            mutation_capability,
             Edit::EndpointUpdate {
-                endpoint_id: endpoint_id.clone(),
-                json: endpoint_json.clone(),
+                endpoint_id,
+                json: endpoint_json.into_zeroizing(),
             },
         ),
         Request::ImageEndpointDelete {
@@ -605,13 +773,15 @@ fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
             endpoint_id,
             expected_config_generation,
             expected_config_revision,
+            mutation_capability,
         } => (
-            client_operation_id.clone(),
-            mutation_intent_hash.clone(),
-            project_root.clone(),
-            *expected_config_generation,
-            expected_config_revision.clone(),
-            Edit::EndpointDelete(endpoint_id.clone()),
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            expected_config_generation,
+            expected_config_revision,
+            mutation_capability,
+            Edit::EndpointDelete(endpoint_id),
         ),
         Request::ImageTargetCreate {
             client_operation_id,
@@ -620,13 +790,15 @@ fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
             target_json,
             expected_config_generation,
             expected_config_revision,
+            mutation_capability,
         } => (
-            client_operation_id.clone(),
-            mutation_intent_hash.clone(),
-            project_root.clone(),
-            *expected_config_generation,
-            expected_config_revision.clone(),
-            Edit::TargetCreate(target_json.clone()),
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            expected_config_generation,
+            expected_config_revision,
+            mutation_capability,
+            Edit::TargetCreate(target_json.into_zeroizing()),
         ),
         Request::ImageTargetUpdate {
             client_operation_id,
@@ -636,15 +808,17 @@ fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
             target_json,
             expected_config_generation,
             expected_config_revision,
+            mutation_capability,
         } => (
-            client_operation_id.clone(),
-            mutation_intent_hash.clone(),
-            project_root.clone(),
-            *expected_config_generation,
-            expected_config_revision.clone(),
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            expected_config_generation,
+            expected_config_revision,
+            mutation_capability,
             Edit::TargetUpdate {
-                target_id: target_id.clone(),
-                json: target_json.clone(),
+                target_id,
+                json: target_json.into_zeroizing(),
             },
         ),
         Request::ImageTargetDelete {
@@ -654,13 +828,15 @@ fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
             target_id,
             expected_config_generation,
             expected_config_revision,
+            mutation_capability,
         } => (
-            client_operation_id.clone(),
-            mutation_intent_hash.clone(),
-            project_root.clone(),
-            *expected_config_generation,
-            expected_config_revision.clone(),
-            Edit::TargetDelete(target_id.clone()),
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            expected_config_generation,
+            expected_config_revision,
+            mutation_capability,
+            Edit::TargetDelete(target_id),
         ),
         Request::ImageTargetSetDefault {
             client_operation_id,
@@ -669,13 +845,15 @@ fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
             target_id,
             expected_config_generation,
             expected_config_revision,
+            mutation_capability,
         } => (
-            client_operation_id.clone(),
-            mutation_intent_hash.clone(),
-            project_root.clone(),
-            *expected_config_generation,
-            expected_config_revision.clone(),
-            Edit::TargetSetDefault(target_id.clone()),
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            expected_config_generation,
+            expected_config_revision,
+            mutation_capability,
+            Edit::TargetSetDefault(target_id),
         ),
         Request::ImageWorkflowUpload {
             client_operation_id,
@@ -684,13 +862,15 @@ fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
             workflow_json,
             expected_config_generation,
             expected_config_revision,
+            mutation_capability,
         } => (
-            client_operation_id.clone(),
-            mutation_intent_hash.clone(),
-            project_root.clone(),
-            *expected_config_generation,
-            expected_config_revision.clone(),
-            Edit::WorkflowUpload(workflow_json.clone()),
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            expected_config_generation,
+            expected_config_revision,
+            mutation_capability,
+            Edit::WorkflowUpload(workflow_json.into_zeroizing()),
         ),
         Request::ImageWorkflowBind {
             client_operation_id,
@@ -700,15 +880,17 @@ fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
             bindings_json,
             expected_config_generation,
             expected_config_revision,
+            mutation_capability,
         } => (
-            client_operation_id.clone(),
-            mutation_intent_hash.clone(),
-            project_root.clone(),
-            *expected_config_generation,
-            expected_config_revision.clone(),
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            expected_config_generation,
+            expected_config_revision,
+            mutation_capability,
             Edit::WorkflowBind {
-                workflow_id: workflow_id.clone(),
-                json: bindings_json.clone(),
+                workflow_id,
+                json: bindings_json.into_zeroizing(),
             },
         ),
         Request::ImageWorkflowDelete {
@@ -718,18 +900,20 @@ fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
             workflow_id,
             expected_config_generation,
             expected_config_revision,
+            mutation_capability,
         } => (
-            client_operation_id.clone(),
-            mutation_intent_hash.clone(),
-            project_root.clone(),
-            *expected_config_generation,
-            expected_config_revision.clone(),
-            Edit::WorkflowDelete(workflow_id.clone()),
+            client_operation_id,
+            mutation_intent_hash,
+            project_root,
+            expected_config_generation,
+            expected_config_revision,
+            mutation_capability,
+            Edit::WorkflowDelete(workflow_id),
         ),
         other => {
             return Err(internal(format!(
                 "dispatch_image_control_mutation called with non-mutation request `{}`",
-                crate::daemon::principal::request_kind(other)
+                crate::daemon::principal::request_kind(&other)
             )));
         }
     };
@@ -756,6 +940,7 @@ fn extract(request: &Request) -> Result<ExtractedMutation, ErrorPayload> {
         project_root,
         expected_generation: expected,
         expected_revision,
+        mutation_capability,
         edit,
     })
 }
@@ -770,13 +955,14 @@ pub(crate) async fn dispatch_image_control_mutation(
     request_hash: [u8; 32],
     fencing_generation: i64,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let extracted = extract(&request)?;
+    let extracted = extract(request)?;
     let ExtractedMutation {
         client_operation_id,
         mutation_intent_hash,
         project_root,
         expected_generation,
         expected_revision,
+        mutation_capability,
         edit,
     } = extracted;
 
@@ -798,14 +984,35 @@ pub(crate) async fn dispatch_image_control_mutation(
     let trust_policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, &cwd)
         .await
         .map_err(internal)?;
-    let (_, extended) = ctx
-        .config_source
-        .load_effective_for_daemon(&cwd, &trust_policy)
-        .map_err(internal)?;
+    // Resolve the exact raw layer that owns this atomic registry. Never edit a
+    // merged/effective projection: that would flatten inherited values into a
+    // different layer and mutate the authority model as a side effect.
+    let layer = authoritative_image_layer(ctx, &cwd, &trust_policy).map_err(internal)?;
+    let target = layer.target;
+    let target_display = target.to_string_lossy().into_owned();
+    let publication_guard =
+        cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
+    let consumed = read_document(&target).map_err(internal)?;
+    let consumed_revision = content_revision(ctx, consumed.as_slice());
+    if consumed_revision != expected_revision {
+        return Err(conflict(
+            "image configuration document changed; reload before mutating",
+        ));
+    }
+    verify_mutation_capability(
+        ctx,
+        &mutation_capability,
+        &cwd,
+        &target,
+        &consumed_revision,
+        current,
+    )?;
+    let registry = registry_from_document(consumed.as_slice())
+        .map_err(|_| bad_request("the authoritative image configuration registry is malformed"))?;
 
     // Apply + validate through the single `ImageGenerationConfig::new` funnel.
     // An invalid result returns here — nothing is written or bumped.
-    let (new_registry, pending) = apply_edit(&extended.image_generation, edit)?;
+    let (new_registry, pending) = apply_edit(&registry, edit)?;
 
     // The public mutation identity is derived exclusively from redacted safe
     // projections. Endpoint credentials/headers and workflow graph bytes can
@@ -825,19 +1032,9 @@ pub(crate) async fn dispatch_image_control_mutation(
         ));
     }
 
-    let target = target_path(&cwd);
-    let target_display = target.to_string_lossy().into_owned();
-    let publication_guard =
-        cockpit_config::config::hold_config_mutation_lock(&target).map_err(internal)?;
-    let consumed = read_document(&target).map_err(internal)?;
-    let consumed_revision = content_revision(ctx, &consumed);
-    if consumed_revision != expected_revision {
-        return Err(conflict(
-            "image configuration document changed; reload before mutating",
-        ));
-    }
-    let intended = render_registry_patch(&consumed, &new_registry)?;
-    let result_revision = content_revision(ctx, &intended);
+    let intended =
+        zeroize::Zeroizing::new(render_registry_patch(consumed.as_slice(), &new_registry)?);
+    let result_revision = content_revision(ctx, intended.as_slice());
     let predicted_generation =
         current.saturating_add(u64::from(result_revision != consumed_revision));
     let generation = predicted_generation.to_string();
@@ -847,17 +1044,22 @@ pub(crate) async fn dispatch_image_control_mutation(
         project_changes(&new_registry, &pending, &generation),
     );
     let daemon_instance_id = inventory::daemon_instance_id().to_string();
-    let canonical_project_id = cwd.to_string_lossy().into_owned();
+    let canonical_project_root = cwd.to_string_lossy().into_owned();
+    let next_capability =
+        mint_mutation_capability(ctx, &cwd, &target, &result_revision, predicted_generation)
+            .map_err(internal)?;
     let mut response = Response::ImageControlMutated(ImageControlMutationResponseV1::new(
         client_operation_id.clone(),
         mutation_intent_hash.clone(),
         daemon_instance_id.clone(),
-        canonical_project_id,
         project_root.clone(),
+        canonical_project_root.clone(),
         target_display.clone(),
         consumed_revision.clone(),
         result_revision.clone(),
         current,
+        predicted_generation,
+        next_capability,
         change_set,
     ));
     let mut terminal_response_json = serde_json::to_string(&response).map_err(internal)?;
@@ -919,7 +1121,7 @@ pub(crate) async fn dispatch_image_control_mutation(
     drop(publication_guard);
 
     if published_generation != predicted_generation {
-        amend_response_generation(&mut response, published_generation);
+        amend_response_generation(ctx, &mut response, published_generation).map_err(internal)?;
         terminal_response_json = serde_json::to_string(&response).map_err(internal)?;
         let amend_owner = owner.clone();
         let amend_operation = client_operation_id.clone();
@@ -952,6 +1154,20 @@ pub(crate) async fn dispatch_image_control_mutation(
         event: ImageControlEventV1::config_changed(
             daemon_instance_id.clone(),
             project_root.clone(),
+            canonical_project_root,
+            target_display,
+            match &response {
+                Response::ImageControlMutated(receipt) => receipt.result_revision.clone(),
+                _ => unreachable!(),
+            },
+            match &response {
+                Response::ImageControlMutated(receipt) => receipt.mutation_capability.clone(),
+                _ => unreachable!(),
+            },
+            match &response {
+                Response::ImageControlMutated(receipt) => receipt.result_config_generation,
+                _ => unreachable!(),
+            },
             change_set.clone(),
         ),
     });
@@ -965,24 +1181,14 @@ pub(crate) async fn dispatch_image_control_mutation(
 pub(crate) async fn recover_image_config_mutation_journals(
     ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<u64, ErrorPayload> {
-    type Row = (
-        String,
-        String,
-        Vec<u8>,
-        i64,
-        String,
-        String,
-        String,
-        String,
-        String,
-    );
+    type Row = (String, String, Vec<u8>, i64, String, String, String, String);
     let rows: Vec<Row> = ctx
         .db
         .read(|conn| {
             let mut statement = conn.prepare(
                 "SELECT journal.owner_digest,journal.client_operation_id,journal.request_hash,
                     journal.fencing_generation,journal.target_path,journal.consumed_revision,
-                    journal.intended_revision,journal.terminal_response_json,receipt.state
+                    journal.intended_revision,journal.terminal_response_json
                FROM image_config_mutation_journals journal
                JOIN local_operation_receipts receipt
                  ON receipt.owner_digest=journal.owner_digest
@@ -1000,7 +1206,6 @@ pub(crate) async fn recover_image_config_mutation_journals(
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
-                        row.get(8)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1009,45 +1214,32 @@ pub(crate) async fn recover_image_config_mutation_journals(
         .await
         .map_err(internal)?;
     let mut recovered = 0_u64;
-    for (
-        owner,
-        operation,
-        request_hash,
-        fence,
-        target,
-        consumed,
-        intended,
-        response_json,
-        receipt_state,
-    ) in rows
-    {
+    for (owner, operation, request_hash, fence, target, consumed, intended, response_json) in rows {
         let hash: [u8; 32] = request_hash
             .try_into()
             .map_err(|_| internal("image mutation journal request hash is malformed"))?;
-        if receipt_state.starts_with("terminal_") {
-            ctx.db.write(move |conn| {
-                conn.execute(
-                    "DELETE FROM image_config_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2",
-                    rusqlite::params![owner, operation],
-                )?;
-                Ok(())
-            }).await.map_err(internal)?;
-            recovered = recovered.saturating_add(1);
-            continue;
-        }
-        let actual = content_revision(ctx, &read_document(Path::new(&target)).map_err(internal)?);
+        // The file is authoritative even when a receipt already looks
+        // terminal. A process can commit the atomic replace and then have a
+        // later path incorrectly terminalize the receipt before the journal is
+        // retired. Never discard that evidence without reconciling it.
+        let actual_bytes = read_document(Path::new(&target)).map_err(internal)?;
+        let actual = content_revision(ctx, actual_bytes.as_slice());
         if actual == intended {
             let mut response: Response = serde_json::from_str(&response_json).map_err(internal)?;
-            let published = inventory::publish_committed_config_generation();
-            amend_response_generation(&mut response, published);
+            let published = if intended == consumed {
+                inventory::current_config_generation()
+            } else {
+                inventory::publish_committed_config_generation()
+            };
+            amend_response_generation(ctx, &mut response, published).map_err(internal)?;
             let terminal = serde_json::to_string(&response).map_err(internal)?;
             ctx.db.transaction(move |conn| {
                 let changed = conn.execute(
                     "UPDATE local_operation_receipts SET state='terminal_success',terminal_outcome_json=?5,execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
-                     WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4 AND state='executing'",
+                     WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4",
                     rusqlite::params![owner,operation,hash.as_slice(),fence,terminal,chrono::Utc::now().timestamp_millis()],
                 )?;
-                if changed != 1 { anyhow::bail!("image mutation recovery lost its executing receipt"); }
+                if changed != 1 { anyhow::bail!("image mutation recovery lost its exact receipt"); }
                 conn.execute("DELETE FROM image_config_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2", rusqlite::params![owner,operation])?;
                 Ok(())
             }).await.map_err(internal)?;
@@ -1062,10 +1254,10 @@ pub(crate) async fn recover_image_config_mutation_journals(
             ctx.db.transaction(move |conn| {
                 let changed = conn.execute(
                     "UPDATE local_operation_receipts SET state='terminal_cancelled',terminal_outcome_json=?5,execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
-                     WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4 AND state='executing'",
+                     WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4",
                     rusqlite::params![owner,operation,hash.as_slice(),fence,terminal,chrono::Utc::now().timestamp_millis()],
                 )?;
-                if changed != 1 { anyhow::bail!("image mutation recovery lost its executing receipt"); }
+                if changed != 1 { anyhow::bail!("image mutation recovery lost its exact receipt"); }
                 conn.execute("DELETE FROM image_config_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2", rusqlite::params![owner,operation])?;
                 Ok(())
             }).await.map_err(internal)?;

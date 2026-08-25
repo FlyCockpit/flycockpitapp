@@ -4,6 +4,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Map;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 use crate::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
 use crate::engine::tool::{Tool, ToolCtx, ToolOutput, invalid_input, typed_args};
@@ -51,7 +54,42 @@ impl Tool for SkillManageTool {
             )));
         }
         let extended = ctx.config.extended();
-        let config_requires_approval = extended.skills.write_approval
+        // Discovery is a real filesystem traversal, including configured
+        // `external_dirs` which are read-only as mutation destinations. Do
+        // not let `skill_manage` inspect those roots merely because a config
+        // points at them: establish the native policy on every effective root
+        // first, then replace the config spellings with the exact checked
+        // paths used by the service.
+        let (effective_skills, preflight_roots) =
+            checked_skill_preflight_config(ctx, &extended.skills).await?;
+        let service = SkillMutationService::new(&ctx.cwd, &effective_skills)
+            .with_origin(ctx.skill_write_origin)
+            .with_db(&ctx.session.db);
+        // Preparation is deliberately before the potentially parked approval.
+        // In particular, delete's durable pin/usage preflight cannot be an
+        // await between the final capability claim and its destructive rename.
+        // The resulting plan has already completed its host preflight, so a
+        // cancellation/revision cannot reopen that window.
+        // `prepare`'s first possible syscall is discovery/canonicalization of
+        // a configured root. Claim every exact read access immediately before
+        // entering it. `prepare` performs all filesystem preflight before its
+        // sole durable await (delete's usage lookup), so no cancellation can
+        // interpose between this fence and a root traversal.
+        crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+            "skill_manage_preflight_native_access",
+            &preflight_roots
+                .iter()
+                .map(|root| {
+                    crate::tools::sandbox::native_access_effect(
+                        root,
+                        crate::tools::shell_sandbox::SandboxPathAccess::Read,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        let prepared = service.prepare(&args).await?;
+        let config_requires_approval = effective_skills.write_approval
             && ctx.skill_write_origin != crate::skills::manage::SkillWriteOrigin::BackgroundReview;
         let approval_required =
             config_requires_approval || crate::engine::interrupt::pre_resolved_interrupt_pending();
@@ -66,23 +104,164 @@ impl Tool for SkillManageTool {
                 args.action, args.name
             )));
         }
+        // The plan is now immutable and identifies one configured writable
+        // root. Establish its `ReadWrite` policy before any approval can
+        // park. The ready native handoff remains distinct from the eventual
+        // mutation approval and is atomically composed with it at the final
+        // no-await boundary below.
+        let mutation_root = crate::tools::sandbox::check_native_access(
+            ctx,
+            service.prepared_mutation_root(&prepared),
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        )
+        .await?;
         if approval_required && !approve_write(&args, ctx).await? {
             return Ok(ToolOutput::text(format!(
                 "Skill {:?} for `{}` was not approved; nothing changed.",
                 args.action, args.name
             )));
         }
-        let result = SkillMutationService::new(&ctx.cwd, &extended.skills)
-            .with_origin(ctx.skill_write_origin)
-            .with_db(&ctx.session.db)
-            .apply(&args)
-            .await?;
+        // Reconstruct the exact mutation commitment immediately before the
+        // only service entry point that can alter a skill package.  The
+        // approval candidate carries this same digest, so an approved prompt
+        // for one body, root, support path, or consolidation target cannot be
+        // reused for another mutation with the same action and skill name.
+        let concrete_effects = skill_mutation_final_effects(&args, &mutation_root)?;
+        crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+            "skill_manage_mutation",
+            &concrete_effects,
+        )
+        .await?;
+        // `apply_prepared` is synchronous by construction and begins with
+        // its selected mutation. Ledger/bookkeeping is intentionally deferred
+        // until that mutation has committed.
+        let result = service.apply_prepared(&prepared)?;
+        service.record_post_mutation(&prepared, &result).await;
         Ok(ToolOutput::text(result.message))
     }
 }
 
+/// Resolve the roots that `SkillMutationService::prepare` can actually touch,
+/// establish native read policy for each, and return a semantically equivalent
+/// config whose paths are the syscall-effective spellings that were checked.
+///
+/// `scan_dirs` remains distinct from `external_dirs`: the latter participates
+/// in discovery only and must never become writable merely because it was
+/// normalized for the preflight traversal.
+async fn checked_skill_preflight_config(
+    ctx: &ToolCtx,
+    skills: &crate::config::extended::SkillsConfig,
+) -> Result<(crate::config::extended::SkillsConfig, Vec<PathBuf>)> {
+    let all_service = SkillMutationService::new(&ctx.cwd, skills);
+    let all_roots = all_service.preflight_scan_roots();
+
+    let mut writable_only = skills.clone();
+    writable_only.external_dirs.clear();
+    let writable_roots: HashSet<PathBuf> =
+        SkillMutationService::new(&ctx.cwd, &writable_only)
+            .preflight_scan_roots()
+            .into_iter()
+            .collect();
+
+    let mut effective = skills.clone();
+    effective.scan_dirs.clear();
+    effective.external_dirs.clear();
+    // The roots below are already fully expanded, including any ancestor
+    // walk. Re-expanding them could silently add a path that was never passed
+    // through native access policy.
+    effective.ancestor_walk = false;
+
+    let mut checked_roots = Vec::with_capacity(all_roots.len());
+    for root in all_roots {
+        // Classify before canonicalization: a configured writable root may be
+        // a symlink, so its checked effective spelling need not compare equal
+        // to the original config value.
+        let is_writable_root = writable_roots.contains(&root);
+        let root = crate::tools::sandbox::check_native_access(
+            ctx,
+            &root,
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        )
+        .await?;
+        if is_writable_root {
+            effective.scan_dirs.push(root.display().to_string());
+        } else {
+            effective.external_dirs.push(root.display().to_string());
+        }
+        checked_roots.push(root);
+    }
+    Ok((effective, checked_roots))
+}
+
 fn requires_prior_view(action: SkillManageAction) -> bool {
     !matches!(action, SkillManageAction::Create)
+}
+
+/// Domain-separated commitment to every typed field that reaches
+/// [`SkillMutationService::apply`].  The canonical wire value deliberately
+/// uses `SkillManageArgs`' action-specific `params` serializer: it includes
+/// every semantic mutation input and excludes impossible inactive-arm fields.
+///
+/// The durable host-approval record retains this commitment rather than the
+/// source content, description, root, or support path in plaintext.
+fn skill_mutation_payload_digest(args: &SkillManageArgs) -> Result<String> {
+    let payload = serde_json::to_value(args)?;
+    let canonical = crate::agent_tree::canonical_json_bytes(&payload)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"flycockpit.skill-manage-approval.v1\0");
+    hasher.update(canonical);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The exact effect shape persisted in the selected approval candidate and
+/// reconstructed at the final mutation boundary.  Keep the payload digest in
+/// this *effect*, rather than only in surrounding operation metadata: the
+/// durable handoff matcher authorizes one selected candidate effect at a
+/// time.
+fn skill_mutation_execute_payload(args: &SkillManageArgs, payload_digest: &str) -> Value {
+    serde_json::json!({
+        "action": args.action.as_str(),
+        "skill_name": &args.name,
+        "payload_digest": payload_digest,
+    })
+}
+
+fn skill_mutation_execute_effect(args: &SkillManageArgs) -> Result<Value> {
+    let payload_digest = skill_mutation_payload_digest(args)?;
+    Ok(serde_json::json!({
+        "execute": skill_mutation_execute_payload(args, &payload_digest),
+    }))
+}
+
+/// The final irreversible skill mutation needs both independent authorities:
+/// the exact syscall-effective writable root and the exact typed mutation
+/// payload. The host effect scope claims each matching ready capability in
+/// this one fence, then `apply_prepared` runs without an await.
+fn skill_mutation_final_effects(
+    args: &SkillManageArgs,
+    root: &std::path::Path,
+) -> Result<[Value; 2]> {
+    Ok([
+        crate::tools::sandbox::native_access_effect(
+            root,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        ),
+        skill_mutation_execute_effect(args)?,
+    ])
+}
+
+fn skill_mutation_approval_operation_input(args: &SkillManageArgs) -> Result<Value> {
+    let payload_digest = skill_mutation_payload_digest(args)?;
+    let execute = skill_mutation_execute_payload(args, &payload_digest);
+    Ok(serde_json::json!({
+        "action": args.action.as_str(),
+        "skill_name": &args.name,
+        "payload_digest": payload_digest,
+        "candidate_effects": [
+            {"selection": "approve", "execute": execute},
+            {"selection": "reject", "effect": "deny"}
+        ],
+    }))
 }
 
 async fn approve_write(args: &SkillManageArgs, ctx: &ToolCtx) -> Result<bool> {
@@ -118,15 +297,24 @@ async fn approve_write(args: &SkillManageArgs, ctx: &ToolCtx) -> Result<bool> {
         sandbox_escalation: None,
     };
     let description = format!("Skill write: {:?} `{}`", args.action, args.name);
+    let operation_input = skill_mutation_approval_operation_input(args)?;
     loop {
-        let response = crate::engine::interrupt::raise_and_wait(
+        let operation = crate::agent_tree::HostApprovalOperation::new(
+            "skill_manage_mutation",
+            operation_input.clone(),
+        )?;
+        let response = crate::engine::interrupt::raise_and_wait_with_agent_tree(
             &ctx.session.db,
             &ctx.interrupts,
             ctx.session.id,
             &ctx.agent_id,
+            ctx.agent_instance_id,
             &description,
             InterruptQuestionSet {
                 questions: vec![question.clone()],
+            },
+            crate::agent_tree::HostDecisionSubject::HostApproval {
+                operation,
             },
             "skill write approval",
         )
@@ -307,6 +495,23 @@ mod tests {
         );
     }
 
+    fn apply_test_config_with_external_dir(
+        ctx: &mut ToolCtx,
+        root: &std::path::Path,
+        external_dir: &std::path::Path,
+        write_approval: Option<bool>,
+    ) {
+        let mut config = extended_with_skills_root(root, write_approval);
+        config.skills.external_dirs = vec![external_dir.to_string_lossy().into_owned()];
+        ctx.config = crate::daemon::session_worker::SessionConfigHandle::detached(
+            crate::daemon::session_worker::SessionConfigSnapshot::new(
+                0,
+                crate::config::providers::ProvidersConfig::default(),
+                config,
+            ),
+        );
+    }
+
     fn ctx_with_interrupt_hub(
         cwd: &std::path::Path,
         root: &std::path::Path,
@@ -398,6 +603,7 @@ mod tests {
             .unwrap()
             .expect("parked skill approval row");
         crate::engine::interrupt::PreResolvedInterruptQuestion {
+            agent_instance_id: row.agent_instance_id,
             agent: row.agent_id,
             description: row.description,
             questions: row.questions.expect("parked skill approval question set"),
@@ -436,6 +642,7 @@ mod tests {
             sandbox_escalation: None,
         };
         crate::engine::interrupt::PreResolvedInterruptQuestion {
+            agent_instance_id: ctx.agent_instance_id,
             agent: ctx.agent_id.clone(),
             description: format!("Skill write: {:?} `{}`", args.action, args.name),
             questions: InterruptQuestionSet {
@@ -581,6 +788,112 @@ mod tests {
     }
 
     #[test]
+    fn approved_candidate_rejects_every_altered_skill_mutation_payload() {
+        // The database host-effect fence compares a selected candidate's
+        // concrete `execute` member structurally.  This ratchets the
+        // skill_manage side of that contract: each action-specific field that
+        // can reach SkillMutationService::apply must change the candidate
+        // effect and therefore be rejected after a user approved a different
+        // mutation.
+        let create = SkillManageArgs {
+            action: SkillManageAction::Create,
+            name: "approval-binding".to_string(),
+            description: Some("Original description".to_string()),
+            content: Some("Original body".to_string()),
+            category: Some("original-category".to_string()),
+            root: Some("/original-root".to_string()),
+            path: None,
+            absorbed_into: None,
+        };
+        let delete = SkillManageArgs {
+            action: SkillManageAction::Delete,
+            name: "approval-binding".to_string(),
+            description: None,
+            content: None,
+            category: None,
+            root: None,
+            path: None,
+            absorbed_into: Some("original-umbrella".to_string()),
+        };
+        let remove_file = SkillManageArgs {
+            action: SkillManageAction::RemoveFile,
+            name: "approval-binding".to_string(),
+            description: None,
+            content: None,
+            category: None,
+            root: None,
+            path: Some("references/original.md".to_string()),
+            absorbed_into: None,
+        };
+
+        let mut altered_description = create.clone();
+        altered_description.description = Some("Altered description".to_string());
+        let mut altered_content = create.clone();
+        altered_content.content = Some("Altered body".to_string());
+        let mut altered_category = create.clone();
+        altered_category.category = Some("altered-category".to_string());
+        let mut altered_root = create.clone();
+        altered_root.root = Some("/altered-root".to_string());
+        let mut altered_absorbed_into = delete.clone();
+        altered_absorbed_into.absorbed_into = Some("altered-umbrella".to_string());
+        let mut altered_path = remove_file.clone();
+        altered_path.path = Some("references/altered.md".to_string());
+
+        let cases = [
+            ("description", create.clone(), altered_description),
+            ("content", create.clone(), altered_content),
+            ("category", create.clone(), altered_category),
+            ("root", create, altered_root),
+            ("absorbed_into", delete, altered_absorbed_into),
+            ("path", remove_file, altered_path),
+        ];
+        for (field, approved, altered) in cases {
+            let operation = skill_mutation_approval_operation_input(&approved).unwrap();
+            let candidate = operation["candidate_effects"][0].clone();
+            let approved_effect = skill_mutation_execute_effect(&approved).unwrap();
+            let altered_effect = skill_mutation_execute_effect(&altered).unwrap();
+
+            assert_eq!(candidate.get("execute"), approved_effect.get("execute"));
+            assert_eq!(
+                operation["payload_digest"],
+                candidate["execute"]["payload_digest"],
+                "the selected candidate, not only surrounding operation metadata, binds {field}"
+            );
+            assert!(
+                candidate
+                    .pointer("/execute/payload_digest")
+                    .and_then(Value::as_str)
+                    .is_some_and(|digest| digest.len() == 64),
+                "approved {field} candidate carries the full-payload commitment"
+            );
+            assert_ne!(
+                candidate.get("execute"),
+                altered_effect.get("execute"),
+                "an approved mutation must reject altered {field} at the final host boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn every_skill_mutation_action_fences_native_root_and_exact_payload_together() {
+        let root = std::path::Path::new("/checked-skill-root");
+        for action in SkillManageAction::ALL {
+            let args: SkillManageArgs =
+                serde_json::from_value(minimal_args_for(action)).unwrap();
+            let effects = skill_mutation_final_effects(&args, root).unwrap();
+            assert_eq!(
+                effects[0],
+                crate::tools::sandbox::native_access_effect(
+                    root,
+                    crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+                ),
+                "{action:?} must not mutate without the checked native root"
+            );
+            assert_eq!(effects[1], skill_mutation_execute_effect(&args).unwrap());
+        }
+    }
+
+    #[test]
     fn terse_and_defensive_arms_agree_on_shape() {
         assert_eq!(
             strip_descriptions(&skill_manage_schema(false)),
@@ -695,6 +1008,81 @@ mod tests {
             .call(create_value(name), &ctx)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_scan_root_requires_native_read_access_before_skill_preflight() {
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(external.path().join("shared-skill")).unwrap();
+        std::fs::write(
+            external.path().join("shared-skill/SKILL.md"),
+            "---\nname: shared-skill\ndescription: Shared\n---\n\nRead only.\n",
+        )
+        .unwrap();
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(workspace.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let writable = workspace.path().join("skills");
+            let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(workspace.path());
+            apply_test_config_with_external_dir(&mut ctx, &writable, external.path(), Some(false));
+            ctx.approver = None;
+            ctx.session
+                .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
+
+            let error = SkillManageTool
+                .call(create_value("must-not-preflight"), &ctx)
+                .await
+                .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("outside the session boundary and cannot be approved"),
+                "{error:#}"
+            );
+            assert!(!writable.join("must-not-preflight/SKILL.md").exists());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn external_scan_root_is_read_only_and_internal_roots_do_not_prompt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let policy = crate::config::trust::WorkspaceTrustPolicy {
+            root: crate::config::trust::resolve_trust_root(workspace.path()).unwrap(),
+            mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+        };
+        crate::config::trust::scope_workspace_trust_policy(policy, async {
+            let writable = workspace.path().join("skills");
+            let (mut ctx, _db) = crate::tools::common::test_ctx_with_db(workspace.path());
+            apply_test_config_with_external_dir(&mut ctx, &writable, external.path(), Some(false));
+
+            let output = SkillManageTool
+                .call(create_value("native-root-ok"), &ctx)
+                .await
+                .unwrap();
+            assert!(output.content.contains("Created skill"));
+            assert!(writable.join("native-root-ok/SKILL.md").is_file());
+            assert!(!external.path().join("native-root-ok/SKILL.md").exists());
+
+            let internal = workspace.path().join("internal-skills");
+            let (mut headless, _db) = crate::tools::common::test_ctx_with_db(workspace.path());
+            apply_test_config(&mut headless, &internal, Some(false));
+            headless.approver = None;
+            headless
+                .session
+                .set_approval_mode(crate::config::extended::ApprovalMode::Manual);
+            SkillManageTool
+                .call(create_value("in-boundary-no-prompt"), &headless)
+                .await
+                .unwrap();
+            assert!(internal.join("in-boundary-no-prompt/SKILL.md").is_file());
+        })
+        .await;
     }
 
     #[tokio::test]

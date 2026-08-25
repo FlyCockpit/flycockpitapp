@@ -2231,7 +2231,9 @@ mod tests {
         assert_eq!(approver.approval_mode(), ApprovalMode::Auto);
         assert!(!approver.yolo_mode());
         assert!(
-            !approver.auto_allows("bash", "rm -rf /").await,
+            !approver
+                .auto_allows(crate::agent_tree::HostEffectClass::Destructive, "rm -rf /")
+                .await,
             "Auto without guard model must fail closed"
         );
         s.clear_invocation_approval_override();

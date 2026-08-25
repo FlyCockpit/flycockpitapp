@@ -17,6 +17,260 @@ mod schedule;
 mod skills_preflight;
 mod turn_loop;
 
+/// `run_user_input` deliberately returns `Ok(())` after it has cleaned up a
+/// cancellation or terminal inference failure.  The late-steer receipt is a
+/// stricter boundary: neither a cancellation before the dispatch permit, a
+/// cancellation after a provider stream started, nor a terminal model failure
+/// may be converted into the durable `completed` transition.
+#[tokio::test]
+async fn late_steer_noncompletion_outcomes_never_complete_a_queued_receipt() {
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    let cases = [
+        (
+            "cancelled before provider dispatch",
+            LateUserSteerContinuationOutcome::Cancelled,
+        ),
+        (
+            "cancelled during provider stream",
+            LateUserSteerContinuationOutcome::Cancelled,
+        ),
+        (
+            "terminal model failure",
+            LateUserSteerContinuationOutcome::failed("provider unavailable"),
+        ),
+    ];
+
+    for (case, outcome) in cases {
+        let queue_item_id = uuid::Uuid::new_v4();
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        driver.pending_late_user_steer_acks.insert(
+            queue_item_id,
+            PendingLateUserSteerAck {
+                agent_instance_id: uuid::Uuid::new_v4(),
+                steer_id: uuid::Uuid::new_v4(),
+                continuation_id: uuid::Uuid::new_v4(),
+                recovery_epoch: uuid::Uuid::new_v4(),
+                respond_to,
+            },
+        );
+
+        driver
+            .finish_late_steer_deliveries(&[queue_item_id], outcome.clone())
+            .await;
+
+        assert_eq!(
+            response.await.expect("queued late steer must receive an outcome"),
+            outcome,
+            "{case} must retain the accepted checkpoint instead of completing it"
+        );
+    }
+}
+
+/// A recovery endpoint is deliberately publishable before the worker consumes
+/// its durable claim, but its executor must remain inert through that crash
+/// window.  This exercises the shared barrier used by root, foreground,
+/// noninteractive, batch, and recursive recovery paths.
+#[tokio::test]
+async fn recovery_activation_gate_blocks_until_claim_and_abort_never_executes() {
+    let gate = RecoveryActivationGate::new();
+    let (executed_tx, mut executed_rx) = tokio::sync::oneshot::channel();
+    let waiting_gate = gate.clone();
+    tokio::spawn(async move {
+        waiting_gate.wait().await.unwrap();
+        let _ = executed_tx.send(());
+    });
+
+    // Let the executor register its wait.  Publishing an endpoint alone is
+    // not a claim acknowledgement and therefore cannot start work.
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        executed_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    gate.release();
+    executed_rx.await.unwrap();
+
+    let aborted = RecoveryActivationGate::new();
+    aborted.abort();
+    aborted.release();
+    assert!(aborted.wait().await.is_err());
+}
+
+/// An accepted interactive steer can park on a later QuestionTool after its
+/// provider handoff. On restart the task snapshot still contains the pre-tool
+/// prompt, so recovery must bind the exact accepted receipt to the frame and
+/// let the parked replay supply the only post-question continuation. In
+/// particular, `ResumeAccepted…` must not queue that stale prompt as a second
+/// user turn.
+#[tokio::test]
+async fn recovered_parked_interactive_late_steer_restores_one_permit_without_queueing_stale_prompt() {
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    let owner = uuid::Uuid::new_v4();
+    let steer_id = uuid::Uuid::new_v4();
+    let continuation_id = uuid::Uuid::new_v4();
+    let recovery_epoch = uuid::Uuid::new_v4();
+    driver.set_root_agent_instance_id(owner);
+    let permit = LateUserSteerPermitIdentity {
+        agent_instance_id: owner,
+        steer_id,
+        continuation_id,
+        recovery_epoch,
+    };
+    driver.recovered_interactive_late_steer_continuations.insert(
+        owner,
+        RecoveredInteractiveLateSteerContinuation {
+            permit,
+            continuation_id,
+            next_prompt: Message::user("stale accepted user body"),
+            has_parked_continuation: true,
+            pending_response: None,
+        },
+    );
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let input_queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (respond_to, mut response) = tokio::sync::oneshot::channel();
+    let checkpoint = serde_json::json!({
+        "version": 1,
+        "steer_id": steer_id,
+        "continuation_id": continuation_id,
+        "agent_instance_id": owner,
+    })
+    .to_string();
+
+    driver
+        .resume_recovered_interactive_late_steer(
+            owner,
+            steer_id,
+            continuation_id,
+            recovery_epoch,
+            &checkpoint,
+            respond_to,
+            &input_queue,
+        )
+        .await;
+    assert!(
+        driver.recovered_interactive_continuations.is_empty(),
+        "the pre-question snapshot prompt must never be scheduled"
+    );
+    assert!(
+        driver.pending_late_user_steer_acks.is_empty(),
+        "the parked replay, not ResumeAccepted, owns the receipt handoff"
+    );
+    assert!(matches!(
+        response.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+
+    driver
+        .restore_recovered_parked_late_steer(owner)
+        .expect("parked replay restores the accepted permit");
+    driver
+        .restore_recovered_parked_late_steer(owner)
+        .expect("a duplicate replay must not recreate a second receipt");
+    assert!(
+        driver.recovered_interactive_late_steer_continuations.is_empty(),
+        "the parked phase has been consumed exactly once"
+    );
+    assert_eq!(driver.pending_late_user_steer_acks.len(), 1);
+    let restored = driver
+        .stack
+        .last()
+        .and_then(|frame| frame.late_user_steer_permit);
+    assert_eq!(restored, Some(permit));
+    let pending = driver
+        .pending_late_user_steer_acks
+        .values()
+        .next()
+        .expect("one recovered receipt");
+    assert_eq!(pending.agent_instance_id, owner);
+    assert_eq!(pending.steer_id, steer_id);
+    assert_eq!(pending.continuation_id, continuation_id);
+    assert_eq!(pending.recovery_epoch, recovery_epoch);
+}
+
+/// The root has no task-child snapshot to reattach. Its accepted late-steer
+/// checkpoint must therefore restore the exact root frame first, remain parked
+/// through the later decision, and create exactly the one continuation receipt
+/// when that decision is replayed.
+#[tokio::test]
+async fn recovered_parked_root_late_steer_uses_its_durable_checkpoint_once() {
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    let root = uuid::Uuid::new_v4();
+    let steer_id = uuid::Uuid::new_v4();
+    let continuation_id = uuid::Uuid::new_v4();
+    let recovery_epoch = uuid::Uuid::new_v4();
+    driver.set_root_agent_instance_id(root);
+    let history = vec![Message::user("pre-accept root history")];
+    let next_prompt = Message::user("pre-question root continuation");
+    let snapshot = serde_json::json!({
+        "version": 1,
+        "agent_instance_id": root,
+        "history": &history,
+        "next_prompt": &next_prompt,
+        "late_user_steer_continuation_id": continuation_id,
+        "parked_interrupt_id": uuid::Uuid::new_v4(),
+    })
+    .to_string();
+    let permit = RecoveredLateUserSteerPermit {
+        steer_id,
+        continuation_id,
+        recovery_epoch,
+    };
+    driver
+        .restore_root_late_user_steer_continuation(root, permit, &snapshot, true)
+        .expect("root must restore only its exact accepted durable snapshot");
+    assert_eq!(driver.stack.first().expect("root frame").history, history);
+
+    let (updates_tx, _updates_rx) = tokio::sync::watch::channel(Vec::new());
+    let input_queue = crate::engine::message::UserSubmissionQueue::new(updates_tx);
+    let (respond_to, mut response) = tokio::sync::oneshot::channel();
+    let checkpoint = serde_json::json!({
+        "version": 1,
+        "steer_id": steer_id,
+        "continuation_id": continuation_id,
+        "agent_instance_id": root,
+    })
+    .to_string();
+    driver
+        .resume_recovered_interactive_late_steer(
+            root,
+            steer_id,
+            continuation_id,
+            recovery_epoch,
+            &checkpoint,
+            respond_to,
+            &input_queue,
+        )
+        .await;
+    assert!(driver.recovered_interactive_continuations.is_empty());
+    assert!(matches!(
+        response.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+
+    driver
+        .restore_recovered_parked_late_steer(root)
+        .expect("the resolved parked root decision restores one permit");
+    driver
+        .restore_recovered_parked_late_steer(root)
+        .expect("a duplicate root replay cannot create another receipt");
+    assert!(driver.recovered_interactive_late_steer_continuations.is_empty());
+    assert_eq!(driver.pending_late_user_steer_acks.len(), 1);
+    assert_eq!(
+        driver
+            .stack
+            .first()
+            .expect("root frame")
+            .late_user_steer_permit,
+        Some(LateUserSteerPermitIdentity {
+            agent_instance_id: root,
+            steer_id,
+            continuation_id,
+            recovery_epoch,
+        })
+    );
+}
+
 fn test_provider_base_url() -> String {
     static PROVIDER: std::sync::OnceLock<&'static ScriptedProvider> = std::sync::OnceLock::new();
     PROVIDER
@@ -797,10 +1051,12 @@ fn push_test_child(driver: &mut Driver, history: Vec<Message>) {
             "default",
         ),
         agent: child,
+        agent_instance_id: None,
         history,
         answering: None,
         deferred_log: crate::engine::deferred::DeferredLog::new(),
         fallback_decision: None,
+        recovery_activation: None,
         _vnext_child_admission: None,
         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
     });
@@ -861,6 +1117,7 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
             "default",
         ),
         agent: Arc::new(child),
+        agent_instance_id: None,
         history: vec![],
         answering: Some(PendingTaskCall {
             call_id: call_id.to_string(),
@@ -870,6 +1127,7 @@ fn push_answering_child(driver: &mut Driver, call_id: &str, function_call_id: &s
         }),
         deferred_log: crate::engine::deferred::DeferredLog::new(),
         fallback_decision: None,
+        recovery_activation: None,
         _vnext_child_admission: None,
         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
     });

@@ -82,8 +82,15 @@ impl Tool for SearchTool {
         // gates the requested root/file before search reads any contents, so
         // an out-of-boundary tree stops at the first denial instead of
         // prompting per file.
-        crate::tools::sandbox::check_native_access(
+        let search_path = crate::tools::sandbox::check_native_access(
             ctx,
+            &search_path,
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        )
+        .await?;
+        // `metadata` is the first post-approval host access. Fence the exact
+        // checked target before it can reveal or branch on filesystem state.
+        crate::tools::sandbox::recheck_native_access_effect_boundary(
             &search_path,
             crate::tools::shell_sandbox::SandboxPathAccess::Read,
         )
@@ -120,6 +127,15 @@ impl Tool for SearchTool {
         {
             return Ok(refusal);
         }
+
+        // The gitignore gate can park while its own repository probes run.
+        // Recheck the original requested access after that gate and directly
+        // before the blocking walker reads the target tree.
+        crate::tools::sandbox::recheck_native_access_effect_boundary(
+            requested_file.as_deref().unwrap_or(&guard_root),
+            crate::tools::shell_sandbox::SandboxPathAccess::Read,
+        )
+        .await?;
 
         let options = SearchOptions {
             pattern: pattern.to_string(),

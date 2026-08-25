@@ -100,7 +100,10 @@ pub(crate) async fn authorize_monty_native_call(
     let label = format!("`{}` via cockpit MCP {}", tool.name(), args);
     let decision = if let Some(approver) = ctx.approver.as_ref() {
         approver
-            .authorize(crate::approval::AuthorizationRequest::NativeTool { label: &label })
+            .authorize(crate::approval::AuthorizationRequest::NativeTool {
+                label: &label,
+                input: args,
+            })
             .await?
     } else {
         crate::approval::Decision::NoninteractiveDeny
@@ -211,6 +214,36 @@ async fn fire_permission_denied_hook(
 }
 
 pub(crate) async fn execute_ordinary_call(
+    env: &DispatchEnv<'_>,
+    history: &mut Vec<Message>,
+    tc: &ToolCall,
+    resolved_name: &str,
+    name_recovery: Recovery,
+    text_recovery_marker: Option<Recovery>,
+) -> Result<()> {
+    // Approval gates run before `dispatch_one_timed`, while the concrete tool
+    // call gets its own nested boundary inside the timeout wrapper. The outer
+    // scope owns approvals raised by loop/safety/btw gates and receives the
+    // actual `ToolOutput` outcome below; the inner scope owns approvals raised
+    // from within the tool itself. Without this enclosing scope a gate could
+    // consume a host approval before any effect boundary existed to own it.
+    crate::engine::interrupt::with_host_approval_effect_scope(
+        "ordinary_tool_dispatch_gate",
+        env.ctx.cancel.clone(),
+        execute_ordinary_call_unscoped(
+            env,
+            history,
+            tc,
+            resolved_name,
+            name_recovery,
+            text_recovery_marker,
+        ),
+        |_| None,
+    )
+    .await
+}
+
+async fn execute_ordinary_call_unscoped(
     env: &DispatchEnv<'_>,
     history: &mut Vec<Message>,
     tc: &ToolCall,
@@ -707,7 +740,10 @@ pub(crate) async fn execute_ordinary_call(
             let label = format!("`{resolved_name}` in /btw side conversation");
             let decision = if let Some(approver) = env.ctx.approver.as_ref() {
                 approver
-                    .authorize(crate::approval::AuthorizationRequest::NativeTool { label: &label })
+                    .authorize(crate::approval::AuthorizationRequest::NativeTool {
+                        label: &label,
+                        input: &args,
+                    })
                     .await?
             } else {
                 crate::approval::Decision::NoninteractiveDeny
@@ -819,6 +855,24 @@ pub(crate) async fn execute_ordinary_call(
             .unwrap_or_else(|| format!("`{resolved_name}` arguments failed schema validation"));
         (Err(invalid_input(msg)), 0)
     };
+    // This is the outer approval scope's exact effect outcome. The nested
+    // timeout scope has already completed any approval raised *inside* the
+    // tool; this records the result for approvals raised by the loop/safety/
+    // btw gates before that tool boundary existed. A pre-dispatch refusal is
+    // definitively rejected. An execution error deliberately remains unset so
+    // the outer scope records submission-unknown rather than guessing whether
+    // an external command/MCP call crossed its boundary before failing.
+    match &result {
+        Ok(output) if tool_was_dispatched => {
+            crate::engine::interrupt::record_host_approval_effect_boundary_outcome(
+                output.exit_code.is_none_or(|code| code == 0),
+            );
+        }
+        Err(_) if !tool_was_dispatched => {
+            crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+        }
+        Ok(_) | Err(_) => {}
+    }
     if result
         .as_ref()
         .is_err_and(crate::engine::interrupt::is_parked)
@@ -2204,6 +2258,7 @@ mod tests {
     ) -> ToolCtx {
         ToolCtx {
             agent_id: "Build".to_string(),
+            agent_instance_id: None,
             lock_identity: "Build".to_string().clone(),
             write_scope: None,
             current_tool_call_id: None,
@@ -2533,6 +2588,7 @@ mod tests {
             .unwrap()
             .expect("parked interrupt row");
         crate::engine::interrupt::PreResolvedInterruptQuestion {
+            agent_instance_id: row.agent_instance_id,
             agent: row.agent_id,
             description: row.description,
             questions: row.questions.expect("parked interrupt question set"),

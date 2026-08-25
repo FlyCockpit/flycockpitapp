@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context as _;
 use crate::sync::lock_or_recover;
 
 use tokio::sync::oneshot;
@@ -59,8 +60,755 @@ tokio::task_local! {
     static CURRENT_PRE_RESOLVED_INTERRUPTS: RefCell<PreResolvedInterrupts>;
 }
 
+// An approved host operation is not a plain boolean.  The parked approval
+// continuation hands a typed, exact operation capability to the enclosing
+// production tool-effect boundary.  That boundary owns the definitive
+// success/rejection receipt; dropping the scope because of cancellation,
+// timeout, or a task panic records submission-unknown rather than leaving a
+// replayable approval behind.
+tokio::task_local! {
+    static CURRENT_HOST_APPROVAL_HANDOFFS: RefCell<HostApprovalEffectScope>;
+}
+
+struct HostApprovalEffectScope {
+    handoffs: Vec<HostApprovalEffectHandoff>,
+    /// Stable name of the actual host-effect boundary that owns every
+    /// capability registered in this task-local scope.  It is selected by the
+    /// concrete dispatcher, never by the prompt or resolver, and becomes part
+    /// of the durable completion receipt for audit/reconciliation.
+    boundary: &'static str,
+    /// Every cancellation generation that encloses this concrete effect.
+    /// Nested effect wrappers are not independent host-effect owners: they
+    /// share the same handoffs, so dropping an inner token used to let an
+    /// outer successful result publish `succeeded` after the inner backend
+    /// boundary had been cancelled. Keep *all* generations and make any one
+    /// of them terminally win until the common outermost owner writes the
+    /// receipt.
+    cancellations: Vec<tokio_util::sync::CancellationToken>,
+    /// The exact boundary can override the wrapper's result classifier when
+    /// its public return type does not preserve the real effect outcome (for
+    /// example ordinary dispatch records a `ToolOutput` before it returns its
+    /// broader audit result). `None` is deliberately conservative: a dropped
+    /// or erroring boundary becomes submission-unknown.
+    outcome: Option<bool>,
+}
+
+#[derive(Debug)]
+struct HostApprovalEffectHandoff {
+    db: crate::db::Db,
+    /// The same real QuestionTool continuation that settled the operation.
+    /// A ready/dispatching database row alone is not sufficient authority to
+    /// reach an effect boundary after recovery.
+    authority: crate::agent_tree::HostApprovalAuthority,
+    session_id: Uuid,
+    agent_instance_id: Uuid,
+    interrupt_id: Uuid,
+    operation_id: Uuid,
+    operation_kind: String,
+    canonical_input_json: String,
+    input_digest: String,
+    /// Set only after the durable final-dispatch claim succeeds. Until then
+    /// this is a ready capability, not permission to touch the host; dropping
+    /// it records a known not-submitted rejection rather than an ambiguous
+    /// external handoff.
+    claimed: bool,
+    terminalized: bool,
+}
+
+impl HostApprovalEffectHandoff {
+    fn new(
+        db: crate::db::Db,
+        authority: crate::agent_tree::HostApprovalAuthority,
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        interrupt_id: Uuid,
+        operation: crate::agent_tree::HostApprovalOperation,
+    ) -> Self {
+        Self {
+            db,
+            authority,
+            session_id,
+            agent_instance_id,
+            interrupt_id,
+            operation_id: operation.operation_id,
+            operation_kind: operation.operation_kind,
+            canonical_input_json: operation.canonical_input_json,
+            input_digest: operation.input_digest,
+            claimed: false,
+            terminalized: false,
+        }
+    }
+
+    fn db_authority(
+        &self,
+    ) -> anyhow::Result<crate::db::agent_tree_decisions::HostApprovalAuthority> {
+        self.authority.db_for_effect_handoff(
+            self.session_id,
+            self.agent_instance_id,
+            self.interrupt_id,
+        )
+    }
+
+    async fn claim_at_effect_boundary(
+        &mut self,
+        concrete_effects_json: String,
+    ) -> crate::db::agent_tree_decisions::HostApprovalEffectFence {
+        if self.claimed {
+            // A single selected operation can contain an ordered persistent
+            // mutation plus its external execution. The first one already
+            // made this operation irrevocable, but a later concrete boundary
+            // must still prove it is another exact member of that *same*
+            // selected candidate; a claimed path grant cannot become generic
+            // permission for an unrelated command in the shared scope.
+            let Ok(authority) = self.db_authority() else {
+                return crate::db::agent_tree_decisions::HostApprovalEffectFence::NotLive;
+            };
+            return if self
+                .db
+                .claimed_host_approval_effect_handoff_matches_candidate(
+                    authority,
+                    self.interrupt_id,
+                    self.session_id,
+                    self.agent_instance_id,
+                    self.operation_id,
+                    self.operation_kind.clone(),
+                    self.canonical_input_json.clone(),
+                    self.input_digest.clone(),
+                    concrete_effects_json,
+                )
+                .await
+                .unwrap_or(false)
+            {
+                crate::db::agent_tree_decisions::HostApprovalEffectFence::Claimed
+            } else {
+                crate::db::agent_tree_decisions::HostApprovalEffectFence::DifferentCandidate
+            };
+        }
+        let Ok(authority) = self.db_authority() else {
+            return crate::db::agent_tree_decisions::HostApprovalEffectFence::NotLive;
+        };
+        let claim = self
+            .db
+            .claim_host_approval_effect_handoff(
+                authority,
+                self.interrupt_id,
+                self.session_id,
+                self.agent_instance_id,
+                self.operation_id,
+                self.operation_kind.clone(),
+                self.canonical_input_json.clone(),
+                self.input_digest.clone(),
+                concrete_effects_json,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+            .unwrap_or(crate::db::agent_tree_decisions::HostApprovalEffectFence::NotLive);
+        if claim == crate::db::agent_tree_decisions::HostApprovalEffectFence::Claimed {
+            self.claimed = true;
+        }
+        claim
+    }
+
+    async fn reject_if_unclaimed(mut self) {
+        if self.claimed {
+            self.mark_submission_unknown().await;
+            return;
+        }
+        let Ok(authority) = self.db_authority() else {
+            return;
+        };
+        let _ = self
+            .db
+            .reject_unclaimed_host_approval_final_operation(
+                authority,
+                self.interrupt_id,
+                self.session_id,
+                self.agent_instance_id,
+                self.operation_id,
+                self.operation_kind.clone(),
+                self.canonical_input_json.clone(),
+                self.input_digest.clone(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await;
+        self.terminalized = true;
+    }
+
+    async fn complete_at_effect_boundary(
+        mut self,
+        boundary: &'static str,
+        succeeded: bool,
+        cancellations: &[tokio_util::sync::CancellationToken],
+    ) {
+        if !self.claimed {
+            self.reject_if_unclaimed().await;
+            return;
+        }
+        // This is the final in-process fence before publishing success or
+        // rejection.  The claim already crossed the irreversible dispatch
+        // boundary, so a cancellation observed here is necessarily ambiguous
+        // and must be submission-unknown rather than a late success receipt.
+        if cancellations
+            .iter()
+            .any(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            self.mark_submission_unknown().await;
+            return;
+        }
+        let receipt = serde_json::json!({
+            "boundary": boundary,
+            "outcome": if succeeded { "completed" } else { "rejected" },
+        })
+        .to_string();
+        let Ok(authority) = self.db_authority() else {
+            self.mark_submission_unknown().await;
+            return;
+        };
+        let completed = self
+            .db
+            .complete_host_approval_final_operation(
+                authority,
+                self.interrupt_id,
+                self.session_id,
+                self.agent_instance_id,
+                self.operation_id,
+                self.operation_kind.clone(),
+                self.canonical_input_json.clone(),
+                self.input_digest.clone(),
+                succeeded,
+                receipt,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await;
+        if !matches!(completed, Ok(true)) {
+            let Ok(authority) = self.db_authority() else {
+                self.terminalized = true;
+                return;
+            };
+            let _ = self
+                .db
+                .mark_host_approval_final_operation_submission_unknown(
+                    authority,
+                    self.interrupt_id,
+                    self.session_id,
+                    self.agent_instance_id,
+                    self.operation_id,
+                    self.operation_kind.clone(),
+                    self.canonical_input_json.clone(),
+                    self.input_digest.clone(),
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await;
+        }
+        self.terminalized = true;
+    }
+
+    async fn mark_submission_unknown(mut self) {
+        if !self.claimed {
+            self.reject_if_unclaimed().await;
+            return;
+        }
+        let Ok(authority) = self.db_authority() else {
+            self.terminalized = true;
+            return;
+        };
+        let _ = self
+            .db
+            .mark_host_approval_final_operation_submission_unknown(
+                authority,
+                self.interrupt_id,
+                self.session_id,
+                self.agent_instance_id,
+                self.operation_id,
+                self.operation_kind.clone(),
+                self.canonical_input_json.clone(),
+                self.input_digest.clone(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await;
+        self.terminalized = true;
+    }
+}
+
+impl Drop for HostApprovalEffectHandoff {
+    fn drop(&mut self) {
+        if self.terminalized {
+            return;
+        }
+        let db = self.db.clone();
+        let authority = self.authority;
+        let session_id = self.session_id;
+        let agent_instance_id = self.agent_instance_id;
+        let interrupt_id = self.interrupt_id;
+        let operation_id = self.operation_id;
+        let operation_kind = self.operation_kind.clone();
+        let canonical_input_json = self.canonical_input_json.clone();
+        let input_digest = self.input_digest.clone();
+        let claimed = self.claimed;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let Ok(db_authority) = authority.db_for_effect_handoff(
+                    session_id,
+                    agent_instance_id,
+                    interrupt_id,
+                ) else {
+                    return;
+                };
+                if claimed {
+                    let _ = db
+                        .mark_host_approval_final_operation_submission_unknown(
+                            db_authority,
+                            interrupt_id,
+                            session_id,
+                            agent_instance_id,
+                            operation_id,
+                            operation_kind,
+                            canonical_input_json,
+                            input_digest,
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await;
+                } else {
+                    let _ = db
+                        .reject_unclaimed_host_approval_final_operation(
+                            db_authority,
+                            interrupt_id,
+                            session_id,
+                            agent_instance_id,
+                            operation_id,
+                            operation_kind,
+                            canonical_input_json,
+                            input_digest,
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await;
+                }
+            });
+        } else {
+            tracing::error!(
+                %session_id,
+                %agent_instance_id,
+                %operation_id,
+                "host approval effect handoff escaped without a runtime for submission-unknown reconciliation"
+            );
+        }
+    }
+}
+
+/// Runs one concrete host-effect `boundary` as the owner of all host-approval
+/// handoffs raised beneath it. `is_success` translates that boundary's own
+/// result shape into a durable success/rejection receipt; `None` preserves the
+/// conservative submission-unknown outcome. An exact boundary whose broader
+/// result type hides its effect result may instead call
+/// [`record_host_approval_effect_boundary_outcome`].
+///
+/// This is generic rather than tied to `ToolOutput`: ordinary tools use their
+/// exit code, while direct host boundaries such as schedule's background
+/// launcher use their own successful completion signal. Keeping both under
+/// this single scope means an approval can never be consumed by a helper and
+/// escape without a concrete owner recording its terminal state.
+pub(crate) async fn with_host_approval_effect_scope<T, F, S>(
+    boundary: &'static str,
+    cancelled: tokio_util::sync::CancellationToken,
+    future: F,
+    is_success: S,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>>,
+    S: Fn(&T) -> Option<bool>,
+{
+    // A nested timeout/native-tool wrapper is not a second host effect.  If
+    // it installed a fresh task-local scope, an approval raised by the outer
+    // pre-dispatch gate would be invisible to the concrete dispatcher and
+    // could cross the boundary without its cancellation/revision recheck.
+    // Reuse the enclosing capability set and upgrade its receipt boundary to
+    // this more concrete owner instead.
+    if CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| {
+            let mut scope = slot.borrow_mut();
+            scope.boundary = boundary;
+            scope.cancellations.push(cancelled.clone());
+        })
+        .is_ok()
+    {
+        // This is an inner, *more concrete* effect boundary.  Reusing the
+        // outer handoff collection is correct, but merely returning its
+        // future used to discard the inner result classifier.  In the common
+        // ordinary-tool shape the outer authorization gate has an opaque
+        // `Result<()>` classifier while the timeout dispatcher below it owns
+        // the definitive `ToolOutput`; losing that classifier downgraded a
+        // successfully claimed operation to `submission_unknown`.
+        //
+        // Publish the exact inner result into the shared scope.  The outermost
+        // scope remains the single terminalizer (so there is no double finish
+        // if several wrappers nest), and its cancellation token still wins
+        // over a result observed after cancellation.  `None` remains
+        // intentionally ambiguous and lets the outer scope use a later,
+        // more-specific classifier if one exists.
+        let result = future.await;
+        if !current_host_approval_effect_scope_is_cancelled()
+            && let Some(succeeded) = result.as_ref().ok().and_then(|output| is_success(output))
+        {
+            record_host_approval_effect_boundary_outcome(succeeded);
+        }
+        return result;
+    }
+    CURRENT_HOST_APPROVAL_HANDOFFS
+        .scope(
+            RefCell::new(HostApprovalEffectScope {
+                handoffs: Vec::new(),
+                boundary,
+                cancellations: vec![cancelled.clone()],
+                outcome: None,
+            }),
+            async move {
+                let result = future.await;
+                let scope = CURRENT_HOST_APPROVAL_HANDOFFS.with(|slot| {
+                    let mut scope = slot.borrow_mut();
+                    HostApprovalEffectScope {
+                        handoffs: std::mem::take(&mut scope.handoffs),
+                        boundary: scope.boundary,
+                        cancellations: std::mem::take(&mut scope.cancellations),
+                        outcome: scope.outcome.take(),
+                    }
+                });
+                let definitive = if scope
+                    .cancellations
+                    .iter()
+                    .any(tokio_util::sync::CancellationToken::is_cancelled)
+                {
+                    None
+                } else {
+                    scope
+                        .outcome
+                        .or_else(|| result.as_ref().ok().and_then(|output| is_success(output)))
+                };
+                for handoff in scope.handoffs {
+                    if !handoff.claimed {
+                        // The enclosing dispatcher returned before any exact
+                        // host boundary claimed this ready capability. No
+                        // effect was submitted, so this is a known rejection,
+                        // not an ambiguous handoff.
+                        handoff.reject_if_unclaimed().await;
+                    } else if let Some(succeeded) = definitive {
+                        handoff
+                            .complete_at_effect_boundary(
+                                scope.boundary,
+                                succeeded,
+                                &scope.cancellations,
+                            )
+                            .await;
+                    } else {
+                        // Cancellation, timeout, panic, or an opaque error
+                        // happened after the final claim. The host may already
+                        // have accepted the effect, so recovery must not replay
+                        // it and records submission-unknown instead.
+                        handoff.mark_submission_unknown().await;
+                    }
+                }
+                result
+            },
+        )
+        .await
+}
+
+fn current_host_approval_effect_scope_is_cancelled() -> bool {
+    CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| {
+            slot.borrow()
+                .cancellations
+                .iter()
+                .any(tokio_util::sync::CancellationToken::is_cancelled)
+        })
+        // No active scope has no registered approval capability, so it is not
+        // a cancellation signal for the standalone/no-op paths.
+        .unwrap_or(false)
+}
+
+fn register_host_approval_effect_handoff(handoff: HostApprovalEffectHandoff) -> bool {
+    CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| slot.borrow_mut().handoffs.push(handoff))
+        .is_ok()
+}
+
+/// Publish the definitive result of the currently-active host effect boundary.
+/// The helper is intentionally scoped, not a global completion API: only the
+/// code executing inside a typed handoff scope can settle the capabilities it
+/// owns. Nested wrappers share one scope so the innermost concrete dispatcher
+/// rechecks and settles the capability that an outer authorization gate
+/// obtained; only the outermost scope publishes a terminal receipt.
+pub(crate) fn record_host_approval_effect_boundary_outcome(succeeded: bool) {
+    let _ = CURRENT_HOST_APPROVAL_HANDOFFS.try_with(|slot| {
+        slot.borrow_mut().outcome = Some(succeeded);
+    });
+}
+
+/// Revalidate every approval capability owned by the current concrete effect
+/// scope immediately before the host crosses its real dispatch boundary.
+///
+/// `consume_host_approval_final_operation` proves the user answered the
+/// exact prompt, but it intentionally happens before the caller returns from
+/// an async approval helper.  A cancellation or agent revision transition can
+/// win in the small interval before a shell, MCP, harness, or filesystem call
+/// begins.  This boundary check is the second fence: stale capabilities are
+/// terminalized as known rejections and never reach the host effect.
+pub(crate) async fn recheck_host_approval_effect_boundary(
+    boundary: &'static str,
+    cancelled: &tokio_util::sync::CancellationToken,
+    concrete_effects: &[serde_json::Value],
+) -> anyhow::Result<()> {
+    // A concrete boundary sometimes contributes its own generation in
+    // addition to the enclosing tool/effect scope (the computer coordinator
+    // is the canonical case).  Do not replace the task-local generations
+    // with that one token: preserve and bind it into the common terminal
+    // scope so an outer cancellation that races this second recheck still
+    // wins over a later success receipt.
+    let cancellations = CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| {
+            let mut scope = slot.borrow_mut();
+            scope.boundary = boundary;
+            scope.cancellations.push(cancelled.clone());
+            scope.cancellations.clone()
+        })
+        .unwrap_or_else(|_| vec![cancelled.clone()]);
+    recheck_host_approval_effect_boundary_for_generations(
+        boundary,
+        &cancellations,
+        concrete_effects,
+    )
+    .await
+}
+
+async fn recheck_host_approval_effect_boundary_for_generations(
+    boundary: &'static str,
+    cancellations: &[tokio_util::sync::CancellationToken],
+    concrete_effects: &[serde_json::Value],
+) -> anyhow::Result<()> {
+    let concrete_effects_json = serde_json::to_string(concrete_effects)
+        .context("serializing concrete host approval effects")?;
+    let handoffs = CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| {
+            let mut scope = slot.borrow_mut();
+            scope.boundary = boundary;
+            std::mem::take(&mut scope.handoffs)
+        })
+        .map_err(|_| anyhow::anyhow!("host approval capability escaped its effect scope"))?;
+    if handoffs.is_empty() {
+        return Ok(());
+    }
+    let mut retained = Vec::with_capacity(handoffs.len());
+    let mut rejected = Vec::new();
+    // A scope can legitimately carry more than one *ready* capability. The
+    // first connect to an external MCP tool is the important example: the
+    // tool-call approval is retained for `tools/call`, while the distinct
+    // server-connect approval crosses the earlier connection boundary.
+    let mut matched_exact_capability = false;
+    for mut handoff in handoffs {
+        let was_claimed = handoff.claimed;
+        let fence = if cancellations
+            .iter()
+            .any(tokio_util::sync::CancellationToken::is_cancelled)
+        {
+            crate::db::agent_tree_decisions::HostApprovalEffectFence::NotLive
+        } else {
+            handoff
+                .claim_at_effect_boundary(concrete_effects_json.clone())
+                .await
+        };
+        match fence {
+            crate::db::agent_tree_decisions::HostApprovalEffectFence::Claimed => {
+                // Both a newly claimed ready handoff and a prior submission
+                // whose selected candidate contains this next effect prove
+                // the exact boundary.  Any sibling handoffs that do not
+                // match stay reserved for their own later boundary.
+                matched_exact_capability = true;
+                retained.push(handoff);
+            }
+            crate::db::agent_tree_decisions::HostApprovalEffectFence::DifferentCandidate => {
+                if was_claimed
+                    && !cancellations
+                        .iter()
+                        .any(tokio_util::sync::CancellationToken::is_cancelled)
+                {
+                    // A scope can own more than one sequential operation
+                    // (for example the gitignore shape selection followed by
+                    // its separately-approved persistence mutation). An
+                    // already-submitted operation is retained for completion,
+                    // but it is not counted as authority for this boundary.
+                    retained.push(handoff);
+                } else {
+                    // Do not consume or reject a different live ready
+                    // capability just because a composed operation reaches
+                    // an earlier boundary first. We still fail closed below
+                    // unless some handoff exactly matches this boundary.
+                    // `NotLive` remains terminal, so cancellation/revision
+                    // and stale handoffs cannot hide behind a matching
+                    // sibling capability.
+                    retained.push(handoff);
+                }
+            }
+            crate::db::agent_tree_decisions::HostApprovalEffectFence::NotLive => {
+                rejected.push(handoff);
+            }
+        }
+    }
+    let rejected_any = !rejected.is_empty();
+    for handoff in rejected {
+        handoff.reject_if_unclaimed().await;
+    }
+    CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| slot.borrow_mut().handoffs.extend(retained))
+        .map_err(|_| anyhow::anyhow!("host approval effect scope disappeared during recheck"))?;
+    if cancellations
+        .iter()
+        .any(tokio_util::sync::CancellationToken::is_cancelled)
+    {
+        anyhow::bail!("host approval effect was cancelled before dispatch");
+    }
+    // If an approval was rejected by the revision/state fence, do not let a
+    // mixed scope dispatch another effect under an unrelated handoff.
+    if rejected_any {
+        anyhow::bail!("host approval capability is no longer live at effect boundary");
+    }
+    // Every concrete boundary needs one exact selected candidate. A live
+    // mismatch is deliberately neither rejected nor treated as authority:
+    // it remains ready for its own boundary, while a mismatched-only scope
+    // fails closed and cannot smuggle that capability into this effect.
+    if !matched_exact_capability {
+        anyhow::bail!("no live host approval capability authorizes this effect boundary");
+    }
+    Ok(())
+}
+
+/// Recheck using the cancellation generation bound to the active opaque
+/// capability. Low-level concrete effect code uses this rather than accepting
+/// an arbitrary token. A standalone utility/test call has no capability to
+/// recheck and remains a no-op.
+pub(crate) async fn recheck_current_host_approval_effect_boundary(
+    boundary: &'static str,
+    concrete_effects: &[serde_json::Value],
+) -> anyhow::Result<()> {
+    let Some(cancellations) = CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| {
+            let mut scope = slot.borrow_mut();
+            scope.boundary = boundary;
+            scope.cancellations.clone()
+        })
+        .ok()
+    else {
+        return Ok(());
+    };
+    recheck_host_approval_effect_boundary_for_generations(
+        boundary,
+        &cancellations,
+        concrete_effects,
+    )
+    .await
+}
+
+/// Revalidate only already-claimed capabilities at a read-only stability
+/// boundary, without consuming a different ready capability that is reserved
+/// for a later irreversible effect.
+///
+/// A write/edit first claims its native path before the initial content read.
+/// It can then await a content approval and a lock before checking that the
+/// source bytes still match.  That stability read must reject a cancelled or
+/// revised *path* approval, but claiming the ready exact-content approval
+/// there would reopen the forbidden claim-to-mutation window.  This helper
+/// keeps the two fences separate: it verifies the claimed access candidate
+/// and leaves unclaimed content candidates for the immediately-adjacent write
+/// boundary.
+pub(crate) async fn recheck_current_claimed_host_approval_effect_boundary(
+    boundary: &'static str,
+    concrete_effects: &[serde_json::Value],
+) -> anyhow::Result<()> {
+    let Some(cancellations) = CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| {
+            let mut scope = slot.borrow_mut();
+            scope.boundary = boundary;
+            scope.cancellations.clone()
+        })
+        .ok()
+    else {
+        return Ok(());
+    };
+    let concrete_effects_json = serde_json::to_string(concrete_effects)
+        .context("serializing concrete host approval effects")?;
+    let handoffs = CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| {
+            let mut scope = slot.borrow_mut();
+            scope.boundary = boundary;
+            std::mem::take(&mut scope.handoffs)
+        })
+        .map_err(|_| anyhow::anyhow!("host approval capability escaped its effect scope"))?;
+    if handoffs.is_empty() {
+        return Ok(());
+    }
+    let cancelled = cancellations
+        .iter()
+        .any(tokio_util::sync::CancellationToken::is_cancelled);
+    let mut retained = Vec::with_capacity(handoffs.len());
+    let mut rejected = Vec::new();
+    let mut had_claimed = false;
+    let mut matched_claimed = false;
+    for mut handoff in handoffs {
+        if !handoff.claimed {
+            // The later write-content approval must remain ready until its
+            // exact mutation boundary. Do not turn this stability check into
+            // a claim or reject it merely because its candidate is different.
+            retained.push(handoff);
+            continue;
+        }
+        had_claimed = true;
+        let fence = if cancelled {
+            crate::db::agent_tree_decisions::HostApprovalEffectFence::NotLive
+        } else {
+            handoff
+                .claim_at_effect_boundary(concrete_effects_json.clone())
+                .await
+        };
+        match fence {
+            crate::db::agent_tree_decisions::HostApprovalEffectFence::Claimed => {
+                matched_claimed = true;
+                retained.push(handoff);
+            }
+            crate::db::agent_tree_decisions::HostApprovalEffectFence::DifferentCandidate => {
+                // This may be a prior sequential submission in the same tool
+                // scope. Retain it for its terminal receipt, but never treat
+                // it as authority for this stability read.
+                retained.push(handoff);
+            }
+            crate::db::agent_tree_decisions::HostApprovalEffectFence::NotLive => {
+                rejected.push(handoff);
+            }
+        }
+    }
+    let rejected_any = !rejected.is_empty();
+    for handoff in rejected {
+        handoff.reject_if_unclaimed().await;
+    }
+    CURRENT_HOST_APPROVAL_HANDOFFS
+        .try_with(|slot| slot.borrow_mut().handoffs.extend(retained))
+        .map_err(|_| anyhow::anyhow!("host approval effect scope disappeared during recheck"))?;
+    if cancelled {
+        anyhow::bail!("host approval effect was cancelled before stability read");
+    }
+    if rejected_any {
+        anyhow::bail!("claimed host approval capability is no longer live at stability read");
+    }
+    if had_claimed && !matched_claimed {
+        anyhow::bail!("claimed host approval capability does not authorize this stability read");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct PreResolvedInterruptQuestion {
+    /// Exact durable executor identity for AgentTree-owned QuestionTool
+    /// replays. This is deliberately distinct from `agent`, which remains a
+    /// human-readable display label and may be shared by recursive children.
+    /// `None` is only for legacy/daemonless interrupt compatibility.
+    pub agent_instance_id: Option<Uuid>,
     pub agent: String,
     pub description: String,
     pub questions: InterruptQuestionSet,
@@ -167,15 +915,22 @@ where
 }
 
 fn take_matching_pre_resolved_interrupt(
+    agent_instance_id: Option<Uuid>,
     agent: &str,
     description: &str,
     questions: &InterruptQuestionSet,
 ) -> Option<(Uuid, ResolveResponse)> {
-    let interrupt_id = matching_pre_resolved_interrupt_id(agent, description, questions)?;
+    let interrupt_id = matching_pre_resolved_interrupt_id(
+        agent_instance_id,
+        agent,
+        description,
+        questions,
+    )?;
     take_pre_resolved_interrupt(interrupt_id).map(|response| (interrupt_id, response))
 }
 
 fn matching_pre_resolved_interrupt_id(
+    agent_instance_id: Option<Uuid>,
     agent: &str,
     description: &str,
     questions: &InterruptQuestionSet,
@@ -183,7 +938,7 @@ fn matching_pre_resolved_interrupt_id(
     CURRENT_PRE_RESOLVED_INTERRUPTS
         .try_with(|slot| {
             let mut state = slot.borrow_mut();
-            let key = question_key(agent, description, questions)?;
+            let key = question_key(agent_instance_id, agent, description, questions)?;
             let occurrence = {
                 let seen = state.seen_questions.entry(key.clone()).or_default();
                 *seen += 1;
@@ -192,7 +947,12 @@ fn matching_pre_resolved_interrupt_id(
             state.answers.iter().find_map(|(interrupt_id, entry)| {
                 let question = entry.question.as_ref()?;
                 (question.occurrence == occurrence
-                    && question_key(&question.agent, &question.description, &question.questions)
+                    && question_key(
+                        question.agent_instance_id,
+                        &question.agent,
+                        &question.description,
+                        &question.questions,
+                    )
                         .as_deref()
                         == Some(key.as_str()))
                 .then_some(*interrupt_id)
@@ -215,12 +975,26 @@ fn take_pre_resolved_interrupt(interrupt_id: Uuid) -> Option<ResolveResponse> {
 }
 
 fn question_key(
+    agent_instance_id: Option<Uuid>,
     agent: &str,
     description: &str,
     questions: &InterruptQuestionSet,
 ) -> Option<String> {
+    // An AgentTree UUID is the stable replay identity. Do not include the
+    // display name in that branch: an executor may be renamed between park
+    // and recovery, and recursive siblings are allowed to share a name.
+    // Legacy/daemonless rows intentionally retain their historical
+    // display-name key while no typed owner exists.
+    let identity = match agent_instance_id {
+        Some(agent_instance_id) => serde_json::json!({
+            "agent_instance_id": agent_instance_id,
+        }),
+        None => serde_json::json!({
+            "legacy_agent": agent,
+        }),
+    };
     serde_json::to_string(&serde_json::json!({
-        "agent": agent,
+        "identity": identity,
         "description": description,
         "questions": questions,
     }))
@@ -1096,6 +1870,22 @@ pub struct PendingInterrupt<'a> {
 }
 
 impl PendingInterrupt<'_> {
+    /// Issue the host-approval capability from this live waiter.  The opaque
+    /// capability therefore cannot be created from a durable operation UUID
+    /// alone: the caller must hold the actual registered QuestionTool
+    /// continuation that will receive the approval result.
+    pub(crate) fn host_approval_authority(
+        &self,
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+    ) -> anyhow::Result<crate::agent_tree::HostApprovalAuthority> {
+        crate::agent_tree::HostApprovalAuthority::for_registered_interrupt(
+            session_id,
+            agent_instance_id,
+            self.interrupt_id,
+        )
+    }
+
     /// Block until resolved or parked. A closed wakeup channel is treated
     /// as parked: teardown must never auto-answer or auto-cancel a row.
     pub async fn wait(mut self) -> InterruptOutcome {
@@ -1160,8 +1950,53 @@ pub async fn raise_and_wait(
     set: InterruptQuestionSet,
     log_label: &str,
 ) -> InterruptOutcome {
+    // This is the compatibility entry point used by older engine surfaces.
+    // In a daemon-owned session it must not silently create a second,
+    // interrupt-only decision path.  Prefer the exact task-local executor
+    // identity; the root lookup covers driver controls that run outside the
+    // turn task-local scope.  Isolated/daemonless helpers intentionally keep
+    // the legacy implementation below.
+    let owner = crate::engine::agent::current_agent_instance_id().or(
+        db.session_root_agent(session_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|root| root.agent_instance_id),
+    );
+    match owner {
+        Some(agent_instance_id) => {
+            raise_and_wait_with_agent_tree(
+                db,
+                interrupts,
+                session_id,
+                agent,
+                Some(agent_instance_id),
+                description,
+                set,
+                crate::agent_tree::HostDecisionSubject::UserQuestion,
+                log_label,
+            )
+            .await
+        }
+        None => raise_and_wait_legacy(db, interrupts, session_id, agent, description, set, log_label).await,
+    }
+}
+
+/// Legacy/daemonless implementation.  Production callers enter
+/// [`raise_and_wait`] and are promoted to the typed AgentTree bridge when a
+/// durable executor exists; this stays available only for helpers that have
+/// deliberately not established a daemon-owned session root.
+async fn raise_and_wait_legacy(
+    db: &crate::db::Db,
+    interrupts: &InterruptHub,
+    session_id: Uuid,
+    agent: &str,
+    description: &str,
+    set: InterruptQuestionSet,
+    log_label: &str,
+) -> InterruptOutcome {
     if let Some((_interrupt_id, response)) =
-        take_matching_pre_resolved_interrupt(agent, description, &set)
+        take_matching_pre_resolved_interrupt(None, agent, description, &set)
     {
         return InterruptOutcome::Resolved(response);
     }
@@ -1184,9 +2019,628 @@ pub async fn raise_and_wait(
     };
     let pending = interrupts.register(interrupt_id);
     interrupts
-        .emit_raised(session_id, interrupt_id, agent, description, set)
+        .emit_raised(session_id, interrupt_id, agent, description, set.clone())
         .await;
     pending.wait().await
+}
+
+/// Resolve a failed dedicated refresh attempt before its real interrupt,
+/// decision, and operation can be bound. The storage transaction owns the
+/// child, descriptor, and raw QuestionTool row together; in particular, a
+/// late error must never use the ordinary operation cancellation API, because
+/// there is no bound operation yet to finalise.
+async fn abort_unbound_host_capability_refresh_initialization(
+    db: &crate::db::Db,
+    session_id: Uuid,
+    agent_instance_id: Option<Uuid>,
+    operation: crate::agent_tree::HostCapabilitiesRefreshOperation,
+    raw_interrupt_id: Option<Uuid>,
+    failure_stage: &'static str,
+) {
+    if !operation.requires_dedicated_child_initialization() {
+        // Isolated lifecycle fixtures retain the old no-child shape. There
+        // cannot be an initialization descriptor to atomically clean up, but
+        // an accidentally reserved operation/interrupt must still be closed.
+        let _ = db
+            .cancel_host_capability_refresh_operation(
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+                session_id,
+                operation.operation_id,
+                "host capability refresh decision could not be created".to_string(),
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await;
+        if let Some(raw_interrupt_id) = raw_interrupt_id {
+            let _ = db.mark_interrupt_interrupted(raw_interrupt_id).await;
+        }
+        return;
+    }
+    let Some(agent_instance_id) = agent_instance_id else {
+        tracing::error!(
+            %session_id,
+            operation_id = %operation.operation_id,
+            request_id = %operation.request_id,
+            %failure_stage,
+            "dedicated host capability refresh lost its child identity before pre-bind cleanup"
+        );
+        return;
+    };
+    match db
+        .abort_host_capability_refresh_initialization(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+            session_id,
+            operation.operation_id,
+            operation.request_id,
+            agent_instance_id,
+            raw_interrupt_id,
+            crate::agent_tree::system_now_unix_ms(),
+        )
+        .await
+    {
+        Ok(crate::db::agent_tree_decisions::HostCapabilityRefreshInitializationAbort::Aborted) => {}
+        Ok(crate::db::agent_tree_decisions::HostCapabilityRefreshInitializationAbort::AlreadyBound) => {
+            // An ambiguous storage failure may be reported after the bind
+            // committed. Preserve that exact bound operation and let its
+            // durable terminalizer/recovery path decide its outcome; a stale
+            // prompt failure must never cancel an already-authorized probe.
+            tracing::warn!(
+                %session_id,
+                operation_id = %operation.operation_id,
+                request_id = %operation.request_id,
+                %failure_stage,
+                "pre-bind cleanup observed an already-bound host capability refresh; preserving exact operation finalization"
+            );
+        }
+        Ok(outcome) => {
+            tracing::warn!(
+                %session_id,
+                operation_id = %operation.operation_id,
+                request_id = %operation.request_id,
+                ?outcome,
+                %failure_stage,
+                "pre-bind cleanup did not find a live matching host capability refresh initialization"
+            );
+        }
+        Err(error) => {
+            // A failed cleanup transaction leaves every pre-existing durable
+            // fact untouched, so boot recovery remains able to repair the
+            // descriptor atomically. Do not split the child/raw-attention
+            // writes into best-effort follow-ups here.
+            tracing::error!(
+                %error,
+                %session_id,
+                operation_id = %operation.operation_id,
+                request_id = %operation.request_id,
+                %failure_stage,
+                "atomically aborting pre-bind host capability refresh initialization failed"
+            );
+        }
+    }
+}
+
+/// The QuestionTool's production bridge.  It persists the existing interrupt
+/// first, registers the existing continuation before any lifecycle delivery can
+/// settle it, binds that *same* Attention row to the requesting agent's durable
+/// decision, and then emits through the unchanged InterruptHub continuation.
+/// Tests and non-daemon helpers may not have a lifecycle instance; those retain
+/// the historical interrupt-only path.
+pub(crate) async fn raise_and_wait_with_agent_tree(
+    db: &crate::db::Db,
+    interrupts: &InterruptHub,
+    session_id: Uuid,
+    agent: &str,
+    agent_instance_id: Option<Uuid>,
+    description: &str,
+    set: InterruptQuestionSet,
+    decision_subject: crate::agent_tree::HostDecisionSubject,
+    log_label: &str,
+) -> InterruptOutcome {
+    let host_capability_refresh_operation = decision_subject
+        .host_capabilities_refresh_operation()
+        .copied();
+    // Resolve the durable owner before probing the recovery map. Some host
+    // callers (notably approval helpers) run outside the executor task-local
+    // scope but still belong to the session root; matching them as legacy
+    // first would miss the typed parked answer and issue a duplicate prompt.
+    let agent_instance_id = match agent_instance_id {
+        Some(agent_instance_id) => Some(agent_instance_id),
+        None => match db.session_root_agent(session_id).await {
+            Ok(Some(root)) => Some(root.agent_instance_id),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(%error, %session_id, "loading question root lifecycle owner failed");
+                if let Some(operation) = host_capability_refresh_operation {
+                    abort_unbound_host_capability_refresh_initialization(
+                        db,
+                        session_id,
+                        agent_instance_id,
+                        operation,
+                        None,
+                        "loading the refresh decision owner",
+                    )
+                    .await;
+                }
+                return InterruptOutcome::Resolved(ResolveResponse::Cancel);
+            }
+        },
+    };
+    if let Some(agent_instance_id) = agent_instance_id
+        && let Some((interrupt_id, response)) = take_matching_pre_resolved_interrupt(
+            Some(agent_instance_id),
+            agent,
+            description,
+            &set,
+        )
+    {
+        if let Some(operation) = decision_subject.host_approval_operation() {
+            // A restart must consume the original persisted approval operation,
+            // not manufacture a new prompt identity (and never silently turn
+            // an already-approved effect into Cancel). The caller-provided
+            // facts are recomputed from the actual effect input and must match
+            // the stored kind/digest before the one-use CAS succeeds.
+            let replayed = match db.decision_request_for_interrupt(session_id, interrupt_id).await {
+                Ok(Some(decision))
+                    if decision.decision_class == "host_approval"
+                        && crate::approval::host_approval_response_allows(&response, &set) =>
+                {
+                    let authority = match db.get_interrupt(interrupt_id).await {
+                        Ok(Some(interrupt)) => match crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                            session_id,
+                            &decision,
+                            &interrupt,
+                        ) {
+                            Ok(authority) => authority,
+                            Err(_) => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
+                        },
+                        Ok(None) | Err(_) => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
+                    };
+                    let db_authority = match authority.db_for_effect_handoff(
+                        session_id,
+                        decision.agent_instance_id,
+                        interrupt_id,
+                    ) {
+                        Ok(authority) => authority,
+                        Err(_) => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
+                    };
+                    let Some(operation_id) = decision.host_approval_operation_id else {
+                        return InterruptOutcome::Resolved(ResolveResponse::Cancel);
+                    };
+                    // `operation` was freshly derived from the concrete
+                    // replayed effect.  Only after that kind/digest proof do
+                    // we restore the durable operation UUID; handing the
+                    // newly allocated prompt UUID to the effect scope would
+                    // strand the actual dispatching record on restart.
+                    let operation = match operation.with_persisted_operation_id(operation_id) {
+                        Ok(operation) => operation,
+                        Err(_) => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
+                    };
+                    let dispatched = db
+                        .consume_host_approval_final_operation(
+                            db_authority,
+                            interrupt_id,
+                            session_id,
+                            decision.agent_instance_id,
+                            operation_id,
+                            operation.operation_kind.clone(),
+                            operation.canonical_input_json.clone(),
+                            operation.input_digest.clone(),
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await;
+                    match dispatched {
+                        Ok(true)
+                            if register_host_approval_effect_handoff(
+                                HostApprovalEffectHandoff::new(
+                                    db.clone(),
+                                    authority,
+                                    session_id,
+                                    decision.agent_instance_id,
+                                    interrupt_id,
+                                    operation.clone(),
+                                ),
+                            ) =>
+                        {
+                            response
+                        }
+                        Ok(true) => {
+                            // There is no production effect boundary in this
+                            // task (for example a test-only direct caller).
+                            // The capability is still ready, not submitted,
+                            // so record a known rejection rather than an
+                            // ambiguous external handoff.
+                            let _ = db
+                                .reject_unclaimed_host_approval_final_operation(
+                                    db_authority,
+                                    interrupt_id,
+                                    session_id,
+                                    decision.agent_instance_id,
+                                    operation_id,
+                                    operation.operation_kind.clone(),
+                                    operation.canonical_input_json.clone(),
+                                    operation.input_digest.clone(),
+                                    crate::agent_tree::system_now_unix_ms(),
+                                )
+                                .await;
+                            ResolveResponse::Cancel
+                        }
+                        // A pre-resolved replay that observes an existing
+                        // dispatch is deliberately denied.  We cannot prove
+                        // whether a non-idempotent shell/MCP/harness/fs
+                        // operation crossed its external boundary before the
+                        // crash, so replaying the response would authorize a
+                        // duplicate effect.  Promote a still-dispatching
+                        // handoff to the explicit audit state when possible;
+                        // completed/rejected rows make this a fenced no-op.
+                        Ok(false) => {
+                            // A concurrent replay can observe either a
+                            // still-ready capability (no submission happened)
+                            // or an already-claimed dispatch. Reject the former
+                            // first; only the latter is promoted to unknown.
+                            let _ = db
+                                .reject_unclaimed_host_approval_final_operation(
+                                    db_authority,
+                                    interrupt_id,
+                                    session_id,
+                                    decision.agent_instance_id,
+                                    operation_id,
+                                    operation.operation_kind.clone(),
+                                    operation.canonical_input_json.clone(),
+                                    operation.input_digest.clone(),
+                                    crate::agent_tree::system_now_unix_ms(),
+                                )
+                                .await;
+                            let _ = db
+                                .mark_host_approval_final_operation_submission_unknown(
+                                    db_authority,
+                                    interrupt_id,
+                                    session_id,
+                                    decision.agent_instance_id,
+                                    operation_id,
+                                    operation.operation_kind.clone(),
+                                    operation.canonical_input_json.clone(),
+                                    operation.input_digest.clone(),
+                                    crate::agent_tree::system_now_unix_ms(),
+                                )
+                                .await;
+                            ResolveResponse::Cancel
+                        }
+                        Err(_) => ResolveResponse::Cancel,
+                    }
+                }
+                // A denied/cancelled replay preserves that outcome; it never
+                // consumes an operation. Any missing/mismatched durable
+                // binding fails closed.
+                Ok(Some(decision)) if decision.decision_class == "host_approval" => response,
+                Ok(_) | Err(_) => ResolveResponse::Cancel,
+            };
+            return InterruptOutcome::Resolved(replayed);
+        }
+        return InterruptOutcome::Resolved(response);
+    }
+    // The normal turn dispatcher is intentionally usable by lightweight
+    // helpers too. A daemonless caller has no typed owner, so only that
+    // explicit legacy case can use the historical name-keyed path.
+    let Some(agent_instance_id) = agent_instance_id else {
+        // A daemonless helper has no tree to own. Do not make the compatibility
+        // path affect normal production behavior. Unit tests exercise
+        // historical Approver prompt shapes without a daemon tree, so retain
+        // their isolated interrupt-only path; production host effects still
+        // fail closed below.
+        #[cfg(test)]
+        {
+            return raise_and_wait_legacy(
+                db,
+                interrupts,
+                session_id,
+                agent,
+                description,
+                set,
+                log_label,
+            )
+            .await;
+        }
+        #[cfg(not(test))]
+        {
+            if matches!(&decision_subject, crate::agent_tree::HostDecisionSubject::UserQuestion) {
+                return raise_and_wait_legacy(
+                    db,
+                    interrupts,
+                    session_id,
+                    agent,
+                    description,
+                    set,
+                    log_label,
+                )
+                .await;
+            }
+            tracing::warn!(%session_id, "host effect has no durable lifecycle owner");
+            return InterruptOutcome::Resolved(ResolveResponse::Cancel);
+        }
+    };
+    let owner = match db.agent_instance(session_id, agent_instance_id).await {
+        Ok(Some(owner)) => owner,
+        Ok(None) => {
+            tracing::warn!(%session_id, %agent_instance_id, "question owner is not authorized for this session");
+            if let Some(operation) = host_capability_refresh_operation {
+                abort_unbound_host_capability_refresh_initialization(
+                    db,
+                    session_id,
+                    Some(agent_instance_id),
+                    operation,
+                    None,
+                    "loading the refresh decision owner",
+                )
+                .await;
+            }
+            return InterruptOutcome::Resolved(ResolveResponse::Cancel);
+        }
+        Err(error) => {
+            tracing::warn!(%error, %session_id, %agent_instance_id, "loading question lifecycle owner failed");
+            if let Some(operation) = host_capability_refresh_operation {
+                abort_unbound_host_capability_refresh_initialization(
+                    db,
+                    session_id,
+                    Some(agent_instance_id),
+                    operation,
+                    None,
+                    "loading the refresh decision owner",
+                )
+                .await;
+            }
+            return InterruptOutcome::Resolved(ResolveResponse::Cancel);
+        }
+    };
+    // The public event and durable row retain the human-readable agent label.
+    // The exact AgentTree UUID is persisted beside it as a typed continuation
+    // key; never overload a display name (or a UUID-shaped display string)
+    // as replay authority.
+    let payload = current_interrupt_park_payload();
+    let interrupt_id = match db
+        .raise_interrupt_questions_with_agent_instance_and_payload(
+            session_id,
+            agent,
+            Some(agent_instance_id),
+            description,
+            &set,
+            payload.as_ref(),
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(%error, "{log_label}: raising lifecycle interrupt failed");
+            if let Some(operation) = host_capability_refresh_operation {
+                abort_unbound_host_capability_refresh_initialization(
+                    db,
+                    session_id,
+                    Some(agent_instance_id),
+                    operation,
+                    None,
+                    "raising the refresh QuestionTool interrupt",
+                )
+                .await;
+            }
+            return InterruptOutcome::Resolved(ResolveResponse::Cancel);
+        }
+    };
+    // A live automatic resolver can settle immediately after the decision is
+    // committed. Register the real QuestionTool continuation *before* that
+    // binding exists, so its terminal projection can never beat this waiter
+    // and strand the original tool call. Every failure below drops this guard,
+    // which removes the registry entry and leaves no synthetic continuation.
+    let pending = interrupts.register(interrupt_id);
+    let host_operation = decision_subject.host_approval_operation().cloned();
+    let host_operation_id = host_operation.as_ref().map(|operation| operation.operation_id);
+    // The capability is created only after the real interrupt has been
+    // raised and registered. It is carried through both reservation and the
+    // atomic decision bind; a durable operation UUID alone is never enough.
+    let host_approval_authority = match host_operation.as_ref() {
+        Some(_) => match pending.host_approval_authority(session_id, agent_instance_id) {
+            Ok(authority) => Some(authority),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %session_id,
+                    %interrupt_id,
+                    "refusing host approval without a non-nil registered interrupt authority"
+                );
+                let _ = db.mark_interrupt_interrupted(interrupt_id).await;
+                return InterruptOutcome::Resolved(ResolveResponse::Cancel);
+            }
+        },
+        None => None,
+    };
+    if let Some(operation) = host_operation.as_ref() {
+        let authority = match host_approval_authority
+            .expect("host approval authority follows operation")
+            .db_for_reservation(session_id, agent_instance_id)
+        {
+            Ok(authority) => authority,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %session_id,
+                    %interrupt_id,
+                    "registered interrupt did not own host approval reservation"
+                );
+                let _ = db.mark_interrupt_interrupted(interrupt_id).await;
+                return InterruptOutcome::Resolved(ResolveResponse::Cancel);
+            }
+        };
+        if let Err(error) = db
+            .reserve_host_approval_final_operation(
+                session_id,
+                agent_instance_id,
+                operation.operation_id,
+                operation.operation_kind.clone(),
+                operation.canonical_input_json.clone(),
+                operation.input_digest.clone(),
+                authority,
+                crate::agent_tree::system_now_unix_ms(),
+            )
+            .await
+        {
+            tracing::warn!(
+                %error,
+                %session_id,
+                %interrupt_id,
+                "reserving final host approval operation failed"
+            );
+            let _ = db.mark_interrupt_interrupted(interrupt_id).await;
+            return InterruptOutcome::Resolved(ResolveResponse::Cancel);
+        }
+    }
+    let contract = match crate::agent_tree::NewDecisionContract::user_question_interrupt(
+        agent_instance_id,
+        owner.revision,
+        &set,
+        owner.workspace_ref.clone(),
+    ) {
+        Ok(contract) => match (host_operation, host_approval_authority) {
+            (Some(operation), Some(authority)) => {
+                contract.with_host_approval_subject(operation, authority)
+            }
+            (None, None) => contract.with_host_subject(decision_subject),
+            _ => unreachable!("host approval operation and authority are paired"),
+        },
+        Err(error) => {
+            tracing::warn!(%error, %session_id, %interrupt_id, "building redacted QuestionTool contract failed");
+            if let Some(operation_id) = host_operation_id {
+                let _ = db
+                    .cancel_unbound_host_approval_final_operation(
+                        session_id,
+                        agent_instance_id,
+                        operation_id,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await;
+            }
+            if let Some(operation) = host_capability_refresh_operation {
+                abort_unbound_host_capability_refresh_initialization(
+                    db,
+                    session_id,
+                    Some(agent_instance_id),
+                    operation,
+                    Some(interrupt_id),
+                    "building the refresh decision contract",
+                )
+                .await;
+            } else {
+                let _ = db.mark_interrupt_interrupted(interrupt_id).await;
+            }
+            return InterruptOutcome::Resolved(ResolveResponse::Cancel);
+        }
+    };
+    let _decision = match crate::agent_tree::AgentTreeLifecycle::new(db.clone())
+        .request_decision_for_interrupt(
+            session_id,
+            contract,
+            interrupt_id,
+            crate::agent_tree::system_now_unix_ms(),
+        )
+        .await
+    {
+        Ok(decision) => decision,
+        Err(error) => {
+            tracing::warn!(%error, %session_id, %interrupt_id, "binding QuestionTool interrupt to durable decision failed");
+            if let Some(operation_id) = host_operation_id {
+                let _ = db
+                    .cancel_unbound_host_approval_final_operation(
+                        session_id,
+                        agent_instance_id,
+                        operation_id,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await;
+            }
+            if let Some(operation) = host_capability_refresh_operation {
+                abort_unbound_host_capability_refresh_initialization(
+                    db,
+                    session_id,
+                    Some(agent_instance_id),
+                    operation,
+                    Some(interrupt_id),
+                    "binding the refresh decision to its QuestionTool interrupt",
+                )
+                .await;
+            } else {
+                let _ = db.mark_interrupt_interrupted(interrupt_id).await;
+            }
+            return InterruptOutcome::Resolved(ResolveResponse::Cancel);
+        }
+    };
+    interrupts
+        .emit_raised(session_id, interrupt_id, agent, description, set.clone())
+        .await;
+    let outcome = pending.wait().await;
+    let InterruptOutcome::Resolved(response) = &outcome else {
+        return outcome;
+    };
+    let Some(operation_id) = host_operation_id else {
+        return outcome;
+    };
+    let Some(operation) = host_operation else {
+        return InterruptOutcome::Resolved(ResolveResponse::Cancel);
+    };
+    if !crate::approval::host_approval_response_allows(response, &set) {
+        return outcome;
+    }
+    let authority = match host_approval_authority {
+        Some(authority) => authority,
+        None => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
+    };
+    let db_authority = match authority.db_for_effect_handoff(
+        session_id,
+        agent_instance_id,
+        interrupt_id,
+    ) {
+        Ok(authority) => authority,
+        Err(_) => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
+    };
+    match db
+        .consume_host_approval_final_operation(
+            db_authority,
+            interrupt_id,
+            session_id,
+            agent_instance_id,
+            operation.operation_id,
+            operation.operation_kind.clone(),
+            operation.canonical_input_json.clone(),
+            operation.input_digest.clone(),
+            crate::agent_tree::system_now_unix_ms(),
+        )
+        .await
+    {
+        Ok(true)
+            if register_host_approval_effect_handoff(HostApprovalEffectHandoff::new(
+                db.clone(),
+                authority,
+                session_id,
+                agent_instance_id,
+                interrupt_id,
+                operation.clone(),
+            )) =>
+        {
+            outcome
+        }
+        Ok(true) => {
+            let _ = db
+                .reject_unclaimed_host_approval_final_operation(
+                    db_authority,
+                    interrupt_id,
+                    session_id,
+                    agent_instance_id,
+                    operation.operation_id,
+                    operation.operation_kind,
+                    operation.canonical_input_json,
+                    operation.input_digest,
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await;
+            InterruptOutcome::Resolved(ResolveResponse::Cancel)
+        }
+        Ok(false) | Err(_) => InterruptOutcome::Resolved(ResolveResponse::Cancel),
+    }
 }
 
 #[cfg(test)]
@@ -1232,6 +2686,107 @@ mod tests {
             ),
             receiver,
         )
+    }
+
+    async fn running_host_effect_agent() -> (crate::db::Db, Uuid, Uuid, i64) {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("project", "/repo", "builder").await.unwrap();
+        let agent = db
+            .create_agent_instance(
+                crate::db::agent_tree_decisions::NewAgentInstance {
+                    session_id: session.session_id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let agent = match db
+            .transition_agent_instance(
+                session.session_id,
+                agent.agent_instance_id,
+                agent.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                "{}",
+                2,
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(agent) => agent,
+            outcome => panic!("unexpected running transition: {outcome:?}"),
+        };
+        (db, session.session_id, agent.agent_instance_id, agent.revision)
+    }
+
+    async fn insert_ready_host_effect_handoff(
+        db: &crate::db::Db,
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        agent_revision: i64,
+        operation: &crate::agent_tree::HostApprovalOperation,
+    ) {
+        let candidate = serde_json::from_str::<serde_json::Value>(&operation.canonical_input_json)
+            .unwrap()["candidate_effects"][0]
+            .clone();
+        let selected_candidate_json = String::from_utf8(
+            crate::agent_tree::canonical_json_bytes(&candidate).unwrap(),
+        )
+        .unwrap();
+        let operation_id = operation.operation_id.to_string();
+        let operation_kind = operation.operation_kind.clone();
+        let canonical_input_json = operation.canonical_input_json.clone();
+        let input_digest = operation.input_digest.clone();
+        let operation_id_for_handoff = operation_id.clone();
+        let operation_kind_for_handoff = operation_kind.clone();
+        let canonical_input_for_handoff = canonical_input_json.clone();
+        let input_digest_for_handoff = input_digest.clone();
+        let selected_candidate_for_handoff = selected_candidate_json.clone();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO agent_host_approval_operations (
+                     operation_id, session_id, agent_instance_id, operation_kind,
+                     canonical_input_json, input_digest, state, approved_agent_revision,
+                     selected_response_json, selected_candidate_json, created_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'approved', ?7, ?8, ?9, 3)",
+                rusqlite::params![
+                    operation_id,
+                    session_id.to_string(),
+                    agent_instance_id.to_string(),
+                    operation_kind,
+                    canonical_input_json,
+                    input_digest,
+                    agent_revision,
+                    r#"{"kind":"single","data":{"selected_id":"approve"}}"#,
+                    selected_candidate_json,
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO agent_host_approval_effect_handoffs (
+                     operation_id, session_id, agent_instance_id, operation_kind,
+                     canonical_input_json, input_digest, selected_candidate_json,
+                     idempotency_key, state
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready')",
+                rusqlite::params![
+                    operation_id_for_handoff.clone(),
+                    session_id.to_string(),
+                    agent_instance_id.to_string(),
+                    operation_kind_for_handoff,
+                    canonical_input_for_handoff,
+                    input_digest_for_handoff,
+                    selected_candidate_for_handoff,
+                    operation_id_for_handoff,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1316,6 +2871,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dedicated_host_refresh_prebind_binding_failure_is_aborted_without_restart() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/workspace", "root").await.unwrap();
+        let parent = db
+            .create_agent_instance(
+                crate::db::agent_tree_decisions::NewAgentInstance {
+                    session_id: session.session_id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        let parent = match db
+            .transition_agent_instance(
+                session.session_id,
+                parent.agent_instance_id,
+                parent.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                "{}",
+                11,
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(agent) => agent,
+            outcome => panic!("unexpected parent transition: {outcome:?}"),
+        };
+        let operation = crate::agent_tree::HostCapabilitiesRefreshOperation::for_dedicated_child();
+        let child = db
+            .create_host_capability_refresh_initialization(
+                crate::db::agent_tree_decisions::NewAgentInstance {
+                    session_id: session.session_id,
+                    parent_agent_instance_id: Some(parent.agent_instance_id),
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                operation.operation_id,
+                operation.request_id,
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+                12,
+            )
+            .await
+            .unwrap();
+
+        // Leave the child in `created` so the real typed bind rejects it.
+        // The raw QuestionTool row is nevertheless durably raised first,
+        // exercising the ordinary runtime error path rather than boot
+        // reconciliation.
+        let outcome = raise_and_wait_with_agent_tree(
+            &db,
+            &InterruptHub::detached(),
+            session.session_id,
+            "host-capability-refresh",
+            Some(child.agent_instance_id),
+            "host capability refresh",
+            InterruptQuestionSet {
+                questions: vec![InterruptQuestion::Single {
+                    prompt: "Refresh this daemon's locally probed host-capability snapshot?".into(),
+                    options: vec![
+                        InterruptOption {
+                            id: "refresh".into(),
+                            label: "Refresh local capabilities".into(),
+                            description: None,
+                            secondary: false,
+                        },
+                        InterruptOption {
+                            id: "cancel".into(),
+                            label: "Not now".into(),
+                            description: None,
+                            secondary: true,
+                        },
+                    ],
+                    allow_freetext: false,
+                    command_detail: None,
+                    permission: false,
+                    approval_class: None,
+                    sandbox_escalation: None,
+                }],
+            },
+            crate::agent_tree::HostDecisionSubject::HostCapabilitiesRefresh { operation },
+            "pre-bind cleanup test",
+        )
+        .await;
+        assert!(matches!(outcome, InterruptOutcome::Resolved(ResolveResponse::Cancel)));
+
+        let child_after = db
+            .agent_instance(session.session_id, child.agent_instance_id)
+            .await
+            .unwrap()
+            .expect("initialization child remains auditable after abort");
+        assert_eq!(
+            child_after.state,
+            crate::db::agent_tree_decisions::AgentInstanceState::Cancelled
+        );
+        assert_eq!(
+            db.list_open_interrupts(session.session_id).await.unwrap().len(),
+            0,
+            "the raw pre-bind interrupt is resolved in the same abort transaction"
+        );
+        let operation_id = operation.operation_id;
+        let request_id = operation.request_id;
+        let child_id = child.agent_instance_id;
+        let session_id = session.session_id;
+        let (descriptor_state, raw_state, operation_count, terminal_receipts) = db
+            .read(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT state FROM host_capability_refresh_initializations
+                          WHERE operation_id = ?1 AND request_id = ?2
+                            AND session_id = ?3 AND agent_instance_id = ?4",
+                        rusqlite::params![
+                            operation_id.to_string(),
+                            request_id.to_string(),
+                            session_id.to_string(),
+                            child_id.to_string(),
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT state FROM needs_attention
+                          WHERE session_id = ?1 AND agent_instance_id = ?2",
+                        rusqlite::params![session_id.to_string(), child_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM host_capability_refresh_operations
+                          WHERE operation_id = ?1 AND request_id = ?2
+                            AND session_id = ?3 AND agent_instance_id = ?4",
+                        rusqlite::params![
+                            operation_id.to_string(),
+                            request_id.to_string(),
+                            session_id.to_string(),
+                            child_id.to_string(),
+                        ],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM agent_transition_receipts
+                          WHERE session_id = ?1 AND agent_instance_id = ?2",
+                        rusqlite::params![session_id.to_string(), child_id.to_string()],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(descriptor_state, "cancelled");
+        assert_eq!(raw_state, "resolved");
+        assert_eq!(operation_count, 0);
+        assert_eq!(terminal_receipts, 1);
+        assert_eq!(
+            db.reconcile_host_capability_refresh_operations(
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+                session.session_id,
+                20,
+            )
+            .await
+            .unwrap(),
+            0,
+            "the live pre-bind abort leaves no work for a restart to repair"
+        );
+        assert_eq!(
+            db.abort_host_capability_refresh_initialization(
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+                session.session_id,
+                operation.operation_id,
+                operation.request_id,
+                child.agent_instance_id,
+                None,
+                21,
+            )
+            .await
+            .unwrap(),
+            crate::db::agent_tree_decisions::HostCapabilityRefreshInitializationAbort::AlreadyTerminal,
+            "a duplicate runtime cleanup cannot create a second terminal receipt"
+        );
+    }
+
+    #[tokio::test]
     async fn interrupt_replay_answer_requires_matching_id() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "builder").await.unwrap();
@@ -1362,6 +3105,7 @@ mod tests {
                 selected_id: "second-stored".into(),
             },
             PreResolvedInterruptQuestion {
+                agent_instance_id: None,
                 agent: "builder".into(),
                 description: "second".into(),
                 questions: question_set(),
@@ -1417,6 +3161,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovered_question_uses_typed_agent_instance_identity_not_display_name() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("project", "/repo", "root").await.unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let agent_instance_id = Uuid::new_v4();
+        let question = question_set();
+
+        let replayed = with_pre_resolved_interrupt_question(
+            Uuid::new_v4(),
+            ResolveResponse::Single {
+                selected_id: "stored-answer".into(),
+            },
+            PreResolvedInterruptQuestion {
+                agent_instance_id: Some(agent_instance_id),
+                // Recovery reads the persisted display label. It deliberately
+                // differs from the live executor's human-facing name: only
+                // the typed UUID may identify this replay.
+                agent: "persisted-worker-label".into(),
+                description: "same durable question".into(),
+                questions: question.clone(),
+                occurrence: 1,
+            },
+            async {
+                raise_and_wait_with_agent_tree(
+                    &db,
+                    &hub,
+                    session.session_id,
+                    "renamed-live-worker",
+                    Some(agent_instance_id),
+                    "same durable question",
+                    question,
+                    crate::agent_tree::HostDecisionSubject::UserQuestion,
+                    "typed replay identity test",
+                )
+                .await
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(replayed, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "stored-answer"),
+            "same-named or renamed recursive executors must consume only their own recovered answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_recursive_questions_consume_only_the_exact_typed_owner_once() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("project", "/repo", "root").await.unwrap();
+        let (hub, _events) = attached_hub(db.clone(), session.session_id);
+        let first_agent_instance_id = Uuid::new_v4();
+        let second_agent_instance_id = Uuid::new_v4();
+        let questions = question_set();
+        let description = "shared recursive question";
+
+        let (second, first) = with_pre_resolved_interrupts(
+            vec![
+                PreResolvedInterrupt {
+                    interrupt_id: Uuid::new_v4(),
+                    response: ResolveResponse::Single {
+                        selected_id: "first-answer".into(),
+                    },
+                    question: Some(PreResolvedInterruptQuestion {
+                        agent_instance_id: Some(first_agent_instance_id),
+                        // Recursive siblings intentionally share this display
+                        // name; it is not part of their recovery identity.
+                        agent: "worker".into(),
+                        description: description.into(),
+                        questions: questions.clone(),
+                        occurrence: 1,
+                    }),
+                },
+                PreResolvedInterrupt {
+                    interrupt_id: Uuid::new_v4(),
+                    response: ResolveResponse::Single {
+                        selected_id: "second-answer".into(),
+                    },
+                    question: Some(PreResolvedInterruptQuestion {
+                        agent_instance_id: Some(second_agent_instance_id),
+                        agent: "worker".into(),
+                        description: description.into(),
+                        questions: questions.clone(),
+                        occurrence: 1,
+                    }),
+                },
+            ],
+            async {
+                let second = raise_and_wait_with_agent_tree(
+                    &db,
+                    &hub,
+                    session.session_id,
+                    "renamed-live-worker",
+                    Some(second_agent_instance_id),
+                    description,
+                    questions.clone(),
+                    crate::agent_tree::HostDecisionSubject::UserQuestion,
+                    "recursive typed replay identity test",
+                )
+                .await;
+                // The other parked continuation remains available only to
+                // its exact UUID, even though it has the same display text.
+                let first = take_matching_pre_resolved_interrupt(
+                    Some(first_agent_instance_id),
+                    "another-live-name",
+                    description,
+                    &questions,
+                );
+                (second, first)
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(second, InterruptOutcome::Resolved(ResolveResponse::Single { selected_id }) if selected_id == "second-answer")
+        );
+        assert!(
+            matches!(first, Some((_interrupt_id, ResolveResponse::Single { selected_id })) if selected_id == "first-answer"),
+            "one recovered recursive answer must never be consumed by a sibling or reissued"
+        );
+    }
+
+    #[tokio::test]
     async fn interrupt_replay_multiple_parked_answers_keyed_by_id() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let session = db.create_session("p", "/x", "builder").await.unwrap();
@@ -1433,6 +3299,7 @@ mod tests {
                         selected_id: "first-stored".into(),
                     },
                     question: Some(PreResolvedInterruptQuestion {
+                        agent_instance_id: None,
                         agent: "builder".into(),
                         description: "first".into(),
                         questions: question_set(),
@@ -1445,6 +3312,7 @@ mod tests {
                         selected_id: "second-stored".into(),
                     },
                     question: Some(PreResolvedInterruptQuestion {
+                        agent_instance_id: None,
                         agent: "builder".into(),
                         description: "second".into(),
                         questions: question_set(),
@@ -1532,6 +3400,7 @@ mod tests {
                 selected_id: "second-stored".into(),
             },
             PreResolvedInterruptQuestion {
+                agent_instance_id: None,
                 agent: "builder".into(),
                 description: "same prompt".into(),
                 questions: question_set(),
@@ -1613,6 +3482,7 @@ mod tests {
                 selected_id: "stale".into(),
             },
             PreResolvedInterruptQuestion {
+                agent_instance_id: None,
                 agent: "builder".into(),
                 description: "never raised".into(),
                 questions: question_set(),
@@ -1968,5 +3838,898 @@ mod tests {
         assert!(!consumer.is_finished());
         park_commit.report_startup_reconciled();
         assert!(consumer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancelled_host_approval_effect_recheck_rejects_before_dispatch() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("project", "/repo", "builder").await.unwrap();
+        let agent = db
+            .create_agent_instance(
+                crate::db::agent_tree_decisions::NewAgentInstance {
+                    session_id: session.session_id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let agent = match db
+            .transition_agent_instance(
+                session.session_id,
+                agent.agent_instance_id,
+                agent.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                "{}",
+                2,
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(agent) => agent,
+            outcome => panic!("unexpected agent transition: {outcome:?}"),
+        };
+        let operation = crate::agent_tree::HostApprovalOperation::new(
+            "test_effect_handoff",
+            serde_json::json!({
+                "operation": "effect-handoff",
+                "candidate_effects": [{
+                    "selection": "approve",
+                    "execute": {"operation": "effect-handoff"},
+                }],
+            }),
+        )
+        .unwrap();
+        let operation_id = operation.operation_id;
+        let operation_kind = operation.operation_kind.clone();
+        let canonical_input_json = operation.canonical_input_json.clone();
+        let input_digest = operation.input_digest.clone();
+        let operation_kind_for_insert = operation_kind.clone();
+        let canonical_input_for_insert = canonical_input_json.clone();
+        let input_digest_for_insert = input_digest.clone();
+        let selected_response_json = r#"{"data":{"selected_id":"approve"},"kind":"single"}".to_owned();
+        let selected_candidate_json = String::from_utf8(
+            crate::agent_tree::canonical_json_bytes(&serde_json::json!({
+                "selection": "approve",
+                "execute": {"operation": "effect-handoff"},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let selected_response_for_insert = selected_response_json.clone();
+        let selected_candidate_for_insert = selected_candidate_json.clone();
+        let session_id = session.session_id.to_string();
+        let agent_id = agent.agent_instance_id.to_string();
+        let operation_id_text = operation_id.to_string();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO agent_host_approval_operations (
+                     operation_id, session_id, agent_instance_id, operation_kind, canonical_input_json, input_digest,
+                     selected_response_json, selected_candidate_json, state, created_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'dispatching', 3)",
+                rusqlite::params![
+                    operation_id_text,
+                    session_id.clone(),
+                    agent_id.clone(),
+                    operation_kind_for_insert,
+                    canonical_input_for_insert,
+                    input_digest_for_insert,
+                    selected_response_for_insert,
+                    selected_candidate_for_insert.clone(),
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO agent_host_approval_effect_handoffs (
+                     operation_id, session_id, agent_instance_id, operation_kind, canonical_input_json, input_digest,
+                     selected_candidate_json, idempotency_key, state, dispatch_started_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'dispatching', 3)",
+                rusqlite::params![
+                    operation_id.to_string(),
+                    session_id,
+                    agent_id,
+                    operation_kind,
+                    canonical_input_json,
+                    input_digest,
+                    selected_candidate_for_insert,
+                    operation_id.to_string(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        with_host_approval_effect_scope(
+            "test_effect_boundary",
+            cancelled,
+            async {
+                assert!(register_host_approval_effect_handoff(
+                    HostApprovalEffectHandoff::new(
+                        db.clone(),
+                        crate::agent_tree::HostApprovalAuthority::trusted_host(),
+                        session.session_id,
+                        agent.agent_instance_id,
+                        Uuid::nil(),
+                        operation,
+                    ),
+                ));
+                assert!(recheck_current_host_approval_effect_boundary(
+                    "test_effect_boundary",
+                    &[serde_json::json!({
+                        "execute": {"operation": "effect-handoff"},
+                    })],
+                )
+                .await
+                .is_err());
+                Ok::<(), anyhow::Error>(())
+            },
+            |_: &()| Some(true),
+        )
+        .await
+        .unwrap();
+
+        let states: (String, String) = db
+            .read(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT state FROM agent_host_approval_operations WHERE operation_id = ?1",
+                        [operation_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT state FROM agent_host_approval_effect_handoffs WHERE operation_id = ?1",
+                        [operation_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(states, ("rejected".into(), "rejected".into()));
+    }
+
+    #[tokio::test]
+    async fn composed_ready_handoffs_claim_connect_then_retain_external_mcp_tool() {
+        let (db, session_id, agent_instance_id, revision) = running_host_effect_agent().await;
+        let tool_operation = crate::agent_tree::HostApprovalOperation::new(
+            "external_mcp_tool",
+            serde_json::json!({
+                "server": "calendar",
+                "tool": "create_event",
+                "candidate_effects": [{
+                    "selection": "approve",
+                    "execute": {"server": "calendar", "tool": "create_event", "wire_input": {"title": "Planning"}}
+                }],
+            }),
+        )
+        .unwrap();
+        let connect_operation = crate::agent_tree::HostApprovalOperation::new(
+            "mcp_server_connect",
+            serde_json::json!({
+                "server": "calendar",
+                "identity": "https://calendar.example.invalid/mcp",
+                "candidate_effects": [{
+                    "selection": "approve",
+                    "connect": {"server": "calendar", "identity": "https://calendar.example.invalid/mcp"}
+                }],
+            }),
+        )
+        .unwrap();
+        let tool_operation_id = tool_operation.operation_id;
+        let connect_operation_id = connect_operation.operation_id;
+        insert_ready_host_effect_handoff(
+            &db,
+            session_id,
+            agent_instance_id,
+            revision,
+            &tool_operation,
+        )
+        .await;
+        insert_ready_host_effect_handoff(
+            &db,
+            session_id,
+            agent_instance_id,
+            revision,
+            &connect_operation,
+        )
+        .await;
+
+        with_host_approval_effect_scope(
+            "external_mcp_tools_call",
+            tokio_util::sync::CancellationToken::new(),
+            async {
+                // This is the real first-time ordering: external tool
+                // authorization is already ready, then connection reaches
+                // its own host boundary. The tool handoff must remain ready
+                // for the later `tools/call` request.
+                assert!(register_host_approval_effect_handoff(
+                    HostApprovalEffectHandoff::new(
+                        db.clone(),
+                        crate::agent_tree::HostApprovalAuthority::trusted_host(),
+                        session_id,
+                        agent_instance_id,
+                        Uuid::nil(),
+                        tool_operation,
+                    ),
+                ));
+                assert!(register_host_approval_effect_handoff(
+                    HostApprovalEffectHandoff::new(
+                        db.clone(),
+                        crate::agent_tree::HostApprovalAuthority::trusted_host(),
+                        session_id,
+                        agent_instance_id,
+                        Uuid::nil(),
+                        connect_operation,
+                    ),
+                ));
+                recheck_current_host_approval_effect_boundary(
+                    "mcp_initialize_request",
+                    &[serde_json::json!({
+                        "connect": {"server": "calendar", "identity": "https://calendar.example.invalid/mcp"}
+                    })],
+                )
+                .await?;
+                let states: (String, String) = db
+                    .read(move |conn| {
+                        Ok((
+                            conn.query_row(
+                                "SELECT state FROM agent_host_approval_effect_handoffs WHERE operation_id = ?1",
+                                [tool_operation_id.to_string()],
+                                |row| row.get(0),
+                            )?,
+                            conn.query_row(
+                                "SELECT state FROM agent_host_approval_effect_handoffs WHERE operation_id = ?1",
+                                [connect_operation_id.to_string()],
+                                |row| row.get(0),
+                            )?,
+                        ))
+                    })
+                    .await?;
+                assert_eq!(states, ("ready".to_string(), "dispatching".to_string()));
+                recheck_current_host_approval_effect_boundary(
+                    "external_mcp_tools_call",
+                    &[serde_json::json!({
+                        "execute": {"server": "calendar", "tool": "create_event", "wire_input": {"title": "Planning"}}
+                    })],
+                )
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            },
+            |_: &()| Some(true),
+        )
+        .await
+        .unwrap();
+
+        let states: (String, String) = db
+            .read(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT state FROM agent_host_approval_effect_handoffs WHERE operation_id = ?1",
+                        [tool_operation_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT state FROM agent_host_approval_effect_handoffs WHERE operation_id = ?1",
+                        [connect_operation_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(states, ("succeeded".to_string(), "succeeded".to_string()));
+    }
+
+    #[tokio::test]
+    async fn composed_ready_handoffs_reject_mismatched_only_boundary() {
+        let (db, session_id, agent_instance_id, revision) = running_host_effect_agent().await;
+        let tool_operation = crate::agent_tree::HostApprovalOperation::new(
+            "external_mcp_tool",
+            serde_json::json!({
+                "server": "calendar",
+                "tool": "create_event",
+                "candidate_effects": [{
+                    "selection": "approve",
+                    "execute": {"server": "calendar", "tool": "create_event", "wire_input": {"title": "Planning"}}
+                }],
+            }),
+        )
+        .unwrap();
+        let tool_operation_id = tool_operation.operation_id;
+        insert_ready_host_effect_handoff(
+            &db,
+            session_id,
+            agent_instance_id,
+            revision,
+            &tool_operation,
+        )
+        .await;
+
+        with_host_approval_effect_scope(
+            "mcp_initialize_request",
+            tokio_util::sync::CancellationToken::new(),
+            async {
+                assert!(register_host_approval_effect_handoff(
+                    HostApprovalEffectHandoff::new(
+                        db.clone(),
+                        crate::agent_tree::HostApprovalAuthority::trusted_host(),
+                        session_id,
+                        agent_instance_id,
+                        Uuid::nil(),
+                        tool_operation,
+                    ),
+                ));
+                let error = recheck_current_host_approval_effect_boundary(
+                    "mcp_initialize_request",
+                    &[serde_json::json!({
+                        "connect": {"server": "calendar", "identity": "https://calendar.example.invalid/mcp"}
+                    })],
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("no live host approval capability authorizes this effect boundary"),
+                    "{error}"
+                );
+                Ok::<(), anyhow::Error>(())
+            },
+            |_: &()| Some(true),
+        )
+        .await
+        .unwrap();
+
+        let state: String = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT state FROM agent_host_approval_effect_handoffs WHERE operation_id = ?1",
+                    [tool_operation_id.to_string()],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, "rejected");
+    }
+
+    #[tokio::test]
+    async fn skill_manage_composed_fence_rejects_every_action_after_owner_revision_invalidates() {
+        for (action, payload) in [
+            (
+                "create",
+                serde_json::json!({"description": "new", "content": "body"}),
+            ),
+            ("delete", serde_json::json!({"absorbed_into": "umbrella"})),
+            ("remove_file", serde_json::json!({"path": "references/old.md"})),
+        ] {
+            let (db, session_id, agent_instance_id, revision) = running_host_effect_agent().await;
+            let root = format!("/external-skills/{action}");
+            let access_operation = crate::agent_tree::HostApprovalOperation::new(
+                "path_access",
+                serde_json::json!({
+                    "path": &root,
+                    "required_access": "ReadWrite",
+                    "candidate_effects": [{
+                        "selection": "approve",
+                        "access": {"path": &root, "required_access": "ReadWrite"},
+                    }],
+                }),
+            )
+            .unwrap();
+            let mutation_operation = crate::agent_tree::HostApprovalOperation::new(
+                "skill_manage_mutation",
+                serde_json::json!({
+                    "action": action,
+                    "skill_name": "revision-race",
+                    "payload": payload,
+                    "candidate_effects": [{
+                        "selection": "approve",
+                        "execute": {
+                            "action": action,
+                            "skill_name": "revision-race",
+                            "payload": payload,
+                        },
+                    }],
+                }),
+            )
+            .unwrap();
+            let access_operation_id = access_operation.operation_id;
+            let mutation_operation_id = mutation_operation.operation_id;
+            insert_ready_host_effect_handoff(
+                &db,
+                session_id,
+                agent_instance_id,
+                revision,
+                &access_operation,
+            )
+            .await;
+            insert_ready_host_effect_handoff(
+                &db,
+                session_id,
+                agent_instance_id,
+                revision,
+                &mutation_operation,
+            )
+            .await;
+            assert!(matches!(
+                db.transition_agent_instance(
+                    session_id,
+                    agent_instance_id,
+                    revision,
+                    crate::db::agent_tree_decisions::AgentInstanceState::Cancelled,
+                    "{}",
+                    4,
+                )
+                .await
+                .unwrap(),
+                crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(_)
+            ));
+
+            with_host_approval_effect_scope(
+                "skill_manage_mutation",
+                tokio_util::sync::CancellationToken::new(),
+                async {
+                    for operation in [access_operation, mutation_operation] {
+                        assert!(register_host_approval_effect_handoff(
+                            HostApprovalEffectHandoff::new(
+                                db.clone(),
+                                crate::agent_tree::HostApprovalAuthority::trusted_host(),
+                                session_id,
+                                agent_instance_id,
+                                Uuid::nil(),
+                                operation,
+                            ),
+                        ));
+                    }
+                    let error = recheck_current_host_approval_effect_boundary(
+                        "skill_manage_mutation",
+                        &[
+                            serde_json::json!({
+                                "access": {"path": &root, "required_access": "ReadWrite"},
+                            }),
+                            serde_json::json!({
+                                "execute": {
+                                    "action": action,
+                                    "skill_name": "revision-race",
+                                    "payload": payload,
+                                },
+                            }),
+                        ],
+                    )
+                    .await
+                    .unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("capability is no longer live at effect boundary"),
+                        "{action}: {error}"
+                    );
+                    Ok::<(), anyhow::Error>(())
+                },
+                |_: &()| Some(true),
+            )
+            .await
+            .unwrap();
+
+            let states: (String, String) = db
+                .read(move |conn| {
+                    Ok((
+                        conn.query_row(
+                            "SELECT state FROM agent_host_approval_effect_handoffs WHERE operation_id = ?1",
+                            [access_operation_id.to_string()],
+                            |row| row.get(0),
+                        )?,
+                        conn.query_row(
+                            "SELECT state FROM agent_host_approval_effect_handoffs WHERE operation_id = ?1",
+                            [mutation_operation_id.to_string()],
+                            |row| row.get(0),
+                        )?,
+                    ))
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                states,
+                ("rejected".to_string(), "rejected".to_string()),
+                "{action}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_effect_cancellation_wins_after_claim_over_outer_success() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("project", "/repo", "builder").await.unwrap();
+        let agent = db
+            .create_agent_instance(
+                crate::db::agent_tree_decisions::NewAgentInstance {
+                    session_id: session.session_id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let agent = match db
+            .transition_agent_instance(
+                session.session_id,
+                agent.agent_instance_id,
+                agent.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                "{}",
+                2,
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(agent) => agent,
+            outcome => panic!("unexpected running transition: {outcome:?}"),
+        };
+        let candidate = serde_json::json!({
+            "selection": "approve",
+            "execute": {"operation": "nested-effect"},
+        });
+        let operation = crate::agent_tree::HostApprovalOperation::new(
+            "nested_effect",
+            serde_json::json!({
+                "operation": "nested-effect",
+                "candidate_effects": [candidate.clone()],
+            }),
+        )
+        .unwrap();
+        let selected_candidate_json = String::from_utf8(
+            crate::agent_tree::canonical_json_bytes(&candidate).unwrap(),
+        )
+        .unwrap();
+        let operation_id = operation.operation_id;
+        let operation_kind = operation.operation_kind.clone();
+        let canonical_input_json = operation.canonical_input_json.clone();
+        let input_digest = operation.input_digest.clone();
+        let session_id = session.session_id.to_string();
+        let agent_id = agent.agent_instance_id.to_string();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO agent_host_approval_operations (
+                     operation_id, session_id, agent_instance_id, operation_kind,
+                     canonical_input_json, input_digest, state, approved_agent_revision,
+                     selected_response_json, selected_candidate_json, created_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'approved', ?7, ?8, ?9, 3)",
+                rusqlite::params![
+                    operation_id.to_string(),
+                    session_id.clone(),
+                    agent_id.clone(),
+                    operation_kind.clone(),
+                    canonical_input_json.clone(),
+                    input_digest.clone(),
+                    agent.revision,
+                    r#"{"kind":"single","data":{"selected_id":"approve"}}"#,
+                    selected_candidate_json.clone(),
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO agent_host_approval_effect_handoffs (
+                     operation_id, session_id, agent_instance_id, operation_kind,
+                     canonical_input_json, input_digest, selected_candidate_json,
+                     idempotency_key, state, dispatch_started_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready', 3)",
+                rusqlite::params![
+                    operation_id.to_string(),
+                    session_id,
+                    agent_id,
+                    operation_kind,
+                    canonical_input_json,
+                    input_digest,
+                    selected_candidate_json,
+                    operation_id.to_string(),
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let outer_cancel = tokio_util::sync::CancellationToken::new();
+        let inner_cancel = tokio_util::sync::CancellationToken::new();
+        let inner_for_effect = inner_cancel.clone();
+        with_host_approval_effect_scope(
+            "outer_host_effect",
+            outer_cancel,
+            async {
+                with_host_approval_effect_scope(
+                    "computer_coordinator_backend_execute",
+                    inner_cancel,
+                    async {
+                        assert!(register_host_approval_effect_handoff(
+                            HostApprovalEffectHandoff::new(
+                                db.clone(),
+                                crate::agent_tree::HostApprovalAuthority::trusted_host(),
+                                session.session_id,
+                                agent.agent_instance_id,
+                                Uuid::nil(),
+                                operation,
+                            ),
+                        ));
+                        recheck_current_host_approval_effect_boundary(
+                            "computer_coordinator_backend_execute",
+                            &[serde_json::json!({
+                                "execute": {"operation": "nested-effect"},
+                            })],
+                        )
+                        .await?;
+                        // This mirrors coordinator invalidation after the
+                        // durable handoff claim but before the outer tool
+                        // wrapper reports a successful result.
+                        inner_for_effect.cancel();
+                        Ok::<(), anyhow::Error>(())
+                    },
+                    |_: &()| Some(true),
+                )
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            },
+            |_: &()| Some(true),
+        )
+        .await
+        .unwrap();
+
+        let states: (String, String) = db
+            .read(move |conn| {
+                Ok((
+                    conn.query_row(
+                        "SELECT state FROM agent_host_approval_operations WHERE operation_id = ?1",
+                        [operation_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT state FROM agent_host_approval_effect_handoffs WHERE operation_id = ?1",
+                        [operation_id.to_string()],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(states, ("submission_unknown".into(), "submission_unknown".into()));
+    }
+
+    #[tokio::test]
+    async fn pre_resolved_host_approval_replay_completes_the_persisted_operation_receipt() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = db.create_session("project", "/repo", "builder").await.unwrap();
+        let agent = db
+            .create_agent_instance(
+                crate::db::agent_tree_decisions::NewAgentInstance {
+                    session_id: session.session_id,
+                    parent_agent_instance_id: None,
+                    task_delegation_job_id: None,
+                    task_delegation_child_uuid: None,
+                    resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let agent = match db
+            .transition_agent_instance(
+                session.session_id,
+                agent.agent_instance_id,
+                agent.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                "{}",
+                2,
+            )
+            .await
+            .unwrap()
+        {
+            crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(agent) => agent,
+            outcome => panic!("unexpected agent transition: {outcome:?}"),
+        };
+        let input = serde_json::json!({
+            "effect": "replay-receipt",
+            "candidate_effects": [{
+                "selection": "approve",
+                "execute": {"effect": "replay-receipt"},
+            }],
+        });
+        let persisted_operation = crate::agent_tree::HostApprovalOperation::new(
+            "replay_receipt_effect",
+            input.clone(),
+        )
+        .unwrap();
+        let persisted_operation_id = persisted_operation.operation_id;
+        let question = InterruptQuestion::Single {
+            prompt: "Approve replay receipt effect?".into(),
+            options: vec![InterruptOption {
+                id: "approve".into(),
+                label: "Approve".into(),
+                description: None,
+                secondary: false,
+            }],
+            allow_freetext: false,
+            command_detail: None,
+            permission: true,
+            approval_class: None,
+            sandbox_escalation: None,
+        };
+        let questions = InterruptQuestionSet {
+            questions: vec![question],
+        };
+        let description = "replay receipt effect";
+        let interrupt_id = db
+            .raise_interrupt_questions_with_agent_instance_and_payload(
+                session.session_id,
+                "builder",
+                Some(agent.agent_instance_id),
+                description,
+                &questions,
+                None,
+            )
+            .await
+            .unwrap();
+        db.reserve_host_approval_final_operation(
+            session.session_id,
+            agent.agent_instance_id,
+            persisted_operation.operation_id,
+            persisted_operation.operation_kind.clone(),
+            persisted_operation.canonical_input_json.clone(),
+            persisted_operation.input_digest.clone(),
+            crate::agent_tree::HostApprovalAuthority::trusted_host().into_db(),
+            3,
+        )
+        .await
+        .unwrap();
+        let lifecycle = crate::agent_tree::AgentTreeLifecycle::new(db.clone());
+        let decision = lifecycle
+            .request_decision_for_interrupt(
+                session.session_id,
+                crate::agent_tree::NewDecisionContract::user_question_interrupt(
+                    agent.agent_instance_id,
+                    agent.revision,
+                    &questions,
+                    None,
+                )
+                .unwrap()
+                .with_host_approval_subject(
+                    persisted_operation,
+                    crate::agent_tree::HostApprovalAuthority::trusted_host(),
+                ),
+                interrupt_id,
+                3,
+            )
+            .await
+            .unwrap();
+        let approval_response = ResolveResponse::Single {
+            selected_id: "approve".into(),
+        };
+        lifecycle
+            .resolve_host_approval(
+                session.session_id,
+                decision.decision_request_id,
+                interrupt_id,
+                &serde_json::to_string(&approval_response).unwrap(),
+                crate::agent_tree::HostApprovalAuthority::trusted_host(),
+                4,
+            )
+            .await
+            .unwrap();
+
+        // Recovery reconstructs the same canonical facts but starts with a
+        // fresh UUID. The replay bridge must replace it only after matching
+        // the persisted decision and drive that persisted UUID to completion.
+        let replay_operation = crate::agent_tree::HostApprovalOperation::new(
+            "replay_receipt_effect",
+            input,
+        )
+        .unwrap();
+        assert_ne!(replay_operation.operation_id, persisted_operation_id);
+        let replay_questions = questions.clone();
+        let concrete_effect = serde_json::json!({
+            "execute": {"effect": "replay-receipt"},
+        });
+        with_pre_resolved_interrupt_question(
+            interrupt_id,
+            approval_response,
+            PreResolvedInterruptQuestion {
+                agent_instance_id: Some(agent.agent_instance_id),
+                agent: "builder".into(),
+                description: description.into(),
+                questions: replay_questions.clone(),
+                occurrence: 1,
+            },
+            async {
+                with_host_approval_effect_scope(
+                    // The broad ordinary gate has an opaque `Result<()>`.
+                    // The nested concrete ToolOutput boundary must propagate
+                    // its classifier through the shared scope.
+                    "ordinary_tool_dispatch_gate",
+                    tokio_util::sync::CancellationToken::new(),
+                    async {
+                        with_host_approval_effect_scope(
+                            "tool_dispatch",
+                            tokio_util::sync::CancellationToken::new(),
+                            async {
+                                let outcome = raise_and_wait_with_agent_tree(
+                                    &db,
+                                    &InterruptHub::detached(),
+                                    session.session_id,
+                                    "builder",
+                                    Some(agent.agent_instance_id),
+                                    description,
+                                    replay_questions,
+                                    crate::agent_tree::HostDecisionSubject::HostApproval {
+                                        operation: replay_operation,
+                                    },
+                                    "replay test",
+                                )
+                                .await;
+                                assert!(matches!(
+                                    outcome,
+                                    InterruptOutcome::Resolved(ResolveResponse::Single { ref selected_id })
+                                        if selected_id == "approve"
+                                ));
+                                // Simulate the real concrete tool boundary:
+                                // approval consumed, exact candidate claimed
+                                // and rechecked, then a successful ToolOutput.
+                                recheck_current_host_approval_effect_boundary(
+                                    "tool_dispatch",
+                                    std::slice::from_ref(&concrete_effect),
+                                )
+                                .await?;
+                                Ok::<crate::engine::tool::ToolOutput, anyhow::Error>(
+                                    crate::engine::tool::ToolOutput::text("effect succeeded"),
+                                )
+                            },
+                            |output: &crate::engine::tool::ToolOutput| {
+                                Some(output.exit_code.is_none_or(|code| code == 0))
+                            },
+                        )
+                        .await
+                        .map(|_| ())
+                    },
+                    |_: &()| None,
+                )
+                .await
+            },
+        )
+        .await
+        .unwrap();
+
+        let (operation_state, handoff_state, handoff_operation_id, receipt):
+            (String, String, String, String) = db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT operation.state, handoff.state, handoff.operation_id,
+                            handoff.completion_receipt_json
+                       FROM agent_host_approval_operations operation
+                       JOIN agent_host_approval_effect_handoffs handoff
+                         ON handoff.operation_id = operation.operation_id
+                      WHERE operation.operation_id = ?1",
+                    [persisted_operation_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(Into::into)
+            })
+            .await
+            .unwrap();
+        assert_eq!(operation_state, "completed");
+        assert_eq!(handoff_state, "succeeded");
+        assert_eq!(handoff_operation_id, persisted_operation_id.to_string());
+        assert!(receipt.contains("tool_dispatch"), "{receipt}");
     }
 }

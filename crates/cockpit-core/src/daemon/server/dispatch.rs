@@ -5726,6 +5726,94 @@ async fn handle_serialized_request_impl(
             })
         }
 
+        Request::ReadAgentTree {
+            session_id,
+            root_agent_instance_id,
+            after,
+            limit,
+        } => {
+            let attached = require_attached(state)?;
+            ensure_agent_tree_attached_session(session_id, attached.handle.session_id)?;
+            let page = ctx
+                .db
+                .agent_lineage_page(
+                    session_id,
+                    root_agent_instance_id,
+                    after.map(agent_tree_cursor_from_wire),
+                    usize::from(limit),
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Response::AgentTreePage {
+                session_id,
+                nodes: page.entries.into_iter().map(agent_tree_node_wire).collect(),
+                next_cursor: page.next_cursor.map(agent_tree_cursor_to_wire),
+            })
+        }
+
+        Request::ReadAgentAttention {
+            session_id,
+            after,
+            limit,
+        } => {
+            let attached = require_attached(state)?;
+            ensure_agent_tree_attached_session(session_id, attached.handle.session_id)?;
+            let page = ctx
+                .db
+                .decision_attention_page(
+                    session_id,
+                    after.map(agent_tree_cursor_from_wire),
+                    usize::from(limit),
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Response::AgentAttentionPage {
+                session_id,
+                entries: page
+                    .entries
+                    .into_iter()
+                    .map(agent_attention_wire)
+                    .collect(),
+                next_cursor: page.next_cursor.map(agent_tree_cursor_to_wire),
+            })
+        }
+
+        Request::ResolveAgentDecision {
+            session_id,
+            decision_request_id,
+            answer,
+        } => {
+            let attached = require_attached(state)?;
+            ensure_agent_tree_attached_session(session_id, attached.handle.session_id)?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            attached.handle
+                .send_work(SessionWork::ResolveAgentDecision {
+                    decision_request_id,
+                    answer: agent_decision_answer_from_wire(answer),
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let settlement = response_rx
+                .await
+                .map_err(|_| internal(anyhow::anyhow!("agent decision worker stopped")))?
+                .map_err(|_| internal(anyhow::anyhow!("agent decision resolution failed")))?;
+            let decision = ctx
+                .db
+                .decision_request(session_id, decision_request_id)
+                .await
+                .map_err(internal)?
+                .context("resolved agent decision disappeared")
+                .map_err(internal)?;
+            let (status, decision_state) = agent_decision_settlement_wire(&settlement, &decision);
+            Ok(Response::AgentDecisionSteered {
+                session_id,
+                decision_request_id,
+                status,
+                decision_state,
+            })
+        }
+
         Request::SessionLiveStatus { session_ids } => {
             let mut visible_ids = Vec::new();
             for id in session_ids {
@@ -8300,7 +8388,7 @@ async fn handle_serialized_request_impl(
             Ok(Response::Ack)
         }
         Request::GetHostCapabilities => get_host_capabilities(ctx),
-        Request::RefreshHostCapabilities => refresh_host_capabilities_request(ctx).await,
+        Request::RefreshHostCapabilities => refresh_host_capabilities_request(state, ctx).await,
         Request::MigrateKekPlacement { dest } => migrate_kek_placement_request(ctx, dest).await,
         Request::RestartIfIdle => {
             tracing::info!("RestartIfIdle requested via client");
@@ -9696,6 +9784,95 @@ async fn handle_concurrent_request_impl(
                 oldest_seq: page.oldest_seq,
             })
         }
+        Request::ReadAgentTree {
+            session_id,
+            root_agent_instance_id,
+            after,
+            limit,
+        } => {
+            let attached = require_shared_attached(&shared)?;
+            ensure_agent_tree_attached_session(session_id, attached.session_id())?;
+            let page = ctx
+                .db
+                .agent_lineage_page(
+                    session_id,
+                    root_agent_instance_id,
+                    after.map(agent_tree_cursor_from_wire),
+                    usize::from(limit),
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Response::AgentTreePage {
+                session_id,
+                nodes: page.entries.into_iter().map(agent_tree_node_wire).collect(),
+                next_cursor: page.next_cursor.map(agent_tree_cursor_to_wire),
+            })
+        }
+        Request::ReadAgentAttention {
+            session_id,
+            after,
+            limit,
+        } => {
+            let attached = require_shared_attached(&shared)?;
+            ensure_agent_tree_attached_session(session_id, attached.session_id())?;
+            let page = ctx
+                .db
+                .decision_attention_page(
+                    session_id,
+                    after.map(agent_tree_cursor_from_wire),
+                    usize::from(limit),
+                )
+                .await
+                .map_err(internal)?;
+            Ok(Response::AgentAttentionPage {
+                session_id,
+                entries: page
+                    .entries
+                    .into_iter()
+                    .map(agent_attention_wire)
+                    .collect(),
+                next_cursor: page.next_cursor.map(agent_tree_cursor_to_wire),
+            })
+        }
+        Request::ResolveAgentDecision {
+            session_id,
+            decision_request_id,
+            answer,
+        } => {
+            let attached = require_shared_attached(&shared)?;
+            ensure_agent_tree_attached_session(session_id, attached.session_id())?;
+            let handle = ctx.registry.live_handle(session_id).ok_or_else(|| ErrorPayload {
+                code: ErrorCode::UnknownSession,
+                message: "attached session worker is unavailable".into(),
+            })?;
+            let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+            handle
+                .send_work(SessionWork::ResolveAgentDecision {
+                    decision_request_id,
+                    answer: agent_decision_answer_from_wire(answer),
+                    respond_to,
+                })
+                .await
+                .map_err(internal)?;
+            let settlement = response_rx
+                .await
+                .map_err(|_| internal(anyhow::anyhow!("agent decision worker stopped")))?
+                .map_err(|_| internal(anyhow::anyhow!("agent decision resolution failed")))?;
+            let decision = ctx
+                .db
+                .decision_request(session_id, decision_request_id)
+                .await
+                .map_err(internal)?
+                .context("resolved agent decision disappeared")
+                .map_err(internal)?;
+            let (status, decision_state) = agent_decision_settlement_wire(&settlement, &decision);
+            Ok(Response::AgentDecisionSteered {
+                session_id,
+                decision_request_id,
+                status,
+                decision_state,
+            })
+        }
         Request::SessionLiveStatus { session_ids } => {
             let mut visible_ids = Vec::new();
             for id in session_ids {
@@ -9781,6 +9958,9 @@ async fn handle_concurrent_request_impl(
             schema_version: ctx.db.schema_version().await.map_err(internal)?,
         }),
         Request::GetHostCapabilities => get_host_capabilities(&ctx),
+        Request::RefreshHostCapabilities => {
+            refresh_host_capabilities_request_shared(&shared, &ctx).await
+        }
         Request::ListLeakReports {
             cursor,
             limit,
@@ -10102,20 +10282,68 @@ async fn migrate_kek_placement_request(
 }
 
 async fn refresh_host_capabilities_request(
+    state: &MutableClientState,
     ctx: &Arc<DaemonContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
-    let (snapshot, published) = crate::host_capabilities::refresh_host_capabilities(
-        &ctx.host_capabilities,
-        &ctx.host_capability_probes,
-    )
-    .await
-    .map_err(internal)?;
-    if published {
-        ctx.broadcast_global(proto::Event::HostCapabilitiesChanged {
-            snapshot: snapshot.clone(),
-        });
-    }
-    Ok(Response::HostCapabilities { snapshot })
+    refresh_host_capabilities_request_with_handle(require_attached(state)?.handle.clone(), ctx).await
+}
+
+/// Concurrent-dispatch counterpart for the durable host-capability refresh
+/// operation. The
+/// shared attachment snapshot is intentionally sufficient: authorization was
+/// completed before dispatch, and the cloned worker handle still owns the
+/// session's serial decision/continuation boundary.  The original refresh
+/// request awaits its own durable decision receipt in a task, leaving the
+/// connection's serialized loop free to receive `ResolveInterrupt`.
+async fn refresh_host_capabilities_request_shared(
+    shared: &SharedClientState,
+    ctx: &Arc<DaemonContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    let handle = require_shared_attached(shared)?.handle.clone();
+    refresh_host_capabilities_request_with_handle(handle, ctx).await
+}
+
+async fn refresh_host_capabilities_request_with_handle(
+    handle: crate::daemon::session_worker::SessionWorkerHandle,
+    ctx: &Arc<DaemonContext>,
+) -> std::result::Result<Response, ErrorPayload> {
+    // A host-capability refresh is intentionally the only low-risk host
+    // effect. The server cannot invoke it straight from this RPC: route it to
+    // the attached worker, which persists the operation and its bound
+    // AgentTree decision before emitting Attention. This keeps manual,
+    // automatic, timeout, and restart decision handling in one durable path.
+    let (authorization_tx, authorization_rx) = tokio::sync::oneshot::channel();
+    handle
+        .send_work(SessionWork::AuthorizeHostCapabilitiesRefresh {
+            respond_to: authorization_tx,
+        })
+        .await
+        .map_err(internal)?;
+    let completion = authorization_rx.await.map_err(|_| ErrorPayload {
+        code: ErrorCode::Unavailable,
+        message: "host capability refresh decision worker stopped before resolving".to_string(),
+    })?;
+    let completion = completion.map_err(|error| match error {
+        crate::daemon::session_worker::HostCapabilitiesRefreshError::Declined => ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "host capability refresh was declined by its durable decision".to_string(),
+        },
+        crate::daemon::session_worker::HostCapabilitiesRefreshError::Internal(message) => {
+            ErrorPayload {
+                code: ErrorCode::Internal,
+                message,
+            }
+        }
+    })?;
+    // The worker owns the durable operation and executes the probe only after
+    // its exact decision is terminally allowed.  A live attached request gets
+    // the resulting snapshot through this one-shot; after a crash the same
+    // durable operation is recovered by the worker, not retried as a fresh
+    // server-side probe.
+    let _ = completion.published;
+    Ok(Response::HostCapabilities {
+        snapshot: completion.snapshot,
+    })
 }
 
 fn validate_request_semantics(request: &Request) -> std::result::Result<(), ErrorPayload> {
@@ -15169,6 +15397,122 @@ pub(super) fn curator_run_report_to_proto(
         snapshot_id: report.snapshot_id,
         consolidation: report.consolidation,
     }
+}
+
+fn agent_tree_cursor_from_wire(cursor: proto::AgentTreeCursor) -> crate::db::agent_tree_decisions::AgentTreePageCursor {
+    crate::db::agent_tree_decisions::AgentTreePageCursor {
+        created_at_unix_ms: cursor.created_at_unix_ms,
+        id: cursor.id,
+    }
+}
+
+fn ensure_agent_tree_attached_session(
+    requested_session_id: Uuid,
+    attached_session_id: Uuid,
+) -> std::result::Result<(), ErrorPayload> {
+    if requested_session_id == attached_session_id {
+        return Ok(());
+    }
+    Err(ErrorPayload {
+        code: ErrorCode::UnknownSession,
+        message: "agent tree request is not authorized for the attached session".into(),
+    })
+}
+
+fn agent_tree_cursor_to_wire(cursor: crate::db::agent_tree_decisions::AgentTreePageCursor) -> proto::AgentTreeCursor {
+    proto::AgentTreeCursor {
+        created_at_unix_ms: cursor.created_at_unix_ms,
+        id: cursor.id,
+    }
+}
+
+fn agent_tree_node_wire(node: crate::db::agent_tree_decisions::AgentInstanceRow) -> proto::AgentTreeNode {
+    proto::AgentTreeNode {
+        agent_instance_id: node.agent_instance_id,
+        parent_agent_instance_id: node.parent_agent_instance_id,
+        workspace_ref: node.workspace_ref,
+        state: node.state.as_str().to_string(),
+        revision: node.revision,
+        created_at_unix_ms: node.created_at_unix_ms,
+        updated_at_unix_ms: node.updated_at_unix_ms,
+    }
+}
+
+fn agent_attention_wire(
+    attention: crate::db::agent_tree_decisions::DecisionAttentionRow,
+) -> proto::AgentDecisionAttention {
+    let decision = attention.decision;
+    proto::AgentDecisionAttention {
+        attention_id: attention.attention_id,
+        decision_request_id: decision.decision_request_id,
+        agent_instance_id: attention.agent_instance_id,
+        state: attention.state,
+        decision_state: decision.state.as_str().to_string(),
+        decision_class: decision.decision_class,
+        task_call_id: decision.task_call_id,
+        workspace_ref: decision.workspace_ref,
+        options_contract_json: decision.options_contract_json,
+        free_text_contract_json: decision.free_text_contract_json,
+        recommendation_json: decision.recommendation_json,
+        deadline_unix_ms: decision.deadline_unix_ms,
+        revision: decision.revision,
+        raised_at_unix_ms: attention.raised_at_unix_ms,
+        resolved_at_unix_ms: attention.resolved_at_unix_ms,
+    }
+}
+
+fn agent_decision_answer_from_wire(answer: proto::AgentDecisionAnswer) -> crate::agent_tree::DecisionAnswer {
+    match answer {
+        proto::AgentDecisionAnswer::Option { option_id } => {
+            crate::agent_tree::DecisionAnswer::option(option_id)
+        }
+        proto::AgentDecisionAnswer::FreeText { text } => {
+            crate::agent_tree::DecisionAnswer::FreeText { text }
+        }
+        proto::AgentDecisionAnswer::InterruptResponse { response } => {
+            crate::agent_tree::DecisionAnswer::InterruptResponse {
+                response: agent_interrupt_response_from_wire(response),
+            }
+        }
+    }
+}
+
+fn agent_interrupt_response_from_wire(
+    response: proto::AgentInterruptResponse,
+) -> crate::db::wire::ResolveResponse {
+    match response {
+        proto::AgentInterruptResponse::Single { selected_id } => {
+            crate::db::wire::ResolveResponse::Single { selected_id }
+        }
+        proto::AgentInterruptResponse::Multi { selected_ids } => {
+            crate::db::wire::ResolveResponse::Multi { selected_ids }
+        }
+        proto::AgentInterruptResponse::Freetext { text } => {
+            crate::db::wire::ResolveResponse::Freetext { text }
+        }
+        proto::AgentInterruptResponse::Batch { responses } => {
+            crate::db::wire::ResolveResponse::Batch {
+                responses: responses
+                    .into_iter()
+                    .map(agent_interrupt_response_from_wire)
+                    .collect(),
+            }
+        }
+        proto::AgentInterruptResponse::Cancel => crate::db::wire::ResolveResponse::Cancel,
+    }
+}
+
+fn agent_decision_settlement_wire(
+    settlement: &crate::agent_tree::DecisionSettlement,
+    decision: &crate::db::agent_tree_decisions::DecisionRequestRow,
+) -> (String, String) {
+    let status = match settlement {
+        crate::agent_tree::DecisionSettlement::Resolved(_) => "resolved",
+        crate::agent_tree::DecisionSettlement::Steered { .. } => "steered",
+        crate::agent_tree::DecisionSettlement::AlreadyTerminal(_) => "already_terminal",
+        crate::agent_tree::DecisionSettlement::Retry => "retry",
+    };
+    (status.to_string(), decision.state.as_str().to_string())
 }
 
 pub(super) fn paused_work_to_proto(

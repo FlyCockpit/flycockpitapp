@@ -54,7 +54,20 @@ impl Approver {
         )
     }
 
-    pub(crate) async fn auto_allows(&self, effect: &str, payload: &str) -> bool {
+    pub(crate) async fn auto_allows(
+        &self,
+        effect: crate::agent_tree::HostEffectClass,
+        payload: &str,
+    ) -> bool {
+        // The approval subsystem is an actual host-effect boundary, not a
+        // classifier hint. Only the closed, host-owned local metadata ingress
+        // is eligible for automatic resolution. Commands, credentials,
+        // authorization changes, destructive writes, external/MCP/harness
+        // calls, publish/purchase, and production effects always require an
+        // explicit durable approval (or an already-recorded user grant).
+        if effect != crate::agent_tree::HostEffectClass::LocalMetadataRefresh {
+            return false;
+        }
         if !matches!(
             self.approval_mode(),
             crate::config::extended::ApprovalMode::Auto
@@ -69,7 +82,7 @@ impl Approver {
             return false;
         };
         let (extended, providers) = self.store.configs();
-        matches!(crate::engine::safety_gate::evaluate(extended.guard_model_ref(), &providers, redact, None, effect, payload).await, crate::engine::safety_gate::SafetyOutcome::Rated(verdict) if verdict.safe)
+        matches!(crate::engine::safety_gate::evaluate(extended.guard_model_ref(), &providers, redact, None, "local_metadata_refresh", payload).await, crate::engine::safety_gate::SafetyOutcome::Rated(verdict) if verdict.safe)
     }
 
     /// Read-only access to the underlying store (the §4 query API).
@@ -207,25 +220,57 @@ impl Approver {
     /// MCP server/tool call). Returns `Allow { Once }` on approval,
     /// `Deny` on dismissal.
     pub async fn approve_tool_call(&self, label: &str) -> Result<Decision> {
-        self.authorize(AuthorizationRequest::NativeTool { label })
+        let input = serde_json::json!({"label": label});
+        self.authorize(AuthorizationRequest::NativeTool {
+            label,
+            input: &input,
+        })
             .await
     }
 
-    pub(super) async fn approve_tool_call_inner(&self, label: &str) -> Result<Decision> {
-        if self.yolo_mode() || self.auto_allows("native_tool", label).await {
+    pub(super) async fn approve_tool_call_inner(
+        &self,
+        label: &str,
+        input: &serde_json::Value,
+    ) -> Result<Decision> {
+        if self.yolo_mode()
+            || self
+                .auto_allows(crate::agent_tree::HostEffectClass::Destructive, label)
+                .await
+        {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
         // `wrapper = true` makes the prompt offer only "Yes, once" — the
         // right shape for a non-persistable per-call approval. Nothing is
         // recorded; a later identical call prompts again.
+        let question = approval_question(
+            label,
+            true,
+            GrantKind::Command,
+            None,
+            None,
+            None,
+            &[Scope::Once],
+            None,
+        );
+        let set = approval_option_set("native_tool_approval", true, &[Scope::Once], None);
         let choice = self
-            .prompt(
+            .raise_and_decode(
                 label,
-                true,
-                None,
-                None,
-                &[Scope::Once],
-                PromptExtras::default(),
+                question,
+                "native_tool",
+                serde_json::json!({
+                    "label": label,
+                    "wire_input": input,
+                    "candidate_effects": [
+                        // `label` is presentation only. The canonical wire
+                        // input is the exact value the eventual native-tool
+                        // dispatcher can re-derive at its concrete boundary.
+                        {"selection": "approve", "execute": {"wire_input": input}},
+                        {"selection": "reject", "effect": "deny"}
+                    ],
+                }),
+                |response| response_to_approval_choice(response, &set),
             )
             .await?;
         let decision = match choice {
@@ -256,8 +301,19 @@ impl Approver {
     /// session/project/global scope. Concurrent ungranted invocations may
     /// each prompt before either records a grant; that matches command/path
     /// behavior and avoids a per-key in-flight lock.
-    pub async fn approve_mcp_tool(&self, server: &str, tool: &str) -> Result<Decision> {
-        self.authorize(AuthorizationRequest::ExternalMcpTool { server, tool })
+    pub async fn approve_mcp_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        input: &serde_json::Value,
+        target: &serde_json::Value,
+    ) -> Result<Decision> {
+        self.authorize(AuthorizationRequest::ExternalMcpTool {
+            server,
+            tool,
+            input,
+            target,
+        })
             .await
     }
 
@@ -265,14 +321,16 @@ impl Approver {
         &self,
         server: &str,
         tool: &str,
+        input: &serde_json::Value,
+        effect_target: &serde_json::Value,
     ) -> Result<Decision> {
-        let target = crate::approval::store::mcp_tool_key(server, tool);
+        let grant_target = crate::approval::store::mcp_tool_key(server, tool);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
         if let Some(scope) = self.store.mcp_tool_reject_scope(server, tool).await {
             let decision = Decision::StandingReject { scope };
             self.record_permission_decision(
                 "mcp_tool",
-                &target,
+                &grant_target,
                 &offered,
                 decision,
                 DecisionSource::StandingReject,
@@ -284,7 +342,7 @@ impl Approver {
             let decision = Decision::Allow { scope };
             self.record_permission_decision(
                 "mcp_tool",
-                &target,
+                &grant_target,
                 &offered,
                 decision,
                 DecisionSource::AlreadyGranted,
@@ -293,14 +351,21 @@ impl Approver {
             return Ok(decision);
         }
 
-        if self.yolo_mode() || self.auto_allows("mcp_tool", &target).await {
+        if self.yolo_mode()
+            || self
+                .auto_allows(
+                    crate::agent_tree::HostEffectClass::ExternalAction,
+                    &grant_target,
+                )
+                .await
+        {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
         let prompt = format!(
             "`{tool}` on MCP server `{server}` wants to run. This server is external to cockpit."
         );
         let question = approval_question(
-            &target,
+            &grant_target,
             false,
             GrantKind::McpTool,
             Some(&prompt),
@@ -311,26 +376,62 @@ impl Approver {
         );
         let set = approval_option_set("mcp_tool_approval", false, &offered, None);
         let choice = self
-            .raise_and_decode(&prompt, question, |response| {
-                response_to_approval_choice(response, &set)
-            })
+            .raise_and_decode(
+                &prompt,
+                question,
+                "external_mcp_tool",
+                serde_json::json!({
+                    "server": server,
+                    "tool": tool,
+                    "wire_input": input,
+                    "target": effect_target,
+                    "offered_scopes": offered.iter().map(|scope| scope_label(*scope)).collect::<Vec<_>>(),
+                    "candidate_effects": offered.iter().map(|scope| serde_json::json!({
+                        "selection": approve_option_id_for_scope(*scope).as_str(),
+                        "execute": {"server": server, "tool": tool, "wire_input": input, "target": effect_target},
+                        "persist_grant": if *scope == Scope::Once { serde_json::Value::Null } else { serde_json::json!({"kind": "mcp_tool", "key": grant_target, "scope": scope_label(*scope)}) },
+                    })).chain(offered.iter().copied().filter(|scope| *scope != Scope::Once).map(|scope| serde_json::json!({
+                        "selection": reject_option_id_for_scope(scope).as_str(),
+                        "persist_reject": {"kind": "mcp_tool", "key": grant_target, "scope": scope_label(scope)}
+                    }))).chain(std::iter::once(serde_json::json!({
+                        "selection": "reject", "effect": "deny"
+                    }))).collect::<Vec<_>>(),
+                }),
+                |response| response_to_approval_choice(response, &set),
+            )
             .await?;
         let decision = match choice {
             ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
             ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
             ApprovalChoice::Approve(scope) => {
-                if let Err(e) = self.store.record_mcp_tool(server, tool, scope).await {
-                    tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool grant failed; applying once");
-                    Decision::Allow { scope: Scope::Once }
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "mcp_tool_grant_persistence",
+                    &[serde_json::json!({"persist_grant": {"kind": "mcp_tool", "key": &grant_target, "scope": scope_label(scope)}})],
+                ).await.is_err() {
+                    Decision::Deny
                 } else {
-                    Decision::Allow { scope }
+                    if let Err(e) = self.store.record_mcp_tool(server, tool, scope).await {
+                        tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool grant failed; rejecting selected capability");
+                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                        Decision::Deny
+                    } else {
+                        Decision::Allow { scope }
+                    }
                 }
             }
             ApprovalChoice::Reject(scope) => {
-                if let Err(e) = self.store.record_mcp_tool_reject(server, tool, scope).await {
-                    tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool reject failed; denying once");
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "mcp_tool_reject_persistence",
+                    &[serde_json::json!({"persist_reject": {"kind": "mcp_tool", "key": &grant_target, "scope": scope_label(scope)}})],
+                ).await.is_err() {
+                    Decision::Deny
+                } else {
+                    if let Err(e) = self.store.record_mcp_tool_reject(server, tool, scope).await {
+                        tracing::warn!(error = %e, server, tool, ?scope, "recording MCP tool reject failed; denying once");
+                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                    }
+                    Decision::Deny
                 }
-                Decision::Deny
             }
             ApprovalChoice::Deny
             | ApprovalChoice::ApproveAllOnce
@@ -338,7 +439,7 @@ impl Approver {
         };
         self.record_permission_decision(
             "mcp_tool",
-            &target,
+            &grant_target,
             &offered,
             decision,
             DecisionSource::UserPrompt,
@@ -350,7 +451,13 @@ impl Approver {
     /// Gate a configured shell tool that would otherwise run outside the
     /// filesystem sandbox. Grants are exact `(agent, tool)` pairs; command
     /// text and arguments never broaden the authority.
-    pub(super) async fn approve_custom_tool_inner(&self, tool: &str) -> Result<Decision> {
+    pub(super) async fn approve_custom_tool_inner(
+        &self,
+        tool: &str,
+        command: &str,
+        input: &serde_json::Value,
+        cwd: &std::path::Path,
+    ) -> Result<Decision> {
         let agent = self.agent_id.as_str();
         let target = crate::approval::store::mcp_tool_key(agent, tool);
         let offered = [Scope::Once, Scope::Session, Scope::Project, Scope::Global];
@@ -379,7 +486,14 @@ impl Approver {
             return Ok(decision);
         }
 
-        if self.yolo_mode() || self.auto_allows("custom_tool", &target).await {
+        if self.yolo_mode()
+            || self
+                .auto_allows(
+                    crate::agent_tree::HostEffectClass::ExternalAction,
+                    &target,
+                )
+                .await
+        {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
         let prompt = format!(
@@ -397,26 +511,63 @@ impl Approver {
         );
         let set = approval_option_set("custom_tool_approval", false, &offered, None);
         let choice = self
-            .raise_and_decode(&prompt, question, |response| {
-                response_to_approval_choice(response, &set)
-            })
+            .raise_and_decode(
+                &prompt,
+                question,
+                "custom_tool",
+                serde_json::json!({
+                    "agent": agent,
+                    "tool": tool,
+                    "command": command,
+                    "wire_input": input,
+                    "cwd": cwd,
+                    "offered_scopes": offered.iter().map(|scope| scope_label(*scope)).collect::<Vec<_>>(),
+                    "candidate_effects": offered.iter().map(|scope| serde_json::json!({
+                        "selection": approve_option_id_for_scope(*scope).as_str(),
+                        "execute": {"agent": agent, "tool": tool, "command": command, "wire_input": input, "cwd": cwd},
+                        "persist_grant": if *scope == Scope::Once { serde_json::Value::Null } else { serde_json::json!({"kind": "custom_tool", "key": target, "scope": scope_label(*scope)}) },
+                    })).chain(offered.iter().copied().filter(|scope| *scope != Scope::Once).map(|scope| serde_json::json!({
+                        "selection": reject_option_id_for_scope(scope).as_str(),
+                        "persist_reject": {"kind": "custom_tool", "key": target, "scope": scope_label(scope)}
+                    }))).chain(std::iter::once(serde_json::json!({
+                        "selection": "reject", "effect": "deny"
+                    }))).collect::<Vec<_>>(),
+                }),
+                |response| response_to_approval_choice(response, &set),
+            )
             .await?;
         let decision = match choice {
             ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
             ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
             ApprovalChoice::Approve(scope) => {
-                if let Err(e) = self.store.record_mcp_tool(agent, tool, scope).await {
-                    tracing::warn!(error = %e, agent, tool, ?scope, "recording custom tool grant failed; applying once");
-                    Decision::Allow { scope: Scope::Once }
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "custom_tool_grant_persistence",
+                    &[serde_json::json!({"persist_grant": {"kind": "custom_tool", "key": &target, "scope": scope_label(scope)}})],
+                ).await.is_err() {
+                    Decision::Deny
                 } else {
-                    Decision::Allow { scope }
+                    if let Err(e) = self.store.record_mcp_tool(agent, tool, scope).await {
+                        tracing::warn!(error = %e, agent, tool, ?scope, "recording custom tool grant failed; rejecting selected capability");
+                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                        Decision::Deny
+                    } else {
+                        Decision::Allow { scope }
+                    }
                 }
             }
             ApprovalChoice::Reject(scope) => {
-                if let Err(e) = self.store.record_mcp_tool_reject(agent, tool, scope).await {
-                    tracing::warn!(error = %e, agent, tool, ?scope, "recording custom tool reject failed; denying once");
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "custom_tool_reject_persistence",
+                    &[serde_json::json!({"persist_reject": {"kind": "custom_tool", "key": &target, "scope": scope_label(scope)}})],
+                ).await.is_err() {
+                    Decision::Deny
+                } else {
+                    if let Err(e) = self.store.record_mcp_tool_reject(agent, tool, scope).await {
+                        tracing::warn!(error = %e, agent, tool, ?scope, "recording custom tool reject failed; denying once");
+                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                    }
+                    Decision::Deny
                 }
-                Decision::Deny
             }
             ApprovalChoice::Deny
             | ApprovalChoice::ApproveAllOnce
@@ -474,7 +625,14 @@ impl Approver {
             .await;
             return Ok(decision);
         }
-        if self.yolo_mode() || self.auto_allows("mcp_server_connect", &target).await {
+        if self.yolo_mode()
+            || self
+                .auto_allows(
+                    crate::agent_tree::HostEffectClass::ExternalAction,
+                    &target,
+                )
+                .await
+        {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
         let prompt = mcp_server_connect_prompt(server, identity);
@@ -490,34 +648,68 @@ impl Approver {
         );
         let set = approval_option_set("mcp_server_connect_approval", false, &offered, None);
         let choice = self
-            .raise_and_decode(&prompt, question, |response| {
-                response_to_approval_choice(response, &set)
-            })
+            .raise_and_decode(
+                &prompt,
+                question,
+                "mcp_server_connect",
+                serde_json::json!({
+                    "server": server,
+                    "identity": identity,
+                    "offered_scopes": offered.iter().map(|scope| scope_label(*scope)).collect::<Vec<_>>(),
+                    "candidate_effects": offered.iter().map(|scope| serde_json::json!({
+                        "selection": approve_option_id_for_scope(*scope).as_str(),
+                        "connect": {"server": server, "identity": identity},
+                        "persist_grant": if *scope == Scope::Once { serde_json::Value::Null } else { serde_json::json!({"kind": "mcp_server_connect", "key": target, "scope": scope_label(*scope)}) },
+                    })).chain(offered.iter().copied().filter(|scope| *scope != Scope::Once).map(|scope| serde_json::json!({
+                        "selection": reject_option_id_for_scope(scope).as_str(),
+                        "persist_reject": {"kind": "mcp_server_connect", "key": target, "scope": scope_label(scope)}
+                    }))).chain(std::iter::once(serde_json::json!({
+                        "selection": "reject", "effect": "deny"
+                    }))).collect::<Vec<_>>(),
+                }),
+                |response| response_to_approval_choice(response, &set),
+            )
             .await?;
         let decision = match choice {
             ApprovalChoice::NoninteractiveDeny => Decision::NoninteractiveDeny,
             ApprovalChoice::Approve(Scope::Once) => Decision::Allow { scope: Scope::Once },
             ApprovalChoice::Approve(scope) => {
-                if let Err(error) = self
-                    .store
-                    .record_mcp_server_connect(server, identity, scope)
-                    .await
-                {
-                    tracing::warn!(%error, server, identity, ?scope, "recording MCP server connect grant failed; applying once");
-                    Decision::Allow { scope: Scope::Once }
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "mcp_connect_grant_persistence",
+                    &[serde_json::json!({"persist_grant": {"kind": "mcp_server_connect", "key": &target, "scope": scope_label(scope)}})],
+                ).await.is_err() {
+                    Decision::Deny
                 } else {
-                    Decision::Allow { scope }
+                    if let Err(error) = self
+                        .store
+                        .record_mcp_server_connect(server, identity, scope)
+                        .await
+                    {
+                        tracing::warn!(%error, server, identity, ?scope, "recording MCP server connect grant failed; rejecting selected capability");
+                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                        Decision::Deny
+                    } else {
+                        Decision::Allow { scope }
+                    }
                 }
             }
             ApprovalChoice::Reject(scope) => {
-                if let Err(error) = self
-                    .store
-                    .record_mcp_server_connect_reject(server, identity, scope)
-                    .await
-                {
-                    tracing::warn!(%error, server, identity, ?scope, "recording MCP server connect reject failed; denying once");
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "mcp_connect_reject_persistence",
+                    &[serde_json::json!({"persist_reject": {"kind": "mcp_server_connect", "key": &target, "scope": scope_label(scope)}})],
+                ).await.is_err() {
+                    Decision::Deny
+                } else {
+                    if let Err(error) = self
+                        .store
+                        .record_mcp_server_connect_reject(server, identity, scope)
+                        .await
+                    {
+                        tracing::warn!(%error, server, identity, ?scope, "recording MCP server connect reject failed; denying once");
+                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                    }
+                    Decision::Deny
                 }
-                Decision::Deny
             }
             ApprovalChoice::Deny
             | ApprovalChoice::ApproveAllOnce
@@ -553,7 +745,14 @@ impl Approver {
         clone_url: &str,
         rationale: &str,
     ) -> Result<Decision> {
-        if self.yolo_mode() || self.auto_allows("package_clone", clone_url).await {
+        if self.yolo_mode()
+            || self
+                .auto_allows(
+                    crate::agent_tree::HostEffectClass::ExternalAction,
+                    clone_url,
+                )
+                .await
+        {
             return Ok(Decision::Allow { scope: Scope::Once });
         }
         let prompt = format!(
@@ -573,7 +772,20 @@ impl Approver {
         let description = format!("Clone `{identifier}` from {clone_url} for docs? ({rationale})");
         let set = ApprovalOptionSet::new("package_add_approval", [ApprovalOptionId::ApproveOnce]);
         let decision = self
-            .raise_and_decode(&description, question, |response| {
+            .raise_and_decode(
+                &description,
+                question,
+                "package_clone",
+                serde_json::json!({
+                    "identifier": identifier,
+                    "clone_url": clone_url,
+                    "rationale": rationale,
+                    "candidate_effects": [
+                        {"selection": "approve_once", "execute": {"identifier": identifier, "clone_url": clone_url, "rationale": rationale}},
+                        {"selection": "reject", "effect": "deny"}
+                    ],
+                }),
+                |response| {
                 let Some(id) = decode_option_response(response, &set)? else {
                     return Ok(Decision::Deny);
                 };
@@ -581,7 +793,8 @@ impl Approver {
                     ApprovalOptionId::ApproveOnce => Ok(Decision::Allow { scope: Scope::Once }),
                     _ => Err(ForeignOptionId::new(&set, id.as_str())),
                 }
-            })
+                },
+            )
             .await?;
         self.record_permission_decision(
             "add-package",
@@ -608,9 +821,22 @@ impl Approver {
     /// prompt defines one-decision reuse).
     pub(super) async fn approve_computer_action_inner(
         &self,
+        session_id: &str,
+        delegation_id: &str,
         action_id: &str,
         tier: &str,
         action_label: &str,
+        backend_kind: &str,
+        focus_generation: u64,
+        observation_generation: u64,
+        has_host_lease: bool,
+        provider_call_id: &str,
+        batch_index: u32,
+        geometry_generation: u64,
+        action_class: &str,
+        action_payload_digest: &str,
+        lease_binding_digest: Option<&str>,
+        target_evidence_binding_digest: &str,
     ) -> Result<Decision> {
         // Yolo tier: zero human requests, no semantic denial. Only the
         // *computer* effective tier grants this — the global session
@@ -643,7 +869,33 @@ impl Approver {
             [ApprovalOptionId::ApproveOnce, ApprovalOptionId::Reject],
         );
         let decision = self
-            .raise_and_decode(&description, question, |response| {
+            .raise_and_decode(
+                &description,
+                question,
+                "computer_action",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "delegation_id": delegation_id,
+                    "action_id": action_id,
+                    "tier": tier,
+                    "action_label": action_label,
+                    "backend_kind": backend_kind,
+                    "focus_generation": focus_generation,
+                    "observation_generation": observation_generation,
+                    "geometry_generation": geometry_generation,
+                    "provider_call_id": provider_call_id,
+                    "batch_index": batch_index,
+                    "action_class": action_class,
+                    "has_host_lease": has_host_lease,
+                    "lease_binding_digest": lease_binding_digest,
+                    "target_evidence_binding_digest": target_evidence_binding_digest,
+                    "payload_digest": action_payload_digest,
+                    "candidate_effects": [
+                        {"selection": "approve_once", "execute": {"session_id": session_id, "delegation_id": delegation_id, "action_id": action_id, "tier": tier, "action_label": action_label, "backend_kind": backend_kind, "focus_generation": focus_generation, "observation_generation": observation_generation, "geometry_generation": geometry_generation, "provider_call_id": provider_call_id, "batch_index": batch_index, "action_class": action_class, "has_host_lease": has_host_lease, "payload_digest": action_payload_digest, "lease_binding_digest": lease_binding_digest, "target_evidence_binding_digest": target_evidence_binding_digest}},
+                        {"selection": "reject", "effect": "deny"}
+                    ],
+                }),
+                |response| {
                 // Dismissal (no selection) still denies.
                 let Some(id) = decode_option_response(response, &set)? else {
                     return Ok(Decision::Deny);
@@ -653,7 +905,8 @@ impl Approver {
                     ApprovalOptionId::Reject => Ok(Decision::Deny),
                     _ => Err(ForeignOptionId::new(&set, id.as_str())),
                 }
-            })
+                },
+            )
             .await?;
         // No durable permission record for computer actions. The delegation
         // lease contract forbids standing computer grants: reuse of an Ask
@@ -774,7 +1027,49 @@ impl Approver {
             "media_egress_approval",
             [ApprovalOptionId::ApproveOnce, ApprovalOptionId::Reject],
         );
-        self.raise_and_decode(&description, question, |response| {
+        // This is the durable authority input, deliberately richer than the
+        // display prompt. It carries every secret-free fact that can select or
+        // scope the external egress and the exact request digest that binds
+        // hidden prompt/audio/credential material. The concrete multipart
+        // dispatch must re-present the matching `execute` member at its host
+        // boundary; a rendered description is never effect authority.
+        let egress = serde_json::json!({
+            "purpose": facts.purpose,
+            "request_digest": facts.request_digest.as_str(),
+            "provider_id": facts.provider_id,
+            "model_id": facts.model_id,
+            "credential_fingerprint_digest": facts.credential_fingerprint_digest.as_str(),
+            "project_digest": facts.project_digest,
+            "session_id": facts.session_id,
+            "attachment_id": facts.attachment_id,
+            "attachment_checksum": facts.attachment_checksum,
+            "interval_start_us": facts.interval_start_us,
+            "interval_end_us": facts.interval_end_us,
+            "prompt_present": facts.prompt_present,
+            "keyword_count": facts.keyword_count,
+            "language_count": facts.language_count,
+            "timestamps": facts.timestamps,
+            "diarization": facts.diarization,
+        });
+        self.raise_and_decode(
+            &description,
+            question,
+            "media_egress_transcription",
+            serde_json::json!({
+                "egress": egress.clone(),
+                "candidate_effects": [
+                    {
+                        "selection": ApprovalOptionId::ApproveOnce.as_str(),
+                        "scope": "once",
+                        "execute": {"media_egress": egress},
+                    },
+                    {
+                        "selection": ApprovalOptionId::Reject.as_str(),
+                        "effect": "deny",
+                    },
+                ],
+            }),
+            |response| {
             // Dismissal (no selection) denies, fail closed.
             let Some(id) = decode_option_response(response, &set)? else {
                 return Ok(Decision::Deny);
@@ -784,7 +1079,8 @@ impl Approver {
                 ApprovalOptionId::Reject => Ok(Decision::Deny),
                 _ => Err(ForeignOptionId::new(&set, id.as_str())),
             }
-        })
+            },
+        )
         .await
     }
 
@@ -938,7 +1234,33 @@ impl Approver {
             "image_generation_approval",
             [ApprovalOptionId::ApproveOnce, ApprovalOptionId::Reject],
         );
-        self.raise_and_decode(&description, question, |response| {
+        self.raise_and_decode(
+            &description,
+            question,
+            "image_generation",
+            serde_json::json!({
+                "plan_digest": facts.plan_digest,
+                "destinations": facts.destinations,
+                "fanout": facts.fanout,
+                "total_outputs": facts.total_outputs,
+                "cost_maximum": facts.cost_maximum,
+                "reference_egress_unmatched": facts.reference_egress_unmatched,
+                "base_threshold_usd_micros": facts.base_threshold_usd_micros,
+                "spend_request": facts.spend_request,
+                "spend_session": facts.spend_session,
+                "spend_project": facts.spend_project,
+                "path_read_authorized": facts.path_read_authorized,
+                "output_write_authorized": facts.output_write_authorized,
+                "destination_enabled": facts.destination_enabled,
+                "capability_fresh": facts.capability_fresh,
+                "insecure_transport_allowed": facts.insecure_transport_allowed,
+                "output_path_authority": facts.output_path_authority,
+                "candidate_effects": [
+                    {"selection": "approve_once", "execute": {"plan_digest": facts.plan_digest, "destinations": facts.destinations, "fanout": facts.fanout, "total_outputs": facts.total_outputs, "cost_maximum": facts.cost_maximum, "output_path_authority": facts.output_path_authority}},
+                    {"selection": "reject", "effect": "deny"}
+                ],
+            }),
+            |response| {
             // Dismissal (no selection) denies, fail closed.
             let Some(id) = decode_option_response(response, &set)? else {
                 return Ok(Decision::Deny);
@@ -948,7 +1270,8 @@ impl Approver {
                 ApprovalOptionId::Reject => Ok(Decision::Deny),
                 _ => Err(ForeignOptionId::new(&set, id.as_str())),
             }
-        })
+            },
+        )
         .await
     }
 }
@@ -1012,7 +1335,15 @@ mod approval_mode_tests {
             crate::config::extended::ApprovalMode::Yolo
         );
         assert_eq!(
-            approver.approve_mcp_tool("untrusted", "run").await.unwrap(),
+            approver
+                .approve_mcp_tool(
+                    "untrusted",
+                    "run",
+                    &serde_json::json!({"query": "x"}),
+                    &serde_json::json!({"endpoint": "https://example.invalid/mcp"}),
+                )
+                .await
+                .unwrap(),
             Decision::Allow { scope: Scope::Once }
         );
     }

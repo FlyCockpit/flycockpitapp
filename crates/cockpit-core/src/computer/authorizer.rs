@@ -83,6 +83,13 @@ impl ComputerAuthorizer for ApproverComputerAuthorizer {
             focus_generation: request.focus_generation,
             observation_generation: request.observation_generation,
             has_host_lease: request.host_lease.is_some(),
+            provider_call_id: &request.provider_call_id,
+            batch_index: request.batch_index,
+            geometry_generation: request.geometry_generation,
+            action_class: request.action_class.label(),
+            action_payload_digest: &request.action_payload_digest,
+            lease_binding_digest: request.lease_binding_digest.as_deref(),
+            target_evidence_binding_digest: &request.target_evidence_binding_digest,
         };
         match self.approver.authorize(central).await {
             Ok(decision) => Ok(map_decision(decision)),
@@ -143,6 +150,10 @@ mod tests {
             batch_index: 0,
             geometry_generation: 1,
             action_class: ActionRiskClass::Unknown,
+            action_payload_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            lease_binding_digest: None,
+            target_evidence_binding_digest:
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
         }
     }
 

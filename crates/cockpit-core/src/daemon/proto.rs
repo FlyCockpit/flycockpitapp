@@ -12,6 +12,11 @@ use uuid::Uuid;
 /// `ToolEnd` in the future.
 pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Event> {
     match event {
+        // These are worker-local endpoint registrations. They carry no
+        // user-visible state and must never become a protocol event.
+        TurnEvent::AgentTreeExecutorEndpointAttached { .. }
+        | TurnEvent::AgentTreeExecutorEndpointDetached { .. }
+        | TurnEvent::AgentTreeNoninteractiveEndpointAttached { .. } => Vec::new(),
         TurnEvent::InterruptDecision {
             session_id: _,
             interrupt_id,

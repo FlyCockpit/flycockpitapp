@@ -555,6 +555,7 @@ mod tests {
             "fs_read",
             "fs_stat",
             "get_host_capabilities",
+            "refresh_host_capabilities",
             "get_image_spend_policy",
             "image_endpoint_list",
             "image_endpoint_get",

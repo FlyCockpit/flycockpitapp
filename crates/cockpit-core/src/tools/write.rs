@@ -103,6 +103,16 @@ impl Tool for WriteTool {
                 }
             };
 
+        // The early native check can park for approval.  Do not even inspect
+        // target existence/content after a cancellation or revision won that
+        // decision: claim the exact ReadWrite path immediately before this
+        // first filesystem access.  The later content/mutation fence remains
+        // the separate irreversible-write commitment.
+        crate::tools::sandbox::recheck_native_access_effect_boundary(
+            &path,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        )
+        .await?;
         let exists = path.exists();
         let existing_before = if exists {
             Some(std::fs::read(&path)?)
@@ -139,6 +149,15 @@ impl Tool for WriteTool {
             )
             .await?;
 
+        // `authorize_existing_write` and lock acquisition can both wait.
+        // Revalidate the already-claimed exact path before this stability
+        // read, but deliberately leave the ready content mutation claim for
+        // the immediately following irreversible-write fence.
+        crate::tools::sandbox::recheck_claimed_native_access_stability_boundary(
+            &path,
+            crate::tools::shell_sandbox::SandboxPathAccess::ReadWrite,
+        )
+        .await?;
         if let Some(previous) = &existing_before
             && std::fs::read(&path)? != *previous
         {
@@ -166,6 +185,18 @@ impl Tool for WriteTool {
             )));
         }
 
+        // Both concrete helpers mutate the filesystem before their first
+        // await, so fence the capability immediately before selecting one.
+        let concrete_effects = host_approval_filesystem_write_effects(
+            &path,
+            existing_before.as_deref(),
+            normalized.as_bytes(),
+        );
+        crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+            "write_filesystem_mutation",
+            &concrete_effects,
+        )
+        .await?;
         let outcome = if exists {
             write_and_release(ctx, &path, normalized.as_bytes(), write_guard).await?
         } else {
@@ -203,6 +234,33 @@ impl Tool for WriteTool {
 
         Ok(ToolOutput::text(message))
     }
+}
+
+/// Reconstruct every approval candidate that can authorize a filesystem write
+/// at its real mutation boundary. Both `write` and `edit` use this exact
+/// projection so an approved path-access or previous/next-content commitment
+/// cannot be consumed by a different in-process write helper.
+pub(crate) fn host_approval_filesystem_write_effects(
+    path: &std::path::Path,
+    previous: Option<&[u8]>,
+    next: &[u8],
+) -> Vec<Value> {
+    let mut effects = vec![serde_json::json!({
+        "access": {
+            "path": path.display().to_string(),
+            "required_access": "ReadWrite",
+        }
+    })];
+    if let Some(previous) = previous {
+        effects.push(serde_json::json!({
+            "write": {
+                "path": path.display().to_string(),
+                "previous": crate::approval::write_content_commitment(previous),
+                "next": crate::approval::write_content_commitment(next),
+            }
+        }));
+    }
+    effects
 }
 
 pub(crate) fn enforce_write_scope(ctx: &ToolCtx, path: &std::path::Path, tool: &str) -> Result<()> {
@@ -366,6 +424,7 @@ mod tests {
         );
         ToolCtx {
             agent_id: "helper".to_string(),
+            agent_instance_id: None,
             lock_identity: "helper".to_string().clone(),
             write_scope: None,
             current_tool_call_id: None,
@@ -457,6 +516,25 @@ mod tests {
         crate::config::trust::with_workspace_trust_policy(trusted_policy(&ctx.cwd), || {
             crate::skills::catalog_cache_contains(&ctx.cwd, cfg)
         })
+    }
+
+    #[test]
+    fn filesystem_write_effects_bind_path_and_exact_content_commitments() {
+        let path = Path::new("/workspace/.agents/skills/example/SKILL.md");
+        let approved = host_approval_filesystem_write_effects(path, Some(b"before"), b"after");
+        let altered = host_approval_filesystem_write_effects(path, Some(b"before"), b"different");
+
+        assert_eq!(approved.len(), 2);
+        assert_eq!(approved[0]["access"]["path"], path.display().to_string());
+        assert_eq!(approved[0]["access"]["required_access"], "ReadWrite");
+        assert_eq!(
+            approved[1]["write"]["previous"],
+            crate::approval::write_content_commitment(b"before")
+        );
+        assert_ne!(
+            approved[1]["write"], altered[1]["write"],
+            "a final write fence must reject changed content after approval"
+        );
     }
 
     async fn load_skill(

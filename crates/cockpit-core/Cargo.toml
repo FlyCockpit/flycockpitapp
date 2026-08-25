@@ -67,7 +67,7 @@ rig = { workspace = true }
 httpdate = "1"
 tokio-tungstenite = { workspace = true, optional = true }
 cockpit-config = { path = "../cockpit-config" }
-cockpit-db = { path = "../cockpit-db" }
+cockpit-db = { path = "../cockpit-db", features = ["host-approval-composition", "host-capability-refresh-composition"] }
 cockpit-proto = { path = "../cockpit-proto" }
 cockpit-tokenizer = { path = "../cockpit-tokenizer" }
 cockpit-test-support = { path = "../cockpit-test-support", optional = true }
@@ -263,6 +263,7 @@ windows = { version = "=0.62.2", default-features = false, features = [
 libc = { workspace = true }
 
 [dev-dependencies]
+cockpit-db = { path = "../cockpit-db", features = ["host-approval-test-support"] }
 flycockpit-relay-protocol = { path = "../relay-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }

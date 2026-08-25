@@ -19,6 +19,19 @@ pub fn is_cancelled(err: &anyhow::Error) -> bool {
     err.downcast_ref::<InferenceCancelled>().is_some()
 }
 
+/// Sentinel returned only when an AgentTree late-user steer lost the final
+/// runnable-owner race before any provider bytes were sent. This is neither a
+/// user cancellation nor an inference failure: its durable row is still
+/// pending and must remain ordered behind the owner continuation that parked
+/// first.
+#[derive(Debug, thiserror::Error)]
+#[error("late user steer deferred until its owner is runnable")]
+pub struct LateUserSteerDeferred;
+
+pub fn is_late_user_steer_deferred(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<LateUserSteerDeferred>().is_some()
+}
+
 pub fn cancellation_phase(err: &anyhow::Error) -> Option<InferencePhase> {
     err.downcast_ref::<InferenceCancelled>()
         .map(|cancelled| cancelled.phase)

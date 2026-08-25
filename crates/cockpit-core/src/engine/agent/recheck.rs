@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone)]
 pub(crate) struct ResultRecheckCtx {
     pub agent_id: String,
+    pub agent_instance_id: Option<uuid::Uuid>,
     pub session: Arc<Session>,
     pub cwd: std::path::PathBuf,
     pub config: crate::daemon::session_worker::SessionConfigHandle,
@@ -14,6 +15,7 @@ impl ResultRecheckCtx {
     pub(crate) fn from_tool_ctx(ctx: &ToolCtx) -> Self {
         Self {
             agent_id: ctx.agent_id.clone(),
+            agent_instance_id: ctx.agent_instance_id,
             session: ctx.session.clone(),
             cwd: ctx.cwd.clone(),
             config: ctx.config.clone(),

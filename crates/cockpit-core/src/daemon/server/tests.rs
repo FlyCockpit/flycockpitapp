@@ -13658,6 +13658,7 @@ async fn client_state_split_handler_holding_a_stale_snapshot_still_scrubs() {
     stale.attached = Some(SharedAttachedSession {
         session_id: state.attached.as_ref().unwrap().handle.session_id,
         project_root: state.attached.as_ref().unwrap().handle.project_root.clone(),
+        handle: state.attached.as_ref().unwrap().handle.clone(),
         redaction_table: table,
         active_tool_names: state.attached.as_ref().unwrap().handle.active_tool_names(),
     });
@@ -21851,7 +21852,7 @@ macro_rules! request_ordering_rows_from_command_table {
 }
 
 #[tokio::test]
-async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
+async fn request_ordering_concurrent_set_is_exactly_the_enumerated_nonblocking_requests() {
     let rows = proto::command!(request_ordering_rows_from_command_table);
     assert!(
         rows.len() > 80,
@@ -21873,6 +21874,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "fs_read",
         "fs_stat",
         "get_host_capabilities",
+        "refresh_host_capabilities",
         "get_image_spend_policy",
         "image_endpoint_list",
         "image_endpoint_get",
@@ -21969,6 +21971,90 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
     }
 }
 
+#[tokio::test]
+async fn pending_host_capability_refresh_does_not_block_same_client_interrupt_resolution() {
+    let ctx = test_ctx();
+    let project = tempfile::tempdir().unwrap();
+    let (mut state, _session_id, mut work_rx) =
+        attached_state_with_worker_receiver(&ctx, project.path()).await;
+    let mut shared = state.shared_snapshot();
+    let (writer_tx, mut writer_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let (event_cmd_tx, _event_cmd_rx) = mpsc::channel(CLIENT_IO_CHANNEL_CAPACITY);
+    let mut concurrent = ConcurrentRequestRuntime::new();
+
+    let refresh_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::request(refresh_id, Request::RefreshHostCapabilities),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+
+    let SessionWork::AuthorizeHostCapabilitiesRefresh { respond_to } = work_rx
+        .recv()
+        .await
+        .expect("refresh reaches the attached worker")
+    else {
+        panic!("expected durable host-capability refresh authorization work");
+    };
+
+    let resolve_id = Uuid::new_v4();
+    let interrupt_id = Uuid::new_v4();
+    handle_envelope(
+        Envelope::request(
+            resolve_id,
+            Request::ResolveInterrupt {
+                interrupt_id,
+                response: crate::daemon::proto::ResolveResponse::Single {
+                    selected_id: "refresh".to_string(),
+                },
+            },
+        ),
+        &mut state,
+        &mut shared,
+        &ctx,
+        &event_cmd_tx,
+        &writer_tx,
+        &mut concurrent,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "same-client interrupt response").await,
+        Body::Response { id, response } if id == resolve_id && matches!(*response, Response::Ack)
+    ));
+    assert!(matches!(
+        work_rx.recv().await.expect("interrupt reaches worker while refresh waits"),
+        SessionWork::ResolveInterrupt { interrupt_id: delivered, .. } if delivered == interrupt_id
+    ));
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "the original refresh response remains tied to its unresolved durable authorization"
+    );
+
+    respond_to
+        .send(Err(
+            crate::daemon::session_worker::HostCapabilitiesRefreshError::Declined,
+        ))
+        .unwrap();
+    match concurrent.join_next().await.expect("refresh task joins") {
+        Ok(()) => {}
+        Err(error) => panic!("refresh task failed: {error}"),
+    }
+    assert!(matches!(
+        recv_writer_body(&mut writer_rx, "original refresh response").await,
+        Body::Error { id: Some(id), error }
+            if id == refresh_id && error.code == proto::ErrorCode::Authorization
+    ));
+}
+
+#[cfg(feature = "remote")]
 #[tokio::test]
 async fn command_table_metadata_is_exhaustive_and_stable() {
     struct CommandMetadataCase {

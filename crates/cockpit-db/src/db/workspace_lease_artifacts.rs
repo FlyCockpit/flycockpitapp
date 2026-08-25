@@ -820,6 +820,8 @@ mod tests {
                     task_delegation_job_id: None,
                     task_delegation_child_uuid: None,
                     resolved_profile_snapshot_id: None,
+                    workspace_ref: None,
+                    auto_answer_enabled: false,
                 },
                 now,
             )

@@ -12,6 +12,7 @@ use crate::host_capabilities::{
     FEATURE_SANDBOX_HOST, FEATURE_SECRET_STORE_KEYRING, HostCapabilityProbeInputs,
     HostCapabilitySnapshotStore, KeyringProbeSource, SandboxProbeSource,
     build_host_capability_snapshot, collect_shared_host_probes, publish_initial_host_capabilities,
+    publish_staged_host_capabilities_refresh, stage_host_capabilities_refresh,
 };
 use crate::secure_key::{
     KeyringProbeResult, default_platform_store_is_registered, probe_platform_keyring,
@@ -183,29 +184,19 @@ async fn host_capabilities_get_returns_features_and_secret_store() {
 }
 
 #[tokio::test]
-async fn host_capabilities_refresh_emits_changed_and_discards_stale_generation() {
+async fn host_capabilities_refresh_requires_an_attached_durable_decision_and_discards_stale_generation() {
     let _guard = lock_keyring_probe_tests();
     reset_keyring_probe_cache_for_test();
     let tmp = tempfile::tempdir().expect("tempdir");
     let probes = injected_probes(&tmp, Arc::new(AtomicUsize::new(0)));
     let (_tmp, ctx) = tempdir_ctx(probes.clone());
     publish_initial_host_capabilities(&ctx.host_capabilities, &probes).await;
-    let first_generation = ctx.host_capabilities.current().unwrap().generation;
 
-    let mut events = ctx.subscribe_global();
     let mut state = MutableClientState::detached_for_test();
-    let response = handle_request(Request::RefreshHostCapabilities, &mut state, &ctx)
+    let error = handle_request(Request::RefreshHostCapabilities, &mut state, &ctx)
         .await
-        .expect("refresh");
-    let Response::HostCapabilities { snapshot } = response else {
-        panic!("expected HostCapabilities");
-    };
-    assert!(snapshot.generation > first_generation);
-    let event = events.try_recv().expect("HostCapabilitiesChanged");
-    assert!(matches!(
-        event.event,
-        proto::Event::HostCapabilitiesChanged { .. }
-    ));
+        .expect_err("detached callers cannot bypass the HostEffect decision");
+    assert_eq!(error.code, ErrorCode::NotAttached);
 
     let store = HostCapabilitySnapshotStore::new();
     let stale = store.begin_refresh();
@@ -227,6 +218,104 @@ async fn host_capabilities_refresh_emits_changed_and_discards_stale_generation()
     );
     assert!(store.publish(current_snapshot));
     assert_eq!(store.current().unwrap().generation, current);
+}
+
+#[tokio::test]
+async fn staged_refresh_never_leaks_when_the_durable_completion_is_cancelled_or_fails() {
+    let _guard = lock_keyring_probe_tests();
+    reset_keyring_probe_cache_for_test();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let probes = injected_probes(&tmp, Arc::new(AtomicUsize::new(0)));
+    let store = HostCapabilitySnapshotStore::new();
+    publish_initial_host_capabilities(&store, &probes).await;
+    let initial = (*store.current().expect("initial snapshot")).clone();
+
+    // The real worker drops this stage if cancellation wins the completion CAS.
+    // Nothing in the probe path is allowed to make it externally observable.
+    let cancelled_stage = stage_host_capabilities_refresh(&store, &probes)
+        .await
+        .expect("stage refresh before cancellation");
+    assert!(cancelled_stage.snapshot().generation > initial.generation);
+    drop(cancelled_stage);
+    assert_eq!(
+        store.current().expect("initial snapshot remains live").generation,
+        initial.generation,
+        "cancellation between probe and durable completion must not publish"
+    );
+
+    // A DB failure follows the same no-publication path: the staged value is
+    // simply dropped.  Only a successful durable receipt may call publish.
+    let failed_stage = stage_host_capabilities_refresh(&store, &probes)
+        .await
+        .expect("stage refresh before simulated DB failure");
+    drop(failed_stage);
+    assert_eq!(
+        store.current().expect("initial snapshot remains live").generation,
+        initial.generation,
+        "a failed durable completion must not publish a staged probe"
+    );
+
+    let committed_stage = stage_host_capabilities_refresh(&store, &probes)
+        .await
+        .expect("stage committed refresh");
+    // A later probe may be in flight when this receipt commits. It has no
+    // durable authorization yet, so it cannot suppress the earlier committed
+    // snapshot merely by reserving a newer generation.
+    let later_uncommitted_stage = stage_host_capabilities_refresh(&store, &probes)
+        .await
+        .expect("stage later uncommitted refresh");
+    let (committed, published) = publish_staged_host_capabilities_refresh(&store, committed_stage)
+        .expect("committed stage must install or match the exact live snapshot");
+    assert!(published, "only the successful receipt may change the live view");
+    assert_eq!(
+        store.current().expect("committed snapshot").generation,
+        committed.generation
+    );
+    drop(later_uncommitted_stage);
+}
+
+#[tokio::test]
+async fn recovered_committed_generation_advances_next_refresh_and_rejects_mismatched_replay() {
+    let _guard = lock_keyring_probe_tests();
+    reset_keyring_probe_cache_for_test();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let probes = injected_probes(&tmp, Arc::new(AtomicUsize::new(0)));
+    let collected = collect_shared_host_probes(&probes, false).await;
+
+    // Model a process that durably completed generation 2 but crashed before
+    // its in-memory store/outbox acknowledgement. Recovery starts from a new
+    // store, installs that exact receipt, then must reserve generation 3.
+    let recovered = HostCapabilitySnapshotStore::new();
+    let generation_two = build_host_capability_snapshot(
+        2,
+        &collected,
+        cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
+    );
+    assert!(recovered
+        .publish_committed(generation_two.clone())
+        .expect("durable generation two installs on recovery"));
+    assert_eq!(
+        recovered.begin_refresh(),
+        3,
+        "the next probe may not reuse a recovered committed generation"
+    );
+
+    let generation_three = build_host_capability_snapshot(
+        3,
+        &collected,
+        cockpit_proto::SecretStoreSnapshot::unconfigured_placeholder(),
+    );
+    assert!(recovered
+        .publish_committed(generation_three.clone())
+        .expect("generation three installs after recovered generation two"));
+    assert_eq!(recovered.current().as_deref(), Some(&generation_three));
+
+    let mut mismatched = generation_three;
+    mismatched.features.clear();
+    assert!(
+        recovered.publish_committed(mismatched).is_err(),
+        "a same-generation but different durable receipt must retain its outbox entry"
+    );
 }
 
 #[tokio::test]

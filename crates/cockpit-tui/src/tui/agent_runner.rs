@@ -1547,6 +1547,12 @@ fn event_persisted_seq(event: &proto::Event) -> Option<i64> {
         | proto::Event::ToolError { seq, .. } => *seq,
         proto::Event::UserMessageRecorded { seq, .. } => Some(*seq),
         proto::Event::HistoryReplay { max_seq, .. } => Some(*max_seq),
+        // `AgentTreeChanged` is a durable tree invalidation, but this
+        // terminal renderer has no tree projection yet.  It therefore has no
+        // transcript effect and must not advance the transcript replay cursor:
+        // a higher tree event arriving before a lower transcript event would
+        // otherwise make reconnect/live forwarding drop that transcript row.
+        proto::Event::AgentTreeChanged { .. } => None,
         _ => None,
     }
 }
@@ -3433,7 +3439,8 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
         | TandemState { session_id, .. }
         | GitignoreAllow { session_id, .. }
         | PausedWorkAvailable { session_id, .. }
-        | WaitingForLock { session_id, .. } => *session_id,
+        | WaitingForLock { session_id, .. }
+        | AgentTreeChanged { session_id, .. } => *session_id,
         EventStreamLagged {
             session_id: Some(session_id),
             ..
@@ -4413,6 +4420,11 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         HostCapabilitiesChanged { snapshot } => TurnEvent::HostCapabilitiesChanged {
             snapshot: Box::new(snapshot),
         },
+        // Agent-tree changes invalidate daemon-owned Attention/tree queries;
+        // the current terminal UI has no tree surface or local cache to
+        // refresh. Consume the event explicitly so a new protocol event never
+        // falls through as a rendered history turn.
+        AgentTreeChanged { .. } => return None,
         // This daemon-global, project-scoped invalidation has no image-control
         // TUI state to refresh yet. Consume its safe projection explicitly so
         // it is neither treated as a session event nor rendered as history.
@@ -6426,6 +6438,45 @@ mod tests {
                 reason: cockpit_core::engine::IdleReason::Completed,
             } if turn_id == "turn-1"
         ));
+    }
+
+    #[test]
+    fn agent_tree_invalidation_does_not_advance_transcript_cursor_or_drop_late_transcript() {
+        let session_id = uuid::Uuid::new_v4();
+        let event = proto::Event::AgentTreeChanged {
+            session_id,
+            session_event_seq: 47,
+            transition: proto::AgentTreeTransition::AttentionStateChanged,
+            subject_kind: proto::AgentTreeEventSubject::Decision,
+            subject_id: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(event_session(&event), Some(session_id));
+        assert_eq!(event_persisted_seq(&event), None);
+        assert!(
+            proto_event_to_turn_event(event.clone()).is_none(),
+            "the current TUI has no agent-tree surface but must consume its durable invalidation"
+        );
+        // Event streams can reconnect with a tree invalidation before an
+        // earlier transcript event. Tree state has no local renderer/cursor,
+        // so it must not make that valid transcript event look stale.
+        let cursor = Arc::new(Mutex::new(Some(45)));
+        if let Some(seq) = event_persisted_seq(&event) {
+            update_last_applied_seq(&cursor, seq);
+        }
+        assert_eq!(current_last_applied_seq(&cursor), Some(45));
+        let transcript = proto::Event::AssistantText {
+            session_id,
+            agent: "Build".to_string(),
+            text: "arrived after tree invalidation".to_string(),
+            presentation_text: None,
+            reasoning: String::new(),
+            seq: Some(46),
+            response_performance: None,
+        };
+        let seq = event_persisted_seq(&transcript).expect("transcript events own cursor order");
+        assert!(current_last_applied_seq(&cursor).is_none_or(|last| seq > last));
+        update_last_applied_seq(&cursor, seq);
+        assert_eq!(current_last_applied_seq(&cursor), Some(46));
     }
 
     #[test]

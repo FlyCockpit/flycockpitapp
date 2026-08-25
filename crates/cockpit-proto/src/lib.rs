@@ -238,6 +238,87 @@ pub struct EnvSnapshotMeta {
     pub path_entry_count: usize,
 }
 
+/// Opaque, stable pagination position for daemon-owned agent-tree reads.
+/// Timestamp plus UUID avoids drops when several lifecycle transitions share a
+/// clock tick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTreeCursor {
+    pub created_at_unix_ms: i64,
+    pub id: Uuid,
+}
+
+/// Public, resolver-context-free projection of one durable agent node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTreeNode {
+    pub agent_instance_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_instance_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_ref: Option<String>,
+    pub state: String,
+    pub revision: i64,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+/// Typed attention projection. All contracts were allowlisted and redacted by
+/// the daemon before persistence; no resolver prompt, credential, live tool
+/// handle, or approval operation appears on this wire type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentDecisionAttention {
+    pub attention_id: Uuid,
+    pub decision_request_id: Uuid,
+    pub agent_instance_id: Uuid,
+    pub state: String,
+    pub decision_state: String,
+    pub decision_class: String,
+    /// Bounded opaque task lineage derived by the daemon from the owning
+    /// agent, never from caller presentation metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_call_id: Option<String>,
+    /// Bounded opaque daemon-owned workspace reference for the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_ref: Option<String>,
+    pub options_contract_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_text_contract_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix_ms: Option<i64>,
+    pub revision: i64,
+    pub raised_at_unix_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at_unix_ms: Option<i64>,
+}
+
+/// A client answer is validated against the durable bounded/free-text
+/// contract by the daemon and reduced to a redacted receipt before storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentDecisionAnswer {
+    Option { option_id: String },
+    FreeText { text: String },
+    /// Exact wire continuation for a linked QuestionTool interrupt.  It has
+    /// the same serde envelope as `ResolveResponse`, but lives in the
+    /// protocol crate so clients never depend on the daemon storage crate.
+    InterruptResponse { response: AgentInterruptResponse },
+}
+
+/// A QuestionTool continuation supplied through `ResolveAgentDecision`.
+/// Keeping this typed rather than accepting JSON means the session worker can
+/// validate the durable redacted question contract before it releases the
+/// parked continuation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", content = "data")]
+pub enum AgentInterruptResponse {
+    Single { selected_id: String },
+    Multi { selected_ids: Vec<String> },
+    Freetext { text: String },
+    Batch { responses: Vec<AgentInterruptResponse> },
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSnapshotWire {
     pub source: EnvSnapshotSource,
@@ -1022,7 +1103,8 @@ impl fmt::Debug for StoredFlycockpitCredential {
 
 /// Current wire schema version. v14 adds exact identity-bearing settings,
 /// workspace-agent, and assistant-definition authority RPCs, including
-/// occurrence-bound denylist edits with nonce-bound committed receipts.
+/// occurrence-bound denylist edits with nonce-bound committed receipts, plus
+/// daemon-owned AgentTree lifecycle/Attention RPCs and invalidation events.
 /// (`assistant_display_*`) the live chip/stream path and retires the v9/v10
 /// negotiation window — both `MIN_SUPPORTED` and `PROTOCOL_VERSION` are 14.
 pub const PROTOCOL_VERSION: u32 = 14;
@@ -1753,7 +1835,7 @@ fn default_client_protocol_version() -> u32 {
 
 mod event;
 pub use event::{
-    AuthFailureKind, DefaultModelStandaloneOutcome, DefaultModelUpdateOutcome, Event,
+    AgentTreeEventSubject, AgentTreeTransition, AuthFailureKind, DefaultModelStandaloneOutcome, DefaultModelUpdateOutcome, Event,
     InferenceErrorClass, ModelSelectionActiveState, ModelSelectionOutcome, ResponsePerformance,
     UserMessageTerminalDisposition,
 };
@@ -3589,7 +3671,7 @@ mod proto_fixture_tests {
     }
 
     #[test]
-    fn frozen_fixture_supported_version_list_matches_directories() {
+    fn frozen_fixture_directories_are_well_formed_without_expanding_compatibility() {
         let listed = SUPPORTED_PROTOCOL_VERSIONS
             .iter()
             .chain(ARCHIVED_PROTOCOL_VERSIONS)
@@ -3604,11 +3686,14 @@ mod proto_fixture_tests {
             !directories.is_empty(),
             "daemon_proto has no v*/ fixture directories"
         );
-        assert_eq!(
-            directories, listed,
-            "supported protocol version list must match daemon_proto/v*/ directories"
+        assert!(
+            directories.is_superset(&listed),
+            "every live protocol version needs a daemon_proto/vN fixture directory"
         );
-        for version in listed {
+        // Older vN directories are migration archaeology. They deliberately
+        // remain in-tree as frozen wire evidence, but their presence must not
+        // widen the live protocol-compatibility window.
+        for version in directories {
             assert_fixture_directory_files(version);
         }
     }

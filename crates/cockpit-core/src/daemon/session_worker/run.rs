@@ -3,6 +3,7 @@ use super::helpers::*;
 use super::lifecycle::*;
 use super::*;
 use anyhow::Context;
+use sha2::{Digest, Sha256};
 
 pub(super) const INTERRUPT_REDACTION_FAILED: &str = "[redaction failed]";
 
@@ -20,6 +21,1809 @@ const PARK_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// later client submission happens to arrive.
 const TEXT_ARTIFACT_RESERVATION_REAP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
+/// A maintenance source may never monopolize the sole session worker. Each
+/// turn takes a stable bounded slice; the next interval resumes from the
+/// durable/local cursor while client work, replay completions and the other
+/// maintenance classes remain selectable.
+const AGENT_TREE_MAINTENANCE_ITEMS_PER_TURN: usize = 32;
+/// Publication has a global generation fence, so one bounded page must be
+/// fully acknowledged before an allowed operation may reserve a newer probe.
+/// The periodic refresh arm schedules another page when this returns `more`.
+const HOST_CAPABILITY_REFRESH_OUTBOX_ITEMS_PER_TURN: usize = 32;
+
+/// A refresh probe is a short local operation.  An executing row is owned by
+/// the process that claimed it, but that owner can be lost without a restart
+/// (for example after a task panic or a DB completion error).  Reap only after
+/// this bounded lease; live execution has its own immediate completion/failure
+/// path below.
+const HOST_CAPABILITY_REFRESH_EXECUTION_LEASE: std::time::Duration =
+    std::time::Duration::from_secs(60);
+/// A claim is renewed while the probe future is pending. This is deliberately
+/// shorter than the durable execution lease so a live local probe remains
+/// owned even if periodic worker housekeeping runs concurrently.
+const HOST_CAPABILITY_REFRESH_EXECUTION_HEARTBEAT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(20);
+const HOST_CAPABILITY_REFRESH_REAPER_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// Holds the one daemon-local dispatch right for a durable refresh operation.
+/// The set itself belongs to the shared capability store, so independently
+/// constructed session runtimes observe the same owner.  Keeping this guard
+/// alive while a direct request waits for its decision closes the small race
+/// where the periodic allowed-operation scanner could otherwise spawn a
+/// second task for the very same operation.
+struct HostCapabilityRefreshDispatchGuard {
+    in_flight_operations:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    operation_id: uuid::Uuid,
+}
+
+impl HostCapabilityRefreshDispatchGuard {
+    fn claim(runtime: &HostCapabilityRefreshRuntime, operation_id: uuid::Uuid) -> Option<Self> {
+        let admitted = runtime
+            .in_flight_operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(operation_id);
+        admitted.then(|| Self {
+            in_flight_operations: runtime.in_flight_operations.clone(),
+            operation_id,
+        })
+    }
+}
+
+impl Drop for HostCapabilityRefreshDispatchGuard {
+    fn drop(&mut self) {
+        self.in_flight_operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.operation_id);
+    }
+}
+
+fn canonical_host_capability_refresh_receipt(
+    snapshot: &cockpit_proto::HostCapabilitySnapshot,
+) -> std::result::Result<crate::db::agent_tree_decisions::HostCapabilityRefreshSnapshotReceipt, String> {
+    if snapshot.generation == 0 {
+        return Err("host capability refresh snapshot generation must be positive".to_string());
+    }
+    let value = serde_json::to_value(snapshot)
+        .map_err(|error| format!("serializing host capability refresh snapshot failed: {error}"))?;
+    let canonical = crate::db::agent_tree_decisions::canonical_json_bytes(&value)
+        .map_err(|error| format!("canonicalizing host capability refresh snapshot failed: {error}"))?;
+    let result_snapshot_json = String::from_utf8(canonical.clone())
+        .map_err(|error| format!("canonical host capability refresh snapshot was not UTF-8: {error}"))?;
+    let digest = Sha256::digest(&canonical)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(crate::db::agent_tree_decisions::HostCapabilityRefreshSnapshotReceipt {
+        result_snapshot_json,
+        generation: snapshot.generation,
+        digest,
+    })
+}
+
+/// Recovery attachment must never make the sole worker await a full driver
+/// mailbox. A bounded retry keeps the accepted durable checkpoint owned while
+/// a just-started driver drains its bootstrap controls; exhaustion leaves the
+/// row accepted for the next boot rather than releasing/redelivering it.
+const ACCEPTED_LATE_STEER_RECOVERY_RETRY_ATTEMPTS: u8 = 8;
+const ACCEPTED_LATE_STEER_RECOVERY_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(25);
+
+/// Make one durably completed capability refresh visible and acknowledge its
+/// publication outbox. `source_session_id` belongs to the durable row, while
+/// `session` is only the daemon worker that happened to win the store-wide
+/// dispatcher lease. Every session uses the same database and global event
+/// bus, so a live worker may safely recover an older receipt owned by a
+/// stopped session.
+async fn publish_one_completed_host_capability_refresh_operation_while_serialized(
+    session: &std::sync::Arc<crate::session::Session>,
+    source_session_id: uuid::Uuid,
+    operation_id: uuid::Uuid,
+    receipt: crate::db::agent_tree_decisions::HostCapabilityRefreshSnapshotReceipt,
+    runtime: &HostCapabilityRefreshRuntime,
+    global_bus: &Option<EventSender>,
+    redaction: &SharedRedactionTable,
+) -> std::result::Result<HostCapabilitiesRefreshCompletion, String> {
+    // Parse and canonicalize before changing the store. The database also
+    // validates this at completion, but an outbox reader must treat the
+    // persisted receipt as hostile/corrupt until its bytes, digest, and
+    // declared generation agree exactly.
+    let snapshot: cockpit_proto::HostCapabilitySnapshot =
+        serde_json::from_str(&receipt.result_snapshot_json).map_err(|error| {
+            format!("durable host capability refresh result is invalid: {error}")
+        })?;
+    if snapshot.generation != receipt.generation {
+        return Err(format!(
+            "durable host capability refresh generation {} disagrees with receipt generation {}",
+            snapshot.generation, receipt.generation
+        ));
+    }
+    let value = serde_json::to_value(&snapshot)
+        .map_err(|error| format!("serializing durable host capability refresh snapshot failed: {error}"))?;
+    let canonical = crate::db::agent_tree_decisions::canonical_json_bytes(&value)
+        .map_err(|error| format!("canonicalizing durable host capability refresh snapshot failed: {error}"))?;
+    let canonical_json = std::str::from_utf8(&canonical)
+        .map_err(|error| format!("canonical host capability refresh snapshot was not UTF-8: {error}"))?;
+    let digest = Sha256::digest(&canonical)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if canonical_json != receipt.result_snapshot_json || digest != receipt.digest {
+        return Err("durable host capability refresh receipt bytes do not match its canonical digest".to_string());
+    }
+    let published = runtime.store.publish_committed(snapshot.clone()).map_err(|error| {
+        format!(
+            "refusing to acknowledge host capability refresh outbox because its committed snapshot is not live: {error}"
+        )
+    })?;
+    let outbox_acked = session
+        .db
+        .mark_host_capability_refresh_published(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+            source_session_id,
+            operation_id,
+            receipt.generation,
+            receipt.digest.clone(),
+            crate::agent_tree::system_now_unix_ms(),
+        )
+        .await
+        .map_err(|error| format!("acknowledging host capability refresh publication failed: {error}"))?;
+    if outbox_acked {
+        // The durable acknowledgement, not the in-memory `published` flag,
+        // owns the one event.  In the crash-after-swap case `published` is
+        // false on recovery but this is still the first durable publication
+        // acknowledgement and therefore the one event emission.
+        if let Some(global_bus) = global_bus {
+            crate::daemon::send_current_event(
+                global_bus,
+                redaction,
+                proto::Event::HostCapabilitiesChanged {
+                    snapshot: snapshot.clone(),
+                },
+            );
+        }
+    }
+    Ok(HostCapabilitiesRefreshCompletion { snapshot, published })
+}
+
+/// Drain the single durable refresh outbox for every session which shares the
+/// process-wide snapshot store. The database supplies rows in snapshot-
+/// generation order, and this function retains `serial_execution` for the
+/// entire scan: N becomes live and is acknowledged before N+1 is considered.
+///
+async fn drain_completed_host_capability_refresh_outbox_while_serialized(
+    session: &std::sync::Arc<crate::session::Session>,
+    runtime: &HostCapabilityRefreshRuntime,
+    global_bus: &Option<EventSender>,
+    redaction: &SharedRedactionTable,
+) -> std::result::Result<
+    Option<crate::db::agent_tree_decisions::HostCapabilityRefreshOutboxCursor>,
+    String,
+> {
+    // Do not retain a global outbox backlog in memory. Each row is
+    // acknowledged before the next maintenance turn asks SQLite for the next
+    // keyset page; this also keeps generation order a durable fence rather
+    // than a best-effort iterator property.
+    let completed = session
+        .db
+        .completed_unpublished_host_capability_refresh_operations_page(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+            None,
+            HOST_CAPABILITY_REFRESH_OUTBOX_ITEMS_PER_TURN,
+        )
+        .await
+        .map_err(|error| format!("listing global host capability refresh publication outbox failed: {error}"))?;
+    let next_cursor = completed.next_cursor;
+    for operation in completed.entries {
+        let result_snapshot_json = operation.result_snapshot_json.ok_or_else(|| {
+            format!("completed host capability refresh {} has no durable snapshot", operation.operation_id)
+        })?;
+        let generation = operation.result_snapshot_generation.ok_or_else(|| {
+            format!("completed host capability refresh {} has no durable generation", operation.operation_id)
+        })?;
+        let digest = operation.result_snapshot_digest.ok_or_else(|| {
+            format!("completed host capability refresh {} has no durable digest", operation.operation_id)
+        })?;
+        publish_one_completed_host_capability_refresh_operation_while_serialized(
+            session,
+            operation.session_id,
+            operation.operation_id,
+            crate::db::agent_tree_decisions::HostCapabilityRefreshSnapshotReceipt {
+                result_snapshot_json,
+                generation,
+                digest,
+            },
+            runtime,
+            global_bus,
+            redaction,
+        )
+        .await?;
+    }
+    // The worker intentionally restarts its next query at the durable head:
+    // every row through `next_cursor` was individually acknowledged above,
+    // so that re-read cannot skip a concurrently committed successor. The
+    // returned cursor remains the exact ordered proof that this turn stopped
+    // at a bounded page boundary; `Some` is the reschedule/fence signal.
+    Ok(next_cursor)
+}
+
+/// Cross the one durable host-capability refresh probe boundary.  The claim
+/// occurs immediately before the local probe; all success/failure outcomes
+/// then become durable before a live RPC receiver is notified.  Startup uses
+/// this same function for an already-allowed operation, so recovery cannot
+/// manufacture a fresh request or decision.
+fn host_capability_refresh_execution_lease_expires_at(now_unix_ms: i64) -> i64 {
+    now_unix_ms.saturating_add(
+        i64::try_from(HOST_CAPABILITY_REFRESH_EXECUTION_LEASE.as_millis()).unwrap_or(i64::MAX),
+    )
+}
+
+/// Run the probe while periodically extending its exact durable execution
+/// lease. A probe can outlast the nominal lease under host contention; the
+/// heartbeat proves its task is still alive. If renewal loses an owner or
+/// revision fence, drop the staged result without publication.
+async fn stage_host_capability_refresh_with_execution_heartbeat(
+    session: &std::sync::Arc<crate::session::Session>,
+    operation_id: uuid::Uuid,
+    lease: &crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionLease,
+    runtime: &HostCapabilityRefreshRuntime,
+) -> std::result::Result<crate::host_capabilities::StagedHostCapabilityRefresh, String> {
+    let stage = crate::host_capabilities::stage_host_capabilities_refresh_at_generation(
+        &runtime.store,
+        &runtime.probes,
+        lease.snapshot_generation(),
+    );
+    tokio::pin!(stage);
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + HOST_CAPABILITY_REFRESH_EXECUTION_HEARTBEAT_INTERVAL,
+        HOST_CAPABILITY_REFRESH_EXECUTION_HEARTBEAT_INTERVAL,
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            staged = &mut stage => return staged,
+            _ = heartbeat.tick() => {
+                let now = crate::agent_tree::system_now_unix_ms();
+                let renewed = session
+                    .db
+                    .renew_host_capability_refresh_execution_lease(
+                        crate::agent_tree::daemon_host_capability_refresh_authority(),
+                        session.id,
+                        operation_id,
+                        lease,
+                        host_capability_refresh_execution_lease_expires_at(now),
+                        now,
+                    )
+                    .await
+                    .map_err(|error| format!("renewing host capability refresh execution lease failed: {error}"))?;
+                if !renewed {
+                    return Err(
+                        "host capability refresh lost its execution lease before probe completion"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+async fn execute_host_capability_refresh_operation(
+    session: &std::sync::Arc<crate::session::Session>,
+    operation_id: uuid::Uuid,
+    runtime: &HostCapabilityRefreshRuntime,
+    global_bus: &Option<EventSender>,
+    redaction: &SharedRedactionTable,
+) -> std::result::Result<HostCapabilitiesRefreshCompletion, String> {
+    // Keep the whole operation linearized with publication, not merely the
+    // probe.  If two approved refreshes race, generation N must complete and
+    // acknowledge before N+1 can reserve/stage/publish its snapshot.
+    // A dispatcher gets one bounded attempt.  An in-flight durable owner is
+    // not a reason to park an unbounded task per RPC/maintenance call; the
+    // registry admits one task per operation and the periodic reaper tick
+    // retries after a receipt becomes publishable or a stale lease is fenced.
+    let _serial_execution = runtime.serial_execution.lock().await;
+    execute_host_capability_refresh_operation_while_serialized(
+        session,
+        operation_id,
+        runtime,
+        global_bus,
+        redaction,
+    )
+    .await
+}
+
+async fn execute_host_capability_refresh_operation_while_serialized(
+    session: &std::sync::Arc<crate::session::Session>,
+    operation_id: uuid::Uuid,
+    runtime: &HostCapabilityRefreshRuntime,
+    global_bus: &Option<EventSender>,
+    redaction: &SharedRedactionTable,
+) -> std::result::Result<HostCapabilitiesRefreshCompletion, String> {
+    // Before a new probe can reserve its generation, make every older
+    // completed receipt from every session sharing this store visible. This
+    // is also what lets a live request from session B unblock a crashed
+    // session A whose durable completion is waiting only for outbox replay.
+    if drain_completed_host_capability_refresh_outbox_while_serialized(
+        session,
+        runtime,
+        global_bus,
+        redaction,
+    )
+    .await?
+    .is_some() {
+        // A later probe is forbidden until every older publication receipt
+        // has been acknowledged. The periodic maintenance arm retries the
+        // next bounded page; returning here leaves this operation `allowed`.
+        return Err("host capability refresh publication outbox has additional older entries".to_string());
+    }
+    let now = crate::agent_tree::system_now_unix_ms();
+    match session
+            .db
+            .claim_host_capability_refresh_execution(
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+                session.id,
+                operation_id,
+                uuid::Uuid::new_v4(),
+                host_capability_refresh_execution_lease_expires_at(now),
+                now,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+    {
+            crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::Claimed { lease } => {
+                // A probe is read-only, but publication is externally observable.
+                // Stage it first, commit the exact durable terminal receipt, and
+                // only then swap it into the live capability store. A cancellation
+                // or DB failure between these steps therefore cannot leak a
+                // successful snapshot whose operation is durably failed.
+                return match stage_host_capability_refresh_with_execution_heartbeat(
+                    session,
+                    operation_id,
+                    &lease,
+                    runtime,
+                ).await {
+                    Ok(staged) => {
+                        let receipt = canonical_host_capability_refresh_receipt(staged.snapshot())?;
+                        if receipt.generation != lease.snapshot_generation() {
+                            return Err(format!(
+                                "host capability refresh staged generation {} does not match durable reservation {}",
+                                receipt.generation,
+                                lease.snapshot_generation()
+                            ));
+                        }
+                        let completed = match session
+                            .db
+                            .complete_host_capability_refresh_execution(
+                                crate::agent_tree::daemon_host_capability_refresh_authority(),
+                                session.id,
+                                operation_id,
+                                &lease,
+                                receipt.result_snapshot_json,
+                                receipt.generation,
+                                receipt.digest,
+                                crate::agent_tree::system_now_unix_ms(),
+                            )
+                            .await
+                        {
+                            Ok(completed) => completed,
+                            Err(error) => {
+                                // Do not leave an executing operation stranded
+                                // merely because its receipt write failed. A
+                                // transport/connection error can be ambiguous:
+                                // the completion transaction may have won even
+                                // though this caller did not receive its OK.
+                                // Re-read the durable state before attempting a
+                                // failure repair so the live RPC returns the
+                                // actual completed receipt in that branch.
+                                let message = format!(
+                                    "persisting host capability refresh completion failed: {error}"
+                                );
+                                match session
+                                    .db
+                                    .claim_host_capability_refresh_execution(
+                                        crate::agent_tree::daemon_host_capability_refresh_authority(),
+                                        session.id,
+                                        operation_id,
+                                        uuid::Uuid::new_v4(),
+                                        host_capability_refresh_execution_lease_expires_at(
+                                            crate::agent_tree::system_now_unix_ms(),
+                                        ),
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await
+                                {
+                                    Ok(crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::Completed {
+                                        receipt,
+                                    }) => {
+                                        return publish_one_completed_host_capability_refresh_operation_while_serialized(
+                                            session,
+                                            session.id,
+                                            operation_id,
+                                            receipt,
+                                            runtime,
+                                            global_bus,
+                                            redaction,
+                                        )
+                                        .await;
+                                    }
+                                    Ok(crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::Failed {
+                                        error_text,
+                                    })
+                                    | Ok(crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::Cancelled {
+                                        error_text,
+                                    }) => return Err(error_text),
+                                    Ok(
+                                        crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::Claimed { .. }
+                                        | crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::InFlight
+                                        | crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::NotReady,
+                                    ) => {}
+                                    Err(recovery_error) => {
+                                        tracing::error!(%recovery_error, operation_id = %operation_id, "reading ambiguous host capability refresh completion failed; attempting terminal repair");
+                                    }
+                                }
+                                // The completion did not leave a durable
+                                // terminal receipt. The immediate repair is
+                                // the fast path; the periodic lease reaper
+                                // below remains the fallback if this second
+                                // write also fails.
+                                if let Err(repair_error) = session
+                                    .db
+                                    .fail_host_capability_refresh_execution(
+                                        crate::agent_tree::daemon_host_capability_refresh_authority(),
+                                        session.id,
+                                        operation_id,
+                                        &lease,
+                                        message.clone(),
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(%repair_error, operation_id = %operation_id, "host capability refresh completion repair also failed; lease reaper retains recovery ownership");
+                                }
+                                return Err(message);
+                            }
+                        };
+                        if !completed {
+                            // A cancellation or newer owner revision won the
+                            // completion fence. Preserve that durable loser for
+                            // recovery and, crucially, drop the staged snapshot
+                            // without publishing it.
+                            let _ = session
+                                .db
+                                .fail_host_capability_refresh_execution(
+                                    crate::agent_tree::daemon_host_capability_refresh_authority(),
+                                    session.id,
+                                    operation_id,
+                                    &lease,
+                                    "host capability refresh lost its owner completion fence"
+                                        .to_string(),
+                                    crate::agent_tree::system_now_unix_ms(),
+                                )
+                                .await;
+                            return Err(
+                                "host capability refresh lost its owner completion fence"
+                                    .to_string(),
+                            );
+                        }
+                        // Re-read the persisted receipt through the same
+                        // outbox publication path recovery uses.  The staged
+                        // value is intentionally dropped here: the committed
+                        // bytes, not an in-memory probe result, are now the
+                        // only authority for publication after this boundary.
+                        drop(staged);
+                        let operation = session
+                            .db
+                            .claim_host_capability_refresh_execution(
+                                crate::agent_tree::daemon_host_capability_refresh_authority(),
+                                session.id,
+                                operation_id,
+                                uuid::Uuid::new_v4(),
+                                host_capability_refresh_execution_lease_expires_at(
+                                    crate::agent_tree::system_now_unix_ms(),
+                                ),
+                                crate::agent_tree::system_now_unix_ms(),
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::Completed {
+                            receipt,
+                        } = operation else {
+                            return Err("host capability refresh completion receipt disappeared before publication".to_string());
+                        };
+                        publish_one_completed_host_capability_refresh_operation_while_serialized(
+                            session,
+                            session.id,
+                            operation_id,
+                            receipt,
+                            runtime,
+                            global_bus,
+                            redaction,
+                        )
+                        .await
+                    }
+                    Err(error) => {
+                        let _ = session
+                            .db
+                            .fail_host_capability_refresh_execution(
+                                crate::agent_tree::daemon_host_capability_refresh_authority(),
+                                session.id,
+                                operation_id,
+                                &lease,
+                                error.clone(),
+                                crate::agent_tree::system_now_unix_ms(),
+                            )
+                            .await;
+                        Err(error)
+                    }
+                };
+            }
+            crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::Completed {
+                receipt,
+            } => return publish_one_completed_host_capability_refresh_operation_while_serialized(
+                session,
+                session.id,
+                operation_id,
+                receipt,
+                runtime,
+                global_bus,
+                redaction,
+            )
+            .await,
+            crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::InFlight => {
+                // A durable owner already holds the probe boundary. Return
+                // promptly; the bounded maintenance scheduler retries this
+                // operation after the owner publishes or its lease is fenced.
+                Err("host capability refresh is already in flight".to_string())
+            }
+            crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::Failed {
+                error_text,
+            }
+            | crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::Cancelled {
+                error_text,
+            } => return Err(error_text),
+            crate::db::agent_tree_decisions::HostCapabilityRefreshExecutionClaim::NotReady => {
+                Err(
+                    "host capability refresh is not terminally allowed for this probe boundary"
+                        .to_string(),
+                )
+            }
+        }
+}
+
+/// Drain the daemon-global completion outbox, then schedule this session's
+/// operations that have already crossed their durable allow decision but not
+/// their probe boundary. This is used both at worker startup and immediately
+/// after a terminal decision: a worker for session B can recover an older
+/// completed receipt from session A before B stages a later generation.
+async fn spawn_ready_host_capability_refresh_operations(
+    session: &std::sync::Arc<crate::session::Session>,
+    runtime: Option<HostCapabilityRefreshRuntime>,
+    global_bus: &Option<EventSender>,
+    redaction: &SharedRedactionTable,
+    registry: &Arc<WorkerAgentTreeResolverRegistry>,
+) {
+    let Some(runtime) = runtime else {
+        return;
+    };
+    {
+        // One store-wide dispatcher drains every session's durable receipts
+        // synchronously. Do not spawn one publisher per session or receipt:
+        // that would let a reverse startup order race the generation order.
+        let _serial_execution = runtime.serial_execution.lock().await;
+        let next_outbox_cursor = match drain_completed_host_capability_refresh_outbox_while_serialized(
+            session,
+            &runtime,
+            global_bus,
+            redaction,
+        )
+        .await {
+            Ok(next_cursor) => next_cursor,
+            Err(error) => {
+                tracing::warn!(%error, session_id = %session.id, "draining global host capability refresh publication outbox failed");
+                // A bad or inaccessible older receipt is a durable fence. Do not
+                // schedule a newer local probe until a later tick can repair it.
+                return;
+            }
+        };
+        if next_outbox_cursor.is_some() {
+            // The daemon's periodic refresh maintenance arm owns the next
+            // rescheduled page. Do not inspect allowed work while any older
+            // completed receipt remains unacknowledged.
+            return;
+        }
+    }
+    let after = runtime
+        .store
+        .refresh_allowed_operation_cursor(session.id)
+        .map(|(created_at_unix_ms, id)| crate::db::agent_tree_decisions::AgentTreePageCursor {
+            created_at_unix_ms,
+            id,
+        });
+    let operations = match session
+        .db
+        .ready_host_capability_refresh_operations_page(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+            session.id,
+            after,
+            AGENT_TREE_MAINTENANCE_ITEMS_PER_TURN,
+        )
+        .await
+    {
+        Ok(operations) => operations,
+        Err(error) => {
+            tracing::warn!(%error, session_id = %session.id, "listing allowed host capability refreshes failed");
+            return;
+        }
+    };
+    runtime.store.set_refresh_allowed_operation_cursor(
+        session.id,
+        operations
+            .next_cursor
+            .as_ref()
+            .map(|cursor| (cursor.created_at_unix_ms, cursor.id)),
+    );
+    for operation in operations.entries {
+        let Some(dispatch_guard) =
+            HostCapabilityRefreshDispatchGuard::claim(&runtime, operation.operation_id)
+        else {
+            continue;
+        };
+        let recovery_session = session.clone();
+        let recovery_runtime = runtime.clone();
+        let recovery_global_bus = global_bus.clone();
+        let recovery_redaction = redaction.clone();
+        let recovery_registry = registry.clone();
+        tokio::spawn(async move {
+            let _dispatch_guard = dispatch_guard;
+            let execution = execute_host_capability_refresh_operation(
+                &recovery_session,
+                operation.operation_id,
+                &recovery_runtime,
+                &recovery_global_bus,
+                &recovery_redaction,
+            )
+            .await;
+            let _ = finalize_terminal_host_capability_refresh_operation(
+                &recovery_session,
+                operation.operation_id,
+                &recovery_registry,
+            )
+            .await;
+            if let Err(error) = execution {
+                tracing::warn!(
+                    %error,
+                    operation_id = %operation.operation_id,
+                    "executing durable host capability refresh failed"
+                );
+            }
+        });
+    }
+}
+
+fn host_capability_refresh_terminal_child_state(
+    state: crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState,
+) -> Option<crate::db::agent_tree_decisions::AgentInstanceState> {
+    match state {
+        crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Completed => {
+            Some(crate::db::agent_tree_decisions::AgentInstanceState::Completed)
+        }
+        crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Failed => {
+            Some(crate::db::agent_tree_decisions::AgentInstanceState::Failed)
+        }
+        crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Cancelled => {
+            Some(crate::db::agent_tree_decisions::AgentInstanceState::Cancelled)
+        }
+        crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Pending
+        | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Allowed
+        | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Executing => None,
+    }
+}
+
+/// A dedicated refresh child is terminalized with the durable operation it
+/// owns. Historical refresh rows used the root as their owner, so preserve
+/// that root rather than treating every old receipt as permission to change a
+/// foreground driver's lifecycle.
+async fn terminalize_host_capability_refresh_child(
+    session: &crate::session::Session,
+    agent_instance_id: uuid::Uuid,
+    state: crate::db::agent_tree_decisions::AgentInstanceState,
+    receipt: &'static str,
+) {
+    let Ok(Some(agent)) = session
+        .db
+        .agent_instance(session.id, agent_instance_id)
+        .await
+    else {
+        return;
+    };
+    if agent.parent_agent_instance_id.is_none() {
+        return;
+    }
+    let _ = session
+        .db
+        .transition_agent_instance(
+            session.id,
+            agent_instance_id,
+            agent.revision,
+            state,
+            receipt,
+            crate::agent_tree::system_now_unix_ms(),
+        )
+        .await;
+}
+
+/// The direct refresh ingress creates a child and its pre-bind descriptor
+/// before it can raise the real QuestionTool interrupt. Every local failure
+/// in that interval must close the exact descriptor transactionally rather
+/// than terminalizing only the child and leaving boot to discover stale work.
+async fn abort_unbound_host_capability_refresh_initialization(
+    session: &crate::session::Session,
+    operation: crate::agent_tree::HostCapabilitiesRefreshOperation,
+    agent_instance_id: uuid::Uuid,
+    failure_stage: &'static str,
+) {
+    match session
+        .db
+        .abort_host_capability_refresh_initialization(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+            session.id,
+            operation.operation_id,
+            operation.request_id,
+            agent_instance_id,
+            None,
+            crate::agent_tree::system_now_unix_ms(),
+        )
+        .await
+    {
+        Ok(crate::db::agent_tree_decisions::HostCapabilityRefreshInitializationAbort::Aborted) => {}
+        Ok(crate::db::agent_tree_decisions::HostCapabilityRefreshInitializationAbort::AlreadyBound) => {
+            // Never undo an operation that crossed the atomic bind. Its
+            // durable decision/operation finalizer owns the exact-once result
+            // even if a caller observed an ambiguous local failure.
+            tracing::warn!(
+                operation_id = %operation.operation_id,
+                request_id = %operation.request_id,
+                %failure_stage,
+                "pre-bind refresh cleanup observed an already-bound operation; preserving durable finalization"
+            );
+        }
+        Ok(outcome) => {
+            tracing::warn!(
+                operation_id = %operation.operation_id,
+                request_id = %operation.request_id,
+                ?outcome,
+                %failure_stage,
+                "pre-bind refresh cleanup did not find a live matching initialization"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                operation_id = %operation.operation_id,
+                request_id = %operation.request_id,
+                %failure_stage,
+                "atomically aborting pre-bind host capability refresh initialization failed"
+            );
+        }
+    }
+}
+
+/// `execute_*` may deliberately return a retryable failure while the durable
+/// operation remains `allowed` (for example, an older global publication page
+/// still fences this probe). Only a persisted terminal state may terminalize
+/// the dedicated child or acknowledge its Attention row.
+async fn finalize_terminal_host_capability_refresh_operation(
+    session: &crate::session::Session,
+    operation_id: uuid::Uuid,
+    registry: &Arc<WorkerAgentTreeResolverRegistry>,
+) -> bool {
+    let operation = match session
+        .db
+        .host_capability_refresh_operation_by_id(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+            session.id,
+            operation_id,
+        )
+        .await
+    {
+        Ok(Some(operation)) => operation,
+        Ok(None) => {
+            tracing::warn!(%operation_id, "host capability refresh operation disappeared before typed terminalization; retaining child for durable repair");
+            return false;
+        }
+        Err(error) => {
+            tracing::warn!(%error, %operation_id, "loading host capability refresh state before typed terminalization failed; retaining child for durable repair");
+            return false;
+        }
+    };
+    let Some(child_terminal_state) = host_capability_refresh_terminal_child_state(operation.state) else {
+        tracing::debug!(
+            operation_id = %operation.operation_id,
+            state = ?operation.state,
+            "host capability refresh dispatcher retained nonterminal operation for typed retry"
+        );
+        return false;
+    };
+    terminalize_host_capability_refresh_child(
+        session,
+        operation.agent_instance_id,
+        child_terminal_state,
+        r#"{"host_operation":"capability_refresh"}"#,
+    )
+    .await;
+    // This continuation is daemon-owned and has no parked driver waiter after
+    // recovery. Only after the operation reached a durable terminal state may
+    // we acknowledge the linked executing Attention row.
+    handle_terminal_host_capability_refresh_interrupt(
+        session,
+        session.id,
+        operation.interrupt_id,
+        registry,
+    )
+    .await
+}
+
+/// Worker-owned deadline directory. Scheduling is not a best-effort spawned
+/// sleep: restarts rebuild this map from durable decisions, and the worker
+/// loop invokes the same lifecycle CAS for every due entry.
+#[derive(Default)]
+struct WorkerAgentTreeDeadlines {
+    // Keep the deadline in the ordering key.  The old `(decision, deadline)`
+    // map required a full scan and temporary `Vec` for every tick, which made
+    // a single old backlog allocate proportionally to its total size.  The
+    // reverse index makes replacement/cancellation exact without giving up
+    // the bounded ordered due range.
+    state: std::sync::Mutex<WorkerAgentTreeDeadlineState>,
+}
+
+#[derive(Default)]
+struct WorkerAgentTreeDeadlineState {
+    entries: std::collections::BTreeSet<(i64, uuid::Uuid, uuid::Uuid)>,
+    by_decision: std::collections::BTreeMap<(uuid::Uuid, uuid::Uuid), i64>,
+    cursor: Option<(i64, uuid::Uuid, uuid::Uuid)>,
+}
+
+impl WorkerAgentTreeDeadlines {
+    fn due_limited(&self, now_unix_ms: i64, limit: usize) -> Vec<(uuid::Uuid, uuid::Uuid)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let due_end = (now_unix_ms, uuid::Uuid::from_u128(u128::MAX), uuid::Uuid::from_u128(u128::MAX));
+        let mut selected = Vec::with_capacity(limit);
+
+        // Start just after the prior result so a permanently due backlog is
+        // fair across ticks. `take(limit)` applies directly to the B-tree
+        // iterator: no all-due materialization occurs.
+        if let Some(cursor) = state.cursor {
+            selected.extend(
+                state
+                    .entries
+                    .range((Excluded(cursor), Included(due_end)))
+                    .take(limit)
+                    .map(|(_, session_id, decision_request_id)| (*session_id, *decision_request_id)),
+            );
+        }
+        if selected.len() < limit {
+            selected.extend(
+                state
+                    .entries
+                    .range((Unbounded, Included(due_end)))
+                    .take(limit - selected.len())
+                    .map(|(_, session_id, decision_request_id)| (*session_id, *decision_request_id)),
+            );
+        }
+        state.cursor = selected.last().and_then(|(session_id, decision_request_id)| {
+            state
+                .by_decision
+                .get(&(*session_id, *decision_request_id))
+                .copied()
+                .map(|deadline| (deadline, *session_id, *decision_request_id))
+        });
+        selected
+    }
+}
+
+impl crate::agent_tree::DecisionDeadlineScheduler for WorkerAgentTreeDeadlines {
+    fn schedule(&self, session_id: uuid::Uuid, decision_request_id: uuid::Uuid, deadline_unix_ms: i64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(previous) = state
+            .by_decision
+            .insert((session_id, decision_request_id), deadline_unix_ms)
+        {
+            state.entries.remove(&(previous, session_id, decision_request_id));
+        }
+        state
+            .entries
+            .insert((deadline_unix_ms, session_id, decision_request_id));
+    }
+
+    fn cancel(&self, session_id: uuid::Uuid, decision_request_id: uuid::Uuid) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(deadline) = state.by_decision.remove(&(session_id, decision_request_id)) {
+            state.entries.remove(&(deadline, session_id, decision_request_id));
+        }
+    }
+}
+
+struct WorkerAgentTreeClock;
+
+impl crate::agent_tree::AgentTreeClock for WorkerAgentTreeClock {
+    fn now_unix_ms(&self) -> i64 {
+        crate::agent_tree::system_now_unix_ms()
+    }
+}
+
+/// Resolver eligibility comes from live worker ownership and the requesting
+/// agent's immutable profile snapshot, never from an agent-provided flag or
+/// the session root's model. A profile slot stays user-visible until its exact
+/// verified binding has been installed in the daemon-owned utility directory.
+#[derive(Clone)]
+enum WorkerAgentTreeResolverEndpoint {
+    Driver(tokio::sync::mpsc::Sender<crate::engine::driver::DriverControl>),
+    Noninteractive(tokio::sync::mpsc::Sender<crate::engine::agent::AgentTreeExecutorRequest>),
+    /// A daemon-owned host operation has a durable executor/lifecycle but no
+    /// model mailbox. It exists solely as the exact decision owner; automatic
+    /// resolution still routes to its live parent or a utility executor.
+    HostOperation,
+}
+
+/// A concrete mailbox registration, not merely an agent-instance label.
+///
+/// A resumed executor can legitimately replace an older mailbox for the same
+/// durable agent UUID.  Failure handling must therefore identify the exact
+/// registration that accepted (or rejected) a packet: blindly deleting by
+/// agent UUID lets an old full/closed sender remove its live replacement.
+#[derive(Clone)]
+struct WorkerAgentTreeResolverEndpointRegistration {
+    generation: crate::engine::agent::AgentTreeEndpointGeneration,
+    endpoint: WorkerAgentTreeResolverEndpoint,
+}
+
+#[derive(Default)]
+struct WorkerAgentTreeResolverRegistry {
+    /// Only the worker that owns a live executor can register its redacted
+    /// decision endpoint. The map stores an exact executor mailbox, never a
+    /// generic/root model handle, parent history, or tool context.
+    live_parent_endpoints: std::sync::Mutex<
+        std::collections::BTreeMap<
+            (uuid::Uuid, uuid::Uuid),
+            WorkerAgentTreeResolverEndpointRegistration,
+        >,
+    >,
+    /// Immutable-profile utility executors. A key contains the exact profile
+    /// snapshot and its bound slot, so a child can never inherit the root
+    /// model merely because both happen to be live in one session.
+    utility_models: std::sync::Mutex<
+        std::collections::BTreeMap<(uuid::Uuid, uuid::Uuid, String), Arc<Model>>,
+    >,
+}
+
+impl WorkerAgentTreeResolverRegistry {
+    fn attach_parent_endpoint(
+        &self,
+        session_id: uuid::Uuid,
+        agent_instance_id: uuid::Uuid,
+        endpoint_generation: crate::engine::agent::AgentTreeEndpointGeneration,
+        endpoint: tokio::sync::mpsc::Sender<crate::engine::driver::DriverControl>,
+    ) -> crate::engine::agent::AgentTreeEndpointGeneration {
+        let mut endpoints = self
+            .live_parent_endpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (session_id, agent_instance_id);
+        // A worker-local attachment can be forwarded after a recovery path
+        // has already installed a newer incarnation.  Never let that delayed
+        // old attach regress the directory and make its later detach relevant
+        // again. Equal generations are the same source registration being
+        // observed through the recovery fast path and normal event forwarder.
+        if endpoints
+            .get(&key)
+            .is_some_and(|registered| registered.generation > endpoint_generation)
+        {
+            return endpoint_generation;
+        }
+        endpoints.insert(
+            key,
+            WorkerAgentTreeResolverEndpointRegistration {
+                generation: endpoint_generation,
+                endpoint: WorkerAgentTreeResolverEndpoint::Driver(endpoint),
+            },
+        );
+        endpoint_generation
+    }
+
+    fn attach_noninteractive_endpoint(
+        &self,
+        session_id: uuid::Uuid,
+        agent_instance_id: uuid::Uuid,
+        endpoint_generation: crate::engine::agent::AgentTreeEndpointGeneration,
+        endpoint: tokio::sync::mpsc::Sender<crate::engine::agent::AgentTreeExecutorRequest>,
+    ) -> crate::engine::agent::AgentTreeEndpointGeneration {
+        let mut endpoints = self
+            .live_parent_endpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (session_id, agent_instance_id);
+        if endpoints
+            .get(&key)
+            .is_some_and(|registered| registered.generation > endpoint_generation)
+        {
+            return endpoint_generation;
+        }
+        endpoints.insert(
+            key,
+            WorkerAgentTreeResolverEndpointRegistration {
+                generation: endpoint_generation,
+                endpoint: WorkerAgentTreeResolverEndpoint::Noninteractive(endpoint),
+            },
+        );
+        endpoint_generation
+    }
+
+    fn attach_host_operation_endpoint(
+        &self,
+        session_id: uuid::Uuid,
+        agent_instance_id: uuid::Uuid,
+    ) -> crate::engine::agent::AgentTreeEndpointGeneration {
+        let endpoint_generation = crate::engine::agent::next_agent_tree_endpoint_generation();
+        let mut endpoints = self
+            .live_parent_endpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (session_id, agent_instance_id);
+        if endpoints
+            .get(&key)
+            .is_some_and(|registered| registered.generation > endpoint_generation)
+        {
+            return endpoint_generation;
+        }
+        endpoints.insert(
+            key,
+            WorkerAgentTreeResolverEndpointRegistration {
+                generation: endpoint_generation,
+                endpoint: WorkerAgentTreeResolverEndpoint::HostOperation,
+            },
+        );
+        endpoint_generation
+    }
+
+    /// Remove the current endpoint because the durable host operation itself
+    /// is conclusively terminal.  This is deliberately not a mailbox-local
+    /// cleanup: no replacement incarnation for this terminal operation is
+    /// runnable, and retaining one would violate the durable terminal state.
+    fn detach_terminal_host_operation_endpoint(
+        &self,
+        session_id: uuid::Uuid,
+        agent_instance_id: uuid::Uuid,
+    ) {
+        self.live_parent_endpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(session_id, agent_instance_id));
+    }
+
+    /// Withdraw a failed endpoint only if it is still the exact mailbox that
+    /// was selected for delivery.  This is the compare-and-remove half of the
+    /// warm-parent hand-off: an old mailbox failure can never evict a recovered
+    /// replacement registered for the same durable agent UUID.
+    fn detach_parent_endpoint_if_generation(
+        &self,
+        session_id: uuid::Uuid,
+        agent_instance_id: uuid::Uuid,
+        generation: crate::engine::agent::AgentTreeEndpointGeneration,
+    ) -> bool {
+        let mut endpoints = self
+            .live_parent_endpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (session_id, agent_instance_id);
+        if endpoints
+            .get(&key)
+            .is_some_and(|registered| registered.generation == generation)
+        {
+            endpoints.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn detach_session(&self, session_id: uuid::Uuid) {
+        self.live_parent_endpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(owner_session_id, _), _| *owner_session_id != session_id);
+        self.utility_models
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(owner_session_id, _, _), _| *owner_session_id != session_id);
+    }
+
+    fn attach_utility_model(
+        &self,
+        session_id: uuid::Uuid,
+        profile_snapshot_id: uuid::Uuid,
+        resolver_slot: String,
+        model: Arc<Model>,
+    ) {
+        self.utility_models
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((session_id, profile_snapshot_id, resolver_slot), model);
+    }
+
+    fn utility_model(
+        &self,
+        session_id: uuid::Uuid,
+        profile_snapshot_id: uuid::Uuid,
+        resolver_slot: &str,
+    ) -> Option<Arc<Model>> {
+        self.utility_models
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(session_id, profile_snapshot_id, resolver_slot.to_owned()))
+            .cloned()
+    }
+
+    fn parent_endpoint(
+        &self,
+        session_id: uuid::Uuid,
+        agent_instance_id: uuid::Uuid,
+    ) -> Option<WorkerAgentTreeResolverEndpoint> {
+        self.parent_endpoint_registration(session_id, agent_instance_id)
+            .map(|registered| registered.endpoint)
+    }
+
+    fn parent_endpoint_registration(
+        &self,
+        session_id: uuid::Uuid,
+        agent_instance_id: uuid::Uuid,
+    ) -> Option<WorkerAgentTreeResolverEndpointRegistration> {
+        self.live_parent_endpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(session_id, agent_instance_id))
+            .cloned()
+    }
+}
+
+/// Keeps a daemon-owned host-operation child live in the exact-owner
+/// directory for precisely the lifetime of its local executor task. Dropping
+/// the task (including cancellation/panic) withdraws only its exact endpoint
+/// incarnation, so no later resolver can settle through a stale root-shaped
+/// handle and an old Drop cannot evict a recovered replacement.
+struct HostOperationEndpointGuard {
+    registry: Arc<WorkerAgentTreeResolverRegistry>,
+    session_id: uuid::Uuid,
+    agent_instance_id: uuid::Uuid,
+    endpoint_generation: crate::engine::agent::AgentTreeEndpointGeneration,
+}
+
+impl Drop for HostOperationEndpointGuard {
+    fn drop(&mut self) {
+        self.registry
+            .detach_parent_endpoint_if_generation(
+                self.session_id,
+                self.agent_instance_id,
+                self.endpoint_generation,
+            );
+    }
+}
+
+/// Extract worker-local executor lifecycle events even when a noninteractive
+/// child wrapped them in its display-only nested-turn envelope.
+fn agent_tree_executor_endpoint_event(
+    event: &TurnEvent,
+) -> Option<(
+    uuid::Uuid,
+    bool,
+    crate::engine::agent::AgentTreeEndpointGeneration,
+)> {
+    match event {
+        TurnEvent::AgentTreeExecutorEndpointAttached {
+            agent_instance_id,
+            endpoint_generation,
+        } => {
+            Some((*agent_instance_id, true, *endpoint_generation))
+        }
+        TurnEvent::AgentTreeExecutorEndpointDetached {
+            agent_instance_id,
+            endpoint_generation,
+        } => {
+            Some((*agent_instance_id, false, *endpoint_generation))
+        }
+        TurnEvent::NestedTurn { inner, .. } => agent_tree_executor_endpoint_event(inner),
+        _ => None,
+    }
+}
+
+fn agent_tree_noninteractive_endpoint_event(
+    event: &TurnEvent,
+) -> Option<(
+    uuid::Uuid,
+    crate::engine::agent::AgentTreeEndpointGeneration,
+    tokio::sync::mpsc::Sender<crate::engine::agent::AgentTreeExecutorRequest>,
+)> {
+    match event {
+        TurnEvent::AgentTreeNoninteractiveEndpointAttached {
+            agent_instance_id,
+            endpoint_generation,
+            endpoint,
+        } => Some((*agent_instance_id, *endpoint_generation, endpoint.clone())),
+        TurnEvent::NestedTurn { inner, .. } => agent_tree_noninteractive_endpoint_event(inner),
+        _ => None,
+    }
+}
+
+struct WorkerAgentTreeResolverDirectory {
+    registry: Arc<WorkerAgentTreeResolverRegistry>,
+}
+
+impl crate::agent_tree::DecisionResolverDirectory for WorkerAgentTreeResolverDirectory {
+    fn exact_owner_executor_is_live(
+        &self,
+        session_id: uuid::Uuid,
+        agent_instance_id: uuid::Uuid,
+    ) -> bool {
+        self.registry
+            .parent_endpoint(session_id, agent_instance_id)
+            .is_some()
+    }
+
+    fn parent_cache_resumable(
+        &self,
+        session_id: uuid::Uuid,
+        parent_agent_instance_id: uuid::Uuid,
+    ) -> bool {
+        // A host-operation endpoint is live enough to own its durable
+        // decision/deadline lifecycle, but it is deliberately not a model
+        // cache. Never select it as the warm parent of another automatic
+        // decision: that route must always reach an executor that can accept
+        // an AgentTree resolver request.
+        matches!(
+            self.registry
+                .parent_endpoint(session_id, parent_agent_instance_id),
+            Some(WorkerAgentTreeResolverEndpoint::Driver(_))
+                | Some(WorkerAgentTreeResolverEndpoint::Noninteractive(_))
+        )
+    }
+
+    fn utility_slot_is_compatible(
+        &self,
+        session_id: uuid::Uuid,
+        _agent_instance_id: uuid::Uuid,
+        profile_snapshot_id: Option<uuid::Uuid>,
+        resolver_slot: &str,
+    ) -> bool {
+        profile_snapshot_id.is_some_and(|profile_snapshot_id| {
+            self.registry
+                .utility_model(session_id, profile_snapshot_id, resolver_slot)
+                .is_some()
+        })
+    }
+}
+
+#[derive(Debug)]
+struct AgentTreeResolverCompletion {
+    session_id: uuid::Uuid,
+    decision_request_id: uuid::Uuid,
+    route: crate::agent_tree::DecisionResolverRoute,
+    result: std::result::Result<crate::agent_tree::DecisionAnswer, String>,
+}
+
+/// The worker's real executor hand-off for automatic low-risk decisions. It
+/// accepts only the redacted packet, delivers a warm route to its exact live
+/// parent endpoint (or a cold route to the utility lane), and reports one
+/// result back to the worker-owned CAS path. A dropped worker leaves the
+/// durable `resolving` claim for recovery; a rejected warm endpoint is removed
+/// before the utility fallback is selected.
+struct WorkerAgentTreeResolverDelivery {
+    registry: Arc<WorkerAgentTreeResolverRegistry>,
+    completions: tokio::sync::mpsc::Sender<AgentTreeResolverCompletion>,
+}
+
+impl crate::agent_tree::DecisionResolverDelivery for WorkerAgentTreeResolverDelivery {
+    fn accept(
+        &self,
+        session_id: uuid::Uuid,
+        route: crate::agent_tree::DecisionResolverRoute,
+        packet: crate::agent_tree::RedactedDecisionPacket,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            packet.session_id == session_id,
+            "agent-tree resolver packet does not belong to this worker session"
+        );
+        let prompt = agent_tree_resolver_prompt(&packet)?;
+        match route {
+            crate::agent_tree::DecisionResolverRoute::WarmParent => {
+                let parent_agent_instance_id = packet
+                    .parent_agent_instance_id
+                    .context("warm-parent decision packet has no parent owner")?;
+                let registered = self
+                    .registry
+                    .parent_endpoint_registration(session_id, parent_agent_instance_id)
+                    .context("warm-parent exact executor endpoint is no longer live")?;
+                let endpoint_generation = registered.generation;
+                let (respond_to, response) = tokio::sync::oneshot::channel();
+                let accepted = match registered.endpoint {
+                    WorkerAgentTreeResolverEndpoint::Driver(endpoint) => endpoint
+                        .try_send(crate::engine::driver::DriverControl::ResolveAgentTreeDecision {
+                            agent_instance_id: parent_agent_instance_id,
+                            prompt,
+                            respond_to,
+                        })
+                        .map_err(|error| {
+                            anyhow::anyhow!("warm-parent endpoint did not accept resolver packet: {error}")
+                        }),
+                    WorkerAgentTreeResolverEndpoint::Noninteractive(endpoint) => endpoint
+                        .try_send(crate::engine::agent::AgentTreeExecutorRequest::ResolveDecision(
+                            crate::engine::agent::AgentTreeResolverRequest {
+                                prompt,
+                                respond_to,
+                            },
+                        ))
+                        .map_err(|error| {
+                            anyhow::anyhow!("warm noninteractive endpoint did not accept resolver packet: {error}")
+                        }),
+                    WorkerAgentTreeResolverEndpoint::HostOperation => Err(anyhow::anyhow!(
+                        "host-operation executor cannot resolve a nested warm-parent decision"
+                    )),
+                };
+                if let Err(error) = accepted {
+                    // `try_send` returns synchronously for both full and
+                    // closed mailboxes. Drop this exact registration before
+                    // returning the error so `begin_delivery` reselects the
+                    // configured utility route rather than seeing the same
+                    // unusable warm parent again.  A concurrent recovered
+                    // replacement has a different generation and survives.
+                    self.registry.detach_parent_endpoint_if_generation(
+                        session_id,
+                        parent_agent_instance_id,
+                        endpoint_generation,
+                    );
+                    return Err(error);
+                }
+                let completions = self.completions.clone();
+                let registry = self.registry.clone();
+                tokio::spawn(async move {
+                    let result = match response.await {
+                        Ok(Ok(response)) => agent_tree_resolver_answer(&packet, &response)
+                            .map_err(|error| error.to_string()),
+                        Ok(Err(error)) => Err(error),
+                        Err(error) => Err(format!("warm-parent endpoint dropped resolver response: {error}")),
+                    };
+                    if result.is_err() {
+                        // A queued endpoint that subsequently rejects or drops
+                        // the packet is not warm for this worker epoch. Remove
+                        // it before the lifecycle re-selects the utility
+                        // fallback; never retain a false warm-parent receipt.
+                        registry.detach_parent_endpoint_if_generation(
+                            session_id,
+                            parent_agent_instance_id,
+                            endpoint_generation,
+                        );
+                    }
+                    let _ = completions
+                        .send(AgentTreeResolverCompletion {
+                            session_id,
+                            decision_request_id: packet.decision_request_id,
+                            route,
+                            result,
+                        })
+                        .await;
+                });
+            }
+            crate::agent_tree::DecisionResolverRoute::Utility => {
+                let profile_snapshot_id = packet
+                    .resolver_profile_snapshot_id
+                    .context("utility decision packet has no immutable profile snapshot")?;
+                let resolver_slot = packet
+                    .resolver_slot
+                    .as_deref()
+                    .context("utility decision packet has no resolver slot")?;
+                let model = self
+                    .registry
+                    .utility_model(session_id, profile_snapshot_id, resolver_slot)
+                    .context("configured utility resolver binding is not live")?;
+                let completions = self.completions.clone();
+                tokio::spawn(async move {
+                    let result = match model
+                        .text_completion_for(
+                            crate::engine::model::UtilityCallSite::AgentTreeDecision,
+                            &prompt,
+                        )
+                        .await
+                    {
+                        Ok(response) => agent_tree_resolver_answer(&packet, &response)
+                            .map_err(|error| error.to_string()),
+                        Err(error) => Err(format!("agent-tree resolver model failed: {error}")),
+                    };
+                    let _ = completions
+                        .send(AgentTreeResolverCompletion {
+                            session_id,
+                            decision_request_id: packet.decision_request_id,
+                            route,
+                            result,
+                        })
+                        .await;
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Install the daemon-owned utility lane for one immutable agent profile. The
+/// selected provider/model comes only from the already verified binding
+/// evidence stored in that snapshot. Failure leaves that slot unavailable,
+/// which in turn leaves its decisions pending for a human rather than falling
+/// back to the session root model.
+async fn attach_agent_tree_profile_utility_models(
+    session: &std::sync::Arc<crate::session::Session>,
+    session_id: uuid::Uuid,
+    profile_snapshot_id: uuid::Uuid,
+    providers: &crate::config::providers::ProvidersConfig,
+    redaction: Arc<RedactionTable>,
+    registry: &WorkerAgentTreeResolverRegistry,
+) -> Result<()> {
+    let snapshot = session
+        .db
+        .agent_profile_snapshot_by_id(session_id, profile_snapshot_id)
+        .await?
+        .context("agent-tree utility profile snapshot is absent")?
+        .reconstruct()?;
+    let credential_store = session.provider_credential_store(providers).ok();
+    for binding in snapshot.bindings {
+        if !binding.hard_capability_verified {
+            continue;
+        }
+        let provider_id = &binding.selected_provider_alias.provider_id;
+        let model_id = &binding.selected_provider_alias.model_id;
+        let model = match Model::for_provider_optional_store(
+            providers,
+            provider_id,
+            model_id,
+            redaction.clone(),
+            credential_store.clone(),
+        ) {
+            Ok(model) => Arc::new(model),
+            Err(error) => {
+                tracing::warn!(
+                    profile_snapshot_id = %profile_snapshot_id,
+                    resolver_slot = %binding.slot_id,
+                    provider_id,
+                    model_id,
+                    %error,
+                    "agent-tree configured utility binding is unavailable"
+                );
+                continue;
+            }
+        };
+        registry.attach_utility_model(session_id, profile_snapshot_id, binding.slot_id, model);
+    }
+    Ok(())
+}
+
+fn agent_tree_resolver_prompt(packet: &crate::agent_tree::RedactedDecisionPacket) -> anyhow::Result<String> {
+    let packet = serde_json::to_string(packet)
+        .context("serializing redacted agent-tree resolver packet")?;
+    let owns_interrupt_continuation = serde_json::from_str::<serde_json::Value>(&packet)
+        .ok()
+        .and_then(|packet| {
+            packet
+                .get("options_contract_json")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|contract| contract.get("interrupt_response_contract").cloned())
+        })
+        .is_some_and(|contract| !contract.is_null());
+    let answer_contract = if owns_interrupt_continuation {
+        // A linked QuestionTool continuation cannot consume the shorthand
+        // option/free-text decision representation. Its parked continuation
+        // owns the daemon's typed response envelope, and the lifecycle later
+        // checks that envelope against this same redacted contract.
+        "Return exactly one JSON object with a `response` member containing a ResolveResponse envelope: \\
+         {\"response\":{\"kind\":\"single\",\"data\":{\"selected_id\":\"...\"}}}, \\
+         or the matching `multi`, `freetext`, or `batch` envelope required by the redacted interrupt contract. \\
+         Do not explain your choice or invent an option."
+    } else {
+        "Return exactly one JSON object: {\"option_id\":\"...\"} for one offered option, \\
+         or {\"free_text\":\"...\"} only when its free-text contract allows it. \\
+         Do not explain your choice or invent an option."
+    };
+    let host_semantic = host_owned_resolver_option(packet)?;
+    let host_instruction = host_semantic.as_ref().map_or(String::new(), |option_id| {
+        format!(
+            " The packet includes a typed daemon-host recommendation for this non-sensitive action; return the recommended opaque option `{option_id}`. Do not infer intent from option order or labels."
+        )
+    });
+    Ok(format!(
+        "Resolve this low-risk daemon decision using only its redacted contract.{host_instruction} \\
+         {answer_contract}\n\n{packet}"
+    ))
+}
+
+/// Decode the one allowlisted host-owned resolver semantic.  The durable DB
+/// created it from an exhaustive host classifier, not from prompt prose, and
+/// its option is already daemon-minted/opaque.  Keep this parser strict so a
+/// future recommendation field cannot silently become an authority channel.
+fn host_owned_resolver_option(
+    packet: &crate::agent_tree::RedactedDecisionPacket,
+) -> anyhow::Result<Option<String>> {
+    let Some(raw) = packet.recommendation_json.as_deref() else {
+        return Ok(None);
+    };
+    let recommendation: serde_json::Value = serde_json::from_str(raw)
+        .context("decoding redacted host-owned recommendation")?;
+    let Some(host_action) = recommendation.get("host_action").and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        packet.decision_class == crate::agent_tree::DecisionClass::LowRisk
+            && host_action == "refresh_local_host_capabilities",
+        "redacted packet contains an unsupported host-owned action"
+    );
+    let option_id = recommendation
+        .get("option_id")
+        .and_then(serde_json::Value::as_str)
+        .context("host-owned recommendation is missing its opaque option")?;
+    let options: serde_json::Value = serde_json::from_str(&packet.options_contract_json)
+        .context("decoding redacted resolver option contract")?;
+    anyhow::ensure!(
+        redacted_decision_contract_offers_option(&options, option_id),
+        "host-owned recommendation is not an offered opaque option"
+    );
+    Ok(Some(option_id.to_owned()))
+}
+
+/// The redacted decision form has two disjoint option carriers: ordinary
+/// lifecycle decisions use top-level `options`, while a QuestionTool
+/// continuation carries its opaque choices inside the typed question set.
+/// A host-owned recommendation must prove membership in either carrier; it
+/// must never infer a continuation id from labels or option position.
+fn redacted_decision_contract_offers_option(
+    contract: &serde_json::Value,
+    option_id: &str,
+) -> bool {
+    let ordinary = contract
+        .get("options")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|options| {
+            options.iter().any(|option| {
+                option.get("id").and_then(serde_json::Value::as_str) == Some(option_id)
+            })
+        });
+    let interrupt = contract
+        .get("interrupt_response_contract")
+        .and_then(|value| (!value.is_null()).then_some(value))
+        .and_then(|contract| contract.get("questions"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|questions| {
+            questions.iter().any(|question| {
+                question
+                    .get("option_ids")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|option_ids| {
+                        option_ids.iter().any(|id| id.as_str() == Some(option_id))
+                    })
+            })
+        });
+    ordinary || interrupt
+}
+
+fn agent_tree_resolver_answer(
+    packet: &crate::agent_tree::RedactedDecisionPacket,
+    response: &str,
+) -> anyhow::Result<crate::agent_tree::DecisionAnswer> {
+    let response: serde_json::Value = serde_json::from_str(response.trim())
+        .context("agent-tree resolver did not return a JSON object")?;
+    let options: serde_json::Value = serde_json::from_str(&packet.options_contract_json)
+        .context("decoding redacted resolver option contract")?;
+    let host_owned_option = host_owned_resolver_option(packet)?;
+    if options
+        .get("interrupt_response_contract")
+        .is_some_and(|contract| !contract.is_null())
+    {
+        // `raise_and_wait_with_agent_tree` binds this decision to a parked
+        // QuestionTool continuation.  The normal shorthand is deliberately
+        // not accepted for that path: emit the typed wire response the
+        // original continuation understands.  `resolve_auto_result` remains
+        // the authority that validates it against the persisted redacted
+        // question set before terminalizing the decision.
+        if let Some(option_id) = host_owned_option {
+            // The sole real low-risk host ingress is refresh of daemon-local
+            // metadata. Its action is selected by this typed host semantic,
+            // never by the model guessing between opaque tokens or relying on
+            // their list order.
+            return Ok(crate::agent_tree::DecisionAnswer::InterruptResponse {
+                response: crate::daemon::proto::ResolveResponse::Single { selected_id: option_id },
+            });
+        }
+        let envelope = response
+            .get("response")
+            .cloned()
+            .unwrap_or(response);
+        let response = serde_json::from_value::<crate::daemon::proto::ResolveResponse>(envelope)
+            .context("agent-tree resolver did not return a typed interrupt response")?;
+        return Ok(crate::agent_tree::DecisionAnswer::InterruptResponse { response });
+    }
+    if let Some(option_id) = host_owned_option.as_deref() {
+        return Ok(crate::agent_tree::DecisionAnswer::Option {
+            id: option_id.to_owned(),
+        });
+    }
+    if let Some(option_id) = response.get("option_id").and_then(serde_json::Value::as_str) {
+        let offered = options
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|options| {
+                options.iter().any(|option| {
+                    option.get("id").and_then(serde_json::Value::as_str) == Some(option_id)
+                })
+            });
+        anyhow::ensure!(offered, "agent-tree resolver selected an unoffered option");
+        return Ok(crate::agent_tree::DecisionAnswer::Option {
+            id: option_id.to_string(),
+        });
+    }
+    let free_text = response
+        .get("free_text")
+        .and_then(serde_json::Value::as_str)
+        .context("agent-tree resolver response has no permitted answer")?;
+    let contract: serde_json::Value = packet
+        .free_text_contract_json
+        .as_deref()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw))
+        .transpose()
+        .context("decoding redacted resolver free-text contract")?
+        .context("agent-tree resolver used free text without a contract")?;
+    anyhow::ensure!(
+        contract.get("allowed").and_then(serde_json::Value::as_bool) == Some(true),
+        "agent-tree resolver used prohibited free text"
+    );
+    let max_chars = contract
+        .get("max_chars")
+        .and_then(serde_json::Value::as_u64)
+        .context("allowed agent-tree resolver free-text contract is missing its bounded maximum")?;
+    anyhow::ensure!(
+        (1..=10_000).contains(&max_chars),
+        "agent-tree resolver free-text contract has an invalid bounded maximum"
+    );
+    anyhow::ensure!(
+        free_text.chars().count() <= max_chars as usize,
+        "agent-tree resolver free text exceeds its contract"
+    );
+    Ok(crate::agent_tree::DecisionAnswer::FreeText {
+        text: free_text.to_string(),
+    })
+}
+
+/// The control tables commit their own ordered `agent_tree` session event in
+/// the same SQLite transaction as each state change. This worker relay is the
+/// sole conversion to a client invalidation, so creation, waits, resolver
+/// claims/releases, timeout/cancel, recovery and terminalization all have the
+/// same session-scoped ordering contract.
+async fn relay_agent_tree_events(
+    session: &Arc<Session>,
+    event_tx: &EventSender,
+    redaction: &SharedRedactionTable,
+    session_id: uuid::Uuid,
+    cursor: &mut i64,
+    late_steer_registry: &Arc<WorkerAgentTreeResolverRegistry>,
+) {
+    let rows = match session
+            .db
+            .agent_tree_events_after(session_id, *cursor, AGENT_TREE_MAINTENANCE_ITEMS_PER_TURN)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, %session_id, "reading committed agent-tree invalidations failed");
+                return;
+            }
+        };
+    if rows.is_empty() {
+        return;
+    }
+    for row in rows {
+            let transition = match row.kind.as_str() {
+                "agent_created" => proto::AgentTreeTransition::AgentCreated,
+                "decision_pending" => proto::AgentTreeTransition::AttentionRaised,
+                "attention_transition" => proto::AgentTreeTransition::AttentionStateChanged,
+                "recovery_claimed" | "recovery_attached" => {
+                    proto::AgentTreeTransition::RecoveryAttached
+                }
+                kind if kind.starts_with("decision_") => {
+                    proto::AgentTreeTransition::DecisionStateChanged
+                }
+                _ => proto::AgentTreeTransition::AgentStateChanged,
+            };
+            let subject_kind = match row.subject_kind.as_str() {
+                "agent" => proto::AgentTreeEventSubject::Agent,
+                "decision" => proto::AgentTreeEventSubject::Decision,
+                other => {
+                    tracing::warn!(%session_id, session_event_seq = row.session_event_seq, %other, "committed agent-tree event has an invalid subject kind");
+                    *cursor = row.session_event_seq;
+                    continue;
+                }
+            };
+            // An event is an ordered invalidation only.  Do not read the live
+            // agent or decision row here: it may have moved on since this
+            // transaction committed, which would make an old event describe a
+            // later state.
+            let payload = proto::Event::AgentTreeChanged {
+                session_id,
+                session_event_seq: row.session_event_seq,
+                transition,
+                subject_kind,
+                subject_id: row.subject_id,
+            };
+            send_current_session_event(
+                session,
+                event_tx,
+                redaction,
+                payload,
+                NoticeSource::DaemonDirect,
+            );
+            // A late steer which lost the race with a new QuestionTool or
+            // approval remains `pending` (and therefore is safely
+            // releasable). Re-attempt it only when the exact durable owner
+            // has made a fresh transition back to `running`; polling the
+            // queue while it is waiting would violate the predecessor's
+            // ordering and turn a parked continuation into a busy loop.
+            //
+            // This relay is deliberately only a scheduler. In particular it
+            // must never await a driver-control send: an accepted checkpoint
+            // may be waiting behind a full control mailbox while that driver
+            // is doing inference, and blocking the sole session worker here
+            // would stall deadlines, resolver completions, and unrelated
+            // work. Accepted checkpoints are attached only by the boot
+            // recovery path below; a live `running` event may schedule only a
+            // new/pending steer on a detached retry task.
+            if row.kind == "agent_transition" && row.subject_kind == "agent" {
+                match session.db.agent_instance(session_id, row.subject_id).await {
+                    Ok(Some(agent))
+                        if agent.state
+                            == crate::db::agent_tree_decisions::AgentInstanceState::Running =>
+                    {
+                        let retry_session = Arc::clone(session);
+                        let retry_registry = Arc::clone(late_steer_registry);
+                        tokio::spawn(async move {
+                            if let Err(error) = deliver_next_pending_late_user_steer(
+                                &retry_session,
+                                session_id,
+                                agent.agent_instance_id,
+                                &retry_registry,
+                            )
+                            .await
+                            {
+                                tracing::debug!(%error, agent_instance_id = %agent.agent_instance_id, "no runnable pending late user steer to schedule after agent lifecycle transition");
+                            }
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, agent_instance_id = %row.subject_id, "loading agent state for late-steer reactivation failed"),
+                }
+            }
+            *cursor = row.session_event_seq;
+    }
+}
 
 pub(super) fn persistent_llm_mode_control(
     mode: crate::config::extended::LlmMode,
@@ -109,6 +1913,827 @@ pub(super) struct ParkedReplayCompletion {
     result: std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
 }
 
+/// Start the one canonical replay path for a continuation that was durably
+/// claimed as `executing`.  Both a live user answer and startup recovery use
+/// this exact hand-off; completion is returned to the worker so SQLite is the
+/// only acknowledgement boundary.
+fn spawn_parked_interrupt_replay(
+    driver_control_tx: tokio::sync::mpsc::Sender<crate::engine::driver::DriverControl>,
+    registry: Arc<WorkerAgentTreeResolverRegistry>,
+    session_id: uuid::Uuid,
+    replay_completion_tx: tokio::sync::mpsc::Sender<ParkedReplayCompletion>,
+    interrupt_id: uuid::Uuid,
+    agent_instance_id: Option<uuid::Uuid>,
+    payload: crate::db::needs_attention::InterruptParkPayload,
+    response: crate::daemon::proto::ResolveResponse,
+    question: crate::engine::interrupt::PreResolvedInterruptQuestion,
+    decision: Option<proto::InterruptDecision>,
+    was_active: bool,
+) {
+    tokio::spawn(async move {
+        let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
+        let delivery = match agent_instance_id {
+            Some(agent_instance_id) => match registry.parent_endpoint(session_id, agent_instance_id) {
+                Some(WorkerAgentTreeResolverEndpoint::Driver(endpoint)) => endpoint
+                    .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
+                        interrupt_id,
+                        agent_instance_id: Some(agent_instance_id),
+                        payload: Box::new(payload),
+                        response,
+                        question: Box::new(question),
+                        respond_to,
+                    })
+                    .await
+                    .map_err(|_| "exact interactive executor is unavailable".to_string()),
+                Some(WorkerAgentTreeResolverEndpoint::Noninteractive(endpoint)) => endpoint
+                    .send(
+                        crate::engine::agent::AgentTreeExecutorRequest::ReplayParkedInterrupt {
+                            interrupt_id,
+                            payload: Box::new(payload),
+                            response,
+                            question: Box::new(question),
+                            respond_to,
+                        },
+                    )
+                    .await
+                    .map_err(|_| "exact noninteractive executor is unavailable".to_string()),
+                // A host-operation child has no model continuation and never
+                // owns a parked QuestionTool replay. Its typed operation
+                // recovery path acknowledges the linked Attention row
+                // directly after it has terminalized the durable operation.
+                Some(WorkerAgentTreeResolverEndpoint::HostOperation) => Err(
+                    "host-operation continuation must be acknowledged by its typed durable operation"
+                        .to_string(),
+                ),
+                None => Err("exact parked continuation executor is not attached".to_string()),
+            },
+            // A legacy unowned row has no agent-tree authority boundary and
+            // retains the historical foreground replay route.
+            None => driver_control_tx
+                .send(crate::engine::driver::DriverControl::ReplayParkedInterrupt {
+                    interrupt_id,
+                    agent_instance_id: None,
+                    payload: Box::new(payload),
+                    response,
+                    question: Box::new(question),
+                    respond_to,
+                })
+                .await
+                .map_err(|_| "driver is not available for parked interrupt replay".to_string()),
+        };
+        let result = if delivery.is_ok() {
+            replay_result_rx
+                .await
+                .unwrap_or_else(|error| Err(format!("exact parked replay response dropped: {error}")))
+        } else {
+            Err(delivery.expect_err("checked delivery failure"))
+        };
+        let _ = replay_completion_tx
+            .send(ParkedReplayCompletion {
+                interrupt_id,
+                decision,
+                was_active,
+                result,
+            })
+            .await;
+    });
+}
+
+fn agent_tree_interrupt_owner(
+    row: &crate::db::needs_attention::NeedsAttentionRow,
+) -> Option<uuid::Uuid> {
+    row.agent_instance_id
+}
+
+/// A host-capability refresh child is a daemon operation, not a parked model
+/// continuation.  Its terminal Attention row has no live driver waiter after
+/// restart, so replaying it through the root would both lose the durable
+/// operation identity and risk a second probe.  The allowed operation is
+/// picked up by the exact-once dispatcher; cancellation/failure/completion
+/// acknowledges the already-claimed Attention row directly.
+///
+/// `true` means the interrupt is conclusively a host-operation continuation
+/// and callers must not fall through to generic driver replay.  For an
+/// in-flight operation the durable execution lease remains the recovery
+/// authority, so retaining the Attention claim is intentional.
+async fn handle_terminal_host_capability_refresh_interrupt(
+    session: &Session,
+    session_id: uuid::Uuid,
+    interrupt_id: uuid::Uuid,
+    registry: &Arc<WorkerAgentTreeResolverRegistry>,
+) -> bool {
+    let operation = match session
+        .db
+        .host_capability_refresh_operation_for_interrupt(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+            session_id,
+            interrupt_id,
+        )
+        .await
+    {
+        Ok(Some(operation)) => operation,
+        Ok(None) => return false,
+        Err(error) => {
+            tracing::warn!(%error, %interrupt_id, "loading host capability refresh interrupt operation failed");
+            // Do not hand a possibly typed host continuation to a driver on a
+            // storage failure. A later recovery epoch can re-read the exact
+            // operation/Attention tuple.
+            return true;
+        }
+    };
+    match operation.state {
+        crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Allowed => {
+            // `spawn_ready_host_capability_refresh_operations` owns the
+            // exact-once dispatch claim. Keep this execution claim until that
+            // task commits a durable result and acknowledges it below.
+            true
+        }
+        crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Cancelled
+        | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Failed
+        | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Completed => {
+            let child_terminal_state = host_capability_refresh_terminal_child_state(operation.state)
+                .expect("terminal operation states are matched above");
+            // A recovery can crash between durable operation terminalization
+            // and the child lifecycle CAS. Repair that exact child here,
+            // before acknowledging Attention, so a denied/failed/completed
+            // daemon operation never remains a live resolver endpoint.
+            terminalize_host_capability_refresh_child(
+                session,
+                operation.agent_instance_id,
+                child_terminal_state,
+                r#"{"host_operation":"capability_refresh"}"#,
+            )
+            .await;
+            registry.detach_terminal_host_operation_endpoint(session_id, operation.agent_instance_id);
+            match session.db.complete_executing_interrupt(interrupt_id).await {
+                Ok(true) => tracing::debug!(%interrupt_id, operation_id = %operation.operation_id, "acknowledged terminal host capability refresh Attention directly"),
+                Ok(false) => tracing::debug!(%interrupt_id, operation_id = %operation.operation_id, "host capability refresh Attention was already acknowledged"),
+                Err(error) => tracing::warn!(%error, %interrupt_id, operation_id = %operation.operation_id, "acknowledging terminal host capability refresh Attention failed"),
+            }
+            true
+        }
+        crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Pending
+        | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Executing => {
+            tracing::debug!(
+                %interrupt_id,
+                operation_id = %operation.operation_id,
+                state = ?operation.state,
+                "retaining host capability refresh Attention for its typed operation recovery"
+            );
+            true
+        }
+    }
+}
+
+/// Deliver the terminal projection of an AgentTree decision to the one real
+/// QuestionTool continuation it owns.  This is shared by automatic resolution
+/// and deadline settlement: both have already won the decision CAS, so this
+/// function never re-settles the decision or manufactures a second waiter.
+async fn deliver_terminal_agent_tree_interrupt(
+    session: &Session,
+    event_tx: &EventSender,
+    redaction: &SharedRedactionTable,
+    interrupts: &Arc<crate::engine::interrupt::InterruptHub>,
+    session_id: uuid::Uuid,
+    decision_request_id: uuid::Uuid,
+    driver_control_tx: tokio::sync::mpsc::Sender<crate::engine::driver::DriverControl>,
+    registry: Arc<WorkerAgentTreeResolverRegistry>,
+    replay_completion_tx: tokio::sync::mpsc::Sender<ParkedReplayCompletion>,
+) {
+    let interrupt_id = match session
+        .db
+        .interrupt_for_decision_request(session_id, decision_request_id)
+        .await
+    {
+        Ok(Some(interrupt_id)) => interrupt_id,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %decision_request_id,
+                "loading terminal AgentTree interrupt continuation failed"
+            );
+            return;
+        }
+    };
+    let row = match session.db.get_interrupt(interrupt_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, %interrupt_id, "loading terminal AgentTree interrupt failed");
+            return;
+        }
+    };
+    let Some(response) = row.response.clone() else {
+        tracing::warn!(%interrupt_id, "terminal AgentTree interrupt has no durable response");
+        return;
+    };
+    match row.state {
+        crate::db::needs_attention::InterruptState::Resolved => {
+            let decision = crate::db::needs_attention::summarize_interrupt_decision(&row, &response);
+            let seq = record_interrupt_decision_event(session, redaction, interrupt_id, &decision);
+            send_current_event(
+                event_tx,
+                redaction,
+                proto::Event::InterruptResolved {
+                    session_id,
+                    interrupt_id,
+                    decision: Some(decision),
+                    seq,
+                },
+            );
+            interrupts.resolve(interrupt_id, response);
+            interrupts.emit_queue_state().await;
+        }
+        crate::db::needs_attention::InterruptState::Executing => {
+            if handle_terminal_host_capability_refresh_interrupt(
+                session,
+                session_id,
+                interrupt_id,
+                &registry,
+            )
+            .await
+            {
+                // A live direct refresh task is still awaiting this real
+                // QuestionTool interrupt. Waking it is not a parked replay:
+                // its typed operation state already owns dispatch or the
+                // terminal acknowledgement above. On recovery there is no
+                // waiter, so this is harmlessly a no-op.
+                interrupts.resolve(interrupt_id, response);
+                interrupts.emit_queue_state().await;
+                return;
+            }
+            let Some(payload) = row.parked.clone() else {
+                tracing::warn!(%interrupt_id, "terminal AgentTree parked interrupt has no replay payload; retaining exact claim for repair");
+                return;
+            };
+            let Some(questions) = row.questions.clone().or_else(|| {
+                row.question.clone().map(|question| crate::daemon::proto::InterruptQuestionSet {
+                    questions: vec![question],
+                })
+            }) else {
+                tracing::warn!(%interrupt_id, "terminal AgentTree parked interrupt has no replay question; retaining exact claim for repair");
+                return;
+            };
+            let occurrence = session
+                .db
+                .interrupt_question_occurrence(interrupt_id)
+                .await
+                .unwrap_or(1);
+            let question = crate::engine::interrupt::PreResolvedInterruptQuestion {
+                agent_instance_id: row.agent_instance_id,
+                agent: row.agent_id.clone(),
+                description: row.description.clone(),
+                questions,
+                occurrence,
+            };
+            let decision = Some(crate::db::needs_attention::summarize_interrupt_decision(
+                &row, &response,
+            ));
+            spawn_parked_interrupt_replay(
+                driver_control_tx,
+                registry,
+                session_id,
+                replay_completion_tx,
+                interrupt_id,
+                agent_tree_interrupt_owner(&row),
+                payload,
+                response,
+                question,
+                decision,
+                false,
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Deliver every currently pending steer for one exact live agent owner.
+/// Each row has a fresh delivery claim and is acknowledged only after the
+/// attached exact-owner continuation accepts it; a send/reply failure releases
+/// the exact claim for restart recovery rather than dropping the user
+/// instruction.
+async fn deliver_live_agent_tree_late_user_steers(
+    session: &Arc<Session>,
+    session_id: uuid::Uuid,
+    agent_instance_id: uuid::Uuid,
+    registry: &std::sync::Arc<WorkerAgentTreeResolverRegistry>,
+    recovered_claim: Option<(
+        uuid::Uuid,
+        Vec<crate::db::agent_tree_decisions::LateUserDecisionSteer>,
+    )>,
+) -> anyhow::Result<()> {
+    let registered = registry
+        .parent_endpoint_registration(session_id, agent_instance_id)
+        .context("late user steer has no live exact agent executor")?;
+    let endpoint_generation = registered.generation;
+    let endpoint = registered.endpoint;
+    // `record_late_user_decision_steer` atomically routes a post-auto
+    // HostOperation answer to its direct requesting parent. A host endpoint
+    // therefore cannot be a valid durable steer target. Detect corruption
+    // before taking or modifying a delivery claim: never detach the typed
+    // host endpoint, release a row, or substitute the root driver.
+    if matches!(&endpoint, WorkerAgentTreeResolverEndpoint::HostOperation) {
+        anyhow::bail!(
+            "late user steer target is a host operation without a model continuation; durable routing invariant was violated"
+        );
+    }
+    let (steer_epoch, steers) = match recovered_claim {
+        Some(claim) => claim,
+        None => {
+            let steer_epoch = uuid::Uuid::now_v7();
+            let steers = session
+                .db
+                .claim_late_user_decision_steers(session_id, agent_instance_id, steer_epoch)
+                .await?;
+            (steer_epoch, steers)
+        }
+    };
+    // Claims are deliberately one-at-a-time.  One model turn has one
+    // immutable continuation identity, so batching multiple late steers here
+    // would make all but one of them indistinguishable to the external
+    // journal. The successful receipt below schedules the next owner-local
+    // steer only after this identity has completed.
+    for steer in steers {
+        // A prior exact executor completed this continuation but its worker
+        // acknowledgement was interrupted.  Receipt-only recovery is the
+        // exactly-once path; do not enqueue the steer a second time.
+        if steer.completed_at_unix_ms.is_some() {
+            let db = session.db.clone();
+            let next_session = session.clone();
+            let next_registry = Arc::clone(registry);
+            tokio::spawn(async move {
+                match crate::agent_tree::AgentTreeLifecycle::new(db)
+                    .ack_late_user_steer_delivery(
+                        session_id,
+                        steer.steer_id,
+                        steer_epoch,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        if let Err(error) = deliver_next_pending_late_user_steer(
+                            &next_session,
+                            session_id,
+                            agent_instance_id,
+                            &next_registry,
+                        )
+                        .await
+                        {
+                            tracing::warn!(%error, %agent_instance_id, "scheduling next late user steer after receipt-only recovery failed");
+                        }
+                    }
+                    Ok(false) => tracing::warn!(
+                        steer_id = %steer.steer_id,
+                        "completed late user steer acknowledgement lost its exact claim"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        steer_id = %steer.steer_id,
+                        "acknowledging completed late user steer failed"
+                    ),
+                }
+            });
+            continue;
+        }
+        // `accepted` is a no-redelivery state, not an abandoned claim. A
+        // successor receives a distinct resume command carrying the same
+        // checkpoint/continuation identity; it must not execute the ordinary
+        // acceptance path again just because the daemon epoch changed. In
+        // contrast, a newly claimed `pending` steer remains pending until the
+        // exact executor reaches the final provider-handoff gate.
+        let resume_checkpoint = match steer.execution_state {
+            crate::db::agent_tree_decisions::LateUserDecisionSteerExecutionState::Pending => None,
+            crate::db::agent_tree_decisions::LateUserDecisionSteerExecutionState::Accepted => {
+                match steer.continuation_checkpoint_json.clone() {
+                    Some(checkpoint)
+                        if accepted_late_user_steer_checkpoint_matches(&steer, &checkpoint) =>
+                    {
+                        Some(checkpoint)
+                    }
+                    Some(_) => {
+                        tracing::error!(
+                            steer_id = %steer.steer_id,
+                            "accepted late user steer checkpoint does not bind its exact immutable owner"
+                        );
+                        continue;
+                    }
+                    None => {
+                        tracing::error!(
+                            steer_id = %steer.steer_id,
+                            "accepted late user steer has no durable continuation checkpoint"
+                        );
+                        continue;
+                    }
+                }
+            }
+            crate::db::agent_tree_decisions::LateUserDecisionSteerExecutionState::Rejected => {
+                tracing::debug!(steer_id = %steer.steer_id, "not resuming rejected late user steer");
+                continue;
+            }
+            crate::db::agent_tree_decisions::LateUserDecisionSteerExecutionState::Completed => {
+                unreachable!("completed steers are acknowledged above")
+            }
+        };
+        if let Some(checkpoint) = resume_checkpoint.as_deref() {
+            // This only restores an already accepted checkpoint to its exact
+            // executor; it does not cross the provider boundary. A child
+            // parked on a later QuestionTool/approval must receive this
+            // association while waiting, so that replay can reinstall the
+            // same permit. `late_user_decision_steer_dispatch_permit_is_current`
+            // remains the independent `running`-only authority immediately
+            // before any provider work.
+            let owner_can_restore_checkpoint = session
+                .db
+                .agent_instance(session_id, steer.agent_instance_id)
+                .await?
+                .is_some_and(|owner| {
+                    !owner.state.is_terminal()
+                        && accepted_late_user_steer_checkpoint_matches(&steer, checkpoint)
+                });
+            if !owner_can_restore_checkpoint {
+                tracing::warn!(
+                    steer_id = %steer.steer_id,
+                    "accepted late user steer owner cannot restore its immutable continuation checkpoint"
+                );
+                continue;
+            }
+        }
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        // Neither live delivery nor accepted recovery may await a bounded
+        // executor mailbox. A pending row is released for a later `running`
+        // retry if full; an accepted checkpoint instead gets a bounded
+        // boot-recovery retry and remains immutable if it exhausts.
+        let delivered = match (&endpoint, resume_checkpoint.as_deref()) {
+            (endpoint, None) => try_send_pending_late_user_steer(
+                endpoint,
+                agent_instance_id,
+                steer.steer_id,
+                steer.continuation_id,
+                steer_epoch,
+                steer.payload_json.clone(),
+                accepted_tx,
+            ),
+            (WorkerAgentTreeResolverEndpoint::Driver(driver_control_tx), Some(checkpoint)) => schedule_accepted_late_steer_recovery_control(
+                driver_control_tx.clone(),
+                crate::engine::driver::DriverControl::ResumeAcceptedLateUserDecisionSteer {
+                    agent_instance_id,
+                    steer_id: steer.steer_id,
+                    continuation_id: steer.continuation_id,
+                    recovery_epoch: steer_epoch,
+                    payload_json: steer.payload_json.clone(),
+                    continuation_checkpoint_json: checkpoint.to_owned(),
+                    respond_to: accepted_tx,
+                },
+            )
+            .await,
+            (WorkerAgentTreeResolverEndpoint::Noninteractive(executor_tx), Some(checkpoint)) => executor_tx
+                .try_send(
+                    crate::engine::agent::AgentTreeExecutorRequest::ResumeAcceptedLateUserDecisionSteer {
+                        steer_id: steer.steer_id,
+                        continuation_id: steer.continuation_id,
+                        recovery_epoch: steer_epoch,
+                        payload_json: steer.payload_json.clone(),
+                        continuation_checkpoint_json: checkpoint.to_owned(),
+                        respond_to: accepted_tx,
+                    },
+                )
+                .map_err(|error| {
+                    matches!(error, tokio::sync::mpsc::error::TrySendError::Closed(_))
+                }),
+            (WorkerAgentTreeResolverEndpoint::HostOperation, Some(_)) => {
+                // A daemon host operation cannot resume an agent/model steer.
+                // Preserve the accepted durable checkpoint for a later exact
+                // executor rather than routing it through the root driver.
+                Err(true)
+            }
+        };
+        if let Err(endpoint_closed) = delivered {
+            if resume_checkpoint.is_some() {
+                // This is boot/recovery attachment, never live pending work.
+                // An accepted row cannot be released if its endpoint is full
+                // or gone: preserve its immutable checkpoint and fail this
+                // worker epoch before an unbound frame can run.
+                anyhow::bail!(
+                    "accepted late-steer recovery control was not attached ({})",
+                    if endpoint_closed {
+                        "executor endpoint closed"
+                    } else {
+                        "bounded driver mailbox retry exhausted"
+                    }
+                );
+            }
+            let _ = session
+                .db
+                .release_late_user_decision_steer_claim(
+                    session_id,
+                    steer.steer_id,
+                    steer_epoch,
+                    crate::agent_tree::system_now_unix_ms(),
+                )
+                .await;
+            if endpoint_closed {
+                // `try_send` observed the registration selected above. A
+                // recovered replacement may already own this durable UUID,
+                // so withdraw only the closed sender's exact incarnation.
+                registry.detach_parent_endpoint_if_generation(
+                    session_id,
+                    agent_instance_id,
+                    endpoint_generation,
+                );
+            }
+            tracing::warn!(
+                steer_id = %steer.steer_id,
+                endpoint_closed,
+                "agent continuation did not accept a nonblocking late user steer delivery"
+            );
+            continue;
+        }
+        let db = session.db.clone();
+        let next_session = session.clone();
+        let next_registry = Arc::clone(registry);
+        tokio::spawn(async move {
+            // This receiver resolves only after the exact executor either
+            // crossed its durable provider-handoff boundary or proved it
+            // could not do so. It intentionally remains outside the
+            // session-worker loop: cancelling a slow model turn by timing out
+            // and releasing an *accepted* claim would allow a second executor
+            // to run the same user steer. A non-completed result can, however,
+            // still be a `pending` row when a new question/approval parked the
+            // owner before handoff; that row is released below so the next
+            // transition back to `running` can retry it in order.
+            match accepted_rx.await {
+                Ok(crate::engine::driver::LateUserSteerContinuationOutcome::Completed) => match crate::agent_tree::AgentTreeLifecycle::new(db.clone())
+                    .ack_late_user_steer_delivery(
+                        session_id,
+                        steer.steer_id,
+                        steer_epoch,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        if let Err(error) = deliver_next_pending_late_user_steer(
+                            &next_session,
+                            session_id,
+                            agent_instance_id,
+                            &next_registry,
+                        )
+                        .await
+                        {
+                            tracing::warn!(%error, %agent_instance_id, "scheduling next late user steer after durable completion failed");
+                        }
+                    }
+                    Ok(false) => tracing::warn!(
+                        steer_id = %steer.steer_id,
+                        "completed late user steer acknowledgement lost its exact claim"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %error,
+                        steer_id = %steer.steer_id,
+                        "acknowledging delivered late user steer failed"
+                    ),
+                },
+                Ok(outcome) => {
+                    let diagnostic = outcome.diagnostic().unwrap_or("owner cancelled before continuation completion");
+                    match db
+                        .release_late_user_decision_steer_claim(
+                            session_id,
+                            steer.steer_id,
+                            steer_epoch,
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await
+                    {
+                        Ok(true) => tracing::debug!(
+                            steer_id = %steer.steer_id,
+                            ?outcome,
+                            %diagnostic,
+                            "late user steer never reached provider handoff; retaining pending order for a later runnable owner revision"
+                        ),
+                        Ok(false) => tracing::warn!(
+                            steer_id = %steer.steer_id,
+                            ?outcome,
+                            %diagnostic,
+                            "late user steer continuation did not complete; retaining exact accepted checkpoint"
+                        ),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            steer_id = %steer.steer_id,
+                            ?outcome,
+                            "releasing undelivered late user steer failed"
+                        ),
+                    }
+                }
+                Err(_) => {
+                    match db
+                        .release_late_user_decision_steer_claim(
+                            session_id,
+                            steer.steer_id,
+                            steer_epoch,
+                            crate::agent_tree::system_now_unix_ms(),
+                        )
+                        .await
+                    {
+                        Ok(true) => tracing::debug!(
+                            steer_id = %steer.steer_id,
+                            "agent endpoint dropped an undelivered late steer; retaining pending order for retry"
+                        ),
+                        Ok(false) => tracing::warn!(
+                            steer_id = %steer.steer_id,
+                            "agent continuation dropped acknowledgement after durable acceptance; retaining exact checkpoint"
+                        ),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            steer_id = %steer.steer_id,
+                            "releasing dropped late user steer acknowledgement failed"
+                        ),
+                    }
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Enqueue a newly pending late steer without ever waiting for an executor's
+/// bounded control mailbox.  A full mailbox is an ordinary retry condition:
+/// the caller releases only the still-pending durable claim, then a later
+/// owner `running` transition schedules it again.  This helper deliberately
+/// has no accepted-checkpoint branch; an accepted steer is boot/recovery-only
+/// and its immutable claim must never be released for mailbox pressure.
+fn try_send_pending_late_user_steer(
+    endpoint: &WorkerAgentTreeResolverEndpoint,
+    agent_instance_id: uuid::Uuid,
+    steer_id: uuid::Uuid,
+    continuation_id: uuid::Uuid,
+    recovery_epoch: uuid::Uuid,
+    payload_json: String,
+    respond_to: tokio::sync::oneshot::Sender<crate::engine::driver::LateUserSteerContinuationOutcome>,
+) -> std::result::Result<(), bool> {
+    match endpoint {
+        WorkerAgentTreeResolverEndpoint::Driver(driver_control_tx) => driver_control_tx
+            .try_send(crate::engine::driver::DriverControl::DeliverLateUserDecisionSteer {
+                agent_instance_id,
+                steer_id,
+                continuation_id,
+                recovery_epoch,
+                payload_json,
+                respond_to,
+            })
+            .map_err(|error| {
+                matches!(error, tokio::sync::mpsc::error::TrySendError::Closed(_))
+            }),
+        WorkerAgentTreeResolverEndpoint::Noninteractive(executor_tx) => executor_tx
+            .try_send(
+                crate::engine::agent::AgentTreeExecutorRequest::DeliverLateUserDecisionSteer {
+                    steer_id,
+                    continuation_id,
+                    recovery_epoch,
+                    payload_json,
+                    respond_to,
+                },
+            )
+            .map_err(|error| {
+                matches!(error, tokio::sync::mpsc::error::TrySendError::Closed(_))
+            }),
+        WorkerAgentTreeResolverEndpoint::HostOperation => {
+            // `deliver_live_agent_tree_late_user_steers` rejects this before
+            // claiming a row. Keep the match exhaustive if a future caller
+            // bypasses that boundary, but do not manufacture a host control
+            // continuation from a user-authored steer.
+            Err(true)
+        }
+    }
+}
+
+/// Attempt recovery attachment without coupling worker progress to a bounded
+/// driver mailbox.  This helper is used only for an already accepted
+/// checkpoint during boot/recovery.  A full mailbox retains its DB claim and
+/// retries the same control packet only for a bounded startup window; it never calls
+/// `release_late_user_decision_steer_claim`, so an accepted user body cannot
+/// return to normal live delivery.
+async fn schedule_accepted_late_steer_recovery_control(
+    driver_control_tx: tokio::sync::mpsc::Sender<crate::engine::driver::DriverControl>,
+    control: crate::engine::driver::DriverControl,
+) -> std::result::Result<(), bool> {
+    match driver_control_tx.try_send(control) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(true),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(control)) => {
+            let mut control = control;
+            for attempt in 1..=ACCEPTED_LATE_STEER_RECOVERY_RETRY_ATTEMPTS {
+                // This is bounded startup coordination, not a mailbox send
+                // await: the worker remains free of a model/control wait and
+                // gives a just-started driver a short chance to drain its
+                // bootstrap controls before we fail this recovery epoch.
+                tokio::time::sleep(ACCEPTED_LATE_STEER_RECOVERY_RETRY_DELAY).await;
+                match driver_control_tx.try_send(control) {
+                    Ok(()) => return Ok(()),
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(next_control)) => {
+                        control = next_control;
+                        tracing::debug!(attempt, "accepted late-steer recovery control mailbox remains full; retaining durable checkpoint");
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Err(true),
+                }
+            }
+            tracing::warn!("accepted late-steer recovery control retries exhausted; retaining durable checkpoint for next boot");
+            Err(false)
+        }
+    }
+}
+
+/// An accepted row is recoverable only when its checkpoint still proves the
+/// immutable steer/continuation/owner binding.  The user payload itself stays
+/// in the canonical steer row (rather than being copied into a second private
+/// blob), so this validation prevents a malformed checkpoint from being used
+/// to attach that body to a different executor.
+fn accepted_late_user_steer_checkpoint_matches(
+    steer: &crate::db::agent_tree_decisions::LateUserDecisionSteer,
+    checkpoint_json: &str,
+) -> bool {
+    let Ok(checkpoint) = serde_json::from_str::<serde_json::Value>(checkpoint_json) else {
+        return false;
+    };
+    let steer_id = steer.steer_id.to_string();
+    let continuation_id = steer.continuation_id.to_string();
+    let agent_instance_id = steer.agent_instance_id.to_string();
+    let decision_request_id = steer.decision_request_id.to_string();
+    let payload_bytes = i64::try_from(steer.payload_json.as_bytes().len()).ok();
+    let Some(accepted_agent_revision) = steer.accepted_agent_revision else {
+        return false;
+    };
+    let Some(recorded_payload_bytes) = steer.payload_bytes else {
+        return false;
+    };
+    checkpoint.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+        && checkpoint.get("steer_id").and_then(serde_json::Value::as_str)
+            == Some(steer_id.as_str())
+        && checkpoint
+            .get("continuation_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(continuation_id.as_str())
+        && checkpoint
+            .get("agent_instance_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(agent_instance_id.as_str())
+        && checkpoint
+            .get("decision_request_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(decision_request_id.as_str())
+        && checkpoint
+            .get("agent_revision")
+            .and_then(serde_json::Value::as_i64)
+            == Some(accepted_agent_revision)
+        && checkpoint
+            .get("payload_bytes")
+            .and_then(serde_json::Value::as_i64)
+            == payload_bytes
+        && recorded_payload_bytes == payload_bytes.unwrap_or(-1)
+}
+
+/// The root continuation snapshot's parked marker is deliberately separate
+/// from the tool payload: the marker proves which durable Attention row is
+/// allowed to reattach this root frame, while that row remains the authority
+/// for the exact tool call and its response. A malformed marker fails closed
+/// rather than allowing an unrelated root question to resume an accepted
+/// late-steer continuation after restart.
+fn root_parked_interrupt_id_from_snapshot(snapshot_json: &str) -> anyhow::Result<Option<uuid::Uuid>> {
+    let snapshot: serde_json::Value = serde_json::from_str(snapshot_json)
+        .context("parsing recovered root continuation snapshot for parked interrupt marker")?;
+    snapshot
+        .get("parked_interrupt_id")
+        .map(|raw| {
+            let raw = raw
+                .as_str()
+                .context("root parked interrupt marker is not a UUID string")?;
+            uuid::Uuid::parse_str(raw).context("root parked interrupt marker is not a UUID")
+        })
+        .transpose()
+}
+
+/// Continue an owner-local *pending* steer stream only after its preceding
+/// continuation is durably terminal. Accepted checkpoints are intentionally
+/// absent from this live scheduler: they are boot/recovery-only work, because
+/// attaching one can require a durable executor reattachment and must never
+/// wait behind a running driver's bounded control mailbox.
+async fn deliver_next_pending_late_user_steer(
+    session: &Arc<Session>,
+    session_id: uuid::Uuid,
+    agent_instance_id: uuid::Uuid,
+    registry: &Arc<WorkerAgentTreeResolverRegistry>,
+) -> anyhow::Result<()> {
+    deliver_live_agent_tree_late_user_steers(
+        session,
+        session_id,
+        agent_instance_id,
+        registry,
+        None,
+    )
+    .await
+}
+
 pub(super) fn redaction_failed_interrupt_decision_payload(
     interrupt_id: uuid::Uuid,
     decision: &crate::daemon::proto::InterruptDecision,
@@ -188,14 +2813,22 @@ pub(super) async fn finish_parked_replay_completion(
     interrupts: &Arc<crate::engine::interrupt::InterruptHub>,
     session_id: uuid::Uuid,
     completion: ParkedReplayCompletion,
-) {
+) -> bool {
     let outcome = match completion.result {
         Ok(outcome) => outcome,
         Err(error) => {
-            let _ = session
-                .db
-                .mark_interrupt_interrupted(completion.interrupt_id)
-                .await;
+            // AgentTree-owned continuations acknowledge their execution claim
+            // only after the exact executor reports successful consumption.
+            // In particular, a missing/stale endpoint must leave the durable
+            // `executing` row intact for the next recovery epoch; completing
+            // it here would discard an already-recorded user response and
+            // cause the child to re-run its pre-interrupt model prompt.
+            if completion.decision.is_none() {
+                let _ = session
+                    .db
+                    .mark_interrupt_interrupted(completion.interrupt_id)
+                    .await;
+            }
             tracing::warn!(
                 %error,
                 interrupt_id = %completion.interrupt_id,
@@ -215,7 +2848,7 @@ pub(super) async fn finish_parked_replay_completion(
                 NoticeSource::DaemonDirect,
             );
             interrupts.emit_queue_state().await;
-            return;
+            return false;
         }
     };
     if matches!(
@@ -227,16 +2860,23 @@ pub(super) async fn finish_parked_replay_completion(
             "parked interrupt replay parked on a later prompt"
         );
     }
-    if let Err(error) = session
+    let replay_acknowledged = match session
         .db
         .complete_executing_interrupt(completion.interrupt_id)
         .await
     {
-        tracing::warn!(
-            %error,
-            interrupt_id = %completion.interrupt_id,
-            "completing parked interrupt failed"
-        );
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(interrupt_id = %completion.interrupt_id, "parked interrupt replay lost its durable acknowledgement");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(%error, interrupt_id = %completion.interrupt_id, "completing parked interrupt failed");
+            false
+        }
+    };
+    if !replay_acknowledged {
+        return false;
     }
     let seq = completion.decision.as_ref().and_then(|decision| {
         record_interrupt_decision_event(session, redaction, completion.interrupt_id, decision)
@@ -256,13 +2896,14 @@ pub(super) async fn finish_parked_replay_completion(
         crate::engine::driver::ParkedReplayOutcome::ParkedAgain
     ) {
         interrupts.emit_active_from_db().await;
-        return;
+        return true;
     }
     if completion.was_active {
         interrupts.emit_active_from_db().await;
     } else {
         interrupts.emit_queue_state().await;
     }
+    true
 }
 
 pub(super) fn validate_parked_interrupt_payload(
@@ -1139,7 +3780,7 @@ pub(super) async fn run_worker(
     resource_scheduler: Option<Arc<crate::engine::resource_scheduler::ResourceScheduler>>,
     scheduler: Arc<std::sync::Mutex<Option<crate::daemon::scheduler::DaemonSchedulerHandle>>>,
     write_scope: crate::write_scope::WriteScopeSource,
-    _global_bus: Option<EventSender>,
+    global_bus: Option<EventSender>,
     park_commit: crate::engine::interrupt::ParkCommit,
 ) {
     let session_id = session.id;
@@ -1427,6 +4068,9 @@ pub(super) async fn run_worker(
     }
     let (driver_control_tx, driver_control_rx) =
         mpsc::channel::<crate::engine::driver::DriverControl>(WORK_QUEUE_CAPACITY);
+    // Construct this before the event forwarder. Child-frame lifecycle events
+    // update the same registry that decision delivery consults.
+    let tree_resolver_registry = std::sync::Arc::new(WorkerAgentTreeResolverRegistry::default());
     let (engine_event_tx, mut engine_event_rx) = mpsc::channel::<TurnEvent>(WORK_QUEUE_CAPACITY);
     let engine_event_notice_tx = engine_event_tx.clone();
 
@@ -1447,6 +4091,8 @@ pub(super) async fn run_worker(
     let sandbox_notice_armed_for_forward = sandbox_notice_armed.clone();
     let session_for_forward = session.clone();
     let authoritative_active_model_state_for_forward = authoritative_active_model_state.clone();
+    let tree_resolver_registry_for_forward = tree_resolver_registry.clone();
+    let driver_control_for_forward = driver_control_tx.clone();
     // The lock authority + the interactive-client count, for the
     // `AgentIdle`-with-zero-clients release edge
     // (implementation note). When a turn finishes and no
@@ -1545,6 +4191,35 @@ pub(super) async fn run_worker(
                             }
                             break;
                         };
+                        if let Some((agent_instance_id, attached, endpoint_generation)) =
+                            agent_tree_executor_endpoint_event(&event)
+                        {
+                            if attached {
+                                tree_resolver_registry_for_forward.attach_parent_endpoint(
+                                    session_id,
+                                    agent_instance_id,
+                                    endpoint_generation,
+                                    driver_control_for_forward.clone(),
+                                );
+                            } else {
+                                tree_resolver_registry_for_forward
+                                    .detach_parent_endpoint_if_generation(
+                                        session_id,
+                                        agent_instance_id,
+                                        endpoint_generation,
+                                    );
+                            }
+                        }
+                        if let Some((agent_instance_id, endpoint_generation, endpoint)) =
+                            agent_tree_noninteractive_endpoint_event(&event)
+                        {
+                            tree_resolver_registry_for_forward.attach_noninteractive_endpoint(
+                                session_id,
+                                agent_instance_id,
+                                endpoint_generation,
+                                endpoint,
+                            );
+                        }
                         update_live_foreground(
                             &foreground_for_forward,
                             &foreground_input_target_for_forward,
@@ -1566,6 +4241,35 @@ pub(super) async fn run_worker(
                 let Some(event) = engine_event_rx.recv().await else {
                     break;
                 };
+                if let Some((agent_instance_id, attached, endpoint_generation)) =
+                    agent_tree_executor_endpoint_event(&event)
+                {
+                    if attached {
+                        tree_resolver_registry_for_forward.attach_parent_endpoint(
+                            session_id,
+                            agent_instance_id,
+                            endpoint_generation,
+                            driver_control_for_forward.clone(),
+                        );
+                    } else {
+                        tree_resolver_registry_for_forward
+                            .detach_parent_endpoint_if_generation(
+                                session_id,
+                                agent_instance_id,
+                                endpoint_generation,
+                            );
+                    }
+                }
+                if let Some((agent_instance_id, endpoint_generation, endpoint)) =
+                    agent_tree_noninteractive_endpoint_event(&event)
+                {
+                    tree_resolver_registry_for_forward.attach_noninteractive_endpoint(
+                        session_id,
+                        agent_instance_id,
+                        endpoint_generation,
+                        endpoint,
+                    );
+                }
                 update_live_foreground(
                     &foreground_for_forward,
                     &foreground_input_target_for_forward,
@@ -1887,9 +4591,39 @@ pub(super) async fn run_worker(
     // within `INTERRUPT_PARK_COMMIT_DEADLINE`; not the irreversible
     // `COCKPIT_TEST_PAUSE_PARKED_REPLAY_EXECUTING` loop. Unreachable in release.
     test_injected_park_delay("COCKPIT_TEST_DELAY_STARTUP_RECONCILE_MS").await;
+    // A terminal AgentTree decision may have claimed a parked QuestionTool
+    // continuation immediately before a worker crash.  Keep the exact row so
+    // the fresh root executor can replay it after it attaches below; treating
+    // that durable `executing` claim as an interrupted orphan would discard
+    // the original continuation and its already-recorded answer.
+    let mut terminal_tree_interrupt_replays = Vec::new();
     match session.db.list_reconcilable_interrupts(session_id).await {
         Ok(rows) => {
             for row in rows {
+                // A host-capability refresh is a daemon RPC with a durable
+                // decision, not a parked driver tool call. It intentionally
+                // has no replay payload or in-memory waiter after restart.
+                // Keep its exact pending interrupt answerable; decision
+                // settlement will schedule the same operation row below.
+                match session
+                    .db
+                    .has_pending_host_capability_refresh_interrupt(
+                        crate::agent_tree::daemon_host_capability_refresh_authority(),
+                        session_id,
+                        row.interrupt_id,
+                    )
+                    .await
+                {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            interrupt_id = %row.interrupt_id,
+                            "checking durable host capability refresh interrupt failed"
+                        );
+                    }
+                }
                 match row.state {
                     crate::db::needs_attention::InterruptState::Open
                         if validate_parked_interrupt_payload(&row).is_ok() =>
@@ -1904,6 +4638,61 @@ pub(super) async fn run_worker(
                     }
                     crate::db::needs_attention::InterruptState::Parked
                         if validate_parked_interrupt_payload(&row).is_ok() => {}
+                    crate::db::needs_attention::InterruptState::Executing
+                        if validate_parked_interrupt_payload(&row).is_ok()
+                            && row.response.is_some() =>
+                    {
+                        let terminal_tree_decision = match session
+                            .db
+                            .decision_request_for_interrupt(session_id, row.interrupt_id)
+                            .await
+                        {
+                            Ok(Some(decision)) => matches!(
+                                decision.state,
+                                crate::db::agent_tree_decisions::DecisionState::Answered
+                                    | crate::db::agent_tree_decisions::DecisionState::AutoResolved
+                                    | crate::db::agent_tree_decisions::DecisionState::TimedOut
+                                    | crate::db::agent_tree_decisions::DecisionState::Cancelled
+                            ),
+                            Ok(None) => false,
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    interrupt_id = %row.interrupt_id,
+                                    "loading executing interrupt lifecycle decision failed"
+                                );
+                                false
+                            }
+                        };
+                        if terminal_tree_decision {
+                            terminal_tree_interrupt_replays.push(row);
+                            continue;
+                        }
+                        if let Err(error) = session
+                            .db
+                            .mark_interrupt_interrupted(row.interrupt_id)
+                            .await
+                        {
+                            tracing::warn!(
+                                %error,
+                                interrupt_id = %row.interrupt_id,
+                                "marking unrecoverable executing interrupt failed"
+                            );
+                        }
+                        send_current_session_event(
+                            &session,
+                            &event_tx,
+                            &redaction,
+                            proto::Event::Notice {
+                                session_id,
+                                text: format!(
+                                    "Interrupted request {}: replay was in progress during worker restart.",
+                                    row.interrupt_id
+                                ),
+                            },
+                            NoticeSource::DaemonDirect,
+                        );
+                    }
                     crate::db::needs_attention::InterruptState::Open
                     | crate::db::needs_attention::InterruptState::Parked
                     | crate::db::needs_attention::InterruptState::Executing => {
@@ -1964,8 +4753,620 @@ pub(super) async fn run_worker(
     let mut longcache_enabled = false;
     let mut unsupported_redaction_notified: HashSet<PathBuf> = HashSet::new();
 
+    // The driver above is the fresh root executor. Bind the one stable root
+    // tree node to it before recovery, then consume only the claim it has
+    // actually accepted. This replaces the former log-and-drop scan: a claim
+    // is never acknowledged until an executor exists in this worker.
+    // Do not replay prior-worker invalidations. The cursor is captured before
+    // this worker creates/reconciles anything, so every transition committed
+    // by this boot is relayed in durable sequence order below.
+    let mut agent_tree_event_seq = match session.db.latest_agent_tree_event_seq(session_id).await {
+        Ok(Some(seq)) => seq,
+        Ok(None) => 0,
+        Err(error) => {
+            tracing::warn!(%error, %session_id, "loading agent-tree invalidation cursor failed; replaying from session start");
+            0
+        }
+    };
+    let tree_now = crate::agent_tree::system_now_unix_ms();
+    // A prior worker can have crossed the host effect handoff boundary and
+    // then died before it recorded the effect's terminal receipt. Reconcile
+    // that state before recovery replays any parked continuation: dispatching
+    // is submission-unknown, never permission to execute again.
+    if let Err(error) = session
+        .db
+        .reconcile_host_approval_dispatches(session_id, tree_now)
+        .await
+    {
+        tracing::error!(%error, %session_id, "reconciling stranded host approval dispatches failed");
+        return;
+    }
+    if let Err(error) = session
+        .db
+        .reconcile_host_capability_refresh_operations(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+            session_id,
+            tree_now,
+        )
+        .await
+    {
+        tracing::error!(%error, %session_id, "reconciling interrupted host capability refreshes failed");
+        return;
+    }
+    // Unit/integration worker construction can bypass the daemon boot helper.
+    // Re-seed only from a receipt already acknowledged to the live store;
+    // completed outbox entries are drained in generation order below before a
+    // recovered allowed operation can reserve a later number.
+    if let Some(runtime) = start_config.host_capability_refresh_runtime.as_ref() {
+        match session
+            .db
+            .latest_published_host_capability_refresh_snapshot_receipt(
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+            )
+            .await
+        {
+            Ok(Some(receipt)) => {
+                let snapshot: cockpit_proto::HostCapabilitySnapshot = match serde_json::from_str(
+                    &receipt.result_snapshot_json,
+                ) {
+                    Ok(snapshot) if snapshot.generation == receipt.generation => snapshot,
+                    Ok(snapshot) => {
+                        tracing::error!(
+                            snapshot_generation = snapshot.generation,
+                            receipt_generation = receipt.generation,
+                            %session_id,
+                            "durable host capability refresh receipt has mismatched generation"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, %session_id, "durable host capability refresh receipt is malformed");
+                        return;
+                    }
+                };
+                let high_water = match session.db.host_capability_refresh_generation_high_water(
+                    crate::agent_tree::daemon_host_capability_refresh_authority(),
+                ).await {
+                    Ok(high_water) if high_water >= receipt.generation => high_water,
+                    Ok(high_water) => {
+                        tracing::error!(
+                            %session_id,
+                            high_water,
+                            receipt_generation = receipt.generation,
+                            "host capability refresh allocator is behind a completed receipt"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, %session_id, "loading durable host capability refresh high-water failed");
+                        return;
+                    }
+                };
+                runtime.store.observe_durable_generation(high_water);
+                let boot_snapshot_is_newer = runtime
+                    .store
+                    .current()
+                    .is_some_and(|current| {
+                        current.generation > receipt.generation
+                            && current.generation == high_water
+                    });
+                if !boot_snapshot_is_newer
+                    && let Err(error) = runtime.store.publish_committed(snapshot)
+                {
+                    tracing::error!(%error, %session_id, "seeding worker host capability store from durable refresh receipt failed");
+                    return;
+                }
+            }
+            Ok(None) => match session.db.host_capability_refresh_generation_high_water(
+                crate::agent_tree::daemon_host_capability_refresh_authority(),
+            ).await {
+                Ok(high_water) => runtime.store.observe_durable_generation(high_water),
+                Err(error) => {
+                    tracing::error!(%error, %session_id, "loading durable host capability refresh high-water failed");
+                    return;
+                }
+            },
+            Err(error) => {
+                tracing::error!(%error, %session_id, "loading durable host capability refresh receipt failed");
+                return;
+            }
+        }
+    }
+    // Do not schedule an already-allowed refresh yet. Recovery first attaches
+    // every nonterminal dedicated host-operation child below, consumes its
+    // exact recovery claim, and repairs terminal child/Attention pairs. A
+    // scheduler that runs before that attachment can finish a durable effect
+    // while its child remains an unattached generic descriptor.
+    let root_profile_snapshot_id = match session
+        .db
+        .agent_profile_snapshot(session_id)
+        .await
+    {
+        Ok(Some(snapshot)) => match snapshot.reconstruct() {
+            Ok(_) => Some(snapshot.snapshot_id),
+            Err(error) => {
+                tracing::error!(%error, %session_id, "reconstructing immutable root question policy failed");
+                Some(snapshot.snapshot_id)
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            tracing::error!(%error, %session_id, "loading immutable root profile for agent-tree recovery failed");
+            None
+        }
+    };
+    let root_workspace_ref = match crate::agent_tree::workspace_ref_for_host_path(&project_root) {
+        Ok(workspace_ref) => workspace_ref,
+        Err(error) => {
+            tracing::error!(%error, %session_id, "deriving durable host workspace reference failed");
+            return;
+        }
+    };
+    let tree_root = match session
+        .db
+        .ensure_session_root_agent(
+            session_id,
+            root_profile_snapshot_id,
+            root_workspace_ref,
+            tree_now,
+        )
+        .await
+    {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::error!(%error, %session_id, "creating durable root agent-tree node failed");
+            // Do not run an untracked executor when durable lifecycle setup
+            // has failed. The next worker start retries from the DB boundary.
+            return;
+        }
+    };
+    let tree_root = if tree_root.state == crate::db::agent_tree_decisions::AgentInstanceState::Created {
+        match session
+            .db
+            .transition_agent_instance(
+                session_id,
+                tree_root.agent_instance_id,
+                tree_root.revision,
+                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                "{}",
+                tree_now,
+            )
+            .await
+        {
+            Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(root)) => root,
+            Ok(_) | Err(_) => return,
+        }
+    } else {
+        tree_root
+    };
+    // Agent rows always begin with auto-answer disabled. The immutable profile
+    // is the only authority that can reduce this concrete root into an enabled
+    // resolver participant; ordinary sessions and missing/off snapshots stay
+    // disabled without consulting mutable defaults.
+    let tree_root = if let Some(snapshot_id) = tree_root.resolved_profile_snapshot_id {
+        match session
+            .db
+            .set_agent_auto_answer_from_resolved_profile(
+                session_id,
+                tree_root.agent_instance_id,
+                snapshot_id,
+                tree_now,
+            )
+            .await
+        {
+            Ok(_) => match session.db.agent_instance(session_id, tree_root.agent_instance_id).await {
+                Ok(Some(root)) => root,
+                Ok(None) | Err(_) => return,
+            },
+            Err(error) => {
+                tracing::error!(%error, %session_id, "applying resolved root auto-answer policy failed");
+                return;
+            }
+        }
+    } else {
+        tree_root
+    };
+    driver.set_root_agent_instance_id(tree_root.agent_instance_id);
+    let tree_epoch = Uuid::now_v7();
+    let tree_lifecycle = crate::agent_tree::AgentTreeLifecycle::new(session.db.clone());
+    let tree_deadlines = std::sync::Arc::new(WorkerAgentTreeDeadlines::default());
+    // The root driver is the one executor this worker owns at boot. Register
+    // its exact control endpoint before recovery so a child can use the warm
+    // route only while that concrete owner is live and accepts the packet.
+    let root_endpoint_generation = crate::engine::agent::next_agent_tree_endpoint_generation();
+    tree_resolver_registry.attach_parent_endpoint(
+        session_id,
+        tree_root.agent_instance_id,
+        root_endpoint_generation,
+        driver_control_tx.clone(),
+    );
+    let (agent_tree_resolver_tx, mut agent_tree_resolver_rx) =
+        mpsc::channel::<AgentTreeResolverCompletion>(WORK_QUEUE_CAPACITY);
+    let tree_runtime = crate::agent_tree::AgentTreeRuntime::new(
+        tree_lifecycle,
+        std::sync::Arc::new(WorkerAgentTreeClock),
+        std::sync::Arc::new(WorkerAgentTreeResolverDirectory {
+            registry: tree_resolver_registry.clone(),
+        }),
+        tree_deadlines.clone(),
+    )
+    .with_resolver_delivery(std::sync::Arc::new(WorkerAgentTreeResolverDelivery {
+        registry: tree_resolver_registry.clone(),
+        completions: agent_tree_resolver_tx,
+    }));
+    let tree_recovery = match tree_runtime
+        .recover_session(session_id, tree_epoch)
+        .await
+    {
+        Ok(recovery) => recovery,
+        Err(_) => return,
+    };
+    // Host-capability refreshes own a small daemon-operation executor rather
+    // than parking the foreground root. Every operation state participates in
+    // recovery while its dedicated child remains nonterminal: recovery can
+    // crash after an operation is terminal but before its child/Attention are
+    // acknowledged. Reattach the typed endpoint and consume its exact claim
+    // before the generic task descriptor loop; no operation is ever
+    // impersonated by the root driver.
+    let mut recovered_host_operation_agents = std::collections::BTreeSet::new();
+    let mut host_operation_agents = std::collections::BTreeSet::new();
+    let mut terminal_host_operation_interrupts = Vec::new();
+    match session
+        .db
+        .nonterminal_host_capability_refresh_operations(
+            crate::agent_tree::daemon_host_capability_refresh_authority(),
+            session_id,
+        )
+        .await
+    {
+        Ok(operations) => {
+            for operation in operations {
+                let agent_instance_id = operation.agent_instance_id;
+                host_operation_agents.insert(agent_instance_id);
+                if !tree_recovery.claimed_agents.contains(&agent_instance_id) {
+                    // Another recovery owner may have won this epoch. Do not
+                    // attach a stale endpoint and, crucially, do not turn a
+                    // daemon operation into an unattached generic task.
+                    tracing::debug!(
+                        %agent_instance_id,
+                        operation_id = %operation.operation_id,
+                        state = ?operation.state,
+                        "host capability refresh child has no local recovery claim; retaining durable operation for its exact owner"
+                    );
+                    continue;
+                }
+                let Ok(Some(agent)) = session.db.agent_instance(session_id, agent_instance_id).await else {
+                    tracing::warn!(%agent_instance_id, operation_id = %operation.operation_id, "host capability refresh child disappeared during recovery; retaining operation for durable repair");
+                    continue;
+                };
+                let endpoint_generation = tree_resolver_registry
+                    .attach_host_operation_endpoint(session_id, agent_instance_id);
+                let consumed = session
+                    .db
+                    .consume_agent_resume_claims_atomically(
+                        session_id,
+                        vec![(agent_instance_id, agent.revision)],
+                        tree_epoch,
+                        crate::agent_tree::system_now_unix_ms(),
+                    )
+                    .await
+                    .unwrap_or(false);
+                if consumed {
+                    recovered_host_operation_agents.insert(agent_instance_id);
+                    match operation.state {
+                        crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Pending
+                        | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Allowed
+                        | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Executing => {}
+                        crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Completed
+                        | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Failed
+                        | crate::db::agent_tree_decisions::HostCapabilityRefreshOperationState::Cancelled => {
+                            terminal_host_operation_interrupts.push(operation.interrupt_id);
+                        }
+                    }
+                } else {
+                    tree_resolver_registry.detach_parent_endpoint_if_generation(
+                        session_id,
+                        agent_instance_id,
+                        endpoint_generation,
+                    );
+                    // A claim race is not an excuse to abort the foreground
+                    // worker. The durable operation remains owned by its
+                    // successor epoch and is deliberately excluded from the
+                    // generic task recovery path below.
+                    tracing::warn!(
+                        %agent_instance_id,
+                        operation_id = %operation.operation_id,
+                        "host capability refresh child recovery claim was not consumable; retaining typed durable recovery"
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, %session_id, "loading nonterminal host capability refresh operation children failed");
+        }
+    }
+    // A terminal operation owns the exact final Attention acknowledgement;
+    // repair it before generic descriptor recovery sees the child. The
+    // helper is idempotent and also detaches the host endpoint, so a crash
+    // between operation and child terminalization cannot leave a warm-but-dead
+    // operation owner around for a resolver result.
+    for interrupt_id in terminal_host_operation_interrupts {
+        if !handle_terminal_host_capability_refresh_interrupt(
+            &session,
+            session_id,
+            interrupt_id,
+            &tree_resolver_registry,
+        )
+        .await
+        {
+            tracing::warn!(%interrupt_id, "terminal host capability refresh recovery lost its typed operation binding; retaining durable repair");
+        }
+    }
+    // The utility directory is keyed by the *requesting* immutable profile,
+    // not by the root model.  Recovery has now identified every nonterminal
+    // executor this worker may attach, so install each distinct selected
+    // snapshot before any of their pending decisions can resume. A missing or
+    // unbuildable exact binding is intentionally absent from the directory:
+    // that request remains manual instead of borrowing a root/provider model.
+    let mut utility_profile_snapshot_ids = std::collections::BTreeSet::new();
+    if let Some(profile_snapshot_id) = tree_root.resolved_profile_snapshot_id {
+        utility_profile_snapshot_ids.insert(profile_snapshot_id);
+    }
+    for agent_instance_id in &tree_recovery.claimed_agents {
+        match session.db.agent_instance(session_id, *agent_instance_id).await {
+            Ok(Some(agent)) => {
+                if let Some(profile_snapshot_id) = agent.resolved_profile_snapshot_id {
+                    utility_profile_snapshot_ids.insert(profile_snapshot_id);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, %agent_instance_id, "loading recovered agent profile for utility resolver failed");
+            }
+        }
+    }
+    for profile_snapshot_id in utility_profile_snapshot_ids {
+        if let Err(error) = attach_agent_tree_profile_utility_models(
+            &session,
+            session_id,
+            profile_snapshot_id,
+            &start_config.providers,
+            current_redaction(&redaction),
+            &tree_resolver_registry,
+        )
+        .await
+        {
+            tracing::warn!(%error, %session_id, %profile_snapshot_id, "agent-tree utility resolver profile is unavailable; affected decisions remain manual");
+        }
+    }
+    // Recovery itself can expire a previously parked decision before the
+    // driver has attached. Re-read just the terminal execution claims after
+    // that durable pass so the original continuation is replayed rather than
+    // being stranded until another user action happens.
+    match session.db.list_reconcilable_interrupts(session_id).await {
+        Ok(rows) => {
+            for row in rows {
+                if row.state != crate::db::needs_attention::InterruptState::Executing
+                    || validate_parked_interrupt_payload(&row).is_err()
+                    || row.response.is_none()
+                    || terminal_tree_interrupt_replays
+                        .iter()
+                        .any(|known| known.interrupt_id == row.interrupt_id)
+                {
+                    continue;
+                }
+                let terminal_tree_decision = match session
+                    .db
+                    .decision_request_for_interrupt(session_id, row.interrupt_id)
+                    .await
+                {
+                    Ok(Some(decision)) => matches!(
+                        decision.state,
+                        crate::db::agent_tree_decisions::DecisionState::Answered
+                            | crate::db::agent_tree_decisions::DecisionState::AutoResolved
+                            | crate::db::agent_tree_decisions::DecisionState::TimedOut
+                            | crate::db::agent_tree_decisions::DecisionState::Cancelled
+                    ),
+                    Ok(None) => false,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            interrupt_id = %row.interrupt_id,
+                            "loading post-recovery executing interrupt decision failed"
+                        );
+                        false
+                    }
+                };
+                if terminal_tree_decision {
+                    terminal_tree_interrupt_replays.push(row);
+                }
+            }
+        }
+        Err(error) => tracing::warn!(%error, %session_id, "scanning post-recovery terminal interrupt claims failed"),
+    }
+    let root_claimed = tree_recovery
+        .claimed_agents
+        .iter()
+        .any(|agent_id| *agent_id == tree_root.agent_instance_id);
+    // The root is also a recovered executor. Publish its driver endpoint now,
+    // but do not let an already-queued submission execute until the exact
+    // root claim below has been consumed for this boot epoch.
+    let root_activation_gate = root_claimed.then(crate::engine::driver::RecoveryActivationGate::new);
+    if let Some(gate) = root_activation_gate.clone() {
+        driver.set_root_recovery_activation(gate);
+    }
+    // Resolver replay is allowed only for an executor that this worker has
+    // actually attached. Child rows remain claimed for their dedicated
+    // rehydrator; replaying their decision through the root would either lose
+    // the continuation or attribute it to the wrong UUID.
+    let mut root_pending_decisions = Vec::new();
+    for decision_request_id in &tree_recovery.pending_decisions {
+        match session.db.decision_request(session_id, *decision_request_id).await {
+            Ok(Some(decision)) if decision.agent_instance_id == tree_root.agent_instance_id => {
+                root_pending_decisions.push(*decision_request_id);
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, %decision_request_id, "loading recovered decision owner failed"),
+        }
+    }
+
+    // A recovery claim is not permission to cancel an executor.  Child
+    // continuations keep their exact durable UUID/claim until their own
+    // rehydration path attaches them; a restart must never turn ordinary
+    // running/waiting work into cancellation merely because the root driver is
+    // the first executor available in this worker.
+    let root_late_user_steers = tree_recovery
+        .claimed_late_user_steers
+        .iter()
+        .filter(|steer| steer.agent_instance_id == tree_root.agent_instance_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    // Accepted steers are deliberately held apart from new deliveries.  The
+    // recovery handoff below sends their checkpoint-resume command only after
+    // the exact root endpoint is attached and its resume claim is consumed.
+    let root_accepted_late_user_steers = tree_recovery
+        .accepted_late_user_steers
+        .iter()
+        .filter(|steer| steer.agent_instance_id == tree_root.agent_instance_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut root_recovery = crate::agent_tree::AgentTreeRecovery {
+        claimed_agents: root_claimed.then_some(tree_root.agent_instance_id).into_iter().collect(),
+        pending_decisions: root_pending_decisions,
+        claimed_late_user_steers: root_late_user_steers.clone(),
+        accepted_late_user_steers: root_accepted_late_user_steers.clone(),
+    };
+    // A root accepted late steer has no task-child descriptor to reattach.
+    // Reconstruct its private root continuation before the driver exists, and
+    // refuse this worker epoch if the durable proof is absent or ambiguous.
+    // The accepted DB claim remains untouched in either failure case so the
+    // next boot can retry the same continuation; it must never fall back to
+    // the user payload or an unrelated root history.
+    if root_accepted_late_user_steers.len() > 1 {
+        tracing::error!(
+            session_id = %session_id,
+            root_agent_instance_id = %tree_root.agent_instance_id,
+            count = root_accepted_late_user_steers.len(),
+            "root has multiple accepted late-steer checkpoints; retaining all exact claims"
+        );
+        if let Some(gate) = root_activation_gate.as_ref() {
+            gate.abort();
+        }
+        return;
+    }
+    if let Some(accepted) = root_accepted_late_user_steers.first() {
+        let descriptor = match session
+            .db
+            .session_root_agent_continuation_for_steer(
+                session_id,
+                tree_root.agent_instance_id,
+                accepted.continuation_id,
+            )
+            .await
+        {
+            Ok(Some(descriptor)) => descriptor,
+            Ok(None) => {
+                tracing::error!(
+                    steer_id = %accepted.steer_id,
+                    continuation_id = %accepted.continuation_id,
+                    "accepted root late steer has no exact durable root continuation snapshot"
+                );
+                if let Some(gate) = root_activation_gate.as_ref() {
+                    gate.abort();
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::error!(%error, steer_id = %accepted.steer_id, "loading accepted root late-steer continuation failed");
+                if let Some(gate) = root_activation_gate.as_ref() {
+                    gate.abort();
+                }
+                return;
+            }
+        };
+        let expected_parked_interrupt_id = match root_parked_interrupt_id_from_snapshot(
+            &descriptor.snapshot_json,
+        ) {
+            Ok(interrupt_id) => interrupt_id,
+            Err(error) => {
+                tracing::error!(%error, steer_id = %accepted.steer_id, "accepted root late steer has a malformed parked continuation marker");
+                if let Some(gate) = root_activation_gate.as_ref() {
+                    gate.abort();
+                }
+                return;
+            }
+        };
+        let root_has_parked_continuation = match session.db.list_reconcilable_interrupts(session_id).await {
+            Ok(rows) => match expected_parked_interrupt_id {
+                Some(expected_interrupt_id) => {
+                    let matched = rows.into_iter().any(|row| {
+                        row.interrupt_id == expected_interrupt_id
+                            && row.agent_instance_id == Some(tree_root.agent_instance_id)
+                            && row.parked.is_some()
+                            && matches!(
+                                row.state,
+                                crate::db::needs_attention::InterruptState::Open
+                                    | crate::db::needs_attention::InterruptState::Parked
+                                    | crate::db::needs_attention::InterruptState::Executing
+                            )
+                    });
+                    if !matched {
+                        tracing::error!(
+                            steer_id = %accepted.steer_id,
+                            interrupt_id = %expected_interrupt_id,
+                            "accepted root late steer parked checkpoint has no exact recoverable interrupt"
+                        );
+                    }
+                    matched
+                }
+                None => false,
+            },
+            Err(error) => {
+                tracing::error!(%error, steer_id = %accepted.steer_id, "loading root parked continuation for accepted late steer failed");
+                if let Some(gate) = root_activation_gate.as_ref() {
+                    gate.abort();
+                }
+                return;
+            }
+        };
+        if expected_parked_interrupt_id.is_some() && !root_has_parked_continuation {
+            if let Some(gate) = root_activation_gate.as_ref() {
+                gate.abort();
+            }
+            return;
+        }
+        if let Err(error) = driver.restore_root_late_user_steer_continuation(
+            tree_root.agent_instance_id,
+            crate::engine::driver::RecoveredLateUserSteerPermit {
+                steer_id: accepted.steer_id,
+                continuation_id: accepted.continuation_id,
+                recovery_epoch: tree_epoch,
+            },
+            &descriptor.snapshot_json,
+            root_has_parked_continuation,
+        ) {
+            tracing::error!(%error, steer_id = %accepted.steer_id, "reconstructing accepted root late-steer continuation failed");
+            if let Some(gate) = root_activation_gate.as_ref() {
+                gate.abort();
+            }
+            return;
+        }
+    }
+    for agent_instance_id in tree_recovery
+        .claimed_agents
+        .iter()
+        .copied()
+        .filter(|agent_instance_id| *agent_instance_id != tree_root.agent_instance_id)
+    {
+        tracing::info!(
+            %session_id,
+            %agent_instance_id,
+            "retaining recovered child claim until its exact durable executor attaches"
+        );
+    }
     // Spawn the driver loop.
     let driver_queue_for_loop = driver_input_queue.clone();
+    let resolver_registry_for_driver = tree_resolver_registry.clone();
     let mut driver_handle = tokio::spawn(async move {
         crate::config::trust::scope_workspace_trust_policy(trust_policy, async move {
             let driver_loop = Box::pin(driver.run_main_loop(
@@ -1974,6 +5375,11 @@ pub(super) async fn run_worker(
                 &engine_event_tx,
             ));
             let outcome = driver_loop.await;
+            // The endpoint must disappear before the worker can attempt a
+            // subsequent warm delivery. A stale root never qualifies merely
+            // because its model handle outlived the driver task.
+            resolver_registry_for_driver
+                .detach_session(session_id);
             // Pairing teardown: a driver-loop exit that still holds interactive
             // child frames (only reachable via a fatal `Err` — every clean /
             // cancel / gate / interrupt / inference-failure path already
@@ -1999,14 +5405,927 @@ pub(super) async fn run_worker(
         .await
     });
 
+    // Reattach task-backed interactive descendants in parent-before-child
+    // order. A descriptor is complete only when its durable payload and
+    // snapshot can be read; otherwise its resume claim stays intact for a
+    // later worker epoch instead of being mass-cancelled or routed through the
+    // root. Noninteractive recovery has its own executor path and therefore
+    // is deliberately left claimed here rather than impersonated by the
+    // foreground driver.
+    let mut attached_recovered_agents = std::collections::BTreeSet::new();
+    attached_recovered_agents.insert(tree_root.agent_instance_id);
+    attached_recovered_agents.extend(recovered_host_operation_agents.iter().copied());
+    // A reattached executor is addressable before it may run.  Keep every
+    // child gate closed until accepted late-steer checkpoints have been
+    // enqueued below; otherwise a recovery can race its own resume command
+    // and execute the pre-crash prompt with a fresh inference identity.
+    let mut deferred_recovery_activation_gates = Vec::new();
+    let mut pending_recovery_agents = tree_recovery
+        .claimed_agents
+        .iter()
+        .copied()
+        .filter(|agent_instance_id| *agent_instance_id != tree_root.agent_instance_id)
+        .collect::<Vec<_>>();
+    // One control hand-off owns an entire batch job. Without this directory a
+    // later sibling in the same recovery scan could reconstruct the same DAG
+    // a second time after the first member had already attached.
+    let mut recovered_batch_jobs = std::collections::HashSet::new();
+    loop {
+        let mut progressed = false;
+        let mut remaining = Vec::new();
+        for agent_instance_id in pending_recovery_agents {
+            if attached_recovered_agents.contains(&agent_instance_id) {
+                continue;
+            }
+            if host_operation_agents.contains(&agent_instance_id) {
+                // A daemon-owned refresh child has a typed operation
+                // descriptor, not a task-delegation descriptor. Its own
+                // recovery above either attached the HostOperation endpoint
+                // or intentionally retained the exact claim for a successor;
+                // never reinterpret it as a generic missing child.
+                continue;
+            }
+            let descriptor = match session
+                .db
+                .task_delegation_recovery_descriptor(session_id, agent_instance_id)
+                .await
+            {
+                Ok(Some(descriptor)) => descriptor,
+                Ok(None) => {
+                    tracing::warn!(%session_id, %agent_instance_id, "recovered child has no complete task recovery descriptor; retaining exact claim");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %session_id, %agent_instance_id, "loading recovered child task descriptor failed; retaining exact claim");
+                    continue;
+                }
+            };
+            if !attached_recovered_agents.contains(&descriptor.parent_agent_instance_id) {
+                remaining.push(agent_instance_id);
+                continue;
+            }
+            let is_noninteractive = match session
+                .db
+                .task_delegation_is_noninteractive_for_agent(session_id, agent_instance_id)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(%error, %agent_instance_id, "checking recovered task executor mode failed; retaining exact claim");
+                    continue;
+                }
+            };
+            if is_noninteractive {
+                let batch_job = serde_json::from_str::<serde_json::Value>(&descriptor.original_args_json)
+                    .ok()
+                    .is_some_and(|args| args.get("entries").is_some());
+                if batch_job {
+                    let batch_id = descriptor.task_call_id.clone();
+                    let activation_gate = crate::engine::driver::RecoveryActivationGate::new();
+                    // This set records a fully-attached batch, not an attempt.
+                    // Inserting before all descriptor/payload/mailbox/claim
+                    // work succeeds poisons the current boot after one
+                    // transient failure: every later sibling observes the
+                    // marker and the durable batch is never retried.  A
+                    // successful attachment below is the only linearization
+                    // point for suppressing its other members.
+                    if recovered_batch_jobs.contains(&batch_id) {
+                        continue;
+                    }
+                    let descriptors = match session
+                        .db
+                        .task_delegation_recovery_descriptors_for_job(session_id, batch_id.clone())
+                        .await
+                    {
+                        Ok(descriptors) if !descriptors.is_empty() => descriptors,
+                        Ok(_) => {
+                            remaining.push(agent_instance_id);
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, task_call_id = %batch_id, "loading recovered batch descriptors failed");
+                            remaining.push(agent_instance_id);
+                            continue;
+                        }
+                    };
+                    let batch_members = descriptors
+                        .iter()
+                        .map(|item| item.agent_instance_id)
+                        .collect::<Vec<_>>();
+                    if descriptors.iter().any(|item| {
+                        item.parent_agent_instance_id != descriptor.parent_agent_instance_id
+                            || !tree_recovery.claimed_agents.contains(&item.agent_instance_id)
+                    }) {
+                        tracing::warn!(task_call_id = %batch_id, "recovered batch does not have one claimed parent-owned executor set");
+                        remaining.extend(batch_members);
+                        continue;
+                    }
+                    let rows = match session.db.list_task_delegation_children(session_id).await {
+                        Ok(rows) => rows,
+                        Err(error) => {
+                            tracing::warn!(%error, task_call_id = %batch_id, "loading recovered batch child states failed");
+                            remaining.extend(batch_members);
+                            continue;
+                        }
+                    };
+                    let mut state_by_label = rows
+                        .into_iter()
+                        .filter(|row| row.task_call_id == batch_id)
+                        .map(|row| (row.label.clone(), row))
+                        .collect::<std::collections::HashMap<_, _>>();
+                    let mut recoveries = Vec::with_capacity(descriptors.len());
+                    let mut failed = false;
+                    for item in descriptors {
+                        let Some(row) = state_by_label.remove(&item.label) else {
+                            failed = true;
+                            break;
+                        };
+                        let payload = match session
+                            .db
+                            .load_task_delegation_payload(&item.task_call_id, &item.label)
+                            .await
+                        {
+                            Ok(payload) => payload.body,
+                            Err(error) => {
+                                tracing::warn!(%error, task_call_id = %item.task_call_id, label = %item.label, "loading recovered batch payload failed");
+                                failed = true;
+                                break;
+                            }
+                        };
+                        recoveries.push(crate::engine::driver::RecoveredNoninteractiveTaskChild {
+                            agent_instance_id: item.agent_instance_id,
+                            parent_agent_instance_id: item.parent_agent_instance_id,
+                            task_call_id: item.task_call_id,
+                            label: item.label,
+                            child_agent: item.child_agent,
+                            original_args_json: item.original_args_json,
+                            snapshot_json: item.snapshot_json,
+                            payload,
+                            // The descriptor captures both the durable child
+                            // and job status. The batch's current child row is
+                            // only a consistency check, never a reason to
+                            // revive a backgrounded job as foreground work.
+                            was_backgrounded: item.was_backgrounded,
+                            activation_gate: activation_gate.clone(),
+                        });
+                    }
+                    if failed {
+                        remaining.extend(batch_members);
+                        continue;
+                    }
+                    if state_by_label.values().any(|row| matches!(
+                        row.status,
+                        crate::db::task_delegations::DelegationStatus::Running
+                            | crate::db::task_delegations::DelegationStatus::Backgrounded
+                            | crate::db::task_delegations::DelegationStatus::PausedPendingTool
+                    )) {
+                        tracing::warn!(task_call_id = %batch_id, "recovered batch has a live child without an exact lifecycle descriptor");
+                        remaining.extend(batch_members);
+                        continue;
+                    }
+                    let terminal_children = state_by_label
+                        .into_values()
+                        .filter_map(|row| match row.status {
+                            crate::db::task_delegations::DelegationStatus::Completed
+                            | crate::db::task_delegations::DelegationStatus::Failed
+                            | crate::db::task_delegations::DelegationStatus::Cancelled
+                            | crate::db::task_delegations::DelegationStatus::Lost => Some(
+                                crate::engine::driver::RecoveredNoninteractiveTaskTerminal {
+                                    label: row.label,
+                                    child_agent: row.child_agent,
+                                    report: row.report.unwrap_or_else(|| "recovered terminal batch child has no report".to_string()),
+                                    failed: !matches!(row.status, crate::db::task_delegations::DelegationStatus::Completed),
+                                },
+                            ),
+                            crate::db::task_delegations::DelegationStatus::Running
+                            | crate::db::task_delegations::DelegationStatus::Backgrounded
+                            | crate::db::task_delegations::DelegationStatus::PausedPendingTool
+                            // `Created` has no AgentTree node or resume claim:
+                            // publication is atomic with the first snapshot,
+                            // so it cannot be a reconstructable executor.
+                            | crate::db::task_delegations::DelegationStatus::Created => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let (respond_to, attached) = oneshot::channel();
+                    if driver_control_tx
+                        .send(crate::engine::driver::DriverControl::ReattachNoninteractiveTaskBatch {
+                            recoveries,
+                            terminal_children,
+                            respond_to,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        remaining.extend(batch_members);
+                        continue;
+                    }
+                    match attached.await {
+                        Ok(Ok(endpoints)) if !endpoints.is_empty() => {
+                            let endpoint_ids = endpoints
+                                .iter()
+                                .map(|endpoint| endpoint.agent_instance_id)
+                                .collect::<std::collections::BTreeSet<_>>();
+                            if !batch_members
+                                .iter()
+                                .all(|agent_instance_id| endpoint_ids.contains(agent_instance_id))
+                            {
+                                activation_gate.abort();
+                                tracing::warn!(task_call_id = %batch_id, "recovered batch subtree did not install every batch-root resolver mailbox");
+                                remaining.extend(batch_members);
+                                continue;
+                            }
+                            let endpoint_generations = endpoints
+                                .iter()
+                                .map(|endpoint| {
+                                    (
+                                        endpoint.agent_instance_id,
+                                        tree_resolver_registry.attach_noninteractive_endpoint(
+                                            session_id,
+                                            endpoint.agent_instance_id,
+                                            endpoint.endpoint_generation,
+                                            endpoint.endpoint.clone(),
+                                        ),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            for (endpoint_agent_instance_id, endpoint_generation) in
+                                &endpoint_generations
+                            {
+                                debug_assert!(endpoint_ids.contains(endpoint_agent_instance_id));
+                                debug_assert_ne!(*endpoint_generation, 0);
+                            }
+                            let mut claims = Vec::with_capacity(endpoint_ids.len());
+                            for endpoint_agent_instance_id in &endpoint_ids {
+                                match session
+                                    .db
+                                    .agent_instance(session_id, *endpoint_agent_instance_id)
+                                    .await
+                                {
+                                    Ok(Some(agent)) => {
+                                        claims.push((*endpoint_agent_instance_id, agent.revision));
+                                    }
+                                    Ok(None) | Err(_) => break,
+                                }
+                            }
+                            let consumed = claims.len() == endpoint_ids.len()
+                                && session
+                                    .db
+                                    .consume_agent_resume_claims_atomically(
+                                        session_id,
+                                        claims,
+                                        tree_epoch,
+                                        crate::agent_tree::system_now_unix_ms(),
+                                    )
+                                    .await
+                                    .unwrap_or(false);
+                            if consumed {
+                                // Every returned endpoint, including nested
+                                // recursive descendants, shares this gate.
+                                // Release only after the all-or-nothing claim
+                                // acknowledgement commits.
+                                deferred_recovery_activation_gates
+                                    .push(activation_gate.clone());
+                                recovered_batch_jobs.insert(batch_id.clone());
+                                for endpoint_agent_instance_id in endpoint_ids {
+                                    attached_recovered_agents.insert(endpoint_agent_instance_id);
+                                    root_recovery.claimed_agents.push(endpoint_agent_instance_id);
+                                }
+                                progressed = true;
+                            } else {
+                                activation_gate.abort();
+                                tracing::warn!(task_call_id = %batch_id, "recovered batch could not consume every exact resume claim");
+                                for (endpoint_agent_instance_id, endpoint_generation) in
+                                    endpoint_generations
+                                {
+                                    tree_resolver_registry.detach_parent_endpoint_if_generation(
+                                        session_id,
+                                        endpoint_agent_instance_id,
+                                        endpoint_generation,
+                                    );
+                                }
+                                if let Some(gate) = root_activation_gate.as_ref() {
+                                    gate.abort();
+                                }
+                                driver_handle.abort();
+                                return;
+                            }
+                        }
+                        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+                            activation_gate.abort();
+                            tracing::warn!(task_call_id = %batch_id, "recovered batch did not install every exact resolver mailbox");
+                            remaining.extend(batch_members);
+                        }
+                    }
+                    continue;
+                }
+                // A detached executor owns a real model loop and its own
+                // mailbox. Reattach it from the exact task descriptor rather
+                // than treating the foreground root as its parent, then wait
+                // until that concrete mailbox has reached the warm registry
+                // before consuming the durable resume claim.
+                let payload = match session
+                    .db
+                    .load_task_delegation_payload(&descriptor.task_call_id, &descriptor.label)
+                    .await
+                {
+                    Ok(payload) => payload.body,
+                    Err(error) => {
+                        tracing::warn!(%error, %agent_instance_id, "loading recovered noninteractive task payload failed; retaining exact claim");
+                        continue;
+                    }
+                };
+                let (respond_to, attached) = oneshot::channel();
+                let activation_gate = crate::engine::driver::RecoveryActivationGate::new();
+                if driver_control_tx
+                    .send(crate::engine::driver::DriverControl::ReattachNoninteractiveTaskChild {
+                        recovery: crate::engine::driver::RecoveredNoninteractiveTaskChild {
+                            agent_instance_id: descriptor.agent_instance_id,
+                            parent_agent_instance_id: descriptor.parent_agent_instance_id,
+                            task_call_id: descriptor.task_call_id,
+                            label: descriptor.label,
+                            child_agent: descriptor.child_agent,
+                            original_args_json: descriptor.original_args_json,
+                            snapshot_json: descriptor.snapshot_json,
+                            payload,
+                            was_backgrounded: descriptor.was_backgrounded,
+                            activation_gate: activation_gate.clone(),
+                        },
+                        respond_to,
+                    })
+                    .await
+                    .is_err()
+                {
+                    remaining.push(agent_instance_id);
+                    continue;
+                }
+                match attached.await {
+                    Ok(Ok(endpoints)) if !endpoints.is_empty() => {
+                        // A recursive continuation reports every exact live
+                        // mailbox beneath this root before the worker consumes
+                        // even one claim.  This closes the decision-replay race
+                        // where a descendant was durable but not yet warm.
+                        let endpoint_ids = endpoints
+                            .iter()
+                            .map(|endpoint| endpoint.agent_instance_id)
+                            .collect::<std::collections::BTreeSet<_>>();
+                        if !endpoint_ids.contains(&agent_instance_id) {
+                            activation_gate.abort();
+                            tracing::warn!(%agent_instance_id, "recovered noninteractive subtree omitted its root resolver mailbox");
+                            remaining.push(agent_instance_id);
+                            continue;
+                        }
+                        let endpoint_generations = endpoints
+                            .iter()
+                            .map(|endpoint| {
+                                (
+                                    endpoint.agent_instance_id,
+                                    tree_resolver_registry.attach_noninteractive_endpoint(
+                                        session_id,
+                                        endpoint.agent_instance_id,
+                                        endpoint.endpoint_generation,
+                                        endpoint.endpoint.clone(),
+                                    ),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        // The recursive executor is one recovered unit.  Do
+                        // not acknowledge a prefix of its descendants: a
+                        // later stale/missing claim would otherwise leave an
+                        // attached sibling without a durable recovery
+                        // acknowledgement.  Capture every exact revision
+                        // first, then consume the complete set in the same
+                        // `IMMEDIATE` transaction as the batch path above.
+                        let mut claims = Vec::with_capacity(endpoint_ids.len());
+                        for endpoint_agent_instance_id in &endpoint_ids {
+                            match session
+                                .db
+                                .agent_instance(session_id, *endpoint_agent_instance_id)
+                                .await
+                            {
+                                Ok(Some(agent)) => {
+                                    claims.push((*endpoint_agent_instance_id, agent.revision));
+                                }
+                                Ok(None) | Err(_) => {
+                                    claims.clear();
+                                    break;
+                                }
+                            }
+                        }
+                        let consumed = !claims.is_empty()
+                            && session
+                                .db
+                                .consume_agent_resume_claims_atomically(
+                                    session_id,
+                                    claims,
+                                    tree_epoch,
+                                    crate::agent_tree::system_now_unix_ms(),
+                                )
+                                .await
+                                .unwrap_or(false);
+                        if consumed {
+                            deferred_recovery_activation_gates
+                                .push(activation_gate.clone());
+                            for endpoint_agent_instance_id in endpoint_ids {
+                                attached_recovered_agents.insert(endpoint_agent_instance_id);
+                                root_recovery.claimed_agents.push(endpoint_agent_instance_id);
+                            }
+                            progressed = true;
+                        } else {
+                            activation_gate.abort();
+                            tracing::warn!(%agent_instance_id, "recovered noninteractive subtree attached but an exact resume claim could not be consumed");
+                            for (endpoint_agent_instance_id, endpoint_generation) in
+                                endpoint_generations
+                            {
+                                tree_resolver_registry.detach_parent_endpoint_if_generation(
+                                    session_id,
+                                    endpoint_agent_instance_id,
+                                    endpoint_generation,
+                                );
+                            }
+                            if let Some(gate) = root_activation_gate.as_ref() {
+                                gate.abort();
+                            }
+                            driver_handle.abort();
+                            return;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        activation_gate.abort();
+                        tracing::warn!(%error, %agent_instance_id, "recovering noninteractive child executor failed; retaining exact claim");
+                        remaining.push(agent_instance_id);
+                    }
+                    Err(_) => {
+                        activation_gate.abort();
+                        remaining.push(agent_instance_id)
+                    }
+                }
+                continue;
+            }
+            let payload = match session
+                .db
+                .load_task_delegation_payload(&descriptor.task_call_id, &descriptor.label)
+                .await
+            {
+                Ok(payload) => payload.body,
+                Err(error) => {
+                    tracing::warn!(%error, %agent_instance_id, "loading recovered interactive task payload failed; retaining exact claim");
+                    continue;
+                }
+            };
+            let (respond_to, attached) = oneshot::channel();
+            let activation_gate = crate::engine::driver::RecoveryActivationGate::new();
+            let accepted_late_steers = tree_recovery
+                .accepted_late_user_steers
+                .iter()
+                .filter(|steer| steer.agent_instance_id == descriptor.agent_instance_id)
+                .collect::<Vec<_>>();
+            if accepted_late_steers.len() > 1 {
+                tracing::warn!(
+                    %agent_instance_id,
+                    "recovered interactive child has more than one accepted late-steer checkpoint; retaining exact claim"
+                );
+                continue;
+            }
+            let accepted_late_steer = accepted_late_steers.first().map(|steer| {
+                crate::engine::driver::RecoveredLateUserSteerPermit {
+                    steer_id: steer.steer_id,
+                    continuation_id: steer.continuation_id,
+                    recovery_epoch: tree_epoch,
+                }
+            });
+            if driver_control_tx
+                .send(crate::engine::driver::DriverControl::ReattachInteractiveTaskChild {
+                    recovery: crate::engine::driver::RecoveredInteractiveTaskChild {
+                        agent_instance_id: descriptor.agent_instance_id,
+                        parent_agent_instance_id: descriptor.parent_agent_instance_id,
+                        task_call_id: descriptor.task_call_id,
+                        label: descriptor.label,
+                        child_agent: descriptor.child_agent,
+                        original_args_json: descriptor.original_args_json,
+                        snapshot_json: descriptor.snapshot_json,
+                        payload,
+                        accepted_late_steer,
+                        activation_gate: activation_gate.clone(),
+                    },
+                    respond_to,
+                })
+                .await
+                .is_err()
+            {
+                remaining.push(agent_instance_id);
+                continue;
+            }
+            match attached.await {
+                Ok(Ok(endpoint_generation)) => {
+                    // Keep the one-node interactive continuation on the
+                    // same atomic acknowledgement path as every recursive
+                    // reattach.  Besides making the invariant uniform, this
+                    // prevents a later extension from accidentally changing
+                    // this branch back into a partial subtree consume.
+                    let claims = match session.db.agent_instance(session_id, agent_instance_id).await {
+                        Ok(Some(agent)) => vec![(agent_instance_id, agent.revision)],
+                        Ok(None) | Err(_) => Vec::new(),
+                    };
+                    let claim_consumed = !claims.is_empty()
+                        && session
+                            .db
+                            .consume_agent_resume_claims_atomically(
+                                session_id,
+                                claims,
+                                tree_epoch,
+                                crate::agent_tree::system_now_unix_ms(),
+                            )
+                            .await
+                            .unwrap_or(false);
+                    if claim_consumed {
+                        // Do not wait for the display-event forwarder to run:
+                        // recovery must make the exact attached frame warm
+                        // before it redelivers that frame's pending decision.
+                        tree_resolver_registry.attach_parent_endpoint(
+                            session_id,
+                            agent_instance_id,
+                            endpoint_generation,
+                            driver_control_tx.clone(),
+                        );
+                        deferred_recovery_activation_gates
+                            .push(activation_gate.clone());
+                        attached_recovered_agents.insert(agent_instance_id);
+                        root_recovery.claimed_agents.push(agent_instance_id);
+                        progressed = true;
+                    } else {
+                        activation_gate.abort();
+                        tracing::warn!(%agent_instance_id, "recovered child attached but its exact resume claim could not be consumed");
+                        // The frame is already live, but it has no durable
+                        // recovery acknowledgement.  Do not leave that
+                        // unclaimed continuation running (and do not invent a
+                        // terminal state): tear down this worker so the same
+                        // durable claim is retried by the next epoch.
+                        tree_resolver_registry.detach_parent_endpoint_if_generation(
+                            session_id,
+                            agent_instance_id,
+                            endpoint_generation,
+                        );
+                        if let Some(gate) = root_activation_gate.as_ref() {
+                            gate.abort();
+                        }
+                        driver_handle.abort();
+                        return;
+                    }
+                }
+                Ok(Err(error)) => {
+                    activation_gate.abort();
+                    tracing::warn!(%error, %agent_instance_id, "recovering interactive child executor failed; retaining exact claim");
+                }
+                Err(_) => {
+                    activation_gate.abort();
+                    remaining.push(agent_instance_id)
+                }
+            }
+        }
+        if !progressed {
+            for agent_instance_id in remaining {
+                tracing::warn!(%agent_instance_id, "recovered child lineage could not be attached in this worker epoch; retaining exact claim");
+            }
+            break;
+        }
+        pending_recovery_agents = remaining;
+        if pending_recovery_agents.is_empty() {
+            break;
+        }
+    }
+    // A claim is not merely a decision-owner reservation. Every durable
+    // nonterminal child (Created, Running, and either waiting state) must
+    // attach to a concrete continuation before this worker releases the root.
+    // In particular, a transient missing descriptor/payload/mailbox for a
+    // running child must fail this epoch rather than silently disappearing
+    // after `pending_recovery_agents` falls out of scope. The next worker gets
+    // the same durable epoch claim as a whole; it never starts a half-tree.
+    for agent_instance_id in &tree_recovery.claimed_agents {
+        if *agent_instance_id == tree_root.agent_instance_id
+            || attached_recovered_agents.contains(agent_instance_id)
+            || host_operation_agents.contains(agent_instance_id)
+        {
+            continue;
+        }
+        match session.db.agent_instance(session_id, *agent_instance_id).await {
+            Ok(Some(agent)) if !agent.state.is_terminal() => {
+                tracing::warn!(
+                    %agent_instance_id,
+                    state = ?agent.state,
+                    "recovery left a claimed nonterminal child unattached; refusing to release root"
+                );
+                if let Some(gate) = root_activation_gate.as_ref() {
+                    gate.abort();
+                }
+                driver_handle.abort();
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, %agent_instance_id, "loading claimed child after recovery failed; refusing to release root");
+                if let Some(gate) = root_activation_gate.as_ref() {
+                    gate.abort();
+                }
+                driver_handle.abort();
+                return;
+            }
+        }
+    }
+    // A pending decision can only be consumed by the exact executor that
+    // owns its parked continuation. This is the decision-specific instance of
+    // the all-nonterminal guard above; it protects the one-shot settlement
+    // boundary before manual input, resolver results, or deadlines arrive.
+    for decision_request_id in &tree_recovery.pending_decisions {
+        let decision = match session.db.decision_request(session_id, *decision_request_id).await {
+            Ok(Some(decision)) => decision,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(%error, %decision_request_id, "loading recovered decision owner failed");
+                if let Some(gate) = root_activation_gate.as_ref() {
+                    gate.abort();
+                }
+                driver_handle.abort();
+                return;
+            }
+        };
+        if !attached_recovered_agents.contains(&decision.agent_instance_id)
+            && !host_operation_agents.contains(&decision.agent_instance_id)
+        {
+            tracing::warn!(
+                %decision_request_id,
+                agent_instance_id = %decision.agent_instance_id,
+                "recovery left a decision owner unattached; refusing to process its one-shot decision"
+            );
+            if let Some(gate) = root_activation_gate.as_ref() {
+                gate.abort();
+            }
+            driver_handle.abort();
+            return;
+        }
+    }
+    for decision_request_id in &tree_recovery.pending_decisions {
+        match session.db.decision_request(session_id, *decision_request_id).await {
+            Ok(Some(decision))
+                if decision.agent_instance_id != tree_root.agent_instance_id
+                    && attached_recovered_agents.contains(&decision.agent_instance_id) =>
+            {
+                root_recovery.pending_decisions.push(*decision_request_id);
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, %decision_request_id, "loading attached recovered decision owner failed"),
+        }
+    }
+    root_recovery.claimed_late_user_steers.extend(
+        tree_recovery
+            .claimed_late_user_steers
+            .iter()
+            .filter(|steer| {
+                steer.agent_instance_id != tree_root.agent_instance_id
+                    && attached_recovered_agents.contains(&steer.agent_instance_id)
+            })
+            .cloned(),
+    );
+    root_recovery.accepted_late_user_steers.extend(
+        tree_recovery
+            .accepted_late_user_steers
+            .iter()
+            .filter(|steer| {
+                steer.agent_instance_id != tree_root.agent_instance_id
+                    && attached_recovered_agents.contains(&steer.agent_instance_id)
+            })
+            .cloned(),
+    );
+
+    // The root claim becomes consumed only after the actual driver task has
+    // been spawned with the bound root identity. If this final durable ACK
+    // loses its exact epoch/revision race, abort the just-created executor so
+    // it cannot run an unclaimed continuation; the next recovery epoch owns
+    // retrying the still-durable claim.
+    if root_claimed
+        && !session
+            .db
+            .consume_agent_resume_claim(
+                session_id,
+                tree_root.agent_instance_id,
+                tree_root.revision,
+                tree_epoch,
+                tree_now,
+            )
+            .await
+            .unwrap_or(false)
+    {
+        if let Some(gate) = root_activation_gate.as_ref() {
+            gate.abort();
+        }
+        driver_handle.abort();
+        return;
+    }
+    // Startup scheduling comes only after every recoverable host-operation
+    // child above has installed its typed endpoint/claim (or has been
+    // terminalized and acknowledged). This preserves the operation-child
+    // lifecycle even when an already-allowed refresh completes immediately.
+    spawn_ready_host_capability_refresh_operations(
+        &session,
+        start_config.host_capability_refresh_runtime.clone(),
+        &global_bus,
+        &redaction,
+        &tree_resolver_registry,
+    )
+    .await;
+    // Use the same nonblocking exact-owner delivery path for the root.  A
+    // boot-time late steer must not monopolize this worker while its resumed
+    // root executes an arbitrary model turn; the detached receipt task owns
+    // the durable acknowledgement just as it does for every child.
+    if let Err(error) = deliver_live_agent_tree_late_user_steers(
+        &session,
+        session_id,
+        tree_root.agent_instance_id,
+        &tree_resolver_registry,
+        Some((tree_epoch, root_late_user_steers)),
+    )
+    .await
+    {
+        tracing::warn!(%error, "delivering recovered root late user steers failed");
+    }
+    if let Err(error) = deliver_live_agent_tree_late_user_steers(
+        &session,
+        session_id,
+        tree_root.agent_instance_id,
+        &tree_resolver_registry,
+        Some((tree_epoch, root_accepted_late_user_steers)),
+    )
+    .await
+    {
+        tracing::error!(%error, "resuming recovered root late user steer checkpoints failed; retaining checkpoint for a new recovery epoch");
+        if let Some(gate) = root_activation_gate.as_ref() {
+            gate.abort();
+        }
+        driver_handle.abort();
+        return;
+    }
+
+    // The reattached interactive frames use the same exact-owner completion
+    // path as a live late steer. Run this only after their resume claims have
+    // been consumed and their warm endpoints registered; a failed delivery
+    // releases the steer claim without substituting the root continuation.
+    for agent_instance_id in attached_recovered_agents
+        .iter()
+        .copied()
+        .filter(|agent_instance_id| *agent_instance_id != tree_root.agent_instance_id)
+    {
+        if let Err(error) = deliver_live_agent_tree_late_user_steers(
+            &session,
+            session_id,
+            agent_instance_id,
+            &tree_resolver_registry,
+            Some((
+                tree_epoch,
+                root_recovery
+                    .claimed_late_user_steers
+                    .iter()
+                    .filter(|steer| steer.agent_instance_id == agent_instance_id)
+                    .cloned()
+                    .collect(),
+            )),
+        )
+        .await
+        {
+            tracing::warn!(%error, %agent_instance_id, "delivering recovered child late user steers failed");
+        }
+        if let Err(error) = deliver_live_agent_tree_late_user_steers(
+            &session,
+            session_id,
+            agent_instance_id,
+            &tree_resolver_registry,
+            Some((
+                tree_epoch,
+                root_recovery
+                    .accepted_late_user_steers
+                    .iter()
+                    .filter(|steer| steer.agent_instance_id == agent_instance_id)
+                    .cloned()
+                    .collect(),
+            )),
+        )
+        .await
+        {
+            tracing::error!(%error, %agent_instance_id, "resuming recovered child late user steer checkpoints failed; retaining checkpoint for a new recovery epoch");
+            if let Some(gate) = root_activation_gate.as_ref() {
+                gate.abort();
+            }
+            driver_handle.abort();
+            return;
+        }
+    }
+
     // Main work loop.
     enum WorkerInput {
         Work(Box<SessionWork>),
         ParkedReplay(ParkedReplayCompletion),
+        AgentTreeResolver(AgentTreeResolverCompletion),
         ReapExpiredTextArtifactReservations,
+        RelayAgentTreeEvents,
+        ExpireAgentTreeDeadlines,
+        ReapStaleHostCapabilityRefreshes,
     }
     let (replay_completion_tx, mut replay_completion_rx) =
         mpsc::channel::<ParkedReplayCompletion>(WORK_QUEUE_CAPACITY);
+    // All non-root claims above have either been terminalized or retained for
+    // a later recovery retry. The root activation gate remains closed while
+    // we attach deadlines/resolvers and schedule exact durable replay, so a
+    // queued FCM/client input cannot cross a provider boundary ahead of that
+    // reconstructed state.
+    let recovered_terminal_deadlines = match tree_runtime
+        .resume_recovered_decisions(session_id, &root_recovery)
+        .await
+    {
+        Ok(settlements) => settlements,
+        Err(error) => {
+            tracing::error!(%error, %session_id, "resuming recovered agent-tree decisions failed before root activation");
+            if let Some(gate) = root_activation_gate.as_ref() {
+                gate.abort();
+            }
+            driver_handle.abort();
+            return;
+        }
+    };
+    // A recovery deadline winner has the same real QuestionTool ownership as
+    // a live timer.  Deliver it immediately through the shared boundary,
+    // rather than discovering the resulting `executing` row in a second scan
+    // and risking a duplicate parked replay.  The decision CAS supplied by
+    // `resume_recovered_decisions` makes each id a once-only delivery source.
+    for settlement in recovered_terminal_deadlines {
+        if settlement.terminal_state
+            != crate::db::agent_tree_decisions::DecisionState::TimedOut
+        {
+            continue;
+        }
+        deliver_terminal_agent_tree_interrupt(
+            &session,
+            &event_tx,
+            &redaction,
+            &interrupts,
+            session_id,
+            settlement.decision_request_id,
+            driver_control_tx.clone(),
+            tree_resolver_registry.clone(),
+            replay_completion_tx.clone(),
+        )
+        .await;
+    }
+    // Finish recovering terminal AgentTree claims only after the fresh driver
+    // exists. The response came from the immutable decision receipt and the
+    // `executing` state is its exact-once claim, so this is a redelivery of
+    // the original QuestionTool continuation rather than a new turn. Use the
+    // same one terminal boundary as live answers, resolver results, and
+    // deadlines; a recovery must not have a second replay implementation.
+    for row in terminal_tree_interrupt_replays {
+        let decision_request_id = match session
+            .db
+            .decision_request_for_interrupt(session_id, row.interrupt_id)
+            .await
+        {
+            Ok(Some(decision)) => decision.decision_request_id,
+            Ok(None) => {
+                tracing::warn!(
+                    interrupt_id = %row.interrupt_id,
+                    "terminal AgentTree replay has no linked durable decision; retaining exact claim for repair"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    interrupt_id = %row.interrupt_id,
+                    "loading recovered terminal AgentTree decision failed"
+                );
+                continue;
+            }
+        };
+        deliver_terminal_agent_tree_interrupt(
+            &session,
+            &event_tx,
+            &redaction,
+            &interrupts,
+            session_id,
+            decision_request_id,
+            driver_control_tx.clone(),
+            tree_resolver_registry.clone(),
+            replay_completion_tx.clone(),
+        )
+        .await;
+    }
+    // Every exact endpoint now has its pending steer/resume command, pending
+    // decision/deadline registration, and durable replay schedule before a
+    // reattached executor may consume persisted pre-crash or newly queued
+    // input. Accepted continuation ids therefore reach their owner before
+    // any provider handoff, not after gate release.
+    for gate in deferred_recovery_activation_gates {
+        gate.release();
+    }
+    if let Some(gate) = root_activation_gate.as_ref() {
+        gate.release();
+    }
     let mut driver_failed = false;
     let mut driver_joined = false;
     // Whether every registered interrupt's shutdown park committed durably.
@@ -2021,12 +6340,47 @@ pub(super) async fn run_worker(
     // performed the required first sweep, so consume that instant rather than
     // adding a redundant write before the work loop begins.
     text_artifact_reservation_reaper.tick().await;
+    let mut agent_tree_event_relay = tokio::time::interval(std::time::Duration::from_millis(50));
+    agent_tree_event_relay.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut agent_tree_deadline_reaper = tokio::time::interval(std::time::Duration::from_millis(100));
+    agent_tree_deadline_reaper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut host_capability_refresh_reaper =
+        tokio::time::interval(HOST_CAPABILITY_REFRESH_REAPER_INTERVAL);
+    host_capability_refresh_reaper.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first agent-tree tick is immediate; it deliberately relays the root
+    // creation and recovery transitions committed just above. Startup already
+    // reconciled stale host refreshes, so consume that reaper's immediate tick
+    // before the live loop.
+    host_capability_refresh_reaper.tick().await;
     let stop = loop {
         let input = tokio::select! {
-            biased;
+            // Tokio's default randomized selection prevents a permanently
+            // ready work mailbox from being structurally preferred over the
+            // periodic maintenance arms. Each maintenance arm performs a
+            // bounded slice and its interval uses `Skip`, so no arm can turn
+            // a delayed tick into an unbounded catch-up burst or monopolize
+            // the worker after overload.
+            _ = agent_tree_deadline_reaper.tick() => {
+                WorkerInput::ExpireAgentTreeDeadlines
+            }
+            _ = host_capability_refresh_reaper.tick() => {
+                WorkerInput::ReapStaleHostCapabilityRefreshes
+            }
+            _ = text_artifact_reservation_reaper.tick() => {
+                WorkerInput::ReapExpiredTextArtifactReservations
+            }
+            _ = agent_tree_event_relay.tick() => {
+                WorkerInput::RelayAgentTreeEvents
+            }
             replay = replay_completion_rx.recv() => {
                 match replay {
                     Some(replay) => WorkerInput::ParkedReplay(replay),
+                    None => continue,
+                }
+            }
+            resolver = agent_tree_resolver_rx.recv() => {
+                match resolver {
+                    Some(resolver) => WorkerInput::AgentTreeResolver(resolver),
                     None => continue,
                 }
             }
@@ -2035,9 +6389,6 @@ pub(super) async fn run_worker(
                     Some(work) => WorkerInput::Work(Box::new(work)),
                     None => break WorkerStop::WorkerStopped,
                 }
-            }
-            _ = text_artifact_reservation_reaper.tick() => {
-                WorkerInput::ReapExpiredTextArtifactReservations
             }
             outcome = &mut driver_handle => {
                 driver_joined = true;
@@ -2057,6 +6408,135 @@ pub(super) async fn run_worker(
             }
         };
         match input {
+            WorkerInput::RelayAgentTreeEvents => {
+                // Tool-originated QuestionTool/approval rows are committed by
+                // the live driver, not by this work-loop arm.  Reconcile them
+                // here so every new eligible request receives real timer
+                // registration and an immediate resolver delivery attempt;
+                // waiting/resolving rows are never restarted as fresh roots.
+                match tree_runtime
+                    .reconcile_pending_requests_limited(
+                        session_id,
+                        AGENT_TREE_MAINTENANCE_ITEMS_PER_TURN,
+                    )
+                    .await
+                {
+                    Ok(terminal_deadlines) => {
+                        for settlement in terminal_deadlines {
+                            if settlement.terminal_state
+                                != crate::db::agent_tree_decisions::DecisionState::TimedOut
+                            {
+                                continue;
+                            }
+                            // Reconciliation can win a deadline for a live
+                            // tool-created request.  Persistence alone is not
+                            // enough: this sends the terminal projection to
+                            // the exact live waiter or starts the one parked
+                            // replay, with the durable CAS as the once-only
+                            // delivery fence.
+                            deliver_terminal_agent_tree_interrupt(
+                                &session,
+                                &event_tx,
+                                &redaction,
+                                &interrupts,
+                                session_id,
+                                settlement.decision_request_id,
+                                driver_control_tx.clone(),
+                                tree_resolver_registry.clone(),
+                                replay_completion_tx.clone(),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, %session_id, "reconciling live agent-tree decisions failed");
+                    }
+                }
+                relay_agent_tree_events(
+                    &session,
+                    &event_tx,
+                    &redaction,
+                    session_id,
+                    &mut agent_tree_event_seq,
+                    &tree_resolver_registry,
+                )
+                .await;
+            }
+            WorkerInput::ExpireAgentTreeDeadlines => {
+                for (deadline_session_id, decision_request_id) in
+                    tree_deadlines.due_limited(
+                        crate::agent_tree::system_now_unix_ms(),
+                        AGENT_TREE_MAINTENANCE_ITEMS_PER_TURN,
+                    )
+                {
+                    if deadline_session_id != session_id {
+                        continue;
+                    }
+                    match tree_runtime
+                        .expire_deadline(deadline_session_id, decision_request_id)
+                        .await
+                    {
+                        Ok(crate::agent_tree::DecisionSettlement::Resolved(
+                            crate::db::agent_tree_decisions::DecisionState::TimedOut,
+                        )) => {
+                            // A timer is not a substitute for the original
+                            // continuation boundary. The durable CAS is the
+                            // once-only winner; this shared helper then wakes
+                            // the live QuestionTool/approval waiter or starts
+                            // the exact parked replay, including the typed
+                            // host-refresh special case.
+                            deliver_terminal_agent_tree_interrupt(
+                                &session,
+                                &event_tx,
+                                &redaction,
+                                &interrupts,
+                                session_id,
+                                decision_request_id,
+                                driver_control_tx.clone(),
+                                tree_resolver_registry.clone(),
+                                replay_completion_tx.clone(),
+                            )
+                            .await;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, %decision_request_id, "expiring agent-tree deadline failed");
+                        }
+                    }
+                }
+            }
+            WorkerInput::ReapStaleHostCapabilityRefreshes => {
+                let now = crate::agent_tree::system_now_unix_ms();
+                match session
+                    .db
+                    .reap_stale_host_capability_refresh_operations_globally(
+                        crate::agent_tree::daemon_host_capability_refresh_authority(),
+                        now,
+                    )
+                    .await
+                {
+                    Ok(reaped) if reaped > 0 => {
+                        tracing::warn!(%session_id, reaped, "reaped stale global host capability refresh execution leases");
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, %session_id, "reaping stale host capability refresh executions failed"),
+                }
+                // This also drains the completed publication outbox, including
+                // the narrow crash window after completion CAS and before the
+                // in-memory store swap.
+                spawn_ready_host_capability_refresh_operations(
+                    &session,
+                    config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .host_capability_refresh_runtime
+                        .clone(),
+                    &global_bus,
+                    &redaction,
+                    &tree_resolver_registry,
+                )
+                .await;
+            }
             WorkerInput::ReapExpiredTextArtifactReservations => {
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 if let Err(error) = session
@@ -2072,7 +6552,8 @@ pub(super) async fn run_worker(
                 }
             }
             WorkerInput::ParkedReplay(completion) => {
-                finish_parked_replay_completion(
+                let interrupt_id = completion.interrupt_id;
+                let replay_acknowledged = finish_parked_replay_completion(
                     &session,
                     &event_tx,
                     &redaction,
@@ -2081,6 +6562,140 @@ pub(super) async fn run_worker(
                     completion,
                 )
                 .await;
+                // A post-auto user steer is dependency-gated by the exact
+                // parked replay. Only the durable `executing -> resolved`
+                // acknowledgement above releases it; schedule now rather
+                // than relying on a future unrelated worker input/restart.
+                if replay_acknowledged {
+                    match session
+                        .db
+                        .decision_request_for_interrupt(session_id, interrupt_id)
+                        .await
+                    {
+                        Ok(Some(decision))
+                            if decision.state
+                                == crate::db::agent_tree_decisions::DecisionState::AutoResolved =>
+                        {
+                            if let Err(error) = deliver_live_agent_tree_late_user_steers(
+                                &session,
+                                session_id,
+                                decision.agent_instance_id,
+                                &tree_resolver_registry,
+                                None,
+                            )
+                            .await
+                            {
+                                tracing::warn!(%error, %interrupt_id, "scheduling post-auto late steer after replay acknowledgement failed");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(%error, %interrupt_id, "loading decision after parked replay acknowledgement failed"),
+                    }
+                }
+            }
+            WorkerInput::AgentTreeResolver(completion) => {
+                let AgentTreeResolverCompletion {
+                    session_id: completion_session_id,
+                    decision_request_id,
+                    route,
+                    result,
+                } = completion;
+                let settlement = match result {
+                    Ok(answer) => tree_runtime
+                        .accept_resolver_result(
+                            completion_session_id,
+                            decision_request_id,
+                            route,
+                            answer,
+                        )
+                        .await,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            %decision_request_id,
+                            "agent-tree resolver execution failed; releasing durable claim"
+                        );
+                        match tree_runtime
+                            .abandon_resolver_delivery(completion_session_id, decision_request_id)
+                            .await
+                        {
+                            Ok(_) if route == crate::agent_tree::DecisionResolverRoute::WarmParent => {
+                                if let Err(retry_error) = tree_runtime
+                                    .retry_after_warm_parent_delivery_failure(
+                                        completion_session_id,
+                                        decision_request_id,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        %retry_error,
+                                        %decision_request_id,
+                                        "agent-tree utility fallback after warm-parent failure could not start"
+                                    );
+                                }
+                                continue;
+                            }
+                            Ok(_) => continue,
+                            Err(release_error) => Err(release_error),
+                        }
+                    }
+                };
+                match settlement {
+                    Ok(crate::agent_tree::DecisionSettlement::Resolved(
+                        crate::db::agent_tree_decisions::DecisionState::AutoResolved,
+                    )) => {
+                        spawn_ready_host_capability_refresh_operations(
+                            &session,
+                            config_snapshot
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .host_capability_refresh_runtime
+                                .clone(),
+                            &global_bus,
+                            &redaction,
+                            &tree_resolver_registry,
+                        )
+                        .await;
+                        // The automatic result won the durable terminal CAS.
+                        // If this is a real QuestionTool row, wake or replay
+                        // its original continuation from the projected raw
+                        // response rather than treating AgentTree as a
+                        // parallel queue.
+                        deliver_terminal_agent_tree_interrupt(
+                            &session,
+                            &event_tx,
+                            &redaction,
+                            &interrupts,
+                            session_id,
+                            decision_request_id,
+                            driver_control_tx.clone(),
+                            tree_resolver_registry.clone(),
+                            replay_completion_tx.clone(),
+                        )
+                        .await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        // A stale completion is harmless: recovery or another
+                        // terminal path won its CAS. Try a guarded release
+                        // only when the result itself could not be committed.
+                        tracing::warn!(
+                            %error,
+                            %decision_request_id,
+                            "settling agent-tree resolver delivery failed"
+                        );
+                        if let Err(release_error) = tree_runtime
+                            .abandon_resolver_delivery(completion_session_id, decision_request_id)
+                            .await
+                        {
+                            tracing::warn!(
+                                %release_error,
+                                %decision_request_id,
+                                "releasing failed agent-tree resolver claim failed"
+                            );
+                        }
+                    }
+                }
             }
             WorkerInput::Work(work) => match *work {
                 SessionWork::WakeGoal => {
@@ -3245,10 +7860,382 @@ pub(super) async fn run_worker(
                     }
                     cancel_handle.cancel();
                 }
+                SessionWork::ResolveAgentDecision {
+                    decision_request_id,
+                    answer,
+                    respond_to,
+                } => {
+                    let outcome = async {
+                        let linked_interrupt = session
+                            .db
+                            .interrupt_for_decision_request(session_id, decision_request_id)
+                            .await?;
+                        let linked_response = match (&linked_interrupt, &answer) {
+                            (Some(_), crate::agent_tree::DecisionAnswer::InterruptResponse { response }) => {
+                                Some(response.clone())
+                            }
+                            (Some(_), _) => {
+                                anyhow::bail!(
+                                    "linked QuestionTool decision {decision_request_id} requires an interrupt response envelope"
+                                );
+                            }
+                            (None, _) => None,
+                        };
+                        let decision_before = session
+                            .db
+                            .decision_request(session_id, decision_request_id)
+                            .await?
+                            .context("agent decision disappeared before settlement")?;
+                        anyhow::ensure!(
+                            decision_before.decision_class != "host_approval",
+                            "host approval decisions can only be resolved through their real host-owned interrupt"
+                        );
+                        let settlement = tree_runtime
+                            .resolve_user_answer(session_id, decision_request_id, answer)
+                            .await?;
+                        if matches!(
+                            settlement,
+                            crate::agent_tree::DecisionSettlement::Resolved(_)
+                        ) {
+                            spawn_ready_host_capability_refresh_operations(
+                                &session,
+                                config_snapshot
+                                    .read()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .host_capability_refresh_runtime
+                                    .clone(),
+                                &global_bus,
+                                &redaction,
+                                &tree_resolver_registry,
+                            )
+                            .await;
+                        }
+                        if matches!(
+                            settlement,
+                            crate::agent_tree::DecisionSettlement::Resolved(_)
+                        ) && linked_interrupt.is_some()
+                        {
+                            // The linked row is the legacy continuation owner.
+                            // It has already been terminalized by the same
+                            // decision CAS, so this helper only wakes/replays
+                            // that exact row and never manufactures a second
+                            // continuation.
+                            deliver_terminal_agent_tree_interrupt(
+                                &session,
+                                &event_tx,
+                                &redaction,
+                                &interrupts,
+                                session_id,
+                                decision_request_id,
+                                driver_control_tx.clone(),
+                                tree_resolver_registry.clone(),
+                                replay_completion_tx.clone(),
+                            )
+                            .await;
+                            // Keep the response owned by the typed answer in
+                            // scope: this makes a future refactor unable to
+                            // accidentally reserialize an unvalidated legacy
+                            // answer for the same continuation.
+                            let _ = linked_response;
+                        }
+                        if let crate::agent_tree::DecisionSettlement::Steered {
+                            target_agent_instance_id,
+                        } = &settlement
+                        {
+                            deliver_live_agent_tree_late_user_steers(
+                                &session,
+                                session_id,
+                                *target_agent_instance_id,
+                                &tree_resolver_registry,
+                                None,
+                            )
+                            .await?;
+                        }
+                        Ok::<crate::agent_tree::DecisionSettlement, anyhow::Error>(settlement)
+                    }
+                    .await;
+                    let _ = respond_to.send(outcome.map_err(|error| error.to_string()));
+                }
+                SessionWork::AuthorizeHostCapabilitiesRefresh { respond_to } => {
+                    // This is deliberately spawned rather than awaited in the
+                    // worker select loop. A manual AgentTree decision must
+                    // leave the worker free to accept the matching
+                    // `ResolveInterrupt` request, and an automatic resolver
+                    // likewise needs this loop to receive its completion.
+                    let refresh_session = session.clone();
+                    let refresh_interrupts = interrupts.clone();
+                    let refresh_agent_name = root_agent_name.clone();
+                    let refresh_parent_agent_instance_id = tree_root.agent_instance_id;
+                    let refresh_parent_profile_snapshot_id = tree_root.resolved_profile_snapshot_id;
+                    let refresh_runtime = config_snapshot
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .host_capability_refresh_runtime
+                        .clone();
+                    let refresh_global_bus = global_bus.clone();
+                    let refresh_redaction = redaction.clone();
+                    let refresh_tree_resolver_registry = tree_resolver_registry.clone();
+                    tokio::spawn(async move {
+                        let Some(refresh_runtime) = refresh_runtime else {
+                            let _ = respond_to.send(Err(
+                                HostCapabilitiesRefreshError::Internal(
+                                    "host capability refresh runtime is unavailable in this worker"
+                                        .to_string(),
+                                ),
+                            ));
+                            return;
+                        };
+                        let refresh_operation = crate::agent_tree::HostCapabilitiesRefreshOperation::for_dedicated_child();
+                        // A refresh is a daemon-owned operation child, not a
+                        // second root decision. The foreground root remains
+                        // runnable while this child waits, and the child
+                        // inherits the root's exact profile/workspace lineage
+                        // through the DB transaction.
+                        let refresh_child = match refresh_session
+                            .db
+                            .create_host_capability_refresh_initialization(
+                                crate::db::agent_tree_decisions::NewAgentInstance {
+                                    session_id: refresh_session.id,
+                                    parent_agent_instance_id: Some(
+                                        refresh_parent_agent_instance_id,
+                                    ),
+                                    task_delegation_job_id: None,
+                                    task_delegation_child_uuid: None,
+                                    resolved_profile_snapshot_id: refresh_parent_profile_snapshot_id,
+                                    workspace_ref: None,
+                                    auto_answer_enabled: false,
+                                },
+                                refresh_operation.operation_id,
+                                refresh_operation.request_id,
+                                crate::agent_tree::daemon_host_capability_refresh_authority(),
+                                crate::agent_tree::system_now_unix_ms(),
+                            )
+                            .await
+                        {
+                            Ok(child) => child,
+                            Err(error) => {
+                                let _ = respond_to.send(Err(
+                                    HostCapabilitiesRefreshError::Internal(format!(
+                                        "creating durable host capability refresh initialization failed: {error}"
+                                    )),
+                                ));
+                                return;
+                            }
+                        };
+                        let refresh_agent_instance_id = match refresh_session
+                            .db
+                            .transition_agent_instance(
+                                refresh_session.id,
+                                refresh_child.agent_instance_id,
+                                refresh_child.revision,
+                                crate::db::agent_tree_decisions::AgentInstanceState::Running,
+                                "{}",
+                                crate::agent_tree::system_now_unix_ms(),
+                            )
+                            .await
+                        {
+                            Ok(crate::db::agent_tree_decisions::AgentTransitionOutcome::Transitioned(
+                                child,
+                            )) => child.agent_instance_id,
+                            Ok(_) | Err(_) => {
+                                abort_unbound_host_capability_refresh_initialization(
+                                    &refresh_session,
+                                    refresh_operation,
+                                    refresh_child.agent_instance_id,
+                                    "starting the dedicated host capability refresh child",
+                                )
+                                .await;
+                                let _ = respond_to.send(Err(
+                                    HostCapabilitiesRefreshError::Internal(
+                                        "starting durable host capability refresh child failed"
+                                            .to_string(),
+                                    ),
+                                ));
+                                return;
+                            }
+                        };
+                        if let Some(snapshot_id) = refresh_parent_profile_snapshot_id
+                            && let Err(error) = refresh_session
+                                .db
+                                .set_agent_auto_answer_from_resolved_profile(
+                                    refresh_session.id,
+                                    refresh_agent_instance_id,
+                                    snapshot_id,
+                                    crate::agent_tree::system_now_unix_ms(),
+                                )
+                                .await
+                        {
+                            abort_unbound_host_capability_refresh_initialization(
+                                &refresh_session,
+                                refresh_operation,
+                                refresh_agent_instance_id,
+                                "applying the dedicated host capability refresh child profile",
+                            )
+                            .await;
+                            let _ = respond_to.send(Err(
+                                HostCapabilitiesRefreshError::Internal(format!(
+                                    "applying host capability refresh child profile failed: {error}"
+                                )),
+                            ));
+                            return;
+                        }
+                        let endpoint_generation = refresh_tree_resolver_registry
+                            .attach_host_operation_endpoint(
+                            refresh_session.id,
+                            refresh_agent_instance_id,
+                        );
+                        let _refresh_endpoint = HostOperationEndpointGuard {
+                            registry: refresh_tree_resolver_registry.clone(),
+                            session_id: refresh_session.id,
+                            agent_instance_id: refresh_agent_instance_id,
+                            endpoint_generation,
+                        };
+                        let Some(_dispatch_guard) = HostCapabilityRefreshDispatchGuard::claim(
+                            &refresh_runtime,
+                            refresh_operation.operation_id,
+                        ) else {
+                            // A UUID collision is already cryptographically
+                            // negligible, but a duplicate durable operation
+                            // must still be fail-closed rather than adding a
+                            // second dispatcher while the first owns it.
+                            abort_unbound_host_capability_refresh_initialization(
+                                &refresh_session,
+                                refresh_operation,
+                                refresh_agent_instance_id,
+                                "claiming the dedicated host capability refresh dispatcher",
+                            )
+                            .await;
+                            let _ = respond_to.send(Err(
+                                HostCapabilitiesRefreshError::Internal(
+                                    "host capability refresh operation is already being dispatched"
+                                        .to_string(),
+                                ),
+                            ));
+                            return;
+                        };
+                        let questions = crate::daemon::proto::InterruptQuestionSet {
+                            questions: vec![crate::daemon::proto::InterruptQuestion::Single {
+                                prompt: "Refresh this daemon's locally probed host-capability snapshot?".to_string(),
+                                options: vec![
+                                    crate::daemon::proto::InterruptOption {
+                                        id: "refresh".to_string(),
+                                        label: "Refresh local capabilities".to_string(),
+                                        description: Some(
+                                            "Re-probe daemon-local capability metadata; no command, credential, external request, or workspace mutation is performed."
+                                                .to_string(),
+                                        ),
+                                        secondary: false,
+                                    },
+                                    crate::daemon::proto::InterruptOption {
+                                        id: "cancel".to_string(),
+                                        label: "Not now".to_string(),
+                                        description: Some("Leave the current capability snapshot unchanged.".to_string()),
+                                        secondary: true,
+                                    },
+                                ],
+                                allow_freetext: false,
+                                command_detail: None,
+                                permission: false,
+                                approval_class: None,
+                                sandbox_escalation: None,
+                            }],
+                        };
+                        let outcome = crate::engine::interrupt::raise_and_wait_with_agent_tree(
+                            &refresh_session.db,
+                            &refresh_interrupts,
+                            refresh_session.id,
+                            &refresh_agent_name,
+                            Some(refresh_agent_instance_id),
+                            "Host capability refresh is awaiting its durable AgentTree decision",
+                            questions,
+                            crate::agent_tree::HostDecisionSubject::HostCapabilitiesRefresh {
+                                operation: refresh_operation,
+                            },
+                            "host capability refresh decision",
+                        )
+                        .await;
+                        if matches!(&outcome, crate::engine::interrupt::InterruptOutcome::Parked) {
+                            // Shutdown/restart parked the real durable
+                            // QuestionTool continuation. Leave this child
+                            // nonterminal so the next worker reattaches the
+                            // exact operation owner rather than cancelling a
+                            // refresh the user never declined.
+                            return;
+                        }
+                        let allowed = matches!(
+                            outcome,
+                            crate::engine::interrupt::InterruptOutcome::Resolved(
+                                crate::daemon::proto::ResolveResponse::Single { selected_id }
+                            ) if selected_id == "refresh"
+                        );
+                        if !allowed {
+                            let terminalized = finalize_terminal_host_capability_refresh_operation(
+                                &refresh_session,
+                                refresh_operation.operation_id,
+                                &refresh_tree_resolver_registry,
+                            )
+                            .await;
+                            if !terminalized {
+                                tracing::warn!(
+                                    operation_id = %refresh_operation.operation_id,
+                                    "declined host capability refresh did not reach a durable terminal state before its direct waiter returned"
+                                );
+                            }
+                            let _ = respond_to.send(Err(
+                                HostCapabilitiesRefreshError::Declined,
+                            ));
+                            return;
+                        }
+                        let completion = execute_host_capability_refresh_operation(
+                            &refresh_session,
+                            refresh_operation.operation_id,
+                            &refresh_runtime,
+                            &refresh_global_bus,
+                            &refresh_redaction,
+                        )
+                        .await;
+                        let terminalized = finalize_terminal_host_capability_refresh_operation(
+                            &refresh_session,
+                            refresh_operation.operation_id,
+                            &refresh_tree_resolver_registry,
+                        )
+                        .await;
+                        if !terminalized {
+                            tracing::debug!(
+                                operation_id = %refresh_operation.operation_id,
+                                "host capability refresh direct waiter returned while durable operation remains retryable"
+                            );
+                        }
+                        let _ = respond_to.send(completion.map_err(HostCapabilitiesRefreshError::Internal));
+                    });
+                }
                 SessionWork::ResolveInterrupt {
                     interrupt_id,
                     response,
                 } => {
+                    // A QuestionTool interrupt is both the legacy continuation
+                    // rendezvous and an AgentTree decision.  Settle the latter
+                    // first; only a successful/idempotent terminal receipt may
+                    // wake or replay the original parked tool continuation.
+                    // This makes duplicate client submits race on the durable
+                    // decision CAS instead of on a process-local oneshot.
+                    let tree_decision = match session
+                        .db
+                        .decision_request_for_interrupt(session_id, interrupt_id)
+                        .await
+                    {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            tracing::warn!(%error, %interrupt_id, "loading interrupt lifecycle decision failed");
+                            interrupts.emit_queue_state().await;
+                            continue;
+                        }
+                    };
+                    // Snapshot the real interrupt continuation before its
+                    // linked decision changes the owned Attention projection.
+                    // A parked row carries the only replay payload for the
+                    // original tool call, so rereading after settlement would
+                    // silently lose the exact continuation hand-off.
                     let row = session.db.get_interrupt(interrupt_id).await.ok().flatten();
                     let was_active = session
                         .db
@@ -3260,18 +8247,219 @@ pub(super) async fn run_worker(
                     let decision = row.as_ref().map(|row| {
                         crate::db::needs_attention::summarize_interrupt_decision(row, &response)
                     });
+                    let mut tree_settlement_won = false;
+                    if let Some(tree_decision) = tree_decision.as_ref() {
+                        let envelope = match serde_json::to_string(&response) {
+                            Ok(envelope) => envelope,
+                            Err(error) => {
+                                tracing::warn!(%error, %interrupt_id, "serializing interrupt lifecycle answer failed");
+                                interrupts.emit_queue_state().await;
+                                continue;
+                            }
+                        };
+                        let settlement = if tree_decision.decision_class == "host_approval" {
+                            // This is the actual daemon host-composition
+                            // boundary: only the worker that owns the real
+                            // interrupt continuation holds this capability.
+                            // The DB transaction simultaneously settles the
+                            // bound final operation and decision receipt.
+                            let offered = row.as_ref().and_then(|row| {
+                                row.questions.clone().or_else(|| {
+                                    row.question.clone().map(|question| {
+                                        crate::daemon::proto::InterruptQuestionSet {
+                                            questions: vec![question],
+                                        }
+                                    })
+                                })
+                            });
+                            if offered.as_ref().is_some_and(|offered| {
+                                crate::approval::host_approval_response_allows(&response, offered)
+                            }) {
+                                let authority = match row.as_ref().map(|row| {
+                                    crate::agent_tree::HostApprovalAuthority::for_durable_interrupt_binding(
+                                        session_id,
+                                        tree_decision,
+                                        row,
+                                    )
+                                }) {
+                                    Some(Ok(authority)) => authority,
+                                    Some(Err(error)) => {
+                                        tracing::warn!(
+                                            %error,
+                                            %interrupt_id,
+                                            decision_request_id = %tree_decision.decision_request_id,
+                                            "rejecting host approval settlement without a trusted runtime binding"
+                                        );
+                                        interrupts.emit_queue_state().await;
+                                        continue;
+                                    }
+                                    None => {
+                                        tracing::warn!(
+                                            %interrupt_id,
+                                            decision_request_id = %tree_decision.decision_request_id,
+                                            "rejecting host approval settlement without its real interrupt row"
+                                        );
+                                        interrupts.emit_queue_state().await;
+                                        continue;
+                                    }
+                                };
+                                tree_runtime
+                                    .resolve_host_approval(
+                                        session_id,
+                                        tree_decision.decision_request_id,
+                                        interrupt_id,
+                                        &envelope,
+                                        authority,
+                                    )
+                                    .await
+                            } else {
+                                tree_runtime
+                                    .cancel_host_approval(
+                                        session_id,
+                                        tree_decision.decision_request_id,
+                                        interrupt_id,
+                                        &envelope,
+                                    )
+                                    .await
+                            }
+                        } else {
+                            tree_runtime
+                                .resolve_user_answer(
+                                    session_id,
+                                    tree_decision.decision_request_id,
+                                    crate::agent_tree::DecisionAnswer::InterruptResponse {
+                                        response: response.clone(),
+                                    },
+                                )
+                                .await
+                        };
+                        match settlement {
+                            Ok(crate::agent_tree::DecisionSettlement::Resolved(_)) => {
+                                tree_settlement_won = true;
+                            }
+                            Ok(crate::agent_tree::DecisionSettlement::Steered {
+                                target_agent_instance_id,
+                            }) => {
+                                // The original QuestionTool continuation has
+                                // already consumed the automatic terminal
+                                // result. A later human reply is a durable
+                                // steer to that same owner, never another
+                                // interrupt wakeup or parked replay.
+                                if let Err(error) = deliver_live_agent_tree_late_user_steers(
+                                        &session,
+                                        session_id,
+                                        target_agent_instance_id,
+                                        &tree_resolver_registry,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        %error,
+                                        decision_request_id = %tree_decision.decision_request_id,
+                                        "delivering late root interrupt steer failed"
+                                    );
+                                }
+                                interrupts.emit_queue_state().await;
+                                continue;
+                            }
+                            Ok(crate::agent_tree::DecisionSettlement::AlreadyTerminal(_)
+                                | crate::agent_tree::DecisionSettlement::Retry) => {
+                                // A terminal CAS loser cannot wake the same
+                                // continuation a second time. The durable
+                                // receipt/recovery path remains authoritative.
+                                interrupts.emit_queue_state().await;
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, %interrupt_id, decision_request_id = %tree_decision.decision_request_id, "settling QuestionTool lifecycle decision failed");
+                                interrupts.emit_queue_state().await;
+                                continue;
+                            }
+                        }
+                    }
+                    if tree_settlement_won {
+                        spawn_ready_host_capability_refresh_operations(
+                            &session,
+                            config_snapshot
+                                .read()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .host_capability_refresh_runtime
+                                .clone(),
+                            &global_bus,
+                            &redaction,
+                            &tree_resolver_registry,
+                        )
+                        .await;
+                        // The winning tree settlement has already projected
+                        // the real interrupt to its terminal state.  Do not
+                        // fall through to the legacy `resolve_interrupt`
+                        // write: it correctly rejects that now-terminal row,
+                        // but would leave a live QuestionTool/approval waiter
+                        // asleep.  The shared delivery boundary wakes that
+                        // exact waiter or replays its owned parked payload.
+                        deliver_terminal_agent_tree_interrupt(
+                            &session,
+                            &event_tx,
+                            &redaction,
+                            &interrupts,
+                            session_id,
+                            tree_decision
+                                .as_ref()
+                                .expect("winning tree settlement has its loaded decision")
+                                .decision_request_id,
+                            driver_control_tx.clone(),
+                            tree_resolver_registry.clone(),
+                            replay_completion_tx.clone(),
+                        )
+                        .await;
+                        continue;
+                    }
+                    // A parked host-capability refresh has no model/driver
+                    // continuation to replay. Its durable operation owns the
+                    // exact allow/cancel result; let that typed dispatcher
+                    // execute or directly acknowledge the executing Attention
+                    // claim rather than falling through to `ReplayParkedInterrupt`.
+                    if row.as_ref().is_some_and(|row| {
+                        row.state == crate::db::needs_attention::InterruptState::Parked
+                    }) && handle_terminal_host_capability_refresh_interrupt(
+                        &session,
+                        session_id,
+                        interrupt_id,
+                        &tree_resolver_registry,
+                    )
+                    .await
+                    {
+                        // A parked row normally has no live waiter after a
+                        // restart, but resolving the hub is still the exact
+                        // typed wakeup if a local park raced the response.
+                        // It cannot create a driver replay because this branch
+                        // returns before the generic parked path.
+                        interrupts.resolve(interrupt_id, response.clone());
+                        interrupts.emit_queue_state().await;
+                        continue;
+                    }
                     if let Some(row) = row.as_ref()
                         && row.state == crate::db::needs_attention::InterruptState::Parked
                     {
-                        let claimed = match session
-                            .db
-                            .begin_parked_interrupt_execution(interrupt_id, &response)
-                            .await
-                        {
-                            Ok(claimed) => claimed,
-                            Err(error) => {
-                                tracing::warn!(%error, %interrupt_id, "claiming parked interrupt failed");
-                                false
+                        // Linked decisions atomically transition the parked
+                        // real interrupt to `executing` only for the terminal
+                        // CAS winner. Legacy rows retain their existing claim
+                        // boundary. Either way, only the claimant may replay
+                        // the original continuation.
+                        let claimed = if tree_decision.is_some() {
+                            tree_settlement_won
+                        } else {
+                            match session
+                                .db
+                                .begin_parked_interrupt_execution(interrupt_id, &response)
+                                .await
+                            {
+                                Ok(claimed) => claimed,
+                                Err(error) => {
+                                    tracing::warn!(%error, %interrupt_id, "claiming parked interrupt failed");
+                                    false
+                                }
                             }
                         };
                         if !claimed {
@@ -3346,45 +8534,25 @@ pub(super) async fn run_worker(
                             }
                         };
                         let question = crate::engine::interrupt::PreResolvedInterruptQuestion {
+                            agent_instance_id: row.agent_instance_id,
                             agent: row.agent_id.clone(),
                             description: row.description.clone(),
                             questions,
                             occurrence,
                         };
-                        let driver_control_tx = driver_control_tx.clone();
-                        let replay_completion_tx = replay_completion_tx.clone();
-                        let replay_response = response.clone();
-                        tokio::spawn(async move {
-                            let (respond_to, replay_result_rx) = tokio::sync::oneshot::channel();
-                            let result = if driver_control_tx
-                                .send(
-                                    crate::engine::driver::DriverControl::ReplayParkedInterrupt {
-                                        interrupt_id,
-                                        payload: Box::new(payload),
-                                        response: replay_response,
-                                        question: Box::new(question),
-                                        respond_to,
-                                    },
-                                )
-                                .await
-                                .is_ok()
-                            {
-                                replay_result_rx.await.unwrap_or_else(|error| {
-                                    Err(format!("driver replay response dropped: {error}"))
-                                })
-                            } else {
-                                Err("driver is not available for parked interrupt replay"
-                                    .to_string())
-                            };
-                            let _ = replay_completion_tx
-                                .send(ParkedReplayCompletion {
-                                    interrupt_id,
-                                    decision,
-                                    was_active,
-                                    result,
-                                })
-                                .await;
-                        });
+                        spawn_parked_interrupt_replay(
+                            driver_control_tx.clone(),
+                            tree_resolver_registry.clone(),
+                            session_id,
+                            replay_completion_tx.clone(),
+                            interrupt_id,
+                            agent_tree_interrupt_owner(row),
+                            payload,
+                            response.clone(),
+                            question,
+                            decision,
+                            was_active,
+                        );
                         continue;
                     }
                     if let Err(e) = session.db.resolve_interrupt(interrupt_id, &response).await {
@@ -4581,6 +9749,440 @@ mod interrupt_redaction_tests {
     use super::*;
 
     #[test]
+    fn deadline_maintenance_backlog_round_robins_in_bounded_slices() {
+        let deadlines = WorkerAgentTreeDeadlines::default();
+        let session_id = uuid::Uuid::from_u128(1);
+        let ids = [
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+            uuid::Uuid::from_u128(4),
+            uuid::Uuid::from_u128(5),
+        ];
+        for decision_request_id in ids {
+            crate::agent_tree::DecisionDeadlineScheduler::schedule(
+                &deadlines,
+                session_id,
+                decision_request_id,
+                10,
+            );
+        }
+        let expected = ids.map(|decision_request_id| (session_id, decision_request_id));
+
+        assert_eq!(deadlines.due_limited(10, 2), expected[..2].to_vec());
+        assert_eq!(deadlines.due_limited(10, 2), expected[2..4].to_vec());
+        assert_eq!(
+            deadlines.due_limited(10, 2),
+            vec![expected[4], expected[0]],
+            "the cursor wraps only after every due decision receives a turn"
+        );
+    }
+
+    #[test]
+    fn deadline_backlog_scan_takes_only_the_requested_ordered_slice() {
+        let deadlines = WorkerAgentTreeDeadlines::default();
+        let session_id = uuid::Uuid::from_u128(77);
+        // A deliberately large same-deadline backlog exercises the B-tree
+        // range cursor without constructing an all-due temporary vector.
+        for value in 1..=2_048_u128 {
+            crate::agent_tree::DecisionDeadlineScheduler::schedule(
+                &deadlines,
+                session_id,
+                uuid::Uuid::from_u128(value),
+                10,
+            );
+        }
+        let first = deadlines.due_limited(10, 3);
+        let second = deadlines.due_limited(10, 3);
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.len(), 3);
+        assert!(
+            first.iter().all(|(session, _)| *session == session_id)
+                && second.iter().all(|(session, _)| *session == session_id)
+        );
+        assert!(
+            first.iter().all(|entry| !second.contains(entry)),
+            "the cursor advances through a large due backlog before wrapping"
+        );
+    }
+
+    #[test]
+    fn refresh_dispatch_registry_is_shared_by_all_runtimes_for_one_store() {
+        let store = crate::host_capabilities::HostCapabilitySnapshotStore::new();
+        let runtime = HostCapabilityRefreshRuntime {
+            store: store.clone(),
+            probes: crate::host_capabilities::HostCapabilityProbeInputs::for_unit_tests(
+                std::path::PathBuf::from("/workspace"),
+            ),
+            serial_execution: store.refresh_serialization(),
+            in_flight_operations: store.refresh_in_flight_operations(),
+        };
+        let another_runtime = HostCapabilityRefreshRuntime {
+            store: store.clone(),
+            probes: crate::host_capabilities::HostCapabilityProbeInputs::for_unit_tests(
+                std::path::PathBuf::from("/workspace"),
+            ),
+            serial_execution: store.refresh_serialization(),
+            in_flight_operations: store.refresh_in_flight_operations(),
+        };
+        let operation_id = uuid::Uuid::new_v4();
+        let guard = HostCapabilityRefreshDispatchGuard::claim(&runtime, operation_id)
+            .expect("first dispatcher owns the operation");
+        assert!(
+            HostCapabilityRefreshDispatchGuard::claim(&another_runtime, operation_id).is_none(),
+            "a separately built session runtime must observe the same operation owner"
+        );
+        drop(guard);
+        assert!(
+            HostCapabilityRefreshDispatchGuard::claim(&runtime, operation_id).is_some(),
+            "the one-shot guard is released after its direct or scheduled dispatcher exits"
+        );
+    }
+
+    #[test]
+    fn warm_registry_tracks_exact_interactive_and_noninteractive_endpoints() {
+        let registry = WorkerAgentTreeResolverRegistry::default();
+        let session_id = uuid::Uuid::new_v4();
+        let interactive_id = uuid::Uuid::new_v4();
+        let noninteractive_id = uuid::Uuid::new_v4();
+        let (driver_tx, _driver_rx) = tokio::sync::mpsc::channel(1);
+        let (leaf_tx, _leaf_rx) = tokio::sync::mpsc::channel(1);
+
+        let interactive_generation = crate::engine::agent::next_agent_tree_endpoint_generation();
+        let noninteractive_generation =
+            crate::engine::agent::next_agent_tree_endpoint_generation();
+        registry.attach_parent_endpoint(
+            session_id,
+            interactive_id,
+            interactive_generation,
+            driver_tx,
+        );
+        registry.attach_noninteractive_endpoint(
+            session_id,
+            noninteractive_id,
+            noninteractive_generation,
+            leaf_tx,
+        );
+        assert!(matches!(
+            registry.parent_endpoint(session_id, interactive_id),
+            Some(WorkerAgentTreeResolverEndpoint::Driver(_))
+        ));
+        assert!(matches!(
+            registry.parent_endpoint(session_id, noninteractive_id),
+            Some(WorkerAgentTreeResolverEndpoint::Noninteractive(_))
+        ));
+
+        registry.detach_parent_endpoint_if_generation(
+            session_id,
+            interactive_id,
+            interactive_generation,
+        );
+        assert!(registry.parent_endpoint(session_id, interactive_id).is_none());
+        registry.detach_session(session_id);
+        assert!(registry.parent_endpoint(session_id, noninteractive_id).is_none());
+    }
+
+    #[test]
+    fn full_warm_mailbox_is_withdrawn_before_utility_reselection_and_cannot_evict_replacement() {
+        let registry = Arc::new(WorkerAgentTreeResolverRegistry::default());
+        let session_id = uuid::Uuid::new_v4();
+        let parent_agent_instance_id = uuid::Uuid::new_v4();
+        let (full_tx, _full_rx) = tokio::sync::mpsc::channel(1);
+        full_tx
+            .try_send(crate::engine::driver::DriverControl::WakeGoal)
+            .expect("test setup fills the exact warm-parent mailbox");
+        let failed_generation = registry.attach_parent_endpoint(
+            session_id,
+            parent_agent_instance_id,
+            crate::engine::agent::next_agent_tree_endpoint_generation(),
+            full_tx,
+        );
+        let (completion_tx, _completion_rx) = tokio::sync::mpsc::channel(1);
+        let delivery = WorkerAgentTreeResolverDelivery {
+            registry: registry.clone(),
+            completions: completion_tx,
+        };
+        let packet = crate::agent_tree::RedactedDecisionPacket {
+            decision_request_id: uuid::Uuid::new_v4(),
+            agent_instance_id: uuid::Uuid::new_v4(),
+            resolver_profile_snapshot_id: None,
+            resolver_slot: None,
+            parent_agent_instance_id: Some(parent_agent_instance_id),
+            session_id,
+            task_call_id: None,
+            workspace_ref: None,
+            options_contract_json: "{}".to_string(),
+            free_text_contract_json: None,
+            recommendation_json: None,
+            rationale_redaction_class: "low_risk".to_string(),
+            decision_class: crate::agent_tree::DecisionClass::LowRisk,
+            deadline_unix_ms: None,
+        };
+
+        assert!(
+            crate::agent_tree::DecisionResolverDelivery::accept(
+                &delivery,
+                session_id,
+                crate::agent_tree::DecisionResolverRoute::WarmParent,
+                packet,
+            )
+            .is_err(),
+            "a full warm mailbox must synchronously reject so AgentTreeRuntime can reselect utility"
+        );
+        assert!(
+            registry
+                .parent_endpoint(session_id, parent_agent_instance_id)
+                .is_none(),
+            "the rejected mailbox is withdrawn before begin_delivery performs utility fallback"
+        );
+        let directory = WorkerAgentTreeResolverDirectory {
+            registry: registry.clone(),
+        };
+        assert!(
+            !crate::agent_tree::DecisionResolverDirectory::parent_cache_resumable(
+                &directory,
+                session_id,
+                parent_agent_instance_id,
+            ),
+            "the runtime will now select its configured utility resolver; the generic runtime regression covers that second hand-off"
+        );
+
+        let (replacement_tx, _replacement_rx) = tokio::sync::mpsc::channel(1);
+        let replacement_generation = registry.attach_parent_endpoint(
+            session_id,
+            parent_agent_instance_id,
+            crate::engine::agent::next_agent_tree_endpoint_generation(),
+            replacement_tx,
+        );
+        assert_ne!(failed_generation, replacement_generation);
+        assert!(
+            !registry.detach_parent_endpoint_if_generation(
+                session_id,
+                parent_agent_instance_id,
+                failed_generation,
+            ),
+            "an old failure must not erase a recovered replacement endpoint"
+        );
+        assert_eq!(
+            registry
+                .parent_endpoint_registration(session_id, parent_agent_instance_id)
+                .expect("replacement survives old compare-and-remove")
+                .generation,
+            replacement_generation
+        );
+    }
+
+    #[test]
+    fn delayed_endpoint_detach_cannot_evict_a_replacement_incarnation() {
+        let registry = WorkerAgentTreeResolverRegistry::default();
+        let session_id = uuid::Uuid::new_v4();
+        let agent_instance_id = uuid::Uuid::new_v4();
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
+        let old_generation = registry.attach_parent_endpoint(
+            session_id,
+            agent_instance_id,
+            crate::engine::agent::next_agent_tree_endpoint_generation(),
+            old_tx,
+        );
+        let (replacement_tx, _replacement_rx) = tokio::sync::mpsc::channel(1);
+        let replacement_generation = registry.attach_parent_endpoint(
+            session_id,
+            agent_instance_id,
+            crate::engine::agent::next_agent_tree_endpoint_generation(),
+            replacement_tx,
+        );
+
+        // The old frame's forwarded attach can be delayed behind recovery as
+        // well. It must not regress the directory before its delayed detach
+        // arrives.
+        let (delayed_old_tx, _delayed_old_rx) = tokio::sync::mpsc::channel(1);
+        registry.attach_parent_endpoint(
+            session_id,
+            agent_instance_id,
+            old_generation,
+            delayed_old_tx,
+        );
+
+        assert!(
+            !registry.detach_parent_endpoint_if_generation(
+                session_id,
+                agent_instance_id,
+                old_generation,
+            ),
+            "a delayed detached event from the old frame must not remove its replacement"
+        );
+        assert_eq!(
+            registry
+                .parent_endpoint_registration(session_id, agent_instance_id)
+                .expect("replacement endpoint remains live")
+                .generation,
+            replacement_generation,
+        );
+    }
+
+    #[test]
+    fn stale_closed_sender_cleanup_cannot_evict_a_replacement_incarnation() {
+        let registry = WorkerAgentTreeResolverRegistry::default();
+        let session_id = uuid::Uuid::new_v4();
+        let agent_instance_id = uuid::Uuid::new_v4();
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        drop(closed_rx);
+        let observed_closed_tx = closed_tx.clone();
+        let closed_generation = registry.attach_parent_endpoint(
+            session_id,
+            agent_instance_id,
+            crate::engine::agent::next_agent_tree_endpoint_generation(),
+            closed_tx,
+        );
+        let (replacement_tx, _replacement_rx) = tokio::sync::mpsc::channel(1);
+        let replacement_generation = registry.attach_parent_endpoint(
+            session_id,
+            agent_instance_id,
+            crate::engine::agent::next_agent_tree_endpoint_generation(),
+            replacement_tx,
+        );
+
+        assert!(
+            observed_closed_tx
+                .try_send(crate::engine::driver::DriverControl::WakeGoal)
+                .is_err(),
+            "test setup retains the old closed sender selected before replacement"
+        );
+
+        // This is the late-steer path's ordering: it selected a closed sender,
+        // recovery registered a new endpoint, then the stale send failure
+        // reaches cleanup. Compare-and-remove must preserve the newer mailbox.
+        assert!(
+            !registry.detach_parent_endpoint_if_generation(
+                session_id,
+                agent_instance_id,
+                closed_generation,
+            ),
+            "stale closed-sender cleanup must not remove a new exact executor"
+        );
+        assert_eq!(
+            registry
+                .parent_endpoint_registration(session_id, agent_instance_id)
+                .expect("new endpoint remains warm after stale cleanup")
+                .generation,
+            replacement_generation,
+        );
+    }
+
+    #[test]
+    fn stale_host_operation_guard_drop_cannot_evict_a_replacement_incarnation() {
+        let registry = Arc::new(WorkerAgentTreeResolverRegistry::default());
+        let session_id = uuid::Uuid::new_v4();
+        let agent_instance_id = uuid::Uuid::new_v4();
+        let old_generation = registry.attach_host_operation_endpoint(session_id, agent_instance_id);
+        let old_guard = HostOperationEndpointGuard {
+            registry: registry.clone(),
+            session_id,
+            agent_instance_id,
+            endpoint_generation: old_generation,
+        };
+        let replacement_generation =
+            registry.attach_host_operation_endpoint(session_id, agent_instance_id);
+
+        drop(old_guard);
+
+        assert_eq!(
+            registry
+                .parent_endpoint_registration(session_id, agent_instance_id)
+                .expect("stale host-operation Drop must preserve replacement")
+                .generation,
+            replacement_generation,
+        );
+    }
+
+    #[test]
+    fn full_driver_mailbox_rejects_only_a_pending_late_steer_without_waiting() {
+        let (driver_tx, mut driver_rx) = tokio::sync::mpsc::channel(1);
+        driver_tx
+            .try_send(crate::engine::driver::DriverControl::WakeGoal)
+            .expect("test control fills the bounded driver mailbox");
+        let endpoint = WorkerAgentTreeResolverEndpoint::Driver(driver_tx);
+        let (respond_to, _response) = tokio::sync::oneshot::channel();
+
+        let started = std::time::Instant::now();
+        let outcome = try_send_pending_late_user_steer(
+            &endpoint,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            "durable pending steer".to_string(),
+            respond_to,
+        );
+
+        assert_eq!(outcome, Err(false), "full is retryable, not closed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a full driver mailbox must not stall the session-worker relay"
+        );
+        assert!(matches!(
+            driver_rx.try_recv(),
+            Ok(crate::engine::driver::DriverControl::WakeGoal)
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_driver_mailbox_retries_an_accepted_checkpoint_without_redelivery() {
+        let (driver_tx, mut driver_rx) = tokio::sync::mpsc::channel(1);
+        driver_tx
+            .try_send(crate::engine::driver::DriverControl::WakeGoal)
+            .expect("test control fills the bounded driver mailbox");
+        let agent_instance_id = uuid::Uuid::new_v4();
+        let steer_id = uuid::Uuid::new_v4();
+        let continuation_id = uuid::Uuid::new_v4();
+        let recovery_epoch = uuid::Uuid::new_v4();
+        let (respond_to, _response) = tokio::sync::oneshot::channel();
+
+        let retry = tokio::spawn(schedule_accepted_late_steer_recovery_control(
+                driver_tx,
+                crate::engine::driver::DriverControl::ResumeAcceptedLateUserDecisionSteer {
+                    agent_instance_id,
+                    steer_id,
+                    continuation_id,
+                    recovery_epoch,
+                    payload_json: "durable accepted steer".to_string(),
+                    continuation_checkpoint_json: "{}".to_string(),
+                    respond_to,
+                },
+            ));
+        // Let the retry task make its initial `try_send` while the bounded
+        // mailbox is still occupied. Draining first would only prove the
+        // direct-send fast path, not that a full recovery mailbox preserves
+        // this accepted checkpoint for its retry.
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            driver_rx.try_recv(),
+            Ok(crate::engine::driver::DriverControl::WakeGoal)
+        ));
+        assert_eq!(retry.await.expect("retry task joins"), Ok(()));
+        let delivered = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            driver_rx.recv(),
+        )
+        .await
+        .expect("accepted checkpoint retry must not await a full mailbox forever")
+        .expect("driver sender remains open");
+        assert!(matches!(
+            delivered,
+            crate::engine::driver::DriverControl::ResumeAcceptedLateUserDecisionSteer {
+                agent_instance_id: actual_agent,
+                steer_id: actual_steer,
+                continuation_id: actual_continuation,
+                recovery_epoch: actual_epoch,
+                ..
+            } if actual_agent == agent_instance_id
+                && actual_steer == steer_id
+                && actual_continuation == continuation_id
+                && actual_epoch == recovery_epoch
+        ));
+    }
+
+    #[test]
     fn redaction_failure_payload_preserves_shape_without_raw_interrupt_text() {
         let interrupt_id = uuid::Uuid::new_v4();
         let decision = crate::daemon::proto::InterruptDecision {
@@ -4608,5 +10210,142 @@ mod interrupt_redaction_tests {
         );
         assert!(!serialized.contains("/tmp/secret"));
         assert!(!serialized.contains("Allow once"));
+    }
+
+    #[test]
+    fn resolver_free_text_requires_the_same_positive_persisted_bound() {
+        let packet = crate::agent_tree::RedactedDecisionPacket {
+            decision_request_id: uuid::Uuid::new_v4(),
+            agent_instance_id: uuid::Uuid::new_v4(),
+            resolver_profile_snapshot_id: None,
+            resolver_slot: None,
+            parent_agent_instance_id: None,
+            session_id: uuid::Uuid::new_v4(),
+            task_call_id: None,
+            workspace_ref: None,
+            options_contract_json: r#"{"options":[]}"#.to_string(),
+            // A stale/corrupt persisted form cannot regain an unlimited
+            // parser path just because its boolean says allowed.
+            free_text_contract_json: Some(r#"{"allowed":true,"redacted":true}"#.to_string()),
+            recommendation_json: None,
+            rationale_redaction_class: "sensitive".to_string(),
+            decision_class: crate::agent_tree::DecisionClass::LowRisk,
+            deadline_unix_ms: None,
+        };
+        assert!(agent_tree_resolver_answer(&packet, r#"{"free_text":"x"}"#)
+            .unwrap_err()
+            .to_string()
+            .contains("missing its bounded maximum"));
+
+        let bounded_packet = crate::agent_tree::RedactedDecisionPacket {
+            free_text_contract_json: Some(
+                r#"{"allowed":true,"max_chars":2,"redacted":true}"#.to_string(),
+            ),
+            ..packet
+        };
+        assert_eq!(
+            agent_tree_resolver_answer(&bounded_packet, r#"{"free_text":"ok"}"#).unwrap(),
+            crate::agent_tree::DecisionAnswer::FreeText {
+                text: "ok".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolver_emits_typed_interrupt_response_for_real_question_continuations() {
+        let packet = crate::agent_tree::RedactedDecisionPacket {
+            decision_request_id: uuid::Uuid::new_v4(),
+            agent_instance_id: uuid::Uuid::new_v4(),
+            resolver_profile_snapshot_id: None,
+            resolver_slot: None,
+            parent_agent_instance_id: Some(uuid::Uuid::new_v4()),
+            session_id: uuid::Uuid::new_v4(),
+            task_call_id: None,
+            workspace_ref: None,
+            options_contract_json: r#"{
+                "options": [],
+                "interrupt_response_contract": {"schema":"redacted_interrupt_questions_v1"}
+            }"#
+            .to_string(),
+            free_text_contract_json: None,
+            recommendation_json: None,
+            rationale_redaction_class: "sensitive".to_string(),
+            decision_class: crate::agent_tree::DecisionClass::LowRisk,
+            deadline_unix_ms: None,
+        };
+
+        let prompt = agent_tree_resolver_prompt(&packet).unwrap();
+        assert!(prompt.contains("ResolveResponse envelope"));
+        let answer = agent_tree_resolver_answer(
+            &packet,
+            r#"{"response":{"kind":"single","data":{"selected_id":"refresh"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            answer,
+            crate::agent_tree::DecisionAnswer::InterruptResponse {
+                response: crate::daemon::proto::ResolveResponse::Single {
+                    selected_id: "refresh".to_string(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn production_host_refresh_auto_resolution_uses_typed_semantic_not_option_order() {
+        let refresh = format!("option:{}", uuid::Uuid::new_v4());
+        let cancel = format!("option:{}", uuid::Uuid::new_v4());
+        let packet = crate::agent_tree::RedactedDecisionPacket {
+            decision_request_id: uuid::Uuid::new_v4(),
+            agent_instance_id: uuid::Uuid::new_v4(),
+            resolver_profile_snapshot_id: None,
+            resolver_slot: None,
+            parent_agent_instance_id: None,
+            session_id: uuid::Uuid::new_v4(),
+            task_call_id: Some("task:daemon-owned".to_string()),
+            workspace_ref: Some("workspace:daemon-owned".to_string()),
+            // Place cancel first deliberately: there are no labels, and the
+            // resolver must not infer behavior from this ordering.
+            options_contract_json: serde_json::json!({
+                "options": [],
+                "interrupt_response_contract": {
+                    "schema":"interrupt_question_set_v1",
+                    "questions": [{
+                        "kind":"single",
+                        "option_ids":[cancel.clone(), refresh.clone()],
+                        "allow_freetext":false,
+                    }],
+                },
+            })
+            .to_string(),
+            free_text_contract_json: None,
+            recommendation_json: Some(serde_json::json!({
+                "option_id": refresh.clone(),
+                "host_action": "refresh_local_host_capabilities",
+                "redacted": true,
+            }).to_string()),
+            rationale_redaction_class: "sensitive".to_string(),
+            decision_class: crate::agent_tree::DecisionClass::LowRisk,
+            deadline_unix_ms: None,
+        };
+
+        let prompt = agent_tree_resolver_prompt(&packet).unwrap();
+        assert!(prompt.contains("typed daemon-host recommendation"));
+        let answer = agent_tree_resolver_answer(
+            &packet,
+            // Even a utility reply selecting the first/cancel token cannot
+            // override the host-owned semantic for the one safe ingress.
+            &serde_json::json!({
+                "response": {"kind":"single", "data":{"selected_id": cancel.clone()}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            answer,
+            crate::agent_tree::DecisionAnswer::InterruptResponse {
+                response: crate::daemon::proto::ResolveResponse::Single { selected_id: refresh },
+            }
+        );
     }
 }

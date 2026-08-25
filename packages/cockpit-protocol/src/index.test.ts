@@ -490,6 +490,16 @@ describe("cockpit-proto daemon wire schemas", () => {
     expect(responseKinds).toEqual(new Set(["single", "multi", "freetext", "batch", "cancel"]));
   });
 
+  it("rejects empty interrupt responses accepted by neither wire implementation", () => {
+    for (const response of [
+      { kind: "multi", data: { selected_ids: [] } },
+      { kind: "freetext", data: { text: "" } },
+      { kind: "batch", data: { responses: [] } },
+    ]) {
+      expect(resolveResponseSchema.safeParse(response).success).toBe(false);
+    }
+  });
+
   it("parses command_detail present and absent, sandbox_escalation, and all grant kinds", () => {
     const present = interruptsFixture.event_single_command_detail_present.data.question.data;
     expect(commandDetailSchema.safeParse(present.command_detail).success).toBe(true);
@@ -528,7 +538,7 @@ describe("cockpit-proto daemon wire schemas", () => {
     );
   });
 
-  it("config_refreshed_typescript_mirror_is_v10", () => {
+  it("config_refreshed_typescript_mirror_is_v14", () => {
     expect(PROTOCOL_VERSION).toBe(14);
     expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
       responsesFixture.config_refreshed,

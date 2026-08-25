@@ -762,13 +762,20 @@ async fn maybe_capture_web_key(ctx: &ToolCtx, err: &WebToolError, tool: &str) ->
             masked: true,
         }],
     };
-    let response = crate::engine::interrupt::raise_and_wait(
+    // Credential capture is a typed manual-only decision.  It deliberately
+    // never enters the auto-resolver route, so the masked value is exposed
+    // only to the existing local interrupt continuation.
+    let response = crate::engine::interrupt::raise_and_wait_with_agent_tree(
         &ctx.session.db,
         &ctx.interrupts,
         ctx.session.id,
         &ctx.agent_id,
+        ctx.agent_instance_id,
         "Web tool API key required",
         set,
+        crate::agent_tree::HostDecisionSubject::HostEffect(
+            crate::agent_tree::HostEffectClass::Credential,
+        ),
         "web key prompt",
     )
     .await

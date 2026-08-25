@@ -857,6 +857,10 @@ impl ToolOutput {
 #[derive(Clone)]
 pub struct ToolCtx {
     pub agent_id: String,
+    /// Stable daemon-owned lifecycle identity for this concrete executor.
+    /// `None` is reserved for isolated tests and legacy headless helpers;
+    /// production driver frames always carry a durable instance id.
+    pub agent_instance_id: Option<uuid::Uuid>,
     /// Lock-manager identity for this concrete agent instance. Defaults to
     /// `agent_id`; parallel same-named task children use distinct identities
     /// such as `builder#a` so they cannot self-own each other's locks.

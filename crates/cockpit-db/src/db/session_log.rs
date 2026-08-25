@@ -162,10 +162,14 @@ pub enum SessionEventKind {
     /// only — never tool arguments, title candidates, or provider bodies.
     /// Data/export only; never enters the model's context.
     ToolCallScheduling,
+    /// A durable recursive-agent lifecycle or decision invalidation.  This is
+    /// data/export only: the event is an ordered invalidation, not a tree
+    /// snapshot or a resolver-context carrier.
+    AgentTree,
 }
 
 impl SessionEventKind {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::UserMessage,
         Self::UserNote,
         Self::AssistantMessage,
@@ -194,6 +198,7 @@ impl SessionEventKind {
         Self::ModelSwitch,
         Self::HookRun,
         Self::ToolCallScheduling,
+        Self::AgentTree,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -226,6 +231,7 @@ impl SessionEventKind {
             SessionEventKind::ModelSwitch => "model_switch",
             SessionEventKind::HookRun => "hook_run",
             SessionEventKind::ToolCallScheduling => "tool_call_scheduling",
+            SessionEventKind::AgentTree => "agent_tree",
         }
     }
 }
@@ -1782,6 +1788,7 @@ mod tests {
             "model_switch",
             "hook_run",
             "tool_call_scheduling",
+            "agent_tree",
         ];
         let actual = SessionEventKind::ALL.map(SessionEventKind::as_str);
         assert_eq!(actual, expected);
@@ -1807,9 +1814,9 @@ mod tests {
             SessionEventKind::ToolCallScheduling.as_str(),
             "tool_call_scheduling"
         );
-        // The kind grew the inventory to 28 (appended, not substituted) and
+        // The closed inventory has 29 kinds (appended, not substituted) and
         // every wire string is distinct.
-        assert_eq!(SessionEventKind::ALL.len(), 28);
+        assert_eq!(SessionEventKind::ALL.len(), 29);
         let unique: std::collections::BTreeSet<&str> = kinds.iter().copied().collect();
         assert_eq!(
             unique.len(),

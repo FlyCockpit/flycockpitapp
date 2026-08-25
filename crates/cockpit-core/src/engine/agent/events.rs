@@ -2,6 +2,30 @@ use super::*;
 
 pub use crate::daemon::proto::IdleReason;
 
+/// Opaque, process-local incarnation identity for one live AgentTree resolver
+/// endpoint.  The durable agent UUID identifies the logical decision owner;
+/// this generation distinguishes a retired mailbox from a replacement for the
+/// same owner.  It never crosses the daemon wire or durable storage.
+pub type AgentTreeEndpointGeneration = u64;
+
+static NEXT_AGENT_TREE_ENDPOINT_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Allocate an immutable identity before publishing an endpoint attachment.
+/// The producer keeps the value until its matching detach path, while the
+/// worker registry uses it for compare-and-remove fencing.
+pub(crate) fn next_agent_tree_endpoint_generation() -> AgentTreeEndpointGeneration {
+    let generation = NEXT_AGENT_TREE_ENDPOINT_GENERATION.fetch_add(
+        1,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // Wrapping would make an ancient in-process cleanup indistinguishable from
+    // a newly attached endpoint.  Reaching this limit is not recoverable in a
+    // single daemon process, so fail closed rather than reintroducing ABA.
+    assert_ne!(generation, 0, "AgentTree endpoint generation exhausted");
+    generation
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ControlRequestId(pub u64);
 
@@ -35,11 +59,85 @@ pub struct ToolProgress {
     pub unit: String,
 }
 
+/// A worker-local warm-decision request delivered to a live noninteractive
+/// executor at its ordinary turn boundary. The response is deliberately a
+/// completion receipt, not a best-effort enqueue acknowledgement.
+#[derive(Debug)]
+pub struct AgentTreeResolverRequest {
+    pub prompt: String,
+    pub respond_to: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+}
+
+/// Every worker-to-noninteractive-executor hand-off.  A detached or recursive
+/// executor is not represented by the foreground driver's stack, so resolver
+/// work, parked QuestionTool replays, and late user steers must all target its
+/// exact mailbox rather than being routed through a root `DriverControl`.
+#[derive(Debug)]
+pub enum AgentTreeExecutorRequest {
+    ResolveDecision(AgentTreeResolverRequest),
+    ReplayParkedInterrupt {
+        interrupt_id: uuid::Uuid,
+        payload: Box<crate::db::needs_attention::InterruptParkPayload>,
+        response: crate::daemon::proto::ResolveResponse,
+        question: Box<crate::engine::interrupt::PreResolvedInterruptQuestion>,
+        respond_to: tokio::sync::oneshot::Sender<
+            std::result::Result<crate::engine::driver::ParkedReplayOutcome, String>,
+        >,
+    },
+    DeliverLateUserDecisionSteer {
+        steer_id: uuid::Uuid,
+        /// Stable external-inference idempotency identity, allocated with the
+        /// durable steer rather than with a volatile mailbox delivery.
+        continuation_id: uuid::Uuid,
+        recovery_epoch: uuid::Uuid,
+        payload_json: String,
+        respond_to: tokio::sync::oneshot::Sender<
+            crate::engine::driver::LateUserSteerContinuationOutcome,
+        >,
+    },
+    /// Resume a previously accepted late-user steer after a worker crash.  This
+    /// is deliberately distinct from delivery: the row is already behind its
+    /// no-redelivery fence, so the receiver must restore the same durable
+    /// continuation identity/checkpoint rather than accept or claim it again.
+    ResumeAcceptedLateUserDecisionSteer {
+        steer_id: uuid::Uuid,
+        continuation_id: uuid::Uuid,
+        recovery_epoch: uuid::Uuid,
+        payload_json: String,
+        continuation_checkpoint_json: String,
+        respond_to: tokio::sync::oneshot::Sender<
+            crate::engine::driver::LateUserSteerContinuationOutcome,
+        >,
+    },
+}
+
 /// Events the agent emits during a turn. The driver forwards these to
 /// the TUI for display; the persistence layer can subscribe to the
 /// same channel.
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
+    /// Worker-local lifecycle wiring for an exact live agent-tree executor.
+    /// This never crosses the daemon wire: it lets the owning session worker
+    /// route a warm decision only to the frame that emitted the attachment.
+    AgentTreeExecutorEndpointAttached {
+        agent_instance_id: uuid::Uuid,
+        endpoint_generation: AgentTreeEndpointGeneration,
+    },
+    /// The matching executor is no longer able to accept warm decision work.
+    /// Keeping this explicit prevents a retained model handle from becoming a
+    /// false warm-parent receipt after a frame has popped or unwound.
+    AgentTreeExecutorEndpointDetached {
+        agent_instance_id: uuid::Uuid,
+        endpoint_generation: AgentTreeEndpointGeneration,
+    },
+    /// The noninteractive executor owns a distinct mailbox because it is not
+    /// on the foreground driver's stack. It is still keyed by the same durable
+    /// agent instance id and is consumed only at a real child turn boundary.
+    AgentTreeNoninteractiveEndpointAttached {
+        agent_instance_id: uuid::Uuid,
+        endpoint_generation: AgentTreeEndpointGeneration,
+        endpoint: tokio::sync::mpsc::Sender<AgentTreeExecutorRequest>,
+    },
     /// TUI-local result for a response-bearing control request sent to the
     /// attached daemon session. It is not forwarded over the daemon event bus.
     ControlRequestFinished {

@@ -807,6 +807,21 @@ impl Db {
             .await
     }
 
+    /// Loads the immutable snapshot selected for an agent instance. The
+    /// session predicate prevents an instance ID from becoming a cross-session
+    /// profile oracle and callers must reconstruct it before routing.
+    pub async fn agent_profile_snapshot_by_id(
+        &self,
+        session_id: Uuid,
+        snapshot_id: Uuid,
+    ) -> Result<Option<AgentProfileSnapshotRow>> {
+        self.read(move |conn| {
+            let snapshot = snapshot_by_id(conn, snapshot_id)?;
+            Ok(snapshot.filter(|snapshot| snapshot.session_id == session_id))
+        })
+        .await
+    }
+
     pub async fn current_agent_binding(
         &self,
         installation_id: Uuid,
@@ -2462,7 +2477,28 @@ fn snapshot_for_session(
     conn: &Connection,
     session_id: Uuid,
 ) -> Result<Option<AgentProfileSnapshotRow>> {
-    conn.query_row("SELECT snapshot_id,session_id,installation_id,schema_version,canonical_payload,canonical_payload_digest,definition_digest,binding_revision_map_payload,binding_revision_map_digest,created_at_unix_ms FROM agent_profile_snapshots WHERE session_id=?1",[session_id.to_string()],decode_snapshot).optional().context("looking up agent profile snapshot")
+    // Session-level callers mean the prepared/root profile, not an arbitrary
+    // delegated child's immutable snapshot. Child executors always route via
+    // `snapshot_by_id` and their durable `resolved_profile_snapshot_id`.
+    // Prefer the preparation receipt when one exists; the stable fallback
+    // preserves the root choice for ordinary/test sessions which predate that
+    // receipt while allowing a session to contain distinct child profiles.
+    conn.query_row(
+        "SELECT s.snapshot_id, s.session_id, s.installation_id, s.schema_version,
+                s.canonical_payload, s.canonical_payload_digest, s.definition_digest,
+                s.binding_revision_map_payload, s.binding_revision_map_digest,
+                s.created_at_unix_ms
+           FROM agent_profile_snapshots s
+           LEFT JOIN agent_session_preparations p
+             ON p.snapshot_id = s.snapshot_id AND p.session_id = s.session_id
+          WHERE s.session_id = ?1
+          ORDER BY (p.snapshot_id IS NOT NULL) DESC, s.created_at_unix_ms ASC, s.snapshot_id ASC
+          LIMIT 1",
+        [session_id.to_string()],
+        decode_snapshot,
+    )
+    .optional()
+    .context("looking up root agent profile snapshot")
 }
 fn snapshot_by_id(conn: &Connection, id: Uuid) -> Result<Option<AgentProfileSnapshotRow>> {
     conn.query_row("SELECT snapshot_id,session_id,installation_id,schema_version,canonical_payload,canonical_payload_digest,definition_digest,binding_revision_map_payload,binding_revision_map_digest,created_at_unix_ms FROM agent_profile_snapshots WHERE snapshot_id=?1",[id.to_string()],decode_snapshot).optional().context("looking up agent profile snapshot")

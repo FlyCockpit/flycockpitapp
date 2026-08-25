@@ -195,6 +195,10 @@ struct Inner {
     /// Shared host-capability snapshot. Late-installed after
     /// [`crate::daemon::server::DaemonContext`] owns the store.
     host_capabilities: Mutex<Option<crate::host_capabilities::HostCapabilitySnapshotStore>>,
+    /// The probe sources paired with the daemon-owned snapshot.  They are not
+    /// configuration: a recovered refresh operation must use the same
+    /// composition-owned runtime that the original attached request used.
+    host_capability_probes: Mutex<Option<crate::host_capabilities::HostCapabilityProbeInputs>>,
 }
 
 struct WorkerState {
@@ -504,6 +508,7 @@ impl SessionRegistry {
                 global_bus: Mutex::new(None),
                 config_source,
                 host_capabilities: Mutex::new(None),
+                host_capability_probes: Mutex::new(None),
             }),
         }
     }
@@ -511,8 +516,10 @@ impl SessionRegistry {
     pub fn set_host_capabilities(
         &self,
         store: crate::host_capabilities::HostCapabilitySnapshotStore,
+        probes: crate::host_capabilities::HostCapabilityProbeInputs,
     ) {
         *crate::sync::lock_or_recover(&self.inner.host_capabilities) = Some(store);
+        *crate::sync::lock_or_recover(&self.inner.host_capability_probes) = Some(probes);
     }
 
     fn current_host_capabilities(&self) -> cockpit_proto::HostCapabilitySnapshot {
@@ -520,6 +527,19 @@ impl SessionRegistry {
             .as_ref()
             .and_then(|store| store.current().map(|snapshot| (*snapshot).clone()))
             .unwrap_or_else(session_worker::unpublished_host_capability_snapshot)
+    }
+
+    fn host_capability_refresh_runtime(
+        &self,
+    ) -> Option<session_worker::HostCapabilityRefreshRuntime> {
+        let store = crate::sync::lock_or_recover(&self.inner.host_capabilities).clone()?;
+        let probes = crate::sync::lock_or_recover(&self.inner.host_capability_probes).clone()?;
+        Some(session_worker::HostCapabilityRefreshRuntime {
+            serial_execution: store.refresh_serialization(),
+            in_flight_operations: store.refresh_in_flight_operations(),
+            store,
+            probes,
+        })
     }
 
     pub fn lsp_manager(&self) -> Arc<crate::daemon::lsp::LspManager> {
@@ -1222,13 +1242,17 @@ impl SessionRegistry {
                 let hooks = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
                     crate::config::extended::hooks::resolve_hooks_for_cwd(&project_root)
                 });
-                session_worker::SessionConfigSnapshot::with_hooks(
+                let snapshot = session_worker::SessionConfigSnapshot::with_hooks(
                     0,
                     providers_cfg.clone(),
                     extended_cfg.clone(),
                     hooks,
                 )
-                .with_host_capabilities(self.current_host_capabilities())
+                .with_host_capabilities(self.current_host_capabilities());
+                match self.host_capability_refresh_runtime() {
+                    Some(runtime) => snapshot.with_host_capability_refresh_runtime(runtime),
+                    None => snapshot,
+                }
             },
         );
 

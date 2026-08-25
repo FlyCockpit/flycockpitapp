@@ -316,6 +316,41 @@ pub(super) fn send_sandbox_unavailable_notice(
     );
 }
 
+#[derive(Clone)]
+pub(crate) struct HostCapabilityRefreshRuntime {
+    pub(crate) store: crate::host_capabilities::HostCapabilitySnapshotStore,
+    pub(crate) probes: crate::host_capabilities::HostCapabilityProbeInputs,
+    /// One daemon can own many sessions, but snapshots share one live store.
+    /// The store-wide dispatcher serializes globally ordered durable outbox
+    /// replay, probe → receipt → publication, so a later session cannot stage
+    /// a generation before an earlier session's receipt is acknowledged.
+    pub(crate) serial_execution: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// A durable operation has at most one local dispatcher task. Other
+    /// callers return promptly and the worker's bounded maintenance tick
+    /// retries after the owner exits or a lease is reaped.
+    pub(crate) in_flight_operations: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HostCapabilitiesRefreshCompletion {
+    pub snapshot: cockpit_proto::HostCapabilitySnapshot,
+    pub published: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostCapabilitiesRefreshError {
+    Declined,
+    Internal(String),
+}
+
+impl std::fmt::Debug for HostCapabilityRefreshRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostCapabilityRefreshRuntime")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionConfigSnapshot {
     pub generation: u64,
@@ -330,6 +365,11 @@ pub struct SessionConfigSnapshot {
     /// Unpublished (empty features) leaves host Sandbox usable; Refuse is
     /// the fail-closed backstop.
     pub host_capabilities: cockpit_proto::HostCapabilitySnapshot,
+    /// Daemon-composition-only host probe runtime.  It is not config and is
+    /// intentionally retained when a config watcher replaces the surrounding
+    /// snapshot, so a recovered allowed refresh always has the same host-owned
+    /// execution seam available.
+    pub(crate) host_capability_refresh_runtime: Option<HostCapabilityRefreshRuntime>,
 }
 
 impl SessionConfigSnapshot {
@@ -344,6 +384,7 @@ impl SessionConfigSnapshot {
             extended,
             hooks: crate::config::extended::hooks::HookRegistry::default(),
             host_capabilities: super::unpublished_host_capability_snapshot(),
+            host_capability_refresh_runtime: None,
         }
     }
 
@@ -360,6 +401,7 @@ impl SessionConfigSnapshot {
             extended,
             hooks,
             host_capabilities: super::unpublished_host_capability_snapshot(),
+            host_capability_refresh_runtime: None,
         }
     }
 
@@ -368,6 +410,14 @@ impl SessionConfigSnapshot {
         host_capabilities: cockpit_proto::HostCapabilitySnapshot,
     ) -> Self {
         self.host_capabilities = host_capabilities;
+        self
+    }
+
+    pub(crate) fn with_host_capability_refresh_runtime(
+        mut self,
+        runtime: HostCapabilityRefreshRuntime,
+    ) -> Self {
+        self.host_capability_refresh_runtime = Some(runtime);
         self
     }
 
@@ -1597,6 +1647,24 @@ pub enum SessionWork {
     ResolveInterrupt {
         interrupt_id: Uuid,
         response: proto::ResolveResponse,
+    },
+    /// A typed durable decision answer. This is intentionally handled by the
+    /// owning session worker so the continuation, session-scoped event, and
+    /// any fresh recovery executor share one serialization point.
+    ResolveAgentDecision {
+        decision_request_id: Uuid,
+        answer: crate::agent_tree::DecisionAnswer,
+        respond_to: oneshot::Sender<std::result::Result<crate::agent_tree::DecisionSettlement, String>>,
+    },
+    /// Request the one daemon-classified low-risk host effect through the
+    /// same durable AgentTree decision/continuation path as a tool question.
+    /// The worker owns the durable operation and executes the local probe only
+    /// after the exact decision is terminally allowed; the server receives the
+    /// persisted terminal snapshot for its original attached request.
+    AuthorizeHostCapabilitiesRefresh {
+        respond_to: oneshot::Sender<
+            std::result::Result<HostCapabilitiesRefreshCompletion, HostCapabilitiesRefreshError>,
+        >,
     },
     RepairResume {
         respond_to: oneshot::Sender<std::result::Result<(), String>>,

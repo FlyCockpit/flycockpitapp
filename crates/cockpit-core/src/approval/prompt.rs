@@ -9,17 +9,26 @@ impl Approver {
         &self,
         description: &str,
         question: InterruptQuestion,
+        operation: crate::agent_tree::HostApprovalOperation,
     ) -> Result<ResolveResponse> {
         let set = InterruptQuestionSet {
             questions: vec![question],
         };
-        Ok(crate::engine::interrupt::raise_and_wait(
+        Ok(crate::engine::interrupt::raise_and_wait_with_agent_tree(
             &self.db,
             &self.interrupts,
             self.session_id,
             &self.agent_id,
+            crate::engine::agent::current_agent_instance_id(),
             description,
             set,
+            // The caller has already classified and canonically bound the
+            // actual host effect before this prompt is persisted. Its complete
+            // input—not this display description—becomes the durable approval
+            // capability and is revalidated at consume/replay time.
+            crate::agent_tree::HostDecisionSubject::HostApproval {
+                operation,
+            },
             "approval prompt",
         )
         .await
@@ -30,10 +39,18 @@ impl Approver {
         &self,
         description: &str,
         question: InterruptQuestion,
+        operation_kind: &str,
+        operation_input: serde_json::Value,
         mut decode: impl FnMut(&ResolveResponse) -> std::result::Result<T, ForeignOptionId>,
     ) -> Result<T> {
         loop {
-            let response = self.raise_and_wait(description, question.clone()).await?;
+            let operation = crate::agent_tree::HostApprovalOperation::new(
+                operation_kind,
+                operation_input.clone(),
+            )?;
+            let response = self
+                .raise_and_wait(description, question.clone(), operation)
+                .await?;
             match decode(&response) {
                 Ok(choice) => return Ok(choice),
                 Err(foreign) => {
@@ -119,26 +136,57 @@ impl Approver {
         }
 
         // 3. Prompt with the six choices and act on the answer.
-        let choice = self.prompt_repeat(tool).await?;
+        let choice = self.prompt_repeat(tool, wire_input).await?;
         let repeat = match choice {
             RepeatChoice::AcceptOnce => RepeatDecision::Accept,
             RepeatChoice::RejectOnce => RepeatDecision::Reject,
             RepeatChoice::Always { verdict, scope } => {
-                // Record BEFORE returning, mirroring the command/path
-                // approval contract. A record failure (e.g. Project scope
-                // with no git root) must not strand the call: fall back to
-                // applying the verdict this once and surface the error in
-                // the log rather than aborting the turn.
-                if let Err(e) = self
-                    .store
-                    .record_loop_rule(&signature, verdict, scope)
-                    .await
+                // The persisted selection promises a rule mutation. A
+                // failed write cannot be downgraded to a one-off execution:
+                // reject the capability so the durable selection and the
+                // effect that follows it never disagree.
+                let verdict_label = match verdict {
+                    LoopVerdict::Accept => "accept",
+                    LoopVerdict::Reject => "reject",
+                };
+                let scope_label = match scope {
+                    Scope::Session => "session",
+                    Scope::Project => "project",
+                    // Decoder policy never constructs these, but an invalid
+                    // scope must fail the exact-candidate claim rather than
+                    // skip the durable fence.
+                    Scope::Once | Scope::Global => "invalid",
+                };
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "loop_rule_persistence",
+                    &[serde_json::json!({
+                        "persist_rule": {
+                            "tool": tool,
+                            "wire_input": wire_input,
+                            "verdict": verdict_label,
+                            "scope": scope_label,
+                        }
+                    })],
+                )
+                .await
+                .is_err()
                 {
-                    tracing::warn!(error = %e, tool, ?scope, "recording loop-guard rule failed; applying once");
-                }
-                match verdict {
-                    LoopVerdict::Accept => RepeatDecision::Accept,
-                    LoopVerdict::Reject => RepeatDecision::Reject,
+                    RepeatDecision::Reject
+                } else {
+                    if let Err(e) = self
+                        .store
+                        .record_loop_rule(&signature, verdict, scope)
+                        .await
+                    {
+                        tracing::warn!(error = %e, tool, ?scope, "recording loop-guard rule failed; rejecting selected capability");
+                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                        RepeatDecision::Reject
+                    } else {
+                        match verdict {
+                            LoopVerdict::Accept => RepeatDecision::Accept,
+                            LoopVerdict::Reject => RepeatDecision::Reject,
+                        }
+                    }
                 }
             }
         };
@@ -157,7 +205,11 @@ impl Approver {
     /// the user answers, reusing the `question`-tool interrupt path
     /// verbatim. A dismissal (Esc/cancel) reads as reject-once — the safe
     /// default for a likely loop.
-    pub(super) async fn prompt_repeat(&self, tool: &str) -> Result<RepeatChoice> {
+    pub(super) async fn prompt_repeat(
+        &self,
+        tool: &str,
+        wire_input: &serde_json::Value,
+    ) -> Result<RepeatChoice> {
         let question = repeat_question(tool);
         let set = InterruptQuestionSet {
             questions: vec![question],
@@ -167,6 +219,19 @@ impl Approver {
         self.raise_and_decode(
             &description,
             set.questions[0].clone(),
+            "loop_guard_repeat",
+            serde_json::json!({
+                "tool": tool,
+                "wire_input": wire_input,
+                "candidate_effects": [
+                    {"selection": ID_LOOP_ACCEPT_ONCE, "execute": {"tool": tool, "wire_input": wire_input}},
+                    {"selection": ID_LOOP_REJECT_ONCE, "effect": "deny"},
+                    {"selection": ID_LOOP_ACCEPT_SESSION, "persist_rule": {"tool": tool, "wire_input": wire_input, "verdict": "accept", "scope": "session"}, "execute": {"tool": tool, "wire_input": wire_input}},
+                    {"selection": ID_LOOP_REJECT_SESSION, "persist_rule": {"tool": tool, "wire_input": wire_input, "verdict": "reject", "scope": "session"}, "effect": "deny"},
+                    {"selection": ID_LOOP_ACCEPT_PROJECT, "persist_rule": {"tool": tool, "wire_input": wire_input, "verdict": "accept", "scope": "project"}, "execute": {"tool": tool, "wire_input": wire_input}},
+                    {"selection": ID_LOOP_REJECT_PROJECT, "persist_rule": {"tool": tool, "wire_input": wire_input, "verdict": "reject", "scope": "project"}, "effect": "deny"}
+                ]
+            }),
             response_to_repeat_choice,
         )
         .await
@@ -180,6 +245,7 @@ impl Approver {
     pub(super) async fn prompt(
         &self,
         label: &str,
+        full_command: &str,
         wrapper: bool,
         detail: Option<CommandDetail>,
         escalation: Option<SandboxEscalation>,
@@ -191,6 +257,44 @@ impl Approver {
         if let Some(notice) = extras.notice.as_deref() {
             description = format!("{notice}\n{description}");
         }
+        // Bind the actual command effect facts before they are moved into the
+        // display question. `detail` carries the complete canonical command,
+        // while escalation carries the concrete retry/target scope.
+        let operation_input = serde_json::json!({
+            // Bind the actual shell text that reaches the execution boundary,
+            // not the display label or a command-detail projection.
+            "command": full_command,
+            "label": label,
+            "wrapper": wrapper,
+            "command_detail": detail.clone(),
+            "sandbox_escalation": escalation.clone(),
+            "offered_scopes": offered_scopes.iter().map(|scope| scope_label(*scope)).collect::<Vec<_>>(),
+            "candidate_effects": offered_scopes.iter().map(|scope| serde_json::json!({
+                "selection": if wrapper {
+                    ApprovalOptionId::Approve.as_str()
+                } else {
+                    approve_option_id_for_scope(*scope).as_str()
+                },
+                "execute": {"command": full_command},
+                // A non-wrapper scope records an exact command approval;
+                // wrappers remain once-only and thus carry no grant mutation.
+                "persist_grant": if wrapper || *scope == Scope::Once {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!({"kind": "command", "label": label, "scope": scope_label(*scope)})
+                },
+            })).chain(offered_scopes.iter().copied().filter(|scope| *scope != Scope::Once).map(|scope| serde_json::json!({
+                "selection": reject_option_id_for_scope(scope).as_str(),
+                "persist_reject": {"kind": "command", "label": label, "scope": scope_label(scope)},
+            }))).chain((extras.batch_count.is_some_and(|count| count > 1)).then(|| serde_json::json!({
+                "selection": "approve_all_once",
+                "execute": {"command": full_command},
+            })).into_iter()).chain(std::iter::once(serde_json::json!({
+                "selection": "reject", "effect": "deny"
+            }))).collect::<Vec<_>>(),
+            "notice": extras.notice.as_deref(),
+            "batch_count": extras.batch_count,
+        });
         let mut question = approval_question(
             label,
             wrapper,
@@ -217,9 +321,18 @@ impl Approver {
             offered_scopes,
             extras.batch_count,
         );
-        self.raise_and_decode(&description, question, |response| {
-            response_to_approval_choice(response, &set)
-        })
+        let operation_kind = if wrapper {
+            "wrapper_tool_approval"
+        } else {
+            "command_approval"
+        };
+        self.raise_and_decode(
+            &description,
+            question,
+            operation_kind,
+            operation_input,
+            |response| response_to_approval_choice(response, &set),
+        )
         .await
     }
 }

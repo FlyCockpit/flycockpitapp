@@ -1160,6 +1160,7 @@ fn parse_event_kind(raw: String) -> Result<SessionEventKind> {
         "notice" => Notice,
         "model_switch" => ModelSwitch,
         "hook_run" => HookRun,
+        "agent_tree" => AgentTree,
         _ => bail!("unsupported import event type `{raw}`"),
     };
     Ok(kind)
@@ -1802,6 +1803,16 @@ mod tests {
                     1234,
                     r#"{"text":"round trip"}"#,
                 )?;
+                Db::insert_session_event_json_conn(
+                    conn,
+                    source_id,
+                    SessionEventKind::AgentTree,
+                    None,
+                    None,
+                    SessionEventContext::default(),
+                    1234,
+                    r#"{"kind":"agent_transition","subject_kind":"agent","subject_id":"00000000-0000-0000-0000-000000000001","state":"running"}"#,
+                )?;
                 Db::insert_inference_call_conn(
                     conn,
                     &InferenceCallRow {
@@ -1862,6 +1873,15 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM inference_calls WHERE session_id = ?1", [destination_id.to_string()], |r| r.get(0))?,
         ))).await.unwrap();
         assert_eq!(destination_counts, source_counts);
+        assert!(
+            destination
+                .list_session_events(destination_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "agent_tree"),
+            "typed agent-tree timeline invalidations must survive export/import"
+        );
         let restored = destination
             .get_session(destination_id)
             .await

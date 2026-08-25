@@ -21,10 +21,12 @@ async fn prune_targets_foreground_subagent_only() {
             "default",
         ),
         agent: child,
+        agent_instance_id: None,
         history: dup_read_history(),
         answering: None,
         deferred_log: crate::engine::deferred::DeferredLog::new(),
         fallback_decision: None,
+        recovery_activation: None,
         _vnext_child_admission: None,
         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
     });

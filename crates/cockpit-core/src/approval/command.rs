@@ -111,9 +111,46 @@ impl Approver {
         denial: Option<SandboxDenialReport>,
         command_detail: Option<CommandDetail>,
     ) -> Result<SandboxEscalationApproval> {
+        let mut effect_binding = serde_json::json!({
+            "command": command,
+            "confined_exit": confined_exit,
+            "confined_stderr": &confined_stderr,
+            "grant_paths": grant_offer.map(|offer| offer.paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>()),
+            "grant_access": grant_offer.map(|offer| offer.access.storage_str()),
+            "denial": &denial,
+            "command_detail": &command_detail,
+        });
         let offered_scopes = grant_offer
             .map(|_| self.store.recordable_path_scopes())
             .unwrap_or_default();
+        effect_binding["candidate_effects"] = serde_json::Value::Array(
+            std::iter::once(serde_json::json!({
+                "selection": ApprovalOptionId::EscalateRunUnconfinedOnce.as_str(),
+                "execute": {"command": command, "sandbox": "unconfined"},
+            }))
+            .chain(offered_scopes.iter().filter_map(|scope| {
+                let selection = match scope {
+                    Scope::Session => ApprovalOptionId::EscalateGrantSession,
+                    Scope::Project => ApprovalOptionId::EscalateGrantProject,
+                    Scope::Global => ApprovalOptionId::EscalateGrantGlobal,
+                    Scope::Once => return None,
+                };
+                Some(serde_json::json!({
+                    "selection": selection.as_str(),
+                    "persist_grant": {
+                        "paths": grant_offer.map(|offer| offer.paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>()),
+                        "access": grant_offer.map(|offer| offer.access.storage_str()),
+                        "scope": scope_label(*scope),
+                    },
+                    "execute": {"command": command, "sandbox": "confined"},
+                }))
+            }))
+            .chain(std::iter::once(serde_json::json!({
+                "selection": ApprovalOptionId::Reject.as_str(),
+                "effect": "deny",
+            })))
+            .collect(),
+        );
         let suggested_paths = grant_offer
             .map(|offer| {
                 offer
@@ -194,6 +231,8 @@ impl Approver {
             .raise_and_decode(
                 "Sandboxed command failed — choose a remedy",
                 question,
+                "sandbox_escalation",
+                effect_binding,
                 |response| response_to_approval_choice(response, &set),
             )
             .await?;
@@ -206,8 +245,31 @@ impl Approver {
                 if !offered_scopes.contains(&scope) {
                     return Ok(SandboxEscalationApproval::Deny);
                 }
+                let paths = offer
+                    .paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>();
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "sandbox_path_grant_persistence",
+                    &[serde_json::json!({
+                        "persist_grant": {
+                            "paths": paths,
+                            "access": offer.access.storage_str(),
+                            "scope": scope_label(scope),
+                        }
+                    })],
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(SandboxEscalationApproval::Deny);
+                }
                 for path in &offer.paths {
-                    self.store.record_path(path, scope, offer.access).await?;
+                    if let Err(error) = self.store.record_path(path, scope, offer.access).await {
+                        crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                        return Err(error.into());
+                    }
                     self.record_permission_decision(
                         "path",
                         &path.display().to_string(),
@@ -317,7 +379,11 @@ impl Approver {
             return self.finish_command_approval(command, decision).await;
         }
 
-        if self.yolo_mode() || self.auto_allows("bash", command).await {
+        if self.yolo_mode()
+            || self
+                .auto_allows(crate::agent_tree::HostEffectClass::Destructive, command)
+                .await
+        {
             return self
                 .finish_command_approval(command, Decision::Allow { scope: Scope::Once })
                 .await;
@@ -552,6 +618,7 @@ impl Approver {
         let choice = self
             .prompt(
                 &label,
+                full_command,
                 info.wrapper || info.execution_bearing_option,
                 detail,
                 context.escalation.clone(),
@@ -578,13 +645,37 @@ impl Approver {
                 if !scope.within(policy.max_scope) {
                     return Ok(CommandStepDecision::Decision(Decision::Deny));
                 }
+                // A persisted command grant is a host mutation in its own
+                // right. Claim the exact selected mutation before writing it;
+                // this is the irreversible submission point for a bundled
+                // grant+command candidate, not the generic tool dispatcher.
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "command_grant_persistence",
+                    &[serde_json::json!({
+                        "persist_grant": {
+                            "kind": "command",
+                            "label": &label,
+                            "scope": scope_label(scope),
+                        }
+                    })],
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(CommandStepDecision::Decision(Decision::Deny));
+                }
                 // Record BEFORE returning the decision (§3). A wrapper can
                 // never reach here at a non-Once scope: the prompt only
                 // offered Once for wrappers. The store rejects it anyway as
                 // a belt-and-braces guard.
-                self.store
+                if let Err(error) = self
+                    .store
                     .record_command(info, info.risk.tier, scope)
-                    .await?;
+                    .await
+                {
+                    crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                    return Err(error.into());
+                }
                 Ok(CommandStepDecision::Decision(Decision::Allow { scope }))
             }
             // `Reject(Once)` is mapped to `Deny` upstream; only a persistable
@@ -594,7 +685,25 @@ impl Approver {
                 if !scope.within(policy.max_scope) {
                     return Ok(CommandStepDecision::Decision(Decision::Deny));
                 }
-                self.store.record_command_reject(info, scope).await?;
+                if crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+                    "command_reject_persistence",
+                    &[serde_json::json!({
+                        "persist_reject": {
+                            "kind": "command",
+                            "label": &label,
+                            "scope": scope_label(scope),
+                        }
+                    })],
+                )
+                .await
+                .is_err()
+                {
+                    return Ok(CommandStepDecision::Decision(Decision::Deny));
+                }
+                if let Err(error) = self.store.record_command_reject(info, scope).await {
+                    crate::engine::interrupt::record_host_approval_effect_boundary_outcome(false);
+                    return Err(error.into());
+                }
                 Ok(CommandStepDecision::Decision(Decision::Deny))
             }
         }

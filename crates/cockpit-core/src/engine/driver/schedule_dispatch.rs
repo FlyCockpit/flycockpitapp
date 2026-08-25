@@ -278,19 +278,56 @@ impl Driver {
                     Ok(child) => child,
                     Err(message) => return Ok(message),
                 };
-                if let Some(refusal) = self.approve_background_command(&parsed.command).await? {
-                    return Ok(refusal);
-                }
+                // Resolve the launch environment before accepting the
+                // approval. This is pure local validation; keeping a refused
+                // sandbox configuration outside the handoff scope means an
+                // approved operation always reaches the real spawn boundary
+                // (or is recorded submission-unknown if that boundary fails
+                // unexpectedly).
                 let launch = match self.resolve_background_launch(&child.resolved).await {
                     Ok(launch) => launch,
                     Err(refusal) => return Ok(refusal),
                 };
-                let job_id = self
-                    .schedule
-                    .start_background(parsed, child.resolved, launch);
-                Ok(format!(
-                    "started background `{job_id}` — tail with schedule(action=\"background.tail\", args={{\"job_id\":\"{job_id}\"}})"
-                ))
+                // `schedule` actions execute on the driver authority rather
+                // than through the ordinary tool dispatcher. Keep this direct
+                // shell-launch boundary in the same typed approval scope as
+                // normal tools so an approved command cannot be consumed by
+                // the helper and then escape without a terminal handoff
+                // receipt.
+                let cancel = self
+                    .cancel_current
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .unwrap_or_else(tokio_util::sync::CancellationToken::new);
+                let effect_cancel = cancel.clone();
+                crate::engine::interrupt::with_host_approval_effect_scope(
+                    "schedule_background_start",
+                    cancel,
+                    async {
+                        if let Some(refusal) = self.approve_background_command(&parsed.command).await? {
+                            return Ok(refusal);
+                        }
+                        crate::engine::interrupt::recheck_host_approval_effect_boundary(
+                            "schedule_background_start",
+                            &effect_cancel,
+                            &[serde_json::json!({"execute": {"command": &parsed.command}})],
+                        )
+                        .await?;
+                        let job_id = self
+                            .schedule
+                            .start_background(parsed, child.resolved, launch);
+                        Ok(format!(
+                            "started background `{job_id}` — tail with schedule(action=\"background.tail\", args={{\"job_id\":\"{job_id}\"}})"
+                        ))
+                    },
+                    // `start_background` has synchronously handed the command
+                    // to the background runner before returning its job id.
+                    // The only earlier successful return is a denied approval,
+                    // which has no registered handoff.
+                    |_| Some(true),
+                )
+                .await
             }
             ScheduleAction::BackgroundTail => {
                 let parsed = crate::engine::schedule::parse_background_tail(action_args)?;

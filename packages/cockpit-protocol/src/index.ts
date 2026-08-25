@@ -82,6 +82,13 @@ export const exportSessionDataSchema = z
   .passthrough();
 
 export const uuidSchema = z.string().uuid();
+// Rust rejects nil identifiers on every agent-tree request boundary. Keep the
+// general UUID schema permissive for legacy wire shapes that intentionally use
+// nil as a sentinel, and opt the lifecycle contracts into this exact rule.
+const nonNilUuidSchema = uuidSchema.refine(
+  (value) => value !== "00000000-0000-0000-0000-000000000000",
+  "expected a nonnil UUID",
+);
 const canonicalRfcUuidSchema = uuidSchema.refine(
   (value) =>
     value === value.toLowerCase() &&
@@ -512,22 +519,79 @@ export const resolveResponseSchema: z.ZodType<ResolveResponseValue> = z.lazy(() 
     z
       .object({
         kind: z.literal("multi"),
-        data: z.object({ selected_ids: z.array(z.string().min(1)) }).passthrough(),
+        data: z.object({ selected_ids: z.array(z.string().min(1)).min(1) }).passthrough(),
       })
       .passthrough(),
     z
-      .object({ kind: z.literal("freetext"), data: z.object({ text: z.string() }).passthrough() })
+      .object({
+        kind: z.literal("freetext"),
+        data: z.object({ text: z.string().min(1) }).passthrough(),
+      })
       .passthrough(),
     z
       .object({
         kind: z.literal("batch"),
-        data: z.object({ responses: z.array(resolveResponseSchema) }).passthrough(),
+        data: z.object({ responses: z.array(resolveResponseSchema).min(1) }).passthrough(),
       })
       .passthrough(),
     z.object({ kind: z.literal("cancel") }).passthrough(),
   ]),
 );
 export type ResolveResponse = z.infer<typeof resolveResponseSchema>;
+
+/** Stable opaque position for daemon-owned agent tree and Attention pages. */
+export const agentTreeCursorSchema = z
+  .object({ created_at_unix_ms: safeI64NumberSchema, id: nonNilUuidSchema })
+  .strict();
+export type AgentTreeCursor = z.infer<typeof agentTreeCursorSchema>;
+
+/** Resolver-context-free lifecycle projection owned by the daemon. */
+export const agentTreeNodeSchema = z
+  .object({
+    agent_instance_id: nonNilUuidSchema,
+    parent_agent_instance_id: nonNilUuidSchema.nullable().optional(),
+    workspace_ref: z.string().nullable().optional(),
+    state: z.string().min(1),
+    revision: safeI64NumberSchema,
+    created_at_unix_ms: safeI64NumberSchema,
+    updated_at_unix_ms: safeI64NumberSchema,
+  })
+  .strict();
+export type AgentTreeNode = z.infer<typeof agentTreeNodeSchema>;
+
+/** Allowlisted decision Attention projection. Resolver prompts and receipts are excluded. */
+export const agentDecisionAttentionSchema = z
+  .object({
+    attention_id: nonNilUuidSchema,
+    decision_request_id: nonNilUuidSchema,
+    agent_instance_id: nonNilUuidSchema,
+    state: z.string().min(1),
+    decision_state: z.string().min(1),
+    decision_class: z.string().min(1),
+    task_call_id: z.string().min(1).nullable().optional(),
+    workspace_ref: z.string().min(1).nullable().optional(),
+    options_contract_json: z.string(),
+    free_text_contract_json: z.string().nullable().optional(),
+    recommendation_json: z.string().nullable().optional(),
+    deadline_unix_ms: safeI64NumberSchema.nullable().optional(),
+    revision: safeI64NumberSchema,
+    raised_at_unix_ms: safeI64NumberSchema,
+    resolved_at_unix_ms: safeI64NumberSchema.nullable().optional(),
+  })
+  .strict();
+export type AgentDecisionAttention = z.infer<typeof agentDecisionAttentionSchema>;
+
+export const agentDecisionAnswerSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("option"), option_id: z.string().min(1) }).strict(),
+  z.object({ kind: z.literal("free_text"), text: z.string().min(1) }).strict(),
+  z
+    .object({
+      kind: z.literal("interrupt_response"),
+      response: resolveResponseSchema,
+    })
+    .strict(),
+]);
+export type AgentDecisionAnswer = z.infer<typeof agentDecisionAnswerSchema>;
 
 const requestParamSchemas = {
   get_app_flag: z.object({ key: z.literal("daemon_autostart_notice") }).strict(),
@@ -630,6 +694,28 @@ const requestParamSchemas = {
       label: z.string().min(1),
       before_seq: safeI64NumberSchema.nullable().optional(),
       limit: z.number().int().positive(),
+    })
+    .strict(),
+  read_agent_tree: z
+    .object({
+      session_id: nonNilUuidSchema,
+      root_agent_instance_id: nonNilUuidSchema.nullable().optional(),
+      after: agentTreeCursorSchema.nullable().optional(),
+      limit: z.number().int().min(1).max(100),
+    })
+    .strict(),
+  read_agent_attention: z
+    .object({
+      session_id: nonNilUuidSchema,
+      after: agentTreeCursorSchema.nullable().optional(),
+      limit: z.number().int().min(1).max(100),
+    })
+    .strict(),
+  resolve_agent_decision: z
+    .object({
+      session_id: nonNilUuidSchema,
+      decision_request_id: nonNilUuidSchema,
+      answer: agentDecisionAnswerSchema,
     })
     .strict(),
   read_session_messages: z
@@ -891,8 +977,11 @@ const clientRequestVariants = [
   requestVariant("get_inventory_bundle", requestParamSchemas.get_inventory_bundle),
   requestVariant("list_sessions", requestParamSchemas.list_sessions),
   requestVariant("read_history_page", requestParamSchemas.read_history_page),
+  requestVariant("read_agent_tree", requestParamSchemas.read_agent_tree),
+  requestVariant("read_agent_attention", requestParamSchemas.read_agent_attention),
   requestVariant("read_session_messages", requestParamSchemas.read_session_messages),
   requestVariant("read_subagent_history_page", requestParamSchemas.read_subagent_history_page),
+  requestVariant("resolve_agent_decision", requestParamSchemas.resolve_agent_decision),
   requestVariant("rename_session", requestParamSchemas.rename_session),
   requestVariant("resolve_interrupt", requestParamSchemas.resolve_interrupt),
   requestVariantNoParams("restart_if_idle"),
@@ -1022,6 +1111,9 @@ export const responseNameSchema = z.enum([
   "fs_write",
   "git_diff_file",
   "git_status",
+  "agent_tree_page",
+  "agent_attention_page",
+  "agent_decision_steered",
   "history_page",
   "inventory_bundle",
   "models",
@@ -1464,6 +1556,37 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
       .passthrough(),
   ),
   responseVariant(
+    "agent_tree_page",
+    z
+      .object({
+        session_id: nonNilUuidSchema,
+        nodes: z.array(agentTreeNodeSchema),
+        next_cursor: agentTreeCursorSchema.nullable().optional(),
+      })
+      .strict(),
+  ),
+  responseVariant(
+    "agent_attention_page",
+    z
+      .object({
+        session_id: nonNilUuidSchema,
+        entries: z.array(agentDecisionAttentionSchema),
+        next_cursor: agentTreeCursorSchema.nullable().optional(),
+      })
+      .strict(),
+  ),
+  responseVariant(
+    "agent_decision_steered",
+    z
+      .object({
+        session_id: nonNilUuidSchema,
+        decision_request_id: nonNilUuidSchema,
+        status: z.enum(["resolved", "steered", "already_terminal", "retry"]),
+        decision_state: z.string().min(1),
+      })
+      .strict(),
+  ),
+  responseVariant(
     "forked",
     z
       .object({
@@ -1625,6 +1748,7 @@ export type ErrorEnvelope = z.infer<typeof errorEnvelopeSchema>;
 export const knownEventKindSchema = z.enum([
   "active_model_state",
   "agent_idle",
+  "agent_tree_changed",
   "approval_mode_state",
   "assistant_text",
   "assistant_text_delta",
@@ -1933,8 +2057,29 @@ export const modelSelectionResultDataSchema = z
   .passthrough();
 export type ModelSelectionResultData = z.infer<typeof modelSelectionResultDataSchema>;
 
+const agentTreeChangedDataSchema = z
+  .object({
+    session_id: nonNilUuidSchema,
+    session_event_seq: safeI64NumberSchema,
+    transition: z.enum([
+      "agent_created",
+      "agent_state_changed",
+      "attention_raised",
+      "attention_state_changed",
+      "decision_state_changed",
+      "recovery_attached",
+    ]),
+    // An ordered, state-free invalidation. Consumers fetch the current typed
+    // tree/Attention page; a relay must never relabel later mutable state as
+    // the snapshot for this edge.
+    subject_kind: z.enum(["agent", "decision"]),
+    subject_id: nonNilUuidSchema,
+  })
+  .strict();
+
 const structuredEventDataSchemas = {
   active_model_state: activeModelStateSchema.extend({ session_id: uuidSchema }),
+  agent_tree_changed: agentTreeChangedDataSchema,
   default_model_update_result: defaultModelUpdateResultDataSchema,
   event_stream_lagged: eventStreamLaggedDataSchema,
   history_replay: historyReplayDataSchema,

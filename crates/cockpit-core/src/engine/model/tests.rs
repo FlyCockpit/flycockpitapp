@@ -5523,6 +5523,7 @@ fn utility_turn_blocking_budget_tighter() {
         UtilityCallSite::Translate,
         UtilityCallSite::SkillAutoSelect,
         UtilityCallSite::HarnessSummary,
+        UtilityCallSite::AgentTreeDecision,
     ] {
         assert_eq!(site.budget_class(), UtilityBudgetClass::Background);
     }

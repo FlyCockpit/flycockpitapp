@@ -81,6 +81,24 @@ where
     deserialize_bounded_optional_string::<MAX_OWNER_INVENTORY_CURSOR_BYTES, D>(deserializer)
 }
 
+fn validate_agent_tree_page_request(
+    session_id: Uuid,
+    root_agent_instance_id: Option<Uuid>,
+    after: Option<&AgentTreeCursor>,
+    limit: u16,
+) -> std::result::Result<(), String> {
+    if session_id.is_nil()
+        || root_agent_instance_id.is_some_and(|id| id.is_nil())
+        || after.is_some_and(|cursor| cursor.id.is_nil())
+    {
+        return Err("agent tree identifiers must not be nil".to_string());
+    }
+    if !(1..=100).contains(&limit) {
+        return Err("agent tree page limit must be between 1 and 100".to_string());
+    }
+    Ok(())
+}
+
 fn deserialize_owner_secret_name<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -995,6 +1013,38 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before_seq: Option<i64>,
         limit: u32,
+    },
+
+    /// Read a stable, paginated daemon-owned projection of one recursive
+    /// agent tree. `root_agent_instance_id = None` returns the session forest.
+    /// The response deliberately contains no provider context or process
+    /// handles; frontends render only durable lifecycle state.
+    ReadAgentTree {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root_agent_instance_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<AgentTreeCursor>,
+        limit: u16,
+    },
+
+    /// Read typed, decision-owned Attention entries. This is intentionally
+    /// separate from the legacy interrupt history so decision lifecycle state
+    /// has one ordered durable projection.
+    ReadAgentAttention {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<AgentTreeCursor>,
+        limit: u16,
+    },
+
+    /// Deliver a user-authored steer to the agent that requested a decision.
+    /// The daemon validates this answer against the persisted redacted
+    /// contract. Host approvals have no client resolution path.
+    ResolveAgentDecision {
+        session_id: Uuid,
+        decision_request_id: Uuid,
+        answer: AgentDecisionAnswer,
     },
 
     /// Per-session live status for the `/sessions` browser's top two
@@ -2414,6 +2464,45 @@ impl Request {
                     ));
                 }
             }
+            Self::ReadAgentTree {
+                session_id,
+                root_agent_instance_id,
+                after,
+                limit,
+            } => {
+                validate_agent_tree_page_request(
+                    *session_id,
+                    *root_agent_instance_id,
+                    after.as_ref(),
+                    *limit,
+                )?;
+            }
+            Self::ReadAgentAttention {
+                session_id,
+                after,
+                limit,
+            } => validate_agent_tree_page_request(*session_id, None, after.as_ref(), *limit)?,
+            Self::ResolveAgentDecision {
+                session_id,
+                decision_request_id,
+                answer,
+            } => {
+                if session_id.is_nil() || decision_request_id.is_nil() {
+                    return Err("agent decision identifiers must not be nil".to_string());
+                }
+                match answer {
+                    AgentDecisionAnswer::Option { option_id } if option_id.is_empty() => {
+                        return Err("agent decision option id must not be empty".to_string());
+                    }
+                    AgentDecisionAnswer::FreeText { text } if text.is_empty() => {
+                        return Err("agent decision free text must not be empty".to_string());
+                    }
+                    AgentDecisionAnswer::InterruptResponse { response } => {
+                        validate_agent_interrupt_response(response)?;
+                    }
+                    _ => {}
+                }
+            }
             Self::PutNamedSecret { name, value } => {
                 if name.len() > MAX_OWNER_SECRET_NAME_BYTES {
                     return Err("named secret name exceeds maximum length".to_string());
@@ -2893,6 +2982,36 @@ impl Request {
         Ok(())
     }
 }
+
+fn validate_agent_interrupt_response(response: &AgentInterruptResponse) -> Result<(), String> {
+    match response {
+        AgentInterruptResponse::Single { selected_id } => {
+            if selected_id.is_empty() {
+                return Err("agent interrupt selected id must not be empty".to_string());
+            }
+        }
+        AgentInterruptResponse::Multi { selected_ids } => {
+            if selected_ids.is_empty() || selected_ids.iter().any(String::is_empty) {
+                return Err("agent interrupt selected ids must not be empty".to_string());
+            }
+        }
+        AgentInterruptResponse::Freetext { text } => {
+            if text.is_empty() {
+                return Err("agent interrupt free text must not be empty".to_string());
+            }
+        }
+        AgentInterruptResponse::Batch { responses } => {
+            if responses.is_empty() {
+                return Err("agent interrupt batch must not be empty".to_string());
+            }
+            for response in responses {
+                validate_agent_interrupt_response(response)?;
+            }
+        }
+        AgentInterruptResponse::Cancel => {}
+    }
+    Ok(())
+}
 #[macro_export]
 macro_rules! request_variants {
     ($with_variants:ident $(, $context:ident)*) => {
@@ -2989,6 +3108,9 @@ macro_rules! request_variants {
             (Request::ReadClientSubmissionReceipt { .. }, "read_client_submission_receipt");
             (Request::ReadHistoryPage { .. }, "read_history_page");
             (Request::ReadSubagentHistoryPage { .. }, "read_subagent_history_page");
+            (Request::ReadAgentTree { .. }, "read_agent_tree");
+            (Request::ReadAgentAttention { .. }, "read_agent_attention");
+            (Request::ResolveAgentDecision { .. }, "resolve_agent_decision");
             (Request::SessionLiveStatus { .. }, "session_live_status");
             (Request::ArchiveSession { .. }, "archive_session");
             (Request::UnarchiveSession { .. }, "unarchive_session");
@@ -3271,6 +3393,9 @@ macro_rules! command {
             (Request::ReadClientSubmissionReceipt { session_id, client_submission_id }, "read_client_submission_receipt", custom(authorize_read_session_messages), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|client_submission_id:Uuid", [session_id: Uuid => session, client_submission_id: Uuid => param]);
             (Request::ReadHistoryPage { session_id, before_seq, limit }, "read_history_page", custom(authorize_read_history_page), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|before_seq:Option<i64>|limit:u32", [session_id: Uuid => session, before_seq: Option<i64> => param, limit: u32 => param]);
             (Request::ReadSubagentHistoryPage { session_id, task_call_id, label, before_seq, limit }, "read_subagent_history_page", custom(authorize_read_subagent_history_page), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String|before_seq:Option<i64>|limit:u32", [session_id: Uuid => session, task_call_id: String => param, label: String => param, before_seq: Option<i64> => param, limit: u32 => param]);
+            (Request::ReadAgentTree { session_id, root_agent_instance_id, after, limit }, "read_agent_tree", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|root_agent_instance_id:Option<Uuid>|after:Option<AgentTreeCursor>|limit:u16", [session_id: Uuid => session, root_agent_instance_id: Option<Uuid> => param, after: Option<AgentTreeCursor> => param, limit: u16 => param]);
+            (Request::ReadAgentAttention { session_id, after, limit }, "read_agent_attention", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|after:Option<AgentTreeCursor>|limit:u16", [session_id: Uuid => session, after: Option<AgentTreeCursor> => param, limit: u16 => param]);
+            (Request::ResolveAgentDecision { session_id, decision_request_id, answer }, "resolve_agent_decision", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|decision_request_id:Uuid|answer:AgentDecisionAnswer", [session_id: Uuid => session, decision_request_id: Uuid => param, answer: AgentDecisionAnswer => param]);
             (Request::SessionLiveStatus { session_ids }, "session_live_status", public_read, none, false, read_only, none, concurrent, none, "session_ids:Vec<Uuid>", [session_ids: Vec<Uuid> => param]);
             (Request::ArchiveSession { session_id, cascade }, "archive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|cascade:bool", [session_id: Uuid => session, cascade: bool => param]);
             (Request::UnarchiveSession { session_id }, "unarchive_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
@@ -3407,7 +3532,11 @@ macro_rules! command {
             (Request::StopDaemon { grace_secs }, "stop_daemon", owner_only, none, true, local_only, none, serialized, none, "grace_secs:Option<u64>", [grace_secs: Option<u64> => param]);
             (Request::RestartIfIdle, "restart_if_idle", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetHostCapabilities, "get_host_capabilities", public_read, none, false, read_only, none, concurrent, none, "-", []);
-            (Request::RefreshHostCapabilities, "refresh_host_capabilities", owner_only, none, true, local_only, none, serialized, none, "-", []);
+            // The durable HostEffect itself is serialized by the attached
+            // session worker. Its client request must remain concurrent so a
+            // single attached client can submit the matching ResolveInterrupt
+            // while this original request is awaiting that decision.
+            (Request::RefreshHostCapabilities, "refresh_host_capabilities", owner_only, none, true, local_only, none, concurrent, none, "-", []);
             (Request::MigrateKekPlacement { dest }, "migrate_kek_placement", owner_only, none, true, local_only, none, serialized, none, "dest:SecretStorePlacement", [dest: SecretStorePlacement => param]);
             (Request::ListPackages, "list_packages", owner_only, none, false, read_only, none, concurrent, none, "-", []);
             (Request::AddPackage { project_root, identifier, git, branch, local_path, deep }, "add_package", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "project_root:String|identifier:String|git:Option<String>|branch:Option<String>|local_path:Option<String>|deep:bool", [project_root: String => param, identifier: String => param, git: Option<String> => param, branch: Option<String> => param, local_path: Option<String> => param, deep: bool => param]);
@@ -3908,6 +4037,26 @@ pub fn remote_operation_uuid_v7_from_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_interrupt_response_rejects_the_same_empty_shapes_as_typescript() {
+        for response in [
+            AgentInterruptResponse::Multi {
+                selected_ids: Vec::new(),
+            },
+            AgentInterruptResponse::Freetext {
+                text: String::new(),
+            },
+            AgentInterruptResponse::Batch {
+                responses: Vec::new(),
+            },
+        ] {
+            assert!(
+                validate_agent_interrupt_response(&response).is_err(),
+                "empty response shape must be rejected: {response:?}"
+            );
+        }
+    }
 
     /// `ImportSessionArchive` must not be able to carry archive bytes inline.
     ///

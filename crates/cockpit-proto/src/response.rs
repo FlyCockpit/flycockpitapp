@@ -167,6 +167,32 @@ pub enum Response {
         oldest_seq: Option<i64>,
     },
 
+    /// Stable snapshot page for `Request::ReadAgentTree`. This carries only
+    /// daemon-owned lifecycle metadata, never a worker or resolver handle.
+    AgentTreePage {
+        session_id: Uuid,
+        nodes: Vec<AgentTreeNode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<AgentTreeCursor>,
+    },
+
+    /// Ordered, redacted Attention page for `Request::ReadAgentAttention`.
+    AgentAttentionPage {
+        session_id: Uuid,
+        entries: Vec<AgentDecisionAttention>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<AgentTreeCursor>,
+    },
+
+    /// Durable outcome of a user-authored decision steer. A terminal receipt
+    /// remains daemon-owned; the response exposes only its public state.
+    AgentDecisionSteered {
+        session_id: Uuid,
+        decision_request_id: Uuid,
+        status: String,
+        decision_state: String,
+    },
+
     /// A `/note` session-history note was recorded ([`Request::RecordSessionNote`]).
     /// `seq` is the assigned monotonic `session_events` sequence so the client
     /// can place the note row in the correct chronological position.
@@ -1120,6 +1146,9 @@ macro_rules! response_variants {
             (Response::ClientSubmissionReceipt { .. }, "client_submission_receipt");
             (Response::HistoryPage { .. }, "history_page");
             (Response::SubagentHistoryPage { .. }, "subagent_history_page");
+            (Response::AgentTreePage { .. }, "agent_tree_page");
+            (Response::AgentAttentionPage { .. }, "agent_attention_page");
+            (Response::AgentDecisionSteered { .. }, "agent_decision_steered");
             (Response::NoteRecorded { .. }, "note_recorded");
             (Response::GoalStatus { .. }, "goal_status");
             (Response::GoalUpdated { .. }, "goal_updated");

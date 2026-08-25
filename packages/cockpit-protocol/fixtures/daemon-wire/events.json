@@ -869,7 +869,9 @@
                 "referenceSupport": "unsupported",
                 "maxReferences": 0,
                 "maxSamples": 1,
-                "dimensionDescriptor": { "type": "provider_default" },
+                "dimensionDescriptor": {
+                  "type": "provider_default"
+                },
                 "typedParameterSchema": [],
                 "openRouterRouting": null,
                 "costEvidence": {
@@ -1532,6 +1534,18 @@
       "waiting": true
     },
     "event": "waiting_for_lock",
+    "kind": "evt",
+    "v": 14
+  },
+  "agent_tree_changed": {
+    "data": {
+      "session_id": "11111111-1111-4111-8111-111111111111",
+      "session_event_seq": 42,
+      "transition": "attention_state_changed",
+      "subject_kind": "decision",
+      "subject_id": "44444444-4444-4444-8444-444444444444"
+    },
+    "event": "agent_tree_changed",
     "kind": "evt",
     "v": 14
   }

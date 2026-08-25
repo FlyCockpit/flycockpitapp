@@ -535,6 +535,7 @@ mod tests {
         (
             ToolCtx {
                 agent_id: "helper".to_string(),
+                agent_instance_id: None,
                 lock_identity: "helper".to_string().clone(),
                 write_scope: None,
                 current_tool_call_id: None,

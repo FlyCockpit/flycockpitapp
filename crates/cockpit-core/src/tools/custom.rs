@@ -213,7 +213,12 @@ impl Tool for CustomBashTool {
                 ));
             };
             match approver
-                .authorize(crate::approval::AuthorizationRequest::CustomTool { tool: &self.name })
+                .authorize(crate::approval::AuthorizationRequest::CustomTool {
+                    tool: &self.name,
+                    command: &cmd,
+                    input: &args,
+                    cwd: &ctx.cwd,
+                })
                 .await?
             {
                 crate::approval::Decision::Allow { .. } => {}
@@ -265,6 +270,19 @@ impl Tool for CustomBashTool {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
+        crate::engine::interrupt::recheck_current_host_approval_effect_boundary(
+            "custom_tool_spawn",
+            &[serde_json::json!({
+                "execute": {
+                    "agent": &ctx.agent_id,
+                    "tool": &self.name,
+                    "command": &cmd,
+                    "wire_input": &args,
+                    "cwd": &ctx.cwd,
+                }
+            })],
+        )
+        .await?;
         let mut child = command.spawn()?;
         let child_pid = child.id();
         let stdout_task = crate::process::spawn_bounded_pipe_drain(

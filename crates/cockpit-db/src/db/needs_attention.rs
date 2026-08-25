@@ -8,7 +8,7 @@
 //! v1 stores the wire shapes verbatim — the TUI client and the future
 //! web/mobile client both render the same JSON.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::Utc;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -112,7 +112,13 @@ pub struct InterruptParkPayload {
 pub struct NeedsAttentionRow {
     pub interrupt_id: Uuid,
     pub session_id: Uuid,
+    /// Human-readable executor/profile name shown in the attention UI. This
+    /// is presentation only and is never used to identify a parked replay.
     pub agent_id: String,
+    /// Exact durable owner for AgentTree rows. Kept separate from `agent_id`
+    /// so same-named recursive agents cannot consume each other's recovered
+    /// QuestionTool answer. Legacy attention rows intentionally leave it NULL.
+    pub agent_instance_id: Option<Uuid>,
     pub description: String,
     pub question: Option<InterruptQuestion>,
     /// Multi-question batch (GOALS §3b). Stored in the same
@@ -134,6 +140,28 @@ impl Db {
         description: &str,
         question: Option<&InterruptQuestion>,
     ) -> Result<Uuid> {
+        self.raise_interrupt_with_agent_instance(
+            session_id,
+            agent_id,
+            None,
+            description,
+            question,
+        )
+        .await
+    }
+
+    /// Single-question counterpart to
+    /// [`Self::raise_interrupt_questions_with_agent_instance_and_payload`].
+    /// The display label and exact durable owner intentionally travel as
+    /// separate values.
+    pub async fn raise_interrupt_with_agent_instance(
+        &self,
+        session_id: Uuid,
+        agent_id: &str,
+        agent_instance_id: Option<Uuid>,
+        description: &str,
+        question: Option<&InterruptQuestion>,
+    ) -> Result<Uuid> {
         let interrupt_id = Uuid::new_v4();
         let raised_at = Utc::now().timestamp();
         let question_json = match question {
@@ -141,16 +169,18 @@ impl Db {
             None => None,
         };
         let agent_id = agent_id.to_owned();
+        let agent_instance_id = agent_instance_id.map(|id| id.to_string());
         let description = description.to_owned();
         self.write(move |conn| {
             conn.execute(
                 "INSERT INTO needs_attention
-                 (interrupt_id, session_id, agent_id, description, question_json, raised_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (interrupt_id, session_id, agent_id, agent_instance_id, description, question_json, raised_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     interrupt_id.to_string(),
                     session_id.to_string(),
                     agent_id,
+                    agent_instance_id,
                     description,
                     question_json,
                     raised_at,
@@ -193,6 +223,29 @@ impl Db {
         questions: &InterruptQuestionSet,
         parked: Option<&InterruptParkPayload>,
     ) -> Result<Uuid> {
+        self.raise_interrupt_questions_with_agent_instance_and_payload(
+            session_id,
+            agent_id,
+            None,
+            description,
+            questions,
+            parked,
+        )
+        .await
+    }
+
+    /// Persist a QuestionTool interrupt with its exact durable AgentTree
+    /// owner. `agent_id` remains the display label; `agent_instance_id` is the
+    /// typed continuation identity used by decision binding and recovery.
+    pub async fn raise_interrupt_questions_with_agent_instance_and_payload(
+        &self,
+        session_id: Uuid,
+        agent_id: &str,
+        agent_instance_id: Option<Uuid>,
+        description: &str,
+        questions: &InterruptQuestionSet,
+        parked: Option<&InterruptParkPayload>,
+    ) -> Result<Uuid> {
         let interrupt_id = Uuid::new_v4();
         let raised_at = Utc::now().timestamp();
         let questions_json = serde_json::to_string(questions).context("serializing questions")?;
@@ -216,18 +269,20 @@ impl Db {
             .transpose()
             .context("serializing parked gate memo")?;
         let agent_id = agent_id.to_owned();
+        let agent_instance_id = agent_instance_id.map(|id| id.to_string());
         let description = description.to_owned();
         self.write(move |conn| {
             conn.execute(
                 "INSERT INTO needs_attention
-                 (interrupt_id, session_id, agent_id, description, questions_json, raised_at,
+                 (interrupt_id, session_id, agent_id, agent_instance_id, description, questions_json, raised_at,
                   state, parked_tool, parked_args_json, parked_call_id, parked_resume_json,
                   parked_gate_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?9, ?10, ?11, ?12)",
                 params![
                     interrupt_id.to_string(),
                     session_id.to_string(),
                     agent_id,
+                    agent_instance_id,
                     description,
                     questions_json,
                     raised_at,
@@ -259,12 +314,37 @@ impl Db {
                     "UPDATE needs_attention
                         SET resolved_at = ?1, response_json = ?2, state = 'resolved'
                       WHERE interrupt_id = ?3 AND state = 'open'
-                        AND decision_request_id IS NULL",
+                        AND (decision_request_id IS NULL
+                             OR question_json IS NOT NULL OR questions_json IS NOT NULL)",
                     params![now, response_json, interrupt_id.to_string()],
-                )
-                .context("resolving needs_attention")?;
+            )
+            .context("resolving needs_attention")?;
             if affected == 0 {
-                anyhow::bail!("interrupt {interrupt_id} not found or not open");
+                // AgentTree terminalization owns the same real QuestionTool
+                // row and may have committed its response projection first.
+                // Treat that exact terminal pairing as an idempotent legacy
+                // resolve so the in-memory InterruptHub can still wake the
+                // original continuation; never accept an arbitrary resolved
+                // attention row as a valid replay acknowledgement.
+                let linked_terminal: Option<i64> = conn
+                    .query_row(
+                        "SELECT 1
+                           FROM needs_attention n
+                           JOIN decision_requests d
+                             ON d.decision_request_id = n.decision_request_id
+                            AND d.session_id = n.session_id
+                          WHERE n.interrupt_id = ?1
+                            AND n.state = 'resolved'
+                            AND n.decision_request_id IS NOT NULL
+                            AND (n.question_json IS NOT NULL OR n.questions_json IS NOT NULL)
+                            AND d.state IN ('answered', 'auto_resolved', 'timed_out', 'cancelled')",
+                        [interrupt_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if linked_terminal.is_none() {
+                    anyhow::bail!("interrupt {interrupt_id} not found or not open");
+                }
             }
             Ok(())
         })
@@ -275,13 +355,14 @@ impl Db {
         self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT interrupt_id, session_id, agent_id, description,
+                    "SELECT interrupt_id, session_id, agent_id, agent_instance_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
                             parked_resume_json, parked_gate_json
                        FROM needs_attention
                       WHERE session_id = ?1
-                        AND decision_request_id IS NULL
+                        AND (decision_request_id IS NULL
+                             OR question_json IS NOT NULL OR questions_json IS NOT NULL)
                         AND state IN ('open', 'parked')
                       ORDER BY raised_at ASC, rowid ASC",
                 )
@@ -305,13 +386,14 @@ impl Db {
         self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT interrupt_id, session_id, agent_id, description,
+                    "SELECT interrupt_id, session_id, agent_id, agent_instance_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
                             parked_resume_json, parked_gate_json
                        FROM needs_attention
                       WHERE session_id = ?1
-                        AND decision_request_id IS NULL
+                        AND (decision_request_id IS NULL
+                             OR question_json IS NOT NULL OR questions_json IS NOT NULL)
                         AND state IN ('open', 'parked', 'executing')
                       ORDER BY raised_at ASC, rowid ASC",
                 )
@@ -332,12 +414,14 @@ impl Db {
         self.read(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT interrupt_id, session_id, agent_id, description,
+                    "SELECT interrupt_id, session_id, agent_id, agent_instance_id, description,
                             question_json, questions_json, raised_at, resolved_at, response_json,
                             state, parked_tool, parked_args_json, parked_call_id,
                             parked_resume_json, parked_gate_json
                        FROM needs_attention
-                      WHERE interrupt_id = ?1 AND decision_request_id IS NULL",
+                      WHERE interrupt_id = ?1
+                        AND (decision_request_id IS NULL
+                             OR question_json IS NOT NULL OR questions_json IS NOT NULL)",
                 )
                 .context("preparing get_interrupt")?;
             let mut rows = stmt
@@ -353,17 +437,20 @@ impl Db {
 
     pub async fn interrupt_question_occurrence(&self, interrupt_id: Uuid) -> Result<usize> {
         self.read(move |conn| {
-            let (rowid, session_id, agent_id, description, questions_json): (
+            let (rowid, session_id, agent_id, agent_instance_id, description, questions_json): (
                 i64,
                 String,
                 String,
+                Option<String>,
                 String,
                 Option<String>,
             ) = conn
                 .query_row(
-                    "SELECT rowid, session_id, agent_id, description, questions_json
+                    "SELECT rowid, session_id, agent_id, agent_instance_id, description, questions_json
                        FROM needs_attention
-                      WHERE interrupt_id = ?1 AND decision_request_id IS NULL",
+                      WHERE interrupt_id = ?1
+                        AND (decision_request_id IS NULL
+                             OR question_json IS NOT NULL OR questions_json IS NOT NULL)",
                     [interrupt_id.to_string()],
                     |row| {
                         Ok((
@@ -372,6 +459,7 @@ impl Db {
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
+                            row.get(5)?,
                         ))
                     },
                 )
@@ -381,15 +469,17 @@ impl Db {
                     "SELECT COUNT(*)
                        FROM needs_attention
                       WHERE session_id = ?1
-                        AND decision_request_id IS NULL
+                        AND (decision_request_id IS NULL
+                             OR question_json IS NOT NULL OR questions_json IS NOT NULL)
                         AND rowid <= ?2
-                        AND agent_id = ?3
-                        AND description = ?4
+                        AND ((agent_instance_id IS NOT NULL AND agent_instance_id = ?3)
+                             OR (agent_instance_id IS NULL AND ?3 IS NULL AND agent_id = ?4))
+                        AND description = ?5
                         AND (
-                            questions_json = ?5
-                            OR (questions_json IS NULL AND ?5 IS NULL)
+                            questions_json = ?6
+                            OR (questions_json IS NULL AND ?6 IS NULL)
                         )",
-                    params![session_id, rowid, agent_id, description, questions_json],
+                    params![session_id, rowid, agent_instance_id, agent_id, description, questions_json],
                     |row| row.get(0),
                 )
                 .context("querying interrupt question occurrence")?;
@@ -400,15 +490,62 @@ impl Db {
 
     pub async fn park_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
         self.write(move |conn| {
+            // A real QuestionTool interrupt can be bound to a pending
+            // AgentTree decision.  Parking is still part of the original
+            // continuation protocol, so make that one reversible projection
+            // update under the same short-lived DB guard used by terminal
+            // decision settlement.  Synthetic Attention rows never reach
+            // this branch because they have no question payload.
+            let linked_decision: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT decision_request_id, session_id
+                       FROM needs_attention
+                      WHERE interrupt_id = ?1
+                        AND state = 'open'
+                        AND decision_request_id IS NOT NULL
+                        AND (question_json IS NOT NULL OR questions_json IS NOT NULL)",
+                    [interrupt_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((decision_request_id, session_id)) = linked_decision.as_ref() {
+                conn.execute(
+                    "INSERT INTO decision_attention_mutation_guards (decision_request_id, session_id)
+                     VALUES (?1, ?2)",
+                    params![decision_request_id, session_id],
+                )?;
+            }
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
-                        SET state = 'parked'
+                        SET state = 'parked', revision = revision + 1
                       WHERE interrupt_id = ?1 AND state = 'open'
-                        AND decision_request_id IS NULL",
+                        AND (decision_request_id IS NULL
+                             OR question_json IS NOT NULL OR questions_json IS NOT NULL)",
                     params![interrupt_id.to_string()],
                 )
                 .context("parking needs_attention")?;
+            if affected == 1
+                && let Some((decision_request_id, session_id)) = linked_decision.as_ref()
+            {
+                crate::db::agent_tree_decisions::insert_control_event(
+                    conn,
+                    Uuid::parse_str(session_id).context("decoding linked interrupt session id")?,
+                    "attention_transition",
+                    Uuid::parse_str(decision_request_id)
+                        .context("decoding linked interrupt decision id")?,
+                    InterruptState::Parked.as_str(),
+                    Utc::now().timestamp_millis(),
+                )?;
+            }
+            if let Some((decision_request_id, session_id)) = linked_decision {
+                let removed = conn.execute(
+                    "DELETE FROM decision_attention_mutation_guards
+                     WHERE decision_request_id = ?1 AND session_id = ?2",
+                    params![decision_request_id, session_id],
+                )?;
+                ensure!(removed == 1, "parked interrupt decision guard disappeared");
+            }
             Ok(affected > 0)
         })
         .await
@@ -504,15 +641,64 @@ impl Db {
     pub async fn complete_executing_interrupt(&self, interrupt_id: Uuid) -> Result<bool> {
         let now = Utc::now().timestamp();
         self.write(move |conn| {
+            // A linked QuestionTool row is protected by the decision-owned
+            // projection trigger. Its decision was already terminal before
+            // the parked continuation could be replayed, so install the
+            // short-lived guard only for that exact terminal pair.
+            let linked_decision: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT n.decision_request_id, n.session_id
+                       FROM needs_attention n
+                       JOIN decision_requests d
+                         ON d.decision_request_id = n.decision_request_id
+                        AND d.session_id = n.session_id
+                      WHERE n.interrupt_id = ?1
+                        AND n.state = 'executing'
+                        AND n.decision_request_id IS NOT NULL
+                        AND (n.question_json IS NOT NULL OR n.questions_json IS NOT NULL)
+                        AND d.state IN ('answered', 'auto_resolved', 'timed_out', 'cancelled')",
+                    [interrupt_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((decision_request_id, session_id)) = linked_decision.as_ref() {
+                conn.execute(
+                    "INSERT INTO decision_attention_mutation_guards (decision_request_id, session_id)
+                     VALUES (?1, ?2)",
+                    params![decision_request_id, session_id],
+                )?;
+            }
             let affected = conn
                 .execute(
                     "UPDATE needs_attention
-                        SET state = 'resolved', resolved_at = ?1
+                        SET state = 'resolved', resolved_at = ?1, revision = revision + 1
                       WHERE interrupt_id = ?2 AND state = 'executing'
-                        AND decision_request_id IS NULL",
+                        AND (decision_request_id IS NULL
+                             OR question_json IS NOT NULL OR questions_json IS NOT NULL)",
                     params![now, interrupt_id.to_string()],
                 )
                 .context("completing executing interrupt")?;
+            if affected == 1
+                && let Some((decision_request_id, session_id)) = linked_decision.as_ref()
+            {
+                crate::db::agent_tree_decisions::insert_control_event(
+                    conn,
+                    Uuid::parse_str(session_id).context("decoding linked interrupt session id")?,
+                    "attention_transition",
+                    Uuid::parse_str(decision_request_id)
+                        .context("decoding linked interrupt decision id")?,
+                    InterruptState::Resolved.as_str(),
+                    Utc::now().timestamp_millis(),
+                )?;
+            }
+            if let Some((decision_request_id, session_id)) = linked_decision {
+                let removed = conn.execute(
+                    "DELETE FROM decision_attention_mutation_guards
+                     WHERE decision_request_id = ?1 AND session_id = ?2",
+                    params![decision_request_id, session_id],
+                )?;
+                ensure!(removed == 1, "executing interrupt decision guard disappeared");
+            }
             Ok(affected > 0)
         })
         .await
@@ -690,6 +876,17 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NeedsAttentionRow> {
         interrupt_id,
         session_id,
         agent_id: row.get("agent_id")?,
+        agent_instance_id: row
+            .get::<_, Option<String>>("agent_instance_id")?
+            .map(|raw| Uuid::parse_str(&raw))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
         description: row.get("description")?,
         question,
         questions,
@@ -856,6 +1053,7 @@ mod tests {
             interrupt_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
             agent_id: "builder".into(),
+            agent_instance_id: None,
             description: String::new(),
             question: None,
             questions: Some(InterruptQuestionSet {

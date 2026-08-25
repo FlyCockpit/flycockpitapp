@@ -11293,6 +11293,44 @@ fn oauth_exchange_failure_and_cancellation_have_atomic_receipt_cleanup() {
 }
 
 #[test]
+fn oauth_cancel_candidate_validation_loads_once_and_propagates_storage_errors() {
+    let source = include_str!("dispatch.rs");
+    for (branch, next) in [
+        ("Request::CancelProviderOAuth", "Request::BeginMcpOAuth"),
+        (
+            "Request::CancelMcpOAuth",
+            "Request::DeleteProviderCredential",
+        ),
+    ] {
+        let body = source
+            .split(branch)
+            .nth(1)
+            .and_then(|tail| tail.split(next).next())
+            .unwrap_or_else(|| panic!("missing {branch} handler body"));
+        let candidate_validation = body
+            .split("match candidate {")
+            .nth(1)
+            .and_then(|tail| tail.split("let _lock = SECRET_OWNER_RPC_LOCK").next())
+            .unwrap_or_else(|| panic!("missing {branch} durable candidate validation"));
+        assert_eq!(
+            candidate_validation
+                .matches("load_oauth_flow(ctx, &candidate)?")
+                .count(),
+            1,
+            "{branch} must load its durable candidate exactly once and propagate failures"
+        );
+        assert!(
+            !candidate_validation.contains("candidate.filter("),
+            "{branch} must not collapse durable load failures into a missing candidate"
+        );
+        assert!(
+            !candidate_validation.contains("Ok(Some(DurableOAuthFlow"),
+            "{branch} must not match away durable load failures"
+        );
+    }
+}
+
+#[test]
 fn oauth_token_commit_requires_the_exact_durable_exchange_marker() {
     let source = include_str!("dispatch.rs");
     for (kind, marker) in [

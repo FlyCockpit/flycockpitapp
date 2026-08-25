@@ -9801,30 +9801,34 @@ async fn handle_serialized_request_impl(
                         _ => None,
                     }
                 };
-                candidate.filter(|candidate| {
-                    matches!(
-                        load_oauth_flow(ctx, candidate),
-                        Ok(Some(DurableOAuthFlow::Provider {
-                            owner: durable_owner,
-                            begin_client_operation_id: durable_begin,
-                            ..
-                        })) if durable_owner == owner && durable_begin == begin_client_operation_id
-                    ) || matches!(
-                        load_oauth_flow(ctx, candidate),
-                        Ok(Some(DurableOAuthFlow::ProviderExchanging {
-                            owner: durable_owner,
-                            begin_client_operation_id: durable_begin,
-                            ..
-                        })) if durable_owner == owner && durable_begin == begin_client_operation_id
-                    ) || matches!(
-                        load_oauth_flow(ctx, candidate),
-                        Ok(Some(DurableOAuthFlow::ProviderCommitted {
-                            owner: durable_owner,
-                            begin_client_operation_id: durable_begin,
-                            ..
-                        })) if durable_owner == owner && durable_begin == begin_client_operation_id
-                    )
-                })
+                match candidate {
+                    Some(candidate) => {
+                        let durable_candidate = load_oauth_flow(ctx, &candidate)?;
+                        match durable_candidate {
+                            Some(DurableOAuthFlow::Provider {
+                                owner: durable_owner,
+                                begin_client_operation_id: durable_begin,
+                                ..
+                            })
+                            | Some(DurableOAuthFlow::ProviderExchanging {
+                                owner: durable_owner,
+                                begin_client_operation_id: durable_begin,
+                                ..
+                            })
+                            | Some(DurableOAuthFlow::ProviderCommitted {
+                                owner: durable_owner,
+                                begin_client_operation_id: durable_begin,
+                                ..
+                            }) if durable_owner == owner
+                                && durable_begin == begin_client_operation_id =>
+                            {
+                                Some(candidate)
+                            }
+                            _ => None,
+                        }
+                    }
+                    None => None,
+                }
             };
             // Serialize with the persistence fence. An acknowledged cancellation
             // therefore either wins before the vault commit or reports that the
@@ -10637,30 +10641,34 @@ async fn handle_serialized_request_impl(
                         _ => None,
                     }
                 };
-                candidate.filter(|candidate| {
-                    matches!(
-                        load_oauth_flow(ctx, candidate),
-                        Ok(Some(DurableOAuthFlow::Mcp {
-                            owner: durable_owner,
-                            begin_client_operation_id: durable_begin,
-                            ..
-                        })) if durable_owner == owner && durable_begin == begin_client_operation_id
-                    ) || matches!(
-                        load_oauth_flow(ctx, candidate),
-                        Ok(Some(DurableOAuthFlow::McpExchanging {
-                            owner: durable_owner,
-                            begin_client_operation_id: durable_begin,
-                            ..
-                        })) if durable_owner == owner && durable_begin == begin_client_operation_id
-                    ) || matches!(
-                        load_oauth_flow(ctx, candidate),
-                        Ok(Some(DurableOAuthFlow::McpCommitted {
-                            owner: durable_owner,
-                            begin_client_operation_id: durable_begin,
-                            ..
-                        })) if durable_owner == owner && durable_begin == begin_client_operation_id
-                    )
-                })
+                match candidate {
+                    Some(candidate) => {
+                        let durable_candidate = load_oauth_flow(ctx, &candidate)?;
+                        match durable_candidate {
+                            Some(DurableOAuthFlow::Mcp {
+                                owner: durable_owner,
+                                begin_client_operation_id: durable_begin,
+                                ..
+                            })
+                            | Some(DurableOAuthFlow::McpExchanging {
+                                owner: durable_owner,
+                                begin_client_operation_id: durable_begin,
+                                ..
+                            })
+                            | Some(DurableOAuthFlow::McpCommitted {
+                                owner: durable_owner,
+                                begin_client_operation_id: durable_begin,
+                                ..
+                            }) if durable_owner == owner
+                                && durable_begin == begin_client_operation_id =>
+                            {
+                                Some(candidate)
+                            }
+                            _ => None,
+                        }
+                    }
+                    None => None,
+                }
             };
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             let (cancelled, committed) = if let Some(flow_id) = resolved_flow_id.as_deref() {

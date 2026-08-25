@@ -317,6 +317,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         }
         proto::Response::Attached {
             session_id: _,
+            session_entry_mode: _,
             short_id: _,
             project_root,
             project_id: _,
@@ -1546,6 +1547,7 @@ fn scrub_resume_repair_state(state: &mut proto::ResumeRepairState, redact: &Reda
 fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &RedactionTable) {
     let proto::SessionSummary {
         session_id: _,
+        session_entry_mode: _,
         short_id: _,
         project_root,
         project_id: _,

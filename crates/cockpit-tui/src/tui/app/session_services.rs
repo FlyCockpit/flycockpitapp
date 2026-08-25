@@ -714,6 +714,9 @@ impl App {
     /// AgentRunner publishes the new submission binding. The outcome retains
     /// its transition guard for this entire synchronous adoption.
     fn adopt_session_switch_identity(&mut self, outcome: &agent_runner::SessionSwitchOutcome) {
+        // Preserve-history / side-conversation switches bypass the normal
+        // chrome path, but their Attached outcome is equally authoritative.
+        self.session_mode = Some(outcome.session_entry_mode);
         self.start_model_state_epoch(
             Some(outcome.session_id),
             outcome.active_model_state.as_ref(),
@@ -732,6 +735,9 @@ impl App {
         outcome: agent_runner::SessionSwitchOutcome,
         resume_chrome: bool,
     ) {
+        // Every switch snapshot carries the daemon-owned setup value. Never
+        // retain a stale local command-line choice after a daemon response.
+        self.session_mode = Some(outcome.session_entry_mode);
         // Session navigation changes the owner view before any authoritative
         // replacement state is installed. Blocking results from the previous
         // view are cancelled and cannot mutate the new transcript or chrome.

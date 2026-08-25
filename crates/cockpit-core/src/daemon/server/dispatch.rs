@@ -3907,6 +3907,7 @@ async fn handle_serialized_request_impl(
             initial_model,
             no_sandbox,
             interactive,
+            session_entry_mode,
             model_override,
             client_protocol_version,
             env_snapshot,
@@ -3922,6 +3923,7 @@ async fn handle_serialized_request_impl(
                 initial_model,
                 no_sandbox,
                 interactive,
+                session_entry_mode,
                 model_override,
                 client_protocol_version,
                 env_snapshot,
@@ -20107,6 +20109,7 @@ pub(super) async fn attach(
     initial_model: Option<crate::config::providers::ActiveModelRef>,
     no_sandbox: bool,
     interactive: bool,
+    requested_session_entry_mode: Option<proto::SessionEntryMode>,
     model_override: Option<crate::config::providers::ActiveModelRef>,
     client_protocol_version: u32,
     env_snapshot: Option<EnvSnapshotWire>,
@@ -20124,9 +20127,82 @@ pub(super) async fn attach(
     let model_override = model_override.filter(|_| session_id.is_none());
     let project_root = project_root.map(PathBuf::from);
 
-    let cfg_root = match (session_id, &project_root) {
-        (Some(id), _) => match ctx.db.get_session(id).await {
-            Ok(Some(row)) => Some(PathBuf::from(row.project_root)),
+    // Claim an in-memory lazy session before consulting SQLite. Until its
+    // first user message it intentionally has no durable row; only the
+    // registry owns its identity, project root, and immutable setup mode.
+    // Authorization has already limited this path to the local owner.
+    let live_claim = match session_id {
+        Some(id) => ctx
+            .registry
+            .claim_live_attach_if_present(id)
+            .await
+            .map_err(internal)?,
+        None => None,
+    };
+    let mut session_entry_mode = match (session_id, requested_session_entry_mode) {
+        // Existing-session input is checked against the durable row below.
+        // The placeholder is replaced before the registry sees it.
+        (Some(_), Some(_)) => proto::SessionEntryMode::Code,
+        (None, None) => {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: "new-session attach requires session_entry_mode".into(),
+            });
+        }
+        (None, Some(mode)) => mode,
+        // Durable mode is loaded with the project root below, before the
+        // registry can expose a resumed/live worker to this client.
+        (Some(_), None) => proto::SessionEntryMode::Code,
+    };
+    let cfg_root = match (session_id, live_claim.as_ref(), &project_root) {
+        (Some(_), Some(claim), _) => {
+            let mode = claim.session_entry_mode();
+            if let Some(requested) = requested_session_entry_mode
+                && requested != mode
+            {
+                return Err(ErrorPayload {
+                    code: ErrorCode::BadRequest,
+                    message: format!(
+                        "session entry mode conflict: session is {}, attach requested {}",
+                        mode.as_str(),
+                        requested.as_str()
+                    ),
+                });
+            }
+            // The live worker is the sole source of lazy-session identity;
+            // never accept a caller project root or setup mode here.
+            session_entry_mode = mode;
+            Some(claim.project_root().clone())
+        }
+        (Some(id), None, _) => match ctx.db.get_session(id).await {
+            Ok(Some(row)) => {
+                let mode = match row.session_entry_mode.as_str() {
+                    "code" => proto::SessionEntryMode::Code,
+                    "assistant" => proto::SessionEntryMode::Assistant,
+                    "computer" => proto::SessionEntryMode::Computer,
+                    invalid => {
+                        return Err(ErrorPayload {
+                            code: ErrorCode::BadRequest,
+                            message: format!("invalid persisted session entry mode {invalid:?}"),
+                        });
+                    }
+                };
+                if let Some(requested) = requested_session_entry_mode
+                    && requested != mode
+                {
+                    return Err(ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: format!(
+                            "session entry mode conflict: session is {}, attach requested {}",
+                            mode.as_str(),
+                            requested.as_str()
+                        ),
+                    });
+                }
+                // Rebind from daemon storage, never from caller input.
+                session_entry_mode = mode;
+                Some(PathBuf::from(row.project_root))
+            }
             Ok(None) => {
                 return Err(ErrorPayload {
                     code: ErrorCode::UnknownSession,
@@ -20135,8 +20211,8 @@ pub(super) async fn attach(
             }
             Err(e) => return Err(internal(e)),
         },
-        (None, Some(root)) => Some(root.clone()),
-        (None, None) => {
+        (None, _, Some(root)) => Some(root.clone()),
+        (None, _, None) => {
             return Err(ErrorPayload {
                 code: ErrorCode::BadRequest,
                 message: "attach requires session_id or project_root".into(),
@@ -20200,18 +20276,61 @@ pub(super) async fn attach(
     let (session_env, env_baseline_meta, env_session_meta, env_drift, env_policy_applied) =
         select_session_env(ctx, client_snapshot, env_policy)?;
 
-    let handle = ctx
-        .registry
-        .attach(
-            session_id,
-            project_root,
-            initial_model,
-            client_no_sandbox,
-            model_override.as_ref(),
-            session_env,
-        )
-        .await
-        .map_err(workspace_trust_error)?;
+    let handle = if let Some(claim) = live_claim {
+        // Validation above has proved the optional client assertion equals the
+        // claim's daemon-owned mode. Only now may this reattach reclaim its
+        // released session locks. The generation check makes any close/replace
+        // race content-free: retry so the next request resolves the current
+        // live worker or durable row instead of using stale mode/root facts.
+        let Some(handle) = ctx
+            .registry
+            .activate_claimed_live_session(claim)
+            .await
+            .map_err(internal)?
+        else {
+            return Err(ErrorPayload {
+                code: ErrorCode::Conflict,
+                message: "session changed while attaching; retry the attach".into(),
+            });
+        };
+        handle
+    } else {
+        ctx.registry
+            .attach(
+                session_id,
+                project_root,
+                initial_model,
+                client_no_sandbox,
+                model_override.as_ref(),
+                session_env,
+                session_entry_mode,
+            )
+            .await
+            .map_err(|error| {
+                if error
+                    .downcast_ref::<crate::daemon::registry::SessionEntryModeConflict>()
+                    .is_some()
+                {
+                    ErrorPayload {
+                        code: ErrorCode::BadRequest,
+                        message: error.to_string(),
+                    }
+                } else if error
+                    .downcast_ref::<crate::daemon::registry::SessionAttachRetry>()
+                    .is_some()
+                    || error
+                        .downcast_ref::<crate::daemon::registry::SessionTerminalCleanupRetry>()
+                        .is_some()
+                {
+                    ErrorPayload {
+                        code: ErrorCode::Conflict,
+                        message: error.to_string(),
+                    }
+                } else {
+                    workspace_trust_error(error)
+                }
+            })?
+    };
     // Attach-only projections use the policy snapshot of the handle that the
     // registry actually returned. This is safe for both branches: live
     // workers retain their original policy, while newly-started workers have
@@ -20284,6 +20403,7 @@ pub(super) async fn attach(
     // persist) and has no `sessions` row yet, so `get_session` would miss.
     let project_id = handle.project_id();
     let short_id = handle.short_id();
+    let session_entry_mode = handle.session_entry_mode();
     let active_model_state = handle.authoritative_active_model_state().map(|mut state| {
         state.generation = 0;
         state
@@ -20420,6 +20540,7 @@ pub(super) async fn attach(
 
     Ok(Response::Attached {
         session_id,
+        session_entry_mode,
         short_id,
         project_root,
         project_id,

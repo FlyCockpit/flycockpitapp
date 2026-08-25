@@ -186,6 +186,7 @@ impl App {
         let cwd = self.launch.cwd.clone();
         let no_sandbox = self.no_sandbox;
         let mode = self.lifecycle_mode();
+        let session_entry_mode = self.session_mode;
         let worker_cwd = cwd.clone();
         let action_id = self
             .async_actions
@@ -195,16 +196,24 @@ impl App {
                 async move {
                     let runner = match initial_model {
                         Some(model) => {
-                            agent_runner::try_spawn_with_model(
+                            agent_runner::try_spawn_with_model_and_entry_mode(
                                 &worker_cwd,
                                 requested_session_id,
                                 model,
                                 no_sandbox,
                                 mode,
+                                session_entry_mode,
                             )
                             .await
                         }
-                        None => agent_runner::try_spawn(&worker_cwd, no_sandbox, mode).await,
+                        None => agent_runner::try_spawn_or_attach_with_entry_mode(
+                            &worker_cwd,
+                            requested_session_id,
+                            no_sandbox,
+                            mode,
+                            session_entry_mode,
+                        )
+                        .await,
                     }?;
                     Ok(AsyncActionPayload::AgentRunnerAttached(Box::new(runner)))
                 },
@@ -340,6 +349,8 @@ impl App {
     pub(super) fn adopt_runner(&mut self, runner: Result<AgentRunner, String>) {
         let mut runner = runner;
         if let Ok(r) = &mut runner {
+            // The daemon, not the CLI parser, is authoritative after Attach.
+            self.session_mode = Some(r.session_entry_mode);
             self.start_model_state_epoch(Some(r.session_id()), r.active_model_state.as_ref());
             let live_btw_fork = r.btw_fork.clone();
             self.reset_display_attach_backoff();

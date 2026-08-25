@@ -32,7 +32,7 @@ use cockpit_db::db::text_artifacts::{
 // bounds archive resource use.
 const MAX_IMPORT_ENTRIES: usize = 16_384;
 const MAX_IMPORT_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
-const EXPORT_SCHEMA: &str = "cockpit-session-export/3";
+const EXPORT_SCHEMA: &str = "cockpit-session-export/4";
 const INLINE_USER_TEXT_BYTES: usize = 64 * 1024;
 const MAX_TEXT_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SESSION_TEXT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
@@ -983,6 +983,11 @@ fn parse_session(value: &Value) -> Result<ImportedSession> {
     let object = value
         .as_object()
         .ok_or_else(|| anyhow!("import manifest session must be an object"))?;
+    let session_entry_mode = required_string(object, "session_entry_mode", "import manifest session")?;
+    anyhow::ensure!(
+        matches!(session_entry_mode.as_str(), "code" | "assistant" | "computer"),
+        "import manifest session has invalid session_entry_mode"
+    );
     Ok(ImportedSession {
         source_id: parse_uuid(
             required_string(object, "session_id", "import manifest session")?,
@@ -1012,6 +1017,7 @@ fn parse_session(value: &Value) -> Result<ImportedSession> {
             }
             None => bail!("import manifest session lacks active_model"),
         },
+        session_entry_mode,
         active_agent: required_string(object, "active_agent", "import manifest session")?,
         started_at: required_i64(object, "started_at", "import manifest session")?,
         ended_at: optional_i64(object.get("ended_at"), "ended_at")?,
@@ -1204,6 +1210,7 @@ mod tests {
                 short_id: Some("imported".into()),
                 fork_point_turn_id: None,
                 active_model: None,
+                session_entry_mode: "code".into(),
                 active_agent: "Build".into(),
                 started_at: 1,
                 ended_at: None,
@@ -1270,11 +1277,60 @@ mod tests {
                 "provider": "test-provider",
                 "model": "test-model",
             },
+            "session_entry_mode": "code",
             "active_agent": "Build",
             "started_at": 100,
             "ended_at": null,
             "title": "Imported session",
         })
+    }
+
+    #[test]
+    fn modes_session_setup_archive_mode_is_required_and_exact() {
+        let id = Uuid::new_v4();
+        let mut missing = session(id, None);
+        missing
+            .as_object_mut()
+            .expect("session fixture is an object")
+            .remove("session_entry_mode");
+        assert!(
+            parse_session(&missing)
+                .expect_err("archive import must not default a missing entry mode")
+                .to_string()
+                .contains("session_entry_mode")
+        );
+
+        let mut invalid = session(id, None);
+        invalid["session_entry_mode"] = json!("operator");
+        assert!(
+            parse_session(&invalid)
+                .expect_err("archive import must reject an unknown entry mode")
+                .to_string()
+                .contains("invalid session_entry_mode")
+        );
+
+        let mut computer = session(id, None);
+        computer["session_entry_mode"] = json!("computer");
+        assert_eq!(
+            parse_session(&computer)
+                .expect("canonical entry mode imports")
+                .session_entry_mode,
+            "computer"
+        );
+    }
+
+    #[test]
+    fn modes_session_setup_rejects_prerelease_export_schema_three_without_a_shim() {
+        let archive = archive_bytes_with_schema(
+            "cockpit-session-export/3",
+            vec![session(Uuid::new_v4(), None)],
+            Vec::new(),
+            false,
+        );
+        let error = read_archive_bytes(&archive)
+            .expect_err("the obsolete export schema must not be parsed as v4")
+            .to_string();
+        assert!(error.contains("unsupported export schema"), "{error}");
     }
 
     fn archive_bytes(sessions: Vec<Value>, events: Vec<Value>, redacted: bool) -> Vec<u8> {

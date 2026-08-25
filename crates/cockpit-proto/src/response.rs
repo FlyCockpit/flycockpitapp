@@ -89,6 +89,10 @@ pub enum Response {
 
     Attached {
         session_id: Uuid,
+        /// Authoritative immutable entry setup read from the session by the
+        /// daemon. Clients render this value rather than trusting local CLI
+        /// parsing after attach/reconnect.
+        session_entry_mode: crate::SessionEntryMode,
         /// 6-char display id (GOALS §17b). Used by the TUI as the
         /// predecessor short-id when this session later spawns a
         /// `/compact` handoff. Empty for pre-§17 rows not yet backfilled.

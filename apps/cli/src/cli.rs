@@ -74,9 +74,21 @@ pub enum Command {
     #[command(subcommand)]
     Agent(AgentCommand),
 
-    /// User-facing assistant workflows.
+    /// Start an interactive Code session.
+    Code,
+
+    /// Start an interactive Assistant session.
+    Assistant,
+
+    /// Start an interactive Computer session.
+    Computer,
+
+    /// Manage legacy persistent assistant definitions and media accounting.
+    ///
+    /// This is deliberately separate from `cockpit assistant`, which is the
+    /// interactive Assistant-mode entry point.
     #[command(subcommand)]
-    Assistant(AssistantCommand),
+    Assistants(AssistantCommand),
 
     /// Manage the FlyCockpit account used for SaaS sync and relay access.
     #[cfg(feature = "remote")]
@@ -1549,6 +1561,28 @@ mod tests {
         let cli = Cli::try_parse_from(["cockpit"]).unwrap();
         assert!(cli.project.is_none());
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn modes_session_setup_mode_entries_and_legacy_assistant_management_parse_distinctly() {
+        assert!(matches!(
+            Cli::try_parse_from(["cockpit", "code"]).unwrap().command,
+            Some(Command::Code)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cockpit", "assistant"]).unwrap().command,
+            Some(Command::Assistant)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cockpit", "computer"]).unwrap().command,
+            Some(Command::Computer)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cockpit", "assistants", "list"])
+                .unwrap()
+                .command,
+            Some(Command::Assistants(AssistantCommand::List))
+        ));
     }
 
     #[test]

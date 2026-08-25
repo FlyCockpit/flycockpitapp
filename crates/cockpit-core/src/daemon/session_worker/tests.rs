@@ -793,6 +793,9 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             None,
             trusted_test_policy(tmp.path()),
             None,
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             EnvSnapshot::new(
                 crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                 Default::default(),
@@ -1118,6 +1121,9 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             None,
             trusted_test_policy(tmp.path()),
             None,
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             EnvSnapshot::new(
                 crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                 Default::default(),
@@ -1418,6 +1424,9 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
             None,
             trusted_test_policy(tmp.path()),
             None,
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             EnvSnapshot::new(
                 crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                 Default::default(),
@@ -2349,6 +2358,9 @@ async fn absent_scheduler_is_not_an_error() {
         None,
         trust_policy,
         None,
+        Arc::new(tokio::sync::Mutex::new(())),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
         EnvSnapshot::new(
             crate::env_snapshot::EnvSnapshotSource::DaemonStart,
             Default::default(),
@@ -2443,6 +2455,9 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
         None,
         attached_policy,
         None,
+        Arc::new(tokio::sync::Mutex::new(())),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
         EnvSnapshot::new(
             crate::env_snapshot::EnvSnapshotSource::DaemonStart,
             Default::default(),
@@ -2611,6 +2626,9 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
             None,
             trust_policy.clone(),
             None,
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             EnvSnapshot::new(
                 crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                 Default::default(),

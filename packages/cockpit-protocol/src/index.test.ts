@@ -58,6 +58,27 @@ describe("cockpit-proto daemon wire schemas", () => {
     }
   });
 
+  it("modes_session_setup_requires an explicit mode only when attach creates a session", () => {
+    const fresh = {
+      v: PROTOCOL_VERSION,
+      kind: "req" as const,
+      id: "11111111-1111-4111-8111-111111111111",
+      request: "attach" as const,
+      params: { project_root: "/work/project", session_entry_mode: "computer" as const },
+    };
+    expect(clientEnvelopeSchema.safeParse(fresh).success).toBe(true);
+    expect(
+      clientEnvelopeSchema.safeParse({ ...fresh, params: { project_root: "/work/project" } })
+        .success,
+    ).toBe(false);
+    expect(
+      clientEnvelopeSchema.safeParse({
+        ...fresh,
+        params: { session_id: "11111111-1111-4111-8111-111111111111" },
+      }).success,
+    ).toBe(true);
+  });
+
   it("accepts only opaque 64KiB-through-8MiB bulk user-message references", () => {
     const envelope = (total_length: string, mime_class = "opaque") => ({
       v: PROTOCOL_VERSION,
@@ -538,8 +559,8 @@ describe("cockpit-proto daemon wire schemas", () => {
     );
   });
 
-  it("config_refreshed_typescript_mirror_is_v18", () => {
-    expect(PROTOCOL_VERSION).toBe(18);
+  it("config_refreshed_typescript_mirror_is_v19", () => {
+    expect(PROTOCOL_VERSION).toBe(19);
     expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
       responsesFixture.config_refreshed,
     );

@@ -1679,6 +1679,7 @@ fn build_manifest_conn(
                 "parent_session_id": session.parent_session_id.map(|p| p.to_string()),
                 "fork_point_turn_id": session.fork_point_turn_id,
                 "active_model": active_model,
+                "session_entry_mode": session.session_entry_mode,
                 "active_agent": session.active_agent,
                 "started_at": session.started_at,
                 "ended_at": session.ended_at,
@@ -1688,7 +1689,7 @@ fn build_manifest_conn(
         .collect::<Result<Vec<Value>>>()?;
 
     let mut manifest = json!({
-        "schema": "cockpit-session-export/3",
+        "schema": "cockpit-session-export/4",
         // The version of the cockpit binary producing THIS export — not
         // persisted per session, so a CLI export of an old session reflects
         // the exporting binary, not the one that created the session.

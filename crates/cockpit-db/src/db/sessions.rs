@@ -165,6 +165,8 @@ pub struct SessionRow {
     /// Monotonic CAS token advanced on every durable active-model mutation.
     pub active_model_revision: i64,
     pub session_llm_mode: Option<String>,
+    /// Immutable daemon-owned setup presentation, distinct from authority.
+    pub session_entry_mode: String,
     pub tool_surface_override_json: Option<String>,
     pub goal_settings_override_json: Option<String>,
     pub active_agent: String,
@@ -273,6 +275,7 @@ impl SessionRow {
             model_selection_json: row.get("model_selection_json")?,
             active_model_revision: row.get::<_, i64>("active_model_revision").unwrap_or(0),
             session_llm_mode: row.get("session_llm_mode").unwrap_or(None),
+            session_entry_mode: row.get("session_entry_mode")?,
             tool_surface_override_json: row.get("tool_surface_override_json").unwrap_or(None),
             goal_settings_override_json: row.get("goal_settings_override_json").unwrap_or(None),
             active_agent: row.get("active_agent")?,
@@ -436,11 +439,11 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
         "INSERT INTO sessions
          (session_id, project_id, project_root, started_at, last_active_at, active_agent,
           short_id, provider, model, model_selection_json, active_model_revision,
-          session_llm_mode,
+          session_llm_mode, session_entry_mode,
           tool_surface_override_json, goal_settings_override_json, guidance_baseline_path,
           guidance_baseline_hash, redaction_table_json, model_system_prompt_snapshot_json,
           assistant_name, created_by_principal, shared_with_collaborators)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -454,6 +457,7 @@ fn execute_session_insert(conn: &Connection, row: &SessionRow) -> rusqlite::Resu
             row.model_selection_json,
             row.active_model_revision,
             row.session_llm_mode,
+            row.session_entry_mode,
             row.tool_surface_override_json,
             row.goal_settings_override_json,
             row.guidance_baseline_path,
@@ -497,13 +501,13 @@ fn execute_fork_insert(
          (session_id, project_id, project_root, started_at,
           last_active_at, active_agent, short_id,
           parent_session_id, fork_point_turn_id,
-          provider, model, session_llm_mode, tool_surface_override_json,
+          provider, model, session_llm_mode, session_entry_mode, tool_surface_override_json,
           goal_settings_override_json, ephemeral, user_content_tokens, title_stage,
           title_recovery_nudge_state,
           guidance_baseline_path, guidance_baseline_hash, redaction_table_json, created_by_principal,
           shared_with_collaborators, btw_parent_session_id, btw_tangent, model_selection_json,
           model_system_prompt_snapshot_json, assistant_name, active_model_revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
         params![
             row.session_id.to_string(),
             row.project_id,
@@ -517,6 +521,7 @@ fn execute_fork_insert(
             row.provider,
             row.model,
             row.session_llm_mode,
+            row.session_entry_mode,
             row.tool_surface_override_json,
             row.goal_settings_override_json,
             row.ephemeral as i64,
@@ -610,6 +615,7 @@ fn build_session_row(
         model_selection_json: None,
         active_model_revision: 0,
         session_llm_mode: None,
+        session_entry_mode: "code".to_string(),
         tool_surface_override_json: None,
         goal_settings_override_json: None,
         active_agent: active_agent.to_string(),
@@ -1058,13 +1064,18 @@ impl Db {
         assistant_name: &str,
         short_id: String,
     ) -> SessionRow {
-        build_session_row(
+        let mut row = build_session_row(
             project_id,
             project_root,
             active_agent,
             Some(short_id),
             Some(assistant_name.to_string()),
-        )
+        );
+        // Assistant creation is a distinct immutable session setup. Do not
+        // rely on the generic Code default: direct and scheduled assistants
+        // persist before a daemon Attach can repair metadata.
+        row.session_entry_mode = "assistant".to_string();
+        row
     }
 
     /// Insert a pre-built root session row. Pairs with
@@ -1199,6 +1210,7 @@ impl Db {
             model_selection_json: parent.model_selection_json,
             active_model_revision: 0,
             session_llm_mode: parent.session_llm_mode,
+            session_entry_mode: parent.session_entry_mode,
             tool_surface_override_json: parent.tool_surface_override_json,
             goal_settings_override_json: parent.goal_settings_override_json,
             active_agent: parent.active_agent,
@@ -1347,6 +1359,7 @@ impl Db {
             model_selection_json: parent.model_selection_json,
             active_model_revision: 0,
             session_llm_mode: parent.session_llm_mode,
+            session_entry_mode: parent.session_entry_mode,
             tool_surface_override_json: parent.tool_surface_override_json,
             goal_settings_override_json: parent.goal_settings_override_json,
             active_agent: parent.active_agent,
@@ -2541,6 +2554,7 @@ impl Db {
             );
             summaries.push(crate::db::wire::SessionSummary {
                 session_id: row.session_id,
+                session_entry_mode: row.session_entry_mode,
                 short_id: row.short_id,
                 project_root: row.project_root,
                 project_id: row.project_id,
@@ -3298,6 +3312,25 @@ mod tests {
         assert_eq!(got.project_id, "p");
         assert_eq!(got.short_id, row.short_id);
         assert_eq!(db.list_sessions(false, 100).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_entry_mode_is_durable_and_forks_preserve_it() {
+        let db = Db::open_in_memory().unwrap();
+        let mut row = db.new_session_row("p", "/x", "builder").await.unwrap();
+        assert_eq!(row.session_entry_mode, "code");
+        row.session_entry_mode = "computer".to_string();
+        db.insert_session_row(&row).await.unwrap();
+        assert_eq!(
+            db.get_session(row.session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .session_entry_mode,
+            "computer"
+        );
+        let fork = db.create_fork(row.session_id, None).await.unwrap();
+        assert_eq!(fork.session_entry_mode, "computer");
     }
 
     #[tokio::test]

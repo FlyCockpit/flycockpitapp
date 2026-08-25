@@ -126,6 +126,31 @@ describe("RemoteSessionClient", () => {
     await expect(request).resolves.toEqual(response.data);
   });
 
+  it("modes_session_setup_requires a creation mode while leaving resumed attach mode daemon-owned", async () => {
+    const { client, socket } = makeClient();
+    const fresh = client.attach({
+      project_root: "/work/project",
+      session_entry_mode: "assistant",
+    });
+    const freshRelay = JSON.parse(socket.sent[0] ?? "{}");
+    expect(freshRelay.payload.params).toMatchObject({
+      project_root: "/work/project",
+      session_entry_mode: "assistant",
+    });
+    socket.message({ ...responsesFixture.attached, id: freshRelay.payload.id });
+    await expect(fresh).resolves.toEqual(responsesFixture.attached.data);
+
+    const resumed = client.attach({
+      session_id: "11111111-1111-4111-8111-111111111111",
+    });
+    const resumedRelay = JSON.parse(socket.sent[1] ?? "{}");
+    expect(resumedRelay.payload.params).toEqual({
+      session_id: "11111111-1111-4111-8111-111111111111",
+    });
+    socket.message({ ...responsesFixture.attached, id: resumedRelay.payload.id });
+    await expect(resumed).resolves.toEqual(responsesFixture.attached.data);
+  });
+
   it("resends a caller-retained complete user submission unchanged", async () => {
     const { client, socket } = makeClient();
     const submission = {

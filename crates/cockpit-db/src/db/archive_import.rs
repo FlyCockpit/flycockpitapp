@@ -37,6 +37,7 @@ pub struct ImportedArchiveSession {
     pub short_id: Option<String>,
     pub fork_point_turn_id: Option<String>,
     pub active_model: Option<ImportedArchiveActiveModel>,
+    pub session_entry_mode: String,
     pub active_agent: String,
     pub started_at: i64,
     pub ended_at: Option<i64>,
@@ -322,6 +323,7 @@ fn import_session_archive_graph_conn(
             row.parent_session_id = session.parent_source_id.map(|parent| id_map[&parent]);
             row.short_id = session.short_id;
             row.fork_point_turn_id = session.fork_point_turn_id;
+            row.session_entry_mode = session.session_entry_mode;
             if let Some(active_model) = session.active_model {
                 row.provider = Some(active_model.provider);
                 row.model = Some(active_model.model);

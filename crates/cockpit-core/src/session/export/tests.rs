@@ -3243,7 +3243,7 @@ async fn export_older_events_without_new_fields_still_parse() {
     // The pre-release export contract is the intentional breaking /3 shape.
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&zip, "manifest.json").unwrap()).unwrap();
-    assert_eq!(manifest["schema"], "cockpit-session-export/3");
+    assert_eq!(manifest["schema"], "cockpit-session-export/4");
 }
 
 #[tokio::test]
@@ -3325,7 +3325,7 @@ async fn build_zip_writes_to_disk_and_manifest_lists_sessions() {
     // Manifest round-trips and lists the session.
     let manifest: Value =
         serde_json::from_str(&read_zip_entry(&bytes, "manifest.json").unwrap()).unwrap();
-    assert_eq!(manifest["schema"], "cockpit-session-export/3");
+    assert_eq!(manifest["schema"], "cockpit-session-export/4");
     assert_eq!(manifest["session_count"], 1);
     assert_eq!(
         manifest["target"]["short_id"],

@@ -90,6 +90,8 @@ CREATE TABLE sessions (
     -- Durable CAS token for active-model mutations (picker, recovery, controls).
     active_model_revision INTEGER NOT NULL DEFAULT 0,
     session_llm_mode TEXT CHECK (session_llm_mode IN ('defensive', 'normal', 'frontier')),
+    session_entry_mode TEXT NOT NULL DEFAULT 'code'
+        CHECK (session_entry_mode IN ('code', 'assistant', 'computer')),
     tool_surface_override_json TEXT CHECK (
         tool_surface_override_json IS NULL OR (
             json_valid(tool_surface_override_json)

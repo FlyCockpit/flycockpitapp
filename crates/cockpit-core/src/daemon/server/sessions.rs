@@ -691,6 +691,7 @@ mod sessions_activity_tests {
     fn summary(activity_state: Option<proto::SessionActivityState>) -> proto::SessionSummary {
         proto::SessionSummary {
             session_id: Uuid::new_v4(),
+            session_entry_mode: "code".into(),
             short_id: None,
             project_root: "/proj".into(),
             project_id: "pid".into(),

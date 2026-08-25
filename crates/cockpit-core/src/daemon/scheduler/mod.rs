@@ -810,7 +810,7 @@ impl ScheduledPromptRunner for RegistryPromptRunner {
     ) -> Result<String> {
         let handle = match self
             .registry
-            .attach(Some(session_id), None, None, false, None, env_snapshot)
+            .attach_existing(session_id, None, false, None, env_snapshot)
             .await
         {
             Ok(handle) => handle,
@@ -1741,6 +1741,46 @@ mod tests {
                 disabled_notice: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_scheduled_assistant_resume_uses_durable_assistant_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let registry = production_registry(db.clone());
+        let project_root = tmp.path().to_string_lossy().into_owned();
+        let row = db
+            .create_assistant_session("project", &project_root, "helper-bot", "helper-bot")
+            .await
+            .unwrap();
+        let session = Arc::new(
+            Session::resume(
+                db.clone(),
+                row.session_id,
+                crate::session::test_redaction_key_resolver(),
+                crate::secure_key::vault_for_db(&db).unwrap(),
+            )
+            .unwrap()
+            .expect("durable assistant session"),
+        );
+        assert_eq!(
+            session.session_entry_mode(),
+            crate::daemon::proto::SessionEntryMode::Assistant
+        );
+        let (handle, _work_rx) =
+            SessionWorkerHandle::test_handle_with_receiver(session, registry.locks());
+        registry.insert_test_worker(handle, tokio::spawn(std::future::pending::<()>()));
+
+        let runner = RegistryPromptRunner { registry };
+        let resumed = runner
+            .registry
+            .attach_existing(row.session_id, None, false, None, empty_env_snapshot())
+            .await
+            .expect("scheduler resume derives durable assistant mode");
+        assert_eq!(
+            resumed.session_entry_mode(),
+            crate::daemon::proto::SessionEntryMode::Assistant
+        );
     }
 
     async fn ack_scheduled_prompt(work_rx: &mut mpsc::Receiver<SessionWork>, turn_id: Uuid) {

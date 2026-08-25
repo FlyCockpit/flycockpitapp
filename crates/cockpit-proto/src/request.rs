@@ -351,6 +351,13 @@ pub enum Request {
         /// treated as headless — the safe, non-blocking default.
         #[serde(default)]
         interactive: bool,
+        /// Immutable daemon-owned entry setup for a newly-created session.
+        /// It is required for new sessions. Existing-session attaches omit it
+        /// in all first-party clients; if another client supplies it, the
+        /// daemon requires exact equality with the durable value and never
+        /// permits it to overwrite that value.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_entry_mode: Option<crate::SessionEntryMode>,
         /// Plan-level model pin (prompt
         /// `plan-duplication-and-model-override.md`). The complete selection
         /// is also the new session's authoritative active model, while this
@@ -3884,7 +3891,7 @@ impl Request {
 macro_rules! command {
     ($with_commands:ident $(, $context:ident)*) => {
         $with_commands! { ($($context),*) [
-            (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
+            (Request::Attach { session_id, since_seq, project_root, initial_model, no_sandbox, interactive, session_entry_mode, model_override, client_protocol_version, env_snapshot, env_policy }, "attach", custom(authorize_attach), option_field(session_id), true, idempotent_adapter_mutation, domain_transaction(domain_result_tuple), serialized, none, "session_id:Option<Uuid>|since_seq:Option<i64>|project_root:Option<String>|initial_model:Option<cockpit_config::config::providers::ActiveModelRef>|no_sandbox:bool|interactive:bool|session_entry_mode:Option<SessionEntryMode>|model_override:Option<cockpit_config::config::providers::ActiveModelRef>|client_protocol_version:u32|env_snapshot:Option<EnvSnapshotWire>|env_policy:EnvDriftPolicy", [session_id: Option<Uuid> => session, since_seq: Option<i64> => param, project_root: Option<String> => project_root_effective, initial_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, no_sandbox: bool => param, interactive: bool => param, session_entry_mode: Option<SessionEntryMode> => param, model_override: Option<cockpit_config::config::providers::ActiveModelRef> => param, client_protocol_version: u32 => param, env_snapshot: Option<EnvSnapshotWire> => param, env_policy: EnvDriftPolicy => param]);
             (Request::SubagentTranscript { session_id, task_call_id, label }, "subagent_transcript", custom(authorize_subagent_transcript), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|task_call_id:String|label:String", [session_id: Uuid => session, task_call_id: String => param, label: String => param]);
             (Request::SendUserMessage { client_submission_id, expected_model_state_generation, expected_model, text, display_text, tag_expansions, image_refs, forced_skill, run_invocation_options }, "send_user_message", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|text:String|display_text:Option<String>|tag_expansions:Vec<TagExpansionMeta>|image_refs:Vec<ImageAttachmentRef>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, text: String => param, display_text: Option<String> => param, tag_expansions: Vec<TagExpansionMeta> => param, image_refs: Vec<ImageAttachmentRef> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
             (Request::SendUserMessageBulk { client_submission_id, expected_model_state_generation, expected_model, transfer, display_text, display_transfer, tag_expansions, forced_skill, run_invocation_options }, "send_user_message_bulk", session_writer, attached, true, transactional_mutation, sql_transaction, serialized, none, "client_submission_id:Uuid|expected_model_state_generation:Option<u64>|expected_model:Option<cockpit_config::config::providers::ActiveModelRef>|transfer:crate::bulk_transfer::BulkTransferRef|display_text:Option<String>|display_transfer:Option<crate::bulk_transfer::BulkTransferRef>|tag_expansions:Vec<TagExpansionMeta>|forced_skill:Option<String>|run_invocation_options:Option<RunInvocationOptions>", [client_submission_id: Uuid => legacy_message, expected_model_state_generation: Option<u64> => param, expected_model: Option<cockpit_config::config::providers::ActiveModelRef> => param, transfer: $crate::bulk_transfer::BulkTransferRef => param, display_text: Option<String> => param, display_transfer: Option<$crate::bulk_transfer::BulkTransferRef> => param, tag_expansions: Vec<TagExpansionMeta> => param, forced_skill: Option<String> => param, run_invocation_options: Option<RunInvocationOptions> => param]);
@@ -4743,6 +4750,7 @@ mod tests {
                 initial_model: Some(invalid.clone()),
                 no_sandbox: false,
                 interactive: false,
+                session_entry_mode: Some(SessionEntryMode::Code),
                 model_override: None,
                 client_protocol_version: PROTOCOL_VERSION,
                 env_snapshot: None,
@@ -4755,6 +4763,7 @@ mod tests {
                 initial_model: None,
                 no_sandbox: false,
                 interactive: false,
+                session_entry_mode: Some(SessionEntryMode::Code),
                 model_override: Some(invalid.clone()),
                 client_protocol_version: PROTOCOL_VERSION,
                 env_snapshot: None,

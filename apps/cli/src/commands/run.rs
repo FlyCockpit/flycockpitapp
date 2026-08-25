@@ -417,6 +417,8 @@ pub(crate) async fn attach_send_pump(
             // headless and auto-rejects a back-to-back repeat (with the
             // guidance error) rather than blocking.
             interactive: false,
+            // Headless runs have no selected interactive setup surface.
+            session_entry_mode: requested_session.is_none().then_some(proto::SessionEntryMode::Code),
             model_override,
             client_protocol_version: client.negotiated().version,
             env_snapshot: Some(env_snapshot.to_wire()),

@@ -477,6 +477,37 @@ pub enum EnvDriftPolicy {
     ErrorOnDrift,
 }
 
+/// Daemon-owned setup presentation selected when a session is created.
+///
+/// This is deliberately not an execution, model, sandbox, or agent-authority
+/// setting. It is immutable session setup metadata: later attaches reload it
+/// from the daemon rather than changing the session's entry contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEntryMode {
+    Code,
+    Assistant,
+    Computer,
+}
+
+impl SessionEntryMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Assistant => "assistant",
+            Self::Computer => "computer",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Code => "Code",
+            Self::Assistant => "Assistant",
+            Self::Computer => "Computer",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvDiffSummary {
     pub baseline_digest: String,
@@ -1125,16 +1156,17 @@ impl fmt::Debug for StoredFlycockpitCredential {
     }
 }
 
-/// Current wire schema version. v18 adds daemon-owned AgentTree lifecycle,
+/// Current wire schema version. v19 adds daemon-owned immutable session entry
+/// mode to Attach and Attached. v18 adds daemon-owned AgentTree lifecycle,
 /// Attention, and steering requests, responses, and ordered invalidation events
 /// on top of v17's owner-scoped OAuth cancellation and correlated durable
-/// configuration receipts. v18 is current-only; v12 through v17 fixtures are
+/// configuration receipts. v19 is current-only; v12 through v18 fixtures are
 /// retained as migration evidence, not a compatibility window.
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 
-/// Oldest wire schema version this binary accepts. v18 is current-only: the
-/// AgentTree wire additions have no compatibility shim.
-pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 18;
+/// Oldest wire schema version this binary accepts. v19 is current-only: entry
+/// mode is an explicit Attach contract with no compatibility shim.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 19;
 
 /// Version string the daemon advertises to clients on attach/status.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -3811,8 +3843,8 @@ mod proto_fixture_tests {
     use super::*;
 
     const UNKNOWN_SENTINEL: &str = "__unknown";
-    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[18];
-    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17];
+    const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[19];
+    const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18];
     const DAEMON_PROTO_FIXTURE_FILES: &[&str] = &["event.json", "request.json", "response.json"];
 
     #[test]
@@ -5256,7 +5288,7 @@ mod errorcode_forward_tests {
 /// not support. Keep this separate from the remote-gated supported-version
 /// table: fixture retention must never widen the live compatibility window.
 #[cfg(test)]
-const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17];
+const ARCHIVED_PROTOCOL_VERSIONS: &[u32] = &[12, 13, 14, 15, 16, 17, 18];
 
 /// Fixture-file reader shared by tests that run in the default (non-`remote`)
 /// profile. The full `proto_fixture_tests` module is `remote`-gated because its
@@ -7634,7 +7666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v10_request_is_rejected_after_the_current_only_v18_cutover() {
+    async fn v10_request_is_rejected_after_the_current_only_v19_cutover() {
         let (a, b) = duplex(4096);
         let mut sender = ProtoStream::with_version(a, 10);
         let mut receiver = ProtoStream::with_version(b, 10);
@@ -7652,6 +7684,20 @@ mod tests {
             receiver.recv().await.unwrap(),
             Some(RecvFrame::VersionMismatch { v: 10, .. })
         ));
+    }
+
+    #[test]
+    fn modes_session_setup_entry_mode_has_exact_three_value_wire_contract() {
+        assert_eq!(serde_json::to_value(SessionEntryMode::Code).unwrap(), "code");
+        assert_eq!(
+            serde_json::to_value(SessionEntryMode::Assistant).unwrap(),
+            "assistant"
+        );
+        assert_eq!(
+            serde_json::to_value(SessionEntryMode::Computer).unwrap(),
+            "computer"
+        );
+        assert!(serde_json::from_value::<SessionEntryMode>(json!("unknown")).is_err());
     }
 
     #[tokio::test]
@@ -7685,13 +7731,13 @@ mod tests {
 
     #[test]
     fn config_refreshed_response_is_frozen_in_current_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 18);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 18);
+        assert_eq!(PROTOCOL_VERSION, 19);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 19);
         let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
-                .expect("current v18 config_refreshed fixture")
+                .expect("current v19 config_refreshed fixture")
                 .clone(),
         )
         .unwrap();
@@ -7706,20 +7752,20 @@ mod tests {
 
     #[test]
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
-        assert_eq!(PROTOCOL_VERSION, 18);
-        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 18);
+        assert_eq!(PROTOCOL_VERSION, 19);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 19);
         let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
                 .get(response_name)
-                .unwrap_or_else(|| panic!("current v18 {response_name} fixture"));
+                .unwrap_or_else(|| panic!("current v19 {response_name} fixture"));
             assert_eq!(
                 response["data"]["goal"]["max_verification_attempts"], 4,
-                "current v18 {response_name} must freeze the inclusive verification cap"
+                "current v19 {response_name} must freeze the inclusive verification cap"
             );
             serde_json::from_value::<Response>(response.clone()).unwrap_or_else(|error| {
-                panic!("current v18 {response_name} must deserialize: {error}")
+                panic!("current v19 {response_name} must deserialize: {error}")
             });
         }
     }
@@ -7732,13 +7778,13 @@ mod tests {
                 serde_json::from_value(fixture[response_name]["data"]["assistant"].clone())
                     .unwrap();
             validate_assistant_summary(&summary).unwrap_or_else(|error| {
-                panic!("current v18 {response_name} assistant identity is invalid: {error}")
+                panic!("current v19 {response_name} assistant identity is invalid: {error}")
             });
         }
         let summary: AssistantSummary =
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
-            .expect("current v18 assistant inventory must carry bounded opaque revisions");
+            .expect("current v19 assistant inventory must carry bounded opaque revisions");
         assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
         assert_eq!(
             fixture["agent_inventory"]["data"]["config_generation"],
@@ -7830,7 +7876,7 @@ mod tests {
         ] {
             assert!(
                 mcp[field].is_string(),
-                "current v18 MCP CAS fixture must carry {field}"
+                "current v19 MCP CAS fixture must carry {field}"
             );
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
@@ -7871,7 +7917,7 @@ mod tests {
         ] {
             assert!(
                 requests[tag]["params"]["client_operation_id"].is_string(),
-                "current v18 fixture must carry an operation id for {tag}"
+                "current v19 fixture must carry an operation id for {tag}"
             );
         }
         let responses = proto_fixture_files::read_fixture("response.json");

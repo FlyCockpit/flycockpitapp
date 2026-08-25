@@ -1924,8 +1924,15 @@ fn providers_from_view(
     }
 }
 
+/// Canonical daemon-owned entry setup. The App uses this only for attach
+/// requests until it adopts the daemon-returned authoritative value.
+pub type SessionMode = cockpit_core::daemon::proto::SessionEntryMode;
+
 #[allow(private_interfaces)]
 pub struct App {
+    /// Requested before attach, then replaced by the daemon-owned session
+    /// value from `Attached`. It never grants or changes execution authority.
+    pub(super) session_mode: Option<SessionMode>,
     pub(super) monotonic_origin: Instant,
     pub(super) paste_client_instance_id: uuid::Uuid,
     pub(super) launch: LaunchInfo,
@@ -3428,7 +3435,13 @@ pub(crate) fn startup_first_paint_log_count() -> usize {
 impl App {
     #[cfg(test)]
     pub fn new(project: Option<&Path>, no_sandbox: bool) -> Self {
-        Self::new_inner(project, no_sandbox, StartupWorkspaceTrust::Decided, None)
+        Self::new_inner(
+            project,
+            no_sandbox,
+            Some(SessionMode::Code),
+            StartupWorkspaceTrust::Decided,
+            None,
+        )
     }
 
     pub fn new_with_workspace_trust(
@@ -3445,7 +3458,27 @@ impl App {
         trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
     ) -> Self {
-        Self::new_inner(project, no_sandbox, trust, launch_start)
+        Self::new_inner(
+            project,
+            no_sandbox,
+            Some(SessionMode::Code),
+            trust,
+            launch_start,
+        )
+    }
+
+    pub fn new_with_session_mode_and_workspace_trust_and_launch_start(
+        project: Option<&Path>,
+        no_sandbox: bool,
+        session_mode: SessionMode,
+        trust: StartupWorkspaceTrust,
+        launch_start: Option<Instant>,
+    ) -> Self {
+        Self::new_inner(project, no_sandbox, Some(session_mode), trust, launch_start)
+    }
+
+    pub fn session_mode(&self) -> Option<SessionMode> {
+        self.session_mode
     }
 
     pub fn new_with_session(
@@ -3465,6 +3498,10 @@ impl App {
         let mut app = Self::new_inner(
             project,
             no_sandbox,
+            // Existing sessions receive their mode only from the Attach
+            // response; never prefill a Code placeholder that could leak
+            // into a resume request or initial chrome.
+            None,
             StartupWorkspaceTrust::Decided,
             launch_start,
         );
@@ -3481,6 +3518,7 @@ impl App {
     fn new_inner(
         project: Option<&Path>,
         no_sandbox: bool,
+        session_mode: Option<SessionMode>,
         startup_trust: StartupWorkspaceTrust,
         launch_start: Option<Instant>,
     ) -> Self {
@@ -3596,6 +3634,7 @@ impl App {
         let terminal_title_pushed_for_cleanup = Arc::new(AtomicBool::new(false));
         let active_model_selection = config_snapshot.providers.active_model.clone();
         let mut app = Self {
+            session_mode,
             monotonic_origin: Instant::now(),
             paste_client_instance_id: uuid::Uuid::new_v4(),
             launch,

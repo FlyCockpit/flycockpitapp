@@ -262,6 +262,7 @@ mod tests {
         // only the resolution-relevant fields are set.
         serde_json::from_value(serde_json::json!({
             "session_id": session_id,
+            "session_entry_mode": "code",
             "short_id": short_id,
             "project_root": "/x",
             "project_id": "p",

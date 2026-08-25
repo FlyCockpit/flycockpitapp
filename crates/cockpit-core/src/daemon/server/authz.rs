@@ -612,6 +612,13 @@ pub(super) async fn authorize_attach(
                     "remote principal cannot access this session",
                 )),
             },
+            // A just-created lazy session has no durable row until its first
+            // message. Only the local daemon owner may reclaim that live
+            // worker: there is no durable principal binding yet from which a
+            // remote/shared client could be authorized safely.
+            Ok(None) if principal.is_owner() && ctx.registry.has_live_session(*session_id) => {
+                Ok(())
+            }
             Ok(None) => Err(ErrorPayload {
                 code: ErrorCode::UnknownSession,
                 message: format!("unknown session {session_id}"),

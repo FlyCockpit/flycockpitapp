@@ -15,7 +15,11 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 18 as const;
+export const PROTOCOL_VERSION = 19 as const;
+
+/** Immutable daemon-owned session setup metadata; never an authority grant. */
+export const sessionEntryModeSchema = z.enum(["code", "assistant", "computer"]);
+export type SessionEntryMode = z.infer<typeof sessionEntryModeSchema>;
 
 /**
  * JSON form of a bulk transfer reference, mirroring Rust
@@ -617,20 +621,42 @@ const requestParamSchemas = {
     })
     .strict(),
   archive_session: z.object({ session_id: uuidSchema, cascade: z.boolean().optional() }).strict(),
-  attach: z
-    .object({
-      session_id: optionalUuidSchema,
-      since_seq: safeI64NumberSchema.optional(),
-      project_root: z.string().optional(),
-      no_sandbox: z.boolean().optional(),
-      interactive: z.boolean().optional(),
-      initial_model: activeModelRefSchema.optional(),
-      model_override: activeModelRefSchema.optional(),
-      client_protocol_version: z.number().int().nonnegative().optional(),
-      env_snapshot: z.unknown().optional(),
-      env_policy: envDriftPolicySchema.optional(),
-    })
-    .strict(),
+  attach: z.union([
+    // A fresh session has no durable session identity yet, so it must name
+    // its non-authoritative entry presentation explicitly.
+    z
+      .object({
+        session_id: z.undefined().optional(),
+        since_seq: safeI64NumberSchema.optional(),
+        project_root: projectRootSchema,
+        no_sandbox: z.boolean().optional(),
+        interactive: z.boolean().optional(),
+        session_entry_mode: sessionEntryModeSchema,
+        initial_model: activeModelRefSchema.optional(),
+        model_override: activeModelRefSchema.optional(),
+        client_protocol_version: z.number().int().nonnegative().optional(),
+        env_snapshot: z.unknown().optional(),
+        env_policy: envDriftPolicySchema.optional(),
+      })
+      .strict(),
+    // A resume is keyed by durable session identity. The daemon reloads the
+    // mode; a caller may only provide an exact value for explicit checking.
+    z
+      .object({
+        session_id: uuidSchema,
+        since_seq: safeI64NumberSchema.optional(),
+        project_root: z.string().optional(),
+        no_sandbox: z.boolean().optional(),
+        interactive: z.boolean().optional(),
+        session_entry_mode: sessionEntryModeSchema.optional(),
+        initial_model: activeModelRefSchema.optional(),
+        model_override: activeModelRefSchema.optional(),
+        client_protocol_version: z.number().int().nonnegative().optional(),
+        env_snapshot: z.unknown().optional(),
+        env_policy: envDriftPolicySchema.optional(),
+      })
+      .strict(),
+  ]),
   cancel_paused_work: z.object({ session_id: uuidSchema }).strict(),
   delete_session: z.object({ session_id: uuidSchema }).strict(),
   fork_session: z
@@ -1268,6 +1294,7 @@ const historyEntryWireSchema = z.discriminatedUnion("role", [
 const sessionSummaryWireSchema = z
   .object({
     session_id: uuidSchema,
+    session_entry_mode: sessionEntryModeSchema,
     project_root: projectRootSchema,
     project_id: z.string(),
     started_at: safeI64NumberSchema,
@@ -1393,6 +1420,7 @@ export type BtwForkInfo = z.infer<typeof btwForkInfoSchema>;
 export const attachedDataSchema = z
   .object({
     session_id: uuidSchema,
+    session_entry_mode: sessionEntryModeSchema,
     short_id: z.string(),
     project_root: projectRootSchema,
     project_id: z.string(),
@@ -2152,6 +2180,7 @@ export type HistoryEntry = z.infer<typeof historyEntrySchema>;
 export const sessionSummarySchema = z
   .object({
     session_id: uuidSchema,
+    session_entry_mode: sessionEntryModeSchema,
     short_id: z.string().optional(),
     project_root: projectRootSchema,
     project_id: z.string(),

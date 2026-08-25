@@ -8,9 +8,25 @@ use uuid::Uuid;
 use crate::welcome;
 use cockpit_tui::tui::app::{App, StartupWorkspaceTrust};
 
+/// Canonical daemon wire contract, not a CLI-local policy enum.
+pub type SessionMode = cockpit_core::daemon::proto::SessionEntryMode;
+
 pub async fn run(
     project: Option<&Path>,
     no_sandbox: bool,
+    launch_start: Option<Instant>,
+) -> Result<()> {
+    run_mode(project, no_sandbox, SessionMode::Code, launch_start).await
+}
+
+/// Start every interactive mode through the sole TUI/session construction
+/// path. The mode is intentionally not translated into `SetAgent`,
+/// `SetLlmMode`, or any other broad existing control: those controls lack the
+/// installation/profile authority required for per-node mode setup.
+pub async fn run_mode(
+    project: Option<&Path>,
+    no_sandbox: bool,
+    mode: SessionMode,
     launch_start: Option<Instant>,
 ) -> Result<()> {
     if !stdin().is_terminal() || !stdout().is_terminal() {
@@ -20,8 +36,13 @@ pub async fn run(
 
     let trust = prepare_tui_workspace_trust(project)?;
 
-    let mut app =
-        App::new_with_workspace_trust_and_launch_start(project, no_sandbox, trust, launch_start);
+    let mut app = App::new_with_session_mode_and_workspace_trust_and_launch_start(
+        project,
+        no_sandbox,
+        mode,
+        trust,
+        launch_start,
+    );
     app.run().await
 }
 
@@ -119,5 +140,21 @@ mod tests {
         assert!(trusted.providers.contains_key("p"));
 
         crate::config::trust::clear_runtime_policy_for_tests();
+    }
+
+    #[test]
+    fn modes_session_setup_mode_is_the_canonical_proto_type() {
+        assert_eq!(
+            SessionMode::Code,
+            cockpit_tui::tui::app::SessionMode::Code
+        );
+        assert_eq!(
+            SessionMode::Assistant,
+            cockpit_tui::tui::app::SessionMode::Assistant
+        );
+        assert_eq!(
+            SessionMode::Computer,
+            cockpit_tui::tui::app::SessionMode::Computer
+        );
     }
 }

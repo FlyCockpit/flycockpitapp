@@ -1724,6 +1724,7 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
                     since_seq: None,
                 },
                 session_id: new_session_id,
+                session_entry_mode: cockpit_core::daemon::proto::SessionEntryMode::Computer,
                 short_id: "new001".to_string(),
                 active_agent: "Build".to_string(),
                 active_agent_path: vec!["Build".to_string()],
@@ -1750,6 +1751,13 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
         Some(&attached_selection)
     );
     assert_eq!(app.launch.session_id, Some(new_session_id));
+    if matches!(path, ModelEpochPath::SessionSwitch) {
+        assert_eq!(
+            app.session_mode(),
+            Some(cockpit_core::daemon::proto::SessionEntryMode::Computer),
+            "the session-switch chrome must adopt the daemon-returned Computer setup"
+        );
+    }
     assert_eq!(app.pending_model_selection.is_some(), automatically_retried);
     // Attaching also refreshes daemon capabilities, so unrelated control
     // requests may legitimately be in flight.  What must not survive an
@@ -1968,6 +1976,7 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
             since_seq: None,
         },
         session_id: new_session_id,
+        session_entry_mode: cockpit_core::daemon::proto::SessionEntryMode::Code,
         short_id: "new001".to_string(),
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],

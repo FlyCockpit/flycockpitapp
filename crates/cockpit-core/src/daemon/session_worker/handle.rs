@@ -886,6 +886,18 @@ impl SessionWorkerHandle {
         self.session.set_created_by_principal(principal)
     }
 
+    pub fn session_entry_mode(&self) -> crate::daemon::proto::SessionEntryMode {
+        self.session.session_entry_mode()
+    }
+
+    /// Daemon-owned project identity for a live, not-yet-persisted session.
+    /// This is intentionally available only on the in-process worker handle:
+    /// callers must not substitute an Attach-supplied path while resolving a
+    /// lazy session that has no durable row yet.
+    pub fn project_root(&self) -> std::path::PathBuf {
+        self.session.project_root.clone()
+    }
+
     /// Commit a lazily-created session before an external process is told its
     /// id. Ephemeral daemon attaches use this so their session namespace is
     /// durable even if the client disconnects before sending a message.
@@ -1797,6 +1809,9 @@ pub fn spawn(
     global_bus: Option<EventSender>,
     trust_policy: crate::config::trust::WorkspaceTrustPolicy,
     cleanup: Option<Box<dyn FnOnce() + Send + 'static>>,
+    terminal_lock_cleanup_gate: Arc<tokio::sync::Mutex<()>>,
+    terminal_closing: Arc<std::sync::atomic::AtomicBool>,
+    terminal_cleanup_complete: Arc<std::sync::atomic::AtomicBool>,
     env_snapshot: EnvSnapshot,
     config_snapshot: SessionConfigSnapshot,
 ) -> (SessionWorkerHandle, tokio::task::JoinHandle<()>) {
@@ -1970,6 +1985,9 @@ pub fn spawn(
             write_scope,
             global_bus,
             park_commit,
+            terminal_lock_cleanup_gate,
+            terminal_closing,
+            terminal_cleanup_complete,
         ));
         crate::config::trust::scope_workspace_trust_policy(trust_policy, worker).await;
     });

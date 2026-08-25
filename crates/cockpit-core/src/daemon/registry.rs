@@ -13,13 +13,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
-use tokio::sync::watch;
+use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::config::extended::ExtendedConfig;
@@ -37,6 +39,28 @@ use crate::locks::LockManager;
 use crate::redact::RedactionTable;
 use crate::redact::protected_redaction_history::RedactionKeyResolver;
 use crate::session::Session;
+
+#[derive(Debug, Error)]
+#[error("session entry mode conflict: session is {actual}, attach requested {requested}")]
+pub(crate) struct SessionEntryModeConflict {
+    pub actual: &'static str,
+    pub requested: &'static str,
+}
+
+/// A generation observed during attach could not be activated without being
+/// replaced or closed. Callers must retry the authoritative attach lookup;
+/// they must never fall back to a bare session-id operation.
+#[derive(Debug, Error)]
+#[error("session changed while attaching; retry attach")]
+pub(crate) struct SessionAttachRetry;
+
+/// The prior worker generation reached terminal shutdown but its permanent
+/// lock cleanup could not be committed. The registry retains that exact
+/// generation so a later attach can retry cleanup without ever touching a
+/// successor incarnation.
+#[derive(Debug, Error)]
+#[error("terminal session cleanup is incomplete; retry attach")]
+pub(crate) struct SessionTerminalCleanupRetry;
 
 #[cfg(not(test))]
 pub const DESTRUCTIVE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -210,6 +234,20 @@ struct WorkerState {
 struct WorkerEntry {
     generation: WorkerGeneration,
     handle: SessionWorkerHandle,
+    /// An attach has accepted this exact worker generation and is still
+    /// committing reconciliation/activation. A closed entry stays in place
+    /// until the lease drops so a successor can never inherit that request's
+    /// session-id-only lock resume.
+    activation_leases: usize,
+    /// Serializes a generation-bound reattach lock resume with this worker's
+    /// terminal `LockManager::end_session` cleanup.  It is deliberately per
+    /// generation: an old cleanup must never touch a successor's locks.
+    terminal_lock_cleanup_gate: Arc<AsyncMutex<()>>,
+    /// Set by the worker immediately before its terminal lock cleanup begins.
+    terminal_closing: Arc<AtomicBool>,
+    /// Set only after terminal lock cleanup completes.  Registry removal may
+    /// proceed after this point, never before it.
+    terminal_cleanup_complete: Arc<AtomicBool>,
 }
 
 struct WorkerJoin {
@@ -301,9 +339,69 @@ impl Drop for StartTicket {
 }
 
 enum AttachClaim {
-    Live(Box<SessionWorkerHandle>),
+    Live(LiveAttachClaim),
+    CleanupRequired(LiveAttachClaim),
+    Activating,
     Starting(Arc<StartSlot>),
     Start(StartTicket),
+}
+
+/// A generation-fenced observation of a live worker.
+///
+/// A lazy session has no durable row, so dispatch must read its root and mode
+/// from the worker. Durable and lazy reattach both need the same protection:
+/// facts are valid only while this exact registry generation remains live. The
+/// opaque claim is intentionally consumed by
+/// [`SessionRegistry::activate_claimed_live_session`], which rechecks the
+/// generation before it can reactivate released locks.
+pub(crate) struct LiveAttachClaim {
+    inner: Weak<Inner>,
+    session_id: Uuid,
+    generation: WorkerGeneration,
+    handle: SessionWorkerHandle,
+    session_entry_mode: crate::daemon::proto::SessionEntryMode,
+    project_root: PathBuf,
+    terminal_lock_cleanup_gate: Arc<AsyncMutex<()>>,
+    terminal_cleanup_complete: Arc<AtomicBool>,
+}
+
+impl Drop for LiveAttachClaim {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let should_forget = {
+            let mut workers = crate::sync::lock_or_recover(&inner.workers);
+            let Some(entry) = workers.live.get_mut(&self.session_id) else {
+                return;
+            };
+            if entry.generation != self.generation {
+                return;
+            }
+            entry.activation_leases = entry.activation_leases.saturating_sub(1);
+            entry.activation_leases == 0
+                && entry.handle.is_closed()
+                && (!entry.terminal_closing.load(Ordering::Acquire)
+                    || entry.terminal_cleanup_complete.load(Ordering::Acquire))
+        };
+        if should_forget {
+            forget_generation_from_inner(&inner, self.session_id, self.generation);
+        }
+    }
+}
+
+impl LiveAttachClaim {
+    pub(crate) fn session_entry_mode(&self) -> crate::daemon::proto::SessionEntryMode {
+        self.session_entry_mode
+    }
+
+    pub(crate) fn project_root(&self) -> &PathBuf {
+        &self.project_root
+    }
+
+    pub(crate) fn handle(&self) -> &SessionWorkerHandle {
+        &self.handle
+    }
 }
 
 async fn wait_for_start(slot: Arc<StartSlot>) -> Result<SessionWorkerHandle> {
@@ -450,15 +548,29 @@ fn next_generation(state: &mut WorkerState) -> WorkerGeneration {
 }
 
 fn forget_generation_from_inner(inner: &Inner, session_id: Uuid, generation: WorkerGeneration) {
-    {
+    let retained_by_activation = {
         let mut workers = crate::sync::lock_or_recover(&inner.workers);
         if workers
             .live
             .get(&session_id)
-            .is_some_and(|entry| entry.generation == generation)
+            .is_some_and(|entry| {
+                entry.generation == generation
+                    && entry.activation_leases == 0
+                    && (!entry.terminal_closing.load(Ordering::Acquire)
+                        || entry.terminal_cleanup_complete.load(Ordering::Acquire))
+            })
         {
             workers.live.remove(&session_id);
+            false
+        } else {
+            workers
+                .live
+                .get(&session_id)
+                .is_some_and(|entry| entry.generation == generation)
         }
+    };
+    if retained_by_activation {
+        return;
     }
     let mut joins = crate::sync::lock_or_recover(&inner.worker_joins);
     if joins
@@ -755,6 +867,7 @@ impl SessionRegistry {
         client_no_sandbox: bool,
         model_override: Option<&ActiveModelRef>,
         env_snapshot: EnvSnapshot,
+        session_entry_mode: crate::daemon::proto::SessionEntryMode,
     ) -> Result<SessionWorkerHandle> {
         // Resume path.
         if let Some(id) = session_id {
@@ -762,40 +875,64 @@ impl SessionRegistry {
             // The reconciliation gate below is applied UNIFORMLY afterwards
             // (finding 3) so no claim path can slip a pre-reconciliation handle
             // back to a client.
-            let handle = match self.claim_attach(id) {
-                AttachClaim::Live(handle) => {
-                    // Reattach to a still-alive worker (the worker outlives client
-                    // disconnects, GOALS §8b). Re-acquire any locks released when
-                    // the last client detached while idle
-                    // (implementation note). A no-op when no
-                    // release snapshot exists — so a second concurrent attach to an
-                    // already-attached session triggers nothing.
-                    *handle
-                }
-                AttachClaim::Starting(slot) => Box::pin(wait_for_start(slot))
-                    .await
-                    .context("waiting for session worker start")?,
-                AttachClaim::Start(ticket) => {
-                    let generation = ticket.generation();
-                    self.inner.db.restore_supervised_goals(id).await?;
-                    // Box the heavy resume sub-future: it synchronously calls
-                    // `Session::resume` (a large stack frame) and threads config
-                    // loading, so keeping its state on the heap rather than
-                    // inlined into `attach`'s future is what keeps the enclosing
-                    // future small enough to poll without overflowing the worker
-                    // stack (`daemon-lifecycle-replay-timing-robustness.md`).
-                    let result = Box::pin(self.start_resumed_worker(
-                        id,
-                        initial_model,
-                        client_no_sandbox,
-                        env_snapshot,
-                        generation,
-                    ))
-                    .await;
-                    self.finish_attach_start(ticket, &result);
-                    result?
-                }
+            let mut cleanup_attempts = 0_u8;
+            let claim = loop {
+                let claim = match self.claim_attach(id) {
+                    AttachClaim::Live(claim) => {
+                        // Reattach to a still-alive worker (the worker outlives client
+                        // disconnects, GOALS §8b). Re-acquire any locks released when
+                        // the last client detached while idle
+                        // (implementation note). A no-op when no
+                        // release snapshot exists — so a second concurrent attach to an
+                        // already-attached session triggers nothing.
+                        claim
+                    }
+                    AttachClaim::CleanupRequired(claim) => {
+                        cleanup_attempts = cleanup_attempts.saturating_add(1);
+                        let result = self.complete_terminal_cleanup(&claim).await;
+                        drop(claim);
+                        match result {
+                            Ok(()) if cleanup_attempts == 1 => continue,
+                            Ok(()) | Err(_) => return Err(SessionTerminalCleanupRetry.into()),
+                        }
+                    }
+                    AttachClaim::Activating => {
+                        return Err(SessionAttachRetry.into());
+                    }
+                    AttachClaim::Starting(slot) => {
+                        let generation = slot.generation;
+                        Box::pin(wait_for_start(slot))
+                            .await
+                            .context("waiting for session worker start")?;
+                        self.claim_live_generation(id, generation)
+                            .ok_or(SessionAttachRetry)?
+                    }
+                    AttachClaim::Start(ticket) => {
+                        let generation = ticket.generation();
+                        self.inner.db.restore_supervised_goals(id).await?;
+                        // Box the heavy resume sub-future: it synchronously calls
+                        // `Session::resume` (a large stack frame) and threads config
+                        // loading, so keeping its state on the heap rather than
+                        // inlined into `attach`'s future is what keeps the enclosing
+                        // future small enough to poll without overflowing the worker
+                        // stack (`daemon-lifecycle-replay-timing-robustness.md`).
+                        let result = Box::pin(self.start_resumed_worker(
+                            id,
+                            initial_model,
+                            client_no_sandbox,
+                            env_snapshot,
+                            generation,
+                        ))
+                        .await;
+                        self.finish_attach_start(ticket, &result);
+                        result?;
+                        self.claim_live_generation(id, generation)
+                            .ok_or(SessionAttachRetry)?
+                    }
+                };
+                break claim;
             };
+            let handle = claim.handle().clone();
             // Reconciliation gate (`daemon-lifecycle-replay-timing-robustness.md`,
             // §3 / finding 3): `start_worker` publishes the handle into
             // `workers.live` BEFORE the resumed worker's startup
@@ -818,7 +955,18 @@ impl SessionRegistry {
                     .await_startup_reconciled(INTERRUPT_PARK_COMMIT_DEADLINE),
             )
             .await;
-            self.resume_session_locks(id);
+            if handle.session_entry_mode() != session_entry_mode {
+                return Err(SessionEntryModeConflict {
+                    actual: handle.session_entry_mode().as_str(),
+                    requested: session_entry_mode.as_str(),
+                }
+                .into());
+            }
+            // Every concrete generation — including Start/Starting after it
+            // publishes — holds the same lease through lock resumption.
+            let Some(handle) = self.activate_claimed_live_session(claim).await? else {
+                return Err(SessionAttachRetry.into());
+            };
             return Ok(handle);
         }
 
@@ -834,8 +982,157 @@ impl SessionRegistry {
             client_no_sandbox,
             model_override,
             env_snapshot,
+            session_entry_mode,
         ))
         .await
+    }
+
+    /// Resume an existing durable session without accepting a caller-selected
+    /// entry mode. This is the scheduler/automation boundary: the daemon reads
+    /// immutable mode truth from its own row before it can start or join a
+    /// worker.
+    pub async fn attach_existing(
+        &self,
+        session_id: Uuid,
+        initial_model: Option<ActiveModelRef>,
+        client_no_sandbox: bool,
+        model_override: Option<&ActiveModelRef>,
+        env_snapshot: EnvSnapshot,
+    ) -> Result<SessionWorkerHandle> {
+        let row = self
+            .inner
+            .db
+            .get_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown session {session_id}"))?;
+        let mode = match row.session_entry_mode.as_str() {
+            "code" => crate::daemon::proto::SessionEntryMode::Code,
+            "assistant" => crate::daemon::proto::SessionEntryMode::Assistant,
+            "computer" => crate::daemon::proto::SessionEntryMode::Computer,
+            invalid => anyhow::bail!("invalid persisted session entry mode {invalid:?}"),
+        };
+        self.attach(
+            Some(session_id),
+            None,
+            initial_model,
+            client_no_sandbox,
+            model_override,
+            env_snapshot,
+            mode,
+        )
+        .await
+    }
+
+    /// Claim an already-live worker without ever starting a replacement.
+    ///
+    /// Lazy sessions deliberately have no `sessions` row until their first
+    /// user message. A second local client must therefore reattach through the
+    /// live daemon-owned handle, not manufacture a database-backed resume or
+    /// accept caller-supplied setup metadata. `None` means there is no live
+    /// claim and lets the normal durable attach path decide whether to resume
+    /// or reject the id. The returned claim is generation-fenced: callers may
+    /// await validation, but must successfully consume it before acting on
+    /// the captured root or mode.
+    pub(crate) async fn claim_live_attach_if_present(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<LiveAttachClaim>> {
+        let claim = {
+            let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
+            let Some(entry) = workers.live.get_mut(&session_id) else {
+                return Ok(None);
+            };
+            if entry.handle.is_closed() {
+                return Ok(None);
+            }
+            entry.activation_leases = entry.activation_leases.saturating_add(1);
+            LiveAttachClaim {
+                inner: Arc::downgrade(&self.inner),
+                session_id,
+                generation: entry.generation,
+                session_entry_mode: entry.handle.session_entry_mode(),
+                project_root: entry.handle.project_root(),
+                handle: entry.handle.clone(),
+                terminal_lock_cleanup_gate: entry.terminal_lock_cleanup_gate.clone(),
+                terminal_cleanup_complete: entry.terminal_cleanup_complete.clone(),
+            }
+        };
+        Box::pin(
+            claim
+                .handle
+                .park_commit()
+                .await_startup_reconciled(INTERRUPT_PARK_COMMIT_DEADLINE),
+        )
+        .await;
+        if !self.live_claim_is_current(&claim) {
+            return Ok(None);
+        }
+        Ok(Some(claim))
+    }
+
+    /// Complete a validated live attach. Kept separate from
+    /// [`Self::claim_live_attach_if_present`] so a caller-provided setup mismatch
+    /// cannot reacquire locks or otherwise mutate a live worker before the
+    /// daemon has rejected it.
+    pub(crate) async fn activate_claimed_live_session(
+        &self,
+        claim: LiveAttachClaim,
+    ) -> Result<Option<SessionWorkerHandle>> {
+        if !self.live_claim_is_current(&claim) {
+            return Ok(None);
+        }
+        // The RAII claim pins this generation through the awaited lock resume:
+        // cleanup leaves a closed entry in place and `claim_attach` refuses a
+        // successor until this operation returns or is cancelled. Thus this
+        // session-id-only lock API cannot resume a replacement worker.
+        let _terminal_cleanup = claim.terminal_lock_cleanup_gate.lock().await;
+        if !self.live_claim_is_current(&claim) {
+            return Ok(None);
+        }
+        self.inner
+            .locks
+            .resume_session(claim.session_id)
+            .await
+            .context("re-acquiring session locks on generation-bound reattach")?;
+        if !self.live_claim_is_current(&claim) {
+            return Ok(None);
+        }
+        Ok(Some(claim.handle().clone()))
+    }
+
+    /// Finish cleanup for exactly the terminal generation represented by
+    /// `claim`. The generation lease and its gate prevent a concurrent attach
+    /// or successor from changing which session lock state is being cleared.
+    async fn complete_terminal_cleanup(&self, claim: &LiveAttachClaim) -> Result<()> {
+        let _gate = claim.terminal_lock_cleanup_gate.lock().await;
+        let needs_cleanup = crate::sync::lock_or_recover(&self.inner.workers)
+            .live
+            .get(&claim.session_id)
+            .is_some_and(|entry| {
+                entry.generation == claim.generation
+                    && entry.terminal_closing.load(Ordering::Acquire)
+                    && !entry.terminal_cleanup_complete.load(Ordering::Acquire)
+            });
+        if !needs_cleanup {
+            return Err(SessionTerminalCleanupRetry.into());
+        }
+        self.inner
+            .locks
+            .end_session(claim.session_id)
+            .await
+            .context("retrying generation-bound terminal session lock cleanup")?;
+        claim
+            .terminal_cleanup_complete
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether an id is currently backed by a live worker. This is used only
+    /// by local-owner authorization to permit a lazy reattach; remote callers
+    /// always require durable session ownership.
+    pub fn has_live_session(&self, session_id: Uuid) -> bool {
+        self.lookup_entry(session_id)
+            .is_some_and(|(_, handle)| !handle.is_closed())
     }
 
     /// The create-a-new-session branch of [`Self::attach`], factored out and
@@ -848,6 +1145,7 @@ impl SessionRegistry {
         client_no_sandbox: bool,
         model_override: Option<&ActiveModelRef>,
         env_snapshot: EnvSnapshot,
+        session_entry_mode: crate::daemon::proto::SessionEntryMode,
     ) -> Result<SessionWorkerHandle> {
         let Some(project_root) = project_root else {
             bail!("attach requires either session_id or project_root");
@@ -877,7 +1175,7 @@ impl SessionRegistry {
         // Lazy persistence (session-id-display-and-lazy-persist): hold the
         // new session in memory with its id assigned but its `sessions` row
         // un-written. The worker persists it on the first user message.
-        let session = Session::create_deferred(
+        let mut session = Session::create_deferred(
             self.inner.db.clone(),
             project_root,
             &initial_agent,
@@ -885,6 +1183,7 @@ impl SessionRegistry {
             self.secret_vault()?,
         )
         .context("creating session")?;
+        session.set_deferred_entry_mode(session_entry_mode)?;
         session
             .set_active_model_ref(active)
             .context("setting active model on new session")?;
@@ -935,7 +1234,7 @@ impl SessionRegistry {
         let active = initial_model
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new assistant session")?;
-        let session = Session::create_assistant_deferred(
+        let mut session = Session::create_assistant_deferred(
             self.inner.db.clone(),
             project_root,
             assistant_name,
@@ -944,6 +1243,7 @@ impl SessionRegistry {
             self.secret_vault()?,
         )
         .context("creating assistant session")?;
+        session.set_deferred_entry_mode(crate::daemon::proto::SessionEntryMode::Assistant)?;
         session
             .set_active_model_ref(active)
             .context("setting active model on new assistant session")?;
@@ -1020,25 +1320,91 @@ impl SessionRegistry {
             .map(|entry| (entry.generation, entry.handle.clone()))
     }
 
+    fn live_claim_is_current(&self, claim: &LiveAttachClaim) -> bool {
+        crate::sync::lock_or_recover(&self.inner.workers)
+            .live
+            .get(&claim.session_id)
+            .is_some_and(|entry| {
+                entry.generation == claim.generation
+                    && !entry.handle.is_closed()
+                    && !entry.terminal_closing.load(Ordering::Acquire)
+            })
+    }
+
+    /// Lease one exact already-published worker generation. This is used by
+    /// Start/Starting after their asynchronous construction wait: the returned
+    /// handle alone is not enough because it can close and be replaced before
+    /// reconciliation or lock resumption completes.
+    fn claim_live_generation(
+        &self,
+        session_id: Uuid,
+        generation: WorkerGeneration,
+    ) -> Option<LiveAttachClaim> {
+        let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
+        let entry = workers.live.get_mut(&session_id)?;
+        if entry.generation != generation || entry.handle.is_closed() {
+            return None;
+        }
+        entry.activation_leases = entry.activation_leases.saturating_add(1);
+        Some(LiveAttachClaim {
+            inner: Arc::downgrade(&self.inner),
+            session_id,
+            generation,
+            session_entry_mode: entry.handle.session_entry_mode(),
+            project_root: entry.handle.project_root(),
+            handle: entry.handle.clone(),
+            terminal_lock_cleanup_gate: entry.terminal_lock_cleanup_gate.clone(),
+            terminal_cleanup_complete: entry.terminal_cleanup_complete.clone(),
+        })
+    }
+
     fn claim_attach(&self, session_id: Uuid) -> AttachClaim {
         let mut state = crate::sync::lock_or_recover(&self.inner.workers);
-        if let Some(entry) = state.live.get(&session_id) {
-            if entry.handle.is_closed() {
-                let generation = entry.generation;
-                state.live.remove(&session_id);
-                let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
-                if joins
-                    .get(&session_id)
-                    .is_some_and(|join| join.generation == generation)
-                {
-                    joins.remove(&session_id);
-                }
-            } else {
-                return AttachClaim::Live(Box::new(entry.handle.clone()));
+        let closed_generation = if let Some(entry) = state.live.get_mut(&session_id) {
+            if !entry.handle.is_closed() {
+                entry.activation_leases = entry.activation_leases.saturating_add(1);
+                return AttachClaim::Live(LiveAttachClaim {
+                    inner: Arc::downgrade(&self.inner),
+                    session_id,
+                    generation: entry.generation,
+                    session_entry_mode: entry.handle.session_entry_mode(),
+                    project_root: entry.handle.project_root(),
+                    handle: entry.handle.clone(),
+                    terminal_lock_cleanup_gate: entry.terminal_lock_cleanup_gate.clone(),
+                    terminal_cleanup_complete: entry.terminal_cleanup_complete.clone(),
+                });
             }
-        }
-        if let Some(entry) = state.live.get(&session_id) {
-            return AttachClaim::Live(Box::new(entry.handle.clone()));
+            if entry.terminal_closing.load(Ordering::Acquire)
+                && !entry.terminal_cleanup_complete.load(Ordering::Acquire)
+            {
+                entry.activation_leases = entry.activation_leases.saturating_add(1);
+                return AttachClaim::CleanupRequired(LiveAttachClaim {
+                    inner: Arc::downgrade(&self.inner),
+                    session_id,
+                    generation: entry.generation,
+                    session_entry_mode: entry.handle.session_entry_mode(),
+                    project_root: entry.handle.project_root(),
+                    handle: entry.handle.clone(),
+                    terminal_lock_cleanup_gate: entry.terminal_lock_cleanup_gate.clone(),
+                    terminal_cleanup_complete: entry.terminal_cleanup_complete.clone(),
+                });
+            }
+            if entry.activation_leases > 0 {
+                return AttachClaim::Activating;
+            }
+            Some(entry.generation)
+        } else {
+            None
+        };
+        if let Some(generation) = closed_generation {
+            state.live.remove(&session_id);
+            let mut joins = crate::sync::lock_or_recover(&self.inner.worker_joins);
+            if joins
+                .get(&session_id)
+                .is_some_and(|join| join.generation == generation)
+            {
+                joins.remove(&session_id);
+            }
         }
         if let Some(slot) = state.starting.get(&session_id) {
             return AttachClaim::Starting(slot.clone());
@@ -1060,32 +1426,6 @@ impl SessionRegistry {
 
     fn finish_attach_start(&self, ticket: StartTicket, result: &Result<SessionWorkerHandle>) {
         ticket.finish(result);
-    }
-
-    /// Re-acquire any locks released when this session's last client detached
-    /// while idle (implementation note). A no-op when the
-    /// session has no release snapshot (a fresh session, or a still-attached
-    /// one a second client is joining), since `resume_session` consumes the
-    /// snapshot the detach edge left. Best-effort: a failed reacquire is logged
-    /// — the agent must `read` again, never a crash on attach.
-    fn resume_session_locks(&self, session_id: Uuid) {
-        let locks = self.inner.locks.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Err(e) = locks.resume_session(session_id).await {
-                    tracing::warn!(
-                        error = %e,
-                        %session_id,
-                        "re-acquiring session locks on reattach failed"
-                    );
-                }
-            });
-        } else {
-            tracing::warn!(
-                %session_id,
-                "cannot schedule reattach lock resume outside a tokio runtime"
-            );
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1216,6 +1556,9 @@ impl SessionRegistry {
                 .set_active_model_ref(staged_recovery)
                 .context("committing recovered session model after worker validation")?;
         }
+        let terminal_lock_cleanup_gate = Arc::new(AsyncMutex::new(()));
+        let terminal_closing = Arc::new(AtomicBool::new(false));
+        let terminal_cleanup_complete = Arc::new(AtomicBool::new(false));
         let (handle, join) = session_worker::spawn(
             session,
             self.inner.locks.clone(),
@@ -1235,6 +1578,9 @@ impl SessionRegistry {
             crate::sync::lock_or_recover(&self.inner.global_bus).clone(),
             trust_policy.clone(),
             Some(cleanup),
+            terminal_lock_cleanup_gate.clone(),
+            terminal_closing.clone(),
+            terminal_cleanup_complete.clone(),
             env_snapshot,
             {
                 // Resolve hooks under the same workspace-trust scope and
@@ -1263,6 +1609,10 @@ impl SessionRegistry {
                 WorkerEntry {
                     generation,
                     handle: handle.clone(),
+                    activation_leases: 0,
+                    terminal_lock_cleanup_gate,
+                    terminal_closing,
+                    terminal_cleanup_complete,
                 },
             );
         let config_watcher = crate::daemon::config_watch::spawn_config_watcher(
@@ -1792,7 +2142,17 @@ impl SessionRegistry {
         let generation = {
             let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
             let generation = next_generation(&mut workers);
-            workers.live.insert(id, WorkerEntry { generation, handle });
+            workers.live.insert(
+                id,
+                WorkerEntry {
+                    generation,
+                    handle,
+                    activation_leases: 0,
+                    terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
+                    terminal_closing: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+                },
+            );
             generation
         };
         crate::sync::lock_or_recover(&self.inner.worker_joins).insert(
@@ -1811,7 +2171,17 @@ impl SessionRegistry {
         let id = handle.session_id;
         let mut workers = crate::sync::lock_or_recover(&self.inner.workers);
         let generation = next_generation(&mut workers);
-        workers.live.insert(id, WorkerEntry { generation, handle });
+        workers.live.insert(
+            id,
+            WorkerEntry {
+                generation,
+                handle,
+                activation_leases: 0,
+                terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
+                terminal_closing: Arc::new(AtomicBool::new(false)),
+                terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+            },
+        );
         generation
     }
 
@@ -1916,7 +2286,15 @@ mod tests {
             crate::env_snapshot::EnvSnapshotSource::DaemonStart,
             Default::default(),
         );
-        let fut = reg.attach(Some(Uuid::new_v4()), None, None, false, None, env);
+        let fut = reg.attach(
+            Some(Uuid::new_v4()),
+            None,
+            None,
+            false,
+            None,
+            env,
+            proto::SessionEntryMode::Code,
+        );
         let size = std::mem::size_of_val(&fut);
         assert!(
             size < 4096,
@@ -2097,6 +2475,7 @@ mod tests {
                     crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                     Default::default(),
                 ),
+                proto::SessionEntryMode::Code,
             )
             .await
             .expect("missing watch paths must not fail session start");
@@ -2159,6 +2538,7 @@ mod tests {
                     crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                     Default::default(),
                 ),
+                proto::SessionEntryMode::Code,
             )
             .await
             .err()
@@ -2175,6 +2555,7 @@ mod tests {
                     crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                     Default::default(),
                 ),
+                proto::SessionEntryMode::Code,
             )
             .await
             .err()
@@ -2210,6 +2591,7 @@ mod tests {
                     crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                     Default::default(),
                 ),
+                proto::SessionEntryMode::Code,
             )
             .await
             .err()
@@ -2223,7 +2605,7 @@ mod tests {
         let session = test_session(&reg);
         let id = session.id;
         let handle = test_handle(&reg, session);
-        let generation = reg.insert_test_worker_without_join(handle);
+        reg.insert_test_worker_without_join(handle);
         let config_watcher = tokio::spawn(std::future::pending::<()>());
         let abort_handle = config_watcher.abort_handle();
         let join = tokio::spawn(async {});
@@ -2359,6 +2741,7 @@ mod tests {
                     crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                     Default::default(),
                 ),
+                proto::SessionEntryMode::Code,
             )
             .await
             .expect("explicit model should create a session without a configured default");
@@ -2410,6 +2793,7 @@ mod tests {
                     crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                     Default::default(),
                 ),
+                proto::SessionEntryMode::Code,
             )
             .await
             .expect("explicit model should recover the same model-less session");
@@ -2447,6 +2831,7 @@ mod tests {
                     crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                     Default::default(),
                 ),
+                proto::SessionEntryMode::Code,
             )
             .await;
         assert!(failed_recovery.is_err());
@@ -2476,6 +2861,7 @@ mod tests {
                     crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
                     Default::default(),
                 ),
+                proto::SessionEntryMode::Code,
             )
             .await
             .expect("structured model pin creates an aligned session");
@@ -2508,6 +2894,7 @@ mod tests {
                     crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
                     Default::default(),
                 ),
+                proto::SessionEntryMode::Code,
             )
             .await;
         let mismatch = match mismatch {
@@ -2531,6 +2918,7 @@ mod tests {
                     crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                     Default::default(),
                 ),
+                proto::SessionEntryMode::Code,
             )
             .await;
         let missing = match missing {
@@ -2574,6 +2962,10 @@ mod tests {
                 WorkerEntry {
                     generation,
                     handle: handle.clone(),
+                    activation_leases: 0,
+                    terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
+                    terminal_closing: Arc::new(AtomicBool::new(false)),
+                    terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
                 },
             );
 
@@ -2741,6 +3133,179 @@ mod tests {
         assert!(crate::sync::lock_or_recover(&reg.inner.worker_joins).contains_key(&id));
     }
 
+    #[tokio::test]
+    async fn modes_session_setup_stale_lazy_live_claim_cannot_resume_successor_generation() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let session_id = session.id;
+        let (old_handle, old_rx) = test_handle_with_rx(&reg, session.clone());
+        let old_generation = reg.insert_test_worker_without_join(old_handle);
+
+        let stale_claim = reg
+            .claim_live_attach_if_present(session_id)
+            .await
+            .unwrap()
+            .expect("first generation is live");
+
+        // This models the await between deriving the lazy session's daemon-
+        // owned root/mode and dispatch activation: A exits, while B attempts
+        // to replace the same session id before A's lease resolves.
+        drop(old_rx);
+        reg.forget_generation(session_id, old_generation);
+        assert!(matches!(
+            reg.claim_attach(session_id),
+            AttachClaim::Activating
+        ));
+        assert!(
+            reg.activate_claimed_live_session(stale_claim)
+                .await
+                .unwrap()
+                .is_none(),
+            "a closed generation A must fail before it can resume a successor"
+        );
+        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Start(_)));
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_ordinary_live_claim_pins_generation_through_activation() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let session_id = session.id;
+        let (old_handle, old_rx) = test_handle_with_rx(&reg, session);
+        let old_generation = reg.insert_test_worker_without_join(old_handle);
+
+        let stale_claim = match reg.claim_attach(session_id) {
+            AttachClaim::Live(claim) => claim,
+            _ => panic!("the first generation must be claimed live"),
+        };
+
+        // Interleave after the normal attach path has accepted generation A,
+        // but before it can await lock resumption. A closing must retain its
+        // registry generation while the lease is live, so a replacement B
+        // cannot be started and resumed using A's already-validated facts.
+        drop(old_rx);
+        reg.forget_generation(session_id, old_generation);
+        assert!(matches!(
+            reg.claim_attach(session_id),
+            AttachClaim::Activating
+        ));
+        assert!(
+            reg.activate_claimed_live_session(stale_claim)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Start(_)));
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_terminal_cleanup_retry_retires_only_its_generation() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let session_id = session.id;
+        let (handle, closed_rx) = test_handle_with_rx(&reg, session);
+        let generation = reg.insert_test_worker_without_join(handle);
+        {
+            let workers = crate::sync::lock_or_recover(&reg.inner.workers);
+            let entry = workers.live.get(&session_id).expect("test generation");
+            entry.terminal_closing.store(true, Ordering::Release);
+            assert!(!entry.terminal_cleanup_complete.load(Ordering::Acquire));
+        }
+        drop(closed_rx);
+
+        let claim = match reg.claim_attach(session_id) {
+            AttachClaim::CleanupRequired(claim) => claim,
+            _ => panic!("only the closed terminal generation may own cleanup"),
+        };
+        reg.complete_terminal_cleanup(&claim)
+            .await
+            .expect("cleanup retry succeeds");
+        drop(claim);
+
+        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Start(_)));
+        assert!(
+            reg.live_generation(session_id).is_none(),
+            "the cleaned terminal generation is removed before a successor starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_start_generation_is_leased_before_reconciliation() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let session_id = session.id;
+        let ticket = match reg.claim_attach(session_id) {
+            AttachClaim::Start(ticket) => ticket,
+            _ => panic!("first attach must own startup"),
+        };
+        let generation = ticket.generation();
+        let (handle, closed_rx) = test_handle_with_rx(&reg, session);
+        crate::sync::lock_or_recover(&reg.inner.workers).live.insert(
+            session_id,
+            WorkerEntry {
+                generation,
+                handle: handle.clone(),
+                activation_leases: 0,
+                terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
+                terminal_closing: Arc::new(AtomicBool::new(false)),
+                terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let result = Ok(handle);
+        reg.finish_attach_start(ticket, &result);
+
+        let claim = reg
+            .claim_live_generation(session_id, generation)
+            .expect("published Start generation must receive an activation lease");
+        drop(closed_rx);
+        reg.forget_generation(session_id, generation);
+        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Activating));
+        drop(claim);
+        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Start(_)));
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_starting_generation_is_leased_before_reconciliation() {
+        let reg = test_registry();
+        let session = test_session(&reg);
+        let session_id = session.id;
+        let ticket = match reg.claim_attach(session_id) {
+            AttachClaim::Start(ticket) => ticket,
+            _ => panic!("first attach must own startup"),
+        };
+        let generation = ticket.generation();
+        let slot = match reg.claim_attach(session_id) {
+            AttachClaim::Starting(slot) => slot,
+            _ => panic!("second attach must wait on the first generation"),
+        };
+        let (handle, closed_rx) = test_handle_with_rx(&reg, session);
+        crate::sync::lock_or_recover(&reg.inner.workers).live.insert(
+            session_id,
+            WorkerEntry {
+                generation,
+                handle: handle.clone(),
+                activation_leases: 0,
+                terminal_lock_cleanup_gate: Arc::new(AsyncMutex::new(())),
+                terminal_closing: Arc::new(AtomicBool::new(false)),
+                terminal_cleanup_complete: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let result = Ok(handle);
+        reg.finish_attach_start(ticket, &result);
+        wait_for_start(slot)
+            .await
+            .expect("Starting waiter receives the published generation");
+
+        let claim = reg
+            .claim_live_generation(session_id, generation)
+            .expect("Starting waiter must lease the exact published generation");
+        drop(closed_rx);
+        reg.forget_generation(session_id, generation);
+        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Activating));
+        drop(claim);
+        assert!(matches!(reg.claim_attach(session_id), AttachClaim::Start(_)));
+    }
+
     #[test]
     fn start_worker_refuses_after_drain_begins() {
         let reg = test_registry();
@@ -2819,6 +3384,7 @@ mod tests {
                     crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                     Default::default(),
                 ),
+                proto::SessionEntryMode::Code,
             )
             .await;
         let err = match result {
@@ -3620,23 +4186,6 @@ mod tests {
         );
     }
 
-    /// Reattach hook (`session-detach-lock-release.md`): the registry's resume
-    /// path re-acquires a session's released locks for an unchanged file. A
-    /// changed file is not reacquired. A second reattach (snapshot already
-    /// consumed) reacquires nothing — the multi-attach nuance.
-    async fn wait_until<F>(mut predicate: F)
-    where
-        F: FnMut() -> bool,
-    {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !predicate() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("condition became true");
-    }
-
     #[test]
     fn poisoned_worker_mutex_is_recovered_on_hot_path_reads() {
         let reg = test_registry();
@@ -3692,8 +4241,7 @@ mod tests {
         std::fs::write(&drift, "v2").unwrap();
 
         // Reattach → only the unchanged file is reacquired.
-        reg.resume_session_locks(sid);
-        wait_until(|| locks.holder(&keep).is_some()).await;
+        locks.resume_session(sid).await.unwrap();
         assert_eq!(
             locks.holder(&keep),
             Some((sid, "builder".to_string())),
@@ -3706,8 +4254,7 @@ mod tests {
 
         // A second concurrent reattach finds no snapshot → reacquires nothing
         // new (multi-attach triggers no extra release/reacquire).
-        reg.resume_session_locks(sid);
-        tokio::task::yield_now().await;
+        locks.resume_session(sid).await.unwrap();
         assert_eq!(locks.holder(&keep), Some((sid, "builder".to_string())));
     }
 

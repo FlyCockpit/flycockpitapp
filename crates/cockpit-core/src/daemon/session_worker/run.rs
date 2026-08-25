@@ -3984,6 +3984,9 @@ pub(super) async fn run_worker(
     write_scope: crate::write_scope::WriteScopeSource,
     global_bus: Option<EventSender>,
     park_commit: crate::engine::interrupt::ParkCommit,
+    terminal_lock_cleanup_gate: Arc<tokio::sync::Mutex<()>>,
+    terminal_closing: Arc<AtomicBool>,
+    terminal_cleanup_complete: Arc<AtomicBool>,
 ) {
     let session_id = session.id;
 
@@ -10083,8 +10086,24 @@ pub(super) async fn run_worker(
         _ => {
             // Mark session ended in DB for destructive/explicit worker stops. A
             // graceful daemon drain keeps the session resumable instead.
-            if let Err(e) = locks.end_session(session_id).await {
-                tracing::warn!(error = %e, "lock cleanup failed during terminal session shutdown");
+            // A generation-bound attach may be resuming an idle lock snapshot
+            // at this exact instant. Mark the generation closed before waiting
+            // for its gate, then serialize permanent cleanup after a winning
+            // resume. This gate belongs to one registry generation, so neither
+            // side can clear locks installed by a successor incarnation.
+            terminal_closing.store(true, std::sync::atomic::Ordering::Release);
+            let _terminal_cleanup = terminal_lock_cleanup_gate.lock().await;
+            match locks.end_session(session_id).await {
+                Ok(()) => {
+                    terminal_cleanup_complete.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Err(e) => {
+                    // Do not allow the registry to retire this generation or
+                    // start a successor whose locks could be erased by a
+                    // failed/unfinished terminal cleanup. Recovery is
+                    // deliberately fail-closed rather than id-only cleanup.
+                    tracing::warn!(error = %e, "lock cleanup failed during terminal session shutdown");
+                }
             }
             if let Err(e) = session.end() {
                 tracing::warn!(error = %e, "session.end() failed during shutdown");

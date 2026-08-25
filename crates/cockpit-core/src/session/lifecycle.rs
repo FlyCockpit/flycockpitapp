@@ -216,6 +216,31 @@ impl Session {
         Ok(session)
     }
 
+    /// Set immutable entry setup while the new row is still deferred.  Once a
+    /// session is durable this metadata must be matched, never rewritten, by
+    /// subsequent Attach requests.
+    pub(crate) fn set_deferred_entry_mode(
+        &mut self,
+        mode: crate::daemon::proto::SessionEntryMode,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.pending_row.lock().unwrap().is_some(),
+            "entry mode may only be set before a new session is persisted"
+        );
+        self.session_entry_mode = mode;
+        let staged = self
+            .stage_pending_row(|row| row.session_entry_mode = mode.as_str().to_string());
+        anyhow::ensure!(
+            staged,
+            "deferred session row disappeared while setting entry mode"
+        );
+        Ok(())
+    }
+
+    pub fn session_entry_mode(&self) -> crate::daemon::proto::SessionEntryMode {
+        self.session_entry_mode
+    }
+
     /// Create a brand-new assistant session held in memory only. Mirrors
     /// [`Self::create_deferred`], but carries `assistant_name` in the pending
     /// row so the eventual first user message persists the assistant session
@@ -401,6 +426,12 @@ impl Session {
         resolver: RedactionKeyResolverArc,
         vault: Arc<crate::secure_key::SecretVault>,
     ) -> Result<Self> {
+        let session_entry_mode = match row.session_entry_mode.as_str() {
+            "code" => crate::daemon::proto::SessionEntryMode::Code,
+            "assistant" => crate::daemon::proto::SessionEntryMode::Assistant,
+            "computer" => crate::daemon::proto::SessionEntryMode::Computer,
+            invalid => anyhow::bail!("invalid persisted session entry mode {invalid:?}"),
+        };
         let started_at =
             DateTime::<Utc>::from_timestamp(row.started_at, 0).unwrap_or_else(Utc::now);
         let user_content_turns = count_user_turns_for_title(&db, row.session_id);
@@ -468,6 +499,7 @@ impl Session {
             active_agent: Mutex::new(row.active_agent),
             model_selection: Mutex::new(model_selection),
             session_llm_mode: Mutex::new(row.session_llm_mode),
+            session_entry_mode,
             tool_surface_override_json: Mutex::new(row.tool_surface_override_json),
             goal_settings_override_json: Mutex::new(row.goal_settings_override_json),
             redaction_table_json: Mutex::new(redaction_table_json),

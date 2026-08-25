@@ -679,6 +679,8 @@ pub async fn apply_extended_config_patch(
     let root = trusted_settings_root(ctx, &project_root).await?;
     let db = ctx.db.clone();
     let runtime = tokio::runtime::Handle::current();
+    let settlement_owner = owner.clone();
+    let settlement_operation = client_operation_id.clone();
     let mut response = join_fs_handler(
         "apply_extended_config_patch",
         tokio::task::spawn_blocking(move || {
@@ -888,6 +890,28 @@ pub async fn apply_extended_config_patch(
             if precommit_identity != capability.identity
                 || content_hash(&precommit) != capability.raw_revision
             {
+                drop(_publication_guard);
+                let abandon_owner = owner.clone();
+                let abandon_operation = client_operation_id.clone();
+                runtime
+                    .block_on(db.write(move |conn| {
+                        let deleted = conn.execute(
+                            "DELETE FROM extended_config_patch_journals
+                              WHERE owner_digest=?1 AND client_operation_id=?2
+                                AND request_hash=?3 AND fencing_generation=?4",
+                            rusqlite::params![
+                                abandon_owner,
+                                abandon_operation,
+                                request_hash.as_slice(),
+                                fencing_generation
+                            ],
+                        )?;
+                        if deleted != 1 {
+                            anyhow::bail!("typed settings recovery intent disappeared before safe abandonment");
+                        }
+                        Ok(())
+                    }))
+                    .map_err(internal)?;
                 return Err(conflict(
                     "configuration target changed immediately before commit",
                 ));
@@ -921,18 +945,6 @@ pub async fn apply_extended_config_patch(
                     })).map_err(internal)?;
                 }
             }
-            let settle_owner = owner;
-            let settle_operation = client_operation_id;
-            runtime.block_on(db.transaction(move |conn| {
-                let updated = conn.execute(
-                    "UPDATE local_operation_receipts SET state='terminal_success',terminal_outcome_json=?5,execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
-                     WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4 AND state='executing'",
-                    rusqlite::params![settle_owner,settle_operation,request_hash.as_slice(),fencing_generation,terminal_response_json,chrono::Utc::now().timestamp_millis()],
-                )?;
-                if updated != 1 { anyhow::bail!("typed settings operation lost its execution fence"); }
-                conn.execute("DELETE FROM extended_config_patch_journals WHERE owner_digest=?1 AND client_operation_id=?2", rusqlite::params![settle_owner,settle_operation])?;
-                Ok(())
-            })).map_err(internal)?;
             Ok(terminal_response)
         }),
     )
@@ -943,6 +955,25 @@ pub async fn apply_extended_config_patch(
             *publication = cockpit_proto::ConfigPublicationStatus::Degraded;
         }
     }
+    let terminal_response_json = serde_json::to_string(&response).map_err(internal)?;
+    ctx.db
+        .transaction(move |conn| {
+            let updated = conn.execute(
+                "UPDATE local_operation_receipts SET state='terminal_success',terminal_outcome_json=?5,execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                 WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3 AND fencing_generation=?4 AND state='executing'",
+                rusqlite::params![settlement_owner,settlement_operation,request_hash.as_slice(),fencing_generation,terminal_response_json,chrono::Utc::now().timestamp_millis()],
+            )?;
+            if updated != 1 {
+                anyhow::bail!("typed settings operation lost its execution fence");
+            }
+            conn.execute(
+                "DELETE FROM extended_config_patch_journals WHERE owner_digest=?1 AND client_operation_id=?2",
+                rusqlite::params![settlement_owner, settlement_operation],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(internal)?;
     Ok(response)
 }
 
@@ -2656,6 +2687,13 @@ mod tests {
             .expect("atomic publication");
         assert!(release < prepare && prepare < publication);
         assert!(apply.contains("drop(_publication_guard)"));
+        let refresh = apply
+            .find("ctx.refresh_redaction_table()")
+            .expect("redaction publication reconciliation");
+        let settlement = apply
+            .rfind("UPDATE local_operation_receipts SET state='terminal_success'")
+            .expect("atomic terminal settlement");
+        assert!(publication < refresh && refresh < settlement);
 
         let startup = include_str!("server/mod.rs");
         let recovery = startup

@@ -11872,7 +11872,7 @@ fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
     for required in [
         "projection_matches_plan",
         "CommittedRefreshNeeded",
-        "DELETE FROM assistant_mutation_journals",
+        "DELETE FROM agent_mutation_journals",
         "recover_agent_mutation_journals",
         "conflict_agent_mutation_journal",
         "state='terminal_error'",
@@ -11908,7 +11908,7 @@ fn assistant_mutations_are_owner_receipted_and_crash_recoverable() {
         "assistant_mutation_journals",
         "save_assistant_definition",
         "delete_assistant",
-        "hex::decode(&mutation_intent_hash)",
+        "if mutation_intent_hash != expected_intent",
         "CommittedRefreshNeeded",
     ] {
         assert!(

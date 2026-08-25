@@ -1516,12 +1516,15 @@ impl AgentsPage {
         let Some(pending) = self.pending_external_edit.as_ref() else {
             return;
         };
+        let lease_id = pending.lease_id.clone();
+        let consumed_revision = pending.consumed_revision.clone();
+        let staging_id = pending.staging_id;
         self.settle_external_edit_after_read(
             cx,
             id,
-            pending.lease_id.clone(),
-            pending.consumed_revision.clone(),
-            pending.staging_id,
+            lease_id,
+            consumed_revision,
+            staging_id,
             super::pointer_actions::ExternalEditOutcome::Failed,
             detail,
             Err(error),

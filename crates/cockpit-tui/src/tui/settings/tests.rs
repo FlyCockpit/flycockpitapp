@@ -2578,13 +2578,11 @@ fn pointer_mcp_action_family_dispatches_from_fresh_sources() {
       }
     }"#;
 
-    // MCP list edits (toggle/delete/save) are owner-remoted through the daemon
-    // (`Request::SaveMcpConfig`), which blocks on the ambient runtime and fails
-    // closed on an untrusted workspace. Promote an isolated in-process daemon,
-    // trust one shared project root, and drive every click that can persist
-    // under a multi-thread runtime so `block_in_place(Handle::current())` has a
-    // reactor. The environment is isolated so the owner write never touches this
-    // developer box.
+    // MCP list edits (toggle/delete/save) enqueue typed owner RPC effects and
+    // fail closed on an untrusted workspace. Promote an isolated in-process
+    // daemon and trust one shared project root so the helper can service each
+    // queued effect and feed its correlated receipt back through the reducer.
+    // The environment is isolated so the owner write never touches this box.
     let _env = cockpit_test_support::TestEnvGuard::isolated_cockpit_home();
     let _daemon = cockpit_core::daemon::enable_in_process_auto_promote_with_production_config();
     let runtime = tokio::runtime::Builder::new_multi_thread()

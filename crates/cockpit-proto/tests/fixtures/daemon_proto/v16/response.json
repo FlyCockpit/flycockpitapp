@@ -133,7 +133,7 @@
   "provider_mutation_committed": {
     "data": {
       "client_operation_id": "provider-operation-fixture",
-      "config": {"providers": {}},
+      "config": { "providers": {} },
       "config_generation": 2,
       "consumed_revision": "provider-revision-fixture",
       "layer_id": "provider-layer-fixture",
@@ -1937,8 +1937,18 @@
       "status": "committed",
       "publication": "published",
       "denylist": [
-        {"entry_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","consumed_entry_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","client_nonce":null,"display_mask":"••••"},
-        {"entry_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","consumed_entry_id":null,"client_nonce":"33333333-3333-4333-8333-333333333333","display_mask":"••••"}
+        {
+          "entry_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "consumed_entry_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "client_nonce": null,
+          "display_mask": "••••"
+        },
+        {
+          "entry_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "consumed_entry_id": null,
+          "client_nonce": "33333333-3333-4333-8333-333333333333",
+          "display_mask": "••••"
+        }
       ]
     },
     "response": "extended_config_saved"
@@ -2455,7 +2465,7 @@
       "inventory_revision": null,
       "consumed_revision": "old-revision",
       "completed_lease_id": null,
-      "outcome": {"status":"reconciled"}
+      "outcome": { "status": "reconciled" }
     }
   },
   "agent_editor_lease_begun": {
@@ -2490,7 +2500,7 @@
       "inventory_revision": null,
       "consumed_revision": "1c1036c76fde6cc31026fa16a8b64fec0236dd64d1a9e86688b9ce719c3761b5",
       "completed_lease_id": "11111111-1111-4111-8111-111111111111",
-      "outcome": {"status":"reconciled"}
+      "outcome": { "status": "reconciled" }
     }
   },
   "extended_config_written": {

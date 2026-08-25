@@ -169,6 +169,21 @@ fn validate_owner_identifier(label: &str, value: &str, max: usize) -> Result<(),
     Ok(())
 }
 
+/// Wire-boundary cap for owner identifiers (operation ids, capabilities,
+/// revisions, intent hashes). Field validation re-checks the exact per-field
+/// bound; ingress enforces the loosest one.
+const MAX_OWNER_WIRE_IDENTIFIER_BYTES: usize = 128;
+
+fn deserialize_owner_identifier<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    validate_owner_identifier("owner identifier", &value, MAX_OWNER_WIRE_IDENTIFIER_BYTES)
+        .map_err(serde::de::Error::custom)?;
+    Ok(value)
+}
+
 fn validate_optional_oauth_flow_id(value: Option<&str>, label: &str) -> Result<(), String> {
     if value.is_some_and(|flow_id| {
         flow_id.is_empty() || flow_id.len() > MAX_OWNER_PROVIDER_ID_BYTES || flow_id.contains('\0')
@@ -240,6 +255,13 @@ where
 {
     deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
         .map(SensitiveWirePayload::new)
+}
+
+fn deserialize_owner_mcp_json<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_string::<MAX_OWNER_PROVIDER_METADATA_JSON_BYTES, D>(deserializer)
 }
 
 /// Client-owned immutable options attached to a `cockpit run` submission.
@@ -1644,7 +1666,6 @@ pub enum Request {
             deserialize_with = "deserialize_lower_hex_sha256",
             skip_serializing_if = "String::is_empty"
         )]
-        #[serde(deserialize_with = "deserialize_lower_hex_sha256")]
         mutation_intent_hash: String,
         mutation: crate::ProviderMutationBatch,
     },
@@ -2931,9 +2952,9 @@ impl Request {
                 validate_owner_identifier("MCP expected revision", expected_revision, 64)?;
                 validate_owner_identifier("MCP mutation intent", mutation_intent_hash, 64)?;
                 for (label, value) in [
-                    ("MCP config", config_json),
-                    ("MCP secret values", secret_values_json),
-                    ("MCP cleanup names", cleanup_names_json),
+                    ("MCP config", config_json.as_str()),
+                    ("MCP secret values", secret_values_json.as_str()),
+                    ("MCP cleanup names", cleanup_names_json.as_str()),
                 ] {
                     if value.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
                         return Err(format!("{label} JSON exceeds maximum length"));
@@ -2950,7 +2971,7 @@ impl Request {
                 name,
                 markdown,
                 expected_revision,
-                expected_config_generation,
+                expected_config_generation: _,
             } => {
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
@@ -2978,7 +2999,7 @@ impl Request {
                 project_root,
                 name,
                 expected_revision,
-                expected_config_generation,
+                expected_config_generation: _,
             } => {
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
@@ -3606,6 +3627,7 @@ macro_rules! request_variants {
             (Request::PutSubscriptionAck { .. }, "put_subscription_ack");
             (Request::DeleteNamedSecret { .. }, "delete_named_secret");
             (Request::PutProviderCredential { .. }, "put_provider_credential");
+            (Request::GetLocalOperationSettlement { .. }, "get_local_operation_settlement");
             (Request::BeginProviderOAuth { .. }, "begin_provider_oauth");
             (Request::CompleteProviderOAuth { .. }, "complete_provider_oauth");
             (Request::CancelProviderOAuth { .. }, "cancel_provider_oauth");

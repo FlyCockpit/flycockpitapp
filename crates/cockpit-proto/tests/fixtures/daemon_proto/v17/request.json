@@ -1421,27 +1421,29 @@
       "mutation_intent_hash": "1111111111111111111111111111111111111111111111111111111111111111",
       "mutation": {
         "deletes": [],
-        "upserts": [{
-          "entry": {
-            "cache": {"mode": "none", "ttl_secs": 300},
-            "context": {
-              "auto_compact_pct": null,
-              "auto_prune_pct": 50,
-              "auto_prune_prunable_pct": 30,
-              "compact_keep_recent_turns": 4,
-              "compact_nudge_pct": 60,
-              "compact_shadow": true,
-              "compact_shadow_margin_pct": 10
+        "upserts": [
+          {
+            "entry": {
+              "cache": { "mode": "none", "ttl_secs": 300 },
+              "context": {
+                "auto_compact_pct": null,
+                "auto_prune_pct": 50,
+                "auto_prune_prunable_pct": 30,
+                "compact_keep_recent_turns": 4,
+                "compact_nudge_pct": 60,
+                "compact_shadow": true,
+                "compact_shadow_margin_pct": 10
+              },
+              "headers": [],
+              "models": [],
+              "shrink": { "margin_secs": 30, "strategy": "prune" },
+              "timeout": { "idle_secs": 90, "ttft_secs": 120 },
+              "url": "https://example.test"
             },
-            "headers": [],
-            "models": [],
-            "shrink": {"margin_secs": 30, "strategy": "prune"},
-            "timeout": {"idle_secs": 90, "ttft_secs": 120},
-            "url": "https://example.test"
-          },
-          "header_secrets": [],
-          "provider_id": "example"
-        }]
+            "header_secrets": [],
+            "provider_id": "example"
+          }
+        ]
       },
       "snapshot_session_id": "provider-snapshot-fixture"
     },
@@ -1984,8 +1986,15 @@
         ],
         "materialize": false,
         "denylist": [
-          {"source":"existing","entry_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
-          {"source":"new","client_nonce":"33333333-3333-4333-8333-333333333333","literal":"fixture-secret"}
+          {
+            "source": "existing",
+            "entry_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "source": "new",
+            "client_nonce": "33333333-3333-4333-8333-333333333333",
+            "literal": "fixture-secret"
+          }
         ],
         "redacted_mutations": []
       },

@@ -45,7 +45,8 @@ pub use agent_management::{
     MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
     MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES, MAX_ASSISTANT_HOME_BYTES,
     agent_edit_projection_material, agent_inventory_entry_projection_material,
-    agent_mutation_intent_hash, agent_mutation_name, validate_agent_edit_snapshot,
+    agent_mutation_intent_hash, agent_mutation_name, assistant_mutation_intent_hash,
+    validate_agent_edit_snapshot,
     validate_agent_editor_completion, validate_agent_mutation_envelope,
     validate_agent_source_identity, validate_goal_supervision_projection,
 };
@@ -7598,7 +7599,7 @@ mod tests {
     fn config_refreshed_response_is_frozen_in_current_fixture() {
         assert_eq!(PROTOCOL_VERSION, 17);
         assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 17);
-        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let fixture = proto_fixture_files::read_fixture("response.json");
         let response: Response = serde_json::from_value(
             fixture
                 .get("config_refreshed")
@@ -7619,7 +7620,7 @@ mod tests {
     fn goal_summary_cap_is_present_in_every_current_response_fixture() {
         assert_eq!(PROTOCOL_VERSION, 17);
         assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 17);
-        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let fixture = proto_fixture_files::read_fixture("response.json");
 
         for response_name in ["goal_status", "goal_updated"] {
             let response = fixture
@@ -7663,7 +7664,7 @@ mod tests {
 
     #[test]
     fn authority_commit_receipts_are_frozen_in_current_response_fixtures() {
-        let fixture = proto_fixture_tests::read_fixture("response.json");
+        let fixture = proto_fixture_files::read_fixture("response.json");
         assert!(
             fixture["app_flag"]["data"]
                 .get("client_operation_id")
@@ -7720,7 +7721,7 @@ mod tests {
 
     #[test]
     fn oauth_v17_receipts_are_correlated_and_recoverable() {
-        let requests = proto_fixture_tests::read_fixture("request.json");
+        let requests = proto_fixture_files::read_fixture("request.json");
         for tag in [
             "begin_provider_oauth",
             "complete_provider_oauth",
@@ -7750,7 +7751,7 @@ mod tests {
             assert!(requests[tag]["params"]["begin_client_operation_id"].is_string());
         }
 
-        let responses = proto_fixture_tests::read_fixture("response.json");
+        let responses = proto_fixture_files::read_fixture("response.json");
         for tag in [
             "provider_oauth_started",
             "provider_oauth_completed",
@@ -7771,7 +7772,7 @@ mod tests {
 
     #[test]
     fn settings_v17_receipts_bind_exact_operations_and_content() {
-        let requests = proto_fixture_tests::read_fixture("request.json");
+        let requests = proto_fixture_files::read_fixture("request.json");
         for tag in [
             "put_provider_credential",
             "delete_provider_credential",
@@ -7785,7 +7786,7 @@ mod tests {
                 "current v17 fixture must carry an operation id for {tag}"
             );
         }
-        let responses = proto_fixture_tests::read_fixture("response.json");
+        let responses = proto_fixture_files::read_fixture("response.json");
         let receipt = &responses["extended_config_saved"]["data"];
         assert!(receipt["client_operation_id"].is_string());
         assert_eq!(receipt["request_hash"].as_str().map(str::len), Some(64));
@@ -7795,7 +7796,7 @@ mod tests {
 
     #[test]
     fn editor_v17_settlement_is_correlated_and_document_free() {
-        let requests = proto_fixture_tests::read_fixture("request.json");
+        let requests = proto_fixture_files::read_fixture("request.json");
         for tag in [
             "complete_agent_editor_lease",
             "get_agent_editor_lease_settlement",
@@ -7809,7 +7810,7 @@ mod tests {
                 .is_none()
         );
 
-        let responses = proto_fixture_tests::read_fixture("response.json");
+        let responses = proto_fixture_files::read_fixture("response.json");
         let begun = &responses["agent_editor_lease_begun"]["data"];
         assert!(begun["client_operation_id"].is_string());
         let receipt = &responses["agent_editor_lease_completed"]["data"];

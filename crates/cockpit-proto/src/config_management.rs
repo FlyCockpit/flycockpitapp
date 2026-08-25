@@ -159,7 +159,7 @@ impl ExtendedConfigPatch {
             denylist,
             redacted_mutations,
         })?;
-        Ok(format!("{:x}", Sha256::digest(bytes)))
+        Ok(crate::hex_lower(Sha256::digest(bytes)))
     }
 }
 
@@ -437,11 +437,11 @@ mod tests {
             materialize: true,
             denylist: vec![DesiredDenylistEntry::New {
                 client_nonce: "nonce-1".into(),
-                literal: denylist_literal.into(),
+                literal: crate::SensitiveWireLiteral::new(denylist_literal.to_string()),
             }],
             redacted_mutations: vec![RedactedOccurrenceMutation::Set {
                 pointer: "/provider/token".into(),
-                value: redacted_value.into(),
+                value: crate::SensitiveWireLiteral::new(redacted_value.to_string()),
             }],
         }
     }
@@ -458,7 +458,7 @@ mod tests {
         let mut different_target = second;
         different_target.redacted_mutations = vec![RedactedOccurrenceMutation::Set {
             pointer: "/provider/other-token".into(),
-            value: "token-b".into(),
+            value: crate::SensitiveWireLiteral::new("token-b".to_string()),
         }];
         assert_ne!(
             first.sanitized_intent_hash().unwrap(),

@@ -3879,7 +3879,11 @@
           "type": "u64"
         },
         { "field": "expected_config_revision", "role": "param", "type": "String" },
-        { "field": "mutation_capability", "role": "param", "type": "crate::image_control::ImageConfigMutationCapabilityV1" }
+        {
+          "field": "mutation_capability",
+          "role": "param",
+          "type": "crate::image_control::ImageConfigMutationCapabilityV1"
+        }
       ],
       "fcorSchema": "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1",
       "strategy": "none",
@@ -3908,7 +3912,11 @@
           "type": "u64"
         },
         { "field": "expected_config_revision", "role": "param", "type": "String" },
-        { "field": "mutation_capability", "role": "param", "type": "crate::image_control::ImageConfigMutationCapabilityV1" }
+        {
+          "field": "mutation_capability",
+          "role": "param",
+          "type": "crate::image_control::ImageConfigMutationCapabilityV1"
+        }
       ],
       "fcorSchema": "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1",
       "strategy": "none",
@@ -3942,7 +3950,11 @@
           "type": "u64"
         },
         { "field": "expected_config_revision", "role": "param", "type": "String" },
-        { "field": "mutation_capability", "role": "param", "type": "crate::image_control::ImageConfigMutationCapabilityV1" }
+        {
+          "field": "mutation_capability",
+          "role": "param",
+          "type": "crate::image_control::ImageConfigMutationCapabilityV1"
+        }
       ],
       "fcorSchema": "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|target_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1",
       "strategy": "none",
@@ -3971,7 +3983,11 @@
           "type": "u64"
         },
         { "field": "expected_config_revision", "role": "param", "type": "String" },
-        { "field": "mutation_capability", "role": "param", "type": "crate::image_control::ImageConfigMutationCapabilityV1" }
+        {
+          "field": "mutation_capability",
+          "role": "param",
+          "type": "crate::image_control::ImageConfigMutationCapabilityV1"
+        }
       ],
       "fcorSchema": "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1",
       "strategy": "none",
@@ -4000,7 +4016,11 @@
           "type": "u64"
         },
         { "field": "expected_config_revision", "role": "param", "type": "String" },
-        { "field": "mutation_capability", "role": "param", "type": "crate::image_control::ImageConfigMutationCapabilityV1" }
+        {
+          "field": "mutation_capability",
+          "role": "param",
+          "type": "crate::image_control::ImageConfigMutationCapabilityV1"
+        }
       ],
       "fcorSchema": "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1",
       "strategy": "none",
@@ -4029,7 +4049,11 @@
           "type": "u64"
         },
         { "field": "expected_config_revision", "role": "param", "type": "String" },
-        { "field": "mutation_capability", "role": "param", "type": "crate::image_control::ImageConfigMutationCapabilityV1" }
+        {
+          "field": "mutation_capability",
+          "role": "param",
+          "type": "crate::image_control::ImageConfigMutationCapabilityV1"
+        }
       ],
       "fcorSchema": "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1",
       "strategy": "none",
@@ -4063,7 +4087,11 @@
           "type": "u64"
         },
         { "field": "expected_config_revision", "role": "param", "type": "String" },
-        { "field": "mutation_capability", "role": "param", "type": "crate::image_control::ImageConfigMutationCapabilityV1" }
+        {
+          "field": "mutation_capability",
+          "role": "param",
+          "type": "crate::image_control::ImageConfigMutationCapabilityV1"
+        }
       ],
       "fcorSchema": "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|bindings_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1",
       "strategy": "none",
@@ -4092,7 +4120,11 @@
           "type": "u64"
         },
         { "field": "expected_config_revision", "role": "param", "type": "String" },
-        { "field": "mutation_capability", "role": "param", "type": "crate::image_control::ImageConfigMutationCapabilityV1" }
+        {
+          "field": "mutation_capability",
+          "role": "param",
+          "type": "crate::image_control::ImageConfigMutationCapabilityV1"
+        }
       ],
       "fcorSchema": "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1",
       "strategy": "none",

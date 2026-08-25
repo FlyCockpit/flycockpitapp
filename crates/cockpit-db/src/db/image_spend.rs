@@ -1578,7 +1578,7 @@ impl Db {
     ) -> Result<u64> {
         settings.validate().map_err(anyhow::Error::new)?;
         self.transaction(move |conn| {
-            save_image_spend_policy_conn(
+            Self::save_image_spend_policy_conn(
                 conn,
                 &project_key,
                 &settings,

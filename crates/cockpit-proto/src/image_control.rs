@@ -76,7 +76,7 @@ impl<'de> Deserialize<'de> for ImageConfigMutationCapabilityV1 {
     {
         struct CapabilityVisitor;
 
-        impl serde::de::Visitor<'_> for CapabilityVisitor {
+        impl<'de> serde::de::Visitor<'de> for CapabilityVisitor {
             type Value = ImageConfigMutationCapabilityV1;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

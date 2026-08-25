@@ -52,8 +52,8 @@
   ],
   "counts": {
     "event": 83,
-    "request": 221,
-    "response": 145
+    "request": 223,
+    "response": 149
   },
   "messages": {
     "event": [
@@ -2519,13 +2519,13 @@
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "local_operation_settlement"
+        "tag": "mcp_config_committed"
       },
       {
         "class": "bounded_request_response",
         "inlinePayloadBound": "bounded",
         "lane": "interactive",
-        "tag": "mcp_config_committed"
+        "tag": "local_operation_settlement"
       },
       {
         "class": "bounded_request_response",

@@ -1855,12 +1855,24 @@ async fn mutate_owner_vault_item_with_remote_ledger(
         .db
         .transaction(move |conn| {
             match plaintext.as_deref() {
-                Some(value) => vault
-                    .put_item_on_conn(conn, kind, &item_id, value)
-                    .map_err(|error| anyhow::anyhow!(error))?,
-                None => vault
-                    .delete_item_on_conn(conn, kind, &item_id)
-                    .map_err(|error| anyhow::anyhow!(error))?,
+                Some(value) => {
+                    let unchanged = vault
+                        .get_item_on_conn(conn, kind, &item_id)
+                        .map(|current| current.as_slice() == value)
+                        .unwrap_or(false);
+                    if !unchanged {
+                        vault
+                            .put_item_on_conn(conn, kind, &item_id, value)
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                    }
+                }
+                None => {
+                    if vault.get_item_on_conn(conn, kind, &item_id).is_ok() {
+                        vault
+                            .delete_item_on_conn(conn, kind, &item_id)
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                    }
+                }
             }
             if let Some(server_url) = disable_org_sync_for.as_deref() {
                 cockpit_db::Db::mark_org_sync_disabled_on_conn(conn, server_url, now_ms)?;
@@ -7573,16 +7585,32 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Replay(response) => return Ok(response),
                 LocalOperationStart::Execute(generation) => generation,
             };
+            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            let consumed_vault_generation = ctx
+                .secret_vault
+                .current_inventory_generation()
+                .map_err(|error| internal(anyhow::anyhow!(error)))?;
+            let changed = ctx
+                .secret_vault
+                .get_item(
+                    cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                    &provider_id,
+                )
+                .map(|current| current.as_slice() != record_bytes.as_slice())
+                .unwrap_or(true);
             let receipt = Response::ProviderCredentialCommitted {
                 client_operation_id,
                 provider_id: provider_id.clone(),
                 project_root: None,
                 owner_root: None,
+                owner_scope: "global".into(),
                 stored: true,
-                changed: true,
+                changed,
+                consumed_vault_generation,
+                result_vault_generation: consumed_vault_generation
+                    .saturating_add(u64::from(changed)),
                 config_generation: inventory::current_config_generation(),
             };
-            let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             let result = {
                 #[cfg(feature = "remote")]
                 match remote_operation {
@@ -7600,23 +7628,27 @@ async fn handle_serialized_request_impl(
                         .await
                     }
                     None => {
+                        if changed {
+                            ctx.mutate_owner_vault_item(
+                                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                                &provider_id,
+                                Some(&record_bytes),
+                            )
+                            .map_err(internal)?;
+                        }
+                        Ok(receipt)
+                    }
+                }
+                #[cfg(not(feature = "remote"))]
+                {
+                    if changed {
                         ctx.mutate_owner_vault_item(
                             cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
                             &provider_id,
                             Some(&record_bytes),
                         )
                         .map_err(internal)?;
-                        Ok(receipt)
                     }
-                }
-                #[cfg(not(feature = "remote"))]
-                {
-                    ctx.mutate_owner_vault_item(
-                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                        &provider_id,
-                        Some(&record_bytes),
-                    )
-                    .map_err(internal)?;
                     Ok(receipt)
                 }
             }?;
@@ -8595,13 +8627,25 @@ async fn handle_serialized_request_impl(
                     .is_ok();
                 (provider_id.clone(), credential_present)
             };
+            let consumed_vault_generation = ctx
+                .secret_vault
+                .current_inventory_generation()
+                .map_err(|error| internal(anyhow::anyhow!(error)))?;
+            let owner_scope = canonical_project_root
+                .as_ref()
+                .map(|root| format!("project:{root}"))
+                .unwrap_or_else(|| "global".into());
             let response = Response::ProviderCredentialCommitted {
-                client_operation_id,
-                provider_id,
-                project_root,
+                client_operation_id: client_operation_id.clone(),
+                provider_id: provider_id.clone(),
+                project_root: project_root.clone(),
                 owner_root: canonical_project_root,
+                owner_scope,
                 stored: false,
                 changed,
+                consumed_vault_generation,
+                result_vault_generation: consumed_vault_generation
+                    .saturating_add(u64::from(changed)),
                 config_generation: inventory::current_config_generation(),
             };
             let fencing_generation = match begin_local_operation(
@@ -8633,23 +8677,27 @@ async fn handle_serialized_request_impl(
                         .await
                     }
                     None => {
+                        if changed {
+                            ctx.mutate_owner_vault_item(
+                                cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
+                                &credential_record_id,
+                                None,
+                            )
+                            .map_err(internal)?;
+                        }
+                        Ok(response)
+                    }
+                }
+                #[cfg(not(feature = "remote"))]
+                {
+                    if changed {
                         ctx.mutate_owner_vault_item(
                             cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
                             &credential_record_id,
                             None,
                         )
                         .map_err(internal)?;
-                        Ok(response)
                     }
-                }
-                #[cfg(not(feature = "remote"))]
-                {
-                    ctx.mutate_owner_vault_item(
-                        cockpit_db::secret_vault::SecretVaultKind::CredentialRecord,
-                        &credential_record_id,
-                        None,
-                    )
-                    .map_err(internal)?;
                     Ok(response)
                 }
             }?;
@@ -8925,6 +8973,11 @@ async fn handle_serialized_request_impl(
                 #[cfg(feature = "remote")]
                 remote_operation,
             );
+            let _secret_lock = SECRET_OWNER_RPC_LOCK.lock().await;
+            let consumed_vault_generation = ctx
+                .secret_vault
+                .current_inventory_generation()
+                .map_err(|error| internal(anyhow::anyhow!(error)))?;
             let operation_result = setup_copilot_auth(
                 ctx,
                 &project_root,
@@ -8933,12 +8986,27 @@ async fn handle_serialized_request_impl(
                 is_local_owner,
             )
             .await;
-            let operation_result = operation_result.map(|_| Response::CopilotAuthCommitted {
-                client_operation_id,
-                owner_root: crate::secret_ownership::canonical_owner_root(&project_root),
-                project_root,
-                provider_id,
-                config_generation: inventory::current_config_generation(),
+            let operation_result = operation_result.and_then(|_| {
+                let result_vault_generation = ctx
+                    .secret_vault
+                    .current_inventory_generation()
+                    .map_err(|error| internal(anyhow::anyhow!(error)))?;
+                let owner_root = crate::secret_ownership::canonical_owner_root(&project_root);
+                if result_vault_generation <= consumed_vault_generation {
+                    return Err(internal(anyhow::anyhow!(
+                        "Copilot auth completed without advancing vault generation"
+                    )));
+                }
+                Ok(Response::CopilotAuthCommitted {
+                    client_operation_id,
+                    owner_scope: format!("project:{owner_root}"),
+                    owner_root,
+                    project_root,
+                    provider_id,
+                    consumed_vault_generation,
+                    result_vault_generation,
+                    config_generation: inventory::current_config_generation(),
+                })
             });
             let response = finish_provider_mutation_future!(
                 remote_operation,

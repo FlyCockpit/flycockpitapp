@@ -443,8 +443,15 @@ pub enum Response {
         provider_id: String,
         project_root: Option<String>,
         owner_root: Option<String>,
+        /// Canonical authority identity: `global` or `project:<canonical-root>`.
+        #[serde(default)]
+        owner_scope: String,
         stored: bool,
         changed: bool,
+        #[serde(default)]
+        consumed_vault_generation: u64,
+        #[serde(default)]
+        result_vault_generation: u64,
         config_generation: u64,
     },
     /// Owner-scoped resolution of a transport-ambiguous local mutation.
@@ -459,7 +466,13 @@ pub enum Response {
         client_operation_id: String,
         project_root: String,
         owner_root: String,
+        #[serde(default)]
+        owner_scope: String,
         provider_id: String,
+        #[serde(default)]
+        consumed_vault_generation: u64,
+        #[serde(default)]
+        result_vault_generation: u64,
         config_generation: u64,
     },
     StartupDisclosures {

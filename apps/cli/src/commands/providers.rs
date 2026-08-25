@@ -54,13 +54,18 @@ async fn logout(args: ProviderLogoutArgs) -> Result<()> {
             provider_id,
             project_root: Some(returned_root),
             owner_root: Some(owner_root),
+            owner_scope,
+            consumed_vault_generation,
+            result_vault_generation,
             changed: true,
             stored: false,
             ..
         } if returned_operation_id == client_operation_id
             && provider_id == args.provider
             && returned_root == project_root
-            && !owner_root.trim().is_empty() =>
+            && owner_scope == format!("project:{owner_root}")
+            && result_vault_generation > consumed_vault_generation
+            && result_vault_generation > 0 =>
         {
             println!("signed out `{}`", args.provider)
         }
@@ -69,13 +74,18 @@ async fn logout(args: ProviderLogoutArgs) -> Result<()> {
             provider_id,
             project_root: Some(returned_root),
             owner_root: Some(owner_root),
+            owner_scope,
+            consumed_vault_generation,
+            result_vault_generation,
             changed: false,
             stored: false,
             ..
         } if returned_operation_id == client_operation_id
             && provider_id == args.provider
             && returned_root == project_root
-            && !owner_root.trim().is_empty() =>
+            && owner_scope == format!("project:{owner_root}")
+            && result_vault_generation == consumed_vault_generation
+            && result_vault_generation > 0 =>
         {
             println!("`{}` was already signed out", args.provider)
         }

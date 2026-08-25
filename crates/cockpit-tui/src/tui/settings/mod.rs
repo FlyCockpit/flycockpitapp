@@ -1174,13 +1174,24 @@ impl SettingsMutationAction {
                     client_operation_id: returned_id,
                     provider_id: returned_provider,
                     project_root: Some(returned_root),
+                    owner_root: Some(owner_root),
+                    owner_scope,
                     stored: false,
+                    changed,
+                    consumed_vault_generation,
+                    result_vault_generation,
                     ..
                 },
             ) => {
                 returned_id == client_operation_id
                     && returned_provider == provider_id
                     && returned_root == project_root
+                    && owner_scope == &format!("project:{owner_root}")
+                    && valid_vault_freshness(
+                        *consumed_vault_generation,
+                        *result_vault_generation,
+                        *changed,
+                    )
             }
             (
                 Self::ProviderCredentialPut {
@@ -1195,10 +1206,23 @@ impl SettingsMutationAction {
                     client_operation_id: returned_id,
                     provider_id: returned_provider,
                     project_root: None,
+                    owner_scope,
                     stored: true,
+                    changed,
+                    consumed_vault_generation,
+                    result_vault_generation,
                     ..
                 },
-            ) => returned_id == client_operation_id && returned_provider == provider_id,
+            ) => {
+                returned_id == client_operation_id
+                    && returned_provider == provider_id
+                    && owner_scope == "global"
+                    && valid_vault_freshness(
+                        *consumed_vault_generation,
+                        *result_vault_generation,
+                        *changed,
+                    )
+            }
             (
                 Self::CopilotSetup {
                     provider_id,
@@ -1209,16 +1233,32 @@ impl SettingsMutationAction {
                     client_operation_id: returned_id,
                     provider_id: returned_provider,
                     project_root: returned_root,
+                    owner_root,
+                    owner_scope,
+                    consumed_vault_generation,
+                    result_vault_generation,
                     ..
                 },
             ) => {
                 returned_id == client_operation_id
                     && returned_provider == provider_id
                     && returned_root == project_root
+                    && owner_scope == &format!("project:{owner_root}")
+                    && *result_vault_generation > *consumed_vault_generation
+                    && *result_vault_generation > 0
             }
             _ => false,
         }
     }
+}
+
+fn valid_vault_freshness(consumed: u64, result: u64, changed: bool) -> bool {
+    result > 0
+        && if changed {
+            result > consumed
+        } else {
+            result == consumed
+        }
 }
 
 enum CompletedProviderAuthMutation {
@@ -3214,13 +3254,22 @@ impl SettingsCx {
                             provider_id: returned_provider_id,
                             project_root: Some(returned_root),
                             owner_root: Some(owner_root),
+                            owner_scope,
                             stored: false,
+                            changed,
+                            consumed_vault_generation,
+                            result_vault_generation,
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
                         && returned_provider_id == provider_id
                         && returned_root == project_root
-                        && !owner_root.trim().is_empty() =>
+                        && owner_scope == format!("project:{owner_root}")
+                        && valid_vault_freshness(
+                            consumed_vault_generation,
+                            result_vault_generation,
+                            changed,
+                        ) =>
                     {
                         self.invalidate_secret_inventory_entry(&provider_id, None);
                         self.completed_provider_auth =
@@ -3240,11 +3289,21 @@ impl SettingsCx {
                             provider_id: returned_provider_id,
                             project_root: None,
                             owner_root: None,
+                            owner_scope,
                             stored: true,
+                            changed,
+                            consumed_vault_generation,
+                            result_vault_generation,
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
-                        && returned_provider_id == provider_id =>
+                        && returned_provider_id == provider_id
+                        && owner_scope == "global"
+                        && valid_vault_freshness(
+                            consumed_vault_generation,
+                            result_vault_generation,
+                            changed,
+                        ) =>
                     {
                         self.invalidate_secret_inventory_entry(
                             &provider_id,
@@ -3264,11 +3323,21 @@ impl SettingsCx {
                             provider_id: returned_provider_id,
                             project_root: None,
                             owner_root: None,
+                            owner_scope,
                             stored: true,
+                            changed,
+                            consumed_vault_generation,
+                            result_vault_generation,
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
-                        && returned_provider_id == provider_id =>
+                        && returned_provider_id == provider_id
+                        && owner_scope == "global"
+                        && valid_vault_freshness(
+                            consumed_vault_generation,
+                            result_vault_generation,
+                            changed,
+                        ) =>
                     {
                         self.invalidate_secret_inventory_entry(
                             &provider_id,
@@ -3298,13 +3367,18 @@ impl SettingsCx {
                             client_operation_id: returned_operation_id,
                             project_root: returned_root,
                             owner_root,
+                            owner_scope,
                             provider_id: returned_provider_id,
+                            consumed_vault_generation,
+                            result_vault_generation,
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
                         && returned_provider_id == provider_id
                         && returned_root == project_root
-                        && !owner_root.trim().is_empty() =>
+                        && owner_scope == format!("project:{owner_root}")
+                        && result_vault_generation > consumed_vault_generation
+                        && result_vault_generation > 0 =>
                     {
                         self.invalidate_secret_inventory_entry(&provider_id, None);
                         self.completed_provider_auth =

@@ -1954,8 +1954,11 @@
       "provider_id": "example",
       "project_root": "/tmp/project",
       "owner_root": "/tmp/project",
+      "owner_scope": "project:/tmp/project",
       "stored": false,
       "changed": true,
+      "consumed_vault_generation": 6,
+      "result_vault_generation": 7,
       "config_generation": 7
     },
     "response": "provider_credential_committed"
@@ -1965,7 +1968,10 @@
       "client_operation_id": "11111111-1111-4111-8111-111111111111",
       "project_root": "/tmp/project",
       "owner_root": "/tmp/project",
+      "owner_scope": "project:/tmp/project",
       "provider_id": "copilot",
+      "consumed_vault_generation": 6,
+      "result_vault_generation": 7,
       "config_generation": 7
     },
     "response": "copilot_auth_committed"
@@ -2549,8 +2555,11 @@
           "provider_id": "example",
           "project_root": null,
           "owner_root": null,
+          "owner_scope": "global",
           "stored": true,
           "changed": true,
+          "consumed_vault_generation": 7,
+          "result_vault_generation": 8,
           "config_generation": 8
         }
       }

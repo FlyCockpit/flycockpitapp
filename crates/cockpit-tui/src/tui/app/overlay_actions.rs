@@ -4,12 +4,41 @@ pub(super) struct PendingLeakReveal {
     pub(super) operation_id: uuid::Uuid,
     pub(super) report_id: String,
     pub(super) generation: u64,
-    pub(super) receiver: std::sync::mpsc::Receiver<
-        Result<
-            cockpit_core::daemon::leak_reveal::RevealedLeakSecret,
-            cockpit_core::daemon::leak_reveal::LeakRevealDenied,
-        >,
+    pub(super) active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(super) receiver: std::sync::mpsc::Receiver<LeakRevealWorkerResult>,
+}
+
+pub(super) struct LeakRevealWorkerResult {
+    operation_id: uuid::Uuid,
+    report_id: String,
+    generation: u64,
+    result: Result<
+        cockpit_core::daemon::leak_reveal::RevealedLeakSecret,
+        cockpit_core::daemon::leak_reveal::LeakRevealDenied,
     >,
+}
+
+fn canonical_leak_capability(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn cancel_leak_capability_blocking(
+    socket: &std::path::Path,
+    capability: String,
+    expected_report_id: &str,
+) -> bool {
+    matches!(
+        crate::tui::agent_runner::daemon_request_at_blocking(
+            socket,
+            cockpit_core::daemon::proto::Request::CancelLeakReveal { capability },
+        ),
+        Ok(cockpit_core::daemon::proto::Response::LeakRevealCancelled { report_id })
+            if report_id == expected_report_id
+    )
 }
 
 impl App {
@@ -48,6 +77,7 @@ impl App {
     /// Open the `/leaks` pane (replacing the interim transcript list) and kick
     /// off the first-page metadata load.
     pub(super) fn open_leaks_pane(&mut self) {
+        self.cancel_pending_leak_reveal();
         let pane =
             crate::tui::leaks_pane::LeaksPane::open(self.startup_background.daemon_socket.clone());
         let action = pane.initial_load_action();
@@ -78,6 +108,12 @@ impl App {
     /// into the pane's zeroizing buffer. It never crosses an
     /// `AsyncActionPayload`, the transcript, or any cache.
     pub(super) fn reveal_leak_into_pane(&mut self, report_id: String, generation: u64) {
+        if self.pending_leak_reveal.is_some() {
+            if let Overlay::Leaks(pane) = &mut self.overlay {
+                pane.set_reveal_error("a reveal is already pending");
+            }
+            return;
+        }
         let Some(socket) = self.startup_background.daemon_socket.clone() else {
             if let Overlay::Leaks(pane) = &mut self.overlay {
                 pane.set_reveal_error("daemon detached — reveal unavailable");
@@ -85,6 +121,8 @@ impl App {
             return;
         };
         let operation_id = uuid::Uuid::new_v4();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let worker_active = std::sync::Arc::clone(&active);
         let worker_report_id = report_id.clone();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let _ = tokio::task::spawn_blocking(move || {
@@ -92,50 +130,102 @@ impl App {
                 let capability = match crate::tui::agent_runner::daemon_request_at_blocking(
                     &socket,
                     cockpit_core::daemon::proto::Request::BeginLeakReveal {
-                        report_id: worker_report_id,
+                        report_id: worker_report_id.clone(),
                     },
                 ) {
                     Ok(cockpit_core::daemon::proto::Response::LeakRevealCapability {
                         capability,
-                    }) => capability.capability,
+                    }) => capability,
                     _ => {
                         return Err(
                             cockpit_core::daemon::leak_reveal::LeakRevealDenied::Unauthorized,
                         );
                     }
                 };
-                crate::tui::agent_runner::daemon_reveal_leak_blocking(&socket, &capability)
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let binding_valid = capability.report_id == worker_report_id
+                    && canonical_leak_capability(&capability.capability)
+                    && capability.expires_at_ms > now_ms
+                    && capability.expires_at_ms
+                        <= now_ms
+                            .saturating_add(cockpit_core::leaks::LEAK_REVEAL_CAPABILITY_TTL_MS);
+                if !binding_valid || !worker_active.load(std::sync::atomic::Ordering::Acquire) {
+                    let settled = cancel_leak_capability_blocking(
+                        &socket,
+                        capability.capability,
+                        &capability.report_id,
+                    );
+                    return Err(if settled {
+                        cockpit_core::daemon::leak_reveal::LeakRevealDenied::Unauthorized
+                    } else {
+                        cockpit_core::daemon::leak_reveal::LeakRevealDenied::Internal
+                    });
+                }
+                let token = capability.capability;
+                let reveal = crate::tui::agent_runner::daemon_reveal_leak_blocking(&socket, &token);
+                if reveal.is_err() {
+                    // `RateLimited` and unavailable-channel paths do not consume
+                    // the slot. An authorization failure may already have spent
+                    // it; exact cancel then harmlessly fails closed.
+                    let _ = cancel_leak_capability_blocking(&socket, token, &worker_report_id);
+                }
+                reveal
             })();
-            let _ = sender.send(result);
+            let _ = sender.send(LeakRevealWorkerResult {
+                operation_id,
+                report_id: worker_report_id,
+                generation,
+                result,
+            });
         });
         self.pending_leak_reveal = Some(PendingLeakReveal {
             operation_id,
             report_id,
             generation,
+            active,
             receiver,
         });
+    }
+
+    /// Invalidate an in-flight reveal before its sensitive-channel step. The
+    /// worker retains and receipt-settles the exact token it minted.
+    pub(super) fn cancel_pending_leak_reveal(&mut self) {
+        if let Some(pending) = &self.pending_leak_reveal {
+            pending
+                .active
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     pub(super) fn drain_leak_reveal(&mut self) -> bool {
         let Some(pending) = self.pending_leak_reveal.as_ref() else {
             return false;
         };
-        let result = match pending.receiver.try_recv() {
+        let worker = match pending.receiver.try_recv() {
             Ok(result) => result,
             Err(std::sync::mpsc::TryRecvError::Empty) => return false,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err(cockpit_core::daemon::leak_reveal::LeakRevealDenied::Internal)
-            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => LeakRevealWorkerResult {
+                operation_id: pending.operation_id,
+                report_id: pending.report_id.clone(),
+                generation: pending.generation,
+                result: Err(cockpit_core::daemon::leak_reveal::LeakRevealDenied::Internal),
+            },
         };
         let pending = self
             .pending_leak_reveal
             .take()
             .expect("leak reveal pending checked");
         tracing::debug!(operation_id = %pending.operation_id, "leak reveal worker settled");
+        if worker.operation_id != pending.operation_id
+            || worker.report_id != pending.report_id
+            || worker.generation != pending.generation
+        {
+            return false;
+        }
         let Overlay::Leaks(pane) = &mut self.overlay else {
             return false;
         };
-        match result {
+        match worker.result {
             Ok(secret) => {
                 if secret.report_id == pending.report_id {
                     pane.install_reveal(secret.plaintext, secret.report_id, pending.generation);
@@ -219,5 +309,19 @@ impl App {
                 self.keyboard_enhancement_active,
             ),
         );
+    }
+}
+
+#[cfg(test)]
+mod leak_capability_tests {
+    use super::canonical_leak_capability;
+
+    #[test]
+    fn capability_grammar_is_exact_lowercase_hex() {
+        assert!(canonical_leak_capability(&"ab".repeat(32)));
+        assert!(!canonical_leak_capability(&"AB".repeat(32)));
+        assert!(!canonical_leak_capability(&"ag".repeat(32)));
+        assert!(!canonical_leak_capability(&"ab".repeat(31)));
+        assert!(!canonical_leak_capability(&"ab".repeat(33)));
     }
 }

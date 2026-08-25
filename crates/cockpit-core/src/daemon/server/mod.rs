@@ -592,6 +592,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         // free text to scrub.
         proto::Response::LeakReports { page: _ }
         | proto::Response::LeakRevealCapability { capability: _ }
+        | proto::Response::LeakRevealCancelled { report_id: _ }
         | proto::Response::LeakRotationUpdated {
             report_id: _,
             rotation: _,

@@ -958,6 +958,7 @@ impl App {
             Overlay::Leaks(mut pane) => {
                 match pane.handle_key(key) {
                     crate::tui::leaks_pane::LeaksOutcome::Close => {
+                        self.cancel_pending_leak_reveal();
                         // Zeroize the reveal buffer and request a full alt-screen
                         // clear so no stale plaintext cells survive the close
                         // (serviced with the terminal handle in the event loop).

@@ -3983,6 +3983,10 @@ impl App {
         // teardown below, so a Ctrl-C×2 (or `/exit`) exit doesn't strand the
         // capability until its server-side expiry.
         self.teardown_sealed_overlay();
+        // Prevent a leak-reveal worker from entering the sensitive channel
+        // after the pane/application has surrendered its operation binding.
+        // The worker owns the exact token and receipt-settles it on this path.
+        self.cancel_pending_leak_reveal();
         self.drop_mouse_copy_ui_ownership();
         let async_shutdown = self.async_actions.shutdown_and_reap().await;
         if async_shutdown.export_cleanup_failed > 0 || async_shutdown.export_cleanup_timed_out > 0 {

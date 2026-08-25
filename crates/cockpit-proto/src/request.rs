@@ -637,6 +637,12 @@ pub enum Request {
     BeginLeakReveal {
         report_id: String,
     },
+    /// Spend an unconsumed leak-reveal capability without revealing its
+    /// protected value. The daemon validates the exact opaque token and
+    /// returns a report-bound settlement receipt.
+    CancelLeakReveal {
+        capability: String,
+    },
     /// Update the rotation disposition of a leak record. Metadata-only and
     /// reversible.
     MarkLeakRotated {
@@ -2452,6 +2458,15 @@ impl Request {
                     );
                 }
             }
+            Self::CancelLeakReveal { capability }
+                if capability.len() != 64
+                    || !capability
+                        .as_bytes()
+                        .iter()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)) =>
+            {
+                return Err("leak reveal capability must be 64 lowercase hex bytes".to_string());
+            }
             Self::PutSubscriptionAck { provider_id } => {
                 if provider_id.trim().is_empty() {
                     return Err("subscription provider id must not be empty".to_string());
@@ -3046,6 +3061,7 @@ macro_rules! request_variants {
             (Request::RetireSealedAction { .. }, "retire_sealed_action");
             (Request::ListLeakReports { .. }, "list_leak_reports");
             (Request::BeginLeakReveal { .. }, "begin_leak_reveal");
+            (Request::CancelLeakReveal { .. }, "cancel_leak_reveal");
             (Request::MarkLeakRotated { .. }, "mark_leak_rotated");
             (Request::DeleteLeakReport { .. }, "delete_leak_report");
             (Request::ListProjectNotes { .. }, "list_project_notes");
@@ -3325,6 +3341,7 @@ macro_rules! command {
             (Request::RetireSealedAction { action_id, confirm }, "retire_sealed_action", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "action_id:String|confirm:String", [action_id: String => param, confirm: String => param]);
             (Request::ListLeakReports { cursor, limit, project_root, session_id, rotation }, "list_leak_reports", owner_only, none, false, local_only, none, concurrent, none, "cursor:Option<String>|limit:Option<u32>|project_root:Option<String>|session_id:Option<Uuid>|rotation:Option<LeakRotationState>", [cursor: Option<String> => param, limit: Option<u32> => param, project_root: Option<String> => project_root_effective, session_id: Option<Uuid> => param, rotation: Option<LeakRotationState> => param]);
             (Request::BeginLeakReveal { report_id }, "begin_leak_reveal", owner_only, none, false, local_only, none, serialized, none, "report_id:String", [report_id: String => param]);
+            (Request::CancelLeakReveal { capability }, "cancel_leak_reveal", owner_only, none, true, local_only, none, serialized, none, "capability:String", [capability: String => param]);
             (Request::MarkLeakRotated { report_id, rotation }, "mark_leak_rotated", owner_only, none, true, local_only, none, serialized, none, "report_id:String|rotation:LeakRotationDisposition", [report_id: String => param, rotation: LeakRotationDisposition => param]);
             (Request::DeleteLeakReport { report_id }, "delete_leak_report", owner_only, none, true, local_only, none, serialized, none, "report_id:String", [report_id: String => param]);
             (Request::ListProjectNotes { project_root }, "list_project_notes", owner_only, none, true, local_only, none, serialized, path(project_root), "project_root:String", [project_root: String => project_root]);
@@ -5462,6 +5479,9 @@ mod tests {
             Request::BeginLeakReveal {
                 report_id: "r1".into(),
             },
+            Request::CancelLeakReveal {
+                capability: "00".repeat(32),
+            },
             Request::MarkLeakRotated {
                 report_id: "r1".into(),
                 rotation: crate::LeakRotationDisposition::Accept,
@@ -5476,6 +5496,7 @@ mod tests {
             [
                 "list_leak_reports",
                 "begin_leak_reveal",
+                "cancel_leak_reveal",
                 "mark_leak_rotated",
                 "delete_leak_report",
             ]

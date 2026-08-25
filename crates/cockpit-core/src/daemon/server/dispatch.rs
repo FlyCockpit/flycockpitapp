@@ -9070,6 +9070,9 @@ async fn handle_serialized_request_impl(
         Request::BeginLeakReveal { report_id } => {
             begin_leak_reveal(ctx, &state.principal, report_id).await
         }
+        Request::CancelLeakReveal { capability } => {
+            cancel_leak_reveal(ctx, &state.principal, capability)
+        }
         Request::MarkLeakRotated {
             report_id,
             rotation,
@@ -9290,6 +9293,28 @@ pub(super) async fn begin_leak_reveal(
             expires_at_ms,
         },
     })
+}
+
+fn cancel_leak_reveal(
+    ctx: &Arc<DaemonContext>,
+    principal: &ClientPrincipal,
+    capability: String,
+) -> std::result::Result<Response, ErrorPayload> {
+    if !principal.is_owner() {
+        return Err(authorization_error(
+            "leak reveal cancel requires local owner",
+        ));
+    }
+    let report_id = ctx
+        .leak_reveal_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .cancel_exact(&capability, chrono::Utc::now().timestamp_millis())
+        .ok_or_else(|| ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "unauthorized".to_string(),
+        })?;
+    Ok(Response::LeakRevealCancelled { report_id })
 }
 
 /// Dispatch `MarkLeakRotated`: update the rotation disposition of a leak

@@ -274,6 +274,10 @@ pub enum Response {
     LeakRevealCapability {
         capability: LeakRevealCapability,
     },
+    /// An exact leak-reveal capability was spent without revealing a secret.
+    LeakRevealCancelled {
+        report_id: String,
+    },
     /// MarkLeakRotated response: the updated rotation disposition.
     LeakRotationUpdated {
         report_id: String,
@@ -1159,6 +1163,7 @@ macro_rules! response_variants {
             (Response::SealedActionRetired { .. }, "sealed_action_retired");
             (Response::LeakReports { .. }, "leak_reports");
             (Response::LeakRevealCapability { .. }, "leak_reveal_capability");
+            (Response::LeakRevealCancelled { .. }, "leak_reveal_cancelled");
             (Response::LeakRotationUpdated { .. }, "leak_rotation_updated");
             (Response::LeakReportDeleted { .. }, "leak_report_deleted");
             (Response::ProjectNotes { .. }, "project_notes");
@@ -1607,6 +1612,13 @@ mod tests {
             }
             .wire_tag(),
             "leak_reveal_capability"
+        );
+        assert_eq!(
+            Response::LeakRevealCancelled {
+                report_id: String::new(),
+            }
+            .wire_tag(),
+            "leak_reveal_cancelled"
         );
         assert_eq!(
             Response::LeakRotationUpdated {

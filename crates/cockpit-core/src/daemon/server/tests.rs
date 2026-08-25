@@ -5968,7 +5968,7 @@ async fn assistant_rpc_creates_session_via_registry() {
     let response = handle_request(Request::ListAssistants, &mut state, &ctx)
         .await
         .expect("list assistants");
-    let Response::Assistants { assistants } = response else {
+    let Response::Assistants { assistants, .. } = response else {
         panic!("expected Assistants response");
     };
     assert_eq!(assistants.len(), 1);
@@ -11649,6 +11649,16 @@ fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
         .and_then(|tail| tail.split("fn reset_all_builtins_atomic_locked").next())
         .expect("reset journal recovery must exist");
     assert!(reset_recovery.contains("SELECT DISTINCT project_root FROM agent_mutation_journals"));
+
+    let recovery = management
+        .split("pub async fn recover_agent_mutation_journals")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn cancel_agent_mutation_journal").next())
+        .expect("agent mutation recovery must exist");
+    assert!(recovery.contains("publish_committed_config_generation()"));
+    assert!(recovery.contains("current_config_generation()"));
+    assert!(!recovery.contains("consumed_config_generation.saturating_add"));
+    assert!(recovery.contains("settle_agent_mutation_journal("));
 }
 
 #[test]
@@ -11661,7 +11671,7 @@ fn assistant_mutations_are_owner_receipted_and_crash_recoverable() {
         "assistant_mutation_journals",
         "save_assistant_definition",
         "delete_assistant",
-        "local_operation_secret_request_hash",
+        "hex::decode(&mutation_intent_hash)",
         "CommittedRefreshNeeded",
     ] {
         assert!(

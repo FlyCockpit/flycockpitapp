@@ -1042,7 +1042,9 @@ impl fmt::Debug for StoredFlycockpitCredential {
 /// cancellation so local frontends can terminally settle timed-out or dismissed
 /// daemon-owned PKCE/device flows. It also adds correlated durable configuration
 /// receipts, including atomic image-spend policy receipts, and operation-bound
-/// external-editor settlement/status receipts.
+/// external-editor settlement/status receipts. Agent and assistant inventory
+/// reads also carry one shared configuration generation, while agent inventory
+/// binds its canonical and requested workspace roots.
 pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Oldest wire schema version this binary accepts. v17 is current-only: the
@@ -7636,6 +7638,15 @@ mod tests {
             serde_json::from_value(fixture["assistants"]["data"]["assistants"][0].clone()).unwrap();
         validate_assistant_summary(&summary)
             .expect("current v17 assistant inventory must carry bounded opaque revisions");
+        assert_eq!(fixture["assistants"]["data"]["config_generation"], 7);
+        assert_eq!(
+            fixture["agent_inventory"]["data"]["config_generation"],
+            fixture["assistants"]["data"]["config_generation"]
+        );
+        assert_eq!(
+            fixture["agent_inventory"]["data"]["project_root"],
+            fixture["agent_inventory"]["data"]["requested_project_root"]
+        );
     }
 
     #[test]

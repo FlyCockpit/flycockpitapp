@@ -225,8 +225,8 @@ pub fn agent_mutation_intent_hash(
 }
 
 /// Public, non-secret identity for a global assistant definition mutation.
-/// The daemon additionally derives a vault-keyed request identity before
-/// reserving the owner-scoped durable operation id.
+/// The exact bytes are also stored as the owner-scoped durable-operation
+/// request hash so a client can bind pending and terminal settlement replies.
 pub fn assistant_mutation_intent_hash(
     project_root: &str,
     action: &str,
@@ -354,8 +354,14 @@ pub fn validate_agent_mutation_envelope(
     if result.owner_scope != format!("project:{}", result.project_root) {
         return Err("agent mutation receipt contains an invalid owner scope");
     }
-    if result.result_config_generation != result.config_generation
-        || result.consumed_config_generation > result.result_config_generation
+    if result.result_config_generation != result.config_generation {
+        return Err("agent mutation receipt contains an invalid generation transition");
+    }
+    // Generations are process-local publication counters. A boot-recovered
+    // committed receipt may legitimately carry a consumed generation from the
+    // prior daemon and a smaller generation actually published by this daemon.
+    if matches!(result.outcome, AgentMutationOutcome::Reconciled)
+        && result.consumed_config_generation > result.result_config_generation
     {
         return Err("agent mutation receipt contains an invalid generation transition");
     }

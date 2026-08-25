@@ -5775,16 +5775,10 @@ async fn handle_serialized_request_impl(
             let project_root =
                 crate::daemon::fs_api::canonical_project_root(&requested_project_root)?;
             let owner = stable_authenticated_principal(state);
-            let request_hash = local_operation_secret_request_hash(
-                ctx,
-                b"flycockpit/local-operation/assistant-save/v1\0",
-                &(
-                    &requested_project_root,
-                    &name,
-                    &expected_revision,
-                    &mutation_intent_hash,
-                ),
-            )?;
+            let request_hash: [u8; 32] = hex::decode(&mutation_intent_hash)
+                .map_err(|_| bad_request("assistant mutation intent hash is malformed"))?
+                .try_into()
+                .map_err(|_| bad_request("assistant mutation intent hash has the wrong length"))?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -6215,16 +6209,10 @@ async fn handle_serialized_request_impl(
             let project_root =
                 crate::daemon::fs_api::canonical_project_root(&requested_project_root)?;
             let owner = stable_authenticated_principal(state);
-            let request_hash = local_operation_secret_request_hash(
-                ctx,
-                b"flycockpit/local-operation/assistant-delete/v1\0",
-                &(
-                    &requested_project_root,
-                    &name,
-                    &expected_revision,
-                    &mutation_intent_hash,
-                ),
-            )?;
+            let request_hash: [u8; 32] = hex::decode(&mutation_intent_hash)
+                .map_err(|_| bad_request("assistant mutation intent hash is malformed"))?
+                .try_into()
+                .map_err(|_| bad_request("assistant mutation intent hash has the wrong length"))?;
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
@@ -13744,6 +13732,7 @@ async fn handle_concurrent_request_impl(
         }
         Request::GetAssistant { name } => get_assistant_response(&ctx, name).await,
         Request::ListAssistants => {
+            let expected_config_generation = inventory::current_config_generation();
             let snapshots = crate::assistants::snapshots(&ctx.db)
                 .await
                 .map_err(internal)?;
@@ -13774,7 +13763,16 @@ async fn handle_concurrent_request_impl(
                 .into_iter()
                 .map(assistant_snapshot_to_proto)
                 .collect();
-            Ok(Response::Assistants { assistants })
+            let config_generation = inventory::current_config_generation();
+            if config_generation != expected_config_generation {
+                return Err(conflict(
+                    "configuration changed while reading assistants; retry the paired read",
+                ));
+            }
+            Ok(Response::Assistants {
+                assistants,
+                config_generation,
+            })
         }
         Request::DiagnoseMediaReservation { scope, id } => {
             diagnose_media_reservation_response(&ctx, scope, id).await

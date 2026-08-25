@@ -89,16 +89,33 @@ pub(super) struct AgentsPage {
     editor_body: Cell<Option<Rect>>,
     load_generation: uuid::Uuid,
     inventory_revision: Option<String>,
+    canonical_project_root: Option<String>,
     expected_inventory_after_commit: Option<String>,
     agent_rows: Vec<AgentRow>,
     assistant_rows: Vec<AgentRow>,
     inventory_load_error: Option<String>,
     assistant_load_error: Option<String>,
+    staged_inventory: Option<StagedInventoryLoad>,
+    staged_assistants: Option<StagedAssistantLoad>,
     pending_daemon: HashMap<uuid::Uuid, PendingAgentOperation>,
     /// Exact completion request retained after transport or response
     /// ambiguity. The page cannot close until the daemon replays a matching
     /// terminal receipt.
     uncertain_agent_operation: Option<Box<PendingAgentOperation>>,
+}
+
+struct StagedInventoryLoad {
+    generation: uuid::Uuid,
+    rows: Vec<AgentRow>,
+    inventory_revision: String,
+    canonical_project_root: String,
+    config_generation: u64,
+}
+
+struct StagedAssistantLoad {
+    generation: uuid::Uuid,
+    rows: Vec<AgentRow>,
+    config_generation: u64,
 }
 
 enum PendingAgentOperation {
@@ -128,6 +145,7 @@ enum PendingAgentOperation {
         client_operation_id: String,
         mutation_intent_hash: String,
         cwd: PathBuf,
+        canonical_project_root: String,
         name: String,
         markdown: String,
         expected_revision: String,
@@ -138,6 +156,7 @@ enum PendingAgentOperation {
         client_operation_id: String,
         mutation_intent_hash: String,
         cwd: PathBuf,
+        canonical_project_root: String,
         name: String,
         expected_registration_revision: String,
         querying: bool,
@@ -372,6 +391,21 @@ pub(super) struct AgentDetail {
 }
 
 impl AgentsPage {
+    fn has_authoritative_pair(&self) -> bool {
+        self.canonical_project_root.is_some()
+            && self.inventory_load_error.is_none()
+            && self.assistant_load_error.is_none()
+            && self.staged_inventory.is_none()
+            && self.staged_assistants.is_none()
+            && !self.pending_daemon.values().any(|pending| {
+                matches!(
+                    pending,
+                    PendingAgentOperation::Inventory { .. }
+                        | PendingAgentOperation::Assistants { .. }
+                )
+            })
+    }
+
     pub(super) fn has_unsettled_external_edit(&self) -> bool {
         self.pending_external_edit.is_some()
             || self.uncertain_agent_operation.is_some()
@@ -406,11 +440,14 @@ impl AgentsPage {
             editor_body: Cell::new(None),
             load_generation: uuid::Uuid::new_v4(),
             inventory_revision: None,
+            canonical_project_root: None,
             expected_inventory_after_commit: None,
             agent_rows: Vec::new(),
             assistant_rows: Vec::new(),
             inventory_load_error: None,
             assistant_load_error: None,
+            staged_inventory: None,
+            staged_assistants: None,
             pending_daemon: HashMap::new(),
             uncertain_agent_operation: None,
         }
@@ -543,6 +580,7 @@ impl AgentsPage {
                 client_operation_id,
                 mutation_intent_hash,
                 cwd,
+                canonical_project_root,
                 name,
                 markdown,
                 expected_revision,
@@ -576,6 +614,7 @@ impl AgentsPage {
                         client_operation_id,
                         mutation_intent_hash,
                         cwd,
+                        canonical_project_root,
                         name,
                         markdown,
                         expected_revision,
@@ -589,6 +628,7 @@ impl AgentsPage {
                 client_operation_id,
                 mutation_intent_hash,
                 cwd,
+                canonical_project_root,
                 name,
                 expected_registration_revision,
                 querying,
@@ -619,6 +659,7 @@ impl AgentsPage {
                         client_operation_id,
                         mutation_intent_hash,
                         cwd,
+                        canonical_project_root,
                         name,
                         expected_registration_revision,
                         querying: !querying,
@@ -636,6 +677,8 @@ impl AgentsPage {
         self.load_generation = generation;
         self.inventory_load_error = None;
         self.assistant_load_error = None;
+        self.staged_inventory = None;
+        self.staged_assistants = None;
         self.status = Some("loading daemon-owned agent inventory…".into());
         let project_root = cwd.to_string_lossy().into_owned();
         let inventory = cx.enqueue_daemon_effect(
@@ -666,6 +709,51 @@ impl AgentsPage {
         self.rows = self.agent_rows.clone();
         self.rows.extend(self.assistant_rows.clone());
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
+    }
+
+    fn publish_paired_load(&mut self, generation: uuid::Uuid) {
+        let (Some(inventory), Some(assistants)) = (
+            self.staged_inventory.as_ref(),
+            self.staged_assistants.as_ref(),
+        ) else {
+            return;
+        };
+        if inventory.generation != generation
+            || assistants.generation != generation
+            || inventory.config_generation != assistants.config_generation
+        {
+            self.inventory_load_error = Some(
+                "inventory and assistants were read from different configuration generations"
+                    .into(),
+            );
+            self.assistant_load_error = Some(
+                "inventory and assistants were read from different configuration generations"
+                    .into(),
+            );
+            self.staged_inventory = None;
+            self.staged_assistants = None;
+            return;
+        }
+        let inventory = self
+            .staged_inventory
+            .take()
+            .expect("paired inventory staged");
+        let assistants = self
+            .staged_assistants
+            .take()
+            .expect("paired assistants staged");
+        if let Some(expected) = self.expected_inventory_after_commit.take()
+            && inventory.inventory_revision != expected
+        {
+            self.inventory_load_error =
+                Some("inventory: committed refresh did not match its receipt".into());
+            return;
+        }
+        self.agent_rows = inventory.rows;
+        self.assistant_rows = assistants.rows;
+        self.inventory_revision = Some(inventory.inventory_revision);
+        self.canonical_project_root = Some(inventory.canonical_project_root);
+        self.rebuild_rows();
     }
 
     fn refresh_paired_load_status(&mut self, generation: uuid::Uuid) {
@@ -797,6 +885,8 @@ impl AgentsPage {
                     if generation == self.load_generation {
                         self.inventory_load_error =
                             Some("inventory completion target was malformed".into());
+                        self.staged_inventory = None;
+                        self.staged_assistants = None;
                         self.refresh_paired_load_status(generation);
                     }
                 }
@@ -804,6 +894,8 @@ impl AgentsPage {
                     if generation == self.load_generation {
                         self.assistant_load_error =
                             Some("assistant completion target was malformed".into());
+                        self.staged_inventory = None;
+                        self.staged_assistants = None;
                         self.refresh_paired_load_status(generation);
                     }
                 }
@@ -827,26 +919,21 @@ impl AgentsPage {
                     .response
                     .and_then(|response| inventory_rows_from_response(&cwd, response))
                 {
-                    Ok((rows, inventory_revision)) => {
+                    Ok((rows, inventory_revision, canonical_project_root, config_generation)) => {
                         self.inventory_load_error = None;
-                        if let Some(expected) = self.expected_inventory_after_commit.take()
-                            && inventory_revision != expected
-                        {
-                            self.agent_rows.clear();
-                            self.inventory_revision = None;
-                            self.rebuild_rows();
-                            self.inventory_load_error = Some(
-                                "inventory: committed refresh did not match its receipt".into(),
-                            );
-                            self.refresh_paired_load_status(generation);
-                            return;
-                        }
-                        self.agent_rows = rows;
-                        self.inventory_revision = Some(inventory_revision);
-                        self.rebuild_rows();
+                        self.staged_inventory = Some(StagedInventoryLoad {
+                            generation,
+                            rows,
+                            inventory_revision,
+                            canonical_project_root,
+                            config_generation,
+                        });
+                        self.publish_paired_load(generation);
                     }
                     Err(error) => {
                         self.inventory_load_error = Some(format!("inventory: {error}"));
+                        self.staged_inventory = None;
+                        self.staged_assistants = None;
                     }
                 }
                 self.refresh_paired_load_status(generation);
@@ -856,13 +943,19 @@ impl AgentsPage {
                     return;
                 }
                 match completion.response.and_then(assistant_rows_from_response) {
-                    Ok(rows) => {
+                    Ok((rows, config_generation)) => {
                         self.assistant_load_error = None;
-                        self.assistant_rows = rows;
-                        self.rebuild_rows();
+                        self.staged_assistants = Some(StagedAssistantLoad {
+                            generation,
+                            rows,
+                            config_generation,
+                        });
+                        self.publish_paired_load(generation);
                     }
                     Err(error) => {
                         self.assistant_load_error = Some(format!("assistants: {error}"));
+                        self.staged_inventory = None;
+                        self.staged_assistants = None;
                     }
                 }
                 self.refresh_paired_load_status(generation);
@@ -1005,6 +1098,8 @@ impl AgentsPage {
                 if generation == self.load_generation {
                     self.inventory_load_error =
                         Some("inventory: invalid host completion channel".into());
+                    self.staged_inventory = None;
+                    self.staged_assistants = None;
                     self.refresh_paired_load_status(generation);
                 }
             }
@@ -1012,6 +1107,8 @@ impl AgentsPage {
                 if generation == self.load_generation {
                     self.assistant_load_error =
                         Some("assistants: invalid host completion channel".into());
+                    self.staged_inventory = None;
+                    self.staged_assistants = None;
                     self.refresh_paired_load_status(generation);
                 }
             }
@@ -1343,6 +1440,7 @@ impl AgentsPage {
                 client_operation_id,
                 mutation_intent_hash,
                 cwd,
+                canonical_project_root,
                 name,
                 markdown,
                 expected_revision,
@@ -1353,6 +1451,7 @@ impl AgentsPage {
                     client_operation_id: client_operation_id.clone(),
                     mutation_intent_hash: mutation_intent_hash.clone(),
                     cwd: cwd.clone(),
+                    canonical_project_root: canonical_project_root.clone(),
                     name: name.clone(),
                     markdown: markdown.clone(),
                     expected_revision: expected_revision.clone(),
@@ -1411,7 +1510,7 @@ impl AgentsPage {
                     } if returned_operation_id == client_operation_id
                         && returned_intent == mutation_intent_hash
                         && requested_project_root == requested_root.as_ref()
-                        && !project_root.trim().is_empty()
+                        && canonical_project_root == project_root
                         && returned_name == name
                         && consumed_revision == expected_revision
                         && result_config_generation > consumed_config_generation =>
@@ -1481,6 +1580,7 @@ impl AgentsPage {
                 client_operation_id,
                 mutation_intent_hash,
                 cwd,
+                canonical_project_root,
                 name,
                 expected_registration_revision,
                 querying,
@@ -1491,6 +1591,7 @@ impl AgentsPage {
                             client_operation_id: client_operation_id.clone(),
                             mutation_intent_hash: mutation_intent_hash.clone(),
                             cwd: cwd.clone(),
+                            canonical_project_root: canonical_project_root.clone(),
                             name: name.clone(),
                             expected_registration_revision: expected_registration_revision.clone(),
                             querying,
@@ -1552,7 +1653,7 @@ impl AgentsPage {
                     } if returned_operation_id == client_operation_id
                         && returned_intent == mutation_intent_hash
                         && requested_project_root == cwd.to_string_lossy().as_ref()
-                        && !project_root.trim().is_empty()
+                        && canonical_project_root == project_root
                         && deleted_name == name
                         && consumed_revision == expected_registration_revision
                         && !result_revision.trim().is_empty()
@@ -2386,16 +2487,24 @@ fn agent_mutation_owner(mutation: &cockpit_core::daemon::proto::AgentMutation) -
 fn inventory_rows_from_response(
     cwd: &std::path::Path,
     response: cockpit_core::daemon::proto::Response,
-) -> Result<(Vec<AgentRow>, String), String> {
+) -> Result<(Vec<AgentRow>, String, String, u64), String> {
     let cockpit_core::daemon::proto::Response::AgentInventory {
         entries,
         inventory_revision,
-        ..
+        project_root,
+        requested_project_root,
+        config_generation,
     } = response
     else {
         return Err(format!("unexpected agent inventory response: {response:?}"));
     };
-    if !valid_agent_inventory(cwd, &entries, &inventory_revision) {
+    if requested_project_root != cwd.to_string_lossy()
+        || project_root.trim().is_empty()
+        || project_root.contains('\0')
+        || project_root.len() > cockpit_proto::MAX_ASSISTANT_HOME_BYTES
+        || !std::path::Path::new(&project_root).is_absolute()
+        || !valid_agent_inventory(cwd, &entries, &inventory_revision)
+    {
         return Err("daemon returned an invalid agent inventory receipt".into());
     }
     let rows = entries
@@ -2420,7 +2529,7 @@ fn inventory_rows_from_response(
             },
         })
         .collect();
-    Ok((rows, inventory_revision))
+    Ok((rows, inventory_revision, project_root, config_generation))
 }
 
 fn valid_agent_inventory(
@@ -2464,8 +2573,12 @@ fn valid_agent_inventory(
 
 fn assistant_rows_from_response(
     response: cockpit_core::daemon::proto::Response,
-) -> Result<Vec<AgentRow>, String> {
-    let cockpit_core::daemon::proto::Response::Assistants { assistants } = response else {
+) -> Result<(Vec<AgentRow>, u64), String> {
+    let cockpit_core::daemon::proto::Response::Assistants {
+        assistants,
+        config_generation,
+    } = response
+    else {
         return Err(format!("unexpected assistants response: {response:?}"));
     };
     let mut names = std::collections::HashSet::new();
@@ -2532,7 +2645,7 @@ fn assistant_rows_from_response(
             source,
         });
     }
-    Ok(rows)
+    Ok((rows, config_generation))
 }
 
 fn coherent_assistant_save_revision(
@@ -2793,17 +2906,23 @@ fn bind_assistant_mutation_settlement(
     operation_kind: &str,
 ) -> Result<AssistantMutationSettlement, String> {
     use cockpit_core::daemon::proto::Response;
-    let receipt_matches = |response: &Response| match response {
-        Response::AssistantDefinitionSaved {
-            client_operation_id: returned,
-            mutation_intent_hash: returned_intent,
-            ..
-        }
-        | Response::AssistantDeleted {
-            client_operation_id: returned,
-            mutation_intent_hash: returned_intent,
-            ..
-        } => returned == client_operation_id && returned_intent == mutation_intent_hash,
+    let receipt_matches = |response: &Response| match (operation_kind, response) {
+        (
+            "save_assistant_definition",
+            Response::AssistantDefinitionSaved {
+                client_operation_id: returned,
+                mutation_intent_hash: returned_intent,
+                ..
+            },
+        )
+        | (
+            "delete_assistant",
+            Response::AssistantDeleted {
+                client_operation_id: returned,
+                mutation_intent_hash: returned_intent,
+                ..
+            },
+        ) => returned == client_operation_id && returned_intent == mutation_intent_hash,
         _ => false,
     };
     if receipt_matches(&response) {
@@ -2821,17 +2940,18 @@ fn bind_assistant_mutation_settlement(
         } => {
             if returned != client_operation_id
                 || returned_kind != operation_kind
-                || request_hash.len() != 64
-                || !request_hash
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                || request_hash != mutation_intent_hash
             {
                 return Err("daemon returned an unbound assistant settlement".into());
             }
+            let terminal_shapes = usize::from(pending)
+                + usize::from(response.is_some())
+                + usize::from(terminal_error.is_some())
+                + usize::from(terminal_cancelled);
+            if terminal_shapes != 1 {
+                return Err("assistant settlement carried a contradictory terminal shape".into());
+            }
             if pending {
-                if response.is_some() || terminal_error.is_some() || terminal_cancelled {
-                    return Err("pending assistant settlement carried terminal data".into());
-                }
                 return Ok(AssistantMutationSettlement::Pending);
             }
             if terminal_cancelled {
@@ -2840,6 +2960,11 @@ fn bind_assistant_mutation_settlement(
                 ));
             }
             if let Some(error) = terminal_error {
+                if error.message.trim().is_empty()
+                    || error.message.len() > cockpit_proto::MAX_AGENT_METADATA_BYTES
+                {
+                    return Err("assistant settlement carried an invalid terminal error".into());
+                }
                 return Ok(AssistantMutationSettlement::Rejected(error.message));
             }
             let response = response.ok_or_else(|| {
@@ -3017,6 +3142,17 @@ impl SettingsCx {
                     let assistant_definition = editor.is_assistant_definition();
                     match revision {
                         Some(revision) if assistant_definition => {
+                            if !p.has_authoritative_pair() {
+                                p.status = Some(
+                                    "assistant save requires a coherent daemon inventory refresh"
+                                        .into(),
+                                );
+                                return Nav::Stay;
+                            }
+                            let canonical_project_root = p
+                                .canonical_project_root
+                                .clone()
+                                .expect("authoritative pair has a canonical root");
                             let cwd = self.agents_cwd();
                             let project_root = cwd.to_string_lossy().into_owned();
                             let client_operation_id = uuid::Uuid::new_v4().to_string();
@@ -3047,6 +3183,7 @@ impl SettingsCx {
                                     client_operation_id,
                                     mutation_intent_hash,
                                     cwd,
+                                    canonical_project_root,
                                     name,
                                     markdown: text,
                                     expected_revision: revision,
@@ -3423,6 +3560,15 @@ impl SettingsCx {
         let name = detail.name.clone();
         let source = detail.source.clone();
         if let AgentRowSource::Assistant { .. } = &source {
+            if !p.has_authoritative_pair() {
+                p.status =
+                    Some("assistant save requires a coherent daemon inventory refresh".into());
+                return;
+            }
+            let canonical_project_root = p
+                .canonical_project_root
+                .clone()
+                .expect("authoritative pair has a canonical root");
             let Some(expected_revision) = detail.revision.clone() else {
                 detail.status = Some("save failed: missing assistant revision".into());
                 return;
@@ -3456,6 +3602,7 @@ impl SettingsCx {
                     client_operation_id,
                     mutation_intent_hash,
                     cwd,
+                    canonical_project_root,
                     name,
                     markdown,
                     expected_revision,
@@ -3654,6 +3801,16 @@ impl SettingsCx {
             | AgentRowSource::AssistantUnavailable {
                 registration_revision,
             } => {
+                if !p.has_authoritative_pair() {
+                    p.status = Some(
+                        "assistant delete requires a coherent daemon inventory refresh".into(),
+                    );
+                    return;
+                }
+                let canonical_project_root = p
+                    .canonical_project_root
+                    .clone()
+                    .expect("authoritative pair has a canonical root");
                 let project_root = cwd.to_string_lossy().into_owned();
                 let client_operation_id = uuid::Uuid::new_v4().to_string();
                 let mutation_intent_hash = cockpit_proto::assistant_mutation_intent_hash(
@@ -3681,6 +3838,7 @@ impl SettingsCx {
                         client_operation_id,
                         mutation_intent_hash,
                         cwd,
+                        canonical_project_root,
                         name,
                         expected_registration_revision: registration_revision.clone(),
                         querying: false,

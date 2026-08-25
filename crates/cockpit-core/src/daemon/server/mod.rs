@@ -399,7 +399,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         #[cfg(feature = "remote")]
         proto::Response::RemoteGoalOutcome { .. } => {}
         proto::Response::GoalCleared { cleared: _ } => {}
-        proto::Response::Assistants { assistants } => {
+        proto::Response::Assistants { assistants, .. } => {
             for assistant in assistants {
                 scrub_assistant_summary(assistant, redact);
             }
@@ -495,7 +495,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::AgentInventory {
             entries,
             inventory_revision,
-            config_generation: _,
+            ..
         } => {
             for entry in entries {
                 scrub_agent_inventory_entry(entry, redact);
@@ -1655,7 +1655,7 @@ fn finalize_response_projections(response: &mut proto::Response) {
         proto::Response::Assistant {
             assistant: Some(value),
         } => assistant(value),
-        proto::Response::Assistants { assistants } => assistants.iter_mut().for_each(assistant),
+        proto::Response::Assistants { assistants, .. } => assistants.iter_mut().for_each(assistant),
         proto::Response::AssistantUpserted { assistant: value } => assistant(value),
         proto::Response::AssistantDefinitionSaved {
             assistant: Some(value),
@@ -5672,7 +5672,7 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
     };
     match response {
         proto::Response::Assistant { assistant: value } => value.as_ref().is_none_or(assistant),
-        proto::Response::Assistants { assistants } => {
+        proto::Response::Assistants { assistants, .. } => {
             assistants.len() <= proto::MAX_ASSISTANT_SUMMARIES && assistants.iter().all(assistant)
         }
         proto::Response::AssistantUpserted { assistant: value } => assistant(value),

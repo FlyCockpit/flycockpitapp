@@ -1368,6 +1368,20 @@ fn assistant_definition_mutations_are_durable_and_close_gated() {
     }
     assert!(agents.contains("stale or malformed read-only agent completion was discarded"));
     assert!(!agents.contains("self.pending_daemon.insert(completion.operation_id, pending)"));
+    for required in [
+        "staged_inventory",
+        "staged_assistants",
+        "publish_paired_load",
+        "inventory.config_generation != assistants.config_generation",
+        "canonical_project_root == project_root",
+        "request_hash != mutation_intent_hash",
+        "terminal_shapes != 1",
+    ] {
+        assert!(
+            agents.contains(required),
+            "missing paired authority gate {required}"
+        );
+    }
 }
 
 #[test]

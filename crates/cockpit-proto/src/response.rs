@@ -555,6 +555,9 @@ pub enum Response {
 
     Assistants {
         assistants: Vec<AssistantSummary>,
+        /// Shared daemon configuration generation used to pair this global
+        /// projection with a workspace agent-inventory projection.
+        config_generation: u64,
     },
 
     AssistantUpserted {
@@ -744,6 +747,10 @@ pub enum Response {
         entries: Vec<crate::AgentInventoryEntry>,
         /// Opaque revision covering the resettable workspace inventory.
         inventory_revision: String,
+        /// Canonical daemon-authoritative root used to resolve this inventory.
+        project_root: String,
+        /// Exact spelling supplied by the client for this read.
+        requested_project_root: String,
         config_generation: u64,
     },
 

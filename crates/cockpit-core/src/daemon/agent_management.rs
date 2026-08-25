@@ -288,13 +288,20 @@ pub async fn inventory(
     ctx: &DaemonContext,
     project_root: String,
 ) -> Result<Response, ErrorPayload> {
+    let requested_project_root = project_root.clone();
     let root = trusted_root(ctx, &project_root).await?;
     maintain_editor_leases(ctx).await?;
+    let expected_config_generation = crate::daemon::server::inventory::current_config_generation();
     tokio::task::spawn_blocking(move || {
         let guard =
             cockpit_config::config::hold_config_mutation_lock(&root.join(".cockpit/config.json"))
                 .map_err(internal)?;
-        inventory_sync(&root, &guard)
+        inventory_sync(
+            &root,
+            &requested_project_root,
+            expected_config_generation,
+            &guard,
+        )
     })
     .await
     .map_err(join_error)?
@@ -1090,8 +1097,16 @@ pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64,
                     &plan.intended_projection_hash,
                 )
             });
-        let result_config_generation =
-            consumed_config_generation.saturating_add(if changed_hint { 1 } else { 0 });
+        // Recovery runs in a fresh process.  A generation persisted by the
+        // previous process is evidence about the consumed snapshot, not a
+        // generation that this process has ever published.  Publish the
+        // recovered file change into the live inventory exactly once; a
+        // recovered no-op reports the generation this process actually has.
+        let result_config_generation = if changed_hint {
+            crate::daemon::server::inventory::publish_committed_config_generation()
+        } else {
+            crate::daemon::server::inventory::current_config_generation()
+        };
         let response = Response::AgentMutated(AgentMutationResult {
             client_operation_id: operation.clone(),
             mutation_intent_hash,
@@ -1965,15 +1980,25 @@ async fn trusted_canonical_root(
 
 fn inventory_sync(
     root: &Path,
+    requested_project_root: &str,
+    expected_config_generation: u64,
     guard: &cockpit_config::config::HeldConfigMutationLock,
 ) -> Result<Response, ErrorPayload> {
     recover_reset_all_locked(root, guard)?;
     let entries = inventory_entries(root)?;
     let inventory_revision = inventory_revision(&entries);
+    let config_generation = crate::daemon::server::inventory::current_config_generation();
+    if config_generation != expected_config_generation {
+        return Err(conflict(
+            "configuration changed while reading agent inventory; retry the paired read",
+        ));
+    }
     Ok(Response::AgentInventory {
         entries,
         inventory_revision,
-        config_generation: crate::daemon::server::inventory::current_config_generation(),
+        project_root: root.to_string_lossy().into_owned(),
+        requested_project_root: requested_project_root.to_owned(),
+        config_generation,
     })
 }
 

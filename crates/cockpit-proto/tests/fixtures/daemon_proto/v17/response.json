@@ -247,7 +247,8 @@
           "definition_diagnostic": null,
           "projection_digest": "f0dab748cadf30e98f718d9d1c78b3851cacb5135de9b88a17c21cc3a7f7e1e1"
         }
-      ]
+      ],
+      "config_generation": 7
     },
     "response": "assistants"
   },
@@ -2517,6 +2518,8 @@
         }
       ],
       "inventory_revision": "ea9bc9cf151c9298f6c5d6a0a388c9e5b03444e873c4f3a301d0f274bda60290",
+      "project_root": "/tmp/project",
+      "requested_project_root": "/tmp/project",
       "config_generation": 7
     }
   },

@@ -407,8 +407,6 @@ impl GoalSettingsPane {
                 ..
             } => (agent_name.as_str(), project_root.as_str(), None),
             GoalSettingsPending::SaveAgent {
-                client_operation_id,
-                mutation_intent_hash,
                 agent_name,
                 project_root,
                 expected_revision,

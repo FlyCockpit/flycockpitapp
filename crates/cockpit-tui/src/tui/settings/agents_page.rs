@@ -835,10 +835,10 @@ impl AgentsPage {
                             self.agent_rows.clear();
                             self.inventory_revision = None;
                             self.rebuild_rows();
-                            self.status = Some(
-                                "agent mutation committed, but refreshed inventory did not match its receipt; reopen Agents"
-                                    .into(),
+                            self.inventory_load_error = Some(
+                                "inventory: committed refresh did not match its receipt".into(),
                             );
+                            self.refresh_paired_load_status(generation);
                             return;
                         }
                         self.agent_rows = rows;
@@ -990,8 +990,36 @@ impl AgentsPage {
                     read,
                 );
             }
-            other => {
-                self.pending_daemon.insert(completion.operation_id, other);
+            durable @ (PendingAgentOperation::Mutation { .. }
+            | PendingAgentOperation::AssistantSave { .. }
+            | PendingAgentOperation::AssistantDelete { .. }
+            | PendingAgentOperation::BeginLease { .. }
+            | PendingAgentOperation::CompleteLease { .. }) => {
+                self.uncertain_agent_operation = Some(Box::new(durable));
+                self.status = Some(
+                    "durable agent operation received an invalid host completion; press Enter to reconcile"
+                        .into(),
+                );
+            }
+            PendingAgentOperation::Inventory { generation } => {
+                if generation == self.load_generation {
+                    self.inventory_load_error =
+                        Some("inventory: invalid host completion channel".into());
+                    self.refresh_paired_load_status(generation);
+                }
+            }
+            PendingAgentOperation::Assistants { generation } => {
+                if generation == self.load_generation {
+                    self.assistant_load_error =
+                        Some("assistants: invalid host completion channel".into());
+                    self.refresh_paired_load_status(generation);
+                }
+            }
+            PendingAgentOperation::Snapshot { .. } => {
+                self.status = Some(
+                    "read-only agent snapshot received an invalid host completion and was discarded"
+                        .into(),
+                );
             }
         }
     }

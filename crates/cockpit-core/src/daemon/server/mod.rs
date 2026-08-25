@@ -3818,6 +3818,9 @@ pub async fn run_accept_loop(ctx: Arc<DaemonContext>, listener: UnixListener) ->
                 if let Err(error) = crate::daemon::agent_management::maintain_editor_leases(&ctx).await {
                     tracing::warn!(message = %error.message, "editor lease maintenance failed");
                 }
+                if let Err(error) = dispatch::maintain_durable_oauth_flows(&ctx).await {
+                    tracing::warn!(message = %error.message, "OAuth flow maintenance failed");
+                }
             }
             accepted = listener.accept() => {
                 match accepted {

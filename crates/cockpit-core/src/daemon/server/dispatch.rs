@@ -515,6 +515,83 @@ async fn purge_durable_oauth_flows(
     Ok(())
 }
 
+/// Periodic expiry for daemon-owned OAuth authority.
+///
+/// This path never admits a new flow and never time-takes over an exchange.
+/// It only (a) converts an exact expired Ready marker to its receipt-bound,
+/// secret-free tombstone and (b) deletes terminal tombstones after their
+/// owning begin receipt has itself been retired. Thus an abandoned PKCE
+/// verifier/device state cannot live until the next Begin request, while an
+/// exact retry retains deterministic settlement for as long as its receipt.
+pub(super) async fn maintain_durable_oauth_flows(
+    ctx: &DaemonContext,
+) -> std::result::Result<(), ErrorPayload> {
+    ctx.oauth_flows.maintain().await;
+    for item_id in ctx
+        .secret_vault
+        .list_item_ids(cockpit_db::secret_vault::SecretVaultKind::SealedState)
+        .map_err(|error| internal(anyhow::anyhow!(error)))?
+        .into_iter()
+        .filter(|id| id.starts_with("oauth-flow:"))
+    {
+        let flow_id = item_id.trim_start_matches("oauth-flow:").to_owned();
+        let Some(flow) = load_oauth_flow(ctx, &flow_id)? else {
+            continue;
+        };
+        match flow {
+            DurableOAuthFlow::Provider {
+                owner,
+                begin_client_operation_id,
+                begin_request_hash,
+                begin_fencing_generation,
+                expires_at_unix_ms,
+                ..
+            }
+            | DurableOAuthFlow::Mcp {
+                owner,
+                begin_client_operation_id,
+                begin_request_hash,
+                begin_fencing_generation,
+                expires_at_unix_ms,
+                ..
+            } if oauth_wall_ms() >= expires_at_unix_ms => {
+                expire_ready_oauth_flow(
+                    ctx,
+                    flow_id,
+                    owner,
+                    begin_client_operation_id,
+                    begin_request_hash,
+                    begin_fencing_generation,
+                )
+                .await?;
+            }
+            DurableOAuthFlow::Expired {
+                owner,
+                begin_client_operation_id,
+                ..
+            }
+            | DurableOAuthFlow::Cancelled {
+                owner,
+                begin_client_operation_id,
+                ..
+            } => {
+                let receipt = ctx
+                    .db
+                    .local_operation_settlement(owner, begin_client_operation_id)
+                    .await
+                    .map_err(internal)?;
+                if receipt.is_none() {
+                    delete_oauth_flow(ctx, &flow_id)?;
+                }
+            }
+            // Exchanging and committed markers are recovery evidence. Their
+            // exact receipt transition, not elapsed wall time, owns cleanup.
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn find_durable_oauth_flow(
     ctx: &DaemonContext,
     owner: &str,
@@ -1218,6 +1295,14 @@ impl OAuthFlowStore {
     fn purge_mcp(flows: &mut std::collections::HashMap<String, StoredMcpOAuthFlow>) {
         let now = Instant::now();
         flows.retain(|_, flow| now.duration_since(flow.created_at) <= OAUTH_FLOW_TTL);
+    }
+
+    /// Drop expired process-local mirrors without creating or replaying a
+    /// flow. The durable sealed marker remains authoritative and is settled
+    /// separately by [`maintain_durable_oauth_flows`].
+    async fn maintain(&self) {
+        Self::purge_provider(&mut self.provider.lock().await);
+        Self::purge_mcp(&mut self.mcp.lock().await);
     }
 
     fn evict_oldest_provider(

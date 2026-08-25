@@ -11541,6 +11541,28 @@ fn authority_recovery_precedes_both_socket_binds() {
 }
 
 #[test]
+fn oauth_expiry_maintenance_runs_without_new_admission() {
+    let server = include_str!("mod.rs");
+    let accept_loop = server
+        .split("pub async fn run_accept_loop")
+        .nth(1)
+        .expect("accept loop must exist");
+    assert!(accept_loop.contains("dispatch::maintain_durable_oauth_flows(&ctx).await"));
+
+    let dispatch = include_str!("dispatch.rs");
+    let maintenance = dispatch
+        .split("pub(super) async fn maintain_durable_oauth_flows")
+        .nth(1)
+        .and_then(|tail| tail.split("fn find_durable_oauth_flow").next())
+        .expect("periodic OAuth maintenance must exist");
+    assert!(maintenance.contains("expire_ready_oauth_flow"));
+    assert!(maintenance.contains("local_operation_settlement"));
+    assert!(maintenance.contains("receipt.is_none()"));
+    assert!(!maintenance.contains("begin_local_operation"));
+    assert!(!maintenance.contains("commit_oauth_begin"));
+}
+
+#[test]
 fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
     let dispatch = include_str!("dispatch.rs");
     let arm = dispatch

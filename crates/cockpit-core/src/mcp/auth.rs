@@ -318,11 +318,13 @@ const REMOTE_LOOPBACK_REDIRECT_URI: &str = "http://127.0.0.1/callback";
 ///
 /// `listener` is `None` for a remote-owner flow: the daemon binds no host
 /// loopback listener and the callback code arrives over the RPC instead.
+#[derive(Serialize, Deserialize)]
 pub struct McpOAuthFlow {
     oauth: OauthAuth,
     verifier: String,
     state: String,
     redirect_uri: String,
+    #[serde(skip)]
     listener: Option<tokio::net::TcpListener>,
 }
 

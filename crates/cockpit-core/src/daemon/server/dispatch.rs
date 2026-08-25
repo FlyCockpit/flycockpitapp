@@ -92,6 +92,7 @@ static PROVIDER_EDIT_CAPABILITIES: std::sync::LazyLock<
 const PROVIDER_EDIT_CAPABILITY_TTL: Duration = Duration::from_secs(30 * 60);
 const PROVIDER_EDIT_CAPABILITY_CAPACITY: usize = 128;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct McpOAuthPending {
     project_root: String,
     server: String,
@@ -111,10 +112,75 @@ enum ProviderOAuthFlow {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum ProviderOAuthReady {
     Grok(crate::auth::xai_oauth::ManualLogin),
     Codex(crate::auth::codex_oauth::DeviceLogin),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DurableOAuthFlow {
+    Provider {
+        owner: String,
+        begin_client_operation_id: String,
+        authorize_url: String,
+        user_code: Option<String>,
+        ready: ProviderOAuthReady,
+    },
+    Mcp {
+        owner: String,
+        begin_client_operation_id: String,
+        authorize_url: String,
+        pending: McpOAuthPending,
+    },
+}
+
+fn oauth_flow_vault_id(flow_id: &str) -> String {
+    format!("oauth-flow:{flow_id}")
+}
+
+fn persist_oauth_flow(
+    ctx: &DaemonContext,
+    flow_id: &str,
+    flow: &DurableOAuthFlow,
+) -> std::result::Result<(), ErrorPayload> {
+    let bytes = zeroize::Zeroizing::new(serde_json::to_vec(flow).map_err(internal)?);
+    ctx.secret_vault
+        .mutate_item(
+            cockpit_db::secret_vault::SecretVaultKind::SealedState,
+            &oauth_flow_vault_id(flow_id),
+            Some(bytes.as_slice()),
+        )
+        .map_err(|error| internal(anyhow::anyhow!(error)))?;
+    Ok(())
+}
+
+fn load_oauth_flow(
+    ctx: &DaemonContext,
+    flow_id: &str,
+) -> std::result::Result<Option<DurableOAuthFlow>, ErrorPayload> {
+    match ctx.secret_vault.get_item(
+        cockpit_db::secret_vault::SecretVaultKind::SealedState,
+        &oauth_flow_vault_id(flow_id),
+    ) {
+        Ok(bytes) => serde_json::from_slice(bytes.as_slice())
+            .map(Some)
+            .map_err(internal),
+        Err(crate::secure_key::SecureKeyError::NotFound(_)) => Ok(None),
+        Err(error) => Err(internal(anyhow::anyhow!(error))),
+    }
+}
+
+fn delete_oauth_flow(ctx: &DaemonContext, flow_id: &str) -> std::result::Result<(), ErrorPayload> {
+    ctx.secret_vault
+        .mutate_item(
+            cockpit_db::secret_vault::SecretVaultKind::SealedState,
+            &oauth_flow_vault_id(flow_id),
+            None,
+        )
+        .map_err(|error| internal(anyhow::anyhow!(error)))?;
+    Ok(())
 }
 
 const OAUTH_FLOW_TTL: Duration = Duration::from_secs(10 * 60);
@@ -7662,6 +7728,20 @@ async fn handle_serialized_request_impl(
                 }
                 _ => return Err(bad_request("unsupported provider OAuth flow")),
             };
+            let ProviderOAuthFlow::Ready(durable_ready) = &flow else {
+                unreachable!("new provider OAuth flow must be ready")
+            };
+            persist_oauth_flow(
+                ctx,
+                &flow_id,
+                &DurableOAuthFlow::Provider {
+                    owner: owner.clone(),
+                    begin_client_operation_id: client_operation_id.clone(),
+                    authorize_url: authorize_url.clone(),
+                    user_code: user_code.clone(),
+                    ready: durable_ready.clone(),
+                },
+            )?;
             ctx.oauth_flows
                 .insert_provider(
                     flow_id.clone(),
@@ -7722,13 +7802,38 @@ async fn handle_serialized_request_impl(
                 // lookup instead of issuing another token set. Restore only when
                 // validation or the pre-persistence exchange fails; once the
                 // provider has exchanged the code, replay must remain rejected.
-                let (ready, cancellation_fence) = ctx
-                    .oauth_flows
-                    .claim_provider(&flow_id, &owner)
-                    .await
-                    .ok_or_else(|| {
-                        bad_request("provider OAuth flow is unknown or already completed")
-                    })?;
+                let claimed = ctx.oauth_flows.claim_provider(&flow_id, &owner).await;
+                if claimed.is_none()
+                    && let Some(DurableOAuthFlow::Provider {
+                        owner: durable_owner,
+                        begin_client_operation_id,
+                        authorize_url,
+                        user_code,
+                        ready,
+                    }) = load_oauth_flow(ctx, &flow_id)?
+                    && durable_owner == owner
+                {
+                    ctx.oauth_flows
+                        .insert_provider(
+                            flow_id.clone(),
+                            durable_owner,
+                            begin_client_operation_id,
+                            authorize_url,
+                            user_code,
+                            ProviderOAuthFlow::Ready(ready),
+                        )
+                        .await;
+                }
+                let (ready, cancellation_fence) = match claimed {
+                    Some(claimed) => claimed,
+                    None => ctx
+                        .oauth_flows
+                        .claim_provider(&flow_id, &owner)
+                        .await
+                        .ok_or_else(|| {
+                            bad_request("provider OAuth flow is unknown or already completed")
+                        })?,
+                };
                 let exchange_ready = ready.clone();
                 let exchange = match exchange_ready {
                     ProviderOAuthReady::Grok(login) => {
@@ -7814,6 +7919,7 @@ async fn handle_serialized_request_impl(
                 &response,
             )
             .await?;
+            delete_oauth_flow(ctx, &flow_id)?;
             Ok(response)
         }
 
@@ -7844,12 +7950,52 @@ async fn handle_serialized_request_impl(
                 .oauth_flows
                 .resolve_provider_id(flow_id.as_deref(), &begin_client_operation_id, &owner)
                 .await;
+            let resolved_flow_id = if resolved_flow_id.is_some() {
+                resolved_flow_id
+            } else {
+                let candidate = if let Some(flow_id) = flow_id {
+                    Some(flow_id)
+                } else {
+                    match ctx
+                        .db
+                        .local_operation_settlement(
+                            owner.clone(),
+                            begin_client_operation_id.clone(),
+                        )
+                        .await
+                        .map_err(internal)?
+                    {
+                        Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(json)) => {
+                            match serde_json::from_str::<Response>(&json).map_err(internal)? {
+                                Response::ProviderOAuthStarted { flow_id, .. } => Some(flow_id),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                candidate.filter(|candidate| {
+                    matches!(
+                        load_oauth_flow(ctx, candidate),
+                        Ok(Some(DurableOAuthFlow::Provider {
+                            owner: durable_owner,
+                            begin_client_operation_id: durable_begin,
+                            ..
+                        })) if durable_owner == owner && durable_begin == begin_client_operation_id
+                    )
+                })
+            };
             // Serialize with the persistence fence. An acknowledged cancellation
             // therefore either wins before the vault commit or reports that the
             // exact flow had already reached another terminal state.
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             let cancelled = if let Some(flow_id) = resolved_flow_id.as_deref() {
-                ctx.oauth_flows.cancel_provider(flow_id, &owner).await
+                let in_memory = ctx.oauth_flows.cancel_provider(flow_id, &owner).await;
+                let durable = load_oauth_flow(ctx, flow_id)?.is_some();
+                if durable {
+                    delete_oauth_flow(ctx, flow_id)?;
+                }
+                in_memory || durable
             } else {
                 false
             };
@@ -7960,17 +8106,35 @@ async fn handle_serialized_request_impl(
                     .await
                     .map_err(internal)?;
             let flow_id = uuid::Uuid::new_v4().to_string();
+            let pending = McpOAuthPending {
+                project_root,
+                server,
+                flow,
+            };
+            persist_oauth_flow(
+                ctx,
+                &flow_id,
+                &DurableOAuthFlow::Mcp {
+                    owner: owner.clone(),
+                    begin_client_operation_id: client_operation_id.clone(),
+                    authorize_url: authorize_url.clone(),
+                    pending: McpOAuthPending {
+                        project_root: pending.project_root.clone(),
+                        server: pending.server.clone(),
+                        flow: serde_json::from_slice(
+                            &serde_json::to_vec(&pending.flow).map_err(internal)?,
+                        )
+                        .map_err(internal)?,
+                    },
+                },
+            )?;
             ctx.oauth_flows
                 .insert_mcp(
                     flow_id.clone(),
                     owner.clone(),
                     client_operation_id.clone(),
                     authorize_url.clone(),
-                    McpOAuthPending {
-                        project_root,
-                        server,
-                        flow,
-                    },
+                    pending,
                 )
                 .await;
             let response = Response::McpOAuthStarted {
@@ -8017,11 +8181,36 @@ async fn handle_serialized_request_impl(
                 LocalOperationStart::Execute(generation) => generation,
             };
             let mutation = async {
-                let (pending, cancellation_fence) = ctx
-                    .oauth_flows
-                    .claim_mcp(&flow_id, &owner)
-                    .await
-                    .ok_or_else(|| bad_request("MCP OAuth flow is unknown or already completed"))?;
+                let claimed = ctx.oauth_flows.claim_mcp(&flow_id, &owner).await;
+                if claimed.is_none()
+                    && let Some(DurableOAuthFlow::Mcp {
+                        owner: durable_owner,
+                        begin_client_operation_id,
+                        authorize_url,
+                        pending,
+                    }) = load_oauth_flow(ctx, &flow_id)?
+                    && durable_owner == owner
+                {
+                    ctx.oauth_flows
+                        .insert_mcp(
+                            flow_id.clone(),
+                            durable_owner,
+                            begin_client_operation_id,
+                            authorize_url,
+                            pending,
+                        )
+                        .await;
+                }
+                let (pending, cancellation_fence) = match claimed {
+                    Some(claimed) => claimed,
+                    None => ctx
+                        .oauth_flows
+                        .claim_mcp(&flow_id, &owner)
+                        .await
+                        .ok_or_else(|| {
+                            bad_request("MCP OAuth flow is unknown or already completed")
+                        })?,
+                };
                 // Once claimed, this flow is one-shot. A provider exchange may have
                 // consumed its authorization code even if vault persistence fails,
                 // so it must not be reinserted for a second exchange.
@@ -8099,6 +8288,7 @@ async fn handle_serialized_request_impl(
                 &response,
             )
             .await?;
+            delete_oauth_flow(ctx, &flow_id)?;
             Ok(response)
         }
 
@@ -8129,9 +8319,49 @@ async fn handle_serialized_request_impl(
                 .oauth_flows
                 .resolve_mcp_id(flow_id.as_deref(), &begin_client_operation_id, &owner)
                 .await;
+            let resolved_flow_id = if resolved_flow_id.is_some() {
+                resolved_flow_id
+            } else {
+                let candidate = if let Some(flow_id) = flow_id {
+                    Some(flow_id)
+                } else {
+                    match ctx
+                        .db
+                        .local_operation_settlement(
+                            owner.clone(),
+                            begin_client_operation_id.clone(),
+                        )
+                        .await
+                        .map_err(internal)?
+                    {
+                        Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(json)) => {
+                            match serde_json::from_str::<Response>(&json).map_err(internal)? {
+                                Response::McpOAuthStarted { flow_id, .. } => Some(flow_id),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                candidate.filter(|candidate| {
+                    matches!(
+                        load_oauth_flow(ctx, candidate),
+                        Ok(Some(DurableOAuthFlow::Mcp {
+                            owner: durable_owner,
+                            begin_client_operation_id: durable_begin,
+                            ..
+                        })) if durable_owner == owner && durable_begin == begin_client_operation_id
+                    )
+                })
+            };
             let _lock = SECRET_OWNER_RPC_LOCK.lock().await;
             let cancelled = if let Some(flow_id) = resolved_flow_id.as_deref() {
-                ctx.oauth_flows.remove_mcp(flow_id, &owner).await
+                let in_memory = ctx.oauth_flows.remove_mcp(flow_id, &owner).await;
+                let durable = load_oauth_flow(ctx, flow_id)?.is_some();
+                if durable {
+                    delete_oauth_flow(ctx, flow_id)?;
+                }
+                in_memory || durable
             } else {
                 false
             };

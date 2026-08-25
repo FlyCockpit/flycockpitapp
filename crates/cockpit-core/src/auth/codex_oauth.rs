@@ -45,7 +45,7 @@ impl StoredTokens {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceLogin {
     pub verification_uri: String,
     pub user_code: String,

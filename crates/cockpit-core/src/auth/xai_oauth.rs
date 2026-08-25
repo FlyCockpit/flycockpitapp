@@ -58,7 +58,7 @@ struct Discovery {
     token_endpoint: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManualLogin {
     pub authorize_url: String,
     state: String,

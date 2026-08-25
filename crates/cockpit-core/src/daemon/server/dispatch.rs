@@ -9725,41 +9725,26 @@ async fn handle_serialized_request_impl(
                     #[cfg(feature = "remote")]
                     remote_operation,
                 );
-                let _secret_lock = SECRET_OWNER_RPC_LOCK.lock().await;
-                let consumed_vault_generation = ctx
-                    .secret_vault
-                    .current_inventory_generation()
-                    .map_err(|error| internal(anyhow::anyhow!(error)))?;
+                // Provider config publication owns the complete vault/file
+                // journal. The SQLite writer transaction captures both vault
+                // generations; taking the standalone secret lock here would
+                // self-deadlock when recovery performs journal cleanup.
+                let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
                 let operation_result = setup_copilot_auth(
                     ctx,
                     &project_root,
                     &provider_id,
                     provider_env_snapshot(ctx, state),
                     is_local_owner,
+                    CopilotJournalBinding {
+                        owner_digest: settlement_owner.clone(),
+                        client_operation_id: client_operation_id.clone(),
+                        request_hash,
+                        fencing_generation,
+                        requested_project_root: project_root.clone(),
+                    },
                 )
                 .await;
-                let operation_result = operation_result.and_then(|_| {
-                    let result_vault_generation =
-                        ctx.secret_vault
-                            .current_inventory_generation()
-                            .map_err(|error| internal(anyhow::anyhow!(error)))?;
-                    let owner_root = crate::secret_ownership::canonical_owner_root(&project_root);
-                    if result_vault_generation <= consumed_vault_generation {
-                        return Err(internal(anyhow::anyhow!(
-                            "Copilot auth completed without advancing vault generation"
-                        )));
-                    }
-                    Ok(Response::CopilotAuthCommitted {
-                        client_operation_id: client_operation_id.clone(),
-                        owner_scope: format!("project:{owner_root}"),
-                        owner_root,
-                        project_root: project_root.clone(),
-                        provider_id: provider_id.clone(),
-                        consumed_vault_generation,
-                        result_vault_generation,
-                        config_generation: inventory::current_config_generation(),
-                    })
-                });
                 let response = finish_provider_mutation_future!(
                     remote_operation,
                     ctx,
@@ -12890,7 +12875,11 @@ async fn stage_and_recover_provider_batch(
     retain_only_stale_provider_credentials(&desired, &mut cleanup_credentials);
 
     let result_revision = provider_config_revision(&desired)?;
-    let config_generation = inventory::publish_committed_config_generation();
+    // This is durable intent, not publication. Recovery replaces this
+    // sentinel only after the reference-only file has converged. Publishing a
+    // process-local generation before the filesystem commit lets a crash
+    // leave both a lying receipt and a generation from the wrong daemon boot.
+    let config_generation = 0;
     let response = Response::ProviderMutationCommitted {
         client_operation_id: client_operation_id.to_owned(),
         snapshot_session_id: snapshot_session_id.to_owned(),
@@ -13433,6 +13422,8 @@ async fn provider_models_fetch(
     };
     let response =
         bounded_provider_response(scrub_provider_response(response, &config, &store, &env)?)?;
+    let config_changed =
+        !changed_provider_ids.is_empty() || on_unlisted.is_some_and(|_| !aggregate_fetch_failed);
     for provider_id in changed_provider_ids {
         let entry = config
             .providers
@@ -13449,6 +13440,9 @@ async fn provider_models_fetch(
             config.category_defaults.clone(),
             on_unlisted,
         )?;
+    }
+    if config_changed {
+        inventory::publish_committed_config_generation();
     }
     Ok(response)
 }
@@ -13805,7 +13799,8 @@ async fn setup_copilot_auth(
     provider_id: &str,
     env: std::collections::HashMap<String, String>,
     is_local_owner: bool,
-) -> std::result::Result<(), ErrorPayload> {
+    journal_binding: CopilotJournalBinding,
+) -> std::result::Result<Response, ErrorPayload> {
     // Adopting the daemon HOST's ambient GitHub token (`COPILOT_GITHUB_TOKEN` /
     // `GH_TOKEN` / `GITHUB_TOKEN`) and injecting it into a caller-selected
     // provider's `Authorization` header is a local-host action: the chosen
@@ -13851,8 +13846,30 @@ async fn setup_copilot_auth(
         entry.headers.len() - 1
     };
     header_secrets[index] = Some(token);
-    provider_config_save(ctx, project_root, provider_id, entry, header_secrets).await?;
-    Ok(())
+    let owner = journal_binding.owner_digest.clone();
+    let operation_id = journal_binding.client_operation_id.clone();
+    provider_config_save_under_lock(
+        ctx,
+        project_root,
+        provider_id,
+        entry,
+        header_secrets,
+        Some(journal_binding),
+    )
+    .await?;
+    match ctx
+        .db
+        .local_operation_settlement(owner, operation_id)
+        .await
+        .map_err(internal)?
+    {
+        Some(crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(
+            json,
+        )) => serde_json::from_str(&json).map_err(internal),
+        _ => Err(internal(anyhow::anyhow!(
+            "Copilot provider journal retired without its exact terminal receipt"
+        ))),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -14017,6 +14034,72 @@ mod provider_atomic_authority_tests {
         assert!(compensation.contains("payload.inserted_named_claims"));
         assert!(compensation.contains("payload.inserted_credential_claims"));
         assert!(!compensation.contains("created_at >="));
+    }
+
+    #[test]
+    fn config_generation_is_published_only_after_file_convergence() {
+        let source = include_str!("dispatch.rs");
+        let batch_stage = source
+            .split("async fn stage_and_recover_provider_batch")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("async fn compensate_provider_batch_staging")
+                    .next()
+            })
+            .expect("provider batch staging source");
+        assert!(!batch_stage.contains("publish_committed_config_generation()"));
+        assert!(batch_stage.contains("let config_generation = 0"));
+
+        let provider_recovery = source
+            .split("pub(super) async fn recover_provider_config_journals")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn settle_journaled_local_success_on_conn")
+                    .next()
+            })
+            .expect("provider recovery source");
+        let file_commit = provider_recovery
+            .find("doc.write(&payload.config)")
+            .expect("batch file commit");
+        let generation = provider_recovery
+            .find("publish_committed_config_generation()")
+            .expect("post-commit generation publication");
+        assert!(generation > file_commit);
+
+        let mcp_save = source
+            .split("async fn save_mcp_config")
+            .nth(1)
+            .and_then(|tail| tail.split("fn mcp_live_secret_references").next())
+            .expect("MCP save source");
+        let file_commit = mcp_save
+            .find("config.write_private(&path)")
+            .expect("MCP file commit");
+        let generation = mcp_save
+            .find("publish_mcp_journal_generation(ctx, &journal_id)")
+            .expect("MCP generation publication");
+        assert!(generation > file_commit);
+    }
+
+    #[test]
+    fn copilot_auth_is_bound_to_provider_journal_and_exact_receipt() {
+        let source = include_str!("dispatch.rs");
+        let setup = source
+            .split("async fn setup_copilot_auth")
+            .nth(1)
+            .and_then(|tail| tail.split("struct ProviderConfigJournal").next())
+            .expect("Copilot setup source");
+        assert!(setup.contains("Some(journal_binding)"));
+        assert!(setup.contains("local_operation_settlement(owner, operation_id)"));
+
+        let provider_save = source
+            .split("async fn provider_config_save_under_lock")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn save_mcp_config").next())
+            .expect("provider journal source");
+        assert!(provider_save.contains("Response::CopilotAuthCommitted"));
+        assert!(provider_save.contains("inventory_generation_conn(conn)"));
+        assert!(provider_save.contains("fencing_generation"));
+        assert!(provider_save.contains("terminal_response_json"));
     }
 }
 
@@ -14303,23 +14386,37 @@ pub(super) async fn recover_provider_config_journals(
             _ => return Err(bad_request("provider config journal has an invalid action")),
         }
         let (_, _, effective) = daemon_provider_config(ctx, project_root.as_str()).await?;
-        if journal.action == "batch"
-            && let Some(response_json) = journal.terminal_response_json.as_mut()
-        {
+        if let Some(response_json) = journal.terminal_response_json.as_mut() {
             let mut response: Response = serde_json::from_str(response_json).map_err(internal)?;
-            let Response::ProviderMutationCommitted {
-                result_revision,
-                config,
-                ..
-            } = &mut response
-            else {
-                return Err(internal(anyhow::anyhow!(
-                    "provider batch journal has the wrong terminal response"
-                )));
-            };
-            *result_revision = provider_config_revision(&effective)?;
-            *config = crate::secret_ref::redact_provider_view(&effective);
+            let generation = inventory::publish_committed_config_generation();
+            match &mut response {
+                Response::ProviderMutationCommitted {
+                    result_revision,
+                    config_generation,
+                    config,
+                    ..
+                } if journal.action == "batch" => {
+                    *result_revision = provider_config_revision(&effective)?;
+                    *config_generation = generation;
+                    *config = crate::secret_ref::redact_provider_view(&effective);
+                }
+                Response::CopilotAuthCommitted {
+                    config_generation, ..
+                } if journal.action == "save" => {
+                    *config_generation = generation;
+                }
+                _ => {
+                    return Err(internal(anyhow::anyhow!(
+                        "provider journal has the wrong terminal response"
+                    )));
+                }
+            }
             *response_json = serde_json::to_string(&response).map_err(internal)?;
+        } else {
+            // Legacy reference-only save/delete journals have no typed receipt,
+            // but they still changed the effective configuration. Publish only
+            // now, after their filesystem operation completed successfully.
+            inventory::publish_committed_config_generation();
         }
         let mut named: std::collections::BTreeSet<String> =
             serde_json::from_str(&journal.cleanup_named_json).map_err(internal)?;
@@ -14423,9 +14520,14 @@ pub(super) async fn recover_provider_config_journals(
         ctx.db
             .write(move |conn| {
                 if let Some((owner, operation_id, request_hash, fence, response)) = settlement {
+                    let operation_kind = match serde_json::from_str::<Response>(&response)? {
+                        Response::ProviderMutationCommitted { .. } => "apply_provider_mutation",
+                        Response::CopilotAuthCommitted { .. } => "setup_copilot_auth",
+                        _ => anyhow::bail!("provider journal has an unsupported receipt"),
+                    };
                     settle_journaled_local_success_on_conn(
                         conn,
-                        "apply_provider_mutation",
+                        operation_kind,
                         &owner,
                         &operation_id,
                         &request_hash,
@@ -14615,7 +14717,16 @@ async fn provider_config_save(
     header_secrets: Vec<Option<String>>,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _config_rpc_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
-    provider_config_save_under_lock(ctx, project_root, provider_id, entry, header_secrets).await
+    provider_config_save_under_lock(ctx, project_root, provider_id, entry, header_secrets, None)
+        .await
+}
+
+struct CopilotJournalBinding {
+    owner_digest: String,
+    client_operation_id: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+    requested_project_root: String,
 }
 
 async fn provider_config_save_under_lock(
@@ -14624,6 +14735,7 @@ async fn provider_config_save_under_lock(
     provider_id: &str,
     mut entry: crate::config::providers::ProviderEntry,
     mut header_secrets: Vec<Option<String>>,
+    copilot_binding: Option<CopilotJournalBinding>,
 ) -> std::result::Result<Response, ErrorPayload> {
     // Canonicalize the workspace root once, at this daemon boundary, so every
     // ownership claim, journal, recovery, and owner-scoped read below keys on the
@@ -14742,55 +14854,139 @@ async fn provider_config_save_under_lock(
     let staged_for_tx = staged.clone();
     let credential_ref_for_tx = entry.credential_ref.clone();
     let static_named_refs_for_tx = static_named_refs.clone();
-    let inserted_credential_claim = ctx.db.transaction(move |conn| {
-        // Atomic backstop for the non-staged static header references: each must
-        // still be owned by this exact provider/root with a live vault row,
-        // verified on THIS connection under the writer lock (fails closed on a
-        // conflict, rolling the whole save back).
-        for reference in &static_named_refs_for_tx {
-            ensure_static_named_reference_owned_on_conn(
-                conn,
-                &vault,
-                reference,
-                "provider",
-                &project_root_owned,
-            )?;
-        }
-        for (name, secret) in &staged_for_tx {
-            // ATOMIC cross-kind admission, symmetric with the MCP writer:
-            // re-check ownership INSIDE the same `BEGIN IMMEDIATE` transaction
-            // that writes the vault value and inserts the provider claim. These
-            // are freshly minted per-save names, but an atomic guard here (not
-            // just `INSERT OR IGNORE`) fails closed rather than silently
-            // coexisting should any name ever collide with a foreign owner.
-            reject_conflicting_named_ownership_on_conn(conn, name, "provider", &project_root_owned)?;
-            vault.put_item_on_conn(conn, cockpit_db::secret_vault::SecretVaultKind::NamedSecret, name, secret.as_bytes())?;
-            conn.execute(
-                "INSERT OR IGNORE INTO secret_named_ownership
+    let copilot_provider_id = provider_id.to_owned();
+    let copilot_owner_root = project_root.to_owned();
+    let inserted_credential_claim = ctx
+        .db
+        .transaction(move |conn| {
+            let consumed_vault_generation =
+                cockpit_db::secret_vault::inventory_generation_conn(conn)?;
+            if let Some(binding) = copilot_binding.as_ref() {
+                let fence_is_live: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM local_operation_receipts
+                     WHERE owner_digest=?1 AND client_operation_id=?2
+                       AND request_hash=?3 AND fencing_generation=?4
+                       AND state='executing')",
+                    rusqlite::params![
+                        &binding.owner_digest,
+                        &binding.client_operation_id,
+                        binding.request_hash.as_slice(),
+                        binding.fencing_generation
+                    ],
+                    |row| row.get(0),
+                )?;
+                if !fence_is_live {
+                    anyhow::bail!("Copilot auth lost its durable execution fence");
+                }
+            }
+            // Atomic backstop for the non-staged static header references: each must
+            // still be owned by this exact provider/root with a live vault row,
+            // verified on THIS connection under the writer lock (fails closed on a
+            // conflict, rolling the whole save back).
+            for reference in &static_named_refs_for_tx {
+                ensure_static_named_reference_owned_on_conn(
+                    conn,
+                    &vault,
+                    reference,
+                    "provider",
+                    &project_root_owned,
+                )?;
+            }
+            for (name, secret) in &staged_for_tx {
+                // ATOMIC cross-kind admission, symmetric with the MCP writer:
+                // re-check ownership INSIDE the same `BEGIN IMMEDIATE` transaction
+                // that writes the vault value and inserts the provider claim. These
+                // are freshly minted per-save names, but an atomic guard here (not
+                // just `INSERT OR IGNORE`) fails closed rather than silently
+                // coexisting should any name ever collide with a foreign owner.
+                reject_conflicting_named_ownership_on_conn(
+                    conn,
+                    name,
+                    "provider",
+                    &project_root_owned,
+                )?;
+                vault.put_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::NamedSecret,
+                    name,
+                    secret.as_bytes(),
+                )?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO secret_named_ownership
                  (item_id, owner_kind, project_root, created_at)
                  VALUES (?1, 'provider', ?2, ?3)",
-                rusqlite::params![name, project_root_owned, chrono::Utc::now().timestamp_millis()],
+                    rusqlite::params![
+                        name,
+                        project_root_owned,
+                        chrono::Utc::now().timestamp_millis()
+                    ],
+                )?;
+            }
+            let inserted_credential_claim = credential_ref_for_tx
+                .as_deref()
+                .map(|reference| {
+                    claim_provider_credential_on_conn(
+                        conn,
+                        reference,
+                        &provider_id_owned,
+                        &project_root_owned,
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false);
+            let (owner_digest, client_operation_id, request_hash, fence, terminal_response) =
+                if let Some(binding) = copilot_binding {
+                    let result_vault_generation =
+                        cockpit_db::secret_vault::inventory_generation_conn(conn)?;
+                    if result_vault_generation <= consumed_vault_generation {
+                        anyhow::bail!("Copilot auth did not advance the durable vault generation");
+                    }
+                    let response = Response::CopilotAuthCommitted {
+                        client_operation_id: binding.client_operation_id.clone(),
+                        project_root: binding.requested_project_root,
+                        owner_root: copilot_owner_root.clone(),
+                        owner_scope: format!("project:{copilot_owner_root}"),
+                        provider_id: copilot_provider_id,
+                        consumed_vault_generation,
+                        result_vault_generation,
+                        config_generation: 0,
+                    };
+                    (
+                        Some(binding.owner_digest),
+                        Some(binding.client_operation_id),
+                        Some(binding.request_hash.to_vec()),
+                        Some(binding.fencing_generation),
+                        Some(serde_json::to_string(&response)?),
+                    )
+                } else {
+                    (None, None, None, None, None)
+                };
+            conn.execute(
+                "INSERT INTO provider_config_journals
+             (journal_id, owner_digest, client_operation_id, request_hash,
+              fencing_generation, terminal_response_json, project_root,
+              provider_id, action, entry_json, cleanup_named_json,
+              cleanup_credential_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'save', ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    journal_id_owned,
+                    owner_digest,
+                    client_operation_id,
+                    request_hash,
+                    fence,
+                    terminal_response,
+                    project_root_owned,
+                    provider_id_owned,
+                    entry_json,
+                    named_json,
+                    credentials_json,
+                    chrono::Utc::now().timestamp_millis()
+                ],
             )?;
-        }
-        let inserted_credential_claim = credential_ref_for_tx
-            .as_deref()
-            .map(|reference| {
-                claim_provider_credential_on_conn(
-                    conn,
-                    reference,
-                    &provider_id_owned,
-                    &project_root_owned,
-                )
-            })
-            .transpose()?
-            .unwrap_or(false);
-        conn.execute(
-            "INSERT INTO provider_config_journals (journal_id, project_root, provider_id, action, entry_json, cleanup_named_json, cleanup_credential_json, created_at)
-             VALUES (?1, ?2, ?3, 'save', ?4, ?5, ?6, ?7)",
-            rusqlite::params![journal_id_owned, project_root_owned, provider_id_owned, entry_json, named_json, credentials_json, chrono::Utc::now().timestamp_millis()],
-        )?;
-        Ok(inserted_credential_claim)
-    }).await.map_err(map_named_secret_tx_error)?;
+            Ok(inserted_credential_claim)
+        })
+        .await
+        .map_err(map_named_secret_tx_error)?;
     // The staged writes above intentionally bypass `mutate_owner_vault_item`
     // so they can share one SQLite transaction with the recovery journal. Do
     // not acknowledge (or persist the config) until the live redaction table
@@ -14960,7 +15156,9 @@ async fn save_mcp_config(
         config_path: path.to_string_lossy().into_owned(),
         consumed_revision,
         result_revision,
-        config_generation: inventory::publish_committed_config_generation(),
+        // Recovery assigns the current boot's committed generation only after
+        // the reference-only file has durably converged.
+        config_generation: 0,
         credential_count: u32::try_from(credential_count).unwrap_or(u32::MAX),
     };
     let terminal_response_json = serde_json::to_string(&terminal_response).map_err(internal)?;
@@ -15096,8 +15294,48 @@ async fn save_mcp_config(
         }
         delete_owned_named_secret(ctx, &name, "mcp", project_root).await?;
     }
+    let terminal_response = publish_mcp_journal_generation(ctx, &journal_id).await?;
     delete_mcp_journal(ctx, &journal_id).await?;
     Ok(terminal_response)
+}
+
+/// Replace the MCP journal's pre-publication sentinel with a generation from
+/// this daemon boot. The file write must have completed before this is called;
+/// the amended response is then settled atomically with journal retirement.
+async fn publish_mcp_journal_generation(
+    ctx: &DaemonContext,
+    journal_id: &str,
+) -> std::result::Result<Response, ErrorPayload> {
+    let journal_id = journal_id.to_owned();
+    let generation = inventory::publish_committed_config_generation();
+    ctx.db
+        .write(move |conn| {
+            let response_json: String = conn.query_row(
+                "SELECT terminal_response_json FROM mcp_config_journals WHERE journal_id = ?1",
+                rusqlite::params![journal_id],
+                |row| row.get(0),
+            )?;
+            let mut response: Response = serde_json::from_str(&response_json)?;
+            let Response::McpConfigCommitted {
+                config_generation, ..
+            } = &mut response
+            else {
+                anyhow::bail!("MCP config journal has the wrong terminal response");
+            };
+            *config_generation = generation;
+            let amended = serde_json::to_string(&response)?;
+            let changed = conn.execute(
+                "UPDATE mcp_config_journals SET terminal_response_json = ?2
+                 WHERE journal_id = ?1",
+                rusqlite::params![journal_id, amended],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("MCP config journal disappeared before publication");
+            }
+            Ok(response)
+        })
+        .await
+        .map_err(internal)
 }
 
 async fn delete_mcp_journal(
@@ -15773,6 +16011,7 @@ pub(super) async fn recover_mcp_config_journals(
             }
             delete_owned_named_secret(ctx, name, "mcp", project_root).await?;
         }
+        publish_mcp_journal_generation(ctx, &journal_id).await?;
         delete_mcp_journal(ctx, &journal_id).await?;
     }
     Ok(())

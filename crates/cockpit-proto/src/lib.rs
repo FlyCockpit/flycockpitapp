@@ -3749,18 +3749,6 @@ mod proto_fixture_tests {
             ("response", "response.json", response_variant_tags()),
             ("event", "event.json", event_variant_tags()),
         ] {
-            let expected = if matches!(
-                request.wire_tag(),
-                "begin_provider_oauth"
-                    | "complete_provider_oauth"
-                    | "begin_mcp_oauth"
-                    | "complete_mcp_oauth"
-                    | "cancel_mcp_oauth"
-            ) {
-                17
-            } else {
-                10
-            };
             assert_eq!(
                 tags.iter().filter(|tag| **tag == UNKNOWN_SENTINEL).count(),
                 1,

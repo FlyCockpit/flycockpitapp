@@ -1171,6 +1171,7 @@ dependencies = [
  "cockpit-config",
  "cockpit-core",
  "cockpit-db",
+ "cockpit-host",
  "cockpit-proto",
  "cockpit-test-support",
  "cockpit-tui",
@@ -1278,6 +1279,7 @@ dependencies = [
  "chrono",
  "cockpit-config",
  "cockpit-db",
+ "cockpit-host",
  "cockpit-proto",
  "cockpit-test-support",
  "cockpit-tokenizer",
@@ -1401,6 +1403,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "cockpit-noise"
 version = "0.1.0"
 dependencies = [
@@ -1474,6 +1492,7 @@ dependencies = [
  "chrono",
  "cockpit-config",
  "cockpit-core",
+ "cockpit-host",
  "cockpit-proto",
  "cockpit-test-support",
  "cockpit-tokenizer",

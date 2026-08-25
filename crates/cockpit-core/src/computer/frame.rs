@@ -91,7 +91,8 @@ impl FrameChecksum {
 
 /// Helper: hex-encode without pulling in a new dependency.
 pub(crate) mod hex {
-    pub fn encode(bytes: &[u8]) -> String {
+    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
+        let bytes = bytes.as_ref();
         let mut out = String::with_capacity(bytes.len() * 2);
         for b in bytes {
             out.push_str(&format!("{b:02x}"));

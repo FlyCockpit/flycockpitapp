@@ -1098,7 +1098,7 @@ pub(crate) async fn dispatch_image_control_mutation(
                     journal_target,
                     journal_consumed,
                     journal_intended,
-                    current,
+                    current as i64,
                     journal_response,
                     chrono::Utc::now().timestamp_millis()
                 ],

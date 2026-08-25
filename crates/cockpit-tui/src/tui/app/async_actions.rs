@@ -99,13 +99,13 @@ async fn begin_provider_oauth(
     .await;
     let response = match response {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) | Err(_) => match oauth_settlement(&client, client_operation_id.clone()).await {
+        Ok(Err(_)) | Err(_) => Ok(match oauth_settlement(&client, client_operation_id.clone()).await {
             Ok(response @ Ok(_)) => response,
             Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
             Err(error) => return Ok(oauth_settlement_unknown(error)),
-        },
+        }),
     };
-    match response.map_err(|e| e.to_string())? {
+    match response.map_err(|e: anyhow::Error| e.to_string())? {
         Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,
@@ -202,18 +202,18 @@ async fn complete_provider_oauth(
     let request = cockpit_proto::Request::CompleteProviderOAuth {
         client_operation_id: client_operation_id.clone(),
         flow_id: flow_id.clone(),
-        input: input.map(|value| cockpit_proto::SensitiveWirePayload::new(value.take())),
+        input: input.map(|mut value| cockpit_proto::SensitiveWirePayload::new(std::mem::take(&mut *value))),
     };
     let response = tokio::time::timeout(OAUTH_COMPLETE_TIMEOUT, client.request(request)).await;
     let response = match response {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) | Err(_) => match oauth_settlement(&client, client_operation_id.clone()).await {
+        Ok(Err(_)) | Err(_) => Ok(match oauth_settlement(&client, client_operation_id.clone()).await {
             Ok(response @ Ok(_)) => response,
             Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
             Err(error) => return Ok(oauth_settlement_unknown(error)),
-        },
+        }),
     };
-    match response.map_err(|e| e.to_string())? {
+    match response.map_err(|e: anyhow::Error| e.to_string())? {
         Ok(cockpit_proto::Response::LocalOperationSettlement {
             client_operation_id: settlement_operation_id,
             operation_kind,

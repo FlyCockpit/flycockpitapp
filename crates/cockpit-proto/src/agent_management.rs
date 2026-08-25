@@ -252,6 +252,20 @@ pub fn assistant_mutation_intent_hash(
     crate::hex_lower(digest.finalize())
 }
 
+/// Public, non-secret identity for a `SaveMcpConfig` mutation. The daemon
+/// recomputes this hash over the submitted body and rejects a mismatch, so
+/// every client (CLI, TUI) and the daemon must derive it through this one
+/// function. Secret values are deliberately excluded: the hash binds the
+/// reference-only config shape, not credential material.
+pub fn mcp_mutation_intent_hash(
+    project_root: &str,
+    patch_json: &str,
+) -> String {
+    let encoded = serde_json::to_vec(&("save_mcp_config", project_root, patch_json))
+    .expect("a tuple of strings serializes infallibly");
+    crate::hex_lower(Sha256::digest(&encoded))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEditorLease {
     pub client_operation_id: String,

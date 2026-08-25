@@ -5016,7 +5016,7 @@ mod queued_message_edit_tests {
     use super::{
         QUEUE_EDIT_PENDING_NOTICE, QueueEditOutcome, optimistic_queue_item, queue_item_from_proto,
     };
-    use crate::tui::agent_runner::{AgentRunner, AttachedRequest, ClientTasks, UsageCounts};
+    use crate::tui::agent_runner::{AgentRunner, AttachedRequest, TestRunnerOverrides};
     use crate::tui::app::App;
     use cockpit_core::engine::message::QueueItemStatus as EngineQueueItemStatus;
     use cockpit_proto::{
@@ -5029,49 +5029,10 @@ mod queued_message_edit_tests {
     fn runner_with_attached_request_tx(
         attached_request_tx: mpsc::Sender<AttachedRequest>,
     ) -> AgentRunner {
-        let (input_tx, _input_rx) = mpsc::channel::<crate::tui::agent_runner::RunnerInput>(1);
-        let (record_tx, _record_rx) = mpsc::channel(1);
-        let (control_tx, _control_rx) = mpsc::channel(1);
-        AgentRunner {
-            input_tx,
-            record_tx,
-            control_tx,
-            attached_request_tx,
-            events: Arc::new(Mutex::new(Vec::new())),
-            event_notify: Arc::new(tokio::sync::Notify::new()),
-            active_agent: Arc::new(Mutex::new("Build".to_string())),
-            active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
-            skill_inventory_names: Arc::new(Mutex::new(None)),
-            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
-            active_model_state: None,
-            session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
-            attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            submission_session_tx: tokio::sync::watch::channel(
-                crate::tui::agent_runner::SubmissionSessionBinding::unbound(),
-            )
-            .0,
-            awaiting_durable: Default::default(),
-            short_id: "abc123".to_string(),
-            project_id: "project".to_string(),
-            usage: UsageCounts::default(),
-            owns_daemon: false,
-            socket: PathBuf::from("/tmp/cockpit-test.sock"),
-            history: Vec::new(),
-            paused_work: Vec::new(),
-            repair_required: None,
-            btw_fork: None,
-            daemon_version: "test".to_string(),
-            daemon_compatible: true,
-            current_client: None,
-            attach_context: None,
-            last_applied_seq: None,
-            client_tasks: ClientTasks::default(),
-            #[cfg(test)]
-            test_session_switch_rx: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            test_force_can_switch: false,
-            test_advance_epoch_when_switch_task_created: false,
-        }
+        AgentRunner::test_fixture(TestRunnerOverrides {
+            attached_request_tx: Some(attached_request_tx),
+            ..Default::default()
+        })
     }
 
     fn proto_target(id: &str) -> cockpit_proto::QueueTarget {
@@ -5465,7 +5426,7 @@ mod queued_message_edit_tests {
 
 #[cfg(test)]
 mod paste_routing_tests {
-    use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
+    use crate::tui::agent_runner::{AgentRunner, TestRunnerOverrides};
     use crate::tui::app::{App, Overlay, PendingModelSelection};
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
     use crate::tui::paste::{PasteKind, PasteRegistry};
@@ -5473,8 +5434,6 @@ mod paste_routing_tests {
     use crate::tui::settings::Dialog;
     use cockpit_proto::PinnedMessage;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-    use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
     fn input_ready_app(tmp: &tempfile::TempDir) -> App {
@@ -5545,49 +5504,10 @@ mod paste_routing_tests {
     fn runner_with_input_tx(
         input_tx: mpsc::Sender<crate::tui::agent_runner::RunnerInput>,
     ) -> AgentRunner {
-        let (record_tx, _record_rx) = mpsc::channel(1);
-        let (control_tx, _control_rx) = mpsc::channel(1);
-        let (attached_request_tx, _attached_request_rx) = mpsc::channel(1);
-        AgentRunner {
-            input_tx,
-            record_tx,
-            control_tx,
-            attached_request_tx,
-            events: Arc::new(Mutex::new(Vec::new())),
-            event_notify: Arc::new(tokio::sync::Notify::new()),
-            active_agent: Arc::new(Mutex::new("Build".to_string())),
-            active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
-            skill_inventory_names: Arc::new(Mutex::new(None)),
-            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
-            active_model_state: None,
-            session_id_state: Arc::new(Mutex::new(uuid::Uuid::new_v4())),
-            attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            submission_session_tx: tokio::sync::watch::channel(
-                crate::tui::agent_runner::SubmissionSessionBinding::unbound(),
-            )
-            .0,
-            awaiting_durable: Default::default(),
-            short_id: "abc123".to_string(),
-            project_id: "project".to_string(),
-            usage: UsageCounts::default(),
-            owns_daemon: false,
-            socket: PathBuf::from("/tmp/cockpit-test.sock"),
-            history: Vec::new(),
-            paused_work: Vec::new(),
-            repair_required: None,
-            btw_fork: None,
-            daemon_version: "test".to_string(),
-            daemon_compatible: true,
-            current_client: None,
-            attach_context: None,
-            last_applied_seq: None,
-            client_tasks: ClientTasks::default(),
-            #[cfg(test)]
-            test_session_switch_rx: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            test_force_can_switch: false,
-            test_advance_epoch_when_switch_task_created: false,
-        }
+        AgentRunner::test_fixture(TestRunnerOverrides {
+            input_tx: Some(input_tx),
+            ..Default::default()
+        })
     }
 
     fn ctrl(ch: char) -> KeyEvent {

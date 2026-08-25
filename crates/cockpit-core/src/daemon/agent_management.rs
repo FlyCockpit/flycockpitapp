@@ -6,6 +6,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::computer::frame::hex;
 use crate::daemon::proto::{
     AgentEditSnapshot, AgentEditTarget, AgentEditorCompletion, AgentEditorLease,
     AgentEditorSettlementStatus, AgentEntryKind, AgentInventoryEntry, AgentMutation,

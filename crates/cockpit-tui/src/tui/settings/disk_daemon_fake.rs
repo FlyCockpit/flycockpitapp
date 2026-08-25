@@ -102,6 +102,7 @@ impl SettingsDaemonEffect for DiskDaemonFake {
                 patch,
                 expected_revision,
                 snapshot_session_id,
+                ..
             } => apply_extended_config_patch(
                 Path::new(&project_root),
                 &layer_id,
@@ -187,6 +188,7 @@ impl SettingsDaemonEffect for DiskDaemonFake {
             // than inventing registry rows a test could not have created.
             Request::ListAssistants => Ok(Response::Assistants {
                 assistants: Vec::new(),
+                config_generation: 0,
             }),
             Request::SaveAssistantDefinition { .. }
             | Request::UpsertAssistant { .. }
@@ -886,6 +888,9 @@ fn apply_extended_config_patch(
         current_config_generation()
     };
     Ok(Response::ExtendedConfigSaved {
+        client_operation_id: String::new(),
+        request_hash: String::new(),
+        mutation_intent_hash: String::new(),
         hash: result_revision.clone(),
         config_generation,
         layer_id: layer_id.to_string(),
@@ -1384,7 +1389,7 @@ fn source_snapshot_parts(
 }
 
 fn finalized_snapshot(mut snapshot: AgentEditSnapshot) -> AgentEditSnapshot {
-    snapshot.projection_digest = cockpit_proto::agent_edit_projection_digest(&snapshot);
+    snapshot.projection_digest = cockpit_proto::agent_edit_projection_material(&snapshot);
     snapshot
 }
 
@@ -1528,7 +1533,7 @@ fn inventory_entries(root: &Path) -> Result<Vec<AgentInventoryEntry>, String> {
             editable: source_layer == AgentSourceLayer::Workspace && !markdown.is_empty(),
             projection_digest: String::new(),
         };
-        entry.projection_digest = cockpit_proto::agent_inventory_entry_projection_digest(&entry);
+        entry.projection_digest = cockpit_proto::agent_inventory_entry_projection_material(&entry);
         entries.push(entry);
     }
     Ok(entries)
@@ -1594,6 +1599,9 @@ fn mutate_agent(
     client_operation_id: String,
     mutation_intent_hash: String,
     root: &Path,
+    project_root: &str,
+    client_operation_id: String,
+    mutation_intent_hash: String,
     mutation: AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<AgentMutationResult, String> {
@@ -1601,6 +1609,7 @@ fn mutate_agent(
     let consumed_revision = expected_revision.clone();
     let generation_before = current_config_generation();
     let resets_inventory = matches!(&mutation, AgentMutation::ResetAllBuiltins);
+    let agent_name = cockpit_proto::agent_mutation_name(&mutation).map(String::from);
     let (changed, affected, snapshot) = match mutation {
         AgentMutation::EjectBuiltin { name } => {
             validate_agent_name(&name)?;
@@ -1809,6 +1818,7 @@ fn begin_editor_lease(
     root: &Path,
     name: &str,
     expected_revision: String,
+    client_operation_id: String,
 ) -> Result<Response, String> {
     let snapshot = agent_edit_snapshot(root, name)?;
     ensure_revision(&snapshot.revision, Some(&expected_revision))?;

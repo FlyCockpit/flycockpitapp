@@ -58,7 +58,7 @@ mod pointer_acceptance_tests;
 mod pointer_action_fixtures;
 #[allow(dead_code)] // The registry is consumed incrementally by page fixture matrices.
 pub(crate) mod pointer_actions;
-mod providers;
+pub(crate) mod providers;
 mod reset;
 pub(crate) mod secret_display;
 mod settings_editor;
@@ -89,6 +89,8 @@ use cockpit_config::dirs::{
 };
 use cockpit_config::extended::ExtendedConfig;
 use cockpit_config::providers::{OnUnlistedModelsFetch, ProviderEntry, ProvidersConfig};
+
+use providers::initial_list_cursor;
 
 /// Settings-side operations that need provider secrets must use the persistent
 /// daemon.  Keeping this tiny helper here makes accidental local vault opens
@@ -874,13 +876,13 @@ pub(crate) async fn execute_settings_daemon_work(
                         "typed settings mutation was authoritatively rejected: {error}"
                     ));
                 }
-                response @ Response::LocalOperationSettlement {
+                ref response @ Response::LocalOperationSettlement {
                     client_operation_id: ref returned_operation_id,
                     pending: true,
                     ..
                 } if returned_operation_id == &plan.client_operation_id => {
                     return Ok(SettingsDaemonWorkOutcome {
-                        response: Ok(response),
+                        response: Ok(response.clone()),
                         authoritative_rejection: false,
                         committed_refresh_needed: None,
                     });
@@ -988,7 +990,6 @@ pub(crate) struct SettingsBlockingEffectMetadata {
 /// beneath the application's multi-thread Tokio runtime. Unit reducers are
 /// intentionally synchronous, so give those tests the same daemon boundary
 /// instead of panicking before the request can be exercised.
-#[cfg(test)]
 fn run_settings_daemon<T>(
     future: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
@@ -1018,15 +1019,14 @@ fn run_settings_daemon<T>(
 /// client and tests feed responses through the same snapshot/patch/receipt
 /// validation below; a test double may replace only transport, never config
 /// loading or persistence.
-#[cfg(test)]
 trait SettingsDaemonEffect: Send + Sync {
     fn request(&self, request: Request) -> Result<Response, String>;
 }
 
-#[cfg(test)]
+#[cfg(not(test))]
 struct ProductionSettingsDaemonEffect;
 
-#[cfg(test)]
+#[cfg(not(test))]
 impl SettingsDaemonEffect for ProductionSettingsDaemonEffect {
     fn request(&self, request: Request) -> Result<Response, String> {
         run_settings_daemon(async move {

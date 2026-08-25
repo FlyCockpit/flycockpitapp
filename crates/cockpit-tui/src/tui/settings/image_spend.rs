@@ -229,6 +229,19 @@ pub(super) fn page(project_key: String, cx: &mut SettingsCx) -> PageBox {
         saved: ImageSpendSettings::default(),
         version: None,
         status: "Loading saved policy…".into(),
+        #[cfg(test)]
+        load: Mutex::new(None),
+        #[cfg(test)]
+        save: Mutex::new(None),
+        #[cfg(test)]
+        load_completion: Arc::new(WorkerCompletion {
+            complete: Mutex::new(false),
+            changed: Condvar::new(),
+        }),
+        #[cfg(test)]
+        save_completion: Mutex::new(None),
+        #[cfg(test)]
+        persistence: Arc::new(DefaultImageSpendPersistence { runtime: None }),
     })
 }
 
@@ -475,9 +488,18 @@ impl ImageSpendPage {
         };
     }
 
-    fn save(&mut self, cx: &mut SettingsCx) {
+    /// The one review gate every save path shares: an invalid draft never
+    /// reaches persistence, and both entry points report it identically.
+    fn validate_draft_or_status(&mut self) -> bool {
         if let Err(reason) = self.draft.validate() {
             self.status = format!("Not saved: {reason:?}. Review every required choice.");
+            return false;
+        }
+        true
+    }
+
+    fn save(&mut self, cx: &mut SettingsCx) {
+        if !self.validate_draft_or_status() {
             return;
         }
         if self.daemon_owned {
@@ -495,21 +517,36 @@ impl ImageSpendPage {
         }
         #[cfg(test)]
         {
-            let (tx, rx) = mpsc::sync_channel(1);
-            let project_key = self.project_key.clone();
-            let draft = self.draft.clone();
-            let version = self.version;
-            let persistence = self.persistence.clone();
-            let completion = Arc::new(WorkerCompletion::default());
-            let worker_completion = completion.clone();
-            std::thread::spawn(move || {
-                let _completion = WorkerCompletionGuard(worker_completion);
-                let _ = tx.send(persistence.save(project_key, draft, version));
-            });
-            *self.save.lock().unwrap() = Some(rx);
-            *self.save_completion.lock().unwrap() = Some(completion);
-            self.status = "Saving reviewed policy…".into();
+            self.persist_locally();
         }
+    }
+
+    #[cfg(test)]
+    fn persist_locally(&mut self) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let project_key = self.project_key.clone();
+        let draft = self.draft.clone();
+        let version = self.version;
+        let persistence = self.persistence.clone();
+        let completion = Arc::new(WorkerCompletion::default());
+        let worker_completion = completion.clone();
+        std::thread::spawn(move || {
+            let _completion = WorkerCompletionGuard(worker_completion);
+            let _ = tx.send(persistence.save(project_key, draft, version));
+        });
+        *self.save.lock().unwrap() = Some(rx);
+        *self.save_completion.lock().unwrap() = Some(completion);
+        self.status = "Saving reviewed policy…".into();
+    }
+
+    /// Test-only save entry point for non-daemon-owned pages. Mirrors
+    /// [`Self::save`] without requiring a live [`SettingsCx`].
+    #[cfg(test)]
+    fn save_for_test(&mut self) {
+        if !self.validate_draft_or_status() {
+            return;
+        }
+        self.persist_locally();
     }
 
     fn adjust_selected(&mut self, increase: bool) {
@@ -820,7 +857,7 @@ mod tests {
                 usd_micros: 1_000_000
             }
         );
-        page.save();
+        page.save_for_test();
         assert_eq!(page.saved, ImageSpendSettings::default());
         assert!(page.save.lock().unwrap().is_none());
         assert!(page.status.contains("SessionUnconfigured"));
@@ -923,7 +960,7 @@ mod tests {
             page.edit_micros(KeyCode::Char(character));
         }
         page.edit_micros(KeyCode::Enter);
-        page.save();
+        page.save_for_test();
         poll_after_worker_completion(page);
         assert_eq!(page.version, Some(1));
 
@@ -952,7 +989,7 @@ mod tests {
         ));
 
         reopened.draft.session = BudgetPolicy::Unconfigured;
-        reopened.save();
+        reopened.save_for_test();
         assert!(reopened.save.lock().unwrap().is_none());
         let store =
             cockpit_config::config::image_spend::TestImageSpendPolicyStore::open(&path).unwrap();

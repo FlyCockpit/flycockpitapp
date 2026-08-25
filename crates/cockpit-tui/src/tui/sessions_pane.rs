@@ -963,12 +963,23 @@ impl SessionsPane {
             self.notice = Some(DAEMONLESS_HINT.to_string());
             return;
         }
+        // Only tiers that mean the daemon is still working count as live.
+        // `Interrupted`/`PendingQuestion` are durable needs-attention markers
+        // on an already-drained worker, so they must not draw the confirm's
+        // "it will be interrupted first" warning.
         let live = self
             .current()
             .cards
             .get(self.current().list.cursor())
-            .and_then(|(_, status)| *status)
-            .is_some_and(|(jobs, processing)| jobs || processing);
+            .is_some_and(|(_, status)| {
+                matches!(
+                    status,
+                    Tier::ActiveSchedules
+                        | Tier::ToolRunning
+                        | Tier::InferenceInProgress
+                        | Tier::Processing
+                )
+            });
         let Some(s) = self.selected().cloned() else {
             return;
         };

@@ -399,10 +399,9 @@ async fn pull_bulk_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::agent_runner::{AgentRunner, ClientTasks, UsageCounts};
+    use crate::tui::agent_runner::{AgentRunner, TestRunnerOverrides};
     use cockpit_proto::ExportSessionData;
     use cockpit_proto::bulk_transfer as proto_bulk;
-    use std::sync::{Arc, Mutex};
 
     fn last_plain(app: &App) -> &str {
         match app.history.last().expect("history line") {
@@ -415,49 +414,11 @@ mod tests {
         session_id: uuid::Uuid,
         attached_request_tx: mpsc::Sender<AttachedRequest>,
     ) -> AgentRunner {
-        let (input_tx, _input_rx) = mpsc::channel::<crate::tui::agent_runner::RunnerInput>(1);
-        let (record_tx, _record_rx) = mpsc::channel(1);
-        let (control_tx, _control_rx) = mpsc::channel(1);
-        AgentRunner {
-            input_tx,
-            record_tx,
-            control_tx,
-            attached_request_tx,
-            events: Arc::new(Mutex::new(Vec::new())),
-            event_notify: Arc::new(tokio::sync::Notify::new()),
-            active_agent: Arc::new(Mutex::new("Build".to_string())),
-            active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
-            skill_inventory_names: Arc::new(Mutex::new(None)),
-            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
-            active_model_state: None,
-            session_id_state: Arc::new(Mutex::new(session_id)),
-            attachment_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            submission_session_tx: tokio::sync::watch::channel(
-                crate::tui::agent_runner::SubmissionSessionBinding::new(session_id, 0),
-            )
-            .0,
-            awaiting_durable: Default::default(),
-            short_id: "abc123".to_string(),
-            project_id: "project".to_string(),
-            usage: UsageCounts::default(),
-            owns_daemon: false,
-            socket: std::path::PathBuf::from("/tmp/cockpit-test.sock"),
-            history: Vec::new(),
-            paused_work: Vec::new(),
-            repair_required: None,
-            btw_fork: None,
-            daemon_version: "test".to_string(),
-            daemon_compatible: true,
-            current_client: None,
-            attach_context: None,
-            last_applied_seq: None,
-            client_tasks: ClientTasks::default(),
-            #[cfg(test)]
-            test_session_switch_rx: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            test_force_can_switch: false,
-            test_advance_epoch_when_switch_task_created: false,
-        }
+        AgentRunner::test_fixture(TestRunnerOverrides {
+            attached_request_tx: Some(attached_request_tx),
+            session_id: Some(session_id),
+            ..Default::default()
+        })
     }
 
     fn digest_of(bytes: &[u8]) -> [u8; 32] {

@@ -8783,6 +8783,9 @@ async fn handle_serialized_request_impl(
             record,
         } => {
             let settlement_owner = settings_capability_owner(state);
+            let mutation_intent_hash = local_operation_request_hash_hex(
+                &local_operation_request_hash(&("put_provider_credential", &provider_id))?,
+            );
             let request_hash = local_operation_secret_request_hash(
                 ctx,
                 b"flycockpit/local-operation/provider-credential/put/v1\0",
@@ -8844,6 +8847,7 @@ async fn handle_serialized_request_impl(
                 .unwrap_or(true);
             let receipt = Response::ProviderCredentialCommitted {
                 client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash,
                 provider_id: provider_id.clone(),
                 project_root: None,
                 owner_root: None,
@@ -10681,6 +10685,7 @@ async fn handle_serialized_request_impl(
                 &provider_id,
                 &project_root,
             ))?;
+            let mutation_intent_hash = local_operation_request_hash_hex(&request_hash);
             #[cfg(feature = "remote")]
             let request = Request::DeleteProviderCredential {
                 client_operation_id: client_operation_id.clone(),
@@ -10801,6 +10806,7 @@ async fn handle_serialized_request_impl(
                 .unwrap_or_else(|| "global".into());
             let response = Response::ProviderCredentialCommitted {
                 client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash,
                 provider_id: provider_id.clone(),
                 project_root: project_root.clone(),
                 owner_root: canonical_project_root,
@@ -11111,6 +11117,7 @@ async fn handle_serialized_request_impl(
             let settlement_owner = settings_capability_owner(state);
             let request_hash =
                 local_operation_request_hash(&("setup_copilot_auth", &project_root, &provider_id))?;
+            let mutation_intent_hash = local_operation_request_hash_hex(&request_hash);
             let fencing_generation = match begin_local_operation(
                 ctx,
                 &settlement_owner,
@@ -11168,6 +11175,7 @@ async fn handle_serialized_request_impl(
                         owner_digest: settlement_owner.clone(),
                         client_operation_id: client_operation_id.clone(),
                         request_hash,
+                        mutation_intent_hash,
                         fencing_generation,
                         requested_project_root: project_root.clone(),
                     },
@@ -14000,6 +14008,18 @@ async fn commit_local_provider_credential(
     credential_record_id: String,
     record: Option<zeroize::Zeroizing<Vec<u8>>>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    let mutation_intent_hash = if record.is_some() {
+        local_operation_request_hash_hex(&local_operation_request_hash(&(
+            "put_provider_credential",
+            &provider_id,
+        ))?)
+    } else {
+        local_operation_request_hash_hex(&local_operation_request_hash(&(
+            "delete_provider_credential",
+            &provider_id,
+            &project_root,
+        ))?)
+    };
     let vault = ctx.secret_vault.clone();
     let response = ctx
         .db
@@ -14061,6 +14081,7 @@ async fn commit_local_provider_credential(
                 .unwrap_or_else(|| "global".into());
             let response = Response::ProviderCredentialCommitted {
                 client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash,
                 provider_id,
                 project_root,
                 owner_root,
@@ -16232,6 +16253,7 @@ struct CopilotJournalBinding {
     owner_digest: String,
     client_operation_id: String,
     request_hash: [u8; 32],
+    mutation_intent_hash: String,
     fencing_generation: i64,
     requested_project_root: String,
 }
@@ -16450,6 +16472,7 @@ async fn provider_config_save_under_lock(
                     }
                     let response = Response::CopilotAuthCommitted {
                         client_operation_id: binding.client_operation_id.clone(),
+                        mutation_intent_hash: binding.mutation_intent_hash,
                         project_root: binding.requested_project_root,
                         owner_root: copilot_owner_root.clone(),
                         owner_scope: format!("project:{copilot_owner_root}"),
@@ -16547,10 +16570,16 @@ async fn save_mcp_config(
     project_root: &str,
     config_json: &str,
     secret_values_json: &str,
-    _cleanup_names_json: &str,
+    cleanup_names_json: &str,
 ) -> std::result::Result<Response, ErrorPayload> {
     let _lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     let requested_project_root = project_root.to_owned();
+    let mutation_intent_hash = local_operation_request_hash_hex(&local_operation_request_hash(&(
+        "save_mcp_config",
+        &requested_project_root,
+        &config_json,
+        &cleanup_names_json,
+    ))?);
     // Canonicalize the workspace root once at this daemon boundary so every
     // ownership claim/guard/journal below (and later resolution) keys on the
     // same symlink-resolved form. The CLI (`cockpit mcp add`) sends a raw cwd;
@@ -16658,6 +16687,7 @@ async fn save_mcp_config(
     let terminal_response = Response::McpConfigCommitted {
         client_operation_id: client_operation_id.to_owned(),
         request_hash: crate::intel::hex_lower(&request_hash),
+        mutation_intent_hash,
         project_root: requested_project_root,
         owner_root: project_root.to_owned(),
         config_path: path.to_string_lossy().into_owned(),

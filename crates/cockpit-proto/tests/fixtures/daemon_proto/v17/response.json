@@ -1942,6 +1942,7 @@
     "data": {
       "client_operation_id": "11111111-1111-4111-8111-111111111111",
       "request_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "mutation_intent_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
       "project_root": "/tmp/project",
       "owner_root": "/tmp/project",
       "config_path": "/tmp/project/.cockpit/mcp.json",
@@ -1955,6 +1956,7 @@
   "provider_credential_committed": {
     "data": {
       "client_operation_id": "11111111-1111-4111-8111-111111111111",
+      "mutation_intent_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       "provider_id": "example",
       "project_root": "/tmp/project",
       "owner_root": "/tmp/project",
@@ -1981,6 +1983,7 @@
   "copilot_auth_committed": {
     "data": {
       "client_operation_id": "11111111-1111-4111-8111-111111111111",
+      "mutation_intent_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "project_root": "/tmp/project",
       "owner_root": "/tmp/project",
       "owner_scope": "project:/tmp/project",
@@ -1995,6 +1998,7 @@
     "data": {
       "client_operation_id": "44444444-4444-4444-8444-444444444444",
       "request_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "mutation_intent_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "config_generation": 7,
       "layer_id": "11111111-1111-4111-8111-111111111111",
@@ -2579,6 +2583,7 @@
         "response": "provider_credential_committed",
         "data": {
           "client_operation_id": "11111111-1111-4111-8111-111111111111",
+          "mutation_intent_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
           "provider_id": "example",
           "project_root": null,
           "owner_root": null,

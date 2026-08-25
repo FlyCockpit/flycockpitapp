@@ -6491,6 +6491,7 @@ mod tests {
             Uuid::new_v4(),
             Response::ProviderCredentialCommitted {
                 client_operation_id: "put-provider".into(),
+                mutation_intent_hash: "00".repeat(32),
                 provider_id: "example".into(),
                 project_root: None,
                 owner_root: None,
@@ -6550,6 +6551,7 @@ mod tests {
             id,
             Response::ProviderCredentialCommitted {
                 client_operation_id: "put-provider".into(),
+                mutation_intent_hash: "00".repeat(32),
                 provider_id: "example".into(),
                 project_root: None,
                 owner_root: None,
@@ -6963,6 +6965,7 @@ mod tests {
             Response::McpConfigCommitted {
                 client_operation_id: "save-mcp".into(),
                 request_hash: "22".repeat(32),
+                mutation_intent_hash: "33".repeat(32),
                 project_root: "/workspace".into(),
                 owner_root: "/workspace".into(),
                 config_path: "/workspace/.cockpit/mcp.json".into(),
@@ -6973,6 +6976,7 @@ mod tests {
             },
             Response::ProviderCredentialCommitted {
                 client_operation_id: "delete-provider".into(),
+                mutation_intent_hash: "22".repeat(32),
                 provider_id: "example".into(),
                 project_root: None,
                 owner_root: None,
@@ -6994,6 +6998,7 @@ mod tests {
             Response::ExtendedConfigSaved {
                 client_operation_id: "patch-config".into(),
                 request_hash: "44".repeat(32),
+                mutation_intent_hash: "45".repeat(32),
                 hash: "55".repeat(32),
                 config_generation: 7,
                 layer_id: "layer".into(),
@@ -7006,6 +7011,7 @@ mod tests {
             },
             Response::CopilotAuthCommitted {
                 client_operation_id: "setup-copilot".into(),
+                mutation_intent_hash: "78".repeat(32),
                 project_root: "/tmp/project".into(),
                 owner_root: "/tmp/project".into(),
                 owner_scope: "project:/tmp/project".into(),

@@ -676,6 +676,7 @@ pub async fn apply_extended_config_patch(
     owner: String,
     snapshot_session_id: String,
 ) -> Result<Response, ErrorPayload> {
+    let mutation_intent_hash = patch.sanitized_intent_hash().map_err(internal)?;
     let root = trusted_settings_root(ctx, &project_root).await?;
     let db = ctx.db.clone();
     let runtime = tokio::runtime::Handle::current();
@@ -839,6 +840,7 @@ pub async fn apply_extended_config_patch(
             let mut terminal_response = Response::ExtendedConfigSaved {
                 client_operation_id: client_operation_id.clone(),
                 request_hash: request_hash.iter().map(|byte| format!("{byte:02x}")).collect(),
+                mutation_intent_hash,
                 hash: result_revision.clone(),
                 config_generation,
                 layer_id: layer_id.clone(),

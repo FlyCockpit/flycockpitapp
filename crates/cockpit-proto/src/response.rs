@@ -414,6 +414,10 @@ pub enum Response {
         /// request body. Older archived fixtures predate this field.
         #[serde(default)]
         request_hash: String,
+        /// Public SHA-256 over the project/config/cleanup intent with staged
+        /// secret values excluded.
+        #[serde(default)]
+        mutation_intent_hash: String,
         project_root: String,
         owner_root: String,
         config_path: String,
@@ -460,6 +464,10 @@ pub enum Response {
     /// Exact receipt for a daemon-owned provider credential mutation.
     ProviderCredentialCommitted {
         client_operation_id: String,
+        /// Public correlation over the operation, provider and owner scope;
+        /// secret credential bytes are deliberately excluded.
+        #[serde(default)]
+        mutation_intent_hash: String,
         provider_id: String,
         project_root: Option<String>,
         owner_root: Option<String>,
@@ -508,6 +516,10 @@ pub enum Response {
     },
     CopilotAuthCommitted {
         client_operation_id: String,
+        /// Public correlation over the exact setup target. The acquired token
+        /// remains covered only by the daemon-keyed operation identity.
+        #[serde(default)]
+        mutation_intent_hash: String,
         project_root: String,
         owner_root: String,
         #[serde(default)]
@@ -691,6 +703,9 @@ pub enum Response {
         client_operation_id: String,
         #[serde(default)]
         request_hash: String,
+        /// Client-computable digest of the exact non-secret patch intent.
+        #[serde(default)]
+        mutation_intent_hash: String,
         hash: String,
         config_generation: u64,
         layer_id: String,

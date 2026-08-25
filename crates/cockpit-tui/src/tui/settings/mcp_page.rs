@@ -357,6 +357,12 @@ impl SettingsCx {
         let secret_values_json = serde_json::to_string(secret_values).map_err(|e| e.to_string())?;
         let cleanup_names_json = serde_json::to_string(cleanup_names).map_err(|e| e.to_string())?;
         let owner = project_root.display().to_string();
+        let expected_request_intent_hash = super::local_receipt_request_hash(&(
+            "save_mcp_config",
+            &owner,
+            &config_json,
+            &cleanup_names_json,
+        ))?;
         let client_operation_id = uuid::Uuid::new_v4().to_string();
         self.queue_simple_secret_mutation(
             super::SettingsEffectTarget {
@@ -379,6 +385,7 @@ impl SettingsCx {
                 expected_config_path,
                 expected_consumed_revision,
                 expected_result_revision,
+                expected_request_intent_hash,
             },
         );
         self.extended_warnings = vec!["saving MCP settings…".into()];
@@ -439,12 +446,19 @@ impl SettingsCx {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     let flow_id = flow.flow_id.clone();
                     let client_operation_id = uuid::Uuid::new_v4().to_string();
-                    let expected_request_hash = super::local_receipt_request_hash(&(
+                    let expected_request_hash = match super::local_receipt_request_hash(&(
                         "cancel_mcp_oauth",
                         &flow.begin_client_operation_id,
                         &Some(flow_id.clone()),
-                    ))
-                    .unwrap_or_default();
+                    )) {
+                        Ok(hash) => hash,
+                        Err(error) => {
+                            flow.status =
+                                Some(format!("could not bind OAuth cancellation: {error}"));
+                            s.oauth = Some(flow);
+                            return Nav::Stay;
+                        }
+                    };
                     self.queue_simple_mutation(
                         super::SettingsEffectTarget {
                             surface: "settings.mcp-oauth-cancel",
@@ -477,12 +491,18 @@ impl SettingsCx {
                     }
                     let flow_id = flow.flow_id.clone();
                     let client_operation_id = uuid::Uuid::new_v4().to_string();
-                    let expected_request_hash = super::local_receipt_request_hash(&(
+                    let expected_request_hash = match super::local_receipt_request_hash(&(
                         "complete_mcp_oauth_receipt_v2",
                         &client_operation_id,
                         &flow_id,
-                    ))
-                    .unwrap_or_default();
+                    )) {
+                        Ok(hash) => hash,
+                        Err(error) => {
+                            flow.status = Some(format!("could not bind OAuth completion: {error}"));
+                            s.oauth = Some(flow);
+                            return Nav::Stay;
+                        }
+                    };
                     self.queue_simple_secret_mutation(
                         super::SettingsEffectTarget {
                             surface: "settings.mcp-oauth-complete",
@@ -563,12 +583,17 @@ impl SettingsCx {
                             .or_else(|| std::env::current_dir().ok())
                             .unwrap_or_else(|| std::path::PathBuf::from("."));
                         let project_root = super::canonical_project_root(&project_root);
-                        let expected_request_hash = super::local_receipt_request_hash(&(
+                        let expected_request_hash = match super::local_receipt_request_hash(&(
                             "begin_mcp_oauth",
                             &project_root,
                             &name,
-                        ))
-                        .unwrap_or_default();
+                        )) {
+                            Ok(hash) => hash,
+                            Err(error) => {
+                                s.status = Some(format!("could not bind OAuth start: {error}"));
+                                return Nav::Stay;
+                            }
+                        };
                         self.queue_simple_mutation(
                             super::SettingsEffectTarget {
                                 surface: "settings.mcp-oauth-begin",

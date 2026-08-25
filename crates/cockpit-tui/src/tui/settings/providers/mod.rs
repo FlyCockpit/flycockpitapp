@@ -839,6 +839,17 @@ impl CopilotSetupState {
         let project_root = super::canonical_project_root(project_root);
         let provider_id = provider_id.to_string();
         let client_operation_id = operation_id.0.to_string();
+        let expected_request_hash = match super::local_receipt_request_hash(&(
+            "setup_copilot_auth",
+            &project_root,
+            &provider_id,
+        )) {
+            Ok(hash) => hash,
+            Err(error) => {
+                self.complete(operation_id, Err(error));
+                return;
+            }
+        };
         cx.queue_simple_mutation(
             super::SettingsEffectTarget {
                 surface: "settings.copilot-setup",
@@ -854,6 +865,7 @@ impl CopilotSetupState {
                 provider_id,
                 client_operation_id,
                 project_root,
+                expected_request_hash,
             },
         );
         self.outcome = Some(Ok("Copilot setup pending…".into()));
@@ -1877,6 +1889,11 @@ impl SettingsCx {
             .ok_or_else(|| "resolving provider logout workspace: no project context".to_string())?;
         let project_root = super::canonical_project_root(project_root);
         let client_operation_id = uuid::Uuid::new_v4().to_string();
+        let expected_request_hash = super::local_receipt_request_hash(&(
+            "delete_provider_credential",
+            &provider_id,
+            &Some(project_root.clone()),
+        ))?;
         self.queue_simple_mutation(
             super::SettingsEffectTarget {
                 surface: "settings.provider-logout",
@@ -1892,6 +1909,7 @@ impl SettingsCx {
                 provider_id,
                 client_operation_id,
                 project_root,
+                expected_request_hash,
             },
         );
         Ok(())

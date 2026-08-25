@@ -135,6 +135,9 @@ fn settings_cannot_close_or_accept_a_stale_session_completion_while_pending() {
         Request::ListAssistants,
         SettingsMutationAction::ProviderCredentialDelete {
             provider_id: "example".into(),
+            client_operation_id: "test-operation".into(),
+            project_root: "/workspace".into(),
+            expected_request_hash: "00".repeat(32),
         },
     );
     assert!(!settings.handle_key(press(KeyCode::Char('q'))));
@@ -308,6 +311,7 @@ fn injected_settings_transport_uses_production_receipt_and_reconciliation_path()
             Ok(Response::ExtendedConfigSaved {
                 client_operation_id: "fixture-operation".into(),
                 request_hash: "aa".repeat(32),
+                mutation_intent_hash: "bb".repeat(32),
                 hash: "revision-2".into(),
                 config_generation: 8,
                 layer_id: layer_id.into(),
@@ -363,6 +367,7 @@ fn injected_settings_transport_rejects_wrong_consumed_revision() {
             Response::ExtendedConfigSaved {
                 client_operation_id: "fixture-operation".into(),
                 request_hash: "aa".repeat(32),
+                mutation_intent_hash: "bb".repeat(32),
                 hash: "revision-2".into(),
                 config_generation: 8,
                 layer_id: "layer-capability".into(),
@@ -8987,5 +8992,8 @@ fn oauth_and_project_receipts_are_bound_to_exact_authority_targets() {
     assert!(mcp.contains("expected_consumed_revision"));
     assert!(mcp.contains("expected_result_revision"));
     assert!(source.contains("sanitized_intent_hash"));
+    assert!(source.contains("returned_intent_hash == mutation_intent_hash"));
+    assert!(source.contains("mutation_intent_hash == expected_request_hash"));
+    assert!(mcp.contains("expected_request_intent_hash"));
     assert!(source.contains("provider_view_matches_mutation"));
 }

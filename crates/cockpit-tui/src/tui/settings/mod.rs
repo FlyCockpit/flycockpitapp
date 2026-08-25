@@ -694,17 +694,21 @@ pub(crate) async fn execute_settings_daemon_work(
             let expected_layer_id = layer.layer_id.clone();
             let expected_layer_kind = layer.kind;
             let expected_revision = layer.revision.clone();
+            let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+                operations,
+                materialize: true,
+                denylist: Vec::new(),
+                redacted_mutations: Vec::new(),
+            };
+            let expected_intent_hash = patch
+                .sanitized_intent_hash()
+                .map_err(|error| error.to_string())?;
             let response = client
                 .request(Request::ApplyExtendedConfigPatch {
                     client_operation_id: plan.client_operation_id.clone(),
                     project_root: plan.project_root.clone(),
                     layer_id: expected_layer_id.clone(),
-                    patch: cockpit_core::daemon::proto::ExtendedConfigPatch {
-                        operations,
-                        materialize: true,
-                        denylist: Vec::new(),
-                        redacted_mutations: Vec::new(),
-                    },
+                    patch,
                     expected_revision: expected_revision.clone(),
                     snapshot_session_id: plan.snapshot_session_id.clone(),
                 })
@@ -777,6 +781,7 @@ pub(crate) async fn execute_settings_daemon_work(
                 Response::ExtendedConfigSaved {
                     client_operation_id,
                     request_hash,
+                    mutation_intent_hash,
                     hash,
                     layer_id,
                     layer,
@@ -787,6 +792,7 @@ pub(crate) async fn execute_settings_daemon_work(
                     ..
                 } if client_operation_id == plan.client_operation_id
                     && cockpit_proto::is_opaque_authority_token(&request_hash)
+                    && mutation_intent_hash == expected_intent_hash
                     && layer_id == expected_layer_id
                     && layer == expected_layer_kind
                     && consumed_revision == expected_revision
@@ -1115,6 +1121,7 @@ enum PendingSettingsOperation {
         project_root: String,
         snapshot_session_id: String,
         layer_id: String,
+        mutation_intent_hash: String,
         expected_layer: cockpit_core::daemon::proto::CockpitConfigLayer,
         expected_revision: String,
         expected_generation: u64,
@@ -1288,6 +1295,7 @@ enum SettingsMutationAction {
         expected_config_path: String,
         expected_consumed_revision: String,
         expected_result_revision: String,
+        expected_request_intent_hash: String,
     },
     McpOAuthBegin {
         server: String,
@@ -1310,19 +1318,23 @@ enum SettingsMutationAction {
         provider_id: String,
         client_operation_id: String,
         project_root: String,
+        expected_request_hash: String,
     },
     ProviderCredentialPut {
         provider_id: String,
         client_operation_id: String,
+        expected_request_intent_hash: String,
     },
     WebCredentialPut {
         provider_id: String,
         client_operation_id: String,
+        expected_request_intent_hash: String,
     },
     CopilotSetup {
         provider_id: String,
         client_operation_id: String,
         project_root: String,
+        expected_request_hash: String,
     },
     ImageSpendSave {
         client_operation_id: String,
@@ -1472,6 +1484,7 @@ impl SettingsMutationAction {
                     expected_config_path,
                     expected_consumed_revision,
                     expected_result_revision,
+                    expected_request_intent_hash,
                     ..
                 },
                 Response::McpConfigCommitted {
@@ -1482,6 +1495,7 @@ impl SettingsMutationAction {
                     config_path,
                     consumed_revision,
                     result_revision,
+                    mutation_intent_hash,
                     config_generation,
                     ..
                 },
@@ -1492,6 +1506,7 @@ impl SettingsMutationAction {
                     && config_path == expected_config_path
                     && consumed_revision == expected_consumed_revision
                     && result_revision == expected_result_revision
+                    && mutation_intent_hash == expected_request_intent_hash
                     && cockpit_proto::is_opaque_authority_token(request_hash)
                     && *config_generation > 0
             }
@@ -1500,9 +1515,11 @@ impl SettingsMutationAction {
                     provider_id,
                     client_operation_id,
                     project_root,
+                    expected_request_hash,
                 },
                 Response::ProviderCredentialCommitted {
                     client_operation_id: returned_id,
+                    mutation_intent_hash,
                     provider_id: returned_provider,
                     project_root: Some(returned_root),
                     owner_root: Some(owner_root),
@@ -1516,6 +1533,7 @@ impl SettingsMutationAction {
                 },
             ) => {
                 returned_id == client_operation_id
+                    && mutation_intent_hash == expected_request_hash
                     && returned_provider == provider_id
                     && returned_root == project_root
                     && owner_root == project_root
@@ -1531,13 +1549,16 @@ impl SettingsMutationAction {
                 Self::ProviderCredentialPut {
                     provider_id,
                     client_operation_id,
+                    expected_request_intent_hash,
                 }
                 | Self::WebCredentialPut {
                     provider_id,
                     client_operation_id,
+                    expected_request_intent_hash,
                 },
                 Response::ProviderCredentialCommitted {
                     client_operation_id: returned_id,
+                    mutation_intent_hash,
                     provider_id: returned_provider,
                     project_root: None,
                     owner_root: None,
@@ -1551,6 +1572,7 @@ impl SettingsMutationAction {
                 },
             ) => {
                 returned_id == client_operation_id
+                    && mutation_intent_hash == expected_request_intent_hash
                     && returned_provider == provider_id
                     && owner_scope == "global"
                     && *config_generation > 0
@@ -1565,9 +1587,11 @@ impl SettingsMutationAction {
                     provider_id,
                     client_operation_id,
                     project_root,
+                    expected_request_hash,
                 },
                 Response::CopilotAuthCommitted {
                     client_operation_id: returned_id,
+                    mutation_intent_hash,
                     provider_id: returned_provider,
                     project_root: returned_root,
                     owner_root,
@@ -1579,6 +1603,7 @@ impl SettingsMutationAction {
                 },
             ) => {
                 returned_id == client_operation_id
+                    && mutation_intent_hash == expected_request_hash
                     && returned_provider == provider_id
                     && returned_root == project_root
                     && owner_root == project_root
@@ -1625,6 +1650,14 @@ fn settlement_hash_matches(operation: &PendingSettingsOperation, observed: &str)
                 ..
             }
             | SettingsMutationAction::ImageSpendSave {
+                expected_request_hash,
+                ..
+            }
+            | SettingsMutationAction::ProviderCredentialDelete {
+                expected_request_hash,
+                ..
+            }
+            | SettingsMutationAction::CopilotSetup {
                 expected_request_hash,
                 ..
             } => Some(expected_request_hash.as_str()),
@@ -3329,16 +3362,20 @@ impl SettingsCx {
         let requested_path = self.extended_path.display().to_string();
         let snapshot_session_id = settings_snapshot_session_id().to_owned();
         let client_operation_id = uuid::Uuid::new_v4().to_string();
+        let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+            operations: operations.clone(),
+            materialize: false,
+            denylist: denylist.clone(),
+            redacted_mutations: Vec::new(),
+        };
+        let mutation_intent_hash = patch
+            .sanitized_intent_hash()
+            .map_err(|error| error.to_string())?;
         let request = Request::ApplyExtendedConfigPatch {
             client_operation_id: client_operation_id.clone(),
             project_root: project_root.clone(),
             layer_id: layer_id.clone(),
-            patch: cockpit_core::daemon::proto::ExtendedConfigPatch {
-                operations: operations.clone(),
-                materialize: false,
-                denylist: denylist.clone(),
-                redacted_mutations: Vec::new(),
-            },
+            patch,
             expected_revision: expected_revision.clone(),
             snapshot_session_id: snapshot_session_id.clone(),
         };
@@ -3358,7 +3395,6 @@ impl SettingsCx {
                 project_root,
                 snapshot_session_id,
                 layer_id,
-                owner_root,
                 mutation_intent_hash,
                 expected_layer,
                 expected_revision,
@@ -3689,6 +3725,7 @@ impl SettingsCx {
                 project_root,
                 snapshot_session_id,
                 layer_id,
+                mutation_intent_hash,
                 expected_layer,
                 expected_revision,
                 expected_generation,
@@ -3707,6 +3744,7 @@ impl SettingsCx {
                     Ok(Response::ExtendedConfigSaved {
                         client_operation_id: returned_operation_id,
                         request_hash,
+                        mutation_intent_hash: returned_intent_hash,
                         hash,
                         config_generation,
                         layer_id: returned_layer_id,
@@ -3718,6 +3756,7 @@ impl SettingsCx {
                         denylist,
                     }) if returned_operation_id == client_operation_id
                         && cockpit_proto::is_opaque_authority_token(&request_hash)
+                        && returned_intent_hash == mutation_intent_hash
                         && returned_layer_id == layer_id
                         && layer == expected_layer
                         && consumed_revision == expected_revision
@@ -3747,6 +3786,7 @@ impl SettingsCx {
                                     project_root,
                                     snapshot_session_id,
                                     layer_id,
+                                    mutation_intent_hash,
                                     expected_layer,
                                     expected_revision,
                                     expected_generation,
@@ -3919,6 +3959,7 @@ impl SettingsCx {
                             expected_config_path,
                             expected_consumed_revision,
                             expected_result_revision,
+                            expected_request_intent_hash,
                         },
                         Ok(Response::McpConfigCommitted {
                             client_operation_id: returned_operation_id,
@@ -3928,6 +3969,7 @@ impl SettingsCx {
                             config_path,
                             consumed_revision,
                             result_revision,
+                            mutation_intent_hash,
                             config_generation,
                             ..
                         }),
@@ -3937,6 +3979,7 @@ impl SettingsCx {
                         && config_path == expected_config_path
                         && consumed_revision == expected_consumed_revision
                         && result_revision == expected_result_revision
+                        && mutation_intent_hash == expected_request_intent_hash
                         && cockpit_proto::is_opaque_authority_token(&request_hash)
                         && config_generation > 0 =>
                     {
@@ -4027,9 +4070,11 @@ impl SettingsCx {
                             provider_id,
                             client_operation_id,
                             project_root,
+                            expected_request_hash,
                         },
                         Ok(Response::ProviderCredentialCommitted {
                             client_operation_id: returned_operation_id,
+                            mutation_intent_hash,
                             provider_id: returned_provider_id,
                             project_root: Some(returned_root),
                             owner_root: Some(owner_root),
@@ -4042,6 +4087,7 @@ impl SettingsCx {
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
+                        && mutation_intent_hash == expected_request_hash
                         && returned_provider_id == provider_id
                         && returned_root == project_root
                         && owner_root == project_root
@@ -4065,9 +4111,11 @@ impl SettingsCx {
                         SettingsMutationAction::ProviderCredentialPut {
                             provider_id,
                             client_operation_id,
+                            expected_request_intent_hash,
                         },
                         Ok(Response::ProviderCredentialCommitted {
                             client_operation_id: returned_operation_id,
+                            mutation_intent_hash,
                             provider_id: returned_provider_id,
                             project_root: None,
                             owner_root: None,
@@ -4080,6 +4128,7 @@ impl SettingsCx {
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
+                        && mutation_intent_hash == expected_request_intent_hash
                         && returned_provider_id == provider_id
                         && owner_scope == "global"
                         && config_generation > 0
@@ -4101,9 +4150,11 @@ impl SettingsCx {
                         SettingsMutationAction::WebCredentialPut {
                             provider_id,
                             client_operation_id,
+                            expected_request_intent_hash,
                         },
                         Ok(Response::ProviderCredentialCommitted {
                             client_operation_id: returned_operation_id,
+                            mutation_intent_hash,
                             provider_id: returned_provider_id,
                             project_root: None,
                             owner_root: None,
@@ -4116,6 +4167,7 @@ impl SettingsCx {
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
+                        && mutation_intent_hash == expected_request_intent_hash
                         && returned_provider_id == provider_id
                         && owner_scope == "global"
                         && config_generation > 0
@@ -4148,9 +4200,11 @@ impl SettingsCx {
                             provider_id,
                             client_operation_id,
                             project_root,
+                            expected_request_hash,
                         },
                         Ok(Response::CopilotAuthCommitted {
                             client_operation_id: returned_operation_id,
+                            mutation_intent_hash,
                             project_root: returned_root,
                             owner_root,
                             owner_scope,
@@ -4161,6 +4215,7 @@ impl SettingsCx {
                             ..
                         }),
                     ) if returned_operation_id == client_operation_id
+                        && mutation_intent_hash == expected_request_hash
                         && returned_provider_id == provider_id
                         && returned_root == project_root
                         && owner_root == project_root

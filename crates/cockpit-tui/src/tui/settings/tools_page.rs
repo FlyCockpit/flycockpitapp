@@ -452,6 +452,8 @@ impl SettingsCx {
         let provider_id = web_key_provider_id(provider).to_string();
         let record = serde_json::json!({ "api_key": key }).to_string();
         let client_operation_id = uuid::Uuid::new_v4().to_string();
+        let expected_request_intent_hash =
+            super::local_receipt_request_hash(&("put_provider_credential", &provider_id))?;
         self.queue_simple_secret_mutation(
             super::SettingsEffectTarget {
                 surface: "settings.web-credential",
@@ -466,6 +468,7 @@ impl SettingsCx {
             super::SettingsMutationAction::WebCredentialPut {
                 provider_id,
                 client_operation_id,
+                expected_request_intent_hash,
             },
         );
         self.extended_warnings = vec!["saving web credential…".into()];

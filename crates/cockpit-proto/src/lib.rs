@@ -1768,7 +1768,7 @@ pub use event::{
 /// Structured error response. The model and the TUI both render
 /// `message` directly; `code` lets the client branch on
 /// machine-readable kinds without parsing the message.
-#[derive(Debug, Clone, Serialize, Deserialize, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
 #[error("{code}: {message}")]
 pub struct ErrorPayload {
     pub code: ErrorCode,

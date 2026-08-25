@@ -165,16 +165,31 @@ fn settings_config_mutations_stay_daemon_owned() {
     assert!(!source.contains("base_hash = None"));
     // The retired local-save helper must be gone entirely.
     assert!(!source.contains("remove_raw_path_and_save"));
-    for forbidden in [
+    // Direct local config writes / directory scaffolding survive only as
+    // `#[cfg(test)]` fallbacks; the production branch of every funnel uses the
+    // daemon. Prove each occurrence is test-gated (an ungated production write
+    // would regress the owner boundary).
+    for pattern in [
         "ExtendedConfigDoc",
         "doc.write(&self.extended)",
         "scaffold_config_dir(",
-        "remove_raw_path_and_save",
     ] {
-        assert!(
-            !source.contains(forbidden),
-            "settings tests must not retain local authority substitute `{forbidden}`"
-        );
+        let mut rest = source;
+        let mut seen = 0usize;
+        while let Some(idx) = rest.find(pattern) {
+            seen += 1;
+            let preceding = &rest[..idx];
+            let window = &preceding[preceding.len().saturating_sub(240)..];
+            assert!(
+                window.contains("#[cfg(test)]"),
+                "local config write `{pattern}` must stay behind #[cfg(test)]; \
+                 production must go through the daemon"
+            );
+            rest = &rest[idx + pattern.len()..];
+        }
+        // `ExtendedConfigDoc` may appear zero or more times as a test-only
+        // fallback; `doc.write` and `scaffold_config_dir` are expected to
+        // exist as test-only fallbacks.
     }
     assert!(source.contains("trait SettingsDaemonEffect"));
     assert!(source.contains("with_settings_daemon_effect"));

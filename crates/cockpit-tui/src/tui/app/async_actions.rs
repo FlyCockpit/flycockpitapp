@@ -822,6 +822,17 @@ impl App {
     }
 
     pub(super) fn apply_async_action_result(&mut self, result: AsyncActionResult) {
+        if result.presentation_stale && !stale_completion_requires_reducer(&result.kind) {
+            // The runner has consumed the terminal completion and released its
+            // process authority. Nothing in these handlers owns additional
+            // correlated state; running them would only publish output into a
+            // replacement view. Mouse copy is the one presentation-only host
+            // action with a local gesture record to retire.
+            if matches!(result.kind, AsyncActionKind::Blocking("mouse.copy")) {
+                self.pending_mouse_copies.remove(&result.id);
+            }
+            return;
+        }
         // Provisional `/new` owns a cleared view. Only the switch/resume
         // settlement path and outgoing delivery-receipt fence bookkeeping may
         // run; every other completion is presentation noise from the discarded
@@ -2898,6 +2909,50 @@ impl App {
         }
         false
     }
+}
+
+fn stale_completion_requires_reducer(kind: &AsyncActionKind) -> bool {
+    matches!(
+        kind,
+        AsyncActionKind::Blocking(
+            "btw.teardown" | "paste.delivery_receipt" | "queue.edit" | "settings.blocking-effect"
+        ) | AsyncActionKind::DaemonRpc(
+            "assistant.resolve"
+                | "btw.resolve-interrupt"
+                | "fork.create"
+                | "goal-settings.effect"
+                | "mcp.local"
+                | "paste.image_path_admission"
+                | "resources.promote"
+                | "sealed.effect"
+                | "sessions.mutation"
+                | "settings.effect"
+                | "side.discard"
+                | "side.start"
+                | "subagent.steer"
+                | "tools.effect"
+                | "workspace-trust.effect"
+        ) | AsyncActionKind::Internal(
+            "btw.runner.attach"
+                | "leaks.rpc"
+                | "notes.rpc"
+                | "oauth.acknowledge"
+                | "oauth.cancel"
+                | "oauth.codex.begin"
+                | "oauth.codex.poll"
+                | "oauth.grok.begin"
+                | "oauth.grok.complete"
+                | "pins.pin"
+                | "pins.toggle"
+                | "pins.unpin"
+                | "runner.attach"
+                | "session.fork"
+                | "session.resume"
+                | "session.side"
+                | "session.side.return"
+                | "session.switch"
+        )
+    )
 }
 
 #[cfg(test)]

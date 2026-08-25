@@ -842,6 +842,74 @@ fn full_production_tree_rejects_agent_and_config_authority() {
 }
 
 #[test]
+fn filesystem_read_authority_is_explicit_and_path_discovery_is_worker_only() {
+    struct FsReadCalls(Vec<(usize, String)>);
+    impl<'ast> Visit<'ast> for FsReadCalls {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref() {
+                let name = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                if matches!(
+                    name.as_str(),
+                    "fs::read"
+                        | "fs::read_dir"
+                        | "fs::read_to_string"
+                        | "std::fs::read"
+                        | "std::fs::read_dir"
+                        | "std::fs::read_to_string"
+                ) {
+                    self.0.push((call.span().start().line, name));
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+
+    let root = repo_root().join("crates/cockpit-tui/src/tui");
+    let mut actual = Vec::new();
+    fn visit(path: &Path, root: &Path, actual: &mut Vec<(String, String)>) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, root, actual);
+            } else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
+                let source = production_source(&fs::read_to_string(&path).unwrap());
+                let file = syn::parse_file(&source).expect("production source parses");
+                let mut calls = FsReadCalls(Vec::new());
+                calls.visit_file(&file);
+                let relative = path.strip_prefix(root).unwrap().display().to_string();
+                actual.extend(
+                    calls
+                        .0
+                        .into_iter()
+                        .map(|(_, call)| (relative.clone(), call)),
+                );
+            }
+        }
+    }
+    visit(&root, &root, &mut actual);
+    actual.sort();
+    assert_eq!(
+        actual,
+        vec![
+            ("app/panes.rs".into(), "std::fs::read_to_string".into()),
+            ("dir_suggest.rs".into(), "std::fs::read_dir".into()),
+        ],
+        "production filesystem reads require an explicit reviewed exception"
+    );
+    let category = production_source(&read("crates/cockpit-tui/src/tui/settings/category.rs"));
+    let settings = production_source(&read("crates/cockpit-tui/src/tui/settings/mod.rs"));
+    assert!(!category.contains("suggest_paths("));
+    assert!(settings.contains("execute_settings_blocking_work"));
+    assert!(settings.contains("dir_suggest::suggest_paths"));
+}
+
+#[test]
 fn production_process_and_network_authority_is_exactly_allowlisted() {
     const AUTHORITY: &[&str] = &[
         "std::process::Command::new(",

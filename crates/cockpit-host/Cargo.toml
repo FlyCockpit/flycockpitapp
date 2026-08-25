@@ -20,7 +20,9 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "process", "io-util", "time", "sync"] }
+tokio = { workspace = true, features = [
+    "rt-multi-thread", "macros", "process", "io-util", "time", "sync",
+] }
 uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

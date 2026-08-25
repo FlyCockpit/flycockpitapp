@@ -3,8 +3,9 @@ use ratatui::layout::Rect;
 use uuid::Uuid;
 
 use crate::tui::agent_runner::{self, AgentRunner};
-#[cfg(test)]
-use crate::tui::async_action::AsyncActionPayload;
+use crate::tui::async_action::{
+    AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
+};
 use crate::tui::composer::Composer;
 use crate::tui::history::{HistoryEntry, PendingMsg};
 use cockpit_core::daemon::proto::{self, Request, Response};
@@ -14,7 +15,7 @@ use cockpit_core::engine::message::{
 };
 
 use super::{
-    App, FreshQueueAck,
+    App, FreshQueueAck, RunnerAttachContinuation,
     events::{
         reconcile_folded_user_history, reconcile_history_replay,
         remove_correlated_optimistic_user_history,

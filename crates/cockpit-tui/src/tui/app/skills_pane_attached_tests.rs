@@ -66,6 +66,7 @@ fn runner_with_attached_request_tx(
         project_id: "project".to_string(),
         usage: UsageCounts::default(),
         owns_daemon: false,
+        owned_daemon_guard: None,
         socket: PathBuf::from("/tmp/cockpit-test.sock"),
         history: Vec::new(),
         paused_work: Vec::new(),

@@ -363,7 +363,7 @@ pub struct AgentRunner {
     /// Armed while the runner is still a provisional async attach result.
     /// Adoption transfers this guard to `App`; dropping a stale/replaced
     /// result therefore cannot orphan the ephemeral daemon it spawned.
-    owned_daemon_guard: Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard>,
+    pub(crate) owned_daemon_guard: Option<cockpit_core::daemon::ephemeral_guard::EphemeralDaemonGuard>,
     /// The socket of the daemon this runner is attached to. Carried so an
     /// owned ephemeral daemon can be reaped on exit via the guard.
     pub socket: PathBuf,

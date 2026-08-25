@@ -192,7 +192,7 @@ async fn add(args: McpAddArgs) -> Result<()> {
             expected_revision: expected_revision.clone(),
             mutation_intent_hash: mutation_intent_hash.clone(),
             config_json,
-            secret_values_json,
+            secret_values_json: secret_values_json.into(),
             cleanup_names_json,
         })
         .await?

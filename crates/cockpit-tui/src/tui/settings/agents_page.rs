@@ -1268,7 +1268,6 @@ impl AgentsPage {
                 cwd,
                 mutation,
                 expected_revision,
-                expected_config_generation,
                 purpose,
                 querying,
             } => {
@@ -1739,7 +1738,10 @@ impl AgentsPage {
                 querying,
                 response,
             ),
-            PendingAgentOperation::Inventory { .. } | PendingAgentOperation::Assistants { .. } => {}
+            PendingAgentOperation::Inventory { .. }
+            | PendingAgentOperation::Assistants { .. }
+            | PendingAgentOperation::PrepareStaging { .. }
+            | PendingAgentOperation::ReadStaging { .. } => {}
         }
     }
 
@@ -1777,7 +1779,6 @@ impl AgentsPage {
         let draft = ToolSurfaceDraft::from_def(&def);
         self.detail = Some(AgentDetail {
             name: name.clone(),
-            path: PathBuf::from("<daemon-agent-snapshot>"),
             original_text,
             revision: Some(snapshot.revision.clone()),
             def,
@@ -1842,7 +1843,6 @@ impl AgentsPage {
         external: bool,
     ) {
         let name = snapshot.name.clone();
-        let path = cwd.join(".cockpit/agents").join(format!("{name}.md"));
         let authority_id = super::pointer_actions::AgentId::workspace_occurrence(
             &name,
             &snapshot.source_identity,
@@ -1850,7 +1850,6 @@ impl AgentsPage {
         );
         let draft = AgentEditor::new(
             name.clone(),
-            path,
             &snapshot.markdown,
             cx.extended.tui.vim_mode.vim_enabled(),
             Some(snapshot.revision.clone()),
@@ -3483,7 +3482,7 @@ impl SettingsCx {
         let name = row.name.clone();
         let source = row.source.clone();
         let cwd = self.agents_cwd();
-        let (path, original_text, revision) = match &source {
+        let (original_text, revision) = match &source {
             AgentRowSource::Agent { revision, .. } => {
                 let rendered_identity = row_agent_id(&name, &source);
                 p.stage(
@@ -3582,6 +3581,7 @@ impl SettingsCx {
         };
         let name = detail.name.clone();
         let source = detail.source.clone();
+        let expected_revision = detail.revision.clone();
         if let AgentRowSource::Assistant { .. } = &source {
             if !p.has_authoritative_pair() {
                 p.status =
@@ -3595,8 +3595,10 @@ impl SettingsCx {
             let expected_config_generation = p
                 .authority_config_generation
                 .expect("authoritative pair has a configuration generation");
-            let Some(expected_revision) = detail.revision.clone() else {
-                detail.status = Some("save failed: missing assistant revision".into());
+            let Some(expected_revision) = expected_revision else {
+                if let Some(detail) = p.detail.as_mut() {
+                    detail.status = Some("save failed: missing assistant revision".into());
+                }
                 return;
             };
             let cwd = self.agents_cwd();
@@ -3638,7 +3640,7 @@ impl SettingsCx {
                     querying: false,
                 },
             );
-        } else if let Some(revision) = detail.revision.clone() {
+        } else if let Some(revision) = expected_revision {
             let cwd = self.agents_cwd();
             let mutation = cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
                 name,
@@ -3655,7 +3657,9 @@ impl SettingsCx {
                 },
             );
         } else {
-            detail.status = Some("save failed: missing daemon agent revision".into());
+            if let Some(detail) = p.detail.as_mut() {
+                detail.status = Some("save failed: missing daemon agent revision".into());
+            }
             return;
         }
         if let Some(detail) = p.detail.as_mut() {
@@ -5487,16 +5491,19 @@ pub(super) mod tests {
             vnext_workspace_agent("pointer-agent", "pointer fixture", "Xbody")
         );
         assert!(page_mut(&mut dialog).take_external_edit_request().is_none());
-        let cwd = dialog.cx.agents_cwd();
-        page_mut(&mut dialog).reduce_external_edit_result(
-            &cwd,
-            operation,
-            super::super::pointer_actions::AgentsAction::ExternalEditResult(
-                super::super::pointer_actions::AgentId::workspace("replacement-agent"),
-                super::super::pointer_actions::ExternalEditOutcome::Saved,
-            ),
-            None,
-        );
+        {
+            let SettingsDialog { page, cx, .. } = &mut *dialog;
+            let page = page.downcast_mut::<AgentsPage>().unwrap();
+            page.reduce_external_edit_result(
+                cx,
+                operation,
+                super::super::pointer_actions::AgentsAction::ExternalEditResult(
+                    super::super::pointer_actions::AgentId::workspace("replacement-agent"),
+                    super::super::pointer_actions::ExternalEditOutcome::Saved,
+                ),
+                None,
+            );
+        }
         assert!(
             page(&dialog).pending_external_edit.is_some(),
             "stale stable identity is inert"

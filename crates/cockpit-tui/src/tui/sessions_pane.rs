@@ -963,8 +963,16 @@ impl SessionsPane {
             .current()
             .cards
             .get(self.current().list.cursor())
-            .and_then(|(_, status)| *status)
-            .is_some_and(|(jobs, processing)| jobs || processing);
+            .is_some_and(|(_, status)| {
+                matches!(
+                    status,
+                    Tier::ActiveSchedules
+                        | Tier::ToolRunning
+                        | Tier::InferenceInProgress
+                        | Tier::Interrupted
+                        | Tier::Processing
+                )
+            });
         let Some(s) = self.selected().cloned() else {
             return;
         };

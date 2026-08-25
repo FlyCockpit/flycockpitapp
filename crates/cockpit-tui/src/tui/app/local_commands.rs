@@ -1481,8 +1481,8 @@ impl App {
                 );
             }
             McpLocalPhase::Refresh {
-                snapshot_session_id,
-                result_revision,
+                ref snapshot_session_id,
+                ref result_revision,
                 config_generation,
             } => {
                 let cockpit_core::daemon::proto::Response::ProviderCatalogSnapshot {
@@ -1499,7 +1499,7 @@ impl App {
                     self.retry_mcp_refresh(pending);
                     return;
                 };
-                if returned_session_id != snapshot_session_id
+                if returned_session_id != snapshot_session_id.as_str()
                     || returned_generation < config_generation
                 {
                     self.push_plain(

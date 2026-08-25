@@ -232,7 +232,7 @@ async fn list() -> Result<()> {
         .context("requesting assistant list from daemon")?
         .map_err(|error| anyhow::anyhow!("daemon rejected assistant list: {error}"))?;
     let assistants = match response {
-        Response::Assistants { assistants } => assistants,
+        Response::Assistants { assistants, .. } => assistants,
         other => bail!("daemon returned unexpected response to assistant list: {other:?}"),
     };
     if assistants.is_empty() {

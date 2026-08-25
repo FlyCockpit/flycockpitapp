@@ -136,18 +136,34 @@ pub(crate) struct TypedDocumentEditPlan {
     snapshot_session_id: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct SettingsDaemonWorkOutcome {
+    pub(crate) response: Result<Response, String>,
+    pub(crate) committed_refresh_needed: Option<CommittedRefreshNeeded>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CommittedRefreshNeeded {
+    pub(crate) result_revision: String,
+    pub(crate) config_generation: u64,
+    pub(crate) warning: String,
+}
+
 pub(crate) async fn execute_settings_daemon_work(
     work: SettingsDaemonEffectWork,
-) -> Result<Response, String> {
+) -> Result<SettingsDaemonWorkOutcome, String> {
     let client = settings_daemon_client()
         .await
         .map_err(|error| error.to_string())?;
     match work {
-        SettingsDaemonEffectWork::Request(request) => client
-            .request(request)
-            .await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.to_string()),
+        SettingsDaemonEffectWork::Request(request) => Ok(SettingsDaemonWorkOutcome {
+            response: client
+                .request(request)
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string()),
+            committed_refresh_needed: None,
+        }),
         SettingsDaemonEffectWork::ProviderMutation(plan) => {
             let mut final_response = None;
             for (provider_id, entry, header_secrets) in plan.saves {
@@ -203,7 +219,11 @@ pub(crate) async fn execute_settings_daemon_work(
                 }
                 final_response = Some(response);
             }
-            final_response.ok_or_else(|| "provider mutation contained no changes".to_string())
+            Ok(SettingsDaemonWorkOutcome {
+                response: final_response
+                    .ok_or_else(|| "provider mutation contained no changes".to_string()),
+                committed_refresh_needed: None,
+            })
         }
         SettingsDaemonEffectWork::TypedDocumentEdit(plan) => {
             let snapshot = client
@@ -253,7 +273,7 @@ pub(crate) async fn execute_settings_daemon_work(
                 .await
                 .map_err(|error| error.to_string())?
                 .map_err(|error| error.to_string())?;
-            let result_revision = match response {
+            let (result_revision, result_generation) = match response {
                 Response::ExtendedConfigSaved {
                     hash,
                     layer_id,
@@ -261,6 +281,7 @@ pub(crate) async fn execute_settings_daemon_work(
                     consumed_revision,
                     result_revision,
                     status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+                    config_generation,
                     ..
                 } if layer_id == expected_layer_id
                     && layer == expected_layer_kind
@@ -268,7 +289,7 @@ pub(crate) async fn execute_settings_daemon_work(
                     && hash == result_revision
                     && cockpit_proto::is_opaque_authority_token(&result_revision) =>
                 {
-                    result_revision
+                    (result_revision, config_generation)
                 }
                 other => return Err(format!("unexpected typed-edit commit response: {other:?}")),
             };
@@ -278,22 +299,32 @@ pub(crate) async fn execute_settings_daemon_work(
                     snapshot_session_id: plan.snapshot_session_id,
                 })
                 .await
-                .map_err(|error| error.to_string())?
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())
+                .and_then(|response| response.map_err(|error| error.to_string()));
             match &refreshed {
-                Response::ExtendedConfigSnapshot { layers, .. }
+                Ok(Response::ExtendedConfigSnapshot { layers, .. })
                     if layers.iter().any(|layer| {
                         layer.display_path == plan.requested_path
                             && layer.layer_id == expected_layer_id
                             && layer.revision == result_revision
                     }) =>
                 {
-                    Ok(refreshed)
+                    Ok(SettingsDaemonWorkOutcome {
+                        response: refreshed,
+                        committed_refresh_needed: None,
+                    })
                 }
-                _ => Err(
-                    "typed settings edit committed, but authoritative refresh did not reconcile"
-                        .into(),
-                ),
+                _ => Ok(SettingsDaemonWorkOutcome {
+                    response: Err(
+                        "typed settings edit committed, but authoritative refresh did not reconcile"
+                            .into(),
+                    ),
+                    committed_refresh_needed: Some(CommittedRefreshNeeded {
+                        result_revision,
+                        config_generation: result_generation,
+                        warning: "settings committed, but the authoritative refresh did not reconcile; reload before editing again".into(),
+                    }),
+                }),
             }
         }
     }
@@ -312,6 +343,7 @@ pub(crate) struct SettingsDaemonEffectCompletion {
     pub(crate) operation_id: uuid::Uuid,
     pub(crate) target: SettingsEffectTarget,
     pub(crate) response: Result<Response, String>,
+    pub(crate) committed_refresh_needed: Option<CommittedRefreshNeeded>,
 }
 
 /// Run a short daemon RPC from an input reducer. Production reducers execute
@@ -567,6 +599,7 @@ enum PendingSettingsOperation {
         denylist_plan: Vec<cockpit_core::daemon::proto::DesiredDenylistEntry>,
     },
     ExtendedRefresh {
+        target: SettingsEffectTarget,
         requested_path: String,
         expected_layer: cockpit_core::daemon::proto::CockpitConfigLayer,
         result_revision: String,
@@ -602,6 +635,51 @@ enum PendingSettingsOperation {
         requested_path: String,
         action: TypedDocumentEditAction,
     },
+}
+
+impl PendingSettingsOperation {
+    fn target_matches(&self, actual: &SettingsEffectTarget) -> bool {
+        let expected = match self {
+            Self::ExtendedLoad {
+                requested_path,
+                snapshot_session_id,
+                ..
+            } => SettingsEffectTarget {
+                surface: "settings.extended-load",
+                owner: requested_path.clone(),
+                revision: Some(snapshot_session_id.clone()),
+            },
+            Self::ExtendedSave {
+                layer_id,
+                expected_revision,
+                ..
+            } => SettingsEffectTarget {
+                surface: "settings.extended-save",
+                owner: layer_id.clone(),
+                revision: Some(expected_revision.clone()),
+            },
+            Self::ExtendedRefresh { target, .. }
+            | Self::ProjectShadowSnapshot { target, .. }
+            | Self::ProviderMutation { target, .. }
+            | Self::Followup { target, .. }
+            | Self::SimpleMutation { target, .. }
+            | Self::TypedDocumentEdit { target, .. } => target.clone(),
+            Self::ProviderCatalog {
+                project_root,
+                provider_id,
+                ..
+            } => SettingsEffectTarget {
+                surface: "settings.provider-catalog",
+                owner: format!(
+                    "{}::{}",
+                    project_root,
+                    provider_id.as_deref().unwrap_or("*")
+                ),
+                revision: None,
+            },
+        };
+        expected == *actual
+    }
 }
 
 #[derive(Clone)]
@@ -1746,6 +1824,10 @@ pub struct SettingsCx {
 }
 
 impl SettingsCx {
+    fn authority_operation_pending(&self) -> bool {
+        !self.pending_settings.is_empty() || !self.daemon_effects.is_empty()
+    }
+
     fn enqueue_daemon_effect(
         &mut self,
         target: SettingsEffectTarget,
@@ -2023,6 +2105,15 @@ impl SettingsCx {
         let Some(pending) = self.pending_settings.remove(&completion.operation_id) else {
             return Err(completion);
         };
+        if !pending.target_matches(&completion.target) {
+            self.extended_warnings = vec![format!(
+                "ignored mismatched settings receipt for operation {}",
+                completion.operation_id
+            )];
+            self.pending_settings
+                .insert(completion.operation_id, pending);
+            return Ok(());
+        }
         match pending {
             PendingSettingsOperation::ExtendedLoad {
                 requested_path,
@@ -2212,12 +2303,13 @@ impl SettingsCx {
                         PendingSettingsOperation::Followup { label, target },
                     );
                 }
+                let refresh_target = SettingsEffectTarget {
+                    surface: "settings.extended-refresh",
+                    owner: layer_id,
+                    revision: Some(result_revision.clone()),
+                };
                 let operation_id = self.enqueue_daemon_effect(
-                    SettingsEffectTarget {
-                        surface: "settings.extended-refresh",
-                        owner: layer_id,
-                        revision: Some(result_revision.clone()),
-                    },
+                    refresh_target.clone(),
                     Request::GetExtendedConfigSnapshot {
                         project_root,
                         snapshot_session_id,
@@ -2226,6 +2318,7 @@ impl SettingsCx {
                 self.pending_settings.insert(
                     operation_id,
                     PendingSettingsOperation::ExtendedRefresh {
+                        target: refresh_target,
                         requested_path,
                         expected_layer,
                         result_revision,
@@ -2238,6 +2331,7 @@ impl SettingsCx {
                 self.extended_warnings = vec!["settings committed; reconciling…".into()];
             }
             PendingSettingsOperation::ExtendedRefresh {
+                target: _,
                 requested_path,
                 expected_layer,
                 result_revision,
@@ -2386,6 +2480,14 @@ impl SettingsCx {
                 action,
             } => {
                 if completion.target != target {
+                    return Ok(());
+                }
+                if let Some(committed) = completion.committed_refresh_needed {
+                    self.extended_revision = None;
+                    self.extended_warnings = vec![format!(
+                        "{} (committed revision {}, generation {}); reload before editing again",
+                        committed.warning, committed.result_revision, committed.config_generation
+                    )];
                     return Ok(());
                 }
                 match completion.response {
@@ -3762,6 +3864,9 @@ impl SettingsDialog {
                         prompt.setting.descriptor().label
                     ));
                 }
+                if let Some(McpPage::List(state)) = self.page.downcast_mut::<McpPage>() {
+                    self.cx.adopt_pending_mcp_oauth(state);
+                }
                 return;
             }
             Err(completion) => completion,
@@ -4464,6 +4569,13 @@ impl SettingsDialog {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if self.cx.authority_operation_pending() {
+            self.cx.extended_warnings = vec![
+                "Waiting for the daemon to settle this settings operation; navigation is disabled."
+                    .into(),
+            ];
+            return false;
+        }
         // Tab / Shift+Tab move between fields like ↓/↑ across settings
         // screens. Editors that own Tab themselves opt out through page state.
         let key = if self.in_header_editor() || self.in_pkg_dir_autosuggest() {
@@ -4480,6 +4592,13 @@ impl SettingsDialog {
     }
 
     fn handle_pointer(&mut self, mouse: MouseEvent) -> SettingsPointerOutcome {
+        if self.cx.authority_operation_pending() && !matches!(mouse.kind, MouseEventKind::Moved) {
+            self.cx.extended_warnings = vec![
+                "Waiting for the daemon to settle this settings operation; controls are disabled."
+                    .into(),
+            ];
+            return SettingsPointerOutcome::Consumed;
+        }
         let Some(area) = self.pointer_surface.area.get() else {
             return SettingsPointerOutcome::Consumed;
         };
@@ -4633,6 +4752,13 @@ impl SettingsDialog {
         column: u16,
         row: u16,
     ) -> SettingsPointerOutcome {
+        if self.cx.authority_operation_pending() {
+            self.cx.extended_warnings = vec![
+                "Waiting for the daemon to settle this settings operation; controls are disabled."
+                    .into(),
+            ];
+            return SettingsPointerOutcome::Consumed;
+        }
         match dispatch {
             crate::tui::button::ButtonDispatch::SettingsHeader(SettingsHeaderAction::Close) => {
                 SettingsPointerOutcome::Close

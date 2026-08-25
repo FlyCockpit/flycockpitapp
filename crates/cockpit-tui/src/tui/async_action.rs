@@ -61,6 +61,7 @@ pub enum AsyncActionPayload {
     #[allow(dead_code)]
     DaemonResponse(Box<cockpit_core::daemon::proto::Response>),
     Sessions(Vec<cockpit_core::daemon::proto::SessionSummary>),
+    SessionsMutation(crate::tui::sessions_pane::SessionsMutationCompletion),
     SessionMessages {
         session_id: uuid::Uuid,
         before_seq: Option<i64>,

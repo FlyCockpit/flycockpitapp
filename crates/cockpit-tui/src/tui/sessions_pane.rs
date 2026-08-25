@@ -247,7 +247,35 @@ pub enum SessionsOutcome {
     },
     /// Execute a daemon-owned archive/delete/unarchive mutation without
     /// waiting in the input reducer, then reload this browser level.
-    Mutate(cockpit_core::daemon::proto::Request),
+    Mutate(SessionsMutationEffect),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionsMutationTarget {
+    pub(crate) session_id: Uuid,
+    pub(crate) kind: &'static str,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionsMutationEffect {
+    pub(crate) pane_id: Uuid,
+    pub(crate) operation_id: Uuid,
+    pub(crate) target: SessionsMutationTarget,
+    pub(crate) request: cockpit_core::daemon::proto::Request,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionsMutationCompletion {
+    pub(crate) pane_id: Uuid,
+    pub(crate) operation_id: Uuid,
+    pub(crate) target: SessionsMutationTarget,
+    pub(crate) response: Result<cockpit_core::daemon::proto::Response, String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingSessionsMutation {
+    operation_id: Uuid,
+    target: SessionsMutationTarget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,6 +363,7 @@ struct CardHit {
 }
 
 pub struct SessionsPane {
+    pane_id: Uuid,
     /// Resolved current-project id, or `None` when the cwd couldn't be
     /// resolved. When `None` the scope is pinned to `All`.
     project_id: Option<String>,
@@ -378,6 +407,7 @@ pub struct SessionsPane {
     last_card_click: Option<(usize, std::time::Instant)>,
     confirm_buttons: crate::tui::button::ButtonRegistry,
     pointer_capture: bool,
+    pending_mutation: Option<PendingSessionsMutation>,
 }
 
 impl SessionsPane {
@@ -446,6 +476,7 @@ impl SessionsPane {
             Scope::All
         };
         let mut pane = Self {
+            pane_id: Uuid::new_v4(),
             project_id,
             scope,
             show_archived: false,
@@ -472,6 +503,7 @@ impl SessionsPane {
             last_card_click: None,
             confirm_buttons: crate::tui::button::ButtonRegistry::default(),
             pointer_capture: false,
+            pending_mutation: None,
         };
         if daemon_connected {
             pane.loading = Some("Loading sessions...");
@@ -807,6 +839,13 @@ impl SessionsPane {
     /// otherwise (the pane stays open). Always consumed by `App` so
     /// nothing leaks to the composer (the modal rule).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<SessionsOutcome> {
+        if self.pending_mutation.is_some() {
+            self.notice = Some(
+                "Waiting for the daemon to settle the session change; this browser cannot close yet."
+                    .to_string(),
+            );
+            return None;
+        }
         // The confirm sub-dialog owns input while open.
         if matches!(self.step, Step::Confirm { .. }) {
             return self.handle_confirm_key(key);
@@ -1075,7 +1114,14 @@ impl SessionsPane {
         };
         self.step = Step::Browse;
         self.error = None;
-        Some(SessionsOutcome::Mutate(req))
+        let kind = match choice {
+            ConfirmChoice::Archive => "archive",
+            ConfirmChoice::Delete => "delete",
+            ConfirmChoice::Cancel => unreachable!("cancel returned before request construction"),
+        };
+        Some(SessionsOutcome::Mutate(
+            self.begin_mutation(session_id, kind, req),
+        ))
     }
 
     fn unarchive_selected(&mut self) -> Option<SessionsOutcome> {
@@ -1087,16 +1133,70 @@ impl SessionsPane {
         let s = self.selected().cloned()?;
         s.archived_at?;
         self.error = None;
-        Some(SessionsOutcome::Mutate(
+        Some(SessionsOutcome::Mutate(self.begin_mutation(
+            s.session_id,
+            "unarchive",
             cockpit_core::daemon::proto::Request::UnarchiveSession {
                 session_id: s.session_id,
             },
-        ))
+        )))
     }
 
-    pub(crate) fn apply_mutation_result(&mut self, result: Result<(), String>) {
-        self.error = result.err();
-        self.reload_current_level();
+    fn begin_mutation(
+        &mut self,
+        session_id: Uuid,
+        kind: &'static str,
+        request: cockpit_core::daemon::proto::Request,
+    ) -> SessionsMutationEffect {
+        let operation_id = Uuid::new_v4();
+        let target = SessionsMutationTarget { session_id, kind };
+        self.pending_mutation = Some(PendingSessionsMutation {
+            operation_id,
+            target: target.clone(),
+        });
+        self.notice = Some(format!("{kind} pending…"));
+        SessionsMutationEffect {
+            pane_id: self.pane_id,
+            operation_id,
+            target,
+            request,
+        }
+    }
+
+    pub(crate) fn apply_mutation_completion(
+        &mut self,
+        completion: SessionsMutationCompletion,
+    ) -> bool {
+        let Some(pending) = self.pending_mutation.as_ref() else {
+            return false;
+        };
+        if completion.pane_id != self.pane_id
+            || completion.operation_id != pending.operation_id
+            || completion.target != pending.target
+        {
+            self.error = Some("ignored a mismatched session mutation receipt".to_string());
+            return false;
+        }
+        self.pending_mutation = None;
+        match completion.response {
+            Ok(cockpit_core::daemon::proto::Response::Ack) => {
+                self.error = None;
+                self.notice = Some(format!("{} committed", completion.target.kind));
+                self.reload_current_level();
+                true
+            }
+            Ok(other) => {
+                self.error = Some(format!(
+                    "unexpected {} receipt: {other:?}",
+                    completion.target.kind
+                ));
+                false
+            }
+            Err(error) => {
+                self.error = Some(format!("{} failed: {error}", completion.target.kind));
+                false
+            }
+        }
     }
 
     /// Mouse-wheel scroll (one row).
@@ -1176,6 +1276,13 @@ impl SessionsPane {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<SessionsOutcome> {
+        if self.pending_mutation.is_some() {
+            self.notice = Some(
+                "Waiting for the daemon to settle the session change; controls are disabled."
+                    .to_string(),
+            );
+            return None;
+        }
         if matches!(self.step, Step::Confirm { .. })
             && matches!(
                 mouse.kind,
@@ -3189,6 +3296,7 @@ mod tests {
     /// mode. No daemon/DB interaction either way (the level is seeded).
     fn test_pane_mode(cards: Vec<(SessionSummary, Tier)>, daemon_connected: bool) -> SessionsPane {
         SessionsPane {
+            pane_id: Uuid::new_v4(),
             project_id: Some("pid".into()),
             scope: Scope::Project,
             show_archived: false,
@@ -3220,6 +3328,7 @@ mod tests {
             last_card_click: None,
             confirm_buttons: crate::tui::button::ButtonRegistry::default(),
             pointer_capture: false,
+            pending_mutation: None,
         }
     }
 

@@ -233,7 +233,7 @@ impl App {
             AsyncActionKind::DaemonRpc("goal-settings.effect"),
             AsyncActionPolicy::AllowConcurrent,
             async move {
-                async {
+                let response = async {
                     let client = crate::tui::settings::settings_daemon_client()
                         .await
                         .map_err(|error| error.to_string())?;
@@ -308,13 +308,18 @@ impl App {
                 AsyncActionKind::DaemonRpc("settings.effect"),
                 AsyncActionPolicy::AllowConcurrent,
                 async move {
-                    let response = crate::tui::settings::execute_settings_daemon_work(work).await;
+                    let outcome = crate::tui::settings::execute_settings_daemon_work(work).await;
+                    let (response, committed_refresh_needed) = match outcome {
+                        Ok(outcome) => (outcome.response, outcome.committed_refresh_needed),
+                        Err(error) => (Err(error), None),
+                    };
                     Ok(AsyncActionPayload::SettingsDaemon(
                         crate::tui::settings::SettingsDaemonEffectCompletion {
                             dialog_id,
                             operation_id,
                             target,
                             response,
+                            committed_refresh_needed,
                         },
                     ))
                 },
@@ -324,11 +329,15 @@ impl App {
 
     pub(super) fn start_sessions_mutation_action(
         &mut self,
-        request: cockpit_core::daemon::proto::Request,
+        effect: crate::tui::sessions_pane::SessionsMutationEffect,
     ) {
+        let pane_id = effect.pane_id;
+        let operation_id = effect.operation_id;
+        let target = effect.target;
+        let request = effect.request;
         self.async_actions.start(
             AsyncActionKind::DaemonRpc("sessions.mutation"),
-            AsyncActionPolicy::Dedupe(AsyncActionKey::new("sessions.mutation")),
+            AsyncActionPolicy::AllowConcurrent,
             async move {
                 let response = async {
                     let client = crate::tui::settings::settings_daemon_client()
@@ -340,8 +349,15 @@ impl App {
                         .map_err(|error| error.to_string())?
                         .map_err(|error| error.to_string())
                 }
-                .await?;
-                Ok(AsyncActionPayload::Text(String::new()))
+                .await;
+                Ok(AsyncActionPayload::SessionsMutation(
+                    crate::tui::sessions_pane::SessionsMutationCompletion {
+                        pane_id,
+                        operation_id,
+                        target,
+                        response,
+                    },
+                ))
             },
         );
     }
@@ -374,11 +390,11 @@ impl App {
                 }
             }
             AsyncActionKind::DaemonRpc("sessions.mutation") => {
-                let mutation = result.payload.map(|_| ());
                 let mut reload = false;
-                if let Overlay::Sessions(pane) = &mut self.overlay {
-                    pane.apply_mutation_result(mutation);
-                    reload = true;
+                if let Ok(AsyncActionPayload::SessionsMutation(completion)) = result.payload
+                    && let Overlay::Sessions(pane) = &mut self.overlay
+                {
+                    reload = pane.apply_mutation_completion(completion);
                 }
                 if reload {
                     self.start_sessions_list_action();

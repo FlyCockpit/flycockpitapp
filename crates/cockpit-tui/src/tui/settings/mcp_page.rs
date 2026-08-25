@@ -356,7 +356,7 @@ impl SettingsCx {
         Ok(())
     }
 
-    fn handle_mcp_list_key(&mut self, key: KeyEvent, s: &mut ListState) -> Nav {
+    pub(super) fn adopt_pending_mcp_oauth(&mut self, s: &mut ListState) {
         if let Some(completion) = self.pending_mcp_oauth.take() {
             match completion {
                 super::PendingMcpOAuth::Started {
@@ -395,6 +395,10 @@ impl SettingsCx {
                 }
             }
         }
+    }
+
+    fn handle_mcp_list_key(&mut self, key: KeyEvent, s: &mut ListState) -> Nav {
+        self.adopt_pending_mcp_oauth(s);
         let cfg = self.load_mcp();
         let names: Vec<String> = cfg.servers.keys().cloned().collect();
         let row_count = names.len() + 1; // + [+ add server]

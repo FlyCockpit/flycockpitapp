@@ -147,6 +147,7 @@ fn settings_cannot_close_or_accept_a_stale_session_completion_while_pending() {
         operation_id,
         target,
         response: Ok(Response::Ack),
+        authoritative_rejection: false,
         committed_refresh_needed: None,
     });
     let Dialog::Settings(settings) = &dialog else {

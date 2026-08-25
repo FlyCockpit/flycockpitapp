@@ -505,12 +505,12 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::AgentEditSnapshot(snapshot) => {
             scrub_agent_edit_snapshot(snapshot, redact);
         }
-        proto::Response::AgentMutated(result)
-        | proto::Response::AgentEditorLeaseCompleted(result) => {
+        proto::Response::AgentMutated(result) => {
             if let Some(snapshot) = &mut result.snapshot {
                 scrub_agent_edit_snapshot(snapshot, redact);
             }
         }
+        proto::Response::AgentEditorLeaseCompleted(_) => {}
         proto::Response::AgentEditorLeaseBegun(lease) => {
             scrub_agent_edit_snapshot(&mut lease.snapshot, redact);
         }
@@ -1646,12 +1646,12 @@ fn finalize_response_projections(response: &mut proto::Response) {
             }
         }
         proto::Response::AgentEditSnapshot(value) => agent(value),
-        proto::Response::AgentMutated(result)
-        | proto::Response::AgentEditorLeaseCompleted(result) => {
+        proto::Response::AgentMutated(result) => {
             if let Some(value) = &mut result.snapshot {
                 agent(value);
             }
         }
+        proto::Response::AgentEditorLeaseCompleted(_) => {}
         proto::Response::AgentEditorLeaseBegun(lease) => agent(&mut lease.snapshot),
         _ => {}
     }
@@ -5631,11 +5631,34 @@ fn local_authority_response_within_bounds(response: &proto::Response) -> bool {
                 && entries.iter().all(inventory_entry)
         }
         proto::Response::AgentEditSnapshot(value) => agent_snapshot(value),
-        proto::Response::AgentMutated(result)
-        | proto::Response::AgentEditorLeaseCompleted(result) => {
+        proto::Response::AgentMutated(result) => {
             result.snapshot.as_ref().is_none_or(agent_snapshot)
         }
-        proto::Response::AgentEditorLeaseBegun(lease) => agent_snapshot(&lease.snapshot),
+        proto::Response::AgentEditorLeaseCompleted(result) => {
+            proto::is_opaque_authority_token(&result.consumed_revision)
+                && result.client_operation_id.len() <= 128
+                && result.lease_id.len() <= 128
+                && result.agent_name.len() <= proto::MAX_AGENT_NAME_BYTES
+                && result.project_root.len() <= proto::MAX_OWNER_PROJECT_ROOT_BYTES
+                && match &result.status {
+                    proto::AgentEditorSettlementStatus::Saved {
+                        result_revision, ..
+                    } => proto::is_opaque_authority_token(result_revision),
+                    proto::AgentEditorSettlementStatus::Rejected { error } => {
+                        error.message.len() <= proto::MAX_AGENT_METADATA_BYTES
+                    }
+                    proto::AgentEditorSettlementStatus::NotStarted
+                    | proto::AgentEditorSettlementStatus::Pending
+                    | proto::AgentEditorSettlementStatus::Cancelled => true,
+                }
+        }
+        proto::Response::AgentEditorLeaseBegun(lease) => {
+            !lease.client_operation_id.is_empty()
+                && lease.client_operation_id.len() <= 128
+                && !lease.lease_id.is_empty()
+                && lease.lease_id.len() <= 128
+                && agent_snapshot(&lease.snapshot)
+        }
         _ => true,
     }
 }

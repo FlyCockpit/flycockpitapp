@@ -11195,7 +11195,9 @@ fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
     assert!(source.contains("SealedEditorReplay"));
     assert!(source.contains("SecretVaultKind::SealedState"));
     assert!(source.contains("mutate_item_on_conn"));
-    assert!(source.contains("receipt_result.snapshot = None"));
+    assert!(source.contains("AgentEditorSettlementStatus"));
+    assert!(source.contains("flycockpit.agent-editor.completion.v2"));
+    assert!(source.contains("editor_lease_settlement"));
     assert!(
         !source.contains("snapshot_json"),
         "agent editor plaintext must never be assigned to a SQLite row"
@@ -11208,8 +11210,10 @@ fn editor_lease_replay_is_sealed_and_terminal_receipts_are_document_free() {
         .expect("agent editor lease schema must exist");
     assert!(lease_table.contains("snapshot_handle"));
     assert!(lease_table.contains("snapshot_identity"));
+    assert!(lease_table.contains("completion_operation_id"));
     assert!(!lease_table.contains("snapshot_digest"));
     assert!(!lease_table.contains("snapshot_json"));
+    assert!(!lease_table.contains("markdown"));
 }
 
 #[test]

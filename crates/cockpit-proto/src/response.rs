@@ -729,7 +729,7 @@ pub enum Response {
 
     AgentEditorLeaseBegun(crate::AgentEditorLease),
 
-    AgentEditorLeaseCompleted(crate::AgentMutationResult),
+    AgentEditorLeaseCompleted(crate::AgentEditorCompletion),
 
     /// Safe outcome of a daemon-owned setup wizard mutation.
     SetupWizardApplied {

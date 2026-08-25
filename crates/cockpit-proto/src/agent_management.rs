@@ -165,9 +165,79 @@ pub enum AgentMutationOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEditorLease {
+    pub client_operation_id: String,
     pub lease_id: String,
     pub expires_at_unix_ms: i64,
     pub snapshot: AgentEditSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEditorCompletion {
+    pub client_operation_id: String,
+    pub project_root: String,
+    pub agent_name: String,
+    pub lease_id: String,
+    pub consumed_revision: String,
+    pub status: AgentEditorSettlementStatus,
+}
+
+/// Durable state of one exact external-editor settlement operation. The
+/// receipt intentionally carries no markdown or editable snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AgentEditorSettlementStatus {
+    /// The daemon has not reserved this operation yet. The client may submit
+    /// the original completion again with the same operation id.
+    NotStarted,
+    /// The exact operation is durably reserved by an executor. Query again;
+    /// never create a replacement operation while this state is visible.
+    Pending,
+    Saved {
+        result_revision: String,
+        outcome: AgentMutationOutcome,
+    },
+    Cancelled,
+    Rejected {
+        error: crate::ErrorPayload,
+    },
+}
+
+pub fn validate_agent_editor_completion(
+    receipt: &AgentEditorCompletion,
+    expected_client_operation_id: &str,
+    expected_project_root: &str,
+    expected_agent_name: &str,
+    expected_lease_id: &str,
+    expected_consumed_revision: &str,
+) -> Result<(), &'static str> {
+    if receipt.client_operation_id != expected_client_operation_id {
+        return Err("editor settlement is bound to the wrong client operation");
+    }
+    if receipt.project_root != expected_project_root
+        || receipt.agent_name != expected_agent_name
+        || receipt.lease_id != expected_lease_id
+    {
+        return Err("editor settlement is bound to the wrong domain target");
+    }
+    if receipt.consumed_revision != expected_consumed_revision
+        || !crate::is_opaque_authority_token(&receipt.consumed_revision)
+    {
+        return Err("editor settlement consumed the wrong revision");
+    }
+    match &receipt.status {
+        AgentEditorSettlementStatus::Saved {
+            result_revision, ..
+        } if !crate::is_opaque_authority_token(result_revision) => {
+            Err("editor settlement returned a malformed result revision")
+        }
+        AgentEditorSettlementStatus::Rejected { error }
+            if error.message.trim().is_empty()
+                || error.message.len() > MAX_AGENT_METADATA_BYTES =>
+        {
+            Err("editor settlement returned an invalid rejection")
+        }
+        _ => Ok(()),
+    }
 }
 
 pub fn validate_agent_mutation_envelope(

@@ -39,11 +39,12 @@ pub use agent_installation::{
     AgentInstallationSubmitChoiceV1, AgentInstallationUnmatchedRecommendationV1,
 };
 pub use agent_management::{
-    AgentEditSnapshot, AgentEditorLease, AgentEntryKind, AgentInventoryEntry, AgentMutation,
-    AgentMutationOutcome, AgentMutationResult, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES,
-    MAX_AGENT_NAME_BYTES, MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES,
-    MAX_ASSISTANT_HOME_BYTES, agent_edit_projection_digest,
-    agent_inventory_entry_projection_digest, validate_agent_edit_snapshot,
+    AgentEditSnapshot, AgentEditorCompletion, AgentEditorLease, AgentEditorSettlementStatus,
+    AgentEntryKind, AgentInventoryEntry, AgentMutation, AgentMutationOutcome, AgentMutationResult,
+    MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
+    MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES, MAX_ASSISTANT_HOME_BYTES,
+    agent_edit_projection_digest, agent_inventory_entry_projection_digest,
+    validate_agent_edit_snapshot, validate_agent_editor_completion,
     validate_agent_mutation_envelope, validate_agent_source_identity,
     validate_goal_supervision_projection,
 };
@@ -1027,11 +1028,12 @@ impl fmt::Debug for StoredFlycockpitCredential {
 
 /// Current wire schema version. v17 adds explicit, owner-scoped provider OAuth
 /// cancellation so local frontends can terminally settle timed-out or dismissed
-/// daemon-owned PKCE/device flows.
+/// daemon-owned PKCE/device flows. It also adds correlated durable configuration
+/// receipts and operation-bound external-editor settlement/status receipts.
 pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Oldest wire schema version this binary accepts. v17 is current-only: the
-/// provider OAuth lifecycle change has no safe compatibility fallback.
+/// authority lifecycle changes have no safe compatibility fallback.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 17;
 
 /// Version string the daemon advertises to clients on attach/status.
@@ -3235,7 +3237,10 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "complete_mcp_oauth"
                 | "cancel_mcp_oauth"
                 | "put_subscription_ack"
-                | "apply_provider_mutation" => 17,
+                | "apply_provider_mutation"
+                | "begin_agent_editor_lease"
+                | "complete_agent_editor_lease"
+                | "get_agent_editor_lease_settlement" => 17,
                 "cancel_leak_reveal" => 16,
                 "get_provider_catalog_snapshot" => 15,
                 "list_secret_inventory"
@@ -3259,8 +3264,6 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "get_agent_inventory"
                 | "get_agent_edit_snapshot"
                 | "mutate_agent"
-                | "begin_agent_editor_lease"
-                | "complete_agent_editor_lease"
                 | "get_extended_config_snapshot"
                 | "apply_extended_config_patch"
                 | "save_extended_config"
@@ -3336,7 +3339,9 @@ fn body_required_protocol_version(body: &Body) -> (u32, &'static str) {
                 | "copilot_auth_committed"
                 | "mcp_config_committed"
                 | "provider_catalog_snapshot"
-                | "provider_mutation_committed" => 17,
+                | "provider_mutation_committed"
+                | "agent_editor_lease_begun"
+                | "agent_editor_lease_completed" => 17,
                 "leak_reveal_cancelled" => 16,
                 "flycockpit_org_sync"
                 | "provider_models_fetched"
@@ -6826,6 +6831,23 @@ mod tests {
                 project_root: "/tmp/project".into(),
                 provider_id: "copilot".into(),
             },
+            Request::BeginAgentEditorLease {
+                client_operation_id: "begin-editor".into(),
+                project_root: "/tmp/project".into(),
+                name: "build".into(),
+                expected_revision: "00".repeat(32),
+            },
+            Request::CompleteAgentEditorLease {
+                client_operation_id: "complete-editor".into(),
+                project_root: "/tmp/project".into(),
+                lease_id: Uuid::nil().to_string(),
+                markdown: None,
+            },
+            Request::GetAgentEditorLeaseSettlement {
+                client_operation_id: "complete-editor".into(),
+                project_root: "/tmp/project".into(),
+                lease_id: Uuid::nil().to_string(),
+            },
         ] {
             assert_eq!(
                 body_required_protocol_version(&Body::Request {
@@ -7446,7 +7468,7 @@ mod tests {
             "reconciled"
         );
         assert_eq!(
-            fixture["agent_editor_lease_completed"]["data"]["outcome"]["status"],
+            fixture["agent_editor_lease_completed"]["data"]["status"]["outcome"]["status"],
             "reconciled"
         );
     }
@@ -7499,6 +7521,34 @@ mod tests {
         assert_eq!(receipt["request_hash"].as_str().map(str::len), Some(64));
         let mcp = &responses["mcp_config_committed"]["data"];
         assert_eq!(mcp["request_hash"].as_str().map(str::len), Some(64));
+    }
+
+    #[test]
+    fn editor_v17_settlement_is_correlated_and_document_free() {
+        let requests = proto_fixture_tests::read_fixture("request.json");
+        for tag in [
+            "complete_agent_editor_lease",
+            "get_agent_editor_lease_settlement",
+        ] {
+            assert!(requests[tag]["params"]["client_operation_id"].is_string());
+            assert!(requests[tag]["params"]["lease_id"].is_string());
+        }
+        assert!(
+            requests["get_agent_editor_lease_settlement"]["params"]
+                .get("markdown")
+                .is_none()
+        );
+
+        let responses = proto_fixture_tests::read_fixture("response.json");
+        let begun = &responses["agent_editor_lease_begun"]["data"];
+        assert!(begun["client_operation_id"].is_string());
+        let receipt = &responses["agent_editor_lease_completed"]["data"];
+        assert!(receipt["client_operation_id"].is_string());
+        assert!(receipt["lease_id"].is_string());
+        assert!(receipt["consumed_revision"].is_string());
+        assert!(receipt["status"]["result_revision"].is_string());
+        assert!(receipt.get("markdown").is_none());
+        assert!(receipt.get("snapshot").is_none());
     }
 
     #[test]

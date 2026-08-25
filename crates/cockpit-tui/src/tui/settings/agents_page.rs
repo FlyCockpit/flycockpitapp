@@ -155,6 +155,7 @@ enum PendingAgentOperation {
         detail: Option<String>,
     },
     CompleteLease {
+        client_operation_id: String,
         cwd: PathBuf,
         name: String,
         lease_id: String,
@@ -163,6 +164,7 @@ enum PendingAgentOperation {
         draft: Option<AgentEditor>,
         detail: Option<String>,
         outcome: super::pointer_actions::ExternalEditOutcome,
+        querying: bool,
     },
 }
 
@@ -441,6 +443,7 @@ impl AgentsPage {
                 self.status = Some("retrying editor lease acquisition…".into());
             }
             PendingAgentOperation::CompleteLease {
+                client_operation_id,
                 cwd,
                 name,
                 lease_id,
@@ -449,6 +452,7 @@ impl AgentsPage {
                 draft,
                 detail,
                 outcome,
+                querying: _,
             } => {
                 self.stage(
                     cx,
@@ -457,12 +461,13 @@ impl AgentsPage {
                         owner: format!("{}::{lease_id}", cwd.display()),
                         revision: Some(consumed_revision.clone()),
                     },
-                    cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+                    cockpit_core::daemon::proto::Request::GetAgentEditorLeaseSettlement {
+                        client_operation_id: client_operation_id.clone(),
                         project_root: cwd.to_string_lossy().into_owned(),
                         lease_id: lease_id.clone(),
-                        markdown: markdown.clone(),
                     },
                     PendingAgentOperation::CompleteLease {
+                        client_operation_id,
                         cwd,
                         name,
                         lease_id,
@@ -471,6 +476,7 @@ impl AgentsPage {
                         draft,
                         detail,
                         outcome,
+                        querying: true,
                     },
                 );
                 self.status = Some("retrying editor lease settlement…".into());
@@ -523,6 +529,7 @@ impl AgentsPage {
         let Some(pending) = self.pending_daemon.remove(&completion.operation_id) else {
             return;
         };
+        let authoritative_rejection = completion.authoritative_rejection;
         let cwd = cx.agents_cwd();
         let project_root = cwd.to_string_lossy();
         let target_matches = match &pending {
@@ -1070,9 +1077,11 @@ impl AgentsPage {
                 expected_revision,
                 authority_id,
                 draft,
+                authoritative_rejection,
                 response,
             ),
             PendingAgentOperation::CompleteLease {
+                client_operation_id,
                 cwd,
                 name,
                 lease_id,
@@ -1081,8 +1090,10 @@ impl AgentsPage {
                 mut draft,
                 detail,
                 outcome,
+                querying,
             } => self.apply_complete_lease(
                 cx,
+                client_operation_id,
                 cwd,
                 name,
                 lease_id,
@@ -1091,6 +1102,8 @@ impl AgentsPage {
                 &mut draft,
                 detail,
                 outcome,
+                querying,
+                authoritative_rejection,
                 response,
             ),
             PendingAgentOperation::Inventory { .. } | PendingAgentOperation::Assistants { .. } => {}
@@ -1239,6 +1252,7 @@ impl AgentsPage {
         expected_revision: String,
         authority_id: super::pointer_actions::AgentId,
         draft: AgentEditor,
+        authoritative_rejection: bool,
         response: Result<cockpit_core::daemon::proto::Response, String>,
     ) {
         let lease = match response {
@@ -1259,6 +1273,13 @@ impl AgentsPage {
                 return;
             }
             Err(error) => {
+                if authoritative_rejection {
+                    self.editing = Some(draft);
+                    self.status = Some(format!(
+                        "daemon rejected external editor lease acquisition: {error}"
+                    ));
+                    return;
+                }
                 self.uncertain_editor_settlement =
                     Some(Box::new(PendingAgentOperation::BeginLease {
                         client_operation_id,
@@ -1274,7 +1295,9 @@ impl AgentsPage {
                 return;
             }
         };
-        if uuid::Uuid::parse_str(&lease.lease_id).is_err() {
+        if lease.client_operation_id != client_operation_id
+            || uuid::Uuid::parse_str(&lease.lease_id).is_err()
+        {
             self.uncertain_editor_settlement = Some(Box::new(PendingAgentOperation::BeginLease {
                 client_operation_id,
                 cwd,
@@ -1355,6 +1378,7 @@ impl AgentsPage {
         draft: AgentEditor,
         detail: String,
     ) {
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
         self.stage(
             cx,
             super::SettingsEffectTarget {
@@ -1363,11 +1387,13 @@ impl AgentsPage {
                 revision: Some(consumed_revision.clone()),
             },
             cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+                client_operation_id: client_operation_id.clone(),
                 project_root: cwd.to_string_lossy().into_owned(),
                 lease_id: lease_id.clone(),
                 markdown: None,
             },
             PendingAgentOperation::CompleteLease {
+                client_operation_id,
                 cwd,
                 name,
                 lease_id,
@@ -1376,6 +1402,7 @@ impl AgentsPage {
                 draft: Some(draft),
                 detail: Some(detail),
                 outcome: super::pointer_actions::ExternalEditOutcome::Failed,
+                querying: false,
             },
         );
         self.status = Some("external editor setup failed; cancelling daemon lease…".into());
@@ -1385,6 +1412,7 @@ impl AgentsPage {
     fn apply_complete_lease(
         &mut self,
         cx: &mut SettingsCx,
+        client_operation_id: String,
         cwd: PathBuf,
         name: String,
         lease_id: String,
@@ -1393,126 +1421,166 @@ impl AgentsPage {
         draft: &mut Option<AgentEditor>,
         detail: Option<String>,
         outcome: super::pointer_actions::ExternalEditOutcome,
+        querying: bool,
+        authoritative_rejection: bool,
         response: Result<cockpit_core::daemon::proto::Response, String>,
     ) {
         self.uncertain_editor_settlement = None;
-        if matches!(outcome, super::pointer_actions::ExternalEditOutcome::Saved) {
-            let Some(markdown) = markdown else {
-                self.editing = draft.take();
-                self.status = Some("external editor returned no recovery draft".into());
-                return;
-            };
-            let mutation = cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
-                name: name.clone(),
-                markdown: markdown.clone(),
-            };
-            let result = response.and_then(|response| match response {
-                cockpit_core::daemon::proto::Response::AgentEditorLeaseCompleted(result) => {
-                    validate_agent_mutation_result(
-                        &result,
-                        &cwd,
-                        &mutation,
-                        Some(&consumed_revision),
-                        Some(&lease_id),
-                    )?;
-                    result
-                        .snapshot
-                        .ok_or_else(|| "daemon omitted completed editor identity".into())
-                }
-                other => Err(format!("unexpected editor completion response: {other:?}")),
-            });
-            match result {
-                Ok(snapshot) => {
-                    self.status = Some(match detail {
-                        Some(detail) => format!("saved `{}`; {detail}", snapshot.name),
-                        None => format!("saved `{}`", snapshot.name),
-                    });
-                    self.queue_load(cx);
-                }
-                Err(error) => {
-                    if let Some(editor) = draft.as_mut() {
-                        editor.replace_with_recovery_text(&markdown);
-                    }
-                    self.uncertain_editor_settlement =
-                        Some(Box::new(PendingAgentOperation::CompleteLease {
-                            cwd,
-                            name,
-                            lease_id,
-                            consumed_revision,
-                            markdown: Some(markdown),
-                            draft: draft.take(),
-                            detail,
-                            outcome,
-                        }));
-                    self.status = Some(format!(
-                        "external edit commit settlement is unknown: {error}; press Enter to query/retry"
-                    ));
-                }
+        let expected_saved = matches!(outcome, super::pointer_actions::ExternalEditOutcome::Saved);
+        let receipt = match response {
+            Ok(cockpit_core::daemon::proto::Response::AgentEditorLeaseCompleted(receipt))
+                if cockpit_proto::validate_agent_editor_completion(
+                    &receipt,
+                    &client_operation_id,
+                    cwd.to_string_lossy().as_ref(),
+                    &name,
+                    &lease_id,
+                    &consumed_revision,
+                )
+                .is_ok() =>
+            {
+                receipt
             }
-        } else {
-            // Cancellation is acknowledged only by the daemon response. A
-            // transport failure is not described as a rejected mutation; the
-            // recovery draft remains available because the lease may still be
-            // live server-side.
-            match response {
-                Ok(cockpit_core::daemon::proto::Response::AgentEditorLeaseCompleted(result))
-                    if cockpit_proto::validate_agent_mutation_envelope(
-                        &result,
-                        Some(&consumed_revision),
-                        Some(&lease_id),
-                        false,
-                    )
-                    .is_ok()
-                        && !result.changed
-                        && result.affected == 0
-                        && result.snapshot.is_none()
-                        && matches!(
-                            result.outcome,
-                            cockpit_core::daemon::proto::AgentMutationOutcome::Reconciled
-                        ) =>
+            Err(error) if authoritative_rejection => {
+                if let Some(markdown) = markdown.as_deref()
+                    && let Some(editor) = draft.as_mut()
                 {
-                    self.status = Some(detail.unwrap_or_else(|| match outcome {
-                        super::pointer_actions::ExternalEditOutcome::Cancelled => {
-                            "external edit cancelled".into()
-                        }
-                        _ => "external edit failed".into(),
-                    }));
+                    editor.replace_with_recovery_text(markdown);
                 }
-                Ok(other) => {
-                    self.uncertain_editor_settlement =
-                        Some(Box::new(PendingAgentOperation::CompleteLease {
-                            cwd,
-                            name,
-                            lease_id,
-                            consumed_revision,
-                            markdown: None,
-                            draft: draft.take(),
-                            detail,
-                            outcome,
-                        }));
-                    self.status = Some(format!(
-                        "editor lease settlement is unknown after an unexpected response: {other:?}; press Enter to query/retry"
-                    ))
-                }
-                Err(error) => {
-                    self.uncertain_editor_settlement =
-                        Some(Box::new(PendingAgentOperation::CompleteLease {
-                            cwd,
-                            name,
-                            lease_id,
-                            consumed_revision,
-                            markdown: None,
-                            draft: draft.take(),
-                            detail,
-                            outcome,
-                        }));
-                    self.status = Some(format!(
-                        "editor lease settlement uncertain: {error}; press Enter to query/retry"
-                    ))
-                }
-            }
-            if self.uncertain_editor_settlement.is_none() {
                 self.editing = draft.take();
+                self.status = Some(format!("daemon rejected editor settlement: {error}"));
+                return;
+            }
+            other => {
+                if let Some(markdown) = markdown.as_deref()
+                    && let Some(editor) = draft.as_mut()
+                {
+                    editor.replace_with_recovery_text(markdown);
+                }
+                self.uncertain_editor_settlement =
+                    Some(Box::new(PendingAgentOperation::CompleteLease {
+                        client_operation_id,
+                        cwd,
+                        name,
+                        lease_id,
+                        consumed_revision,
+                        markdown,
+                        draft: draft.take(),
+                        detail,
+                        outcome,
+                        querying,
+                    }));
+                self.status = Some(format!(
+                    "editor lease settlement is unknown after {other:?}; press Enter to query/retry"
+                ));
+                return;
+            }
+        };
+        match receipt.status {
+            cockpit_core::daemon::proto::AgentEditorSettlementStatus::NotStarted if querying => {
+                self.stage(
+                    cx,
+                    super::SettingsEffectTarget {
+                        surface: "agents.editor-lease-complete",
+                        owner: format!("{}::{lease_id}", cwd.display()),
+                        revision: Some(consumed_revision.clone()),
+                    },
+                    cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+                        client_operation_id: client_operation_id.clone(),
+                        project_root: cwd.to_string_lossy().into_owned(),
+                        lease_id: lease_id.clone(),
+                        markdown: markdown.clone(),
+                    },
+                    PendingAgentOperation::CompleteLease {
+                        client_operation_id,
+                        cwd,
+                        name,
+                        lease_id,
+                        consumed_revision,
+                        markdown,
+                        draft: draft.take(),
+                        detail,
+                        outcome,
+                        querying: false,
+                    },
+                );
+                self.status = Some("retrying exact editor lease settlement…".into());
+            }
+            cockpit_core::daemon::proto::AgentEditorSettlementStatus::Pending
+            | cockpit_core::daemon::proto::AgentEditorSettlementStatus::NotStarted => {
+                self.uncertain_editor_settlement =
+                    Some(Box::new(PendingAgentOperation::CompleteLease {
+                        client_operation_id,
+                        cwd,
+                        name,
+                        lease_id,
+                        consumed_revision,
+                        markdown,
+                        draft: draft.take(),
+                        detail,
+                        outcome,
+                        querying: true,
+                    }));
+                self.status = Some(
+                    "editor lease settlement is still pending; press Enter to query again".into(),
+                );
+            }
+            cockpit_core::daemon::proto::AgentEditorSettlementStatus::Rejected { error } => {
+                if let Some(markdown) = markdown.as_deref()
+                    && let Some(editor) = draft.as_mut()
+                {
+                    editor.replace_with_recovery_text(markdown);
+                }
+                self.editing = draft.take();
+                self.status = Some(format!(
+                    "daemon authoritatively rejected editor settlement: {}",
+                    error.message
+                ));
+            }
+            cockpit_core::daemon::proto::AgentEditorSettlementStatus::Cancelled
+                if !expected_saved =>
+            {
+                self.editing = draft.take();
+                self.status = Some(detail.unwrap_or_else(|| match outcome {
+                    super::pointer_actions::ExternalEditOutcome::Cancelled => {
+                        "external edit cancelled".into()
+                    }
+                    _ => "external edit failed".into(),
+                }));
+            }
+            cockpit_core::daemon::proto::AgentEditorSettlementStatus::Saved {
+                result_revision,
+                outcome: commit_outcome,
+            } if expected_saved && cockpit_proto::is_opaque_authority_token(&result_revision) => {
+                self.status = Some(match (detail, commit_outcome) {
+                    (Some(detail), _) => format!("saved `{name}`; {detail}"),
+                    (
+                        None,
+                        cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                            warning,
+                        },
+                    ) => format!("saved `{name}`; {warning}"),
+                    _ => format!("saved `{name}`"),
+                });
+                self.queue_load(cx);
+            }
+            other => {
+                self.uncertain_editor_settlement =
+                    Some(Box::new(PendingAgentOperation::CompleteLease {
+                        client_operation_id,
+                        cwd,
+                        name,
+                        lease_id,
+                        consumed_revision,
+                        markdown,
+                        draft: draft.take(),
+                        detail,
+                        outcome,
+                        querying: true,
+                    }));
+                self.status = Some(format!(
+                    "daemon returned a mismatched editor settlement status {other:?}; press Enter to query again"
+                ));
             }
         }
     }
@@ -1768,6 +1836,7 @@ impl AgentsPage {
             ),
         };
         let cwd = cx.agents_cwd();
+        let client_operation_id = uuid::Uuid::new_v4().to_string();
         self.stage(
             cx,
             super::SettingsEffectTarget {
@@ -1776,11 +1845,13 @@ impl AgentsPage {
                 revision: Some(consumed_revision.clone()),
             },
             cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+                client_operation_id: client_operation_id.clone(),
                 project_root: cwd.to_string_lossy().into_owned(),
                 lease_id: lease_id.clone(),
                 markdown: markdown.clone(),
             },
             PendingAgentOperation::CompleteLease {
+                client_operation_id,
                 cwd,
                 name: pending.agent.name().to_string(),
                 lease_id,
@@ -1789,6 +1860,7 @@ impl AgentsPage {
                 draft: pending.draft.take(),
                 detail: settled_detail,
                 outcome: settled_outcome,
+                querying: false,
             },
         );
         self.status = Some("settling external editor lease…".into());

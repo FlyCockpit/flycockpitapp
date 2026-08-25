@@ -6,8 +6,9 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::daemon::proto::{
-    AgentEditSnapshot, AgentEditTarget, AgentEditorLease, AgentEntryKind, AgentInventoryEntry,
-    AgentMutation, AgentMutationResult, AgentSourceLayer, ErrorCode, ErrorPayload, Response,
+    AgentEditSnapshot, AgentEditTarget, AgentEditorCompletion, AgentEditorLease,
+    AgentEditorSettlementStatus, AgentEntryKind, AgentInventoryEntry, AgentMutation,
+    AgentMutationResult, AgentSourceLayer, ErrorCode, ErrorPayload, Response,
 };
 use crate::daemon::server::DaemonContext;
 
@@ -90,11 +91,23 @@ async fn delete_editor_replay_and_row(
 
 async fn terminalize_editor_failure(
     ctx: &DaemonContext,
-    lease_id: String,
+    row: &crate::db::agent_editor_leases::AgentEditorLeaseRow,
+    project_root: &str,
     completion_identity: [u8; 32],
     error: &ErrorPayload,
-) -> Result<(), ErrorPayload> {
-    let terminal_error_json = serde_json::to_string(error).map_err(internal)?;
+) -> Result<AgentEditorCompletion, ErrorPayload> {
+    let error = safe_editor_rejection(error);
+    let receipt = editor_completion(
+        row,
+        row.completion_operation_id
+            .as_deref()
+            .ok_or_else(|| internal("editor failure omitted its client operation identity"))?,
+        project_root,
+        AgentEditorSettlementStatus::Rejected { error },
+    );
+    let terminal_error_json = serde_json::to_string(&receipt).map_err(internal)?;
+    let completion_operation_id = receipt.client_operation_id.clone();
+    let lease_id = row.lease_id.clone();
     let replay_handle = editor_replay_handle(&lease_id);
     let vault = ctx.secret_vault.clone();
     ctx.db
@@ -111,11 +124,13 @@ async fn terminalize_editor_failure(
                 conn,
                 &lease_id,
                 completion_identity,
+                &completion_operation_id,
                 &terminal_error_json,
             )
         })
         .await
-        .map_err(internal)
+        .map_err(internal)?;
+    Ok(receipt)
 }
 
 async fn clear_editor_replay_after_reservation(
@@ -151,9 +166,9 @@ async fn clear_editor_replay_after_reservation(
 }
 
 /// Boot/periodic maintenance for abandoned editor authority. Expired open
-/// leases and their sealed payloads disappear atomically. A completing claim
-/// whose executor vanished is terminalized after the bounded claim interval so
-/// it cannot remain permanently fenced or repeat an ambiguous mutation.
+/// leases and their sealed payloads disappear atomically. Completing claims
+/// remain durable across restart: after the bounded claim interval, the exact
+/// operation may resubmit its original content and reconcile the filesystem.
 pub(crate) async fn maintain_editor_leases(ctx: &DaemonContext) -> Result<(), ErrorPayload> {
     let expired = ctx
         .db
@@ -162,22 +177,6 @@ pub(crate) async fn maintain_editor_leases(ctx: &DaemonContext) -> Result<(), Er
         .map_err(internal)?;
     for row in expired {
         delete_editor_replay_and_row(ctx, row).await?;
-    }
-    let cutoff = chrono::Utc::now()
-        .timestamp_millis()
-        .saturating_sub(crate::db::agent_editor_leases::AGENT_EDITOR_COMPLETION_CLAIM_MS);
-    let abandoned = ctx
-        .db
-        .abandoned_agent_editor_completions(cutoff)
-        .await
-        .map_err(internal)?;
-    for row in abandoned {
-        let Some(identity) = row.completion_identity else {
-            return Err(internal("completing editor lease omitted its identity"));
-        };
-        let error =
-            internal("editor completion executor was interrupted; start a new editor handoff");
-        terminalize_editor_failure(ctx, row.lease_id, identity, &error).await?;
     }
     Ok(())
 }
@@ -267,6 +266,7 @@ pub async fn begin_editor_lease(
         }
         let snapshot = load_editor_replay(ctx, &existing)?;
         return Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
+            client_operation_id: existing.client_operation_id,
             lease_id: existing.lease_id,
             expires_at_unix_ms: existing.expires_at_unix_ms,
             snapshot,
@@ -304,6 +304,7 @@ pub async fn begin_editor_lease(
     let snapshot_handle = editor_replay_handle(&lease_id);
     let replay_owner = principal_digest.clone();
     let replay_operation = client_operation_id.clone();
+    let response_operation = client_operation_id.clone();
     let replay_root = root_text.clone();
     let replay_name = name.clone();
     let replay_revision = expected_revision.clone();
@@ -318,6 +319,7 @@ pub async fn begin_editor_lease(
         snapshot_identity,
         state: "open".into(),
         completion_identity: None,
+        completion_operation_id: None,
         terminal_result_json: None,
         terminal_error_json: None,
         expires_at_unix_ms,
@@ -368,6 +370,7 @@ pub async fn begin_editor_lease(
             }
             let snapshot = load_editor_replay(ctx, &existing)?;
             return Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
+                client_operation_id: existing.client_operation_id,
                 lease_id: existing.lease_id,
                 expires_at_unix_ms: existing.expires_at_unix_ms,
                 snapshot,
@@ -376,6 +379,7 @@ pub async fn begin_editor_lease(
         return Err(internal(insert_error));
     }
     Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
+        client_operation_id: response_operation,
         lease_id,
         expires_at_unix_ms,
         snapshot,
@@ -384,6 +388,7 @@ pub async fn begin_editor_lease(
 
 pub async fn complete_editor_lease(
     ctx: &DaemonContext,
+    client_operation_id: String,
     project_root: String,
     lease_id: String,
     markdown: Option<String>,
@@ -391,17 +396,18 @@ pub async fn complete_editor_lease(
 ) -> Result<Response, ErrorPayload> {
     let root = trusted_root(ctx, &project_root).await?;
     Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
-    let completion_plaintext = zeroize::Zeroizing::new(match markdown.as_deref() {
-        Some(value) => {
-            let mut input = Vec::with_capacity(value.len() + 1);
-            input.push(1);
-            input.extend_from_slice(value.as_bytes());
-            input
-        }
-        None => vec![0],
-    });
+    let completion_plaintext = zeroize::Zeroizing::new(
+        serde_json::to_vec(&(
+            "complete_agent_editor_lease",
+            &client_operation_id,
+            &project_root,
+            &lease_id,
+            markdown.as_deref(),
+        ))
+        .map_err(internal)?,
+    );
     let completion_identity = ctx.secret_vault.keyed_identity(
-        b"flycockpit.agent-editor.completion.v1",
+        b"flycockpit.agent-editor.completion.v2",
         completion_plaintext.as_slice(),
     );
     let known_lease = ctx
@@ -436,28 +442,44 @@ pub async fn complete_editor_lease(
             lease_id.clone(),
             principal_digest.clone(),
             completion_identity,
+            client_operation_id.clone(),
         )
         .await
         .map_err(|error| conflict(error.to_string()))?;
     let lease = match lease {
         crate::db::agent_editor_leases::AgentEditorCompletionClaim::Execute(lease) => lease,
         crate::db::agent_editor_leases::AgentEditorCompletionClaim::Pending => {
-            return Err(conflict(
-                "an exact editor completion is already executing; retry to query its durable result",
-            ));
+            return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
+                &known_lease,
+                &client_operation_id,
+                &project_root,
+                AgentEditorSettlementStatus::Pending,
+            )));
         }
         crate::db::agent_editor_leases::AgentEditorCompletionClaim::Terminal(lease) => lease,
     };
-    if let Some(json) = lease.terminal_result_json {
-        let result = serde_json::from_str(&json).map_err(internal)?;
+    if let Some(json) = lease.terminal_result_json.as_deref() {
+        let result: AgentEditorCompletion = serde_json::from_str(&json).map_err(internal)?;
         return Ok(Response::AgentEditorLeaseCompleted(result));
     }
-    if let Some(json) = lease.terminal_error_json {
-        return Err(serde_json::from_str(&json).map_err(internal)?);
+    if let Some(json) = lease.terminal_error_json.as_deref() {
+        let result: AgentEditorCompletion = serde_json::from_str(&json).map_err(internal)?;
+        return Ok(Response::AgentEditorLeaseCompleted(result));
     }
-    clear_editor_replay_after_reservation(ctx, &lease_id, completion_identity).await?;
+    if clear_editor_replay_after_reservation(ctx, &lease_id, completion_identity)
+        .await
+        .is_err()
+    {
+        return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
+            &lease,
+            &client_operation_id,
+            &project_root,
+            AgentEditorSettlementStatus::Pending,
+        )));
+    }
     let completed_lease_id = lease_id.clone();
     let consumed_lease_revision = lease.consumed_revision.clone();
+    let is_save = markdown.is_some();
     let result = match markdown {
         Some(markdown) => {
             // A prior daemon may have committed the file and crashed before
@@ -474,8 +496,15 @@ pub async fn complete_editor_lease(
             {
                 Ok(current) => current,
                 Err(error) => {
-                    terminalize_editor_failure(ctx, lease_id, completion_identity, &error).await?;
-                    return Err(error);
+                    let receipt = terminalize_editor_failure(
+                        ctx,
+                        &lease,
+                        &project_root,
+                        completion_identity,
+                        &error,
+                    )
+                    .await?;
+                    return Ok(Response::AgentEditorLeaseCompleted(receipt));
                 }
             };
             if current.markdown == markdown {
@@ -491,14 +520,19 @@ pub async fn complete_editor_lease(
                     outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
                 })
             } else {
+                let agent_name = lease.agent_name.clone();
+                let consumed_revision = lease.consumed_revision.clone();
+                let submitted_markdown = markdown.clone();
+                let reconcile_root = root.clone();
+                let reconcile_name = agent_name.clone();
                 match tokio::task::spawn_blocking(move || {
                     mutate_sync(
                         &root,
                         AgentMutation::SaveDefinition {
-                            name: lease.agent_name,
+                            name: agent_name,
                             markdown,
                         },
-                        Some(lease.consumed_revision),
+                        Some(consumed_revision),
                     )
                 })
                 .await
@@ -507,9 +541,36 @@ pub async fn complete_editor_lease(
                 {
                     Ok(result) => result,
                     Err(error) => {
-                        terminalize_editor_failure(ctx, lease_id, completion_identity, &error)
+                        let reconciled = tokio::task::spawn_blocking(move || {
+                            snapshot_sync(&reconcile_root, &reconcile_name)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .filter(|snapshot| snapshot.markdown == submitted_markdown);
+                        if let Some(snapshot) = reconciled {
+                            Response::AgentMutated(AgentMutationResult {
+                                changed: true,
+                                affected: 1,
+                                snapshot: Some(snapshot),
+                                config_generation:
+                                    crate::daemon::server::inventory::current_config_generation(),
+                                inventory_revision: None,
+                                consumed_revision: Some(consumed_lease_revision.clone()),
+                                completed_lease_id: None,
+                                outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
+                            })
+                        } else {
+                            let receipt = terminalize_editor_failure(
+                                ctx,
+                                &lease,
+                                &project_root,
+                                completion_identity,
+                                &error,
+                            )
                             .await?;
-                        return Err(error);
+                            return Ok(Response::AgentEditorLeaseCompleted(receipt));
+                        }
                     }
                 }
             }
@@ -529,20 +590,50 @@ pub async fn complete_editor_lease(
         unreachable!("agent mutation always returns AgentMutated")
     };
     result.completed_lease_id = Some(completed_lease_id);
-    // Durable settlement is a metadata receipt, not another copy of the agent
-    // document. A replay can refresh the authoritative snapshot separately.
-    let mut receipt_result = result.clone();
-    receipt_result.snapshot = None;
-    let result_json = match serde_json::to_string(&receipt_result) {
+    let status = if is_save {
+        let Some(result_revision) = result
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.revision.clone())
+        else {
+            return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
+                &lease,
+                &client_operation_id,
+                &project_root,
+                AgentEditorSettlementStatus::Pending,
+            )));
+        };
+        AgentEditorSettlementStatus::Saved {
+            result_revision,
+            outcome: result.outcome.clone(),
+        }
+    } else {
+        AgentEditorSettlementStatus::Cancelled
+    };
+    // Durable settlement is a typed metadata receipt, not another copy of the
+    // agent document. A replay can refresh the authoritative snapshot.
+    let receipt = editor_completion(&lease, &client_operation_id, &project_root, status);
+    let result_json = match serde_json::to_string(&receipt) {
         Ok(json) => json,
         Err(error) => {
             let error = internal(error);
-            terminalize_editor_failure(ctx, lease_id, completion_identity, &error).await?;
-            return Err(error);
+            if let Ok(receipt) =
+                terminalize_editor_failure(ctx, &lease, &project_root, completion_identity, &error)
+                    .await
+            {
+                return Ok(Response::AgentEditorLeaseCompleted(receipt));
+            }
+            return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
+                &lease,
+                &client_operation_id,
+                &project_root,
+                AgentEditorSettlementStatus::Pending,
+            )));
         }
     };
     let vault = ctx.secret_vault.clone();
     let replay_handle = editor_replay_handle(&lease_id);
+    let settlement_operation_id = client_operation_id.clone();
     if let Err(error) = ctx
         .db
         .transaction(move |conn| {
@@ -558,6 +649,7 @@ pub async fn complete_editor_lease(
                 conn,
                 &lease_id,
                 completion_identity,
+                &settlement_operation_id,
                 &result_json,
             )
         })
@@ -566,9 +658,105 @@ pub async fn complete_editor_lease(
         // The filesystem mutation may already be durable. Leave the exact
         // completion identity claimed so retry/restart reconciliation checks
         // authoritative content rather than reporting a false failure.
-        return Err(internal(error));
+        tracing::warn!(error = %error, "editor settlement receipt persistence is unresolved");
+        return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
+            &lease,
+            &client_operation_id,
+            &project_root,
+            AgentEditorSettlementStatus::Pending,
+        )));
     }
-    Ok(Response::AgentEditorLeaseCompleted(result))
+    Ok(Response::AgentEditorLeaseCompleted(receipt))
+}
+
+pub async fn editor_lease_settlement(
+    ctx: &DaemonContext,
+    client_operation_id: String,
+    project_root: String,
+    lease_id: String,
+    principal_digest: String,
+) -> Result<Response, ErrorPayload> {
+    let root = trusted_root(ctx, &project_root).await?;
+    Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
+    let row = ctx
+        .db
+        .agent_editor_lease_by_id(lease_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| conflict("editor lease is absent or expired"))?;
+    if row.owner_digest != principal_digest {
+        return Err(ErrorPayload {
+            code: ErrorCode::Authorization,
+            message: "agent editor lease belongs to another client principal".into(),
+        });
+    }
+    if row.project_root != root.to_string_lossy() {
+        return Err(bad_request("editor lease belongs to another workspace"));
+    }
+    let status = match row.completion_operation_id.as_deref() {
+        None => AgentEditorSettlementStatus::NotStarted,
+        Some(operation) if operation != client_operation_id => {
+            return Err(conflict(
+                "agent editor lease was settled by a different client operation",
+            ));
+        }
+        Some(_)
+            if row.state == "completing"
+                && row.updated_at_unix_ms.saturating_add(
+                    crate::db::agent_editor_leases::AGENT_EDITOR_COMPLETION_CLAIM_MS,
+                ) <= chrono::Utc::now().timestamp_millis() =>
+        {
+            AgentEditorSettlementStatus::NotStarted
+        }
+        Some(_) if row.state == "completing" => AgentEditorSettlementStatus::Pending,
+        Some(_) => {
+            let json = row
+                .terminal_result_json
+                .as_deref()
+                .or(row.terminal_error_json.as_deref())
+                .ok_or_else(|| internal("terminal editor lease omitted its receipt"))?;
+            let receipt: AgentEditorCompletion = serde_json::from_str(json).map_err(internal)?;
+            return Ok(Response::AgentEditorLeaseCompleted(receipt));
+        }
+    };
+    Ok(Response::AgentEditorLeaseCompleted(editor_completion(
+        &row,
+        &client_operation_id,
+        &project_root,
+        status,
+    )))
+}
+
+fn editor_completion(
+    row: &crate::db::agent_editor_leases::AgentEditorLeaseRow,
+    client_operation_id: &str,
+    project_root: &str,
+    status: AgentEditorSettlementStatus,
+) -> AgentEditorCompletion {
+    AgentEditorCompletion {
+        client_operation_id: client_operation_id.to_owned(),
+        project_root: project_root.to_owned(),
+        agent_name: row.agent_name.clone(),
+        lease_id: row.lease_id.clone(),
+        consumed_revision: row.consumed_revision.clone(),
+        status,
+    }
+}
+
+fn safe_editor_rejection(error: &ErrorPayload) -> ErrorPayload {
+    let message = match &error.code {
+        ErrorCode::Conflict => {
+            "agent editor settlement conflicted with current authority; reopen the editor"
+        }
+        ErrorCode::BadRequest => {
+            "agent editor content was rejected; reopen the editor to correct it"
+        }
+        _ => "agent editor settlement failed after reservation; retry the exact operation",
+    };
+    ErrorPayload {
+        code: error.code.clone(),
+        message: message.into(),
+    }
 }
 
 async fn trusted_root(ctx: &DaemonContext, root: &str) -> Result<PathBuf, ErrorPayload> {

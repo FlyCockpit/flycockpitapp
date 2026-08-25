@@ -23,6 +23,7 @@ pub struct AgentEditorLeaseRow {
     pub state: String,
     /// Vault-keyed, domain-separated completion identity.
     pub completion_identity: Option<[u8; 32]>,
+    pub completion_operation_id: Option<String>,
     pub terminal_result_json: Option<String>,
     pub terminal_error_json: Option<String>,
     pub expires_at_unix_ms: i64,
@@ -58,32 +59,13 @@ impl Db {
     ) -> Result<Vec<AgentEditorLeaseRow>> {
         self.read(move |conn| {
             let mut statement = conn.prepare(
-                "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,terminal_result_json,terminal_error_json,expires_at_unix_ms,updated_at_unix_ms
+                "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,completion_operation_id,terminal_result_json,terminal_error_json,expires_at_unix_ms,updated_at_unix_ms
                  FROM agent_editor_leases
                  WHERE state='open' AND expires_at_unix_ms < ?1
                  ORDER BY expires_at_unix_ms ASC LIMIT 128",
             )?;
             let rows = statement
                 .query_map([now_unix_ms], map_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-    }
-
-    pub async fn abandoned_agent_editor_completions(
-        &self,
-        cutoff_unix_ms: i64,
-    ) -> Result<Vec<AgentEditorLeaseRow>> {
-        self.read(move |conn| {
-            let mut statement = conn.prepare(
-                "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,terminal_result_json,terminal_error_json,expires_at_unix_ms,updated_at_unix_ms
-                 FROM agent_editor_leases
-                 WHERE state='completing' AND updated_at_unix_ms <= ?1
-                 ORDER BY updated_at_unix_ms ASC LIMIT 128",
-            )?;
-            let rows = statement
-                .query_map([cutoff_unix_ms], map_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -103,9 +85,9 @@ pub fn insert_agent_editor_lease_conn(conn: &Connection, row: &AgentEditorLeaseR
     conn.execute(
                 "INSERT INTO agent_editor_leases
                  (owner_digest,client_operation_id,lease_id,project_root,agent_name,
-                  consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,terminal_result_json,terminal_error_json,
+                  consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,completion_operation_id,terminal_result_json,terminal_error_json,
                   expires_at_unix_ms,created_at_unix_ms,updated_at_unix_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'open',NULL,NULL,NULL,?9,?10,?10)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'open',NULL,NULL,NULL,NULL,?9,?10,?10)",
                 params![
                     &row.owner_digest,
                     &row.client_operation_id,
@@ -126,11 +108,12 @@ pub fn finish_agent_editor_completion_conn(
     conn: &Connection,
     lease_id: &str,
     completion_hash: [u8; 32],
+    completion_operation_id: &str,
     terminal_result_json: &str,
 ) -> Result<()> {
     let changed = conn.execute(
-        "UPDATE agent_editor_leases SET state='terminal',snapshot_handle=NULL,terminal_result_json=?3,terminal_error_json=NULL,updated_at_unix_ms=?4 WHERE lease_id=?1 AND state='completing' AND completion_identity=?2",
-        params![lease_id, completion_hash.as_slice(), terminal_result_json, now_ms()],
+        "UPDATE agent_editor_leases SET state='terminal',snapshot_handle=NULL,terminal_result_json=?4,terminal_error_json=NULL,updated_at_unix_ms=?5 WHERE lease_id=?1 AND state='completing' AND completion_identity=?2 AND completion_operation_id=?3",
+        params![lease_id, completion_hash.as_slice(), completion_operation_id, terminal_result_json, now_ms()],
     )?;
     if changed != 1 {
         bail!("agent editor lease completion lost its durable reservation");
@@ -142,11 +125,12 @@ pub fn fail_agent_editor_completion_conn(
     conn: &Connection,
     lease_id: &str,
     completion_identity: [u8; 32],
+    completion_operation_id: &str,
     terminal_error_json: &str,
 ) -> Result<()> {
     let changed = conn.execute(
-        "UPDATE agent_editor_leases SET state='terminal',snapshot_handle=NULL,terminal_result_json=NULL,terminal_error_json=?3,updated_at_unix_ms=?4 WHERE lease_id=?1 AND state='completing' AND completion_identity=?2",
-        params![lease_id, completion_identity.as_slice(), terminal_error_json, now_ms()],
+        "UPDATE agent_editor_leases SET state='terminal',snapshot_handle=NULL,terminal_result_json=NULL,terminal_error_json=?4,updated_at_unix_ms=?5 WHERE lease_id=?1 AND state='completing' AND completion_identity=?2 AND completion_operation_id=?3",
+        params![lease_id, completion_identity.as_slice(), completion_operation_id, terminal_error_json, now_ms()],
     )?;
     if changed != 1 {
         bail!("agent editor lease failure lost its durable reservation");
@@ -160,12 +144,15 @@ impl Db {
         lease_id: String,
         owner_digest: String,
         completion_hash: [u8; 32],
+        completion_operation_id: String,
     ) -> Result<AgentEditorCompletionClaim> {
         self.transaction(move |conn| {
             let row = by_id(conn, &lease_id)?.context("agent editor lease is absent")?;
             if row.owner_digest != owner_digest { bail!("agent editor lease belongs to another owner"); }
             if let Some(existing) = row.completion_identity
                 && existing != completion_hash { bail!("agent editor lease was settled with different content"); }
+            if let Some(existing) = row.completion_operation_id.as_deref()
+                && existing != completion_operation_id { bail!("agent editor lease was settled by a different client operation"); }
             match row.state.as_str() {
                 "terminal" => return Ok(AgentEditorCompletionClaim::Terminal(row)),
                 "completing" if row.updated_at_unix_ms.saturating_add(COMPLETION_CLAIM_MS) > now_ms() => return Ok(AgentEditorCompletionClaim::Pending),
@@ -177,7 +164,7 @@ impl Db {
                 "open" => {}
                 _ => bail!("agent editor lease has an invalid state"),
             }
-            let changed = conn.execute("UPDATE agent_editor_leases SET state='completing',completion_identity=?2,updated_at_unix_ms=?3 WHERE lease_id=?1 AND state='open'", params![lease_id, completion_hash.as_slice(), now_ms()])?;
+            let changed = conn.execute("UPDATE agent_editor_leases SET state='completing',completion_identity=?2,completion_operation_id=?3,updated_at_unix_ms=?4 WHERE lease_id=?1 AND state='open'", params![lease_id, completion_hash.as_slice(), completion_operation_id, now_ms()])?;
             if changed != 1 { return Ok(AgentEditorCompletionClaim::Pending); }
             Ok(AgentEditorCompletionClaim::Execute(by_id(conn, &lease_id)?.context("agent editor lease disappeared")?))
         }).await
@@ -187,6 +174,7 @@ impl Db {
         &self,
         lease_id: String,
         completion_hash: [u8; 32],
+        completion_operation_id: String,
         terminal_result_json: String,
     ) -> Result<()> {
         self.write(move |conn| {
@@ -194,6 +182,7 @@ impl Db {
                 conn,
                 &lease_id,
                 completion_hash,
+                &completion_operation_id,
                 &terminal_result_json,
             )
         })
@@ -225,7 +214,7 @@ fn query<P: rusqlite::Params>(
     params: P,
 ) -> Result<Option<AgentEditorLeaseRow>> {
     let sql = format!(
-        "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,terminal_result_json,terminal_error_json,expires_at_unix_ms,updated_at_unix_ms FROM agent_editor_leases WHERE {predicate}"
+        "SELECT owner_digest,client_operation_id,lease_id,project_root,agent_name,consumed_revision,snapshot_handle,snapshot_identity,state,completion_identity,completion_operation_id,terminal_result_json,terminal_error_json,expires_at_unix_ms,updated_at_unix_ms FROM agent_editor_leases WHERE {predicate}"
     );
     conn.query_row(&sql, params, map_row)
         .optional()
@@ -252,10 +241,11 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentEditorLeaseRow> {
         snapshot_identity,
         state: row.get(8)?,
         completion_identity: identity,
-        terminal_result_json: row.get(10)?,
-        terminal_error_json: row.get(11)?,
-        expires_at_unix_ms: row.get(12)?,
-        updated_at_unix_ms: row.get(13)?,
+        completion_operation_id: row.get(10)?,
+        terminal_result_json: row.get(11)?,
+        terminal_error_json: row.get(12)?,
+        expires_at_unix_ms: row.get(13)?,
+        updated_at_unix_ms: row.get(14)?,
     })
 }
 

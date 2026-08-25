@@ -714,16 +714,22 @@ impl App {
                 AsyncActionPolicy::AllowConcurrent,
                 async move {
                     let outcome = crate::tui::settings::execute_settings_daemon_work(work).await;
-                    let (response, committed_refresh_needed) = match outcome {
-                        Ok(outcome) => (outcome.response, outcome.committed_refresh_needed),
-                        Err(error) => (Err(error), None),
-                    };
+                    let (response, authoritative_rejection, committed_refresh_needed) =
+                        match outcome {
+                            Ok(outcome) => (
+                                outcome.response,
+                                outcome.authoritative_rejection,
+                                outcome.committed_refresh_needed,
+                            ),
+                            Err(error) => (Err(error), false, None),
+                        };
                     Ok(AsyncActionPayload::SettingsDaemon(
                         crate::tui::settings::SettingsDaemonEffectCompletion {
                             dialog_id,
                             operation_id,
                             target,
                             response,
+                            authoritative_rejection,
                             committed_refresh_needed,
                         },
                     ))

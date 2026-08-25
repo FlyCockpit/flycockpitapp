@@ -733,6 +733,7 @@ fn tui_agent_authority_is_daemon_owned() {
         "MutateAgent",
         "BeginAgentEditorLease",
         "CompleteAgentEditorLease",
+        "GetAgentEditorLeaseSettlement",
         "SaveAssistantDefinition",
         "DeleteAssistant",
     ] {
@@ -740,6 +741,10 @@ fn tui_agent_authority_is_daemon_owned() {
     }
     assert!(!production.contains("std::fs::write("));
     assert!(agents.contains("Uuid::new_v4().to_string()"));
+    assert!(agents.contains("Request::GetAgentEditorLeaseSettlement"));
+    assert!(agents.contains("client_operation_id: client_operation_id.clone()"));
+    assert!(agents.contains("authoritative_rejection"));
+    assert!(agents.contains("AgentEditorSettlementStatus::Rejected"));
     assert!(
         !agents.contains("client_operation_id: \"editor-operation\""),
         "each editor handoff needs a fresh idempotency identity"

@@ -448,6 +448,9 @@ pub(crate) struct TypedDocumentEditPlan {
 #[derive(Debug)]
 pub(crate) struct SettingsDaemonWorkOutcome {
     pub(crate) response: Result<Response, String>,
+    /// True only when the daemon returned a protocol error. Transport,
+    /// timeout, and response-shape failures remain settlement-ambiguous.
+    pub(crate) authoritative_rejection: bool,
     pub(crate) committed_refresh_needed: Option<CommittedRefreshNeeded>,
 }
 
@@ -465,14 +468,18 @@ pub(crate) async fn execute_settings_daemon_work(
         .await
         .map_err(|error| error.to_string())?;
     match work {
-        SettingsDaemonEffectWork::Request(request) => Ok(SettingsDaemonWorkOutcome {
-            response: client
+        SettingsDaemonEffectWork::Request(request) => {
+            let response = client
                 .request(request)
                 .await
-                .map_err(|error| error.to_string())?
-                .map_err(|error| error.to_string()),
-            committed_refresh_needed: None,
-        }),
+                .map_err(|error| error.to_string())?;
+            let authoritative_rejection = response.is_err();
+            Ok(SettingsDaemonWorkOutcome {
+                response: response.map_err(|error| error.to_string()),
+                authoritative_rejection,
+                committed_refresh_needed: None,
+            })
+        }
         SettingsDaemonEffectWork::SettlementQuery(request) => {
             let response =
                 tokio::time::timeout(std::time::Duration::from_secs(15), client.request(request))
@@ -482,6 +489,7 @@ pub(crate) async fn execute_settings_daemon_work(
                     .map_err(|error| error.to_string());
             Ok(SettingsDaemonWorkOutcome {
                 response,
+                authoritative_rejection: false,
                 committed_refresh_needed: None,
             })
         }
@@ -499,6 +507,7 @@ pub(crate) async fn execute_settings_daemon_work(
                 .await
                 .map_err(|error| error.to_string())?
                 .map_err(|error| error.to_string()),
+            authoritative_rejection: false,
             committed_refresh_needed: None,
         }),
         SettingsDaemonEffectWork::McpOAuthComplete {
@@ -515,6 +524,7 @@ pub(crate) async fn execute_settings_daemon_work(
                 .await
                 .map_err(|error| error.to_string())?
                 .map_err(|error| error.to_string()),
+            authoritative_rejection: false,
             committed_refresh_needed: None,
         }),
         SettingsDaemonEffectWork::McpConfigSave {
@@ -537,6 +547,7 @@ pub(crate) async fn execute_settings_daemon_work(
                 .await
                 .map_err(|error| error.to_string())?
                 .map_err(|error| error.to_string()),
+            authoritative_rejection: false,
             committed_refresh_needed: None,
         }),
         SettingsDaemonEffectWork::ProviderMutation(plan) => {
@@ -647,6 +658,7 @@ pub(crate) async fn execute_settings_daemon_work(
             }
             Ok(SettingsDaemonWorkOutcome {
                 response: Ok(response),
+                authoritative_rejection: false,
                 committed_refresh_needed: None,
             })
         }
@@ -755,6 +767,7 @@ pub(crate) async fn execute_settings_daemon_work(
                 } if returned_operation_id == &plan.client_operation_id => {
                     return Ok(SettingsDaemonWorkOutcome {
                         response: Ok(response),
+                        authoritative_rejection: false,
                         committed_refresh_needed: None,
                     });
                 }
@@ -802,6 +815,7 @@ pub(crate) async fn execute_settings_daemon_work(
                 {
                     Ok(SettingsDaemonWorkOutcome {
                         response: refreshed,
+                        authoritative_rejection: false,
                         committed_refresh_needed: None,
                     })
                 }
@@ -810,6 +824,7 @@ pub(crate) async fn execute_settings_daemon_work(
                         "typed settings edit committed, but authoritative refresh did not reconcile"
                             .into(),
                     ),
+                    authoritative_rejection: false,
                     committed_refresh_needed: Some(CommittedRefreshNeeded {
                         result_revision,
                         config_generation: result_generation,
@@ -834,6 +849,7 @@ pub(crate) struct SettingsDaemonEffectCompletion {
     pub(crate) operation_id: uuid::Uuid,
     pub(crate) target: SettingsEffectTarget,
     pub(crate) response: Result<Response, String>,
+    pub(crate) authoritative_rejection: bool,
     pub(crate) committed_refresh_needed: Option<CommittedRefreshNeeded>,
 }
 
@@ -3918,6 +3934,7 @@ impl SettingsCx {
                             operation_id: completion.operation_id,
                             target: original_target,
                             response: Ok(*response),
+                            authoritative_rejection: false,
                             committed_refresh_needed: None,
                         });
                     }

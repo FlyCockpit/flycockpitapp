@@ -5692,15 +5692,32 @@ async fn handle_serialized_request_impl(
         }
 
         Request::CompleteAgentEditorLease {
+            client_operation_id,
             project_root,
             lease_id,
             markdown,
         } => {
             crate::daemon::agent_management::complete_editor_lease(
                 ctx,
+                client_operation_id,
                 project_root,
                 lease_id,
                 markdown,
+                agent_editor_lease_owner(state),
+            )
+            .await
+        }
+
+        Request::GetAgentEditorLeaseSettlement {
+            client_operation_id,
+            project_root,
+            lease_id,
+        } => {
+            crate::daemon::agent_management::editor_lease_settlement(
+                ctx,
+                client_operation_id,
+                project_root,
+                lease_id,
                 agent_editor_lease_owner(state),
             )
             .await

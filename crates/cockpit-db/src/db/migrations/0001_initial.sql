@@ -6385,6 +6385,7 @@ CREATE TABLE agent_editor_leases (
         completion_identity IS NULL OR
         (typeof(completion_identity) = 'blob' AND length(completion_identity) = 32)
     ),
+    completion_operation_id TEXT,
     terminal_result_json TEXT CHECK (
         terminal_result_json IS NULL OR json_valid(terminal_result_json)
     ),
@@ -6401,6 +6402,8 @@ CREATE TABLE agent_editor_leases (
     CHECK (length(trim(agent_name)) > 0),
     CHECK (length(trim(consumed_revision)) > 0),
     CHECK (snapshot_handle IS NULL OR length(trim(snapshot_handle)) > 0),
+    CHECK (completion_operation_id IS NULL OR length(trim(completion_operation_id)) > 0),
+    CHECK ((state = 'open') = (completion_operation_id IS NULL)),
     CHECK ((state = 'open') = (completion_identity IS NULL)),
     CHECK ((state = 'terminal') = ((terminal_result_json IS NOT NULL) OR (terminal_error_json IS NOT NULL))),
     CHECK (terminal_result_json IS NULL OR terminal_error_json IS NULL),
@@ -6422,6 +6425,7 @@ WHEN NEW.owner_digest <> OLD.owner_digest
   OR NEW.agent_name <> OLD.agent_name
   OR NEW.consumed_revision <> OLD.consumed_revision
   OR NEW.snapshot_identity <> OLD.snapshot_identity
+  OR (OLD.completion_operation_id IS NOT NULL AND NEW.completion_operation_id IS NOT OLD.completion_operation_id)
   OR (NEW.snapshot_handle IS NOT OLD.snapshot_handle AND NEW.state NOT IN ('completing', 'terminal'))
   OR NEW.expires_at_unix_ms <> OLD.expires_at_unix_ms
   OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms

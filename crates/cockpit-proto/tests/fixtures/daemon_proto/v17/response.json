@@ -2528,6 +2528,7 @@
   "agent_editor_lease_begun": {
     "response": "agent_editor_lease_begun",
     "data": {
+      "client_operation_id": "11111111-1111-4111-8111-111111111111",
       "lease_id": "11111111-1111-4111-8111-111111111111",
       "expires_at_unix_ms": 1700000000000,
       "snapshot": {
@@ -2550,14 +2551,16 @@
   "agent_editor_lease_completed": {
     "response": "agent_editor_lease_completed",
     "data": {
-      "changed": false,
-      "affected": 0,
-      "snapshot": null,
-      "config_generation": 8,
-      "inventory_revision": null,
+      "client_operation_id": "33333333-3333-4333-8333-333333333333",
+      "project_root": "/tmp/project",
+      "agent_name": "build",
+      "lease_id": "11111111-1111-4111-8111-111111111111",
       "consumed_revision": "1c1036c76fde6cc31026fa16a8b64fec0236dd64d1a9e86688b9ce719c3761b5",
-      "completed_lease_id": "11111111-1111-4111-8111-111111111111",
-      "outcome": {"status":"reconciled"}
+      "status": {
+        "status": "saved",
+        "result_revision": "2c1036c76fde6cc31026fa16a8b64fec0236dd64d1a9e86688b9ce719c3761b5",
+        "outcome": {"status":"reconciled"}
+      }
     }
   },
   "local_operation_settlement": {

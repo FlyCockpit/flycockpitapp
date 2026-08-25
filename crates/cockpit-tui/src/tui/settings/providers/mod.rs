@@ -529,24 +529,24 @@ impl ProvidersPointerSurface {
 impl ProvidersPage {
     pub(super) fn has_unsettled_oauth_operation(&self) -> bool {
         match self {
-            Self::OAuthSetup { state, .. } => state.pending || state.polling,
+            Self::OAuthSetup { state, .. } => state.has_unsettled_authority(),
             Self::Add(state) => state
                 .oauth_auth
                 .as_ref()
-                .is_some_and(|oauth| oauth.pending || oauth.polling),
+                .is_some_and(|oauth| oauth.has_unsettled_authority()),
             _ => false,
         }
     }
 
     pub(super) fn has_unsettled_authority_operation(&self) -> bool {
         match self {
-            Self::OAuthSetup { state, .. } => state.pending || state.polling,
+            Self::OAuthSetup { state, .. } => state.has_unsettled_authority(),
             Self::Add(state) => {
                 state.fetch.is_some()
                     || state
                         .oauth_auth
                         .as_ref()
-                        .is_some_and(|oauth| oauth.pending || oauth.polling)
+                        .is_some_and(|oauth| oauth.has_unsettled_authority())
             }
             Self::Edit(state) => state.fetch.is_some(),
             Self::Headers { parent, .. }
@@ -557,6 +557,17 @@ impl ProvidersPage {
             Self::DeepFetch { state, .. } => state.is_running(),
             Self::CopilotSetup { state, .. } => state.operation.pending().is_some(),
             Self::List { .. } | Self::FetchOnePrompt(_) | Self::FetchFallbackPrompt(_) => false,
+        }
+    }
+
+    pub(super) fn has_unsettled_oauth_acknowledgement(&self) -> bool {
+        match self {
+            Self::OAuthSetup { state, .. } => state.has_unsettled_acknowledgement(),
+            Self::Add(state) => state
+                .oauth_auth
+                .as_ref()
+                .is_some_and(|oauth| oauth.has_unsettled_acknowledgement()),
+            _ => false,
         }
     }
 

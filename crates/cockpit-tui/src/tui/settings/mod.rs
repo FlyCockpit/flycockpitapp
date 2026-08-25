@@ -1573,11 +1573,11 @@ fn valid_vault_freshness(consumed: u64, result: u64, changed: bool) -> bool {
 enum CompletedProviderAuthMutation {
     Logout {
         provider_id: String,
-        result: Result<bool, String>,
+        result: Result<(), String>,
     },
     Copilot {
         provider_id: String,
-        result: Result<bool, String>,
+        result: Result<(), String>,
     },
 }
 
@@ -5399,10 +5399,25 @@ impl Dialog {
         operation_id: shell::PointerOperationId,
         error: String,
     ) {
-        if let Some(s) = self.state.as_mut()
-            && let Some(s) = s.downcast_mut::<SettingsDialog>()
-        {
+        if let Dialog::Settings(s) = self {
             s.apply_oauth_settlement_unknown(provider, client_flow_id, operation_id, error);
+        }
+    }
+
+    pub(crate) fn apply_oauth_acknowledgement_settlement_unknown(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        error: String,
+    ) {
+        if let Dialog::Settings(s) = self {
+            s.apply_oauth_acknowledgement_settlement_unknown(
+                provider,
+                client_flow_id,
+                operation_id,
+                error,
+            );
         }
     }
 
@@ -6351,6 +6366,21 @@ impl SettingsDialog {
         }
     }
 
+    fn apply_oauth_acknowledgement_settlement_unknown(
+        &mut self,
+        provider: OAuthProvider,
+        client_flow_id: pointer_actions::OAuthFlowId,
+        operation_id: shell::PointerOperationId,
+        error: String,
+    ) {
+        let Some(state) = self.oauth_flow_state_mut(provider) else {
+            return;
+        };
+        if state.accepts_result(client_flow_id, operation_id) {
+            state.apply_acknowledgement_settlement_unknown(error);
+        }
+    }
+
     fn apply_oauth_acknowledgement_correlated(
         &mut self,
         provider: OAuthProvider,
@@ -6564,7 +6594,13 @@ impl SettingsDialog {
                     .page
                     .downcast_ref::<ProvidersPage>()
                     .is_some_and(ProvidersPage::has_unsettled_oauth_operation);
-            if oauth_cancel {
+            let oauth_ack_retry = matches!(key.code, KeyCode::Enter)
+                && key.modifiers.is_empty()
+                && self
+                    .page
+                    .downcast_ref::<ProvidersPage>()
+                    .is_some_and(ProvidersPage::has_unsettled_oauth_acknowledgement);
+            if oauth_cancel || oauth_ack_retry {
                 let nav = self.page.handle_key(&mut self.cx, key);
                 return self.apply_nav(nav);
             }

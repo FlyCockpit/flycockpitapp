@@ -529,7 +529,6 @@ impl AgentsPage {
         let Some(pending) = self.pending_daemon.remove(&completion.operation_id) else {
             return;
         };
-        let authoritative_rejection = completion.authoritative_rejection;
         let cwd = cx.agents_cwd();
         let project_root = cwd.to_string_lossy();
         let target_matches = match &pending {
@@ -1077,7 +1076,6 @@ impl AgentsPage {
                 expected_revision,
                 authority_id,
                 draft,
-                authoritative_rejection,
                 response,
             ),
             PendingAgentOperation::CompleteLease {
@@ -1103,7 +1101,6 @@ impl AgentsPage {
                 detail,
                 outcome,
                 querying,
-                authoritative_rejection,
                 response,
             ),
             PendingAgentOperation::Inventory { .. } | PendingAgentOperation::Assistants { .. } => {}
@@ -1252,7 +1249,6 @@ impl AgentsPage {
         expected_revision: String,
         authority_id: super::pointer_actions::AgentId,
         draft: AgentEditor,
-        authoritative_rejection: bool,
         response: Result<cockpit_core::daemon::proto::Response, String>,
     ) {
         let lease = match response {
@@ -1273,13 +1269,9 @@ impl AgentsPage {
                 return;
             }
             Err(error) => {
-                if authoritative_rejection {
-                    self.editing = Some(draft);
-                    self.status = Some(format!(
-                        "daemon rejected external editor lease acquisition: {error}"
-                    ));
-                    return;
-                }
+                // The generic protocol error is not proof that the daemon did
+                // not insert the lease. Preserve the exact operation and
+                // replay it until a typed lease receipt arrives.
                 self.uncertain_editor_settlement =
                     Some(Box::new(PendingAgentOperation::BeginLease {
                         client_operation_id,
@@ -1422,7 +1414,6 @@ impl AgentsPage {
         detail: Option<String>,
         outcome: super::pointer_actions::ExternalEditOutcome,
         querying: bool,
-        authoritative_rejection: bool,
         response: Result<cockpit_core::daemon::proto::Response, String>,
     ) {
         self.uncertain_editor_settlement = None;
@@ -1440,16 +1431,6 @@ impl AgentsPage {
                 .is_ok() =>
             {
                 receipt
-            }
-            Err(error) if authoritative_rejection => {
-                if let Some(markdown) = markdown.as_deref()
-                    && let Some(editor) = draft.as_mut()
-                {
-                    editor.replace_with_recovery_text(markdown);
-                }
-                self.editing = draft.take();
-                self.status = Some(format!("daemon rejected editor settlement: {error}"));
-                return;
             }
             other => {
                 if let Some(markdown) = markdown.as_deref()

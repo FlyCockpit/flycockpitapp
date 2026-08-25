@@ -406,6 +406,11 @@ pub(crate) struct OAuthFlowState {
     pub(crate) ssh: bool,
     pub(crate) spinner_tick: usize,
     acknowledgement_required: bool,
+    /// A durable acknowledgement mutation has been submitted and this pane
+    /// still owns its authority. This is deliberately independent of the
+    /// transport action gate: an ambiguous result completes one transport
+    /// attempt but must not release navigation or permit the pane to close.
+    acknowledgement_authority_pending: bool,
     copy_operation: super::super::shell::PointerOperationGate,
     action_operation: super::super::shell::PointerOperationGate,
 }
@@ -497,6 +502,7 @@ impl OAuthFlowState {
             spinner_tick: 0,
             // Fail closed until the asynchronous inventory answer arrives.
             acknowledgement_required: true,
+            acknowledgement_authority_pending: false,
             copy_operation: super::super::shell::PointerOperationGate::default(),
             action_operation: super::super::shell::PointerOperationGate::default(),
         }
@@ -596,6 +602,9 @@ impl OAuthFlowState {
     }
 
     fn request(&mut self, op: OAuthFlowOp) -> OAuthFlowRequest {
+        if matches!(op, OAuthFlowOp::Acknowledge) {
+            self.acknowledgement_authority_pending = true;
+        }
         OAuthFlowRequest {
             provider: self.provider,
             client_flow_id: self.flow_id,
@@ -677,6 +686,17 @@ impl OAuthFlowState {
         self.pending = true;
         self.status = Some(Err(format!(
             "OAuth settlement is unknown; retry the exact operation: {error}"
+        )));
+    }
+
+    pub(crate) fn apply_acknowledgement_settlement_unknown(&mut self, error: String) {
+        // The transport attempt is complete, but the durable acknowledgement
+        // may already have committed. Keep the explicit authority fence and
+        // the acknowledgement option so Enter replays the same flow-derived
+        // daemon operation id.
+        self.acknowledgement_authority_pending = true;
+        self.status = Some(Err(format!(
+            "Subscription acknowledgement settlement is unknown; press Enter to retry the exact operation: {error}"
         )));
     }
 
@@ -902,11 +922,17 @@ impl OAuthFlowState {
             self.logged_in = logged_in;
         }
         if let Some(acknowledged) = acknowledged {
-            self.acknowledgement_required = !acknowledged;
+            // Inventory refresh is advisory while this visible pane owns an
+            // acknowledgement mutation. Only its exact typed settlement may
+            // release that authority fence.
+            if !self.acknowledgement_authority_pending {
+                self.acknowledgement_required = !acknowledged;
+            }
         }
     }
 
     pub(crate) fn apply_acknowledgement(&mut self, result: Result<(), String>) {
+        self.acknowledgement_authority_pending = false;
         match result {
             Ok(()) => {
                 self.acknowledgement_required = false;
@@ -916,6 +942,14 @@ impl OAuthFlowState {
                 self.status = Some(Err(format!("Could not record acknowledgement: {error}")));
             }
         }
+    }
+
+    pub(crate) fn has_unsettled_authority(&self) -> bool {
+        self.pending || self.polling || self.acknowledgement_authority_pending
+    }
+
+    pub(crate) fn has_unsettled_acknowledgement(&self) -> bool {
+        self.acknowledgement_authority_pending
     }
 }
 
@@ -1097,7 +1131,13 @@ pub(super) fn handle_oauth_flow_key_with(
 
     match key.code {
         KeyCode::Esc => {
-            if matches!(s.session, OAuthSession::None) {
+            if s.acknowledgement_authority_pending {
+                s.status = Some(Err(
+                    "Subscription acknowledgement is still settling; press Enter to retry the exact operation"
+                        .into(),
+                ));
+                OAuthKeyOutcome::stay(None)
+            } else if matches!(s.session, OAuthSession::None) {
                 OAuthKeyOutcome::back(None)
             } else {
                 // The OAuth surface remains the owner until the exact cancel

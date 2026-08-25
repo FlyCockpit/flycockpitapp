@@ -1903,7 +1903,7 @@ impl App {
                             Err(error)
                         }
                         crate::tui::async_action::OAuthAsyncResult::SettlementUnknown(error) => {
-                            self.dialog.apply_oauth_settlement_unknown(
+                            self.dialog.apply_oauth_acknowledgement_settlement_unknown(
                                 provider,
                                 client_flow_id,
                                 operation_id,
@@ -2461,12 +2461,13 @@ impl App {
                                 .await;
                                 let response = match direct {
                                     Ok(Ok(Ok(response))) => response,
-                                    Ok(Ok(Err(error))) => {
-                                        return Ok(crate::tui::async_action::OAuthAsyncResult::AuthoritativeFailure(
-                                            format!("daemon rejected acknowledgement: {error}"),
-                                        ));
-                                    }
-                                    Ok(Err(_)) | Err(_) => {
+                                    // A generic request error is not a typed
+                                    // terminal receipt: the acknowledgement
+                                    // may have committed before the transport
+                                    // carried that error. Resolve every such
+                                    // result through the durable settlement
+                                    // journal before releasing TUI authority.
+                                    Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
                                         let settlement = match tokio::time::timeout(
                                             std::time::Duration::from_secs(10),
                                             client.request(cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {

@@ -181,6 +181,65 @@ fn authority_success_is_receipt_driven_and_committed_refresh_is_explicit() {
 }
 
 #[test]
+fn oauth_acknowledgement_keeps_explicit_authority_until_typed_settlement() {
+    let flow = include_str!("providers/oauth_flow.rs");
+    let providers = include_str!("providers/mod.rs");
+    let app = include_str!("../app/async_actions.rs");
+    let dialog = include_str!("mod.rs");
+
+    assert!(flow.contains("acknowledgement_authority_pending: bool"));
+    assert!(flow.contains("self.acknowledgement_authority_pending = true"));
+    assert!(flow.contains("apply_acknowledgement_settlement_unknown"));
+    assert!(flow.contains("self.acknowledgement_authority_pending = false"));
+    assert!(providers.contains("has_unsettled_oauth_acknowledgement"));
+    assert!(dialog.contains("oauth_ack_retry"));
+    assert!(app.contains("Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_)"));
+    assert!(!app.contains("daemon rejected acknowledgement: {error}"));
+}
+
+#[test]
+fn external_editor_generic_errors_never_release_daemon_authority() {
+    let agents = include_str!("agents_page.rs");
+    let begin = agents
+        .split("fn apply_begin_lease")
+        .nth(1)
+        .and_then(|source| source.split("fn settle_unserviced_editor_lease").next())
+        .expect("editor begin reducer");
+    let completion = agents
+        .split("fn apply_complete_lease")
+        .nth(1)
+        .and_then(|source| source.split("/// Help line for the footer").next())
+        .expect("editor completion reducer");
+
+    assert!(begin.contains("PendingAgentOperation::BeginLease"));
+    assert!(!begin.contains("if authoritative_rejection"));
+    assert!(completion.contains("validate_agent_editor_completion"));
+    assert!(completion.contains("PendingAgentOperation::CompleteLease"));
+    assert!(completion.contains("AgentEditorSettlementStatus::Pending"));
+    assert!(completion.contains("AgentEditorSettlementStatus::Rejected"));
+    assert!(completion.contains("AgentEditorSettlementStatus::Cancelled"));
+    assert!(completion.contains("AgentEditorSettlementStatus::Saved"));
+    assert!(!completion.contains("if authoritative_rejection"));
+}
+
+#[test]
+fn provider_auth_completions_carry_unit_success_results() {
+    let settings = include_str!("mod.rs");
+    let auth_completion = settings
+        .split("enum CompletedProviderAuthMutation")
+        .nth(1)
+        .and_then(|source| source.split("enum PendingMcpOAuth").next())
+        .expect("provider auth completion enum");
+    assert_eq!(
+        auth_completion
+            .matches("result: Result<(), String>")
+            .count(),
+        2
+    );
+    assert!(!auth_completion.contains("Result<bool, String>"));
+}
+
+#[test]
 fn empty_object_merge_patch_is_derived_as_noop_for_existing_object() {
     let mut authored = serde_json::json!({
         "tui": { "mouse": true },

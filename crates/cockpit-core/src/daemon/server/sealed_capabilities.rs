@@ -92,6 +92,23 @@ impl SealedOwnerCapabilityTable {
         self.entries.remove(&capability_id);
     }
 
+    /// Spend and remove every outstanding capability minted by a connection.
+    /// Transport teardown calls this before releasing the client task, making
+    /// disconnect an authoritative cancellation boundary rather than relying
+    /// on expiry.
+    pub fn cancel_for_session(&mut self, minting_session: Uuid) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|_, entry| {
+            if entry.minting_session == minting_session {
+                let _ = entry.capability.cancel();
+                false
+            } else {
+                true
+            }
+        });
+        before.saturating_sub(self.entries.len())
+    }
+
     /// Number of live entries. Test/inspection surface.
     #[cfg(test)]
     pub fn len(&self) -> usize {
@@ -165,6 +182,23 @@ mod tests {
         assert!(table.get(expired_id).is_none(), "expired entry evicted");
         assert!(table.get(fresh_id).is_some(), "fresh entry retained");
         assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn connection_teardown_cancels_only_its_capabilities() {
+        let mut table = SealedOwnerCapabilityTable::default();
+        let departing = Uuid::new_v4();
+        let remaining = Uuid::new_v4();
+        let departed_capability = craft_capability(1_000);
+        let departed_id = departed_capability.capability_id();
+        let remaining_capability = craft_capability(1_000);
+        let remaining_id = remaining_capability.capability_id();
+        assert!(table.insert(departed_capability, departing, 1_000));
+        assert!(table.insert(remaining_capability, remaining, 1_000));
+
+        assert_eq!(table.cancel_for_session(departing), 1);
+        assert!(table.get(departed_id).is_none());
+        assert!(table.get(remaining_id).is_some());
     }
 
     #[test]

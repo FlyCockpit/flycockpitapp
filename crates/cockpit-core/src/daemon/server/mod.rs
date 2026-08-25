@@ -4535,7 +4535,7 @@ where
         Ok::<(), anyhow::Error>(())
     });
     let executor_task = tokio::spawn(run_client_executor(
-        ctx,
+        ctx.clone(),
         principal,
         client_instance_id,
         next_terminal_connection_epoch(),
@@ -4561,6 +4561,18 @@ where
     writer_task.abort();
     event_task.abort();
     executor_task.abort();
+    let cancelled_capabilities = ctx
+        .sealed_owner_capabilities
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .cancel_for_session(client_instance_id);
+    if cancelled_capabilities > 0 {
+        tracing::debug!(
+            client_instance_id = %client_instance_id,
+            cancelled_capabilities,
+            "cancelled sealed capabilities at client transport teardown"
+        );
+    }
     completed?;
     Ok(())
 }

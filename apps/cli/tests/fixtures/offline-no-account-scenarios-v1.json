@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "profile": "local-v0.1",
+  "environment": {
+    "freshHome": true,
+    "clearProxyAndAccountEnvironment": true,
+    "flycockpitEndpoints": "poison-loopback",
+    "networkRecorder": "deny-except-fake-provider"
+  },
+  "scenarios": [
+    "local-help-has-no-account-sync-relay",
+    "missing-provider-is-stable-and-does-not-contact-flycockpit",
+    "fake-loopback-provider-is-the-only-network-peer",
+    "daemon-start-and-tui-first-paint",
+    "daemon-restart-and-session-resume",
+    "settings-save-through-daemon",
+    "redacted-session-export",
+    "data-directories-and-uninstall-disclosure"
+  ],
+  "forbiddenNetworkLabels": ["account", "sync", "relay", "tenant-authority", "flycockpit-api"]
+}

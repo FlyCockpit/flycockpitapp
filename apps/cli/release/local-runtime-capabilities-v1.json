@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "profile": "local-v0.1",
+  "artifactBudgetBytes": 125829120,
+  "forbiddenDependencies": ["flycockpit-relay-protocol", "tokio-tungstenite", "str0m", "turn-client-proto", "turn-client-rustls"],
+  "targets": {
+    "x86_64-unknown-linux-gnu": {"sandbox":"zerobox","clipboard":"wayland-or-osc52","pty":true,"notifications":"dbus","keyring":"os-or-private-file"},
+    "aarch64-unknown-linux-gnu": {"sandbox":"zerobox","clipboard":"wayland-or-osc52","pty":true,"notifications":"dbus","keyring":"os-or-private-file"},
+    "x86_64-apple-darwin": {"sandbox":"zerobox","clipboard":"native-or-osc52","pty":true,"notifications":"native","keyring":"os-or-private-file"},
+    "aarch64-apple-darwin": {"sandbox":"zerobox","clipboard":"native-or-osc52","pty":true,"notifications":"native","keyring":"os-or-private-file"},
+    "x86_64-pc-windows-msvc": {"sandbox":"unavailable-confirmed","clipboard":"native-or-osc52","pty":true,"notifications":"native","keyring":"os-or-private-file"}
+  }
+}

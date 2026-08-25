@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "profile": "local-v0.1",
+  "remoteDaemonWorkers": ["org_sync", "remote_audit_upload", "connector", "remote_outbox_worker"],
+  "localProtocolTagDenylist": [
+    "store_flycockpit_credential",
+    "clear_flycockpit_credential",
+    "set_flycockpit_connector_enabled",
+    "sync_flycockpit_org_policy",
+    "enroll_flycockpit_org_sync"
+  ],
+  "remoteSchemaExtension": "0001_remote_profile.sql"
+}

@@ -122,3 +122,30 @@ fn remote_conformance_is_opt_in_and_release_declares_local_profile() {
     let release = source(".github/workflows/release.yml");
     assert!(release.contains("FLYCOCKPIT_RELEASE_PROFILE: local-v0.1"));
 }
+
+#[test]
+fn generated_local_profile_inventory_is_bound_to_sources() {
+    let inventory: serde_json::Value =
+        serde_json::from_str(&source("apps/cli/release/local-profile-inventory-v1.json")).unwrap();
+    assert_eq!(inventory["profile"], "local-v0.1");
+    let daemon = source("crates/cockpit-core/src/daemon/mod.rs");
+    for worker in inventory["remoteDaemonWorkers"].as_array().unwrap() {
+        let worker = worker.as_str().unwrap();
+        let marker = format!("{worker}::spawn_background");
+        let offset = daemon
+            .find(&marker)
+            .unwrap_or_else(|| panic!("missing {marker}"));
+        assert!(daemon[offset.saturating_sub(100)..offset].contains("feature = \"remote\""));
+    }
+    let protocol = source("crates/cockpit-proto/src/request.rs");
+    for tag in inventory["localProtocolTagDenylist"].as_array().unwrap() {
+        let tag = format!("\"{}\"", tag.as_str().unwrap());
+        let offset = protocol
+            .find(&tag)
+            .unwrap_or_else(|| panic!("missing {tag}"));
+        assert!(protocol[offset.saturating_sub(180)..offset].contains("feature = \"remote\""));
+    }
+    let db = source("crates/cockpit-db/src/db/mod.rs");
+    assert!(db.contains("extension_sql: \"\""));
+    assert!(db.contains(inventory["remoteSchemaExtension"].as_str().unwrap()));
+}

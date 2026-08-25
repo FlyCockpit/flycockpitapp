@@ -156,6 +156,27 @@ fn public_v0_1_allowlist_is_exact_and_single_source() {
 }
 
 #[test]
+fn local_release_outbound_network_inventory_is_fail_closed() {
+    let acceptance = source("apps/cli/tests/e2e/local_offline_acceptance.rs");
+    for required in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "assert_no_network_attempt",
+    ] {
+        assert!(
+            acceptance.contains(required),
+            "missing network ratchet {required}"
+        );
+    }
+    let daemon = source("crates/cockpit-core/src/daemon/mod.rs");
+    assert!(daemon.contains("#[cfg(feature = \"remote\")]\npub mod connector;"));
+    let connector = source("crates/cockpit-core/src/daemon/connector.rs");
+    assert!(connector.contains("connect_async(request)"));
+}
+
+#[test]
 fn generated_local_profile_inventory_is_bound_to_sources() {
     let inventory: serde_json::Value =
         serde_json::from_str(&source("apps/cli/release/local-profile-inventory-v1.json")).unwrap();

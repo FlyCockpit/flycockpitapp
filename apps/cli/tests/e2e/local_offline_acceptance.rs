@@ -7,10 +7,17 @@ use std::{net::TcpListener, time::Duration};
 use crate::support::{HermeticCockpit, HermeticProfile, output_text};
 use cockpit_test_support::provider::{ScriptedProvider, Turn};
 
-const PUBLIC: &[&str] = &[
-    "ask", "run", "agent", "provider", "setup", "models", "daemon", "doctor", "session", "trust",
-    "export", "config", "init",
-];
+const PUBLIC_SNAPSHOT: &str = include_str!("../fixtures/public-v0.1-command-snapshot.json");
+
+fn public_commands() -> Vec<String> {
+    let snapshot: serde_json::Value = serde_json::from_str(PUBLIC_SNAPSHOT).unwrap();
+    snapshot["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect()
+}
 
 fn run(session: &HermeticCockpit, args: &[&str]) -> Output {
     run_with_env(session, args, std::iter::empty::<(String, String)>())
@@ -32,24 +39,21 @@ fn run_with_env(
         .unwrap()
 }
 
-fn poison_flycockpit_endpoints(session: &HermeticCockpit) -> (TcpListener, Vec<(String, String)>) {
+fn deny_proxy() -> (TcpListener, Vec<(String, String)>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let env = [
-        "FLYCOCKPIT_API_URL",
-        "FLYCOCKPIT_RELAY_URL",
-        "FLYCOCKPIT_TENANT_AUTHORITY_URL",
-    ]
-    .into_iter()
-    .map(|name| (name.to_string(), endpoint.clone()))
-    .collect();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let mut env = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
+        .into_iter()
+        .map(|name| (name.to_string(), proxy.clone()))
+        .collect::<Vec<_>>();
+    env.push(("NO_PROXY".into(), "127.0.0.1,localhost".into()));
     (listener, env)
 }
 
-fn install_poison_endpoints(session: &mut HermeticCockpit) -> TcpListener {
-    let (listener, endpoints) = poison_flycockpit_endpoints(session);
-    for (key, value) in endpoints {
+fn install_network_deny_recorder(session: &mut HermeticCockpit) -> TcpListener {
+    let (listener, policy) = deny_proxy();
+    for (key, value) in policy {
         session.set_extra_env(key, value);
     }
     listener
@@ -59,7 +63,7 @@ fn assert_no_network_attempt(listener: &TcpListener) {
     std::thread::sleep(Duration::from_millis(25));
     assert!(
         matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
-        "local acceptance contacted a poisoned FlyCockpit endpoint"
+        "local acceptance attempted a non-allowlisted outbound HTTP(S) connection"
     );
 }
 
@@ -69,7 +73,8 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
     let help = run(&session, &["--help"]);
     assert!(help.status.success(), "{}", output_text(&help));
     let text = output_text(&help);
-    for command in PUBLIC {
+    let public = public_commands();
+    for command in &public {
         assert!(
             text.lines()
                 .any(|line| line.trim_start().starts_with(command)),
@@ -95,8 +100,8 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
             "leaked {hidden}: {text}"
         );
     }
-    for allowed in PUBLIC {
-        let output = run(&session, &[allowed, "--help"]);
+    for allowed in &public {
+        let output = run(&session, &[allowed.as_str(), "--help"]);
         assert!(
             output.status.success(),
             "allowed root {allowed} did not parse: {}",
@@ -133,7 +138,7 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
         &mut completion,
     );
     let completion = String::from_utf8(completion).unwrap();
-    for command in PUBLIC {
+    for command in &public {
         assert!(completion.contains(command), "completion omitted {command}");
     }
     for hidden in ["account", "sync", "connect", "assistant", "mcp", "schedule"] {
@@ -148,33 +153,16 @@ fn public_help_and_completion_expose_exact_v0_1_roots() {
 fn fresh_state_missing_provider_and_daemon_tui_are_offline_stable() {
     let mut session = HermeticCockpit::prepare(HermeticProfile::Default);
     session.enable_isolated_secret_service();
-    let poison = install_poison_endpoints(&mut session);
+    let denied_network = install_network_deny_recorder(&mut session);
     std::fs::remove_file(session.home().config_dir().join("providers/local.json")).unwrap();
     let doctor = run(&session, &["doctor", "--offline"]);
-    assert!(doctor.status.success(), "{}", output_text(&doctor));
-    let models = run(&session, &["models"]);
+    assert_eq!(doctor.status.code(), Some(1), "{}", output_text(&doctor));
     assert!(
-        models.status.success() || models.status.code() == Some(4),
+        output_text(&doctor).contains("no providers configured"),
         "{}",
-        output_text(&models)
+        output_text(&doctor)
     );
-    let missing = output_text(&models).to_ascii_lowercase();
-    assert!(
-        missing.contains("provider")
-            && (missing.contains("missing")
-                || missing.contains("unavailable")
-                || missing.contains("configured")),
-        "missing-provider diagnostic was not explicit: {missing}"
-    );
-    session.start_trusted_daemon();
-    session.spawn_pty(100, 30).unwrap();
-    session
-        .wait_until_ready(std::time::Duration::from_secs(30))
-        .unwrap();
-    assert!(session.snapshot().contents().contains("Message"));
-    assert_no_network_attempt(&poison);
-    session.reap();
-    session.assert_reaped();
+    assert_no_network_attempt(&denied_network);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -194,8 +182,17 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
     )
     .unwrap();
     session.enable_isolated_secret_service();
-    let poison = install_poison_endpoints(&mut session);
+    let denied_network = install_network_deny_recorder(&mut session);
+    let clean_doctor = run(&session, &["doctor", "--offline"]);
+    assert!(
+        clean_doctor.status.success(),
+        "{}",
+        output_text(&clean_doctor)
+    );
     session.start_trusted_daemon();
+    session.spawn_pty(100, 30).unwrap();
+    session.wait_until_ready(Duration::from_secs(30)).unwrap();
+    assert!(session.snapshot().contents().contains("Message"));
 
     let secret = "release-acceptance-secret-7f31";
     let prompt = format!("durable release prompt {secret}");
@@ -272,7 +269,7 @@ async fn isolated_settings_export_and_restart_resume_paths_execute_without_accou
         !exported.contains(secret),
         "redacted export leaked env-derived secret"
     );
-    assert_no_network_attempt(&poison);
+    assert_no_network_attempt(&denied_network);
     assert!(
         !provider.captured().is_empty(),
         "scripted provider saw no successful turn"

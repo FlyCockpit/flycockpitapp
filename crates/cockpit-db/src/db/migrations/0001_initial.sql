@@ -6361,6 +6361,61 @@ BEGIN
     SELECT RAISE(ABORT, 'local operation terminal receipt is final');
 END;
 
+-- Hash-only recovery bridge for daemon-owned agent definition mutations.
+-- Agent markdown never enters SQLite.  The journal is inserted before the
+-- authoritative atomic file publication and binds the owner receipt fence to
+-- the consumed and intended filesystem projections.  Boot reconciliation can
+-- therefore prove a commit after a lost response without replaying a stale
+-- create/save/delete/reset against a different document revision.
+CREATE TABLE agent_mutation_journals (
+    owner_digest          TEXT NOT NULL,
+    client_operation_id   TEXT NOT NULL,
+    request_hash          BLOB NOT NULL CHECK (
+        typeof(request_hash) = 'blob' AND length(request_hash) = 32
+    ),
+    fencing_generation    INTEGER NOT NULL CHECK (fencing_generation > 0),
+    project_root          TEXT NOT NULL,
+    agent_name            TEXT,
+    action                TEXT NOT NULL CHECK (action IN (
+        'eject_builtin', 'save_definition', 'create_definition',
+        'delete_custom', 'reset_builtin', 'reset_all_builtins',
+        'save_goal_supervision'
+    )),
+    consumed_revision     TEXT,
+    intended_projection_hash TEXT NOT NULL CHECK (
+        length(intended_projection_hash) = 64
+        AND intended_projection_hash = lower(intended_projection_hash)
+    ),
+    terminal_response_json TEXT CHECK (
+        terminal_response_json IS NULL OR json_valid(terminal_response_json)
+    ),
+    created_at_unix_ms    INTEGER NOT NULL,
+    PRIMARY KEY (owner_digest, client_operation_id),
+    CHECK (length(trim(owner_digest)) > 0),
+    CHECK (length(trim(client_operation_id)) > 0),
+    CHECK (length(trim(project_root)) > 0),
+    CHECK ((action = 'reset_all_builtins') = (agent_name IS NULL)),
+    CHECK (agent_name IS NULL OR length(trim(agent_name)) > 0),
+    CHECK (consumed_revision IS NULL OR length(trim(consumed_revision)) > 0)
+);
+CREATE INDEX agent_mutation_journals_created
+ON agent_mutation_journals(created_at_unix_ms);
+CREATE TRIGGER agent_mutation_journals_identity_immutable
+BEFORE UPDATE ON agent_mutation_journals
+WHEN NEW.owner_digest <> OLD.owner_digest
+  OR NEW.client_operation_id <> OLD.client_operation_id
+  OR NEW.request_hash <> OLD.request_hash
+  OR NEW.fencing_generation <> OLD.fencing_generation
+  OR NEW.project_root <> OLD.project_root
+  OR NEW.agent_name IS NOT OLD.agent_name
+  OR NEW.action <> OLD.action
+  OR NEW.consumed_revision IS NOT OLD.consumed_revision
+  OR NEW.intended_projection_hash <> OLD.intended_projection_hash
+  OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
+BEGIN
+    SELECT RAISE(ABORT, 'agent mutation journal identity is immutable');
+END;
+
 -- External editor leases are durable authority, not frontend/UI state. The
 -- markdown submitted at completion is represented only by an installation-
 -- and vault-keyed identity; a retry must supply the same bytes. An open lease

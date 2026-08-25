@@ -92,7 +92,21 @@ impl Db {
                     )",
                 params![cutoff_unix_ms],
             )? as u64;
-            Ok(receipts.saturating_add(editor).saturating_add(patch_journals))
+            let agent_journals = conn.execute(
+                "DELETE FROM agent_mutation_journals
+                  WHERE created_at_unix_ms < ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM local_operation_receipts receipt
+                         WHERE receipt.owner_digest=agent_mutation_journals.owner_digest
+                           AND receipt.client_operation_id=agent_mutation_journals.client_operation_id
+                           AND receipt.state IN ('prepared','executing')
+                    )",
+                params![cutoff_unix_ms],
+            )? as u64;
+            Ok(receipts
+                .saturating_add(editor)
+                .saturating_add(patch_journals)
+                .saturating_add(agent_journals))
         })
         .await
     }

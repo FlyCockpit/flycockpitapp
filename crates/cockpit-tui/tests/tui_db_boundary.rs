@@ -283,6 +283,23 @@ const BLOCKING_TRANSPORT_ROOTS: &[&str] = &[
     "resource_snapshot_blocking",
 ];
 
+// Reviewed transport adapters in `tui/agent_runner.rs`. This list is
+// intentionally explicit: deriving wrappers from the call graph would let a
+// reducer become self-exempting merely by calling a forbidden primitive.
+const APPROVED_BLOCKING_ADAPTERS: &[&str] = &[
+    "daemon_request_from_blocking_worker",
+    "fork_session_blocking",
+    "discard_session_blocking",
+    "list_sessions_blocking",
+    "read_session_messages_blocking",
+    "read_client_submission_receipt_blocking",
+    "read_history_page_blocking",
+    "read_subagent_history_page_blocking",
+    "resource_snapshot_blocking",
+    "promote_resource_blocking",
+    "session_live_status_blocking",
+];
+
 fn call_name(call: &syn::ExprCall) -> Option<String> {
     match call.func.as_ref() {
         syn::Expr::Path(path) => path
@@ -329,108 +346,24 @@ fn method_is_worker_boundary(call: &syn::ExprMethodCall) -> bool {
         || (call.method == "start_owned_blocking_action" && receiver == "self")
 }
 
-fn blocking_authority_functions(sources: &[String]) -> std::collections::HashSet<String> {
-    #[derive(Default)]
-    struct CallGraph {
-        current: Option<String>,
-        worker_depth: usize,
-        calls: std::collections::HashMap<String, std::collections::HashSet<String>>,
-    }
-
-    impl CallGraph {
-        fn record(&mut self, name: String) {
-            if self.worker_depth == 0
-                && let Some(current) = &self.current
-            {
-                self.calls.entry(current.clone()).or_default().insert(name);
-            }
-        }
-
-        fn visit_worker_closure(&mut self, closure: &syn::ExprClosure) {
-            self.worker_depth += 1;
-            syn::visit::visit_expr_closure(self, closure);
-            self.worker_depth -= 1;
-        }
-    }
-
-    impl<'ast> Visit<'ast> for CallGraph {
-        fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
-            let previous = self.current.replace(function.sig.ident.to_string());
-            syn::visit::visit_block(self, &function.block);
-            self.current = previous;
-        }
-
-        fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
-            let previous = self.current.replace(function.sig.ident.to_string());
-            syn::visit::visit_block(self, &function.block);
-            self.current = previous;
-        }
-
-        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-            let approved = method_is_worker_boundary(call);
-            self.visit_expr(&call.receiver);
-            for argument in &call.args {
-                if approved && let syn::Expr::Closure(closure) = argument {
-                    self.visit_worker_closure(closure);
-                    continue;
-                }
-                self.visit_expr(argument);
-            }
-            if !approved {
-                self.record(call.method.to_string());
-            }
-        }
-
-        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-            let approved = matches!(call.func.as_ref(), syn::Expr::Path(path) if path_is_spawn_blocking(&path.path));
-            for argument in &call.args {
-                if approved && let syn::Expr::Closure(closure) = argument {
-                    self.visit_worker_closure(closure);
-                    continue;
-                }
-                self.visit_expr(argument);
-            }
-            if !approved && let Some(name) = call_name(call) {
-                self.record(name);
-            }
-        }
-    }
-
-    let mut graph = CallGraph::default();
-    for source in sources {
-        let source = production_source(source);
-        let file = syn::parse_file(&source).expect("production source remains parseable");
-        graph.visit_file(&file);
-    }
-    let mut authority = BLOCKING_TRANSPORT_ROOTS
+fn blocking_authority_functions(_sources: &[String]) -> std::collections::HashSet<String> {
+    BLOCKING_TRANSPORT_ROOTS
         .iter()
+        .chain(APPROVED_BLOCKING_ADAPTERS)
         .map(|name| (*name).to_string())
-        .collect::<std::collections::HashSet<_>>();
-    loop {
-        let newly_authoritative = graph
-            .calls
-            .iter()
-            .filter(|(function, calls)| {
-                !authority.contains(*function) && calls.iter().any(|call| authority.contains(call))
-            })
-            .map(|(function, _)| function.clone())
-            .collect::<Vec<_>>();
-        if newly_authoritative.is_empty() {
-            break;
-        }
-        authority.extend(newly_authoritative);
-    }
-    authority
+        .collect()
 }
 
 fn blocking_worker_transport_findings_with_authority(
     source: &str,
     authority: &std::collections::HashSet<String>,
+    approved_adapter_module: bool,
 ) -> Vec<String> {
     struct WorkerVisitor {
         worker_depth: usize,
         current_function: Option<String>,
         authority: std::collections::HashSet<String>,
+        approved_adapter_module: bool,
         findings: Vec<String>,
     }
 
@@ -445,11 +378,11 @@ fn blocking_worker_transport_findings_with_authority(
             if !self.authority.contains(name) {
                 return;
             }
-            let inside_authority_wrapper = self
-                .current_function
-                .as_ref()
-                .is_some_and(|function| self.authority.contains(function));
-            if self.worker_depth == 0 && !inside_authority_wrapper {
+            let inside_approved_adapter = self.approved_adapter_module
+                && self.current_function.as_ref().is_some_and(|function| {
+                    APPROVED_BLOCKING_ADAPTERS.contains(&function.as_str())
+                });
+            if self.worker_depth == 0 && !inside_approved_adapter {
                 self.findings.push(format!(
                     "line {line}: blocking daemon transport `{name}` escapes an approved worker closure"
                 ));
@@ -548,6 +481,7 @@ fn blocking_worker_transport_findings_with_authority(
         worker_depth: 0,
         current_function: None,
         authority: authority.clone(),
+        approved_adapter_module,
         findings: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -557,7 +491,7 @@ fn blocking_worker_transport_findings_with_authority(
 fn blocking_worker_transport_findings(source: &str) -> Vec<String> {
     let sources = vec![source.to_string()];
     let authority = blocking_authority_functions(&sources);
-    blocking_worker_transport_findings_with_authority(source, &authority)
+    blocking_worker_transport_findings_with_authority(source, &authority, false)
 }
 
 #[test]
@@ -586,7 +520,11 @@ fn blocking_daemon_transport_is_structurally_worker_owned() {
     let mut findings = Vec::new();
     for (path, source) in sources {
         findings.extend(
-            blocking_worker_transport_findings_with_authority(&source, &authority)
+            blocking_worker_transport_findings_with_authority(
+                &source,
+                &authority,
+                path.ends_with("agent_runner.rs"),
+            )
                 .into_iter()
                 .map(|finding| format!("{}: {finding}", path.display())),
         );
@@ -611,6 +549,7 @@ fn blocking_daemon_transport_gate_rejects_obscured_and_reducer_calls() {
         "fn reducer() { let rpc = agent_runner::daemon_request_from_blocking_worker; rpc(req); }",
         "fn wrapper() { daemon_request_at_blocking(socket, req); } fn reducer() { wrapper(); }",
         "fn wrapper() { request_on_socket(socket, req); } fn alias() { wrapper(); } fn reducer() { alias(); }",
+        "fn fork_session_blocking() { daemon_request_blocking(req); }",
         "fn reducer() { fake.start_blocking(move || agent_runner::daemon_request_from_blocking_worker(req)); }",
         "fn reducer() { macro_rules! hidden { () => { agent_runner::daemon_request_from_blocking_worker(req) } } }",
     ] {

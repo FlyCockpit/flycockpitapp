@@ -175,61 +175,6 @@ async fn delete_editor_replay_and_row(
         .map_err(internal)
 }
 
-async fn terminalize_editor_failure(
-    ctx: &DaemonContext,
-    row: &crate::db::agent_editor_leases::AgentEditorLeaseRow,
-    project_root: &str,
-    completion_identity: [u8; 32],
-    error: &ErrorPayload,
-) -> Result<AgentEditorCompletion, ErrorPayload> {
-    let error = safe_editor_rejection(error);
-    let receipt = editor_completion(
-        row,
-        row.completion_operation_id
-            .as_deref()
-            .ok_or_else(|| internal("editor failure omitted its client operation identity"))?,
-        project_root,
-        AgentEditorSettlementStatus::Rejected { error },
-    );
-    let terminal_error_json = serde_json::to_string(&receipt).map_err(internal)?;
-    let completion_operation_id = receipt.client_operation_id.clone();
-    let lease_id = row.lease_id.clone();
-    let replay_handle = editor_replay_handle(&lease_id);
-    let completion_handle = row.completion_handle.clone();
-    let vault = ctx.secret_vault.clone();
-    ctx.db
-        .transaction(move |conn| {
-            vault
-                .mutate_item_on_conn(
-                    conn,
-                    cockpit_db::secret_vault::SecretVaultKind::SealedState,
-                    &replay_handle,
-                    None,
-                )
-                .map_err(|error| anyhow::anyhow!(error))?;
-            if let Some(handle) = completion_handle.as_deref() {
-                vault
-                    .mutate_item_on_conn(
-                        conn,
-                        cockpit_db::secret_vault::SecretVaultKind::SealedState,
-                        handle,
-                        None,
-                    )
-                    .map_err(|error| anyhow::anyhow!(error))?;
-            }
-            crate::db::agent_editor_leases::fail_agent_editor_completion_conn(
-                conn,
-                &lease_id,
-                completion_identity,
-                &completion_operation_id,
-                &terminal_error_json,
-            )
-        })
-        .await
-        .map_err(internal)?;
-    Ok(receipt)
-}
-
 /// Boot/periodic maintenance for abandoned editor authority. Expired open
 /// leases and their sealed payloads disappear atomically. Completing claims
 /// remain durable across restart: after the bounded claim interval, the exact
@@ -252,16 +197,7 @@ pub(crate) async fn maintain_editor_leases(ctx: &DaemonContext) -> Result<(), Er
         .await
         .map_err(internal)?;
     for row in completing {
-        let payload = match load_editor_completion(ctx, &row) {
-            Ok(payload) => payload,
-            Err(error) => {
-                let identity = row
-                    .completion_identity
-                    .ok_or_else(|| internal("completing editor lease omitted its identity"))?;
-                terminalize_editor_failure(ctx, &row, &row.project_root, identity, &error).await?;
-                continue;
-            }
-        };
+        let payload = load_editor_completion(ctx, &row)?;
         if let Err(error) = complete_editor_lease(
             ctx,
             payload.client_operation_id.clone(),
@@ -272,10 +208,11 @@ pub(crate) async fn maintain_editor_leases(ctx: &DaemonContext) -> Result<(), Er
         )
         .await
         {
-            let identity = row
-                .completion_identity
-                .ok_or_else(|| internal("completing editor lease omitted its identity"))?;
-            terminalize_editor_failure(ctx, &row, &row.project_root, identity, &error).await?;
+            tracing::warn!(
+                error = %error.message,
+                lease_id = row.lease_id,
+                "editor completion remains pending after maintenance"
+            );
         }
     }
     Ok(())
@@ -292,17 +229,8 @@ pub(crate) async fn recover_editor_leases_before_publish(
         .await
         .map_err(internal)?;
     for row in completing {
-        let payload = match load_editor_completion(ctx, &row) {
-            Ok(payload) => payload,
-            Err(error) => {
-                let identity = row
-                    .completion_identity
-                    .ok_or_else(|| internal("completing editor lease omitted its identity"))?;
-                terminalize_editor_failure(ctx, &row, &row.project_root, identity, &error).await?;
-                continue;
-            }
-        };
-        if let Err(error) = complete_editor_lease_inner(
+        let payload = load_editor_completion(ctx, &row)?;
+        let response = complete_editor_lease_inner(
             ctx,
             payload.client_operation_id.clone(),
             payload.project_root.clone(),
@@ -312,11 +240,27 @@ pub(crate) async fn recover_editor_leases_before_publish(
             true,
         )
         .await
-        {
-            let identity = row
-                .completion_identity
-                .ok_or_else(|| internal("completing editor lease omitted its identity"))?;
-            terminalize_editor_failure(ctx, &row, &row.project_root, identity, &error).await?;
+        .map_err(|error| ErrorPayload {
+            code: ErrorCode::Shutdown,
+            message: format!(
+                "editor completion {} could not be reconciled safely before publication: {}",
+                row.lease_id, error.message
+            ),
+        })?;
+        if matches!(
+            response,
+            Response::AgentEditorLeaseCompleted(AgentEditorCompletion {
+                status: AgentEditorSettlementStatus::Pending,
+                ..
+            })
+        ) {
+            return Err(ErrorPayload {
+                code: ErrorCode::Shutdown,
+                message: format!(
+                    "editor completion {} remains settlement-unknown; refusing daemon publication",
+                    row.lease_id
+                ),
+            });
         }
     }
     Ok(())
@@ -326,7 +270,6 @@ pub async fn inventory(
     ctx: &DaemonContext,
     project_root: String,
 ) -> Result<Response, ErrorPayload> {
-    let request_project_root = project_root.clone();
     let root = trusted_root(ctx, &project_root).await?;
     maintain_editor_leases(ctx).await?;
     tokio::task::spawn_blocking(move || {
@@ -367,35 +310,9 @@ pub async fn mutate(
     mutation: AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<Response, ErrorPayload> {
+    let request_project_root = project_root.clone();
     let root = trusted_root(ctx, &project_root).await?;
     let canonical_root = root.to_string_lossy().into_owned();
-    let plan_root = root.clone();
-    let plan_mutation = mutation.clone();
-    let plan_revision = expected_revision.clone();
-    let plan = tokio::task::spawn_blocking(move || {
-        let guard = cockpit_config::config::hold_config_mutation_lock(
-            &plan_root.join(".cockpit/config.json"),
-        )
-        .map_err(internal)?;
-        recover_reset_all_locked(&plan_root, &guard)?;
-        prepare_mutation_plan_sync(&plan_root, &plan_mutation, plan_revision.as_deref())
-    })
-    .await
-    .map_err(join_error)??;
-    let journal_owner = owner_digest.clone();
-    let journal_operation = client_operation_id.clone();
-    let journal_root = canonical_root.clone();
-    let journal_request_root = request_project_root.clone();
-    let journal_action = plan.action.clone();
-    let journal_name = plan.agent_name.clone();
-    let journal_revision = expected_revision.clone();
-    let journal_hash = plan.intended_projection_hash.clone();
-    let journal_intent_hash = mutation_intent_hash.clone();
-    let journal_consumed_hash = plan.consumed_projection_hash.clone();
-    let affected_hint = i64::from(plan.affected_hint);
-    let changed_hint = if plan.changed_hint { 1_i64 } else { 0_i64 };
-    let consumed_config_generation = i64::try_from(plan.consumed_config_generation)
-        .map_err(|_| internal("agent mutation config generation is out of range"))?;
     let keyed_request_identity = agent_mutation_keyed_identity(
         ctx,
         &owner_digest,
@@ -404,50 +321,75 @@ pub async fn mutate(
         &request_project_root,
         &mutation_intent_hash,
     )?;
-    ctx.db
-        .transaction(move |conn| {
-            let changed = conn.execute(
-                "INSERT OR IGNORE INTO agent_mutation_journals
-                 (owner_digest,client_operation_id,request_hash,keyed_request_identity,fencing_generation,
-                  project_root,request_project_root,agent_name,action,consumed_revision,affected_hint,changed_hint,consumed_config_generation,
-                  mutation_intent_hash,consumed_projection_hash,intended_projection_hash,
-                  terminal_response_json,created_at_unix_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,NULL,?17)",
-                rusqlite::params![
-                    journal_owner,
-                    journal_operation,
-                    request_hash.as_slice(),
-                    keyed_request_identity.as_slice(),
+    let authority_db = ctx.db.clone();
+    let authority_root = root.clone();
+    let authority_mutation = mutation.clone();
+    let authority_revision = expected_revision.clone();
+    let journal_owner = owner_digest.clone();
+    let journal_operation = client_operation_id.clone();
+    let journal_root = canonical_root.clone();
+    let journal_request_root = request_project_root.clone();
+    let journal_intent_hash = mutation_intent_hash.clone();
+    let (plan, result, committed_match) = tokio::task::spawn_blocking(move || {
+        let guard = cockpit_config::config::hold_config_mutation_lock(
+            &authority_root.join(".cockpit/config.json"),
+        )
+        .map_err(internal)?;
+        recover_reset_all_locked(&authority_root, &guard)?;
+        let plan = prepare_mutation_plan_sync(
+            &authority_root,
+            &authority_mutation,
+            authority_revision.as_deref(),
+        )?;
+        let journal_action = plan.action.clone();
+        let journal_name = plan.agent_name.clone();
+        let journal_revision = authority_revision.clone();
+        let journal_hash = plan.intended_projection_hash.clone();
+        let journal_consumed_hash = plan.consumed_projection_hash.clone();
+        let affected_hint = i64::from(plan.affected_hint);
+        let consumed_config_generation = i64::try_from(plan.consumed_config_generation)
+            .map_err(|_| internal("agent mutation config generation is out of range"))?;
+        authority_db
+            .insert_agent_mutation_journal_under_publication_lock(
+                crate::db::agent_mutation_journals::AgentMutationJournalFence {
+                    owner_digest: journal_owner,
+                    client_operation_id: journal_operation,
+                    request_hash,
+                    keyed_request_identity,
                     fencing_generation,
-                    journal_root,
-                    journal_request_root,
-                    journal_name,
-                    journal_action,
-                    journal_revision,
+                    project_root: journal_root,
+                    request_project_root: journal_request_root,
+                    agent_name: journal_name,
+                    action: journal_action,
+                    consumed_revision: journal_revision,
                     affected_hint,
-                    changed_hint,
+                    changed_hint: plan.changed_hint,
                     consumed_config_generation,
-                    journal_intent_hash,
-                    journal_consumed_hash,
-                    journal_hash,
-                    chrono::Utc::now().timestamp_millis()
-                ],
-            )?;
-            if changed != 1 {
-                anyhow::bail!("agent mutation recovery identity already exists");
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|error| conflict(error.to_string()))?;
-    let result = tokio::task::spawn_blocking({
-        let root = root.clone();
-        let mutation = mutation.clone();
-        let expected_revision = expected_revision.clone();
-        move || mutate_sync(&root, mutation, expected_revision)
+                    mutation_intent_hash: journal_intent_hash,
+                    consumed_projection_hash: journal_consumed_hash,
+                    intended_projection_hash: journal_hash,
+                    created_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                },
+            )
+            .map_err(|error| conflict(error.to_string()))?;
+        // The same exclusive publication guard covers planning, durable fence
+        // insertion, and atomic filesystem mutation. Consequently matching
+        // bytes observed here cannot have been published by an intervening
+        // agent writer and accidentally attributed to this operation.
+        let result = mutate_sync_locked(
+            &authority_root,
+            authority_mutation,
+            authority_revision,
+            &guard,
+        );
+        let committed_match = result
+            .as_ref()
+            .err()
+            .map(|_| projection_matches_plan(&authority_root, &plan));
+        Ok::<_, ErrorPayload>((plan, result, committed_match))
     })
     .await
-    .map_err(join_error)?;
+    .map_err(join_error)??;
     let mut response = match result {
         Ok(Response::AgentMutated(mut result)) => {
             bind_agent_mutation_receipt(
@@ -462,16 +404,22 @@ pub async fn mutate(
         }
         Ok(other) => other,
         Err(error) => {
-            let reconcile_root = root.clone();
-            let reconcile_plan = plan.clone();
-            let matched = tokio::task::spawn_blocking(move || {
-                projection_matches_plan(&reconcile_root, &reconcile_plan)
-            })
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(false);
-            if !matched {
+            let committed_match = match committed_match {
+                Some(Ok(matched)) => matched,
+                Some(Err(read_error)) => {
+                    tracing::warn!(
+                        error = %read_error.message,
+                        client_operation_id,
+                        "agent mutation publication settlement is unreadable"
+                    );
+                    return Err(ErrorPayload {
+                        code: ErrorCode::Shutdown,
+                        message: "agent mutation settlement is unknown; retry the exact operation or query its status".into(),
+                    });
+                }
+                None => false,
+            };
+            if !committed_match {
                 delete_agent_mutation_journal(ctx, &owner_digest, &client_operation_id).await?;
                 return Err(error);
             }
@@ -1083,8 +1031,17 @@ pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64,
             }
             tracing::warn!(
                 client_operation_id = operation,
-                "agent mutation recovery projection is divergent; retaining pending journal"
+                "agent mutation recovery projection is divergent; terminalizing settlement as unknown"
             );
+            conflict_agent_mutation_journal(
+                ctx,
+                owner,
+                operation,
+                request_hash,
+                fencing_generation,
+            )
+            .await?;
+            recovered = recovered.saturating_add(1);
             continue;
         }
         let projection_root = root.clone();
@@ -1194,6 +1151,51 @@ async fn cancel_agent_mutation_journal(
         .map_err(internal)
 }
 
+async fn conflict_agent_mutation_journal(
+    ctx: &DaemonContext,
+    owner: String,
+    operation: String,
+    request_hash: [u8; 32],
+    fencing_generation: i64,
+) -> Result<(), ErrorPayload> {
+    let error = ErrorPayload {
+        code: ErrorCode::Conflict,
+        message: "agent mutation publication is settlement-unknown because the authoritative projection diverged; refresh and submit a new operation".into(),
+    };
+    let json = serde_json::to_string(&error).map_err(internal)?;
+    ctx.db
+        .transaction(move |conn| {
+            let changed = conn.execute(
+                "UPDATE local_operation_receipts
+                 SET state='terminal_error',terminal_outcome_json=?5,
+                     execution_expires_at_unix_ms=NULL,updated_at_unix_ms=?6
+                 WHERE owner_digest=?1 AND client_operation_id=?2 AND request_hash=?3
+                   AND fencing_generation=?4 AND state='executing'",
+                rusqlite::params![
+                    owner,
+                    operation,
+                    request_hash.as_slice(),
+                    fencing_generation,
+                    json,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("agent mutation lost its settlement-unknown receipt fence");
+            }
+            let deleted = conn.execute(
+                "DELETE FROM agent_mutation_journals WHERE owner_digest=?1 AND client_operation_id=?2",
+                rusqlite::params![owner, operation],
+            )?;
+            if deleted != 1 {
+                anyhow::bail!("agent mutation lost its divergent recovery journal");
+            }
+            Ok(())
+        })
+        .await
+        .map_err(internal)
+}
+
 pub async fn begin_editor_lease(
     ctx: &DaemonContext,
     client_operation_id: String,
@@ -1202,13 +1204,18 @@ pub async fn begin_editor_lease(
     expected_revision: String,
     principal_digest: String,
 ) -> Result<Response, ErrorPayload> {
+    // Canonicalize the request before durable lookup so exact replay is bound
+    // to workspace identity rather than caller path spelling. This does not
+    // consult mutable trust; new authority issuance remains trust-gated below.
+    let requested_root = crate::daemon::fs_api::canonical_project_root(&project_root)?;
+    let requested_root_text = requested_root.to_string_lossy().into_owned();
     if let Some(existing) = ctx
         .db
         .agent_editor_lease_by_operation(principal_digest.clone(), client_operation_id.clone())
         .await
         .map_err(internal)?
     {
-        if existing.project_root != project_root
+        if existing.project_root != requested_root_text
             || existing.agent_name != name
             || existing.consumed_revision != expected_revision
         {
@@ -1240,9 +1247,8 @@ pub async fn begin_editor_lease(
     // Exact durable replay is independent of the workspace's current trust
     // configuration. Only issuance of new filesystem authority is trust-gated.
     maintain_editor_leases(ctx).await?;
-    let root = crate::daemon::fs_api::canonical_project_root(&project_root)?;
-    let root_text = root.to_string_lossy().into_owned();
-    let root = trusted_canonical_root(ctx, root).await?;
+    let root_text = requested_root_text;
+    let root = trusted_canonical_root(ctx, requested_root).await?;
     let snapshot = tokio::task::spawn_blocking({
         let root = root.clone();
         let name = name.clone();
@@ -1404,7 +1410,14 @@ async fn complete_editor_lease_inner(
     // lease state. A typo, stale workspace selection, or malformed persisted
     // snapshot must not poison an otherwise reusable lease by reserving its
     // one completion slot.
-    if known_lease.project_root != project_root {
+    let request_root_text = if known_lease.project_root == project_root {
+        project_root.clone()
+    } else {
+        crate::daemon::fs_api::canonical_project_root(&project_root)?
+            .to_string_lossy()
+            .into_owned()
+    };
+    if known_lease.project_root != request_root_text {
         return Err(bad_request("editor lease belongs to another workspace"));
     }
     let root_text = known_lease.project_root.clone();
@@ -1551,18 +1564,32 @@ async fn complete_editor_lease_inner(
             {
                 Ok(current) => current,
                 Err(error) => {
-                    let receipt = terminalize_editor_failure(
-                        ctx,
+                    tracing::warn!(
+                        error = %error.message,
+                        lease_id,
+                        "editor completion projection is unreadable; retaining settlement evidence"
+                    );
+                    return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
                         &lease,
+                        &client_operation_id,
                         &root_text,
-                        completion_identity,
-                        &error,
-                    )
-                    .await?;
-                    return Ok(Response::AgentEditorLeaseCompleted(receipt));
+                        AgentEditorSettlementStatus::Pending,
+                    )));
                 }
             };
             if current.markdown == markdown {
+                if current.revision != consumed_lease_revision {
+                    // The durable completion claim predates this observation,
+                    // but it does not prove which filesystem writer published
+                    // identical bytes. Preserve the sealed payload and report
+                    // ambiguity instead of stealing another writer's commit.
+                    return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
+                        &lease,
+                        &client_operation_id,
+                        &root_text,
+                        AgentEditorSettlementStatus::Pending,
+                    )));
+                }
                 let result_revision = current.revision.clone();
                 let generation = crate::daemon::server::inventory::current_config_generation();
                 Response::AgentMutated(AgentMutationResult {
@@ -1572,8 +1599,8 @@ async fn complete_editor_lease_inner(
                     requested_project_root: root_text.clone(),
                     owner_scope: format!("project:{root_text}"),
                     agent_name: Some(lease.agent_name.clone()),
-                    changed: true,
-                    affected: 1,
+                    changed: false,
+                    affected: 0,
                     snapshot: Some(current),
                     config_generation: generation,
                     consumed_config_generation: generation,
@@ -1587,9 +1614,6 @@ async fn complete_editor_lease_inner(
             } else {
                 let agent_name = lease.agent_name.clone();
                 let consumed_revision = lease.consumed_revision.clone();
-                let submitted_markdown = markdown.clone();
-                let reconcile_root = root.clone();
-                let reconcile_name = agent_name.clone();
                 match tokio::task::spawn_blocking(move || {
                     mutate_sync(
                         &root,
@@ -1606,49 +1630,17 @@ async fn complete_editor_lease_inner(
                 {
                     Ok(result) => result,
                     Err(error) => {
-                        let reconciled = tokio::task::spawn_blocking(move || {
-                            snapshot_sync(&reconcile_root, &reconcile_name)
-                        })
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .filter(|snapshot| snapshot.markdown == submitted_markdown);
-                        if let Some(snapshot) = reconciled {
-                            let result_revision = snapshot.revision.clone();
-                            let generation =
-                                crate::daemon::server::inventory::current_config_generation();
-                            Response::AgentMutated(AgentMutationResult {
-                                client_operation_id: client_operation_id.clone(),
-                                mutation_intent_hash: projection_hash(Some(
-                                    submitted_markdown.as_bytes(),
-                                )),
-                                project_root: root_text.clone(),
-                                requested_project_root: root_text.clone(),
-                                owner_scope: format!("project:{root_text}"),
-                                agent_name: Some(lease.agent_name.clone()),
-                                changed: true,
-                                affected: 1,
-                                snapshot: Some(snapshot),
-                                config_generation: generation,
-                                consumed_config_generation: generation,
-                                result_config_generation: generation,
-                                inventory_revision: None,
-                                consumed_revision: Some(consumed_lease_revision.clone()),
-                                result_revision,
-                                completed_lease_id: None,
-                                outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
-                            })
-                        } else {
-                            let receipt = terminalize_editor_failure(
-                                ctx,
-                                &lease,
-                                &root_text,
-                                completion_identity,
-                                &error,
-                            )
-                            .await?;
-                            return Ok(Response::AgentEditorLeaseCompleted(receipt));
-                        }
+                        tracing::warn!(
+                            error = %error.message,
+                            lease_id,
+                            "editor completion write settlement is ambiguous; retaining sealed payload"
+                        );
+                        return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
+                            &lease,
+                            &client_operation_id,
+                            &root_text,
+                            AgentEditorSettlementStatus::Pending,
+                        )));
                     }
                 }
             }
@@ -1706,13 +1698,7 @@ async fn complete_editor_lease_inner(
     let result_json = match serde_json::to_string(&receipt) {
         Ok(json) => json,
         Err(error) => {
-            let error = internal(error);
-            if let Ok(receipt) =
-                terminalize_editor_failure(ctx, &lease, &root_text, completion_identity, &error)
-                    .await
-            {
-                return Ok(Response::AgentEditorLeaseCompleted(receipt));
-            }
+            tracing::warn!(error = %error, lease_id, "editor settlement receipt encoding is unresolved");
             return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
                 &lease,
                 &client_operation_id,
@@ -1779,7 +1765,14 @@ pub async fn editor_lease_settlement(
             message: "agent editor lease belongs to another client principal".into(),
         });
     }
-    if row.project_root != project_root {
+    let request_root_text = if row.project_root == project_root {
+        project_root
+    } else {
+        crate::daemon::fs_api::canonical_project_root(&project_root)?
+            .to_string_lossy()
+            .into_owned()
+    };
+    if row.project_root != request_root_text {
         return Err(bad_request("editor lease belongs to another workspace"));
     }
     let root_text = row.project_root.clone();
@@ -1847,22 +1840,6 @@ fn validate_editor_completion_receipt(
         return Err(internal("editor completion receipt binding mismatch"));
     }
     Ok(())
-}
-
-fn safe_editor_rejection(error: &ErrorPayload) -> ErrorPayload {
-    let message = match &error.code {
-        ErrorCode::Conflict => {
-            "agent editor settlement conflicted with current authority; reopen the editor"
-        }
-        ErrorCode::BadRequest => {
-            "agent editor content was rejected; reopen the editor to correct it"
-        }
-        _ => "agent editor settlement failed after reservation; retry the exact operation",
-    };
-    ErrorPayload {
-        code: error.code.clone(),
-        message: message.into(),
-    }
 }
 
 async fn trusted_root(ctx: &DaemonContext, root: &str) -> Result<PathBuf, ErrorPayload> {
@@ -2100,13 +2077,22 @@ fn mutate_sync(
     mutation: AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<Response, ErrorPayload> {
-    let mutation_name = cockpit_proto::agent_mutation_name(&mutation).map(str::to_owned);
-    let project_root = root.to_string_lossy().into_owned();
-    let consumed_revision = expected_revision.clone();
     let lock_target = root.join(".cockpit/config.json");
     let guard =
         cockpit_config::config::hold_config_mutation_lock(&lock_target).map_err(internal)?;
-    recover_reset_all_locked(root, &guard)?;
+    mutate_sync_locked(root, mutation, expected_revision, &guard)
+}
+
+fn mutate_sync_locked(
+    root: &Path,
+    mutation: AgentMutation,
+    expected_revision: Option<String>,
+    guard: &cockpit_config::config::HeldConfigMutationLock,
+) -> Result<Response, ErrorPayload> {
+    let mutation_name = cockpit_proto::agent_mutation_name(&mutation).map(str::to_owned);
+    let project_root = root.to_string_lossy().into_owned();
+    let consumed_revision = expected_revision.clone();
+    recover_reset_all_locked(root, guard)?;
     let generation_before = crate::daemon::server::inventory::current_config_generation();
     let resets_inventory = matches!(&mutation, AgentMutation::ResetAllBuiltins);
     let (changed, affected, snapshot) = match mutation {
@@ -2677,6 +2663,22 @@ pub async fn recover_known_workspace_resets(ctx: &DaemonContext) -> Result<(), E
         .map_err(internal)?;
     let mut roots = std::collections::BTreeSet::new();
     roots.extend(sessions.into_iter().map(|session| session.project_root));
+    // Reset-all recovery is a dependency of every agent mutation journal. A
+    // workspace need not have a retained session, so derive the boot recovery
+    // inventory from the authority journals themselves as well.
+    let journal_roots: Vec<String> = ctx
+        .db
+        .read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT project_root FROM agent_mutation_journals ORDER BY project_root",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        })
+        .await
+        .map_err(internal)?;
+    roots.extend(journal_roots);
     let mut trusted_roots = Vec::new();
     for root in roots {
         let historical = PathBuf::from(&root);

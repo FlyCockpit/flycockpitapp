@@ -3725,6 +3725,10 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup typed-settings journal recovery failed")?;
+    crate::daemon::agent_management::recover_known_workspace_resets(ctx)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))
+        .context("startup agent reset journal recovery failed")?;
     let recovered_agent_mutations =
         crate::daemon::agent_management::recover_agent_mutation_journals(ctx)
             .await
@@ -3753,10 +3757,6 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
     crate::assistants::recover_definition_journals(&ctx.db)
         .await
         .context("startup assistant-definition journal recovery failed")?;
-    crate::daemon::agent_management::recover_known_workspace_resets(ctx)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.message))
-        .context("startup agent reset journal recovery failed")?;
     crate::daemon::agent_management::recover_editor_leases_before_publish(ctx)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))

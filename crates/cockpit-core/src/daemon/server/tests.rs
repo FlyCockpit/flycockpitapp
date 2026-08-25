@@ -11450,6 +11450,10 @@ fn editor_replay_precedes_mutable_trust_and_terminal_replay_is_exact() {
         .and_then(|tail| tail.split("pub async fn complete_editor_lease").next())
         .expect("begin editor lease handler must exist");
     assert!(
+        begin.find("canonical_project_root").unwrap()
+            < begin.find("agent_editor_lease_by_operation").unwrap()
+    );
+    assert!(
         begin.find("agent_editor_lease_by_operation").unwrap()
             < begin.find("trusted_canonical_root").unwrap()
     );
@@ -11459,6 +11463,9 @@ fn editor_replay_precedes_mutable_trust_and_terminal_replay_is_exact() {
         .and_then(|tail| tail.split("pub async fn editor_lease_settlement").next())
         .expect("complete editor lease handler must exist");
     assert!(complete.contains("known_lease.completion_identity != Some(completion_identity)"));
+    assert!(complete.contains("identical bytes"));
+    assert!(complete.contains("retaining sealed payload"));
+    assert!(!complete.contains("terminalize_editor_failure"));
     assert!(
         complete.find("known_lease.state == \"terminal\"").unwrap()
             < complete.find("trusted_canonical_root").unwrap()
@@ -11522,6 +11529,15 @@ fn authority_recovery_precedes_both_socket_binds() {
     ] {
         assert!(recovery_body.contains(required), "missing {required}");
     }
+    assert!(
+        recovery_body
+            .find("recover_known_workspace_resets")
+            .unwrap()
+            < recovery_body
+                .find("recover_agent_mutation_journals")
+                .unwrap(),
+        "reset-all filesystem journals must reconcile before dependent agent authority journals"
+    );
 }
 
 #[test]
@@ -11546,20 +11562,58 @@ fn ordinary_agent_mutations_are_receipt_fenced_before_file_publication() {
 
     let management = include_str!("../agent_management.rs");
     let journal = management
-        .find("INSERT OR IGNORE INTO agent_mutation_journals")
+        .find("insert_agent_mutation_journal_under_publication_lock")
         .expect("agent mutation must durably journal its intended projection");
     let publish = management[journal..]
-        .find("mutate_sync(&root, mutation, expected_revision)")
+        .find("mutate_sync_locked(")
         .expect("agent publication must follow journal admission");
     assert!(publish > 0);
+    let mutate = management
+        .split("pub async fn mutate(")
+        .nth(1)
+        .and_then(|tail| tail.split("struct AgentMutationPlan").next())
+        .expect("agent mutation handler must exist");
+    for required in [
+        "hold_config_mutation_lock",
+        "insert_agent_mutation_journal_under_publication_lock",
+        "mutate_sync_locked",
+        "settlement is unknown",
+    ] {
+        assert!(
+            mutate.contains(required),
+            "missing causal authority marker {required}"
+        );
+    }
+    assert!(
+        mutate.find("hold_config_mutation_lock").unwrap()
+            < mutate
+                .find("insert_agent_mutation_journal_under_publication_lock")
+                .unwrap()
+    );
+    assert!(
+        mutate
+            .find("insert_agent_mutation_journal_under_publication_lock")
+            .unwrap()
+            < mutate.find("mutate_sync_locked(").unwrap()
+    );
+    let db_fence = include_str!("../../../../cockpit-db/src/db/agent_mutation_journals.rs");
+    assert!(db_fence.contains("INSERT OR IGNORE INTO agent_mutation_journals"));
     for required in [
         "projection_matches_plan",
         "CommittedRefreshNeeded",
         "recover_agent_mutation_journals",
+        "conflict_agent_mutation_journal",
+        "state='terminal_error'",
         "SET state='terminal_success'",
     ] {
         assert!(management.contains(required), "missing {required}");
     }
+    let reset_recovery = management
+        .split("pub async fn recover_known_workspace_resets")
+        .nth(1)
+        .and_then(|tail| tail.split("fn reset_all_builtins_atomic_locked").next())
+        .expect("reset journal recovery must exist");
+    assert!(reset_recovery.contains("SELECT DISTINCT project_root FROM agent_mutation_journals"));
 }
 
 #[tokio::test]

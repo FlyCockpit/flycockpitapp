@@ -3,13 +3,15 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 matrix="$root/apps/cli/release/local-runtime-capabilities-v1.json"
-tree="$(cargo tree --locked -e normal -p cockpit-cli --no-default-features --prefix none)"
-while IFS= read -r dependency; do
-  if grep -Eq "^${dependency}([[:space:]]|$)" <<<"$tree"; then
-    echo "forbidden local dependency: $dependency" >&2
-    exit 1
-  fi
-done < <(jq -r '.forbiddenDependencies[]' "$matrix")
+while IFS= read -r target; do
+  tree="$(cargo tree --locked -e normal -p cockpit-cli --no-default-features --prefix none --target "$target")"
+  while IFS= read -r dependency; do
+    if grep -Fq "$dependency " <<<"$tree"; then
+      echo "forbidden local dependency for $target: $dependency" >&2
+      exit 1
+    fi
+  done < <(jq -r '.forbiddenDependencies[]' "$matrix")
+done < <(jq -r '.targets | keys[]' "$matrix")
 
 if [[ -z "${COCKPIT_RELEASE_BIN:-}" ]]; then
   exit 0

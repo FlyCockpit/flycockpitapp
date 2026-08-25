@@ -138,6 +138,38 @@ fn generated_local_profile_inventory_is_bound_to_sources() {
         assert!(daemon[offset.saturating_sub(100)..offset].contains("feature = \"remote\""));
     }
     let protocol = source("crates/cockpit-proto/src/request.rs");
+    let expected_remote_tags = protocol
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if line.trim() != "#[cfg(feature = \"remote\")]" {
+                return None;
+            }
+            protocol.lines().nth(index + 1).and_then(|variant| {
+                let variant = variant.trim();
+                let end = variant.find([' ', '{', ','])?;
+                let name = &variant[..end];
+                name.chars().next()?.is_ascii_uppercase().then(|| {
+                    name.chars()
+                        .enumerate()
+                        .flat_map(|(offset, ch)| {
+                            (ch.is_ascii_uppercase() && offset > 0)
+                                .then_some('_')
+                                .into_iter()
+                                .chain(std::iter::once(ch.to_ascii_lowercase()))
+                        })
+                        .collect::<String>()
+                })
+            })
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let inventoried_tags = inventory["localProtocolTagDenylist"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tag| tag.as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(inventoried_tags, expected_remote_tags);
     for tag in inventory["localProtocolTagDenylist"].as_array().unwrap() {
         let tag = format!("\"{}\"", tag.as_str().unwrap());
         let offset = protocol

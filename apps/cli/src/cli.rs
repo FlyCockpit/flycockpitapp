@@ -1771,6 +1771,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn removed_login_stub_parses_but_is_hidden_from_help() {
         let cli = Cli::try_parse_from(["cockpit", "login", "--force"]).unwrap();

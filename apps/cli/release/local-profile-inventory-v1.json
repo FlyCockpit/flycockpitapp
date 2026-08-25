@@ -3,11 +3,20 @@
   "profile": "local-v0.1",
   "remoteDaemonWorkers": ["org_sync", "remote_audit_upload", "connector", "remote_outbox_worker"],
   "localProtocolTagDenylist": [
+    "apply_setup_wizard",
+    "delete_provider_config",
+    "get_connector_state",
+    "get_flycockpit_account",
+    "get_org_sync_status",
+    "operation_status",
+    "save_provider_config",
+    "set_provider_layer_metadata",
     "store_flycockpit_credential",
     "clear_flycockpit_credential",
     "set_flycockpit_connector_enabled",
     "sync_flycockpit_org_policy",
-    "enroll_flycockpit_org_sync"
+    "enroll_flycockpit_org_sync",
+    "upsert_provider_config"
   ],
   "remoteSchemaExtension": "0001_remote_profile.sql"
 }

@@ -16995,12 +16995,17 @@ mod provider_atomic_authority_tests {
         assert!(provider.contains("settlement_phase == \"cleanup_pending\""));
         assert!(provider.contains("SET settlement_phase='cleanup_pending'"));
         assert!(provider.contains("SET terminal_response_json=?2"));
+        assert!(provider.contains("None => intended"));
+        assert!(provider.contains("Receiptless delete journals"));
         let mcp = source
             .split("async fn recover_mcp_config_journals_inner")
             .nth(1)
             .expect("MCP recovery");
         assert!(mcp.contains("settlement_phase == \"cleanup_pending\""));
         assert!(mcp.contains("must never be subjected to its old CAS"));
+        assert!(mcp.contains("bounded_publication"));
+        assert!(mcp.contains("with_target(&path"));
+        assert!(!mcp.contains("hold_config_mutation_lock"));
     }
 
     #[test]
@@ -17293,19 +17298,24 @@ async fn recover_provider_config_journals_inner(
             let intended = u64::try_from(intended)
                 .map_err(|_| bad_request("provider journal config generation is invalid"))?;
             if cleanup_only {
-                let response: Response =
-                    serde_json::from_str(journal.terminal_response_json.as_deref().ok_or_else(
-                        || bad_request("provider cleanup journal is missing terminal response"),
-                    )?)
-                    .map_err(internal)?;
-                let published = match response {
-                    Response::ProviderMutationCommitted {
-                        config_generation, ..
-                    }
-                    | Response::CopilotAuthCommitted {
-                        config_generation, ..
-                    } => config_generation,
-                    _ => return Err(internal("provider cleanup journal has wrong response")),
+                let published = match journal.terminal_response_json.as_deref() {
+                    Some(response) => match serde_json::from_str::<Response>(response)
+                        .map_err(internal)?
+                    {
+                        Response::ProviderMutationCommitted {
+                            config_generation, ..
+                        }
+                        | Response::CopilotAuthCommitted {
+                            config_generation, ..
+                        } => config_generation,
+                        _ => return Err(internal("provider cleanup journal has wrong response")),
+                    },
+                    // Receiptless delete journals predate the typed local
+                    // receipt surface but remain active internal operations.
+                    // Their intended generation was transactionally bound
+                    // before publication and is sufficient for cleanup-only
+                    // replay; never send them back through the stale file CAS.
+                    None => intended,
                 };
                 inventory::publish_committed_config_generation_at_least(published);
                 published
@@ -19820,6 +19830,9 @@ async fn recover_mcp_config_journals_inner(
     ) in journals
     {
         let defer_secret_cleanup = publication.is_some();
+        let bounded_publication = publication.unwrap_or_else(
+            crate::daemon::config_publication_recovery::PreSocketConfigPublication::new,
+        );
         let cleanup_only = settlement_phase == "cleanup_pending";
         let path = std::path::PathBuf::from(path);
         let reconcile_path = path.clone();
@@ -19836,8 +19849,8 @@ async fn recover_mcp_config_journals_inner(
             // Receipt settlement already advanced this durable row to a
             // replayable cleanup-only phase. A later file revision is outside
             // this operation and must never be subjected to its old CAS.
-        } else if let Some(publication) = publication {
-            publication
+        } else {
+            bounded_publication
                 .with_target(&path, move |_| reconcile())
                 .await
                 .map_err(|error| ErrorPayload {
@@ -19846,14 +19859,6 @@ async fn recover_mcp_config_journals_inner(
                         "bounded MCP recovery could not acquire publication authority: {error:#}"
                     ),
                 })?;
-        } else {
-            tokio::task::spawn_blocking(move || {
-                let _guard =
-                    cockpit_config::config::hold_config_mutation_lock(&path).map_err(internal)?;
-                reconcile().map_err(internal)
-            })
-            .await
-            .map_err(internal)??;
         }
         let cleanup: std::collections::BTreeSet<String> =
             serde_json::from_str(&cleanup_json).map_err(internal)?;

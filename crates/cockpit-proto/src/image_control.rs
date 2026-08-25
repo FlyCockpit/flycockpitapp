@@ -303,6 +303,9 @@ pub enum ImageControlReadResultV1 {
 pub struct ImageControlReadResponseV1 {
     pub schema_version: u8,
     pub daemon_instance_id: String,
+    /// Canonical workspace identity authenticated and used by the daemon.
+    pub canonical_project_id: String,
+    /// Caller-supplied project spelling retained for correlation/display.
     pub project_id: String,
     /// Opaque daemon-keyed identity of the exact authoritative target-layer
     /// document consumed by a subsequent mutation. It is not a public hash of
@@ -319,12 +322,14 @@ pub struct ImageControlReadResponseV1 {
 impl ImageControlReadResponseV1 {
     pub fn new(
         daemon_instance_id: String,
+        canonical_project_id: String,
         project_id: String,
         result: ImageControlReadResultV1,
     ) -> Self {
         Self {
             schema_version: IMAGE_CONTROL_SCHEMA_VERSION,
             daemon_instance_id,
+            canonical_project_id,
             project_id,
             config_revision: String::new(),
             target_path: String::new(),

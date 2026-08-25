@@ -847,10 +847,12 @@ pub(crate) async fn dispatch_image_control_mutation(
         project_changes(&new_registry, &pending, &generation),
     );
     let daemon_instance_id = inventory::daemon_instance_id().to_string();
+    let canonical_project_id = cwd.to_string_lossy().into_owned();
     let mut response = Response::ImageControlMutated(ImageControlMutationResponseV1::new(
         client_operation_id.clone(),
         mutation_intent_hash.clone(),
         daemon_instance_id.clone(),
+        canonical_project_id,
         project_root.clone(),
         target_display.clone(),
         consumed_revision.clone(),
@@ -863,7 +865,7 @@ pub(crate) async fn dispatch_image_control_mutation(
 
     let journal_owner = owner.clone();
     let journal_operation = client_operation_id.clone();
-    let journal_project = project_root.clone();
+    let journal_project = cwd.to_string_lossy().into_owned();
     let journal_target = target_display.clone();
     let journal_consumed = consumed_revision.clone();
     let journal_intended = result_revision.clone();
@@ -909,7 +911,10 @@ pub(crate) async fn dispatch_image_control_mutation(
         cockpit_config::config::write_config_bytes_atomic(&target, &intended).map_err(internal)?;
         inventory::publish_committed_config_generation()
     } else {
-        current
+        // A semantic/no-byte-change result still reports the generation at
+        // its commit observation point. Another config family may have
+        // published while this operation waited on the target file lock.
+        inventory::current_config_generation()
     };
     drop(publication_guard);
 

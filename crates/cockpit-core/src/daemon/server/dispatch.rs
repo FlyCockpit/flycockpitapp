@@ -14244,13 +14244,14 @@ async fn provider_catalog_snapshot(
                 .config_write_target_for_provider(&cwd, "default")
         })
         .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+    let target_path = canonical_mcp_target_path(&target_path)?;
     let revision = {
         let _file_lock =
             cockpit_config::config::hold_config_mutation_lock(&target_path).map_err(internal)?;
         let layer = crate::config::providers::ConfigDoc::load(&target_path)
             .map_err(internal)?
             .providers();
-        provider_config_revision(&layer)?
+        provider_config_revision(ctx, &target_path, &layer)?
     };
     let layer_material = format!(
         "provider-layer\0{canonical_root}\0{}\0{snapshot_session_id}",
@@ -14305,12 +14306,17 @@ async fn provider_catalog_snapshot(
 }
 
 fn provider_config_revision(
+    ctx: &DaemonContext,
+    target_path: &std::path::Path,
     config: &crate::config::providers::ProvidersConfig,
 ) -> std::result::Result<String, ErrorPayload> {
-    let bytes = serde_json::to_vec(config).map_err(internal)?;
-    Ok(crate::intel::hex_lower(&<Sha256 as sha2::Digest>::digest(
-        &bytes,
-    )))
+    let bytes = zeroize::Zeroizing::new(
+        serde_json::to_vec(&(target_path.to_string_lossy().as_ref(), config)).map_err(internal)?,
+    );
+    Ok(crate::intel::hex_lower(
+        &ctx.secret_vault
+            .keyed_request_identity(b"flycockpit.provider-layer-revision.v1\0", bytes.as_slice()),
+    ))
 }
 
 async fn apply_provider_mutation(
@@ -14375,7 +14381,7 @@ async fn apply_provider_mutation(
             let layer = crate::config::providers::ConfigDoc::load(&capability.target_path)
                 .map_err(internal)?
                 .providers();
-            provider_config_revision(&layer)?
+            provider_config_revision(ctx, &capability.target_path, &layer)?
         };
         validate_provider_edit_capability(
             &capability,
@@ -15503,6 +15509,7 @@ async fn stage_and_recover_provider_batch(
             .config_write_target_for_provider(&cwd, "default")
     })
     .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+    let target = canonical_mcp_target_path(&target)?;
     if target != capability_target {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -15526,6 +15533,7 @@ async fn stage_and_recover_provider_batch(
                     .config_write_target_for_provider(&cwd, provider_id)
             })
             .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+        let provider_target = canonical_mcp_target_path(&provider_target)?;
         if provider_target != target {
             return Err(bad_request(
                 "provider batch spans multiple authority layers; reload the defining layer",
@@ -15534,7 +15542,7 @@ async fn stage_and_recover_provider_batch(
     }
     let doc = crate::config::providers::ConfigDoc::load(&target).map_err(internal)?;
     let mut desired = doc.providers();
-    let observed_consumed_revision = provider_config_revision(&desired)?;
+    let observed_consumed_revision = provider_config_revision(ctx, &target, &desired)?;
     if observed_consumed_revision != consumed_revision {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
@@ -15648,7 +15656,7 @@ async fn stage_and_recover_provider_batch(
     // retiring this provider's claim would still break its next resolution.
     retain_only_stale_provider_credentials(&desired, &mut cleanup_credentials);
 
-    let result_revision = provider_config_revision(&desired)?;
+    let result_revision = provider_config_revision(ctx, &target, &desired)?;
     let intended_config_generation = consumed_config_generation
         .checked_add(1)
         .ok_or_else(|| internal("provider config generation exhausted"))?;
@@ -17258,6 +17266,7 @@ pub(super) async fn recover_provider_config_journals(
                             .config_write_target_for_provider(&cwd, &journal.provider_id)
                     })
                     .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+                let expected_path = canonical_mcp_target_path(&expected_path)?;
                 if path != expected_path {
                     return Err(bad_request(
                         "provider save journal target no longer matches its authority layer",
@@ -17267,7 +17276,7 @@ pub(super) async fn recover_provider_config_journals(
                 let _file_lock =
                     cockpit_config::config::hold_config_mutation_lock(&path).map_err(internal)?;
                 let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
-                let actual_revision = provider_config_revision(&doc.providers())?;
+                let actual_revision = provider_config_revision(ctx, &path, &doc.providers())?;
                 if actual_revision == intended_revision {
                     // Publication already completed; amend only the exact
                     // authenticated receipt below.
@@ -17278,7 +17287,7 @@ pub(super) async fn recover_provider_config_journals(
                     let published = crate::config::providers::ConfigDoc::load(&path)
                         .map_err(internal)?
                         .providers();
-                    if provider_config_revision(&published)? != intended_revision {
+                    if provider_config_revision(ctx, &path, &published)? != intended_revision {
                         return Err(internal(anyhow::anyhow!(
                             "provider save did not converge to its intended keyed revision"
                         )));
@@ -17338,6 +17347,7 @@ pub(super) async fn recover_provider_config_journals(
                             .config_write_target_for_provider(&cwd, "default")
                     })
                     .ok_or_else(|| bad_request("no cockpit config found"))?;
+                let expected_path = canonical_mcp_target_path(&expected_path)?;
                 if path != expected_path {
                     return Err(bad_request(
                         "provider batch journal target no longer matches its authority layer",
@@ -17347,7 +17357,7 @@ pub(super) async fn recover_provider_config_journals(
                 let _file_lock =
                     cockpit_config::config::hold_config_mutation_lock(&path).map_err(internal)?;
                 let mut doc = crate::config::providers::ConfigDoc::load(&path).map_err(internal)?;
-                let actual_revision = provider_config_revision(&doc.providers())?;
+                let actual_revision = provider_config_revision(ctx, &path, &doc.providers())?;
                 if actual_revision == intended_revision {
                     // Publication completed before a crash. Never rewrite it;
                     // recovery only amends the exact authenticated receipt.
@@ -17356,7 +17366,7 @@ pub(super) async fn recover_provider_config_journals(
                     let published = crate::config::providers::ConfigDoc::load(&path)
                         .map_err(internal)?
                         .providers();
-                    if provider_config_revision(&published)? != intended_revision {
+                    if provider_config_revision(ctx, &path, &published)? != intended_revision {
                         return Err(internal(anyhow::anyhow!(
                             "provider publication did not converge to its intended keyed revision"
                         )));
@@ -17874,15 +17884,16 @@ async fn provider_config_save_under_lock(
             .config_write_target_for_provider(&cwd, provider_id)
     })
     .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
+    let config_path = canonical_mcp_target_path(&config_path)?;
     let raw_layer = crate::config::providers::ConfigDoc::load(&config_path)
         .map_err(internal)?
         .providers();
-    let consumed_revision = provider_config_revision(&raw_layer)?;
+    let consumed_revision = provider_config_revision(ctx, &config_path, &raw_layer)?;
     let mut intended_layer = raw_layer;
     intended_layer
         .providers
         .insert(provider_id.to_owned(), entry.clone());
-    let intended_revision = provider_config_revision(&intended_layer)?;
+    let intended_revision = provider_config_revision(ctx, &config_path, &intended_layer)?;
     let consumed_config_generation = inventory::current_config_generation();
     let intended_config_generation = consumed_config_generation
         .checked_add(1)

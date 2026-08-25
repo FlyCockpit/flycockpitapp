@@ -393,11 +393,11 @@ async fn request_durable_local_mutation(
     operation_kind: &str,
     request: Request,
 ) -> Result<Response> {
-    match client.request(request).await {
+    let initial_rejection = match client.request(request).await {
         Ok(Ok(response)) => return Ok(response),
-        Ok(Err(error)) => bail!("daemon rejected {operation_kind}: {error}"),
-        Err(_) => {}
-    }
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(_) => None,
+    };
     for _ in 0..40 {
         let settlement = client
             .request(Request::GetLocalOperationSettlement {
@@ -436,6 +436,11 @@ async fn request_durable_local_mutation(
             Err(_) => {}
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    if let Some(rejection) = initial_rejection {
+        bail!(
+            "daemon reported {operation_kind} error `{rejection}`, but its durable outcome is still unknown; retry the command to reconcile it"
+        );
     }
     bail!(
         "{operation_kind} may have committed, but its durable outcome is still unknown; retry the command to reconcile it"
@@ -888,7 +893,7 @@ impl ProviderSetupActions {
         // The daemon stages vault bytes and the reference-only config entry
         // under one recoverable journal.  The CLI never allocates predictable
         // vault names or performs a secret/config two-step.
-        let headers_for_notice = entry.headers.clone();
+        let header_reference_notice = env_var_reference_notice(&entry.headers);
         let header_secrets = entry
             .headers
             .iter_mut()
@@ -989,7 +994,7 @@ impl ProviderSetupActions {
         }
         self.saved = Some((id.clone(), self.cwd.join(".cockpit").join(CONFIG_FILE)));
         io.write_line(&format!("Saved provider `{id}`."))?;
-        if let Some(message) = env_var_reference_notice(&headers_for_notice) {
+        if let Some(message) = header_reference_notice {
             io.write_line(&message)?;
         }
         Ok(())

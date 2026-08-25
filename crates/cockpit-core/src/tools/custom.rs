@@ -23,12 +23,12 @@ use serde_json::Value;
 use crate::config::extended::ToolCommandTemplate;
 use crate::engine::tool::{TextArtifactCapture, Tool, ToolCtx, ToolOutput, ToolOutputSidecar};
 use crate::intel::budget::capture_text_artifact_body;
-use crate::process::{
-    BoundedPipeCapture, CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES,
-};
 use crate::redact::RedactionTable;
 use crate::tools::common::{
     OUTPUT_BYTE_CAP, drop_back_margin, drop_front_margin, truncate_head_tail_redacted,
+};
+use cockpit_host::process::{
+    BoundedPipeCapture, CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES,
 };
 
 const SHELL_TIMEOUT_SECS: u64 = 30;
@@ -267,12 +267,12 @@ impl Tool for CustomBashTool {
         command.process_group(0);
         let mut child = command.spawn()?;
         let child_pid = child.id();
-        let stdout_task = crate::process::spawn_bounded_pipe_drain(
+        let stdout_task = cockpit_host::process::spawn_bounded_pipe_drain(
             child.stdout.take(),
             CHILD_PIPE_CAPTURE_HEAD_BYTES,
             CHILD_PIPE_CAPTURE_TAIL_BYTES,
         );
-        let stderr_task = crate::process::spawn_bounded_pipe_drain(
+        let stderr_task = cockpit_host::process::spawn_bounded_pipe_drain(
             child.stderr.take(),
             CHILD_PIPE_CAPTURE_HEAD_BYTES,
             CHILD_PIPE_CAPTURE_TAIL_BYTES,
@@ -285,7 +285,7 @@ impl Tool for CustomBashTool {
         {
             Ok(status) => status?,
             Err(_) => {
-                crate::process::terminate_group_async(
+                cockpit_host::process::terminate_group_async(
                     &mut child,
                     child_pid,
                     std::time::Duration::from_millis(200),

@@ -536,7 +536,7 @@ impl WriteScopeCoordinator {
 
         // Authorization is against the *effective* path, so a symlinked target
         // is judged by where it actually lands.
-        let effective = crate::path_containment::effective_path(target).map_err(|_| {
+        let effective = cockpit_host::path_containment::effective_path(target).map_err(|_| {
             WriteScopeError::EffectivePathChanged {
                 path: target.display().to_string(),
             }
@@ -618,7 +618,7 @@ impl WriteScopeCoordinator {
         // Re-resolve AFTER acquiring the permit. From here the permit's overlap
         // set blocks any Cockpit mutation that could change this path's meaning
         // before the syscall runs.
-        let revalidated = crate::path_containment::effective_path(target).map_err(|_| {
+        let revalidated = cockpit_host::path_containment::effective_path(target).map_err(|_| {
             WriteScopeError::EffectivePathChanged {
                 path: target.display().to_string(),
             }
@@ -654,11 +654,12 @@ impl WriteScopeCoordinator {
         permit: &MutationPermit,
     ) -> Result<(), WriteScopeError> {
         self.validate_token(token).await?;
-        let current = crate::path_containment::effective_path(&permit.requested).map_err(|_| {
-            WriteScopeError::EffectivePathChanged {
-                path: permit.requested.display().to_string(),
-            }
-        })?;
+        let current =
+            cockpit_host::path_containment::effective_path(&permit.requested).map_err(|_| {
+                WriteScopeError::EffectivePathChanged {
+                    path: permit.requested.display().to_string(),
+                }
+            })?;
         if current != permit.effective_target {
             return Err(WriteScopeError::EffectivePathChanged {
                 path: permit.requested.display().to_string(),

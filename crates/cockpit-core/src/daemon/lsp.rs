@@ -968,7 +968,7 @@ async fn remove_lsp_pending(
 impl Drop for LspClient {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.try_lock() {
-            crate::process::terminate_group_start(&mut child);
+            cockpit_host::process::terminate_group_start(&mut child);
         }
     }
 }

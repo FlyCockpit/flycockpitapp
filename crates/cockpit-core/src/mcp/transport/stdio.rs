@@ -441,7 +441,7 @@ impl StdioState {
         match self.child.try_lock() {
             Ok(mut child) => {
                 if let Some(child) = child.as_mut() {
-                    crate::process::terminate_group_start(child);
+                    cockpit_host::process::terminate_group_start(child);
                 }
             }
             Err(_) => {
@@ -464,7 +464,8 @@ impl StdioState {
             return;
         };
         let pid = child.id();
-        crate::process::terminate_group_async(&mut child, pid, STDIO_POISON_WAIT_TIMEOUT).await;
+        cockpit_host::process::terminate_group_async(&mut child, pid, STDIO_POISON_WAIT_TIMEOUT)
+            .await;
         match tokio::time::timeout(STDIO_POISON_WAIT_TIMEOUT, child.wait()).await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => tracing::warn!(

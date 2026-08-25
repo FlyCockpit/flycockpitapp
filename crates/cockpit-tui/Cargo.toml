@@ -19,6 +19,7 @@ remote = ["cockpit-core/remote", "cockpit-proto/remote"]
 [dependencies]
 cockpit-config = { path = "../cockpit-config" }
 cockpit-core = { path = "../cockpit-core" }
+cockpit-host = { path = "../cockpit-host" }
 cockpit-proto = { path = "../cockpit-proto" }
 cockpit-tokenizer = { path = "../cockpit-tokenizer" }
 

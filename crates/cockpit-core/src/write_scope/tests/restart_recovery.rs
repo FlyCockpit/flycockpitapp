@@ -958,7 +958,8 @@ async fn production_barrier_persists_the_transfer_derived_operation_id() {
     );
 
     let root = crate::write_scope::CanonicalScope::from_canonical(
-        crate::path_containment::effective_path(workspace.path()).expect("canonical workspace"),
+        cockpit_host::path_containment::effective_path(workspace.path())
+            .expect("canonical workspace"),
     );
     let parent = coordinator
         .open_root_lease(session_id, "parent", root)

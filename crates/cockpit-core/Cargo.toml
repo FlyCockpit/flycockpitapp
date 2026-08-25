@@ -68,6 +68,7 @@ httpdate = "1"
 tokio-tungstenite = { workspace = true, optional = true }
 cockpit-config = { path = "../cockpit-config" }
 cockpit-db = { path = "../cockpit-db" }
+cockpit-host = { path = "../cockpit-host" }
 cockpit-proto = { path = "../cockpit-proto" }
 cockpit-tokenizer = { path = "../cockpit-tokenizer" }
 cockpit-test-support = { path = "../cockpit-test-support", optional = true }

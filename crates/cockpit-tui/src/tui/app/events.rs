@@ -3592,7 +3592,7 @@ fn run_capture(command: std::process::Command) -> (String, bool) {
 }
 
 fn kill_capture_child(child: &mut std::process::Child) {
-    cockpit_core::process::terminate_group_sync(child, std::time::Duration::from_millis(200));
+    cockpit_host::process::terminate_group_sync(child, std::time::Duration::from_millis(200));
 }
 
 pub(super) fn run_capture_with_options(

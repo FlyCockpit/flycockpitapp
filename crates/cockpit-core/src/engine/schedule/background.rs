@@ -395,7 +395,7 @@ async fn run_background(
                 if changed.is_ok() && *kill_rx.borrow() {
                     killed = true;
                     let pid = child.id();
-                    crate::process::terminate_group_async(
+                    cockpit_host::process::terminate_group_async(
                         &mut child,
                         pid,
                         Duration::from_millis(200),

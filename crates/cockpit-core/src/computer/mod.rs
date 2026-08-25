@@ -956,7 +956,7 @@ impl ComputerBackend for VirtualDisplayBackend {
 impl Drop for VirtualDisplayBackend {
     fn drop(&mut self) {
         if let Some(mut child) = self.xvfb.take() {
-            crate::process::terminate_group_sync(&mut child, Duration::from_millis(200));
+            cockpit_host::process::terminate_group_sync(&mut child, Duration::from_millis(200));
         }
     }
 }

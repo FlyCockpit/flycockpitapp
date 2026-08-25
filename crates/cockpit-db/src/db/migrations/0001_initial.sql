@@ -6300,21 +6300,29 @@ CREATE TABLE local_operation_receipts (
     operation_kind      TEXT NOT NULL,
     request_hash        BLOB NOT NULL
         CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
-    state               TEXT NOT NULL CHECK (state IN ('prepared', 'terminal')),
-    terminal_response_json TEXT
-        CHECK (terminal_response_json IS NULL OR json_valid(terminal_response_json)),
+    state               TEXT NOT NULL CHECK (state IN (
+        'prepared', 'executing', 'terminal_success', 'terminal_error', 'terminal_cancelled'
+    )),
+    fencing_generation  INTEGER NOT NULL CHECK (fencing_generation > 0),
+    execution_started_at_unix_ms INTEGER,
+    execution_expires_at_unix_ms INTEGER,
+    terminal_outcome_json TEXT
+        CHECK (terminal_outcome_json IS NULL OR json_valid(terminal_outcome_json)),
     created_at_unix_ms  INTEGER NOT NULL,
     updated_at_unix_ms  INTEGER NOT NULL,
     PRIMARY KEY (owner_digest, client_operation_id),
     CHECK (length(trim(owner_digest)) > 0),
     CHECK (length(trim(client_operation_id)) > 0),
     CHECK (length(trim(operation_kind)) > 0),
-    CHECK ((state = 'terminal') = (terminal_response_json IS NOT NULL)),
+    CHECK ((state LIKE 'terminal_%') = (terminal_outcome_json IS NOT NULL)),
+    CHECK ((state = 'executing') = (execution_expires_at_unix_ms IS NOT NULL)),
+    CHECK (execution_started_at_unix_ms IS NULL OR execution_started_at_unix_ms >= created_at_unix_ms),
+    CHECK (execution_expires_at_unix_ms IS NULL OR execution_expires_at_unix_ms >= execution_started_at_unix_ms),
     CHECK (updated_at_unix_ms >= created_at_unix_ms)
 );
 CREATE INDEX local_operation_receipts_unsettled
 ON local_operation_receipts(updated_at_unix_ms)
-WHERE state = 'prepared';
+WHERE state IN ('prepared', 'executing');
 CREATE TRIGGER local_operation_receipts_identity_immutable
 BEFORE UPDATE ON local_operation_receipts
 WHEN NEW.owner_digest <> OLD.owner_digest
@@ -6327,7 +6335,7 @@ BEGIN
 END;
 CREATE TRIGGER local_operation_receipts_terminal_is_final
 BEFORE UPDATE ON local_operation_receipts
-WHEN OLD.state = 'terminal'
+WHEN OLD.state LIKE 'terminal_%'
 BEGIN
     SELECT RAISE(ABORT, 'local operation terminal receipt is final');
 END;

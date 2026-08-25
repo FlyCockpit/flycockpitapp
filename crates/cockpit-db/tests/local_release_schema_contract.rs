@@ -21,6 +21,23 @@ fn schema_inventory(conn: &Connection) -> BTreeMap<String, BTreeSet<String>> {
 }
 
 #[test]
+fn local_operation_receipts_have_fenced_terminal_settlement() {
+    let sql = include_str!("../src/db/migrations/0001_initial.sql");
+    for required in [
+        "fencing_generation  INTEGER NOT NULL",
+        "execution_expires_at_unix_ms INTEGER",
+        "'terminal_success', 'terminal_error', 'terminal_cancelled'",
+        "terminal_outcome_json TEXT",
+    ] {
+        assert!(
+            sql.contains(required),
+            "missing receipt invariant: {required}"
+        );
+    }
+    assert!(!sql.contains("state IN ('prepared', 'terminal')"));
+}
+
+#[test]
 fn provider_config_journal_actions_have_strict_payload_shapes() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))

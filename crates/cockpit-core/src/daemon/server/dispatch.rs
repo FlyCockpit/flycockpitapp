@@ -7484,7 +7484,7 @@ async fn handle_serialized_request_impl(
             let encoded_record = serde_json::to_vec(&record_value);
             zeroize_json_strings(&mut record_value);
             let record_bytes = zeroize::Zeroizing::new(encoded_record.map_err(internal)?);
-            if let Some(replay) = begin_local_operation(
+            let fencing_generation = match begin_local_operation(
                 ctx,
                 &settlement_owner,
                 &client_operation_id,
@@ -7493,8 +7493,9 @@ async fn handle_serialized_request_impl(
             )
             .await?
             {
-                return Ok(replay);
-            }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             let receipt = Response::ProviderCredentialCommitted {
                 client_operation_id,
                 provider_id: provider_id.clone(),
@@ -7547,6 +7548,7 @@ async fn handle_serialized_request_impl(
                 settlement_owner,
                 client_operation_id_from_response(&result)?,
                 request_hash,
+                fencing_generation,
                 &result,
             )
             .await?;
@@ -7571,13 +7573,17 @@ async fn handle_serialized_request_impl(
                         response: None,
                     })
                 }
-                crate::db::local_operation_receipts::LocalOperationSettlement::Terminal(json) => {
+                crate::db::local_operation_receipts::LocalOperationSettlement::TerminalSuccess(json) => {
                     let response = serde_json::from_str(&json).map_err(internal)?;
                     Ok(Response::LocalOperationSettlement {
                         client_operation_id,
                         pending: false,
                         response: Some(Box::new(response)),
                     })
+                }
+                crate::db::local_operation_receipts::LocalOperationSettlement::TerminalError(json)
+                | crate::db::local_operation_receipts::LocalOperationSettlement::TerminalCancelled(json) => {
+                    Err(serde_json::from_str(&json).map_err(internal)?)
                 }
             }
         }
@@ -7594,7 +7600,7 @@ async fn handle_serialized_request_impl(
             let owner = oauth_owner(state);
             let request_hash =
                 local_operation_request_hash(&("begin_provider_oauth", &provider_id))?;
-            if let Some(response) = begin_local_operation(
+            let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
                 &client_operation_id,
@@ -7603,8 +7609,9 @@ async fn handle_serialized_request_impl(
             )
             .await?
             {
-                return Ok(response);
-            }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             if let Some((flow_id, authorize_url, user_code)) = ctx
                 .oauth_flows
                 .provider_started(&owner, &client_operation_id)
@@ -7617,8 +7624,15 @@ async fn handle_serialized_request_impl(
                     authorize_url,
                     user_code,
                 };
-                finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
-                    .await?;
+                finish_local_operation(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &response,
+                )
+                .await?;
                 return Ok(response);
             }
             let flow_id = uuid::Uuid::new_v4().to_string();
@@ -7665,8 +7679,15 @@ async fn handle_serialized_request_impl(
                 authorize_url,
                 user_code,
             };
-            finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
-                .await?;
+            finish_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
             Ok(response)
         }
 
@@ -7683,7 +7704,7 @@ async fn handle_serialized_request_impl(
             let owner = oauth_owner(state);
             let request_hash =
                 local_operation_request_hash(&("complete_provider_oauth", &flow_id, &input))?;
-            if let Some(response) = begin_local_operation(
+            let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
                 &client_operation_id,
@@ -7692,8 +7713,9 @@ async fn handle_serialized_request_impl(
             )
             .await?
             {
-                return Ok(response);
-            }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             let mutation = async {
                 // Atomically claim the one-shot flow before any provider network
                 // exchange. A second concurrent completion therefore fails at
@@ -7783,8 +7805,15 @@ async fn handle_serialized_request_impl(
                 })
             };
             let response = mutation.await?;
-            finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
-                .await?;
+            finish_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
             Ok(response)
         }
 
@@ -7799,7 +7828,7 @@ async fn handle_serialized_request_impl(
                 &begin_client_operation_id,
                 &flow_id,
             ))?;
-            if let Some(response) = begin_local_operation(
+            let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
                 &client_operation_id,
@@ -7808,8 +7837,9 @@ async fn handle_serialized_request_impl(
             )
             .await?
             {
-                return Ok(response);
-            }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             let resolved_flow_id = ctx
                 .oauth_flows
                 .resolve_provider_id(flow_id.as_deref(), &begin_client_operation_id, &owner)
@@ -7829,8 +7859,15 @@ async fn handle_serialized_request_impl(
                 flow_id: resolved_flow_id,
                 cancelled,
             };
-            finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
-                .await?;
+            finish_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
             Ok(response)
         }
 
@@ -7851,7 +7888,7 @@ async fn handle_serialized_request_impl(
             let owner = oauth_owner(state);
             let request_hash =
                 local_operation_request_hash(&("begin_mcp_oauth", &project_root, &server))?;
-            if let Some(response) = begin_local_operation(
+            let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
                 &client_operation_id,
@@ -7860,8 +7897,9 @@ async fn handle_serialized_request_impl(
             )
             .await?
             {
-                return Ok(response);
-            }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             if let Some((flow_id, authorize_url)) = ctx
                 .oauth_flows
                 .mcp_started(&owner, &client_operation_id)
@@ -7873,8 +7911,15 @@ async fn handle_serialized_request_impl(
                     flow_id,
                     authorize_url,
                 };
-                finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
-                    .await?;
+                finish_local_operation(
+                    ctx,
+                    owner,
+                    client_operation_id,
+                    request_hash,
+                    fencing_generation,
+                    &response,
+                )
+                .await?;
                 return Ok(response);
             }
             let cwd = std::path::PathBuf::from(&project_root);
@@ -7934,8 +7979,15 @@ async fn handle_serialized_request_impl(
                 flow_id,
                 authorize_url,
             };
-            finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
-                .await?;
+            finish_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
             Ok(response)
         }
 
@@ -7952,7 +8004,7 @@ async fn handle_serialized_request_impl(
             let owner = oauth_owner(state);
             let request_hash =
                 local_operation_request_hash(&("complete_mcp_oauth", &flow_id, &input))?;
-            if let Some(response) = begin_local_operation(
+            let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
                 &client_operation_id,
@@ -7961,8 +8013,9 @@ async fn handle_serialized_request_impl(
             )
             .await?
             {
-                return Ok(response);
-            }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             let mutation = async {
                 let (pending, cancellation_fence) = ctx
                     .oauth_flows
@@ -8037,8 +8090,15 @@ async fn handle_serialized_request_impl(
             };
             let response = mutation.await?;
             let _ = ctx.oauth_flows.remove_mcp(&flow_id, &owner).await;
-            finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
-                .await?;
+            finish_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
             Ok(response)
         }
 
@@ -8053,7 +8113,7 @@ async fn handle_serialized_request_impl(
                 &begin_client_operation_id,
                 &flow_id,
             ))?;
-            if let Some(response) = begin_local_operation(
+            let fencing_generation = match begin_local_operation(
                 ctx,
                 &owner,
                 &client_operation_id,
@@ -8062,8 +8122,9 @@ async fn handle_serialized_request_impl(
             )
             .await?
             {
-                return Ok(response);
-            }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             let resolved_flow_id = ctx
                 .oauth_flows
                 .resolve_mcp_id(flow_id.as_deref(), &begin_client_operation_id, &owner)
@@ -8080,8 +8141,15 @@ async fn handle_serialized_request_impl(
                 flow_id: resolved_flow_id,
                 cancelled,
             };
-            finish_local_operation(ctx, owner, client_operation_id, request_hash, &response)
-                .await?;
+            finish_local_operation(
+                ctx,
+                owner,
+                client_operation_id,
+                request_hash,
+                fencing_generation,
+                &response,
+            )
+            .await?;
             Ok(response)
         }
 
@@ -8171,7 +8239,7 @@ async fn handle_serialized_request_impl(
                 changed,
                 config_generation: inventory::current_config_generation(),
             };
-            if let Some(replay) = begin_local_operation(
+            let fencing_generation = match begin_local_operation(
                 ctx,
                 &settlement_owner,
                 &client_operation_id,
@@ -8180,8 +8248,9 @@ async fn handle_serialized_request_impl(
             )
             .await?
             {
-                return Ok(replay);
-            }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             let result = {
                 #[cfg(feature = "remote")]
                 match remote_operation {
@@ -8224,6 +8293,7 @@ async fn handle_serialized_request_impl(
                 settlement_owner,
                 client_operation_id_from_response(&result)?,
                 request_hash,
+                fencing_generation,
                 &result,
             )
             .await?;
@@ -8449,7 +8519,7 @@ async fn handle_serialized_request_impl(
             let settlement_owner = settings_capability_owner(state);
             let request_hash =
                 local_operation_request_hash(&("setup_copilot_auth", &project_root, &provider_id))?;
-            if let Some(replay) = begin_local_operation(
+            let fencing_generation = match begin_local_operation(
                 ctx,
                 &settlement_owner,
                 &client_operation_id,
@@ -8458,8 +8528,9 @@ async fn handle_serialized_request_impl(
             )
             .await?
             {
-                return Ok(replay);
-            }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept Copilot auth setup",
@@ -8515,6 +8586,7 @@ async fn handle_serialized_request_impl(
                 settlement_owner,
                 client_operation_id_from_response(&response)?,
                 request_hash,
+                fencing_generation,
                 &response,
             )
             .await?;
@@ -8572,7 +8644,7 @@ async fn handle_serialized_request_impl(
                 &secret_values_json,
                 &cleanup_names_json,
             ))?;
-            if let Some(replay) = begin_local_operation(
+            let fencing_generation = match begin_local_operation(
                 ctx,
                 &settlement_owner,
                 &client_operation_id,
@@ -8581,8 +8653,9 @@ async fn handle_serialized_request_impl(
             )
             .await?
             {
-                return Ok(replay);
-            }
+                LocalOperationStart::Replay(response) => return Ok(response),
+                LocalOperationStart::Execute(generation) => generation,
+            };
             if ctx.paths.ephemeral {
                 return Err(bad_request(
                     "ephemeral daemons do not accept MCP config writes",
@@ -8623,6 +8696,7 @@ async fn handle_serialized_request_impl(
                 settlement_owner,
                 client_operation_id_from_response(&response)?,
                 request_hash,
+                fencing_generation,
                 &response,
             )
             .await?;
@@ -10947,7 +11021,7 @@ async fn apply_provider_mutation(
         &expected_revision,
         &mutation,
     ))?;
-    if let Some(replay) = begin_local_operation(
+    let fencing_generation = match begin_local_operation(
         ctx,
         &capability_owner,
         &client_operation_id,
@@ -10956,8 +11030,9 @@ async fn apply_provider_mutation(
     )
     .await?
     {
-        return Ok(replay);
-    }
+        LocalOperationStart::Replay(response) => return Ok(response),
+        LocalOperationStart::Execute(generation) => generation,
+    };
     let _config_lock = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
     let capability = {
         let mut capabilities = PROVIDER_EDIT_CAPABILITIES
@@ -11047,6 +11122,7 @@ async fn apply_provider_mutation(
         capability_owner,
         client_operation_id_from_response(&response)?,
         request_hash,
+        fencing_generation,
         &response,
     )
     .await?;
@@ -11067,13 +11143,18 @@ fn local_operation_request_hash_hex(request_hash: &[u8; 32]) -> String {
         .collect()
 }
 
+enum LocalOperationStart {
+    Execute(i64),
+    Replay(Response),
+}
+
 async fn begin_local_operation(
     ctx: &DaemonContext,
     owner: &str,
     client_operation_id: &str,
     kind: &str,
     request_hash: [u8; 32],
-) -> std::result::Result<Option<Response>, ErrorPayload> {
+) -> std::result::Result<LocalOperationStart, ErrorPayload> {
     match ctx
         .db
         .begin_local_operation(
@@ -11085,15 +11166,25 @@ async fn begin_local_operation(
         .await
         .map_err(|error| conflict(error.to_string()))?
     {
-        crate::db::local_operation_receipts::LocalOperationBegin::Dispatch => Ok(None),
-        crate::db::local_operation_receipts::LocalOperationBegin::Terminal(json) => {
-            serde_json::from_str(&json).map(Some).map_err(internal)
+        crate::db::local_operation_receipts::LocalOperationBegin::Dispatch {
+            fencing_generation,
+        } => Ok(LocalOperationStart::Execute(fencing_generation)),
+        crate::db::local_operation_receipts::LocalOperationBegin::TerminalSuccess(json) => {
+            serde_json::from_str(&json)
+                .map(LocalOperationStart::Replay)
+                .map_err(internal)
         }
-        // These request kinds are serialized and their domain writes are
-        // idempotent/recoverable (vault replace/delete or config journals).
-        // An exact owner+hash retry is therefore the recovery entry point for
-        // a daemon that died after preparing intent but before its receipt.
-        crate::db::local_operation_receipts::LocalOperationBegin::Prepared => Ok(None),
+        crate::db::local_operation_receipts::LocalOperationBegin::TerminalError(json) => {
+            let error: ErrorPayload = serde_json::from_str(&json).map_err(internal)?;
+            Err(error)
+        }
+        crate::db::local_operation_receipts::LocalOperationBegin::TerminalCancelled(json) => {
+            let error: ErrorPayload = serde_json::from_str(&json).map_err(internal)?;
+            Err(error)
+        }
+        crate::db::local_operation_receipts::LocalOperationBegin::Pending => Err(conflict(
+            "an exact duplicate local operation is already executing; query its settlement",
+        )),
     }
 }
 
@@ -11102,11 +11193,19 @@ async fn finish_local_operation(
     owner: String,
     client_operation_id: String,
     request_hash: [u8; 32],
+    fencing_generation: i64,
     response: &Response,
 ) -> std::result::Result<(), ErrorPayload> {
     let response_json = serde_json::to_string(response).map_err(internal)?;
     ctx.db
-        .finish_local_operation(owner, client_operation_id, request_hash, response_json)
+        .finish_local_operation(
+            owner,
+            client_operation_id,
+            request_hash,
+            fencing_generation,
+            "terminal_success".into(),
+            response_json,
+        )
         .await
         .map_err(internal)
 }

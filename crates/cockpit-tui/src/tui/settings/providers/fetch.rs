@@ -393,6 +393,9 @@ pub(in crate::tui::settings) fn render_fetch_all_results(
                 ),
                 red,
             ),
+            Ok(FetchOutcome::UnlistedModelsPreview { .. } | FetchOutcome::Error { .. }) => {
+                unreachable!("FetchHandle converts protocol-only outcomes into errors")
+            }
             Err(e) => (
                 "✗",
                 format!(
@@ -487,6 +490,7 @@ fn fetch_all_degraded_statuses(dialog: &SettingsDialog) -> Vec<(String, FetchDeg
                 FetchDegradedStatus::Failed(redact_model_fetch_reason(error.as_str())),
             )),
             Ok(FetchOutcome::Models { .. }) => None,
+            Ok(FetchOutcome::UnlistedModelsPreview { .. } | FetchOutcome::Error { .. }) => None,
         })
         .collect()
 }

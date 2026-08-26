@@ -499,6 +499,7 @@ fn production_uses_cockpit_proto_directly() {
                 "cockpit_core::welcome::LaunchBundle",
                 "cockpit_core::welcome::LaunchInfo",
                 "cockpit_core::providers::usage::ProviderUsageSnapshot",
+                "cockpit_core::providers::models_fetch::FetchOutcome",
                 "cockpit_core::tokens::TokenUsage",
                 "cockpit_core::engine::model::InferenceErrorClass",
                 "cockpit_core::engine::message::QueueItemStatus",
@@ -619,6 +620,7 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::welcome::LaunchBundle"
                     || imported == "cockpit_core::welcome::LaunchInfo"
                     || imported == "cockpit_core::providers::usage::ProviderUsageSnapshot"
+                    || imported == "cockpit_core::providers::models_fetch::FetchOutcome"
                     || imported == "cockpit_core::tokens::TokenUsage"
                     || imported == "cockpit_core::engine::model::InferenceErrorClass"
                     || imported == "cockpit_core::engine::message::QueueItemStatus"

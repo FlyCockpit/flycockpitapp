@@ -62,9 +62,9 @@ use cockpit_config::providers::{
     provider_model_fetch_reason_display, redact_model_fetch_reason,
 };
 use cockpit_core::auth::copilot_setup::Shell as CopilotShell;
-use cockpit_core::providers::models_fetch::FetchOutcome;
 use cockpit_core::providers::{self as templates, ProviderTemplate};
 use cockpit_core::wizard::{WizardAnswer, WizardRun};
+use cockpit_proto::ProviderModelFetchOutcome as FetchOutcome;
 
 pub(super) use row_editor::{
     HeaderEditor, HeaderMode, HeaderResult, ModelEditor, ModelField, ModelMode, ModelResult,
@@ -1165,6 +1165,9 @@ impl SettingsDialog {
                 }
                 Ok(FetchOutcome::Models { .. }) | Ok(FetchOutcome::FallbackAvailable { .. }) => {
                     unreachable!()
+                }
+                Ok(FetchOutcome::UnlistedModelsPreview { .. } | FetchOutcome::Error { .. }) => {
+                    unreachable!("FetchHandle converts protocol-only outcomes into errors")
                 }
             }
         }

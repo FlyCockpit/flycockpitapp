@@ -2318,8 +2318,7 @@ pub(crate) async fn secret_inventory_contains(
         cursor = Some(next_cursor);
     }
 }
-use cockpit_core::providers::models_fetch::FetchOutcome;
-use cockpit_proto::{Request, Response};
+use cockpit_proto::{ProviderModelFetchOutcome as FetchOutcome, Request, Response};
 use shell::{
     SettingsHeaderAction, SettingsPointerAction, SettingsPointerSurface, SettingsScrollStates,
     marker, muted_style, selected_or_field,

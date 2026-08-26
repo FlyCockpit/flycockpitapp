@@ -7,8 +7,7 @@
 //! async plumbing, not UI state.
 
 use cockpit_config::providers::ProviderEntry;
-use cockpit_core::providers::models_fetch::FetchOutcome;
-use cockpit_proto::{ProviderModelFetchOutcome, Request, Response};
+use cockpit_proto::{ProviderModelFetchOutcome as FetchOutcome, Request, Response};
 use std::sync::{Arc, Mutex};
 
 /// Shared cell for an in-flight `/models` fetch. The background task
@@ -64,25 +63,13 @@ impl FetchHandle {
                     .ok_or_else(|| "daemon returned no provider model fetch result".to_string())?
                     .outcome;
                 Ok(match outcome {
-                    ProviderModelFetchOutcome::Models { models, catalog } => {
-                        FetchOutcome::Models { models, catalog }
-                    }
-                    ProviderModelFetchOutcome::FallbackAvailable {
-                        models,
-                        catalog,
-                        reason,
-                    } => FetchOutcome::FallbackAvailable {
-                        models,
-                        catalog,
-                        reason,
-                    },
-                    ProviderModelFetchOutcome::UnlistedModelsPreview { unlisted_count } => {
+                    FetchOutcome::UnlistedModelsPreview { unlisted_count } => {
                         return Err(format!(
                             "model fetch needs a keep/remove decision for {unlisted_count} configured model(s)"
                         ));
                     }
-                    ProviderModelFetchOutcome::Unsupported => FetchOutcome::Unsupported,
-                    ProviderModelFetchOutcome::Error { message } => return Err(message),
+                    FetchOutcome::Error { message } => return Err(message),
+                    outcome => outcome,
                 })
             }
             .await;

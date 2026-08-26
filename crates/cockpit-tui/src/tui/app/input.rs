@@ -2464,9 +2464,10 @@ impl App {
                 self.composer.set_cursor(lo);
             }
             Operator::Delete | Operator::Change => {
-                self.composer.cut_range(lo, hi, false);
-                self.paste_registry
-                    .shift_for_edit(lo, -((hi - lo) as isize));
+                if let Some(removed) = self.composer.cut_range(lo, hi, false) {
+                    self.paste_registry
+                        .shift_for_edit(removed.start, -(removed.len() as isize));
+                }
             }
         }
         self.mirror_register_to_clipboard();
@@ -4228,9 +4229,10 @@ impl App {
             lo = lo.min(bs);
             hi = hi.max(be);
         }
-        self.composer.delete_range(lo, hi);
-        self.paste_registry
-            .shift_for_edit(lo, -((hi - lo) as isize));
+        if let Some(removed) = self.composer.delete_range(lo, hi) {
+            self.paste_registry
+                .shift_for_edit(removed.start, -(removed.len() as isize));
+        }
     }
 
     /// Run a `f`/`F`/`t`/`T` find as a standalone Normal-mode motion,
@@ -4264,10 +4266,12 @@ impl App {
         }
         let hi = from + ch.len_utf8();
         // Yank the char and remove it, block-aware via the registry.
-        self.composer.cut_range(from, hi, false);
-        if !self.paste_registry.is_empty() {
+        let removed = self.composer.cut_range(from, hi, false);
+        if !self.paste_registry.is_empty()
+            && let Some(removed) = removed
+        {
             self.paste_registry
-                .shift_for_edit(from, -((hi - from) as isize));
+                .shift_for_edit(removed.start, -(removed.len() as isize));
         }
         self.mirror_register_to_clipboard();
     }
@@ -4310,11 +4314,7 @@ impl App {
                     .unwrap_or(0)
             }
         } else if after {
-            self.composer.text()[cursor..]
-                .chars()
-                .next()
-                .map(|c| cursor + c.len_utf8())
-                .unwrap_or(cursor)
+            self.composer.semantic_boundary_after_cursor()
         } else {
             cursor
         };
@@ -4506,9 +4506,10 @@ impl App {
                 self.composer.set_vim_mode(VimMode::Normal);
             }
             Operator::Delete | Operator::Change => {
-                self.composer.cut_range(lo, hi, linewise);
-                self.paste_registry
-                    .shift_for_edit(lo, -((hi - lo) as isize));
+                if let Some(removed) = self.composer.cut_range(lo, hi, linewise) {
+                    self.paste_registry
+                        .shift_for_edit(removed.start, -(removed.len() as isize));
+                }
                 self.composer
                     .set_vim_mode(if matches!(op, Operator::Change) {
                         VimMode::Insert

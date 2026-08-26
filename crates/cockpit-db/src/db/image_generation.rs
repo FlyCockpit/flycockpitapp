@@ -423,6 +423,51 @@ pub fn attempt_transition_allowed(
     IMAGE_ATTEMPT_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 
+#[derive(Clone, Copy)]
+enum ImageJobTransitionContext {
+    Ordinary,
+    AuthoritativeRetry,
+    TerminalProjection,
+}
+
+fn execute_image_job_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    from: ImageGenerationJobState,
+    expected_version: u64,
+    to: ImageGenerationJobState,
+    updated_at_unix_ms: i64,
+    context: ImageJobTransitionContext,
+) -> Result<u64> {
+    let allowed = match context {
+        ImageJobTransitionContext::AuthoritativeRetry => {
+            IMAGE_JOB_CONDITIONAL_EDGES.contains(&(from.as_str(), to.as_str()))
+        }
+        ImageJobTransitionContext::Ordinary | ImageJobTransitionContext::TerminalProjection => {
+            job_transition_allowed(from, to)
+        }
+    };
+    ensure!(allowed, "forbidden image generation job transition");
+    let next_version = expected_version
+        .checked_add(1)
+        .context("image generation job version overflow")?;
+    let changed = match context {
+        ImageJobTransitionContext::TerminalProjection => conn.execute(
+            "UPDATE image_generation_jobs SET state=?1,version=?2,terminal_event_version=?2,updated_at_unix_ms=?3 WHERE job_id=?4 AND state=?5 AND version=?6 AND terminal_event_version IS NULL",
+            params![to.as_str(),i64::try_from(next_version)?,updated_at_unix_ms,job_id.to_string(),from.as_str(),i64::try_from(expected_version)?],
+        )?,
+        ImageJobTransitionContext::Ordinary | ImageJobTransitionContext::AuthoritativeRetry => conn.execute(
+            "UPDATE image_generation_jobs SET state=?1,version=?2,updated_at_unix_ms=?3 WHERE job_id=?4 AND state=?5 AND version=?6",
+            params![to.as_str(),i64::try_from(next_version)?,updated_at_unix_ms,job_id.to_string(),from.as_str(),i64::try_from(expected_version)?],
+        )?,
+    };
+    ensure!(
+        changed == 1,
+        "image generation job transition lost compare-and-set"
+    );
+    Ok(next_version)
+}
+
 pub const fn slot_is_job_settled(state: ImageGenerationSlotState) -> bool {
     use ImageGenerationSlotState as S;
     matches!(
@@ -623,7 +668,15 @@ fn commit_terminal_job_projection_conn(
         "INSERT INTO image_generation_terminal_events(event_id,job_id,job_version,terminal_state,slot_count,published_count,failed_count,cancelled_count,late_published_count,late_quarantined_count,discarded_count,emitted_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         params![event_id,job_id.to_string(),next_version,terminal.as_str(),i64::try_from(rows.len())?,published_count,failed_count,cancelled_count,late_published_count,late_quarantined_count,discarded_count,emitted_at_unix_ms],
     )?;
-    ensure!(conn.execute("UPDATE image_generation_jobs SET state=?1,version=?2,terminal_event_version=?2,updated_at_unix_ms=?3 WHERE job_id=?4 AND state=?5 AND version=?6 AND terminal_event_version IS NULL",params![terminal.as_str(),next_version,emitted_at_unix_ms,job_id.to_string(),current_state,current_version])?==1,"terminal job compare-and-set lost");
+    execute_image_job_transition_conn(
+        conn,
+        job_id,
+        current,
+        u64::try_from(current_version)?,
+        terminal,
+        emitted_at_unix_ms,
+        ImageJobTransitionContext::TerminalProjection,
+    )?;
     Ok(Some(terminal))
 }
 
@@ -1375,6 +1428,8 @@ pub struct ImageGenerationReconciliationObservation<'a> {
 }
 pub struct SealedImageGenerationRecoveryAuthority {
     job_id: Uuid,
+    job_state: ImageGenerationJobState,
+    job_version: u64,
     slot_id: Uuid,
     attempt_number: u32,
     attempt_version: u64,
@@ -1552,8 +1607,24 @@ impl Db {
                     params![authority.job_id.to_string(),slot_id.to_string(),i64::from(attempt.attempt_number),plan_digest,snapshot.canonical_bytes,snapshot.digest],
                 )?;
             }
-            ensure!(conn.execute("UPDATE image_generation_jobs SET state='validating',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='created' AND version=?3",params![at_unix_ms,authority.job_id.to_string(),i64::try_from(authority.job_version)?])?==1,"image generation queue authority is stale");
-            ensure!(conn.execute("UPDATE image_generation_jobs SET state='queued',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='validating' AND version=?3",params![at_unix_ms,authority.job_id.to_string(),i64::try_from(authority.job_version+1)?])?==1,"image generation queue validation lost compare-and-set");
+            let validating_version = execute_image_job_transition_conn(
+                conn,
+                authority.job_id,
+                ImageGenerationJobState::Created,
+                authority.job_version,
+                ImageGenerationJobState::Validating,
+                at_unix_ms,
+                ImageJobTransitionContext::Ordinary,
+            )?;
+            execute_image_job_transition_conn(
+                conn,
+                authority.job_id,
+                ImageGenerationJobState::Validating,
+                validating_version,
+                ImageGenerationJobState::Queued,
+                at_unix_ms,
+                ImageJobTransitionContext::Ordinary,
+            )?;
             let changed=conn.execute("UPDATE image_generation_slots SET state='queued',version=version+1 WHERE job_id=?1 AND state='planned' AND version=1",[authority.job_id.to_string()])?;
             let expected: i64 = conn.query_row(
                 "SELECT slot_count FROM image_generation_plans WHERE job_id=?1",
@@ -1689,7 +1760,15 @@ impl Db {
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='preparing',version=version+1,external_operation_id=?1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='planned' AND version=?6",params![operation.operation_id.to_string(),operation.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt preparation lost compare-and-set");
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='prepared',version=version+1,dispatch_proof_endpoint_id=?5,dispatch_proof_config_generation=?6,dispatch_proof_refresh_epoch=?7,dispatch_proof_connected_ip=?8,dispatch_proof_location_class=?9,dispatch_proof_hops_digest=?10 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='preparing' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version+1)?,input.dispatch_proof.endpoint_id,i64::try_from(input.dispatch_proof.config_generation)?,i64::try_from(input.dispatch_proof.refresh_epoch)?,input.dispatch_proof.connected_ip,input.dispatch_proof.location_class,input.dispatch_proof.hops_digest])?==1,"image generation attempt preparation lost compare-and-set");
             ensure!(conn.execute("UPDATE image_generation_slots SET state='dispatching',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='queued' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot dispatch lost compare-and-set");
-            ensure!(conn.execute("UPDATE image_generation_jobs SET state='dispatching',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='queued' AND version=?3",params![input.at_unix_ms,input.job_id.to_string(),i64::try_from(input.expected_job_version)?])?==1,"image generation job dispatch lost compare-and-set");
+            execute_image_job_transition_conn(
+                conn,
+                input.job_id,
+                ImageGenerationJobState::Queued,
+                input.expected_job_version,
+                ImageGenerationJobState::Dispatching,
+                input.at_unix_ms,
+                ImageJobTransitionContext::Ordinary,
+            )?;
             Ok(PreparedImageGenerationDispatch {
                 job_id: input.job_id,
                 slot_id: input.slot_id,
@@ -1851,7 +1930,19 @@ impl Db {
             if job == "failed" {
                 commit_terminal_job_projection_conn(conn, dispatching.job_id, at_unix_ms)?;
             } else {
-                ensure!(conn.execute("UPDATE image_generation_jobs SET state=?1,version=version+1,updated_at_unix_ms=?2 WHERE job_id=?3 AND state='dispatching'",params![job,at_unix_ms,dispatching.job_id.to_string()])?==1,"image generation handoff job compare-and-set lost");
+                execute_image_job_transition_conn(
+                    conn,
+                    dispatching.job_id,
+                    ImageGenerationJobState::Dispatching,
+                    dispatching.job_version,
+                    job_state,
+                    at_unix_ms,
+                    if retry.is_some() {
+                        ImageJobTransitionContext::AuthoritativeRetry
+                    } else {
+                        ImageJobTransitionContext::Ordinary
+                    },
+                )?;
             }
             Ok(match retry {
                 Some((attempt, canonical_media_plan, media_plan_digest)) => {
@@ -1872,7 +1963,7 @@ impl Db {
         slot_id: Uuid,
         attempt_number: u32,
     ) -> Result<SealedImageGenerationRecoveryAuthority> {
-        conn.query_row("SELECT a.version,s.version,a.external_operation_id,j.version,a.provider_request_identity,a.provider_idempotency_identity,j.payload_digest FROM image_generation_attempts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN external_journal_operations j ON j.operation_id=a.external_operation_id WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state IN ('reconciling','cancellation_requested') AND s.state IN ('submission_unknown','cancellation_requested') AND j.state IN ('reconciling','cancellation_requested')",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|Ok(SealedImageGenerationRecoveryAuthority{job_id,slot_id,attempt_number,attempt_version:u64::try_from(row.get::<_,i64>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,slot_version:u64::try_from(row.get::<_,i64>(1)?).map_err(|_|rusqlite::Error::InvalidQuery)?,external_operation_id:Uuid::parse_str(&row.get::<_,String>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?,journal_version:u64::try_from(row.get::<_,i64>(3)?).map_err(|_|rusqlite::Error::InvalidQuery)?,provider_request_identity:row.get(4)?,provider_idempotency_identity:row.get(5)?,journal_payload_digest:row.get(6)?,claim_worker_boot_id:None,claim_generation:None})).context("image generation recovery authority unavailable")
+        conn.query_row("SELECT a.version,s.version,a.external_operation_id,j.version,a.provider_request_identity,a.provider_idempotency_identity,j.payload_digest,g.state,g.version FROM image_generation_attempts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_jobs g ON g.job_id=a.job_id JOIN external_journal_operations j ON j.operation_id=a.external_operation_id WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state IN ('reconciling','cancellation_requested') AND s.state IN ('submission_unknown','cancellation_requested') AND g.state IN ('submission_unknown','cancellation_requested') AND j.state IN ('reconciling','cancellation_requested')",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|Ok(SealedImageGenerationRecoveryAuthority{job_id,job_state:ImageGenerationJobState::parse(&row.get::<_,String>(7)?).ok_or(rusqlite::Error::InvalidQuery)?,job_version:u64::try_from(row.get::<_,i64>(8)?).map_err(|_|rusqlite::Error::InvalidQuery)?,slot_id,attempt_number,attempt_version:u64::try_from(row.get::<_,i64>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,slot_version:u64::try_from(row.get::<_,i64>(1)?).map_err(|_|rusqlite::Error::InvalidQuery)?,external_operation_id:Uuid::parse_str(&row.get::<_,String>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?,journal_version:u64::try_from(row.get::<_,i64>(3)?).map_err(|_|rusqlite::Error::InvalidQuery)?,provider_request_identity:row.get(4)?,provider_idempotency_identity:row.get(5)?,journal_payload_digest:row.get(6)?,claim_worker_boot_id:None,claim_generation:None})).context("image generation recovery authority unavailable")
     }
     pub fn claim_image_generation_reconciliation_conn(
         conn: &Connection,
@@ -2011,6 +2102,10 @@ impl Db {
             slot_version == i64::try_from(input.slot_version)?,
             "reconciliation slot version is stale"
         );
+        ensure!(
+            job_state == input.job_state && job_version == i64::try_from(input.job_version)?,
+            "reconciliation job authority differs from the sealed proof"
+        );
         let (journal_next, attempt_next, outcome) = match (proof.outcome, cancellation.is_some()) {
             (ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance, true) => (
                 ExternalJournalState::Cancelled,
@@ -2092,6 +2187,10 @@ impl Db {
                 slot_state == ImageGenerationSlotState::CancellationRequested,
                 "accepted cancellation reconciliation requires the persisted cancellation-requested slot"
             );
+            ensure!(
+                job_state == input.job_state && job_version == i64::try_from(input.job_version)?,
+                "accepted cancellation reconciliation changed sealed job authority"
+            );
         }
         if matches!(
             proof.outcome,
@@ -2155,13 +2254,29 @@ impl Db {
             );
         }
         if retry.is_some() {
-            ensure!(conn.execute("UPDATE image_generation_jobs SET state='queued',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state=?3 AND version=?4",params![proof.now_unix_ms,input.job_id.to_string(),job_state.as_str(),job_version])?==1,"reconciled retry lost job compare-and-set");
+            execute_image_job_transition_conn(
+                conn,
+                input.job_id,
+                input.job_state,
+                input.job_version,
+                ImageGenerationJobState::Queued,
+                proof.now_unix_ms,
+                ImageJobTransitionContext::AuthoritativeRetry,
+            )?;
         } else if matches!(
             proof.outcome,
             ImageGenerationReconciliationOutcome::AuthoritativeAccepted
         ) {
             if cancellation.is_none() {
-                ensure!(conn.execute("UPDATE image_generation_jobs SET state='running',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state=?3 AND version=?4",params![proof.now_unix_ms,input.job_id.to_string(),job_state.as_str(),job_version])?==1,"accepted reconciliation lost job compare-and-set");
+                execute_image_job_transition_conn(
+                    conn,
+                    input.job_id,
+                    input.job_state,
+                    input.job_version,
+                    ImageGenerationJobState::Running,
+                    proof.now_unix_ms,
+                    ImageJobTransitionContext::Ordinary,
+                )?;
             }
             return Ok(ImageGenerationReconciliationDisposition::Settled {
                 external_operation_id: input.external_operation_id,
@@ -2479,7 +2594,15 @@ impl Db {
         atomic_conn(conn, "image_generation_begin_download", || {
             ensure!(conn.execute("UPDATE image_generation_attempts SET state='downloading',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='accepted' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt download compare-and-set lost");
             ensure!(conn.execute("UPDATE image_generation_slots SET state='downloading',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='running' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot download compare-and-set lost");
-            ensure!(conn.execute("UPDATE image_generation_jobs SET state='downloading',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='running' AND version=?3",params![input.at_unix_ms,input.job_id.to_string(),i64::try_from(input.expected_job_version)?])?==1,"image generation job download compare-and-set lost");
+            execute_image_job_transition_conn(
+                conn,
+                input.job_id,
+                ImageGenerationJobState::Running,
+                input.expected_job_version,
+                ImageGenerationJobState::Downloading,
+                input.at_unix_ms,
+                ImageJobTransitionContext::Ordinary,
+            )?;
             Ok(())
         })
     }
@@ -3246,10 +3369,7 @@ impl Db {
         let reduced = reduce_terminal_job_facts(&projection);
         let next = reduced.unwrap_or(ImageGenerationJobState::CancellationRequested);
         ensure!(
-            reduced.map_or_else(
-                || job_transition_allowed(current, next),
-                |terminal| terminal_projection_allowed(current, terminal)
-            ),
+            job_transition_allowed(current, next),
             "job cannot accept cancellation"
         );
         if reduced.is_some() {
@@ -3262,8 +3382,15 @@ impl Db {
                 "cancellation terminal projection differs"
             );
         } else {
-            let changed=conn.execute("UPDATE image_generation_jobs SET state=?1,version=?2,updated_at_unix_ms=?3 WHERE job_id=?4 AND state=?5 AND version=?6",params![next.as_str(),job_version+1,input.requested_at_unix_ms,input.job_id.to_string(),job_state,job_version])?;
-            ensure!(changed == 1, "cancellation lost job compare-and-set");
+            execute_image_job_transition_conn(
+                conn,
+                input.job_id,
+                current,
+                u64::try_from(job_version)?,
+                next,
+                input.requested_at_unix_ms,
+                ImageJobTransitionContext::Ordinary,
+            )?;
         }
         Ok(ImageGenerationCasOutcome::Applied {
             version: (job_version + 1) as u64,

@@ -1045,6 +1045,8 @@ fn ownership() -> BTreeMap<String, Ownership> {
         "slot_state == ImageGenerationSlotState::CancellationRequested",
         "slot_version == i64::try_from(input.slot_version)?",
         "state=?3 AND version=?4",
+        "job_state == input.job_state",
+        "job_version == i64::try_from(input.job_version)?",
     ] {
         assert!(
             reconciliation.contains(evidence),

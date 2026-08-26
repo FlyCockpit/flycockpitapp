@@ -248,35 +248,43 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     // or fallible preflight after spawn. From this point to the single
     // teardown boundary below, no path may call `process::exit`.
     let guard = daemon.take_owned_daemon_guard();
-    let signal_task = spawn_signal_shutdown(guard.as_ref(), true);
+    let (signal_task, signal_registration_error) = match spawn_signal_shutdown(guard.as_ref(), true)
+    {
+        Ok(task) => (task, None),
+        Err(error) => (None, Some(error)),
+    };
 
-    let result = async {
-        // Preflight via daemon RPCs — the CLI never opens SQLite.
-        emit_org_logging_indicator_via_daemon(&client, &cwd).await;
-        enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd)
-            .await
-            .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
-        let requested_session = resolve_requested_session_via_daemon(&args, &client, &cwd)
-            .await
-            .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
-        let image_files = resolve_attachment_paths(&cwd, &args.file)
-            .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
-        let image_data = load_and_validate_images(&image_files).map_err(|error| {
-            RunPreflightFailure::new(2, "invalid_attachment", format!("{error:#}"))
-        })?;
+    let result = if let Some(error) = signal_registration_error {
+        Err(error.context("arming owned-daemon signal cleanup"))
+    } else {
+        async {
+            // Preflight via daemon RPCs — the CLI never opens SQLite.
+            emit_org_logging_indicator_via_daemon(&client, &cwd).await;
+            enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd)
+                .await
+                .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
+            let requested_session = resolve_requested_session_via_daemon(&args, &client, &cwd)
+                .await
+                .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+            let image_files = resolve_attachment_paths(&cwd, &args.file)
+                .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+            let image_data = load_and_validate_images(&image_files).map_err(|error| {
+                RunPreflightFailure::new(2, "invalid_attachment", format!("{error:#}"))
+            })?;
 
-        run_turn(
-            &client,
-            &args,
-            prompt,
-            no_sandbox,
-            &cwd,
-            requested_session,
-            &image_data,
-        )
+            run_turn(
+                &client,
+                &args,
+                prompt,
+                no_sandbox,
+                &cwd,
+                requested_session,
+                &image_data,
+            )
+            .await
+        }
         .await
-    }
-    .await;
+    };
 
     // Stop the signal watcher and run the (now happy-path) shutdown
     // before deciding the exit code, so the daemon is gone whether the
@@ -1917,51 +1925,6 @@ mod tests {
         );
         assert!(cleanup_complete.load(std::sync::atomic::Ordering::SeqCst));
         assert!(result.unwrap_err().is::<RunPreflightFailure>());
-    }
-
-    #[test]
-    fn owner_and_signal_cleanup_are_armed_before_run_preflight() {
-        let source = include_str!("run.rs");
-        let start = source.find("pub async fn run(").unwrap();
-        let end = source[start..].find("async fn run_turn(").unwrap() + start;
-        let run = &source[start..end];
-        let guard = run.find("take_owned_daemon_guard()").unwrap();
-        let signal = run
-            .find("spawn_signal_shutdown(guard.as_ref(), true)")
-            .unwrap();
-        let preflight = run
-            .find("emit_org_logging_indicator_via_daemon(&client, &cwd).await")
-            .unwrap();
-        let drop_guard = run.find("drop(guard)").unwrap();
-        let exit = run.find("std::process::exit(exit_code)").unwrap();
-        assert!(guard < signal && signal < preflight);
-        assert!(preflight < drop_guard && drop_guard < exit);
-        assert_eq!(run.matches("std::process::exit(").count(), 1);
-    }
-
-    #[test]
-    fn every_ephemeral_cli_command_publishes_owner_to_its_signal_watcher() {
-        for (name, source) in [
-            ("run", include_str!("run.rs")),
-            ("learn", include_str!("learn.rs")),
-            ("init", include_str!("init.rs")),
-            ("doctor", include_str!("doctor.rs")),
-            ("session", include_str!("session.rs")),
-            ("invocation", include_str!("invocation.rs")),
-        ] {
-            assert!(
-                source.contains("take_owned_daemon_guard()"),
-                "{name} must take provisional process ownership"
-            );
-            assert!(
-                source.contains("spawn_signal_shutdown(guard.as_ref(), true)"),
-                "{name} must arm signal teardown immediately after ownership transfer"
-            );
-            assert!(
-                source.contains("drop(guard)"),
-                "{name} must release the guard before selecting an exit path"
-            );
-        }
     }
 
     #[test]

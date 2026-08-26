@@ -85,17 +85,27 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
     // daemon. The guard owns only a daemon this command spawned, and reaps it
     // on every return path after the socket RPC has been attempted.
     let guard = daemon.take_owned_daemon_guard();
-    let signal_task = spawn_signal_shutdown(guard.as_ref(), true);
-    let response = daemon
-        .client
-        .request(build_doctor_request(&args, no_sandbox))
-        .await
-        .map_err(DoctorCouldNotRun)
-        .and_then(|response| {
-            response.map_err(|error| {
-                DoctorCouldNotRun(anyhow::anyhow!("daemon rejected doctor snapshot: {error}"))
+    let (signal_task, signal_registration_error) = match spawn_signal_shutdown(guard.as_ref(), true)
+    {
+        Ok(task) => (task, None),
+        Err(error) => (None, Some(error)),
+    };
+    let response = if let Some(error) = signal_registration_error {
+        Err(DoctorCouldNotRun(
+            error.context("arming diagnostic-daemon signal cleanup"),
+        ))
+    } else {
+        daemon
+            .client
+            .request(build_doctor_request(&args, no_sandbox))
+            .await
+            .map_err(DoctorCouldNotRun)
+            .and_then(|response| {
+                response.map_err(|error| {
+                    DoctorCouldNotRun(anyhow::anyhow!("daemon rejected doctor snapshot: {error}"))
+                })
             })
-        });
+    };
     if let Some(task) = signal_task {
         task.abort();
     }

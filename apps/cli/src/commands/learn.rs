@@ -23,17 +23,25 @@ pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
     let mut daemon = probe_or_spawn(mode).await?;
     let client = daemon.client.clone();
     let guard = daemon.take_owned_daemon_guard();
-    let signal_task = spawn_signal_shutdown(guard.as_ref(), true);
+    let (signal_task, signal_registration_error) = match spawn_signal_shutdown(guard.as_ref(), true)
+    {
+        Ok(task) => (task, None),
+        Err(error) => (None, Some(error)),
+    };
 
-    eprintln!("Authoring a reusable skill from the supplied sources…");
-    let result = crate::commands::run::attach_send_pump(
-        &client,
-        prompt,
-        no_sandbox,
-        crate::cli::OutputFormat::Default,
-        crate::commands::run::RunPumpOptions::default(),
-    )
-    .await;
+    let result = if let Some(error) = signal_registration_error {
+        Err(error.context("arming owned-daemon signal cleanup"))
+    } else {
+        eprintln!("Authoring a reusable skill from the supplied sources…");
+        crate::commands::run::attach_send_pump(
+            &client,
+            prompt,
+            no_sandbox,
+            crate::cli::OutputFormat::Default,
+            crate::commands::run::RunPumpOptions::default(),
+        )
+        .await
+    };
 
     if let Some(task) = signal_task {
         task.abort();

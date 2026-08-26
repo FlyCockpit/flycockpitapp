@@ -93,6 +93,12 @@ fn semantic_boundary_after(text: &str, byte: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+#[derive(Clone, Copy)]
+enum EditIntent {
+    InsertionEnd(usize),
+    DeletionStart(usize),
+}
+
 pub fn truncate_display_width(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -460,6 +466,18 @@ pub struct Composer {
 }
 
 impl Composer {
+    fn normalize_cursor_after_edit(&mut self, intent: EditIntent) {
+        self.cursor = match intent {
+            EditIntent::InsertionEnd(desired) => {
+                semantic_boundary_at_or_after(&self.buffer, desired.min(self.buffer.len()))
+            }
+            EditIntent::DeletionStart(desired) => {
+                semantic_boundary_at_or_before(&self.buffer, desired.min(self.buffer.len()))
+            }
+        };
+        self.debug_assert_semantic_cursor();
+    }
+
     fn debug_assert_semantic_cursor(&self) {
         debug_assert_eq!(
             self.cursor,
@@ -716,8 +734,9 @@ impl Composer {
     /// the paste path to drop a placeholder (or raw pasted text) in one
     /// step so the registry can record the exact byte span.
     pub fn insert_str(&mut self, s: &str) {
+        let desired = self.cursor.saturating_add(s.len());
         self.buffer.insert_str(self.cursor, s);
-        self.cursor += s.len();
+        self.normalize_cursor_after_edit(EditIntent::InsertionEnd(desired));
     }
 
     /// Run a cursor-moving motion closure without keeping its effect:
@@ -769,17 +788,20 @@ impl Composer {
     pub fn clear(&mut self) {
         self.buffer.clear();
         self.cursor = 0;
+        self.debug_assert_semantic_cursor();
     }
 
     /// Replace the entire buffer content, resetting cursor to end.
     pub fn set(&mut self, text: impl Into<String>) {
         self.buffer = text.into();
         self.cursor = self.buffer.len();
+        self.debug_assert_semantic_cursor();
     }
 
     pub fn insert_char(&mut self, ch: char) {
+        let desired = self.cursor.saturating_add(ch.len_utf8());
         self.buffer.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
+        self.normalize_cursor_after_edit(EditIntent::InsertionEnd(desired));
     }
 
     pub fn delete_left(&mut self) {
@@ -788,7 +810,7 @@ impl Composer {
         }
         let previous = semantic_boundary_before(&self.buffer, self.cursor);
         self.buffer.drain(previous..self.cursor);
-        self.cursor = previous;
+        self.normalize_cursor_after_edit(EditIntent::DeletionStart(previous));
     }
 
     /// Drain the semantic-grapheme-normalized range and return the actual
@@ -800,7 +822,7 @@ impl Composer {
             return None;
         }
         self.buffer.drain(start..end);
-        self.cursor = start;
+        self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
         Some(start..end)
     }
 
@@ -808,8 +830,10 @@ impl Composer {
         if self.cursor >= self.buffer.len() {
             return;
         }
-        let next = semantic_boundary_after(&self.buffer, self.cursor);
-        self.buffer.drain(self.cursor..next);
+        let start = self.cursor;
+        let next = semantic_boundary_after(&self.buffer, start);
+        self.buffer.drain(start..next);
+        self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
     }
 
     pub fn move_left(&mut self) {
@@ -872,7 +896,7 @@ impl Composer {
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        self.cursor = line_start;
+        self.set_cursor(line_start);
     }
 
     pub fn move_line_end(&mut self) {
@@ -957,7 +981,7 @@ impl Composer {
         let end = self.cursor;
         if end > start {
             self.buffer.drain(start..end);
-            self.cursor = start;
+            self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
         }
     }
 
@@ -969,6 +993,7 @@ impl Composer {
         let start = self.cursor;
         if end > start {
             self.buffer.drain(start..end);
+            self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
         }
     }
 
@@ -979,7 +1004,7 @@ impl Composer {
         let end = self.cursor;
         if end > start {
             self.buffer.drain(start..end);
-            self.cursor = start;
+            self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
         }
     }
 
@@ -991,6 +1016,7 @@ impl Composer {
         let start = self.cursor;
         if end > start {
             self.buffer.drain(start..end);
+            self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
         }
     }
 
@@ -1019,13 +1045,13 @@ impl Composer {
             }
         };
         self.buffer.drain(start..end);
-        self.cursor = start.min(self.buffer.len());
+        self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
         // Snap to start of the (now-)current line for vim parity.
         let line_start = self.buffer[..self.cursor]
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        self.cursor = line_start;
+        self.set_cursor(line_start);
     }
 
     /// `o` — open a new empty line below the current one and land at
@@ -1043,7 +1069,7 @@ impl Composer {
         // insert_char advanced the cursor past the new `\n`; step one
         // byte back so we land at the start of the empty line we just
         // opened. The `\n` is single-byte so byte-decrement is safe.
-        self.cursor = self.cursor.saturating_sub(1);
+        self.set_cursor(self.cursor.saturating_sub(1));
     }
 
     /// Vim word-backward (`b`/`B`).
@@ -1359,7 +1385,7 @@ impl Composer {
         }
         self.register = Register { text, linewise };
         self.buffer.drain(start..end);
-        self.set_cursor(start);
+        self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
         Some(start..end)
     }
 
@@ -1385,19 +1411,19 @@ impl Composer {
                 let body = text.strip_suffix('\n').unwrap_or(&text);
                 let insert = format!("\n{body}");
                 self.buffer.insert_str(line_end, &insert);
-                self.cursor = line_end + 1;
+                self.normalize_cursor_after_edit(EditIntent::InsertionEnd(line_end + 1));
             } else {
                 self.buffer.insert_str(line_end, &text);
-                self.cursor = line_end;
+                self.normalize_cursor_after_edit(EditIntent::InsertionEnd(line_end));
             }
         } else {
             // Charwise: insert after the cursor cell.
             let at = semantic_boundary_after(&self.buffer, self.cursor);
             self.buffer.insert_str(at, &self.register.text);
             // Land on the last pasted char.
-            let end = at + self.register.text.len();
-            self.cursor =
+            let desired =
                 at + semantic_boundary_before(&self.register.text, self.register.text.len());
+            self.normalize_cursor_after_edit(EditIntent::InsertionEnd(desired));
         }
     }
 
@@ -1414,12 +1440,13 @@ impl Composer {
                 .unwrap_or(0);
             let text = self.linewise_payload();
             self.buffer.insert_str(line_start, &text);
-            self.cursor = line_start;
+            self.normalize_cursor_after_edit(EditIntent::InsertionEnd(line_start));
         } else {
             let at = self.cursor;
             self.buffer.insert_str(at, &self.register.text);
-            self.cursor =
+            let desired =
                 at + semantic_boundary_before(&self.register.text, self.register.text.len());
+            self.normalize_cursor_after_edit(EditIntent::InsertionEnd(desired));
         }
     }
 
@@ -1641,7 +1668,7 @@ impl Composer {
         let new_cursor = new.len();
         new.push_str(&self.buffer[body_end..]);
         self.buffer = new;
-        self.cursor = new_cursor;
+        self.normalize_cursor_after_edit(EditIntent::InsertionEnd(new_cursor));
     }
 
     /// Cursor's (line, column) measured in terminal display columns.
@@ -2417,6 +2444,57 @@ mod tests {
         assert_eq!(visual, combining_start..combining_start + combining.len());
         composer.yank_range(visual.0, visual.1, false);
         assert_eq!(composer.register().text, combining);
+    }
+
+    #[test]
+    fn edit_seams_resegment_before_the_next_mutation() {
+        let mut composer = Composer::new(false);
+
+        composer.set("👩💻");
+        composer.set_cursor("👩".len());
+        composer.insert_str("\u{200d}");
+        assert_eq!(composer.cursor(), composer.len());
+        composer.delete_left();
+        assert!(
+            composer.text().is_empty(),
+            "joined emoji deletes atomically"
+        );
+
+        composer.set("🇺X🇸");
+        let separator = "🇺".len();
+        let removed = composer
+            .delete_range(separator, separator + 1)
+            .expect("separator removed");
+        assert_eq!(removed, separator..separator + 1);
+        assert_eq!(composer.cursor(), 0, "new regional pair snaps backward");
+        composer.delete_right();
+        assert!(composer.text().is_empty());
+
+        composer.set("ᄀᆨ");
+        composer.set_cursor("ᄀ".len());
+        composer.insert_str("ᅡ");
+        assert_eq!(composer.cursor(), composer.len());
+        composer.delete_left();
+        assert!(
+            composer.text().is_empty(),
+            "Hangul Jamo cluster stays atomic"
+        );
+
+        composer.set("कष");
+        composer.set_cursor("क".len());
+        composer.insert_str("्\u{200d}");
+        assert_eq!(composer.cursor(), composer.len());
+        composer.delete_left();
+        assert!(composer.text().is_empty(), "Indic conjunct stays atomic");
+
+        composer.set("ex");
+        composer.set_cursor(1);
+        composer.insert_char('\u{301}');
+        assert_eq!(composer.cursor(), "e\u{301}".len());
+        composer.delete_left();
+        assert_eq!(composer.text(), "x");
+        composer.insert_char('a');
+        assert_eq!(composer.text(), "ax");
     }
 
     #[test]

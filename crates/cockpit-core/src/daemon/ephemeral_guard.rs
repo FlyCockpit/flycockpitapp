@@ -819,22 +819,28 @@ pub fn stop_daemon_blocking(socket: &Path) {
 }
 
 /// Spawn a task that fires the guard's synchronous shutdown on
-/// SIGINT/SIGTERM (Ctrl-C / console-close on Windows). Returns `None` when
-/// there's no guard (attached to a persistent daemon) — there's nothing to
-/// reap. `exit_on_signal` controls the post-reap behavior: `cockpit run`
+/// SIGINT/SIGTERM (Ctrl-C / console-close on Windows). OS handlers are
+/// installed synchronously before this function returns, so success means
+/// there is no post-spawn registration window. Returns `Ok(None)` when there's
+/// no guard (attached to a persistent daemon). Registration failure is
+/// returned so the caller can immediately perform exact cleanup and fail
+/// closed. `exit_on_signal` controls the post-reap behavior: `cockpit run`
 /// exits the foreground promptly (it has no UI left to run), whereas the
 /// TUI hands control back so its own restore path (leave alt-screen, print
 /// the exit tail) still runs.
 pub fn spawn_signal_shutdown(
     guard: Option<&EphemeralDaemonGuard>,
     exit_on_signal: bool,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let guard = guard?;
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    let Some(guard) = guard else {
+        return Ok(None);
+    };
+    let signals = register_shutdown_signals()?;
     let cleanup_state = guard.cleanup_state.clone();
     let socket = guard.socket.clone();
     let process = guard.process.clone();
-    Some(tokio::spawn(async move {
-        if let Err(error) = wait_for_shutdown_signal().await {
+    Ok(Some(tokio::spawn(async move {
+        if let Err(error) = wait_for_shutdown_signal(signals).await {
             tracing::error!(%error, "foreground signal watcher stopped without a signal");
             return;
         }
@@ -850,20 +856,30 @@ pub fn spawn_signal_shutdown(
             // us to stop. The daemon is already (being) torn down.
             std::process::exit(130);
         }
-    }))
+    })))
 }
 
 #[cfg(unix)]
-async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+struct RegisteredShutdownSignals {
+    interrupt: Option<RegisteredSignal>,
+    terminate: Option<RegisteredSignal>,
+}
+
+#[cfg(unix)]
+fn register_shutdown_signals() -> anyhow::Result<RegisteredShutdownSignals> {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let interrupt = signal(SignalKind::interrupt())
-        .ok()
-        .map(|mut signal| Box::pin(async move { signal.recv().await }) as RegisteredSignal);
-    let terminate = signal(SignalKind::terminate())
-        .ok()
-        .map(|mut signal| Box::pin(async move { signal.recv().await }) as RegisteredSignal);
-    wait_for_registered_unix_signal(interrupt, terminate).await
+    let mut interrupt = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    let mut terminate = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    Ok(RegisteredShutdownSignals {
+        interrupt: Some(Box::pin(async move { interrupt.recv().await })),
+        terminate: Some(Box::pin(async move { terminate.recv().await })),
+    })
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal(signals: RegisteredShutdownSignals) -> anyhow::Result<()> {
+    wait_for_registered_unix_signal(signals.interrupt, signals.terminate).await
 }
 
 #[cfg(unix)]
@@ -886,11 +902,38 @@ async fn wait_for_registered_unix_signal(
     }
 }
 
-#[cfg(not(unix))]
-async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
-    tokio::signal::ctrl_c()
+#[cfg(windows)]
+struct RegisteredShutdownSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+#[cfg(windows)]
+fn register_shutdown_signals() -> anyhow::Result<RegisteredShutdownSignals> {
+    Ok(RegisteredShutdownSignals {
+        ctrl_c: tokio::signal::windows::ctrl_c().context("installing console shutdown handler")?,
+    })
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown_signal(mut signals: RegisteredShutdownSignals) -> anyhow::Result<()> {
+    signals
+        .ctrl_c
+        .recv()
         .await
-        .context("waiting for console shutdown signal")
+        .context("console shutdown signal stream ended")
+}
+
+#[cfg(not(any(unix, windows)))]
+struct RegisteredShutdownSignals;
+
+#[cfg(not(any(unix, windows)))]
+fn register_shutdown_signals() -> anyhow::Result<RegisteredShutdownSignals> {
+    anyhow::bail!("foreground signal cleanup is unsupported on this platform")
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn wait_for_shutdown_signal(_: RegisteredShutdownSignals) -> anyhow::Result<()> {
+    anyhow::bail!("foreground signal cleanup is unsupported on this platform")
 }
 
 #[cfg(test)]

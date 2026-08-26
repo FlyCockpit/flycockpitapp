@@ -24,19 +24,28 @@ async fn status(args: InvocationStatusArgs) -> Result<()> {
         .map_err(|e| exit_transport(4, &format!("{e:#}")))?;
     let client = daemon.client.clone();
     let guard = daemon.take_owned_daemon_guard();
-    let signal_task = spawn_signal_shutdown(guard.as_ref(), true);
-    let result = match client
-        .request(Request::GetRunInvocationStatus {
-            client_submission_id: id,
-        })
-        .await
+    let (signal_task, signal_registration_error) = match spawn_signal_shutdown(guard.as_ref(), true)
     {
-        Ok(Ok(Response::RunInvocationStatus { status })) => print_status(args.format, &status),
-        Ok(Ok(other)) => {
-            Err(InvocationCommandError::transport(format!("unexpected response: {other:?}")).into())
+        Ok(task) => (task, None),
+        Err(error) => (None, Some(error)),
+    };
+    let result = if let Some(error) = signal_registration_error {
+        Err(error.context("arming owned-daemon signal cleanup"))
+    } else {
+        match client
+            .request(Request::GetRunInvocationStatus {
+                client_submission_id: id,
+            })
+            .await
+        {
+            Ok(Ok(Response::RunInvocationStatus { status })) => print_status(args.format, &status),
+            Ok(Ok(other)) => Err(InvocationCommandError::transport(format!(
+                "unexpected response: {other:?}"
+            ))
+            .into()),
+            Ok(Err(error)) => Err(map_daemon_error(&error).into()),
+            Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
         }
-        Ok(Err(error)) => Err(map_daemon_error(&error).into()),
-        Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
     };
     if let Some(task) = signal_task {
         task.abort();
@@ -55,21 +64,30 @@ async fn cancel(args: InvocationCancelArgs) -> Result<()> {
         .map_err(|e| exit_transport(4, &format!("{e:#}")))?;
     let client = daemon.client.clone();
     let guard = daemon.take_owned_daemon_guard();
-    let signal_task = spawn_signal_shutdown(guard.as_ref(), true);
-    let result = match client
-        .request(Request::CancelRunInvocation {
-            client_submission_id: id,
-        })
-        .await
+    let (signal_task, signal_registration_error) = match spawn_signal_shutdown(guard.as_ref(), true)
     {
-        Ok(Ok(Response::RunInvocationCancelResult { result })) => {
-            print_cancel(args.format, &result)
+        Ok(task) => (task, None),
+        Err(error) => (None, Some(error)),
+    };
+    let result = if let Some(error) = signal_registration_error {
+        Err(error.context("arming owned-daemon signal cleanup"))
+    } else {
+        match client
+            .request(Request::CancelRunInvocation {
+                client_submission_id: id,
+            })
+            .await
+        {
+            Ok(Ok(Response::RunInvocationCancelResult { result })) => {
+                print_cancel(args.format, &result)
+            }
+            Ok(Ok(other)) => Err(InvocationCommandError::transport(format!(
+                "unexpected response: {other:?}"
+            ))
+            .into()),
+            Ok(Err(error)) => Err(map_daemon_error(&error).into()),
+            Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
         }
-        Ok(Ok(other)) => {
-            Err(InvocationCommandError::transport(format!("unexpected response: {other:?}")).into())
-        }
-        Ok(Err(error)) => Err(map_daemon_error(&error).into()),
-        Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
     };
     if let Some(task) = signal_task {
         task.abort();

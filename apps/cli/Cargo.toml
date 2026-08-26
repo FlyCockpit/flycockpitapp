@@ -288,6 +288,7 @@ vt100 = "0.16"
 [dev-dependencies]
 assert_cmd = { workspace = true }
 cockpit-config = { path = "../../crates/cockpit-config" }
+syn = { version = "2", features = ["full", "parsing", "visit"] }
 cockpit-core = { path = "../../crates/cockpit-core", features = ["test-support"] }
 cockpit-test-support = { path = "../../crates/cockpit-test-support" }
 predicates = { workspace = true }

@@ -1210,6 +1210,7 @@ dependencies = [
  "shellexpand",
  "similar 3.1.2",
  "sqlite-vec",
+ "syn 2.0.119",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

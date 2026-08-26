@@ -35,6 +35,60 @@ pub struct TokenUsage {
     pub cache_creation_input_tokens: u64,
 }
 
+/// Immutable response timing snapshot presented by daemon clients.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ResponsePerformance {
+    pub ttft_ms: u64,
+    pub generation_ms: u64,
+    pub displayed_tokens: u64,
+    pub encoding: String,
+}
+
+impl ResponsePerformance {
+    pub fn tps(&self) -> Option<f64> {
+        if self.generation_ms == 0 {
+            None
+        } else {
+            Some(self.displayed_tokens as f64 * 1000.0 / self.generation_ms as f64)
+        }
+    }
+
+    pub fn from_proto(snapshot: cockpit_proto::ResponsePerformance) -> Option<Self> {
+        if !matches!(
+            snapshot.encoding.as_str(),
+            "r50k_base" | "p50k_base" | "p50k_edit" | "cl100k_base" | "o200k_base"
+        ) {
+            return None;
+        }
+        Some(Self {
+            ttft_ms: snapshot.ttft_ms,
+            generation_ms: snapshot.generation_ms,
+            displayed_tokens: snapshot.displayed_tokens,
+            encoding: snapshot.encoding,
+        })
+    }
+}
+
+/// Durable assistant body and its exact client presentation snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AssistantTextPayload {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_text: Option<String>,
+    #[serde(default)]
+    pub reasoning: String,
+    #[serde(default)]
+    pub seq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_performance: Option<ResponsePerformance>,
+}
+
+impl AssistantTextPayload {
+    pub fn display_text(&self) -> &str {
+        self.presentation_text.as_deref().unwrap_or(&self.text)
+    }
+}
+
 impl TokenUsage {
     /// Freshly processed input plus output, excluding cached input reads.
     pub fn blended_total(&self) -> u64 {

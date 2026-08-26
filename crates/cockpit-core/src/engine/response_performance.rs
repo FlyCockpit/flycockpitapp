@@ -26,11 +26,12 @@
 
 use crate::engine::think::ThinkSplitter;
 use cockpit_tokenizer::TiktokenEncoding;
-use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 pub use cockpit_client::presentation::AssistantAttemptId;
+pub use cockpit_client::presentation::AssistantTextPayload;
 pub use cockpit_client::presentation::DisplayErrorKind;
+pub use cockpit_client::presentation::ResponsePerformance;
 
 /// Durable per-assistant-message response performance snapshot.
 ///
@@ -48,34 +49,7 @@ pub use cockpit_client::presentation::DisplayErrorKind;
 /// have the same result as unsplit text.
 ///
 /// No provider usage or model tokenizer participates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ResponsePerformance {
-    /// Time-to-first-token: milliseconds from attempt dispatch to the
-    /// first non-whitespace presentation emission.
-    pub ttft_ms: u64,
-    /// Generation duration: milliseconds from first non-whitespace
-    /// presentation emission to finish.
-    pub generation_ms: u64,
-    /// Token count of the final canonical `presentation_text` as counted
-    /// by the shared tokenizer (including the token containing the first
-    /// visible text).
-    pub displayed_tokens: u64,
-    /// The tiktoken encoding used to count `displayed_tokens`. Frozen at
-    /// snapshot time so later tokenizer changes never recompute history.
-    pub encoding: TiktokenEncoding,
-}
-
-impl ResponsePerformance {
-    /// Tokens-per-second for this snapshot. Returns `None` when
-    /// `generation_ms` is zero (all-at-once translated output has zero
-    /// post-first duration and therefore no TPS).
-    pub fn tps(&self) -> Option<f64> {
-        if self.generation_ms == 0 {
-            return None;
-        }
-        Some(self.displayed_tokens as f64 * 1000.0 / self.generation_ms as f64)
-    }
-
+impl DisplayStreamClassifier {
     /// Build a snapshot from the classifier's measured instants and the
     /// final presentation text. Returns `None` when the response has no
     /// visible body, no first-presentation instant, or zero duration with
@@ -83,13 +57,13 @@ impl ResponsePerformance {
     ///
     /// A tokenizer failure emits `None` and is logged by the caller — the
     /// reply is never dropped.
-    pub fn from_measurements(
+    fn response_performance_from_measurements(
         attempt_dispatched_at: Instant,
         first_non_whitespace_presentation_at: Option<Instant>,
         finish_at: Instant,
         presentation_text: &str,
         encoding: TiktokenEncoding,
-    ) -> Option<Self> {
+    ) -> Option<ResponsePerformance> {
         let first = first_non_whitespace_presentation_at?;
         if presentation_text.trim().is_empty() {
             return None;
@@ -109,24 +83,11 @@ impl ResponsePerformance {
         if displayed_tokens == 0 {
             return None;
         }
-        Some(Self {
+        Some(ResponsePerformance {
             ttft_ms,
             generation_ms,
             displayed_tokens,
-            encoding,
-        })
-    }
-
-    /// Reconstruct from the wire-protocol form (string encoding name).
-    /// Returns `None` when the encoding name is unknown — the snapshot is
-    /// then omitted (legacy/unknown encoding).
-    pub fn from_proto(proto: &crate::daemon::proto::ResponsePerformance) -> Option<Self> {
-        let encoding = TiktokenEncoding::from_str_name(&proto.encoding)?;
-        Some(Self {
-            ttft_ms: proto.ttft_ms,
-            generation_ms: proto.generation_ms,
-            displayed_tokens: proto.displayed_tokens,
-            encoding,
+            encoding: encoding.as_str().to_string(),
         })
     }
 }
@@ -180,33 +141,6 @@ impl Instant {
 ///
 /// `AssistantText` remains the durable assistant payload and does **not**
 /// carry `attempt_id`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AssistantTextPayload {
-    /// Model-context/wire body.
-    pub text: String,
-    /// The exact final text shown to users when it differs from `text`
-    /// (translation success). `None` for legacy/fallback/identical.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub presentation_text: Option<String>,
-    /// Finalized (channel + inline) reasoning.
-    #[serde(default)]
-    pub reasoning: String,
-    /// `session_events` row id; `None` when the timeline write failed.
-    #[serde(default)]
-    pub seq: Option<i64>,
-    /// Optional durable response-performance snapshot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_performance: Option<ResponsePerformance>,
-}
-
-impl AssistantTextPayload {
-    /// The text to display to users: `presentation_text.unwrap_or(text)`.
-    /// Live events, daemon history, TUI rehydration, and export all use
-    /// this. Model context continues to use `text` only.
-    pub fn display_text(&self) -> &str {
-        self.presentation_text.as_deref().unwrap_or(&self.text)
-    }
-}
 
 /// The complete display event emitted by [`DisplayStreamClassifier`].
 /// Owns its durable [`AssistantTextPayload`].
@@ -630,7 +564,7 @@ impl DisplayStreamClassifier {
             None
         } else {
             let finish_at = self.clock.now();
-            ResponsePerformance::from_measurements(
+            Self::response_performance_from_measurements(
                 self.attempt_dispatched_at,
                 self.first_non_whitespace_presentation_at,
                 finish_at,
@@ -956,7 +890,7 @@ mod tests {
             ttft_ms: 120,
             generation_ms: 340,
             displayed_tokens: 42,
-            encoding: TiktokenEncoding::O200k,
+            encoding: TiktokenEncoding::O200k.as_str().to_string(),
         };
         let json = serde_json::to_string(&perf).unwrap();
         let back: ResponsePerformance = serde_json::from_str(&json).unwrap();
@@ -1122,7 +1056,7 @@ mod tests {
             ttft_ms: 120,
             generation_ms: 340,
             displayed_tokens: 42,
-            encoding: TiktokenEncoding::O200k,
+            encoding: TiktokenEncoding::O200k.as_str().to_string(),
         };
         let payload = AssistantTextPayload {
             text: "wire body".into(),

@@ -3855,14 +3855,13 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
         } => TurnEvent::AssistantDisplayComplete {
             agent,
             attempt_id: cockpit_client::presentation::AssistantAttemptId::new(attempt_id),
-            assistant: cockpit_core::engine::AssistantTextPayload {
+            assistant: cockpit_client::presentation::AssistantTextPayload {
                 text,
                 presentation_text,
                 reasoning,
                 seq,
-                response_performance: response_performance.as_ref().and_then(
-                    cockpit_core::engine::response_performance::ResponsePerformance::from_proto,
-                ),
+                response_performance: response_performance
+                    .and_then(cockpit_client::presentation::ResponsePerformance::from_proto),
             },
         },
         AssistantDisplayError {
@@ -3896,9 +3895,8 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             presentation_text,
             reasoning,
             seq,
-            response_performance: response_performance.as_ref().and_then(
-                cockpit_core::engine::response_performance::ResponsePerformance::from_proto,
-            ),
+            response_performance: response_performance
+                .and_then(cockpit_client::presentation::ResponsePerformance::from_proto),
         },
         UserMessageRecorded {
             seq,

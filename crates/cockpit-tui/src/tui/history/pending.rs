@@ -1,6 +1,6 @@
 use chrono::{DateTime, Local};
 
-use cockpit_core::engine::response_performance::ResponsePerformance;
+use cockpit_client::presentation::ResponsePerformance;
 
 /// In-flight assistant turn. Lives in `App.pending` from
 /// `ThinkingStarted` to `AssistantText`; once finalized it gets pushed

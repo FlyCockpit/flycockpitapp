@@ -484,7 +484,9 @@ fn production_uses_cockpit_proto_directly() {
                 "cockpit_core::env_snapshot::EnvSnapshotWire",
                 "cockpit_core::engine::IdleReason",
                 "cockpit_core::engine::AssistantAttemptId",
+                "cockpit_core::engine::AssistantTextPayload",
                 "cockpit_core::engine::DisplayErrorKind",
+                "cockpit_core::engine::response_performance::ResponsePerformance",
                 "cockpit_core::tokens::TokenUsage",
                 "cockpit_core::engine::model::InferenceErrorClass",
                 "cockpit_core::engine::message::QueueItemStatus",
@@ -572,7 +574,9 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::env_snapshot::EnvSnapshotWire"
                     || imported == "cockpit_core::engine::IdleReason"
                     || imported == "cockpit_core::engine::AssistantAttemptId"
+                    || imported == "cockpit_core::engine::AssistantTextPayload"
                     || imported == "cockpit_core::engine::DisplayErrorKind"
+                    || imported == "cockpit_core::engine::response_performance::ResponsePerformance"
                     || imported == "cockpit_core::tokens::TokenUsage"
                     || imported == "cockpit_core::engine::model::InferenceErrorClass"
                     || imported == "cockpit_core::engine::message::QueueItemStatus"

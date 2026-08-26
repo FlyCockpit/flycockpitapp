@@ -2747,7 +2747,7 @@ fn sample_perf() -> ResponsePerformance {
         ttft_ms: 3000,
         generation_ms: 500,
         displayed_tokens: 27, // 27*1000/500 = 54 TPS exactly
-        encoding: cockpit_tokenizer::TiktokenEncoding::Cl100k,
+        encoding: "cl100k_base".to_string(),
     }
 }
 
@@ -2854,7 +2854,7 @@ fn response_performance_chip_rounding_matches_detail() {
         ttft_ms: 3000,
         generation_ms: 1000,
         displayed_tokens: 54, // 54 TPS exact; 53.5 would round up
-        encoding: cockpit_tokenizer::TiktokenEncoding::Cl100k,
+        encoding: "cl100k_base".to_string(),
     };
     assert_eq!(format_tps(&perf).as_deref(), Some("54"));
     assert_eq!(metric_chip_text(&perf).as_deref(), Some("3/54"));
@@ -2865,7 +2865,7 @@ fn response_performance_chip_rounding_matches_detail() {
         ttft_ms: 1000,
         generation_ms: 2000,
         displayed_tokens: 107, // 107000/2000 = 53.5
-        encoding: cockpit_tokenizer::TiktokenEncoding::Cl100k,
+        encoding: "cl100k_base".to_string(),
     };
     assert_eq!(format_tps(&half).as_deref(), Some("54"));
 }

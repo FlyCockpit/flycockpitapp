@@ -113,11 +113,9 @@ impl From<cockpit_db::db::session_log::ClientSubmissionTerminalDisposition>
 /// name. The snapshot is immutable: later tokenizer changes never recompute
 /// history.
 ///
-/// This is the wire form; the engine layer (`cockpit-core`) owns the
-/// canonical [`ResponsePerformance`](cockpit_core::engine::ResponsePerformance)
-/// with the typed encoding enum and the classifier that produces it. The
-/// `encoding` field here is the serde string name of the
-/// `TiktokenEncoding` variant.
+/// This is the wire form. The authority-free client layer validates it into
+/// its canonical presentation snapshot; the engine classifier only produces
+/// measurements. `encoding` is the stable shared-tokenizer encoding name.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResponsePerformance {
     /// Time-to-first-token in milliseconds (dispatch → first non-whitespace

@@ -8,9 +8,15 @@ use crate::db::Db;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RetentionConfig {
-    /// Payload-row retention window in days.
-    #[serde(default = "default_retention_payload_window_days")]
-    pub payload_window_days: u32,
+    /// Closed-session transcript retention. Zero means unlimited.
+    #[serde(default = "default_transcript_window_days")]
+    pub transcript_window_days: u32,
+    /// Raw provider requests and tool wire/input/output retention. Zero means unlimited.
+    #[serde(default = "default_raw_wire_window_days")]
+    pub raw_wire_window_days: u32,
+    /// Terminal operational evidence and usage metadata retention. Zero means unlimited.
+    #[serde(default = "default_terminal_evidence_window_days")]
+    pub terminal_evidence_window_days: u32,
     /// Whole-session retention window in days.
     #[serde(default)]
     pub session_window_days: u32,
@@ -28,7 +34,9 @@ pub struct RetentionConfig {
 impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
-            payload_window_days: default_retention_payload_window_days(),
+            transcript_window_days: default_transcript_window_days(),
+            raw_wire_window_days: default_raw_wire_window_days(),
+            terminal_evidence_window_days: default_terminal_evidence_window_days(),
             session_window_days: 0,
             sweep_interval_hours: default_retention_sweep_interval_hours(),
             vacuum_min_deletions: default_retention_vacuum_min_deletions(),
@@ -37,8 +45,16 @@ impl Default for RetentionConfig {
     }
 }
 
-fn default_retention_payload_window_days() -> u32 {
-    0
+fn default_transcript_window_days() -> u32 {
+    90
+}
+
+fn default_raw_wire_window_days() -> u32 {
+    30
+}
+
+fn default_terminal_evidence_window_days() -> u32 {
+    90
 }
 
 fn default_retention_sweep_interval_hours() -> u32 {
@@ -57,6 +73,9 @@ fn default_retention_vacuum_interval_days() -> u32 {
 pub struct RetentionOutcome {
     pub sessions_expired: u64,
     pub payload_rows_deleted: u64,
+    pub transcript_rows_deleted: u64,
+    pub raw_wire_rows_deleted_or_redacted: u64,
+    pub terminal_evidence_rows_deleted: u64,
     pub goal_tombstones_purged: u64,
     pub local_authority_rows_purged: u64,
     pub vacuumed: bool,
@@ -136,12 +155,27 @@ impl Db {
     }
 
     /// Delete old payload rows for closed sessions, preserving session rows.
-    pub async fn prune_session_payloads(&self, payload_cutoff_secs: i64) -> Result<u64> {
-        if payload_cutoff_secs <= 0 {
-            return Ok(0);
+    pub async fn prune_session_payloads(
+        &self,
+        transcript_cutoff_secs: i64,
+        raw_wire_cutoff_secs: i64,
+        terminal_evidence_cutoff_secs: i64,
+    ) -> Result<(u64, u64, u64)> {
+        if transcript_cutoff_secs <= 0
+            && raw_wire_cutoff_secs <= 0
+            && terminal_evidence_cutoff_secs <= 0
+        {
+            return Ok((0, 0, 0));
         }
-        self.write(move |conn| prune_session_payloads_conn(conn, payload_cutoff_secs))
-            .await
+        self.write(move |conn| {
+            prune_session_payloads_conn(
+                conn,
+                transcript_cutoff_secs,
+                raw_wire_cutoff_secs,
+                terminal_evidence_cutoff_secs,
+            )
+        })
+        .await
     }
 
     /// Delete old closed, non-ephemeral root sessions whose subtrees are closed.
@@ -202,10 +236,19 @@ impl Db {
             let cutoff = now_secs - (cfg.session_window_days as i64) * 86_400;
             outcome.sessions_expired = self.expire_old_sessions(cutoff).await?;
         }
-        if cfg.payload_window_days > 0 {
-            let cutoff = now_secs - (cfg.payload_window_days as i64) * 86_400;
-            outcome.payload_rows_deleted = self.prune_session_payloads(cutoff).await?;
-        }
+        let transcript_cutoff = retention_cutoff(now_secs, cfg.transcript_window_days);
+        let raw_wire_cutoff = retention_cutoff(now_secs, cfg.raw_wire_window_days);
+        let terminal_evidence_cutoff =
+            retention_cutoff(now_secs, cfg.terminal_evidence_window_days);
+        let (transcripts, raw_wire, terminal_evidence) = self
+            .prune_session_payloads(transcript_cutoff, raw_wire_cutoff, terminal_evidence_cutoff)
+            .await?;
+        outcome.transcript_rows_deleted = transcripts;
+        outcome.raw_wire_rows_deleted_or_redacted = raw_wire;
+        outcome.terminal_evidence_rows_deleted = terminal_evidence;
+        outcome.payload_rows_deleted = transcripts
+            .saturating_add(raw_wire)
+            .saturating_add(terminal_evidence);
         outcome.goal_tombstones_purged = self
             .purge_cleared_goal_tombstones(now_secs)
             .await?
@@ -213,12 +256,14 @@ impl Db {
             .unwrap_or(u64::MAX);
         // Local mutation receipts contain no request bodies or secret values,
         // but they still disclose operation metadata and workspace targets.
-        // Keep ninety days for lost-response replay, then prune only terminal
-        // receipts and long-expired, never-consumed editor capabilities.
-        let authority_cutoff_ms = now_secs.saturating_sub(90 * 86_400).saturating_mul(1000);
-        outcome.local_authority_rows_purged = self
-            .prune_local_authority_receipts(authority_cutoff_ms)
-            .await?;
+        // Use the configurable terminal-evidence window for lost-response
+        // replay, pruning only terminal receipts and long-expired,
+        // never-consumed editor capabilities. Zero means unlimited.
+        if terminal_evidence_cutoff > 0 {
+            outcome.local_authority_rows_purged = self
+                .prune_local_authority_receipts(terminal_evidence_cutoff.saturating_mul(1000))
+                .await?;
+        }
 
         let deleted = outcome
             .sessions_expired
@@ -275,38 +320,85 @@ fn sqlite_busy(err: &rusqlite::Error) -> bool {
     )
 }
 
-fn prune_session_payloads_conn(conn: &Connection, cutoff_secs: i64) -> Result<u64> {
+fn retention_cutoff(now_secs: i64, window_days: u32) -> i64 {
+    if window_days == 0 {
+        0
+    } else {
+        now_secs.saturating_sub(i64::from(window_days).saturating_mul(86_400))
+    }
+}
+
+fn prune_session_payloads_conn(
+    conn: &Connection,
+    transcript_cutoff_secs: i64,
+    raw_wire_cutoff_secs: i64,
+    terminal_evidence_cutoff_secs: i64,
+) -> Result<(u64, u64, u64)> {
     let tx = conn
         .unchecked_transaction()
         .context("begin prune_session_payloads tx")?;
-    let cutoff_ms = cutoff_secs * 1000;
     let closed =
         "session_id IN (SELECT session_id FROM sessions WHERE ended_at_unix_ms IS NOT NULL)";
-    let mut total = 0_u64;
-    for (sql, cutoff) in [
-        (
-            format!("DELETE FROM inference_requests WHERE ts_ms < ?1 AND {closed}"),
-            cutoff_ms,
-        ),
-        (
-            format!("DELETE FROM session_events WHERE ts_ms < ?1 AND {closed}"),
-            cutoff_ms,
-        ),
-        (
-            format!("DELETE FROM tool_call_events WHERE timestamp < ?1 AND {closed}"),
-            cutoff_secs,
-        ),
-        (
-            format!("DELETE FROM inference_calls WHERE timestamp < ?1 AND {closed}"),
-            cutoff_secs,
-        ),
-    ] {
-        total += tx
-            .execute(&sql, params![cutoff])
-            .context("pruning session payload rows")? as u64;
+    let mut transcripts = 0_u64;
+    if transcript_cutoff_secs > 0 {
+        transcripts = tx.execute(
+            &format!(
+                "DELETE FROM session_events
+                  WHERE ts_ms < ?1 AND {closed}
+                    AND NOT EXISTS (
+                        SELECT 1 FROM pins
+                         WHERE pins.session_id=session_events.session_id
+                           AND pins.seq=session_events.seq
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM sessions child
+                         WHERE child.parent_session_id=session_events.session_id
+                           AND child.fork_point_turn_id=session_events.seq
+                    )"
+            ),
+            params![transcript_cutoff_secs.saturating_mul(1000)],
+        )? as u64;
+    }
+    let mut raw_wire = 0_u64;
+    if raw_wire_cutoff_secs > 0 {
+        raw_wire = raw_wire.saturating_add(tx.execute(
+            &format!("DELETE FROM inference_requests WHERE ts_ms < ?1 AND {closed}"),
+            params![raw_wire_cutoff_secs.saturating_mul(1000)],
+        )? as u64);
+        // A parent deletion cascades its call subtree. Delete it only when no
+        // descendant is newer than the cutoff; otherwise retain the complete
+        // structural chain until the youngest descendant becomes eligible.
+        raw_wire = raw_wire.saturating_add(tx.execute(
+            &format!(
+                "DELETE FROM tool_call_events
+                      WHERE timestamp < ?1 AND {closed}
+                        AND NOT EXISTS (
+                            WITH RECURSIVE descendants(call_id, timestamp) AS (
+                                SELECT child.call_id, child.timestamp
+                                  FROM tool_call_events child
+                                 WHERE child.session_id=tool_call_events.session_id
+                                   AND child.parent_call_id=tool_call_events.call_id
+                                UNION ALL
+                                SELECT child.call_id, child.timestamp
+                                  FROM tool_call_events child
+                                  JOIN descendants parent ON child.parent_call_id=parent.call_id
+                                 WHERE child.session_id=tool_call_events.session_id
+                            )
+                            SELECT 1 FROM descendants WHERE timestamp >= ?1
+                        )"
+            ),
+            params![raw_wire_cutoff_secs],
+        )? as u64);
+    }
+    let mut terminal_evidence = 0_u64;
+    if terminal_evidence_cutoff_secs > 0 {
+        terminal_evidence = tx.execute(
+            &format!("DELETE FROM inference_calls WHERE timestamp < ?1 AND {closed}"),
+            params![terminal_evidence_cutoff_secs],
+        )? as u64;
     }
     tx.commit().context("commit prune_session_payloads tx")?;
-    Ok(total)
+    Ok((transcripts, raw_wire, terminal_evidence))
 }
 
 fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
@@ -328,6 +420,16 @@ fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
                           JOIN subtree parent ON child.parent_session_id = parent.session_id
                     )
                     SELECT 1 FROM subtree WHERE ended_at_unix_ms IS NULL
+                )
+                AND NOT EXISTS (
+                    WITH RECURSIVE subtree(session_id) AS (
+                        SELECT session_id FROM sessions WHERE session_id = root.session_id
+                        UNION ALL
+                        SELECT child.session_id
+                          FROM sessions child
+                          JOIN subtree parent ON child.parent_session_id = parent.session_id
+                    )
+                    SELECT 1 FROM pins JOIN subtree USING (session_id)
                 )",
         )
         .context("preparing old session roots")?;
@@ -437,7 +539,10 @@ mod tests {
         insert_payload_rows(&db, closed.session_id, "closed", 10).await;
         insert_payload_rows(&db, open.session_id, "open", 10).await;
 
-        assert_eq!(db.prune_session_payloads(20).await.unwrap(), 4);
+        assert_eq!(
+            db.prune_session_payloads(20, 20, 20).await.unwrap(),
+            (1, 2, 1)
+        );
 
         for table in [
             "inference_requests",
@@ -477,7 +582,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = db.prune_session_payloads(20).await.unwrap_err();
+        let err = db.prune_session_payloads(20, 20, 20).await.unwrap_err();
 
         assert!(
             format!("{err:#}").contains("injected payload prune failure"),
@@ -503,7 +608,10 @@ mod tests {
         insert_payload_rows(&db, at.session_id, "at", 100).await;
         insert_payload_rows(&db, old.session_id, "old", 99).await;
 
-        assert_eq!(db.prune_session_payloads(100).await.unwrap(), 4);
+        assert_eq!(
+            db.prune_session_payloads(100, 100, 100).await.unwrap(),
+            (1, 2, 1)
+        );
 
         for table in [
             "inference_requests",
@@ -527,7 +635,7 @@ mod tests {
         close_session(&db, s.session_id, 10).await;
         insert_payload_rows(&db, s.session_id, "closed", 10).await;
 
-        db.prune_session_payloads(20).await.unwrap();
+        db.prune_session_payloads(20, 20, 20).await.unwrap();
 
         assert!(db.get_session(s.session_id).await.unwrap().is_some());
     }
@@ -604,9 +712,11 @@ mod tests {
     }
 
     #[test]
-    fn pruning_is_off_by_default() {
+    fn launch_retention_defaults_are_bounded_but_whole_sessions_are_preserved() {
         let cfg = RetentionConfig::default();
-        assert_eq!(cfg.payload_window_days, 0);
+        assert_eq!(cfg.transcript_window_days, 90);
+        assert_eq!(cfg.raw_wire_window_days, 30);
+        assert_eq!(cfg.terminal_evidence_window_days, 90);
         assert_eq!(cfg.session_window_days, 0);
     }
 
@@ -614,7 +724,9 @@ mod tests {
     async fn disabled_windows_delete_nothing() {
         let db = Db::open_in_memory().unwrap();
         let cfg = RetentionConfig {
-            payload_window_days: 0,
+            transcript_window_days: 0,
+            raw_wire_window_days: 0,
+            terminal_evidence_window_days: 0,
             session_window_days: 0,
             vacuum_interval_days: 0,
             ..RetentionConfig::default()
@@ -633,7 +745,9 @@ mod tests {
         close_session(&db, s.session_id, 10).await;
         insert_payload_rows(&db, s.session_id, "closed", 10).await;
         let cfg = RetentionConfig {
-            payload_window_days: 1,
+            transcript_window_days: 1,
+            raw_wire_window_days: 1,
+            terminal_evidence_window_days: 1,
             vacuum_interval_days: 0,
             ..RetentionConfig::default()
         };
@@ -652,7 +766,9 @@ mod tests {
         close_session(&db, s.session_id, 10).await;
         insert_payload_rows(&db, s.session_id, "closed", 10).await;
         let cfg = RetentionConfig {
-            payload_window_days: 1,
+            transcript_window_days: 1,
+            raw_wire_window_days: 1,
+            terminal_evidence_window_days: 1,
             vacuum_interval_days: 0,
             ..RetentionConfig::default()
         };

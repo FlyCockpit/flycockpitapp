@@ -560,12 +560,19 @@ fn retention_line(retention: &crate::db::retention::RetentionConfig) -> String {
     } else {
         format!("{} days", retention.session_window_days)
     };
-    let payloads = if retention.payload_window_days == 0 {
-        "disabled".to_string()
-    } else {
-        format!("{} days", retention.payload_window_days)
+    let window = |days| {
+        if days == 0 {
+            "unlimited".to_string()
+        } else {
+            format!("{days} days")
+        }
     };
-    format!("retention: session pruning {sessions}; payload pruning {payloads}")
+    format!(
+        "retention: sessions {sessions}; transcripts {}; raw/wire {}; terminal evidence {}",
+        window(retention.transcript_window_days),
+        window(retention.raw_wire_window_days),
+        window(retention.terminal_evidence_window_days)
+    )
 }
 
 async fn daemon_lines() -> (Vec<String>, bool) {

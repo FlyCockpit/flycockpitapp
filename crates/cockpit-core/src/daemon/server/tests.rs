@@ -14116,7 +14116,9 @@ async fn retention_tick_runs_one_pass_without_sleep() {
     .await
     .unwrap();
     let cfg = RetentionConfig {
-        payload_window_days: 1,
+        transcript_window_days: 1,
+        raw_wire_window_days: 0,
+        terminal_evidence_window_days: 0,
         vacuum_interval_days: 0,
         ..RetentionConfig::default()
     };

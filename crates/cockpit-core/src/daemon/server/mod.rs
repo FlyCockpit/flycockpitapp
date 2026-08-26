@@ -4035,6 +4035,9 @@ fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
         tracing::info!(
             sessions_expired = outcome.sessions_expired,
             payload_rows_deleted = outcome.payload_rows_deleted,
+            transcript_rows_deleted = outcome.transcript_rows_deleted,
+            raw_wire_rows_deleted_or_redacted = outcome.raw_wire_rows_deleted_or_redacted,
+            terminal_evidence_rows_deleted = outcome.terminal_evidence_rows_deleted,
             local_authority_rows_purged = outcome.local_authority_rows_purged,
             vacuumed = outcome.vacuumed,
             "session payload retention pass completed"

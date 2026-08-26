@@ -129,7 +129,17 @@ impl ClientEndpoint {
                         stream.flush().await?;
                         stream.shutdown().await?;
                         const MAX_SENSITIVE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
-                        let mut response = Zeroizing::new(Vec::new());
+                        // Pre-size the zeroizing buffer to the response ceiling
+                        // so `read_to_end` never reallocates: a realloc would
+                        // copy the partial plaintext into a fresh allocation and
+                        // free the old one WITHOUT zeroizing it, stranding
+                        // revealed-secret fragments in freed heap (Zeroizing's
+                        // drop only scrubs the final allocation). Any response
+                        // within the ceiling now lands in this one buffer, and
+                        // its full capacity is zeroed on drop.
+                        let mut response = Zeroizing::new(Vec::with_capacity(
+                            MAX_SENSITIVE_RESPONSE_BYTES as usize,
+                        ));
                         stream
                             .take(MAX_SENSITIVE_RESPONSE_BYTES + 1)
                             .read_to_end(&mut response)

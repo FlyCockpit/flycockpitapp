@@ -363,9 +363,21 @@ impl std::fmt::Debug for SealedInputBuffer {
 }
 
 impl SealedInputBuffer {
+    /// A zeroizing buffer pre-sized to the frame ceiling so per-keystroke
+    /// `push`es never reallocate. A realloc would copy the partial secret into a
+    /// fresh allocation and free the old one WITHOUT zeroizing it, stranding
+    /// plaintext fragments in freed heap — the exact leak this type promises to
+    /// avoid. Because `push` refuses any char that would exceed
+    /// `MAX_SENSITIVE_FRAME_BYTES`, the reserved capacity is never outgrown, and
+    /// `Zeroizing`'s drop scrubs the full capacity. 16 KiB is a trivial
+    /// per-overlay allocation.
+    fn empty_value() -> Zeroizing<String> {
+        Zeroizing::new(String::with_capacity(MAX_SENSITIVE_FRAME_BYTES))
+    }
+
     pub fn new() -> Self {
         Self {
-            value: Zeroizing::new(String::new()),
+            value: Self::empty_value(),
         }
     }
 
@@ -384,7 +396,7 @@ impl SealedInputBuffer {
 
     /// Zeroize the buffer (dismiss/close). Dropping `Zeroizing` scrubs the bytes.
     pub fn clear(&mut self) {
-        self.value = Zeroizing::new(String::new());
+        self.value = Self::empty_value();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -399,7 +411,7 @@ impl SealedInputBuffer {
     /// Move the literal out inside its zeroizing buffer, leaving `self` empty.
     /// No intermediate non-zeroizing copy is made.
     pub fn take(&mut self) -> Zeroizing<String> {
-        std::mem::replace(&mut self.value, Zeroizing::new(String::new()))
+        std::mem::replace(&mut self.value, Self::empty_value())
     }
 }
 
@@ -848,6 +860,34 @@ mod tests {
             session_id: "11111111-1111-1111-1111-111111111111".to_string(),
             project_key: "proj-key".to_string(),
         }
+    }
+
+    #[test]
+    fn sealed_input_buffer_never_reallocates_on_push() {
+        // The buffer must be pre-sized to the frame ceiling so per-keystroke
+        // pushes never reallocate — a realloc would free an un-zeroized copy of
+        // the partial secret, stranding plaintext in freed heap.
+        let mut buf = SealedInputBuffer::new();
+        let cap = buf.value.capacity();
+        assert!(
+            cap >= MAX_SENSITIVE_FRAME_BYTES,
+            "buffer must reserve the frame ceiling up front"
+        );
+        for _ in 0..MAX_SENSITIVE_FRAME_BYTES {
+            buf.push('x');
+        }
+        assert_eq!(buf.value.len(), MAX_SENSITIVE_FRAME_BYTES);
+        assert_eq!(
+            buf.value.capacity(),
+            cap,
+            "push must not reallocate (would strand plaintext in freed heap)"
+        );
+        // `clear` and `take` also restore a pre-sized buffer for reuse.
+        buf.clear();
+        assert!(buf.value.capacity() >= MAX_SENSITIVE_FRAME_BYTES);
+        buf.push('y');
+        let _ = buf.take();
+        assert!(buf.value.capacity() >= MAX_SENSITIVE_FRAME_BYTES);
     }
 
     fn press(code: KeyCode) -> KeyEvent {

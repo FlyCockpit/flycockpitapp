@@ -23,6 +23,7 @@ use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tui::pane::Pane;
 use crate::tui::pane_shared::{resolve_project_id, short_id};
@@ -71,6 +72,7 @@ impl RangeToggle {
 }
 
 pub struct StatsPane {
+    generation: u64,
     /// Resolved current-project id, or `None` when the cwd couldn't be
     /// resolved to a project. When `None`, the scope toggle is pinned to
     /// `All` (there's no project to scope to).
@@ -87,6 +89,7 @@ pub struct StatsPane {
     /// Cursor over recovery rows plus vertical body scroll.
     list: ListState,
     selected_model: Option<String>,
+    selected_model_index: usize,
     follow_selection: bool,
     /// Rendered body height at the last draw — drives scroll clamping.
     last_body_height: usize,
@@ -96,6 +99,7 @@ pub struct StatsPane {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatsPaneFetchKey {
+    pane_generation: u64,
     project_id: Option<String>,
     scope: ScopeToggle,
     range: RangeToggle,
@@ -118,6 +122,8 @@ impl StatsPane {
     /// Open the pane for `cwd` and request the first roll-up (current
     /// project / 7d by default, per §15a).
     pub fn open(cwd: &std::path::Path) -> Self {
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
         let project_id = resolve_project_id(cwd);
         let scope = if project_id.is_some() {
             ScopeToggle::Project
@@ -126,11 +132,13 @@ impl StatsPane {
         };
         let range = RangeToggle::Last7Days;
         let key = StatsPaneFetchKey {
+            pane_generation: generation,
             project_id: project_id.clone(),
             scope,
             range,
         };
         Self {
+            generation,
             project_id,
             scope,
             range,
@@ -139,6 +147,7 @@ impl StatsPane {
             expanded: Vec::new(),
             list: ListState::default(),
             selected_model: None,
+            selected_model_index: 0,
             follow_selection: false,
             last_body_height: 0,
             last_content_rows: 0,
@@ -154,6 +163,7 @@ impl StatsPane {
         self.expanded = init_expanded(&self.rollup);
         self.list = ListState::default();
         self.selected_model = None;
+        self.selected_model_index = 0;
         self.follow_selection = false;
     }
 
@@ -165,7 +175,7 @@ impl StatsPane {
         if result.key != self.current_fetch_key() {
             return;
         }
-        let previous_index = self.selected_recovery_index();
+        let previous_index = self.selected_model_index;
         let previous_model = self.selected_model.clone();
         let succeeded = result.result.is_ok();
         self.rollup = match result.result {
@@ -175,31 +185,32 @@ impl StatsPane {
         self.expanded = init_expanded(&self.rollup);
         self.list = ListState::default();
         if succeeded {
-            self.selected_model = self.rollup.ready().and_then(|rollup| {
-                previous_model
-                    .filter(|model| {
+            if let Some(rollup) = self.rollup.ready() {
+                let index = previous_model
+                    .as_ref()
+                    .and_then(|model| {
                         rollup
                             .recovery
                             .by_model
                             .iter()
-                            .any(|row| row.model == *model)
+                            .position(|row| row.model == *model)
                     })
-                    .or_else(|| {
-                        rollup
-                            .recovery
-                            .by_model
-                            .get(
-                                previous_index
-                                    .min(rollup.recovery.by_model.len().saturating_sub(1)),
-                            )
-                            .map(|row| row.model.clone())
-                    })
-            });
+                    .unwrap_or_else(|| {
+                        previous_index.min(rollup.recovery.by_model.len().saturating_sub(1))
+                    });
+                self.selected_model_index = index;
+                self.selected_model = rollup
+                    .recovery
+                    .by_model
+                    .get(index)
+                    .map(|row| row.model.clone());
+            }
         }
     }
 
     fn current_fetch_key(&self) -> StatsPaneFetchKey {
         StatsPaneFetchKey {
+            pane_generation: self.generation,
             project_id: self.project_id.clone(),
             scope: self.scope,
             range: self.range,
@@ -232,9 +243,6 @@ impl StatsPane {
 
     fn move_selection(&mut self, delta: isize, total: usize) {
         if total == 0 {
-            self.selected_model = None;
-            self.list.select(None);
-            *self.list.offset_mut() = 0;
             return;
         }
         let current = self.selected_recovery_index();
@@ -248,6 +256,7 @@ impl StatsPane {
             .ready()
             .and_then(|rollup| rollup.recovery.by_model.get(next))
             .map(|row| row.model.clone());
+        self.selected_model_index = next;
     }
 
     /// Handle a key. Returns `true` when the pane should close.
@@ -964,6 +973,7 @@ mod tests {
     fn pane_with(rollup: StatsRollup) -> StatsPane {
         let expanded = vec![false; rollup.recovery.by_model.len()];
         StatsPane {
+            generation: 1,
             project_id: Some("abcdef1234".into()),
             scope: ScopeToggle::Project,
             range: RangeToggle::Last7Days,
@@ -972,6 +982,7 @@ mod tests {
             expanded,
             list: ListState::default(),
             selected_model: None,
+            selected_model_index: 0,
             follow_selection: false,
             last_body_height: 100,
             last_content_rows: 0,
@@ -1485,17 +1496,61 @@ mod tests {
     #[test]
     fn model_selection_survives_error_then_reordered_recovery() {
         let mut rollup = empty_rollup();
-        rollup.recovery.by_model = vec![recovery_row("a"), recovery_row("b")];
+        rollup.recovery.by_model = vec![recovery_row("a"), recovery_row("b"), recovery_row("c")];
         let mut pane = pane_with(rollup.clone());
         pane.handle_key(press(KeyCode::Down));
-        assert_eq!(pane.selected_model.as_deref(), Some("b"));
+        pane.handle_key(press(KeyCode::Down));
+        assert_eq!(pane.selected_model.as_deref(), Some("c"));
 
         pane.apply_fetch_result(StatsPaneFetchResult {
             key: pane.current_fetch_key(),
             result: Err("temporarily offline".to_string()),
         });
-        assert_eq!(pane.selected_model.as_deref(), Some("b"));
+        pane.handle_key(press(KeyCode::Up));
+        pane.handle_key(press(KeyCode::Down));
+        assert_eq!(pane.selected_model.as_deref(), Some("c"));
+        assert_eq!(pane.selected_model_index, 2);
         assert!(matches!(pane.rollup, StatsPaneState::Error(_)));
+
+        rollup.recovery.by_model = vec![recovery_row("x"), recovery_row("y")];
+        pane.apply_fetch_result(StatsPaneFetchResult {
+            key: pane.current_fetch_key(),
+            result: Ok(rollup),
+        });
+        assert_eq!(pane.selected_model.as_deref(), Some("y"));
+        assert_eq!(pane.selected_recovery_index(), 1);
+    }
+
+    #[test]
+    fn fetch_results_are_fenced_to_exact_stats_pane_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut old = StatsPane::open(tmp.path());
+        let old_key = old.take_pending_fetch_key().unwrap();
+        let mut reopened = StatsPane::open(tmp.path());
+        assert_ne!(old.generation, reopened.generation);
+
+        reopened.apply_fetch_result(StatsPaneFetchResult {
+            key: old_key.clone(),
+            result: Ok(empty_rollup()),
+        });
+        assert!(matches!(reopened.rollup, StatsPaneState::Loading));
+        reopened.apply_fetch_result(StatsPaneFetchResult {
+            key: old_key,
+            result: Err("old pane failed".to_string()),
+        });
+        assert!(matches!(reopened.rollup, StatsPaneState::Loading));
+    }
+
+    #[test]
+    fn model_identity_wins_after_error_and_reordered_success() {
+        let mut rollup = empty_rollup();
+        rollup.recovery.by_model = vec![recovery_row("a"), recovery_row("b")];
+        let mut pane = pane_with(rollup.clone());
+        pane.handle_key(press(KeyCode::Down));
+        pane.apply_fetch_result(StatsPaneFetchResult {
+            key: pane.current_fetch_key(),
+            result: Err("offline".to_string()),
+        });
 
         rollup.recovery.by_model.reverse();
         pane.apply_fetch_result(StatsPaneFetchResult {
@@ -1503,6 +1558,6 @@ mod tests {
             result: Ok(rollup),
         });
         assert_eq!(pane.selected_model.as_deref(), Some("b"));
-        assert_eq!(pane.selected_recovery_index(), 0);
+        assert_eq!(pane.selected_model_index, 0);
     }
 }

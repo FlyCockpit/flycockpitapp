@@ -608,7 +608,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "resources",
-        description: "Show resource scheduler state (arg: promote <request-id>)",
+        description: "Show resource scheduler state (arg: promote <display-id-or-uuid>)",
         takes_args: true,
         run: run_resources,
         available: available_always,
@@ -1393,15 +1393,12 @@ impl App {
                     Overlay::Resources(crate::tui::resources_pane::ResourcesPane::open());
                 self.start_resources_snapshot_action();
             }
-            (Some("promote"), Some(request_id), None) => match uuid::Uuid::parse_str(request_id) {
-                Ok(request_id) => self.start_resource_promote_action(request_id),
-                Err(_) => self.push_plain(
-                    "/resources promote requires the canonical request UUID shown by diagnostics",
-                ),
-            },
+            (Some("promote"), Some(request_id), None) => {
+                self.start_resource_promote_token_action(request_id.to_string());
+            }
             _ => {
                 self.push_plain(
-                    "/resources: usage `/resources` or `/resources promote <request-id>`"
+                    "/resources: usage `/resources` or `/resources promote <display-id-or-uuid>`"
                         .to_string(),
                 );
             }

@@ -2930,12 +2930,23 @@ impl App {
     }
 
     pub(super) fn start_resource_promote_action(&mut self, request_id: uuid::Uuid) {
+        let session_id = self.current_session_id();
+        let request = crate::tui::agent_runner::promote_resource_request(request_id, session_id);
+        self.start_resource_promote_request_action(request);
+    }
+
+    pub(super) fn start_resource_promote_token_action(&mut self, request_id: String) {
+        let session_id = self.current_session_id();
+        let request =
+            crate::tui::agent_runner::promote_resource_token_request(request_id, session_id);
+        self.start_resource_promote_request_action(request);
+    }
+
+    fn start_resource_promote_request_action(&mut self, request: cockpit_proto::Request) {
         let pane_generation = match &self.overlay {
             Overlay::Resources(pane) => Some(pane.generation()),
             _ => None,
         };
-        let session_id = self.current_session_id();
-        let request = crate::tui::agent_runner::promote_resource_request(request_id, session_id);
         let lifecycle = self.lifecycle.clone();
         self.async_actions.start_serialized(
             AsyncActionKind::DaemonRpc("resources.promote"),

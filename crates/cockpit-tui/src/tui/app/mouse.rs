@@ -2817,6 +2817,24 @@ mod resource_button_dispatch_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn resources_slash_promote_preserves_display_token_contract() {
+        let _ = crate::tui::agent_runner::take_test_resource_promote_requests();
+        let mut app = App::new(None, false);
+
+        app.handle_resources_command("promote rs-0001");
+
+        assert!(matches!(
+            crate::tui::agent_runner::take_test_resource_promote_requests().as_slice(),
+            [cockpit_proto::Request::PromoteResource { request_id, .. }]
+                if request_id == "rs-0001"
+        ));
+        assert_eq!(
+            app.async_actions.pending_kinds(),
+            vec![AsyncActionKind::DaemonRpc("resources.promote")]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn earlier_fifo_success_survives_later_resource_failure() {
         let mut pane = ResourcesPane::open();
         let snapshot = scheduler_snapshot(&["rs-first", "rs-clicked"]);

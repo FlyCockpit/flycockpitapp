@@ -387,21 +387,34 @@ async fn run_background(
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut killed = false;
+    // Once the sole kill sender (owned by the authority) is dropped,
+    // `kill_rx.changed()` returns `Err` immediately and permanently. Without a
+    // guard the `select!` would keep selecting that always-ready arm while
+    // stdout/stderr are pending, spinning the task at 100% CPU. Disarm the arm
+    // on close so the loop only awaits real output afterwards.
+    let mut kill_watch_closed = false;
 
     loop {
         tokio::select! {
             // Kill request from the authority / `background.cancel`.
-            changed = kill_rx.changed() => {
-                if changed.is_ok() && *kill_rx.borrow() {
-                    killed = true;
-                    let pid = child.id();
-                    cockpit_host::process::terminate_group_async(
-                        &mut child,
-                        pid,
-                        Duration::from_millis(200),
-                    )
-                    .await;
-                    break;
+            changed = kill_rx.changed(), if !kill_watch_closed => {
+                match changed {
+                    Ok(()) => {
+                        if *kill_rx.borrow() {
+                            killed = true;
+                            let pid = child.id();
+                            cockpit_host::process::terminate_group_async(
+                                &mut child,
+                                pid,
+                                Duration::from_millis(200),
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                    // Sender gone: no kill can ever arrive. Stop polling this
+                    // branch and keep draining the child's output.
+                    Err(_) => kill_watch_closed = true,
                 }
             }
             line = out_lines.next_line(), if !stdout_done => {
@@ -855,6 +868,45 @@ mod tests {
             .expect("fast job should complete")
             .unwrap();
         handle.kill();
+        task.await.unwrap();
+        match completed {
+            ScheduleEvent::Completed { result, failed, .. } => {
+                assert!(!failed, "got {result}");
+                assert!(result.contains("done"), "got {result}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_kill_handle_does_not_wedge_running_job() {
+        // Regression: dropping the kill handle (its watch sender) while the job
+        // is still running must NOT spin the task. `kill_rx.changed()` then
+        // returns Err immediately and permanently; without disarming that
+        // `select!` arm the loop selects it forever, never polls stdout/stderr,
+        // and burns 100% CPU while the job never completes. With the fix the arm
+        // is disarmed and the job drains its output and completes normally.
+        let cfg = crate::config::extended::RedactConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let redact = Arc::new(RedactionTable::build(&cfg, tmp.path()).unwrap());
+        let (turn_tx, _turn_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (handle, task) = spawn_test_job(
+            "spin",
+            "sleep 0.3; printf 'done\n'",
+            tmp.path().to_path_buf(),
+            BackgroundLaunch::unconfined(HashMap::new()),
+            redact,
+            turn_tx,
+            event_tx,
+        );
+        // Drop the sole kill sender while the child is still sleeping.
+        drop(handle);
+
+        let completed = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("job must complete after the kill handle is dropped (no busy-spin)")
+            .unwrap();
         task.await.unwrap();
         match completed {
             ScheduleEvent::Completed { result, failed, .. } => {

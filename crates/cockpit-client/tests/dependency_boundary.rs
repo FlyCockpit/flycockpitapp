@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,23 +14,50 @@ fn workspace_root() -> PathBuf {
 fn client_manifest_stays_below_application_and_storage_layers() {
     let manifest = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
         .expect("read cockpit-client manifest");
-    for forbidden in [
-        "cockpit-core",
-        "cockpit-db",
-        "cockpit-host",
-        "cockpit-tui",
-        "ratatui",
-        "crossterm",
-    ] {
-        assert!(
-            !manifest.lines().any(|line| {
-                line.trim_start()
-                    .strip_prefix(forbidden)
-                    .is_some_and(|suffix| suffix.trim_start().starts_with('='))
-            }),
-            "cockpit-client must not depend on {forbidden}"
-        );
+    let mut section = "";
+    let mut local_dependencies = BTreeSet::new();
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line;
+            continue;
+        }
+        if section != "[dependencies]" || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, specification)) = line.split_once('=') else {
+            continue;
+        };
+        if specification.contains("path =") {
+            local_dependencies.insert(name.trim());
+        }
     }
+    assert_eq!(
+        local_dependencies,
+        BTreeSet::from(["cockpit-proto"]),
+        "cockpit-client production workspace dependencies must be exactly cockpit-proto"
+    );
+
+    let feature_mappings = manifest
+        .split_once("[features]")
+        .and_then(|(_, rest)| rest.split_once("[dependencies]"))
+        .map(|(features, _)| {
+            features
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .collect::<BTreeSet<_>>()
+        })
+        .expect("features must precede normal dependencies");
+    assert_eq!(
+        feature_mappings,
+        BTreeSet::from([
+            "default = []",
+            "remote = [\"cockpit-proto/remote\"]",
+            "test-support = []",
+        ]),
+        "client feature mappings must be exact"
+    );
 }
 
 #[test]

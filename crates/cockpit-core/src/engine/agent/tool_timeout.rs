@@ -84,6 +84,11 @@ const TOOL_TIMEOUT_SAFETY: &[ToolTimeoutSafety] = &[
     ToolTimeoutSafety::abandon_safe("start_build"),
     ToolTimeoutSafety::abandon_safe("task"),
     ToolTimeoutSafety::abandon_safe("todo"),
+    // Same abandon-safe media class as extract_audio / extract_video_clip:
+    // dispatcher-level drop cannot leave a half-landed external effect that the
+    // caller would need to observe (egress is fail-closed until attachment
+    // authority admits a source).
+    ToolTimeoutSafety::abandon_safe("transcribe_audio"),
     ToolTimeoutSafety::abandon_safe("artifact_read"),
     ToolTimeoutSafety::abandon_safe("artifact_search"),
     ToolTimeoutSafety::abandon_safe("unlock"),

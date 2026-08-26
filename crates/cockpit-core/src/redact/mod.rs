@@ -2552,6 +2552,7 @@ mod scrub_inventory_tests {
     const INVENTORY_END: &str = "<!-- scrub-inventory:end -->";
     const EXPECTED_SCRUB_FILES: &[&str] = &[
         "apps/cli/src/commands/debug.rs",
+        "crates/cockpit-core/src/daemon/fs_api.rs",
         "crates/cockpit-core/src/daemon/org_sync.rs",
         "crates/cockpit-core/src/daemon/remote_audit_upload.rs",
         "crates/cockpit-core/src/daemon/server/dispatch.rs",
@@ -2559,6 +2560,7 @@ mod scrub_inventory_tests {
         "crates/cockpit-core/src/daemon/session_worker/mod.rs",
         "crates/cockpit-core/src/daemon/session_worker/run.rs",
         "crates/cockpit-core/src/embeddings.rs",
+        "crates/cockpit-core/src/engine/agent/tool_dispatch.rs",
         "crates/cockpit-core/src/engine/driver/mod.rs",
         "crates/cockpit-core/src/engine/model/dispatch.rs",
         "crates/cockpit-core/src/engine/model/mod.rs",

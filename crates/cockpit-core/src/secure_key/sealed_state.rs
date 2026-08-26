@@ -608,6 +608,9 @@ mod tests {
         // secure pin — is a regression.
         const SEALED_HMAC_PIN: &str =
             "hmac = { version = \"=0.13.0\", default-features = false, features = [\"zeroize\"] }";
+        // cockpit-proto gates hmac behind `remote`, so its declaration carries
+        // `optional = true` while keeping the same version / feature pin.
+        const PROTO_HMAC_PIN: &str = "hmac = { version = \"=0.13.0\", default-features = false, features = [\"zeroize\"], optional = true }";
         let own_manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let own_canon = std::fs::canonicalize(&own_manifest).unwrap_or(own_manifest);
         let proto_manifest =
@@ -636,14 +639,13 @@ mod tests {
                 }
             }
         }
-        // cockpit-proto must carry the same exact secure pin as sealed state so
-        // the centralization/pinning invariant is not weakened by the second
-        // legitimate declarer.
+        // cockpit-proto must carry the same secure version/feature pin as sealed
+        // state (optional only because remote feature-gates the dep).
         let proto_manifest_text =
             std::fs::read_to_string(&proto_canon).expect("read cockpit-proto Cargo.toml");
         assert!(
-            proto_manifest_text.contains(SEALED_HMAC_PIN),
-            "cockpit-proto must pin hmac exactly as sealed state does: {SEALED_HMAC_PIN}"
+            proto_manifest_text.contains(PROTO_HMAC_PIN),
+            "cockpit-proto must pin hmac exactly as sealed state does (optional for remote): {PROTO_HMAC_PIN}"
         );
         assert!(
             manifest.contains(SEALED_HMAC_PIN),

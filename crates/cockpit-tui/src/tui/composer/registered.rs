@@ -196,7 +196,7 @@ impl RegisteredComposer {
     pub(crate) fn wire_parts(
         &self,
         vision: bool,
-    ) -> (String, Vec<cockpit_core::engine::message::SubmissionImage>) {
+    ) -> (String, Vec<cockpit_client::image_upload::SubmissionImage>) {
         self.paste_registry.build_wire(self.composer.text(), vision)
     }
 
@@ -1322,7 +1322,7 @@ mod tests {
         let (_, images) = owner.wire_parts(true);
         assert_eq!(
             images,
-            vec![cockpit_core::engine::message::SubmissionImage::retained(
+            vec![cockpit_client::image_upload::SubmissionImage::retained(
                 second_ref
             )]
         );

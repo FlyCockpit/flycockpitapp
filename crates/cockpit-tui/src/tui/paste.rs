@@ -1032,7 +1032,7 @@ impl PasteRegistry {
         &self,
         buffer: &str,
         vision: bool,
-    ) -> (String, Vec<cockpit_core::engine::message::SubmissionImage>) {
+    ) -> (String, Vec<cockpit_client::image_upload::SubmissionImage>) {
         let mut images = Vec::new();
         let out = self.expand_blocks(buffer, |out, block| match &block.kind {
             PasteKind::Text { full, nonce, .. } => {
@@ -1048,7 +1048,7 @@ impl PasteRegistry {
                     out.push_str(&format!("[reference image #{}]", block.number));
                 } else {
                     out.push_str(IMAGE_PART_SENTINEL);
-                    images.push(cockpit_core::engine::message::SubmissionImage::png(
+                    images.push(cockpit_client::image_upload::SubmissionImage::png(
                         png.clone(),
                     ));
                 }
@@ -1067,7 +1067,7 @@ impl PasteRegistry {
                     out.push_str(&format!("[reference image #{}]", block.number));
                 } else {
                     out.push_str(IMAGE_PART_SENTINEL);
-                    images.push(cockpit_core::engine::message::SubmissionImage::retained(
+                    images.push(cockpit_client::image_upload::SubmissionImage::retained(
                         image_ref.clone(),
                     ));
                 }

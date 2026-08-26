@@ -757,17 +757,17 @@ async fn load_and_upload_images(
     let typed = images
         .iter()
         .cloned()
-        .map(cockpit_core::engine::message::SubmissionImage::png)
+        .map(cockpit_client::image_upload::SubmissionImage::png)
         .collect::<Vec<_>>();
-    match crate::daemon::image_upload::upload_submission_images(client, &typed).await {
+    match cockpit_client::image_upload::upload_submission_images(client, &typed).await {
         Ok(refs) => Ok(refs),
         Err(error) => Err(map_image_upload_error(error)),
     }
 }
 
-fn map_image_upload_error(error: crate::daemon::image_upload::ImageUploadError) -> anyhow::Error {
+fn map_image_upload_error(error: cockpit_client::image_upload::ImageUploadError) -> anyhow::Error {
     match error {
-        crate::daemon::image_upload::ImageUploadError::Usage(message) => {
+        cockpit_client::image_upload::ImageUploadError::Usage(message) => {
             RunUsageError(message).into()
         }
         error => error.into(),
@@ -2307,13 +2307,13 @@ mod tests {
         assert!(error.downcast_ref::<RunUsageError>().is_some());
         assert!(error.to_string().contains("too many images"));
 
-        let error = map_image_upload_error(crate::daemon::image_upload::ImageUploadError::Usage(
+        let error = map_image_upload_error(cockpit_client::image_upload::ImageUploadError::Usage(
             "configured upload limit rejected the image".into(),
         ));
         assert!(error.downcast_ref::<RunUsageError>().is_some());
 
         let error = map_image_upload_error(
-            crate::daemon::image_upload::ImageUploadError::Transport("socket closed".into()),
+            cockpit_client::image_upload::ImageUploadError::Transport("socket closed".into()),
         );
         assert!(error.downcast_ref::<RunUsageError>().is_none());
     }

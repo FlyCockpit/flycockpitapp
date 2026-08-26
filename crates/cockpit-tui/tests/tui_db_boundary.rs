@@ -472,7 +472,7 @@ fn production_uses_cockpit_proto_directly() {
                     path.display()
                 ));
             }
-            for migrated_wire_type in [
+            for migrated_lower_layer_type in [
                 "cockpit_core::container::ContainerAvailability",
                 "cockpit_core::container::ContainerRuntimeKind",
                 "cockpit_core::container::ContainerUnavailableReason",
@@ -486,6 +486,7 @@ fn production_uses_cockpit_proto_directly() {
                 "cockpit_core::engine::model::InferenceErrorClass",
                 "cockpit_core::engine::message::QueueItemStatus",
                 "cockpit_core::engine::message::QueueTarget",
+                "cockpit_core::engine::message::SubmissionImage",
                 "cockpit_core::engine::resource_scheduler::ResourcePoolSnapshot",
                 "cockpit_core::engine::resource_scheduler::ResourceQueuedSnapshot",
                 "cockpit_core::engine::resource_scheduler::ResourceQueuedState",
@@ -495,12 +496,18 @@ fn production_uses_cockpit_proto_directly() {
                 "cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot",
                 "cockpit_core::engine::tool::ToolFailKind",
             ] {
-                if compact.contains(migrated_wire_type) {
+                if compact.contains(migrated_lower_layer_type) {
                     findings.push(format!(
-                        "{}: {migrated_wire_type} is a cockpit-proto wire type",
+                        "{}: {migrated_lower_layer_type} has a canonical lower-layer owner",
                         path.display()
                     ));
                 }
+            }
+            if compact.contains("cockpit_core::daemon::image_upload") {
+                findings.push(format!(
+                    "{}: image upload transport is owned by cockpit-client",
+                    path.display()
+                ));
             }
             if compact.contains("externcratecockpit_core") {
                 findings.push(format!(
@@ -518,6 +525,8 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::daemon::self"
                     || imported == "cockpit_core::daemon::proto"
                     || imported.starts_with("cockpit_core::daemon::proto::")
+                    || imported == "cockpit_core::daemon::image_upload"
+                    || imported.starts_with("cockpit_core::daemon::image_upload::")
                     || imported == "cockpit_core::container::ContainerAvailability"
                     || imported == "cockpit_core::container::ContainerRuntimeKind"
                     || imported == "cockpit_core::container::ContainerUnavailableReason"
@@ -531,6 +540,7 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::engine::model::InferenceErrorClass"
                     || imported == "cockpit_core::engine::message::QueueItemStatus"
                     || imported == "cockpit_core::engine::message::QueueTarget"
+                    || imported == "cockpit_core::engine::message::SubmissionImage"
                     || imported == "cockpit_core::engine::resource_scheduler::ResourcePoolSnapshot"
                     || imported
                         == "cockpit_core::engine::resource_scheduler::ResourceQueuedSnapshot"

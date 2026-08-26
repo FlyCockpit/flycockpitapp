@@ -30,6 +30,8 @@ use cockpit_proto::{self as proto, ErrorPayload, Request, Response};
 #[cfg(unix)]
 use cockpit_proto::{Body, Envelope, ProtoStream, RecvFrame};
 
+pub mod image_upload;
+
 /// A cloneable, capability-bearing endpoint for opening fresh in-process
 /// client connections. Unlike the former pathname registry, possession of
 /// this value is the authority to connect.

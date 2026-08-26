@@ -18,6 +18,7 @@ use tokio::sync::{Mutex, Notify, watch};
 use uuid::Uuid;
 
 pub use crate::daemon::proto::{QueueItemStatus, QueueTarget};
+pub use cockpit_client::image_upload::SubmissionImage;
 
 /// Sentinel emitted in wire text by
 /// the TUI paste registry at each real-image
@@ -119,26 +120,6 @@ pub struct UserSubmission {
     pub run_invocation_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SubmissionImage {
-    Png {
-        bytes: Vec<u8>,
-    },
-    Retained {
-        image_ref: crate::daemon::proto::ImageAttachmentRef,
-    },
-}
-
-impl SubmissionImage {
-    pub fn png(bytes: Vec<u8>) -> Self {
-        Self::Png { bytes }
-    }
-
-    pub fn retained(image_ref: crate::daemon::proto::ImageAttachmentRef) -> Self {
-        Self::Retained { image_ref }
-    }
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingSubmissionTerminalDisposition {
     PreflightRejected,

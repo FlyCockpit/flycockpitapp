@@ -4284,14 +4284,14 @@ fn cursor_on_last_line(text: &str, cursor: usize) -> bool {
 }
 
 pub(super) fn validate_pasted_images_for_submit(
-    images: &[cockpit_core::engine::message::SubmissionImage],
+    images: &[cockpit_client::image_upload::SubmissionImage],
 ) -> Result<(), String> {
     if images.is_empty() {
         return Ok(());
     }
     validate_pasted_image_sizes(images)?;
     for (idx, image) in images.iter().enumerate() {
-        let cockpit_core::engine::message::SubmissionImage::Png { bytes: png } = image else {
+        let cockpit_client::image_upload::SubmissionImage::Png { bytes: png } = image else {
             continue;
         };
         let display_idx = idx + 1;
@@ -4312,7 +4312,7 @@ pub(super) fn validate_pasted_images_for_submit(
 }
 
 fn validate_pasted_image_sizes(
-    images: &[cockpit_core::engine::message::SubmissionImage],
+    images: &[cockpit_client::image_upload::SubmissionImage],
 ) -> Result<(), String> {
     if images.len() > cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE {
         return Err(format!(
@@ -4323,7 +4323,7 @@ fn validate_pasted_image_sizes(
     }
     let mut total = 0usize;
     for (idx, image) in images.iter().enumerate() {
-        let cockpit_core::engine::message::SubmissionImage::Png { bytes: png } = image else {
+        let cockpit_client::image_upload::SubmissionImage::Png { bytes: png } = image else {
             continue;
         };
         let display_idx = idx + 1;

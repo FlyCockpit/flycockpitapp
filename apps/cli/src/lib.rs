@@ -26,7 +26,7 @@ pub mod test_env {
 }
 pub(crate) mod daemon {
     pub(crate) use cockpit_core::daemon::{
-        DaemonPaths, DaemonProbe, DaemonStatus, caffeinate, discover, image_upload, proto, server,
+        DaemonPaths, DaemonProbe, DaemonStatus, caffeinate, discover, proto, server,
         session_worker, terminal,
     };
     pub(crate) mod client {

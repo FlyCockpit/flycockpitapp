@@ -2998,17 +2998,17 @@ mod usage_completion_and_wheel_tests {
         AsyncActionId, AsyncActionKind, AsyncActionPayload, AsyncActionResult,
     };
     use crate::tui::usage_pane::UsagePane;
-    use cockpit_core::providers::usage::{ProviderUsageSnapshot, UsageAvailability};
+    use cockpit_proto::{ProviderUsageAvailabilityView, ProviderUsageSnapshotView};
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
-    fn rows(count: usize) -> Vec<ProviderUsageSnapshot> {
+    fn rows(count: usize) -> Vec<ProviderUsageSnapshotView> {
         (0..count)
-            .map(|index| ProviderUsageSnapshot {
+            .map(|index| ProviderUsageSnapshotView {
                 provider_id: format!("provider-{index}"),
                 display_name: format!("Provider {index}"),
                 fetched_at: chrono::Utc::now(),
-                availability: UsageAvailability::Error {
+                availability: ProviderUsageAvailabilityView::Error {
                     message: "offline".to_string(),
                 },
             })

@@ -435,53 +435,6 @@ fn oauth_request_hash<T: serde::Serialize>(value: &T) -> Result<String, String> 
         .collect())
 }
 
-fn provider_usage_from_wire(
-    row: cockpit_proto::ProviderUsageSnapshotView,
-) -> cockpit_core::providers::usage::ProviderUsageSnapshot {
-    use cockpit_core::providers::usage::{ProviderUsageSnapshot, UsageAvailability, UsageWindow};
-    use cockpit_proto::ProviderUsageAvailabilityView as Wire;
-
-    let availability = match row.availability {
-        Wire::Fetched {
-            source: _,
-            plan,
-            windows,
-            details,
-        } => UsageAvailability::Fetched {
-            // The core renderer only uses this as a diagnostic label. Wire
-            // values are daemon-defined, so retain the conservative static
-            // label instead of inventing a leaked remote payload.
-            source: "daemon",
-            plan,
-            windows: windows
-                .into_iter()
-                .map(|window| UsageWindow {
-                    label: window.label,
-                    used_percent: window.used_percent,
-                    reset_at: window.reset_at,
-                    detail: window.detail,
-                })
-                .collect(),
-            details,
-        },
-        Wire::Unsupported { reason: _ } => UsageAvailability::Unsupported {
-            // This legacy local rendering type uses a static reason; detailed
-            // daemon data is intentionally not required for this state.
-            reason: "unsupported by provider",
-        },
-        Wire::Unavailable { reason, hint_url } => {
-            UsageAvailability::Unavailable { reason, hint_url }
-        }
-        Wire::Error { message } => UsageAvailability::Error { message },
-    };
-    ProviderUsageSnapshot {
-        provider_id: row.provider_id,
-        display_name: row.display_name,
-        fetched_at: row.fetched_at,
-        availability,
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StartupDisclosureIdentity<'a> {
     project_root: &'a str,
@@ -3098,10 +3051,7 @@ impl App {
                         .map_err(|e| e.to_string())?
                     {
                         Ok(cockpit_proto::Response::ProviderUsageSnapshot { snapshots }) => {
-                            Ok(snapshots
-                                .into_iter()
-                                .map(provider_usage_from_wire)
-                                .collect())
+                            Ok(snapshots)
                         }
                         Ok(other) => Err(format!(
                             "unexpected provider usage daemon response: {other:?}"

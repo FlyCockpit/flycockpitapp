@@ -309,7 +309,7 @@ pub enum AsyncActionPayload {
     },
     ProviderUsage {
         pane_generation: u64,
-        result: Result<Vec<cockpit_core::providers::usage::ProviderUsageSnapshot>, String>,
+        result: Result<Vec<cockpit_proto::ProviderUsageSnapshotView>, String>,
     },
     Skills(crate::tui::skills_pane::SkillsPaneFetchResult),
     InventoryBundle(cockpit_proto::Response),

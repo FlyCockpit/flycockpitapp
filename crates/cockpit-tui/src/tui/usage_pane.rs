@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
-use cockpit_core::providers::usage::{ProviderUsageSnapshot, render_usage_lines};
+use cockpit_proto::{ProviderUsageAvailabilityView, ProviderUsageSnapshotView};
 
 pub struct UsagePane {
     generation: u64,
-    rows: Result<Vec<ProviderUsageSnapshot>, String>,
+    rows: Result<Vec<ProviderUsageSnapshotView>, String>,
     list: ListState,
     last_body_height: usize,
     last_content_rows: usize,
@@ -35,7 +35,7 @@ impl UsagePane {
         }
     }
 
-    pub fn open(rows: Vec<ProviderUsageSnapshot>) -> Self {
+    pub fn open(rows: Vec<ProviderUsageSnapshotView>) -> Self {
         let mut pane = Self::loading();
         pane.rows = Ok(rows);
         pane
@@ -51,7 +51,7 @@ impl UsagePane {
         self.generation
     }
 
-    pub(crate) fn apply_result(&mut self, result: Result<Vec<ProviderUsageSnapshot>, String>) {
+    pub(crate) fn apply_result(&mut self, result: Result<Vec<ProviderUsageSnapshotView>, String>) {
         self.rows = result;
         *self.list.offset_mut() = 0;
     }
@@ -177,10 +177,70 @@ impl Pane for UsagePane {
     }
 }
 
+fn render_usage_lines(snapshot: &ProviderUsageSnapshotView) -> Vec<String> {
+    let mut lines = Vec::new();
+    match &snapshot.availability {
+        ProviderUsageAvailabilityView::Fetched {
+            plan,
+            windows,
+            details,
+            ..
+        } => {
+            let mut header = format!("{} ({})", snapshot.display_name, snapshot.provider_id);
+            if let Some(plan) = plan.as_deref().filter(|value| !value.trim().is_empty()) {
+                header.push_str(&format!(" — plan: {plan}"));
+            }
+            lines.push(header);
+            if windows.is_empty() && details.is_empty() {
+                lines.push("  No usage windows returned.".to_string());
+            }
+            for window in windows {
+                let mut line = format!("  {}: ", window.label);
+                if let Some(used) = window.used_percent {
+                    let used = used.clamp(0.0, 100.0);
+                    line.push_str(&format!(
+                        "{:.0}% remaining ({:.0}% used)",
+                        (100.0 - used).max(0.0).round(),
+                        used.round()
+                    ));
+                } else {
+                    line.push_str("usage not reported");
+                }
+                if let Some(reset) = window.reset_at {
+                    line.push_str(&format!("; resets {}", reset.to_rfc3339()));
+                }
+                if let Some(detail) = window.detail.as_deref().filter(|v| !v.trim().is_empty()) {
+                    line.push_str(&format!(" — {detail}"));
+                }
+                lines.push(line);
+            }
+            lines.extend(details.iter().map(|detail| format!("  {detail}")));
+        }
+        ProviderUsageAvailabilityView::Unsupported { reason } => lines.push(format!(
+            "{} ({}) — unsupported: {reason}",
+            snapshot.display_name, snapshot.provider_id
+        )),
+        ProviderUsageAvailabilityView::Unavailable { reason, hint_url } => {
+            let suffix = hint_url
+                .as_deref()
+                .map_or(String::new(), |url| format!(" {url}"));
+            lines.push(format!(
+                "{} ({}) — unavailable: {reason}{suffix}",
+                snapshot.display_name, snapshot.provider_id
+            ));
+        }
+        ProviderUsageAvailabilityView::Error { message } => lines.push(format!(
+            "{} ({}) — error: {message}",
+            snapshot.display_name, snapshot.provider_id
+        )),
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cockpit_core::providers::usage::UsageAvailability;
+    use cockpit_proto::ProviderUsageAvailabilityView;
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
@@ -192,11 +252,11 @@ mod tests {
     #[test]
     fn stateful_list_scroll_is_bounded_and_survives_rerender() {
         let rows = (0..20)
-            .map(|index| ProviderUsageSnapshot {
+            .map(|index| ProviderUsageSnapshotView {
                 provider_id: format!("provider-{index}"),
                 display_name: format!("Provider {index}"),
                 fetched_at: chrono::Utc::now(),
-                availability: UsageAvailability::Error {
+                availability: ProviderUsageAvailabilityView::Error {
                     message: "offline".to_string(),
                 },
             })

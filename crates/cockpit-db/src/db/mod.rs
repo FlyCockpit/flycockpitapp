@@ -1315,9 +1315,7 @@ fn create_migration_backup_with_limit(
     // us discard the fresh candidate merely because it owns the digest-shaped
     // pathname. Move it into the lock-owned candidate namespace; it remains
     // recoverable until the replacement reaches its fsync boundary.
-    let displaced = quarantine_path_present(&untrusted)?
-        .then(|| displace_invalid_quarantine(path, &untrusted))
-        .transpose()?;
+    let displaced = handle_invalid_quarantine_occupant(path, &untrusted)?;
     if let Err(error) = validation {
         std::fs::rename(&candidate, &untrusted).with_context(|| {
             format!(
@@ -1371,16 +1369,6 @@ fn existing_quarantine_matches(path: &Path, expected_digest: &str) -> Result<boo
     Ok(file_sha256(path)? == expected_digest)
 }
 
-fn quarantine_path_present(path: &Path) -> Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => {
-            Err(error).with_context(|| format!("inspecting quarantine path {}", path.display()))
-        }
-    }
-}
-
 #[cfg(unix)]
 fn quarantine_metadata_is_private_and_owned(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -1413,6 +1401,55 @@ fn displace_invalid_quarantine(database: &Path, quarantine: &Path) -> Result<Pat
     })?;
     fsync_file_and_parent(&displaced)?;
     Ok(displaced)
+}
+
+fn handle_invalid_quarantine_occupant(
+    database: &Path,
+    quarantine: &Path,
+) -> Result<Option<PathBuf>> {
+    let metadata = match std::fs::symlink_metadata(quarantine) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspecting quarantine path {}", quarantine.display()));
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_file() && !file_type.is_symlink() {
+        return displace_invalid_quarantine(database, quarantine).map(Some);
+    }
+    if file_type.is_symlink() {
+        unlink_quarantine_symlink(quarantine, sync_backup_parent)?;
+        return Ok(None);
+    }
+    anyhow::bail!(
+        "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: no recovery artifact was published because the quarantine path {} is a directory or special file; remove that exact path manually and retry",
+        quarantine.display()
+    )
+}
+
+fn unlink_quarantine_symlink(
+    quarantine: &Path,
+    sync_parent: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    std::fs::remove_file(quarantine).with_context(|| {
+        format!(
+            "unlinking invalid quarantine symlink {} without following it",
+            quarantine.display()
+        )
+    })?;
+    let parent = quarantine
+        .parent()
+        .context("quarantine symlink has no parent directory")?;
+    sync_parent(parent)
+}
+
+fn sync_backup_parent(parent: &Path) -> Result<()> {
+    std::fs::File::open(parent)
+        .with_context(|| format!("opening backup directory {} for fsync", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("fsyncing backup directory {}", parent.display()))
 }
 
 /// Cross-process serialization for recovery-artifact admission. The sibling
@@ -1868,17 +1905,29 @@ fn prune_untrusted_migration_backups_with_limits(
         if !owned {
             continue;
         }
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading quarantined backup type {}", candidate.display()))?;
+        if file_type.is_symlink() {
+            std::fs::remove_file(&candidate).with_context(|| {
+                format!(
+                    "unlinking invalid quarantine symlink {} without following it",
+                    candidate.display()
+                )
+            })?;
+            continue;
+        }
+        anyhow::ensure!(
+            file_type.is_file(),
+            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: quarantine path {} is a directory or special file; remove that exact path manually and retry",
+            candidate.display()
+        );
         let metadata = entry.metadata().with_context(|| {
             format!(
                 "reading quarantined backup metadata {}",
                 candidate.display()
             )
         })?;
-        anyhow::ensure!(
-            metadata.is_file(),
-            "quarantined backup is not a regular file: {}",
-            candidate.display()
-        );
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
         backups.push((modified, metadata.len(), candidate));
     }
@@ -2827,7 +2876,7 @@ mod tests {
         assert!(!existing_quarantine_matches(&quarantine, &digest).unwrap());
 
         let displaced = displace_invalid_quarantine(&database, &quarantine).unwrap();
-        assert!(!quarantine_path_present(&quarantine).unwrap());
+        assert!(!quarantine.exists());
         assert_eq!(std::fs::read(displaced).unwrap(), &exact_bytes[..4]);
     }
 
@@ -2846,7 +2895,66 @@ mod tests {
         symlink(&target, &quarantine).unwrap();
 
         assert!(!existing_quarantine_matches(&quarantine, &digest).unwrap());
-        assert!(quarantine_path_present(&quarantine).unwrap());
+        let mut synced_parent = None;
+        unlink_quarantine_symlink(&quarantine, |parent| {
+            synced_parent = Some(parent.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(synced_parent.as_deref(), Some(temp.path()));
+        assert!(!quarantine.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"matching target bytes");
+        std::fs::write(&quarantine, b"later regular admission").unwrap();
+        assert!(quarantine.is_file());
+    }
+
+    #[test]
+    fn directory_quarantine_occupant_fails_closed_without_candidate_poisoning() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let quarantine = temp
+            .path()
+            .join("cockpit.v1.backup-untrusted-deadbeef.sqlite.quarantine");
+        std::fs::create_dir(&quarantine).unwrap();
+
+        let preflight = prune_untrusted_migration_backups(&database).unwrap_err();
+        assert!(format!("{preflight:#}").contains("remove that exact path manually"));
+        let error = handle_invalid_quarantine_occupant(&database, &quarantine).unwrap_err();
+        assert!(format!("{error:#}").contains("remove that exact path manually"));
+        assert!(quarantine.is_dir());
+        assert!(
+            !std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("backup-candidate")
+                })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_quarantine_occupant_fails_closed_in_place() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let quarantine = temp
+            .path()
+            .join("cockpit.v1.backup-untrusted-special.sqlite.quarantine");
+        let encoded = std::ffi::CString::new(quarantine.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is a live NUL-terminated path and the mode is a
+        // valid permission mask for creating the test FIFO.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let preflight = prune_untrusted_migration_backups(&database).unwrap_err();
+        assert!(format!("{preflight:#}").contains("remove that exact path manually"));
+        let error = handle_invalid_quarantine_occupant(&database, &quarantine).unwrap_err();
+        assert!(format!("{error:#}").contains("directory or special file"));
+        assert!(std::fs::symlink_metadata(&quarantine).is_ok());
     }
 
     #[test]

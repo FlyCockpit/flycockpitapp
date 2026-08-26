@@ -170,7 +170,7 @@ impl App {
     #[cfg(test)]
     pub(super) fn queue_pending_session_switch_submission(
         &mut self,
-        submission: cockpit_core::engine::message::UserSubmission,
+        submission: ClientUserSubmission,
         error_prefix: &str,
         optimistic_tag_entries: usize,
         owns_working_span: bool,
@@ -190,7 +190,7 @@ impl App {
 
     pub(super) fn queue_pending_session_switch_submission_with_optimistic_state(
         &mut self,
-        submission: cockpit_core::engine::message::UserSubmission,
+        submission: ClientUserSubmission,
         error_prefix: &str,
         owns_working_span: bool,
         optimistic: OptimisticSubmissionState,
@@ -523,7 +523,7 @@ impl App {
     pub(super) fn dispatch_init_turn(&mut self, display: &str, wire: String) {
         self.pin_chat_to_tail();
         self.begin_working_span();
-        let submission = cockpit_core::engine::message::UserSubmission::text(wire);
+        let submission = ClientUserSubmission::text(wire);
         self.dispatch_optimistic_user_submission(
             format!("/init {display}"),
             submission,
@@ -536,7 +536,7 @@ impl App {
     pub(super) fn dispatch_optimistic_user_submission(
         &mut self,
         display: String,
-        submission: cockpit_core::engine::message::UserSubmission,
+        submission: ClientUserSubmission,
         error_prefix: &str,
         owns_working_span: bool,
         tag_expansions: &[cockpit_proto::TagExpansionMeta],
@@ -555,7 +555,7 @@ impl App {
         &mut self,
         optimistic_submission_id: uuid::Uuid,
         display: String,
-        mut submission: cockpit_core::engine::message::UserSubmission,
+        mut submission: ClientUserSubmission,
         error_prefix: &str,
         owns_working_span: bool,
         tag_expansions: &[cockpit_proto::TagExpansionMeta],
@@ -907,24 +907,17 @@ impl App {
     pub(super) fn dispatch_skill_invocation(&mut self, display: String, name: &str, args: &str) {
         self.pin_chat_to_tail();
         self.begin_working_span();
-        let submission = cockpit_core::engine::message::UserSubmission {
+        let submission = ClientUserSubmission {
             expected_model_state_generation: None,
             expected_model: None,
-            kind: cockpit_core::engine::message::UserSubmissionKind::User,
-            origin: cockpit_core::engine::message::SubmissionOrigin::ExternalRoot,
+            kind: cockpit_client::submission::UserSubmissionKind::User,
+            origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
             text: args.trim().to_string(),
             display_text: None,
             tag_expansions: Vec::new(),
             images: Vec::new(),
             forced_skill: Some(name.to_string()),
-            origin_principal: None,
-            job_id: None,
-            preflight_cleaned: None,
-            queue_item_ids: Vec::new(),
-            client_submissions: Vec::new(),
-            queue_target: None,
-            pending_terminal_disposition: None,
-            run_invocation_id: None,
+            ..Default::default()
         };
         self.dispatch_optimistic_user_submission(display, submission, "/skill", true, &[]);
     }

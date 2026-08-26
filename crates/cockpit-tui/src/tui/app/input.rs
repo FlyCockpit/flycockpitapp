@@ -2765,7 +2765,7 @@ impl App {
             .into_iter()
             .map(cockpit_proto::TagExpansionMeta::from)
             .collect::<Vec<_>>();
-        let submission = cockpit_core::engine::message::UserSubmission {
+        let submission = ClientUserSubmission {
             expected_model_state_generation: self
                 .active_model_state_confirmed
                 .then_some(self.active_model_state_generation),
@@ -2773,21 +2773,14 @@ impl App {
                 .active_model_state_confirmed
                 .then(|| self.active_model_selection.clone())
                 .flatten(),
-            kind: cockpit_core::engine::message::UserSubmissionKind::User,
-            origin: cockpit_core::engine::message::SubmissionOrigin::ExternalRoot,
+            kind: cockpit_client::submission::UserSubmissionKind::User,
+            origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
             text: wire.clone(),
             display_text: Some(submitted.clone()),
             tag_expansions: tag_expansions.clone(),
             images: paste_images,
             forced_skill: None,
-            origin_principal: None,
-            job_id: None,
-            preflight_cleaned: None,
-            queue_item_ids: Vec::new(),
-            client_submissions: Vec::new(),
-            queue_target: None,
-            pending_terminal_disposition: None,
-            run_invocation_id: None,
+            ..Default::default()
         };
         // A model switch is itself the earlier ordered intent. Attach this
         // fence to that transaction rather than treating it as a generic

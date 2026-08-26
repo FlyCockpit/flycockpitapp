@@ -398,11 +398,11 @@ pub struct SubmissionFenceV1 {
 }
 
 pub fn user_submission_wire_digest(
-    submission: &cockpit_core::engine::message::UserSubmission,
+    submission: &cockpit_client::submission::ClientUserSubmission,
 ) -> [u8; 32] {
     use sha2::Digest as _;
 
-    let cockpit_core::engine::message::UserSubmission {
+    let cockpit_client::submission::ClientUserSubmission {
         kind,
         origin,
         expected_model_state_generation,
@@ -412,14 +412,7 @@ pub fn user_submission_wire_digest(
         tag_expansions,
         images,
         forced_skill,
-        origin_principal,
-        job_id,
-        preflight_cleaned,
-        queue_item_ids,
-        client_submissions,
-        queue_target,
-        pending_terminal_disposition: _,
-        run_invocation_id,
+        ..
     } = submission;
     let bytes = serde_json::to_vec(&(
         kind,
@@ -430,13 +423,6 @@ pub fn user_submission_wire_digest(
         display_text,
         tag_expansions,
         forced_skill,
-        origin_principal,
-        job_id,
-        preflight_cleaned,
-        queue_item_ids,
-        client_submissions,
-        queue_target,
-        run_invocation_id,
     ))
     .expect("UserSubmission contains only infallibly serializable wire fields");
     let mut digest = sha2::Sha256::new();
@@ -1063,7 +1049,7 @@ mod tests {
         assert_eq!(fence.captured_composer, "before");
         assert_eq!(fence.lifecycle, FenceLifecycle::Ready);
 
-        let submission = cockpit_core::engine::message::UserSubmission {
+        let submission = cockpit_client::submission::ClientUserSubmission {
             text: "exact wire".into(),
             images: vec![cockpit_core::engine::message::SubmissionImage::png(vec![
                 1, 2, 3,

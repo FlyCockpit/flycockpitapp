@@ -181,10 +181,10 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
         client_submission_id: uuid::Uuid::new_v4(),
         composer_text: "review @src/model.rs with image".to_string(),
         display: "review @src/model.rs with image".to_string(),
-        submission: cockpit_core::engine::message::UserSubmission {
+        submission: ClientUserSubmission {
             expected_model_state_generation: None,
             expected_model: None,
-            kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+            kind: cockpit_client::submission::UserSubmissionKind::Compact,
             origin: Default::default(),
             text: "review expanded source\n\n<image>".to_string(),
             display_text: Some("review @src/model.rs with image".to_string()),
@@ -1314,7 +1314,7 @@ fn confirmed_model_release_queue_full_retains_and_retries_exact_draft() {
     let (control_tx, _control_rx) = mpsc::channel(2);
     let (input_tx, mut input_rx) = mpsc::channel(1);
     input_tx
-        .try_send(cockpit_core::engine::message::UserSubmission::text("channel blocker").into())
+        .try_send(ClientUserSubmission::text("channel blocker").into())
         .unwrap();
     let runner = AgentRunner::stub_with_channels(control_tx, input_tx);
     let session_id = runner.session_id();

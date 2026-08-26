@@ -126,6 +126,7 @@ use crate::tui::history::{
 };
 use crate::tui::input_source::{MAX_DRAIN_PER_PASS, ObservedTerminalEvent, TerminalInput};
 use crate::tui::settings::{self, Dialog, OAuthBeginResult, OAuthFlowOp, OAuthProvider};
+use cockpit_client::submission::ClientUserSubmission;
 use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
 use cockpit_core::engine::message::QueuedUserMessage;
 use cockpit_core::engine::{
@@ -335,7 +336,7 @@ pub(crate) struct QueuedModelSubmission {
     /// applied result may clear only this exact draft; later edits remain.
     pub composer_text: String,
     pub display: String,
-    pub submission: cockpit_core::engine::message::UserSubmission,
+    pub submission: ClientUserSubmission,
     pub tag_expansions: Vec<cockpit_proto::TagExpansionMeta>,
 }
 
@@ -359,7 +360,7 @@ pub(crate) struct PendingPasteProbe {
 
 pub(crate) struct DeferredFenceDispatch {
     pub display: String,
-    pub submission: cockpit_core::engine::message::UserSubmission,
+    pub submission: ClientUserSubmission,
     pub tag_expansions: Vec<cockpit_proto::TagExpansionMeta>,
     pub waiting_model_selection: Option<uuid::Uuid>,
     pub parked_fence_sequence: Option<u64>,
@@ -1510,7 +1511,7 @@ pub(super) enum DispatchOutcome {
 }
 
 pub(super) struct PendingSessionSwitchSubmission {
-    pub submission: cockpit_core::engine::message::UserSubmission,
+    pub submission: ClientUserSubmission,
     /// Stable client-local identity shared by the exact wire payload and its
     /// optimistic transcript or queue row.
     pub optimistic_submission_id: uuid::Uuid,

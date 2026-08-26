@@ -8,8 +8,9 @@ use crate::tui::async_action::{
 };
 use crate::tui::composer::Composer;
 use crate::tui::history::{HistoryEntry, PendingMsg};
+use cockpit_client::submission::ClientUserSubmission as UserSubmission;
 use cockpit_core::engine::TurnEvent;
-use cockpit_core::engine::message::{QueuedUserMessage, UserSubmission};
+use cockpit_core::engine::message::QueuedUserMessage;
 use cockpit_proto::{self, Request, Response};
 use cockpit_proto::{QueueItemStatus, QueueTarget};
 
@@ -585,21 +586,14 @@ impl BtwPane {
         let submission = UserSubmission {
             expected_model_state_generation: None,
             expected_model: None,
-            kind: cockpit_core::engine::message::UserSubmissionKind::User,
-            origin: cockpit_core::engine::message::SubmissionOrigin::ExternalRoot,
+            kind: cockpit_client::submission::UserSubmissionKind::User,
+            origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
             text: text.clone(),
             display_text: Some(text.clone()),
             tag_expansions: Vec::new(),
             images: Vec::new(),
             forced_skill: None,
-            origin_principal: None,
-            job_id: None,
-            preflight_cleaned: None,
-            queue_item_ids: Vec::new(),
-            client_submissions: Vec::new(),
-            queue_target: None,
-            pending_terminal_disposition: None,
-            run_invocation_id: None,
+            ..Default::default()
         };
         let client_submission_id = Uuid::new_v4();
         runner

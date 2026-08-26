@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
-use cockpit_core::engine::message::UserSubmission;
+use cockpit_client::submission::ClientUserSubmission as UserSubmission;
 
 #[test]
 fn new_session_swap_reads_no_config_from_disk() {
@@ -197,7 +197,7 @@ fn complete_submission(index: usize) -> UserSubmission {
     UserSubmission {
         expected_model_state_generation: None,
         expected_model: None,
-        kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        kind: cockpit_client::submission::UserSubmissionKind::Compact,
         origin: Default::default(),
         text: format!("wire-{index}"),
         display_text: Some(format!("display-{index}")),

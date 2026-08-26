@@ -1088,24 +1088,17 @@ impl App {
             ControlApplied::Multireview { kickoff } => {
                 self.push_plain(MULTIREVIEW_TOKEN_BURN_WARNING.to_string());
                 self.begin_working_span();
-                let submission = cockpit_core::engine::message::UserSubmission {
+                let submission = ClientUserSubmission {
                     expected_model_state_generation: None,
                     expected_model: None,
-                    kind: cockpit_core::engine::message::UserSubmissionKind::User,
-                    origin: cockpit_core::engine::message::SubmissionOrigin::AutoContinue,
+                    kind: cockpit_client::submission::UserSubmissionKind::User,
+                    origin: cockpit_client::submission::SubmissionOrigin::AutoContinue,
                     text: kickoff.clone(),
                     display_text: None,
                     tag_expansions: Vec::new(),
                     images: Vec::new(),
                     forced_skill: None,
-                    origin_principal: None,
-                    job_id: None,
-                    preflight_cleaned: None,
-                    queue_item_ids: Vec::new(),
-                    client_submissions: Vec::new(),
-                    queue_target: None,
-                    pending_terminal_disposition: None,
-                    run_invocation_id: None,
+                    ..Default::default()
                 };
                 self.dispatch_optimistic_user_submission(
                     kickoff,

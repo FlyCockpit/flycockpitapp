@@ -1503,7 +1503,7 @@ impl App {
             } else {
                 format!("/learn {}", args.trim())
             },
-            cockpit_core::engine::message::UserSubmission::text(prompt),
+            ClientUserSubmission::text(prompt),
             "/learn",
             true,
             &[],

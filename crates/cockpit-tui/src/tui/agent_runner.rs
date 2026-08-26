@@ -25,6 +25,7 @@ use cockpit_client::bulk_upload::{
     user_message_needs_bulk,
 };
 use cockpit_client::image_upload::{ImageUploadError, upload_submission_images};
+use cockpit_client::submission::ClientUserSubmission;
 use cockpit_client::{ClientEndpoint, DaemonClient, LifecycleClient, LifecycleIntent};
 use cockpit_core::engine::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
@@ -145,7 +146,7 @@ pub struct ControlRequest {
 
 #[derive(Clone)]
 pub(crate) struct BoundUserSubmission {
-    pub(crate) submission: cockpit_core::engine::message::UserSubmission,
+    pub(crate) submission: ClientUserSubmission,
     pub(crate) optimistic_submission_id: Uuid,
     pub(crate) intended_session_id: Uuid,
     pub(crate) intended_attachment_epoch: u64,
@@ -259,7 +260,7 @@ pub(crate) enum InputNotDelivered {
 }
 
 impl std::ops::Deref for BoundUserSubmission {
-    type Target = cockpit_core::engine::message::UserSubmission;
+    type Target = ClientUserSubmission;
 
     fn deref(&self) -> &Self::Target {
         &self.submission
@@ -267,8 +268,8 @@ impl std::ops::Deref for BoundUserSubmission {
 }
 
 #[cfg(test)]
-impl From<cockpit_core::engine::message::UserSubmission> for BoundUserSubmission {
-    fn from(submission: cockpit_core::engine::message::UserSubmission) -> Self {
+impl From<ClientUserSubmission> for BoundUserSubmission {
+    fn from(submission: ClientUserSubmission) -> Self {
         Self {
             submission,
             optimistic_submission_id: Uuid::new_v4(),
@@ -279,8 +280,8 @@ impl From<cockpit_core::engine::message::UserSubmission> for BoundUserSubmission
 }
 
 #[cfg(test)]
-impl From<cockpit_core::engine::message::UserSubmission> for RunnerInput {
-    fn from(submission: cockpit_core::engine::message::UserSubmission) -> Self {
+impl From<ClientUserSubmission> for RunnerInput {
+    fn from(submission: ClientUserSubmission) -> Self {
         Self::Submission(Box::new(submission.into()))
     }
 }
@@ -607,7 +608,7 @@ impl AgentRunner {
 
     pub(crate) fn try_send_input(
         &self,
-        submission: cockpit_core::engine::message::UserSubmission,
+        submission: ClientUserSubmission,
     ) -> Result<(), InputNotDelivered> {
         self.try_send_optimistic_input(submission, Uuid::new_v4())
             .map_err(|(outcome, _submission)| outcome)
@@ -615,15 +616,9 @@ impl AgentRunner {
 
     pub(crate) fn try_send_optimistic_input(
         &self,
-        submission: cockpit_core::engine::message::UserSubmission,
+        submission: ClientUserSubmission,
         optimistic_submission_id: Uuid,
-    ) -> Result<
-        (),
-        (
-            InputNotDelivered,
-            Box<cockpit_core::engine::message::UserSubmission>,
-        ),
-    > {
+    ) -> Result<(), (InputNotDelivered, Box<ClientUserSubmission>)> {
         let bound = BoundUserSubmission {
             submission,
             optimistic_submission_id,
@@ -655,14 +650,8 @@ impl AgentRunner {
     /// post-switch item even when the batch is larger than its capacity.
     pub(crate) fn try_send_session_switch_inputs(
         &self,
-        submissions: Vec<(Uuid, cockpit_core::engine::message::UserSubmission)>,
-    ) -> Result<
-        (),
-        (
-            InputNotDelivered,
-            Vec<(Uuid, cockpit_core::engine::message::UserSubmission)>,
-        ),
-    > {
+        submissions: Vec<(Uuid, ClientUserSubmission)>,
+    ) -> Result<(), (InputNotDelivered, Vec<(Uuid, ClientUserSubmission)>)> {
         if submissions.is_empty() {
             return Ok(());
         }
@@ -1017,7 +1006,7 @@ async fn dispatch_user_submission_for_current_attachment<F, Fut>(
     send: F,
 ) -> UserSubmissionDispatchOutcome
 where
-    F: FnOnce(Uuid, u64, cockpit_core::engine::message::UserSubmission) -> Fut,
+    F: FnOnce(Uuid, u64, ClientUserSubmission) -> Fut,
     Fut: std::future::Future<Output = Result<(), UserSubmissionSendError>>,
 {
     let transition_guard = transition_gate.lock_owned().await;
@@ -1243,7 +1232,7 @@ async fn run_user_submission_dispatcher<F, Fut>(
     mut context: UserSubmissionDispatcherContext,
     send: F,
 ) where
-    F: Fn(Uuid, u64, cockpit_core::engine::message::UserSubmission) -> Fut + Clone,
+    F: Fn(Uuid, u64, ClientUserSubmission) -> Fut + Clone,
     Fut: std::future::Future<Output = Result<(), UserSubmissionSendError>>,
 {
     enum DispatcherWake {
@@ -4528,11 +4517,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    fn complete_test_submission() -> cockpit_core::engine::message::UserSubmission {
-        cockpit_core::engine::message::UserSubmission {
+    fn complete_test_submission() -> ClientUserSubmission {
+        ClientUserSubmission {
             expected_model_state_generation: None,
             expected_model: None,
-            kind: cockpit_core::engine::message::UserSubmissionKind::User,
+            kind: cockpit_client::submission::UserSubmissionKind::User,
             origin: Default::default(),
             text: "wire text with expanded tag and image sentinel".to_string(),
             display_text: Some("visible @src/lib.rs [image]".to_string()),
@@ -4542,18 +4531,10 @@ mod tests {
                 detail: "expanded source".to_string(),
                 ok: true,
             }],
-            images: vec![cockpit_core::engine::message::SubmissionImage::png(vec![
+            images: vec![cockpit_client::image_upload::SubmissionImage::png(vec![
                 0x89, b'P', b'N', b'G', 0, 1, 2, 3,
             ])],
             forced_skill: Some("review".to_string()),
-            origin_principal: Some("flycockpit:test-user".to_string()),
-            job_id: Some("job-123".to_string()),
-            preflight_cleaned: Some("cleaned wire text".to_string()),
-            queue_item_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
-            client_submissions: Vec::new(),
-            pending_terminal_disposition: None,
-            run_invocation_id: None,
-            queue_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
         }
     }
 
@@ -4932,9 +4913,7 @@ mod tests {
         for text in ["held first", "queued second"] {
             input_tx
                 .send(RunnerInput::Submission(Box::new(BoundUserSubmission {
-                    submission: cockpit_core::engine::message::UserSubmission::text(
-                        text.to_string(),
-                    ),
+                    submission: ClientUserSubmission::text(text.to_string()),
                     optimistic_submission_id: Uuid::new_v4(),
                     intended_session_id: old_session_id,
                     intended_attachment_epoch: 7,
@@ -5583,7 +5562,7 @@ mod tests {
                     intended_attachment_epoch: 4,
                 },
                 BoundUserSubmission {
-                    submission: cockpit_core::engine::message::UserSubmission::text("next payload"),
+                    submission: ClientUserSubmission::text("next payload"),
                     optimistic_submission_id: delivered_id,
                     intended_session_id: session_id,
                     intended_attachment_epoch: 4,
@@ -5776,9 +5755,7 @@ mod tests {
         let optimistic_submission_id = Uuid::new_v4();
         let outcome = dispatch_user_submission_for_current_attachment(
             BoundUserSubmission {
-                submission: cockpit_core::engine::message::UserSubmission::text(
-                    "current payload".to_string(),
-                ),
+                submission: ClientUserSubmission::text("current payload".to_string()),
                 optimistic_submission_id,
                 intended_session_id: session_id,
                 intended_attachment_epoch: 4,

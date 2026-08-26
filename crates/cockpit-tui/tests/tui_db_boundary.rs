@@ -487,6 +487,9 @@ fn production_uses_cockpit_proto_directly() {
                 "cockpit_core::engine::message::QueueItemStatus",
                 "cockpit_core::engine::message::QueueTarget",
                 "cockpit_core::engine::message::SubmissionImage",
+                "cockpit_core::engine::message::SubmissionOrigin",
+                "cockpit_core::engine::message::UserSubmission",
+                "cockpit_core::engine::message::UserSubmissionKind",
                 "cockpit_core::engine::resource_scheduler::ResourcePoolSnapshot",
                 "cockpit_core::engine::resource_scheduler::ResourceQueuedSnapshot",
                 "cockpit_core::engine::resource_scheduler::ResourceQueuedState",
@@ -568,6 +571,9 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::engine::message::QueueItemStatus"
                     || imported == "cockpit_core::engine::message::QueueTarget"
                     || imported == "cockpit_core::engine::message::SubmissionImage"
+                    || imported == "cockpit_core::engine::message::SubmissionOrigin"
+                    || imported == "cockpit_core::engine::message::UserSubmission"
+                    || imported == "cockpit_core::engine::message::UserSubmissionKind"
                     || imported == "cockpit_core::engine::resource_scheduler::ResourcePoolSnapshot"
                     || imported
                         == "cockpit_core::engine::resource_scheduler::ResourceQueuedSnapshot"

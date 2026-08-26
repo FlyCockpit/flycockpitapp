@@ -14,7 +14,7 @@ use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
 };
 use crate::tui::history::HistoryEntry;
-use cockpit_core::engine::message::UserSubmission;
+use cockpit_client::submission::ClientUserSubmission as UserSubmission;
 
 fn runner_with_sender(
     input_tx: mpsc::Sender<RunnerInput>,
@@ -1118,7 +1118,7 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
     let exact_submission = UserSubmission {
         expected_model_state_generation: None,
         expected_model: None,
-        kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        kind: cockpit_client::submission::UserSubmissionKind::Compact,
         origin: Default::default(),
         text: "exact wire text".to_string(),
         display_text: Some("visible side draft".to_string()),
@@ -1227,7 +1227,7 @@ fn complete_dispatch_submission(marker: &str) -> UserSubmission {
     UserSubmission {
         expected_model_state_generation: None,
         expected_model: None,
-        kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        kind: cockpit_client::submission::UserSubmissionKind::Compact,
         origin: Default::default(),
         text: format!("wire-{marker}"),
         display_text: Some(format!("visible-{marker}")),
@@ -1246,7 +1246,7 @@ fn complete_dispatch_submission(marker: &str) -> UserSubmission {
         job_id: Some(format!("job-{marker}")),
         preflight_cleaned: Some(format!("clean-{marker}")),
         queue_item_ids: vec![uuid::Uuid::new_v4(), uuid::Uuid::new_v4()],
-        client_submissions: vec![cockpit_core::engine::message::ClientSubmissionReceipt {
+        client_submissions: vec![cockpit_client::submission::ClientSubmissionReceipt {
             id: uuid::Uuid::new_v4(),
             fingerprint: format!("content-{marker}"),
             wire_fingerprint: format!("wire-fingerprint-{marker}"),
@@ -2024,7 +2024,7 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
     let exact_submission = UserSubmission {
         expected_model_state_generation: None,
         expected_model: None,
-        kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        kind: cockpit_client::submission::UserSubmissionKind::Compact,
         origin: Default::default(),
         text: format!(
             "wire-before{}wire-after",

@@ -537,6 +537,95 @@ fn sql_trigger<'a>(sql: &'a str, name: &str, table: &str) -> &'a str {
     trigger
 }
 
+fn sql_registry_edges(sql: &str, registry: &str) -> BTreeSet<String> {
+    let values = sql
+        .split(&format!("INSERT INTO {registry} VALUES"))
+        .nth(1)
+        .and_then(|tail| tail.split(';').next())
+        .unwrap_or_else(|| panic!("SQL transition registry {registry} has no seed rows"));
+    let literals = quoted_literals(values);
+    assert_eq!(
+        literals.len() % 2,
+        0,
+        "SQL registry {registry} is malformed"
+    );
+    literals
+        .chunks_exact(2)
+        .map(|edge| format!("{}>{}", edge[0], edge[1]))
+        .collect()
+}
+
+fn quoted_set_after(value: &str, marker: &str) -> BTreeSet<String> {
+    value
+        .split(marker)
+        .nth(1)
+        .and_then(|tail| tail.split(')').next())
+        .map(quoted_literals)
+        .unwrap_or_else(|| panic!("SQL state allowlist marker {marker} is absent"))
+        .into_iter()
+        .collect()
+}
+
+fn cartesian_edges(from: &str, destinations: BTreeSet<String>) -> BTreeSet<String> {
+    destinations
+        .into_iter()
+        .filter(|to| to != from)
+        .map(|to| format!("{from}>{to}"))
+        .collect()
+}
+
+fn sql_state_check(declaration: &str) -> &str {
+    [
+        "CHECK (state IN (",
+        "CHECK(state IN (",
+        "CHECK (state IN(",
+        "CHECK(state IN(",
+    ]
+    .into_iter()
+    .find_map(|marker| declaration.split(marker).nth(1))
+    .and_then(|tail| tail.split("))").next())
+    .unwrap_or_else(|| panic!("table has no closed SQL state CHECK"))
+}
+
+fn sql_only_edges(name: &str, trigger: &str) -> BTreeSet<String> {
+    match name {
+        "media_repair" => {
+            let normalized = trigger.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(normalized.contains("(OLD.state='planned' AND NEW.state='rebuilding') OR (OLD.state='rebuilding' AND NEW.state='verifying') OR (OLD.state='verifying' AND NEW.state IN ('committed','failed')) OR OLD.state=NEW.state"), "media repair SQL edge graph drifted");
+            BTreeSet::from([
+                "planned>rebuilding".to_owned(),
+                "rebuilding>verifying".to_owned(),
+                "verifying>committed".to_owned(),
+                "verifying>failed".to_owned(),
+            ])
+        }
+        "remote_attachment_operation" => {
+            let mut edges = cartesian_edges(
+                "reserved",
+                quoted_set_after(trigger, "OLD.state = 'reserved' AND NEW.state NOT IN ("),
+            );
+            edges.extend(cartesian_edges(
+                "dispatched",
+                quoted_set_after(trigger, "OLD.state = 'dispatched' AND NEW.state NOT IN ("),
+            ));
+            edges
+        }
+        "image_response_publication" => {
+            assert!(trigger.contains("OLD.state!='pending'"));
+            cartesian_edges("pending", quoted_set_after(trigger, "NEW.state NOT IN ("))
+        }
+        "image_security_recovery_attempt" => {
+            assert!(trigger.contains("OLD.state!='received'"));
+            cartesian_edges("received", quoted_set_after(trigger, "NEW.state NOT IN ("))
+        }
+        "image_security_recovery_audit" => {
+            assert!(trigger.contains("OLD.state!='recorded'"));
+            cartesian_edges("recorded", quoted_set_after(trigger, "NEW.state NOT IN ("))
+        }
+        _ => panic!("SQL-only family {name} needs a registry or exact extractor"),
+    }
+}
+
 fn ownership() -> BTreeMap<String, Ownership> {
     let parsed: toml::Value = toml::from_str(include_str!("../schema-ownership.toml"))
         .expect("schema-ownership.toml must be valid TOML");
@@ -591,29 +680,54 @@ fn ownership() -> BTreeMap<String, Ownership> {
             .nth(1)
             .and_then(|tail| tail.split(";").next())
             .unwrap_or_else(|| panic!("family {name} table declaration is absent"));
-        let state_check = declaration
-            .split("CHECK (state IN (")
-            .nth(1)
-            .and_then(|tail| tail.split("))").next())
-            .unwrap_or_else(|| panic!("family {name} has no closed SQL state CHECK"));
-        let sql_states = quoted_literals(state_check)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        assert_eq!(allowed, sql_states, "family {name} SQL state set drifted");
-        let mut sql_edges = BTreeSet::new();
+        if family.get("state_columns").is_none() {
+            let sql_states = quoted_literals(sql_state_check(declaration))
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            assert_eq!(allowed, sql_states, "family {name} SQL state set drifted");
+        }
+        let mut sql_edges = family
+            .get("sql_edge_registry")
+            .and_then(toml::Value::as_str)
+            .map(|registry| sql_registry_edges(&sql, registry))
+            .unwrap_or_default();
+        let mut trigger_bodies = String::new();
         for trigger_name in required_text(name, family, "sql_triggers")
             .split(',')
             .map(str::trim)
         {
-            for literal in quoted_literals(sql_trigger(&sql, trigger_name, table)) {
+            let trigger = sql_trigger(&sql, trigger_name, table);
+            trigger_bodies.push_str(trigger);
+            for literal in quoted_literals(trigger) {
                 if literal.contains('>') {
                     sql_edges.insert(literal);
                 }
             }
         }
         assert_eq!(edges, sql_edges, "family {name} SQL edge set drifted");
+        let conditional_edges = family
+            .get("conditional_edges")
+            .and_then(toml::Value::as_str)
+            .map(csv_set)
+            .unwrap_or_default();
+        if !conditional_edges.is_empty() {
+            assert_eq!(
+                conditional_edges,
+                BTreeSet::from([
+                    "dispatching>queued".to_owned(),
+                    "submission_unknown>queued".to_owned(),
+                ]),
+                "family {name} has an unknown conditional-edge shape"
+            );
+            assert!(
+                trigger_bodies.contains("OLD.state IN ('dispatching','submission_unknown')")
+                    && trigger_bodies.contains("NEW.state='queued'"),
+                "family {name} SQL conditional retry edges drifted"
+            );
+        }
         let sql_sources = sql_edges
             .iter()
+            .chain(conditional_edges.iter())
             .filter_map(|edge| edge.split_once('>').map(|(from, _)| from.to_owned()))
             .collect::<BTreeSet<_>>();
         assert_eq!(
@@ -621,6 +735,24 @@ fn ownership() -> BTreeMap<String, Ownership> {
             allowed.difference(&sql_sources).cloned().collect(),
             "family {name} SQL terminal set drifted"
         );
+        if family.get("state_columns").is_some() {
+            let edge_states = edges
+                .iter()
+                .flat_map(|edge| edge.split('>').map(str::to_owned))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                allowed, edge_states,
+                "family {name} SQL event state vocabulary drifted"
+            );
+            let sql_terminals = quoted_literals(&trigger_bodies)
+                .into_iter()
+                .filter(|literal| allowed.contains(literal))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                terminal, sql_terminals,
+                "family {name} SQL event terminal flag drifted"
+            );
+        }
         let rust_source = repository_root().join(required_text(name, family, "rust_source"));
         let rust = std::fs::read_to_string(&rust_source).unwrap_or_else(|error| {
             panic!(
@@ -647,6 +779,22 @@ fn ownership() -> BTreeMap<String, Ownership> {
             .chunks_exact(2)
             .map(|edge| format!("{}>{}", edge[0], edge[1]))
             .collect::<BTreeSet<_>>();
+        let rust_conditional_edges = family
+            .get("conditional_edges_symbol")
+            .and_then(toml::Value::as_str)
+            .map(|symbol| {
+                let values = quoted_literals(rust_constant(&rust, symbol));
+                assert_eq!(
+                    values.len() % 2,
+                    0,
+                    "family {name} Rust conditional edges malformed"
+                );
+                values
+                    .chunks_exact(2)
+                    .map(|edge| format!("{}>{}", edge[0], edge[1]))
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
         let rust_terminals = quoted_literals(rust_constant(
             &rust,
             required_text(name, family, "terminals_symbol"),
@@ -656,8 +804,133 @@ fn ownership() -> BTreeMap<String, Ownership> {
         assert_eq!(allowed, rust_states, "family {name} Rust state set drifted");
         assert_eq!(edges, rust_edges, "family {name} Rust edge set drifted");
         assert_eq!(
+            conditional_edges, rust_conditional_edges,
+            "family {name} Rust conditional edge set drifted"
+        );
+        assert_eq!(
             terminal, rust_terminals,
             "family {name} Rust terminal set drifted"
+        );
+    }
+    let sql_families = parsed
+        .get("sql_state_machine")
+        .and_then(toml::Value::as_table)
+        .expect("schema-ownership.toml must contain SQL-only state-machine families");
+    let all_sql = [
+        include_str!("../src/db/migrations/0001_initial.sql"),
+        include_str!("../src/db/migrations/0001_extended_profile.sql"),
+        include_str!("../src/db/migrations/0001_remote_profile.sql"),
+    ]
+    .join("\n");
+    for (name, value) in sql_families {
+        let family = value
+            .as_table()
+            .unwrap_or_else(|| panic!("SQL-only family {name} must be a rich record"));
+        for field in [
+            "table",
+            "sql_triggers",
+            "allowed_states",
+            "edges",
+            "terminal_states",
+            "edge_evidence",
+        ] {
+            required_text(name, family, field);
+        }
+        let table_name = required_text(name, family, "table");
+        let declaration = all_sql
+            .split(&format!("CREATE TABLE {table_name}"))
+            .nth(1)
+            .and_then(|tail| tail.split(';').next())
+            .unwrap_or_else(|| panic!("SQL-only family {name} table is absent"));
+        let allowed = csv_set(required_text(name, family, "allowed_states"));
+        if family.get("state_columns").is_none() {
+            assert_eq!(
+                allowed,
+                quoted_literals(sql_state_check(declaration))
+                    .into_iter()
+                    .collect(),
+                "SQL-only family {name} state set drifted"
+            );
+        }
+        let trigger = required_text(name, family, "sql_triggers")
+            .split(',')
+            .map(str::trim)
+            .map(|trigger| sql_trigger(&all_sql, trigger, table_name))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let evidence = required_text(name, family, "edge_evidence");
+        let sql_edges = if let Some(registry) = family
+            .get("sql_edge_registry")
+            .and_then(toml::Value::as_str)
+        {
+            sql_registry_edges(&all_sql, registry)
+        } else if evidence == "quoted-edges" {
+            quoted_literals(&trigger)
+                .into_iter()
+                .filter(|literal| literal.contains('>'))
+                .collect()
+        } else if evidence == "terminal-only" {
+            let terminals = csv_set(required_text(name, family, "terminal_states"));
+            allowed
+                .iter()
+                .filter(|from| !terminals.contains(*from))
+                .flat_map(|from| {
+                    allowed
+                        .iter()
+                        .filter(move |to| *to != from)
+                        .map(move |to| format!("{from}>{to}"))
+                })
+                .collect()
+        } else {
+            sql_only_edges(name, &trigger)
+        };
+        let edges = csv_set(required_text(name, family, "edges"));
+        assert_eq!(edges, sql_edges, "SQL-only family {name} edge set drifted");
+        let declared_terminals = csv_set(required_text(name, family, "terminal_states"));
+        if evidence == "terminal-only" {
+            let sql_terminals = if trigger.contains("OLD.state LIKE 'terminal_%'") {
+                allowed
+                    .iter()
+                    .filter(|state| state.starts_with("terminal_"))
+                    .cloned()
+                    .collect()
+            } else {
+                quoted_literals(&trigger)
+                    .into_iter()
+                    .filter(|literal| allowed.contains(literal))
+                    .collect()
+            };
+            assert_eq!(
+                declared_terminals, sql_terminals,
+                "SQL-only family {name} terminal guard drifted"
+            );
+        }
+        if family.get("state_columns").is_some() {
+            let edge_states = edges
+                .iter()
+                .flat_map(|edge| edge.split('>').map(str::to_owned))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                allowed, edge_states,
+                "SQL-only event family {name} state vocabulary drifted"
+            );
+            let sql_terminals = quoted_literals(&trigger)
+                .into_iter()
+                .filter(|literal| allowed.contains(literal))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                declared_terminals, sql_terminals,
+                "SQL-only event family {name} terminal flag drifted"
+            );
+        }
+        let sources = edges
+            .iter()
+            .filter_map(|edge| edge.split_once('>').map(|(from, _)| from.to_owned()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            declared_terminals,
+            allowed.difference(&sources).cloned().collect(),
+            "SQL-only family {name} terminal set drifted"
         );
     }
     let table = parsed
@@ -685,7 +958,10 @@ fn ownership() -> BTreeMap<String, Ownership> {
             if !is_graph || name.contains("registry") {
                 return None;
             }
-            let header = trigger.split("BEGIN").next()?;
+            let header = trigger
+                .split("WHEN")
+                .next()
+                .or_else(|| trigger.split("BEGIN").next())?;
             let tokens = header.split_whitespace().collect::<Vec<_>>();
             tokens
                 .windows(2)
@@ -704,6 +980,15 @@ fn ownership() -> BTreeMap<String, Ownership> {
             "transition-guarded table {guarded_table} cannot be classified none"
         );
     }
+    let exact_guarded_tables = families
+        .values()
+        .chain(sql_families.values())
+        .filter_map(|family| family.as_table()?.get("table")?.as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        guarded_tables, exact_guarded_tables,
+        "transition-guard inventory and exact family inventory must match"
+    );
     assert!(
         !table.is_empty(),
         "ownership classification cannot be vacuous"
@@ -720,6 +1005,19 @@ fn ownership() -> BTreeMap<String, Ownership> {
         referenced_families,
         families.keys().cloned().collect::<BTreeSet<_>>(),
         "every state-machine family must be referenced and every reference must resolve"
+    );
+    let referenced_sql_families = table
+        .iter()
+        .filter_map(|(name, value)| {
+            let entry = value.as_table()?;
+            (entry.get("state_machine")?.as_str()? == "sql")
+                .then(|| required_text(name, entry, "sql_state_machine_family").to_owned())
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        referenced_sql_families,
+        sql_families.keys().cloned().collect::<BTreeSet<_>>(),
+        "every SQL-only family must be referenced and every reference must resolve"
     );
     table
         .iter()

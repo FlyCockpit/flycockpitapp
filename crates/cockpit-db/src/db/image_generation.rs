@@ -116,243 +116,311 @@ state_enum!(ImageGenerationArtifactComponentState {
     Tombstoned => "tombstoned", SecurityBlocked => "security_blocked"
 });
 
+pub const IMAGE_ARTIFACT_STATES: &[&str] = &[
+    "allocating",
+    "writing",
+    "retained",
+    "late_quarantined",
+    "cleanup_pending",
+    "deleting",
+    "tombstoned",
+    "security_blocked",
+];
+pub const IMAGE_ARTIFACT_TERMINAL_STATES: &[&str] = &["tombstoned"];
+pub const IMAGE_ARTIFACT_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("allocating", "writing"),
+    ("allocating", "cleanup_pending"),
+    ("allocating", "security_blocked"),
+    ("writing", "retained"),
+    ("writing", "late_quarantined"),
+    ("writing", "cleanup_pending"),
+    ("writing", "security_blocked"),
+    ("retained", "cleanup_pending"),
+    ("retained", "security_blocked"),
+    ("late_quarantined", "retained"),
+    ("late_quarantined", "cleanup_pending"),
+    ("late_quarantined", "security_blocked"),
+    ("cleanup_pending", "deleting"),
+    ("cleanup_pending", "security_blocked"),
+    ("deleting", "tombstoned"),
+    ("deleting", "security_blocked"),
+    ("security_blocked", "cleanup_pending"),
+    ("security_blocked", "retained"),
+];
+pub const IMAGE_ARTIFACT_COMPONENT_STATES: &[&str] = &[
+    "planned",
+    "writing",
+    "ready",
+    "cleanup_pending",
+    "deleting",
+    "tombstoned",
+    "security_blocked",
+];
+pub const IMAGE_ARTIFACT_COMPONENT_TERMINAL_STATES: &[&str] = &["tombstoned"];
+pub const IMAGE_ARTIFACT_COMPONENT_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("planned", "writing"),
+    ("planned", "cleanup_pending"),
+    ("planned", "security_blocked"),
+    ("writing", "ready"),
+    ("writing", "cleanup_pending"),
+    ("writing", "security_blocked"),
+    ("ready", "cleanup_pending"),
+    ("ready", "security_blocked"),
+    ("cleanup_pending", "deleting"),
+    ("cleanup_pending", "security_blocked"),
+    ("deleting", "tombstoned"),
+    ("deleting", "security_blocked"),
+    ("security_blocked", "cleanup_pending"),
+];
+
+pub const IMAGE_JOB_STATES: &[&str] = &[
+    "created",
+    "validating",
+    "awaiting_authorization",
+    "queued",
+    "dispatching",
+    "submission_unknown",
+    "running",
+    "cancellation_requested",
+    "downloading",
+    "validating_output",
+    "publishing",
+    "completed",
+    "completed_after_cancel",
+    "partially_failed",
+    "failed",
+    "cancelled",
+];
+pub const IMAGE_JOB_TERMINAL_STATES: &[&str] = &[
+    "completed",
+    "completed_after_cancel",
+    "partially_failed",
+    "failed",
+    "cancelled",
+];
+pub const IMAGE_JOB_CONDITIONAL_EDGES: &[(&str, &str)] =
+    &[("dispatching", "queued"), ("submission_unknown", "queued")];
+pub const IMAGE_JOB_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("created", "validating"),
+    ("created", "failed"),
+    ("created", "cancelled"),
+    ("validating", "awaiting_authorization"),
+    ("validating", "queued"),
+    ("validating", "failed"),
+    ("validating", "cancelled"),
+    ("awaiting_authorization", "queued"),
+    ("awaiting_authorization", "failed"),
+    ("awaiting_authorization", "cancelled"),
+    ("queued", "dispatching"),
+    ("queued", "cancellation_requested"),
+    ("queued", "failed"),
+    ("queued", "cancelled"),
+    ("dispatching", "submission_unknown"),
+    ("dispatching", "running"),
+    ("dispatching", "cancellation_requested"),
+    ("dispatching", "downloading"),
+    ("dispatching", "partially_failed"),
+    ("dispatching", "failed"),
+    ("dispatching", "cancelled"),
+    ("submission_unknown", "running"),
+    ("submission_unknown", "cancellation_requested"),
+    ("submission_unknown", "downloading"),
+    ("submission_unknown", "completed_after_cancel"),
+    ("submission_unknown", "partially_failed"),
+    ("submission_unknown", "failed"),
+    ("running", "cancellation_requested"),
+    ("running", "downloading"),
+    ("running", "partially_failed"),
+    ("running", "failed"),
+    ("cancellation_requested", "cancelled"),
+    ("cancellation_requested", "downloading"),
+    ("cancellation_requested", "completed_after_cancel"),
+    ("cancellation_requested", "partially_failed"),
+    ("cancellation_requested", "failed"),
+    ("downloading", "validating_output"),
+    ("downloading", "cancellation_requested"),
+    ("downloading", "completed_after_cancel"),
+    ("downloading", "partially_failed"),
+    ("downloading", "failed"),
+    ("validating_output", "publishing"),
+    ("validating_output", "cancellation_requested"),
+    ("validating_output", "completed_after_cancel"),
+    ("validating_output", "partially_failed"),
+    ("validating_output", "failed"),
+    ("publishing", "completed"),
+    ("publishing", "cancellation_requested"),
+    ("publishing", "completed_after_cancel"),
+    ("publishing", "partially_failed"),
+    ("publishing", "failed"),
+];
+
+pub const IMAGE_SLOT_STATES: &[&str] = &[
+    "planned",
+    "queued",
+    "dispatching",
+    "submission_unknown",
+    "running",
+    "cancellation_requested",
+    "downloading",
+    "validating",
+    "ready_to_publish",
+    "published",
+    "late_quarantined",
+    "failed",
+    "cancelled",
+    "discarded",
+];
+pub const IMAGE_SLOT_TERMINAL_STATES: &[&str] = &["published", "failed", "cancelled", "discarded"];
+pub const IMAGE_SLOT_CONDITIONAL_EDGES: &[(&str, &str)] =
+    &[("dispatching", "queued"), ("submission_unknown", "queued")];
+pub const IMAGE_SLOT_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("planned", "queued"),
+    ("planned", "failed"),
+    ("planned", "cancelled"),
+    ("queued", "dispatching"),
+    ("queued", "failed"),
+    ("queued", "cancelled"),
+    ("dispatching", "submission_unknown"),
+    ("dispatching", "running"),
+    ("dispatching", "downloading"),
+    ("dispatching", "cancellation_requested"),
+    ("dispatching", "failed"),
+    ("dispatching", "cancelled"),
+    ("submission_unknown", "running"),
+    ("submission_unknown", "downloading"),
+    ("submission_unknown", "cancellation_requested"),
+    ("submission_unknown", "failed"),
+    ("submission_unknown", "cancelled"),
+    ("running", "downloading"),
+    ("running", "cancellation_requested"),
+    ("running", "failed"),
+    ("cancellation_requested", "cancelled"),
+    ("cancellation_requested", "submission_unknown"),
+    ("cancellation_requested", "downloading"),
+    ("cancellation_requested", "failed"),
+    ("downloading", "validating"),
+    ("downloading", "cancellation_requested"),
+    ("downloading", "failed"),
+    ("validating", "ready_to_publish"),
+    ("validating", "late_quarantined"),
+    ("validating", "cancellation_requested"),
+    ("validating", "failed"),
+    ("ready_to_publish", "published"),
+    ("ready_to_publish", "late_quarantined"),
+    ("ready_to_publish", "failed"),
+    ("late_quarantined", "published"),
+    ("late_quarantined", "discarded"),
+];
+
+pub const IMAGE_ATTEMPT_STATES: &[&str] = &[
+    "planned",
+    "preparing",
+    "prepared",
+    "dispatching",
+    "accepted",
+    "submission_unknown",
+    "reconciling",
+    "running",
+    "downloading",
+    "cancellation_requested",
+    "response_adopted",
+    "failed_not_submitted",
+    "rejected_not_accepted",
+    "cancelled",
+    "succeeded",
+    "completed_after_cancel",
+    "failed_after_acceptance",
+];
+pub const IMAGE_ATTEMPT_TERMINAL_STATES: &[&str] = &[
+    "failed_not_submitted",
+    "rejected_not_accepted",
+    "cancelled",
+    "succeeded",
+    "completed_after_cancel",
+    "failed_after_acceptance",
+];
+pub const IMAGE_ATTEMPT_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("planned", "preparing"),
+    ("planned", "cancelled"),
+    ("planned", "failed_not_submitted"),
+    ("preparing", "prepared"),
+    ("preparing", "cancelled"),
+    ("preparing", "failed_not_submitted"),
+    ("prepared", "dispatching"),
+    ("prepared", "cancelled"),
+    ("prepared", "failed_not_submitted"),
+    ("dispatching", "accepted"),
+    ("dispatching", "submission_unknown"),
+    ("dispatching", "rejected_not_accepted"),
+    ("dispatching", "cancellation_requested"),
+    ("dispatching", "failed_not_submitted"),
+    ("accepted", "running"),
+    ("accepted", "downloading"),
+    ("accepted", "cancellation_requested"),
+    ("accepted", "response_adopted"),
+    ("accepted", "failed_after_acceptance"),
+    ("submission_unknown", "reconciling"),
+    ("submission_unknown", "cancellation_requested"),
+    ("reconciling", "accepted"),
+    ("reconciling", "submission_unknown"),
+    ("reconciling", "rejected_not_accepted"),
+    ("reconciling", "downloading"),
+    ("reconciling", "cancellation_requested"),
+    ("reconciling", "failed_after_acceptance"),
+    ("running", "downloading"),
+    ("running", "cancellation_requested"),
+    ("running", "failed_after_acceptance"),
+    ("downloading", "response_adopted"),
+    ("downloading", "completed_after_cancel"),
+    ("downloading", "cancellation_requested"),
+    ("downloading", "failed_after_acceptance"),
+    ("cancellation_requested", "cancelled"),
+    ("cancellation_requested", "submission_unknown"),
+    ("cancellation_requested", "reconciling"),
+    ("cancellation_requested", "accepted"),
+    ("cancellation_requested", "downloading"),
+    ("cancellation_requested", "completed_after_cancel"),
+    ("cancellation_requested", "failed_after_acceptance"),
+    ("response_adopted", "succeeded"),
+    ("response_adopted", "completed_after_cancel"),
+    ("response_adopted", "failed_after_acceptance"),
+];
+
 state_enum!(ImageGenerationArtifactComponentKind {
     Primary => "primary", NormalizedRaster => "normalized_raster",
     SanitizedSvg => "sanitized_svg", Thumbnail => "thumbnail", ModelPayload => "model_payload"
 });
 
-pub const fn artifact_transition_allowed(
+pub fn artifact_transition_allowed(
     from: ImageGenerationArtifactState,
     to: ImageGenerationArtifactState,
 ) -> bool {
-    use ImageGenerationArtifactState as S;
-    matches!(
-        (from, to),
-        (
-            S::Allocating,
-            S::Writing | S::CleanupPending | S::SecurityBlocked
-        ) | (
-            S::Writing,
-            S::Retained | S::LateQuarantined | S::CleanupPending | S::SecurityBlocked
-        ) | (S::Retained, S::CleanupPending | S::SecurityBlocked)
-            | (
-                S::LateQuarantined,
-                S::Retained | S::CleanupPending | S::SecurityBlocked
-            )
-            | (S::CleanupPending, S::Deleting | S::SecurityBlocked)
-            | (S::Deleting, S::Tombstoned | S::SecurityBlocked)
-            | (S::SecurityBlocked, S::CleanupPending | S::Retained)
-    )
+    IMAGE_ARTIFACT_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 
-pub const fn artifact_component_transition_allowed(
+pub fn artifact_component_transition_allowed(
     from: ImageGenerationArtifactComponentState,
     to: ImageGenerationArtifactComponentState,
 ) -> bool {
-    use ImageGenerationArtifactComponentState as S;
-    matches!(
-        (from, to),
-        (
-            S::Planned,
-            S::Writing | S::CleanupPending | S::SecurityBlocked
-        ) | (
-            S::Writing,
-            S::Ready | S::CleanupPending | S::SecurityBlocked
-        ) | (S::Ready, S::CleanupPending | S::SecurityBlocked)
-            | (S::CleanupPending, S::Deleting | S::SecurityBlocked)
-            | (S::Deleting, S::Tombstoned | S::SecurityBlocked)
-            | (S::SecurityBlocked, S::CleanupPending)
-    )
+    IMAGE_ARTIFACT_COMPONENT_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 
-pub const fn job_transition_allowed(
-    from: ImageGenerationJobState,
-    to: ImageGenerationJobState,
-) -> bool {
-    use ImageGenerationJobState as S;
-    matches!(
-        (from, to),
-        (S::Created, S::Validating | S::Failed | S::Cancelled)
-            | (
-                S::Validating,
-                S::AwaitingAuthorization | S::Queued | S::Failed | S::Cancelled
-            )
-            | (
-                S::AwaitingAuthorization,
-                S::Queued | S::Failed | S::Cancelled
-            )
-            | (
-                S::Queued,
-                S::Dispatching | S::CancellationRequested | S::Failed | S::Cancelled
-            )
-            | (
-                S::Dispatching,
-                S::SubmissionUnknown
-                    | S::Running
-                    | S::CancellationRequested
-                    | S::Downloading
-                    | S::PartiallyFailed
-                    | S::Failed
-                    | S::Cancelled
-            )
-            | (
-                S::SubmissionUnknown,
-                S::Running
-                    | S::CancellationRequested
-                    | S::Downloading
-                    | S::CompletedAfterCancel
-                    | S::PartiallyFailed
-                    | S::Failed
-            )
-            | (
-                S::Running,
-                S::CancellationRequested | S::Downloading | S::PartiallyFailed | S::Failed
-            )
-            | (
-                S::CancellationRequested,
-                S::Cancelled
-                    | S::Downloading
-                    | S::CompletedAfterCancel
-                    | S::PartiallyFailed
-                    | S::Failed
-            )
-            | (
-                S::Downloading,
-                S::ValidatingOutput
-                    | S::CancellationRequested
-                    | S::CompletedAfterCancel
-                    | S::PartiallyFailed
-                    | S::Failed
-            )
-            | (
-                S::ValidatingOutput,
-                S::Publishing
-                    | S::CancellationRequested
-                    | S::CompletedAfterCancel
-                    | S::PartiallyFailed
-                    | S::Failed
-            )
-            | (
-                S::Publishing,
-                S::Completed
-                    | S::CancellationRequested
-                    | S::CompletedAfterCancel
-                    | S::PartiallyFailed
-                    | S::Failed
-            )
-    )
+pub fn job_transition_allowed(from: ImageGenerationJobState, to: ImageGenerationJobState) -> bool {
+    IMAGE_JOB_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 
-pub const fn slot_transition_allowed(
+pub fn slot_transition_allowed(
     from: ImageGenerationSlotState,
     to: ImageGenerationSlotState,
 ) -> bool {
-    use ImageGenerationSlotState as S;
-    matches!(
-        (from, to),
-        (S::Planned, S::Queued | S::Failed | S::Cancelled)
-            | (S::Queued, S::Dispatching | S::Failed | S::Cancelled)
-            | (
-                S::Dispatching,
-                S::SubmissionUnknown
-                    | S::Running
-                    | S::Downloading
-                    | S::CancellationRequested
-                    | S::Failed
-                    | S::Cancelled
-            )
-            | (
-                S::SubmissionUnknown,
-                S::Running | S::Downloading | S::CancellationRequested | S::Failed | S::Cancelled
-            )
-            | (
-                S::Running,
-                S::Downloading | S::CancellationRequested | S::Failed
-            )
-            | (
-                S::CancellationRequested,
-                S::Cancelled | S::SubmissionUnknown | S::Downloading | S::Failed
-            )
-            | (
-                S::Downloading,
-                S::Validating | S::CancellationRequested | S::Failed
-            )
-            | (
-                S::Validating,
-                S::ReadyToPublish | S::LateQuarantined | S::CancellationRequested | S::Failed
-            )
-            | (
-                S::ReadyToPublish,
-                S::Published | S::LateQuarantined | S::Failed
-            )
-            | (S::LateQuarantined, S::Published | S::Discarded)
-    )
+    IMAGE_SLOT_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 
-pub const fn attempt_transition_allowed(
+pub fn attempt_transition_allowed(
     from: ImageGenerationAttemptState,
     to: ImageGenerationAttemptState,
 ) -> bool {
-    use ImageGenerationAttemptState as S;
-    matches!(
-        (from, to),
-        (
-            S::Planned,
-            S::Preparing | S::Cancelled | S::FailedNotSubmitted
-        ) | (
-            S::Preparing,
-            S::Prepared | S::Cancelled | S::FailedNotSubmitted
-        ) | (
-            S::Prepared,
-            S::Dispatching | S::Cancelled | S::FailedNotSubmitted
-        ) | (
-            S::Dispatching,
-            S::Accepted
-                | S::SubmissionUnknown
-                | S::RejectedNotAccepted
-                | S::CancellationRequested
-                | S::FailedNotSubmitted
-        ) | (
-            S::Accepted,
-            S::Running
-                | S::Downloading
-                | S::CancellationRequested
-                | S::ResponseAdopted
-                | S::FailedAfterAcceptance
-        ) | (
-            S::SubmissionUnknown,
-            S::Reconciling | S::CancellationRequested
-        ) | (
-            S::Reconciling,
-            S::Accepted
-                | S::SubmissionUnknown
-                | S::RejectedNotAccepted
-                | S::Downloading
-                | S::CancellationRequested
-                | S::FailedAfterAcceptance
-        ) | (
-            S::Running,
-            S::Downloading | S::CancellationRequested | S::FailedAfterAcceptance
-        ) | (
-            S::Downloading,
-            S::ResponseAdopted
-                | S::CompletedAfterCancel
-                | S::CancellationRequested
-                | S::FailedAfterAcceptance
-        ) | (
-            S::CancellationRequested,
-            S::Cancelled
-                | S::SubmissionUnknown
-                | S::Reconciling
-                | S::Accepted
-                | S::Downloading
-                | S::CompletedAfterCancel
-                | S::FailedAfterAcceptance
-        ) | (
-            S::ResponseAdopted,
-            S::Succeeded | S::CompletedAfterCancel | S::FailedAfterAcceptance
-        )
-    )
+    IMAGE_ATTEMPT_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 
 pub const fn slot_is_job_settled(state: ImageGenerationSlotState) -> bool {
@@ -1725,6 +1793,11 @@ impl Db {
             );
             ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=version+1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='dispatching' AND version=?6 AND external_operation_id=?7",params![attempt,outcome.record().version,dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::from(dispatching.attempt_number),i64::try_from(dispatching.attempt_version)?,dispatching.operation.operation_id.to_string()])?==1,"image generation handoff attempt compare-and-set lost");
             if let Some((next_attempt, _, _)) = &retry {
+                ensure!(
+                    IMAGE_JOB_CONDITIONAL_EDGES.contains(&("dispatching", "queued"))
+                        && IMAGE_SLOT_CONDITIONAL_EDGES.contains(&("dispatching", "queued")),
+                    "authoritative retry edge contract is absent"
+                );
                 ensure!(conn.execute("INSERT INTO image_generation_attempt_activation_facts(job_id,slot_id,attempt_number,activation_reason,prior_attempt_number,activated_at_unix_ms) VALUES(?1,?2,?3,'authoritative_retry',?4,?5)",params![dispatching.job_id.to_string(),dispatching.slot_id.to_string(),next_attempt,i64::from(dispatching.attempt_number),at_unix_ms])?==1,"image generation retry activation was not recorded");
             }
             ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=version+1,failure_reason=CASE WHEN ?1='failed' THEN 'definitively_rejected' ELSE NULL END WHERE job_id=?2 AND slot_id=?3 AND state='dispatching'",params![slot,dispatching.job_id.to_string(),dispatching.slot_id.to_string()])?==1,"image generation handoff slot compare-and-set lost");
@@ -1940,6 +2013,11 @@ impl Db {
             None
         };
         if retry.is_some() {
+            ensure!(
+                IMAGE_JOB_CONDITIONAL_EDGES.contains(&("submission_unknown", "queued"))
+                    && IMAGE_SLOT_CONDITIONAL_EDGES.contains(&("submission_unknown", "queued")),
+                "reconciled retry edge contract is absent"
+            );
             ensure!(conn.execute("INSERT INTO image_generation_attempt_activation_facts(job_id,slot_id,attempt_number,activation_reason,prior_attempt_number,activated_at_unix_ms) VALUES(?1,?2,?3,'authoritative_retry',?4,?5)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(next_attempt_number),i64::from(input.attempt_number),proof.now_unix_ms])?==1,"reconciled retry activation was not recorded");
         }
         let slot_next = if retry.is_some() {

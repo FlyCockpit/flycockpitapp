@@ -19,7 +19,8 @@ pub struct ForeignKey {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Table {
     pub columns: BTreeSet<String>,
-    pub keys: Vec<Vec<String>>,
+    pub primary_keys: Vec<Vec<String>>,
+    pub unique_keys: Vec<Vec<String>>,
     pub foreign_keys: Vec<ForeignKey>,
 }
 
@@ -253,15 +254,21 @@ pub fn parse(scripts: &[&str]) -> Schema {
                         .iter()
                         .position(|token| *token == Token::Mark('('))
                         .unwrap();
-                    table.keys.push(names_in_parens(clause, key_open));
+                    let key = names_in_parens(clause, key_open);
+                    if is(clause.first(), "primary") {
+                        table.primary_keys.push(key);
+                    } else {
+                        table.unique_keys.push(key);
+                    }
                 } else if let Some(column) = name(clause.first()) {
                     table.columns.insert(column.clone());
                     if clause
                         .windows(2)
                         .any(|pair| is(pair.first(), "primary") && is(pair.get(1), "key"))
-                        || clause.iter().any(|token| is(Some(token), "unique"))
                     {
-                        table.keys.push(vec![column.clone()]);
+                        table.primary_keys.push(vec![column.clone()]);
+                    } else if clause.iter().any(|token| is(Some(token), "unique")) {
+                        table.unique_keys.push(vec![column.clone()]);
                     }
                     if let Some(reference) = foreign_key(clause, Some(column)) {
                         table.foreign_keys.push(reference);
@@ -313,7 +320,8 @@ pub fn parse(scripts: &[&str]) -> Schema {
 }
 
 pub fn exact_target_keys(schema: &Schema, table: &str) -> Vec<Vec<String>> {
-    let mut keys = schema.tables[table].keys.clone();
+    let mut keys = schema.tables[table].primary_keys.clone();
+    keys.extend(schema.tables[table].unique_keys.clone());
     keys.extend(
         schema
             .indexes
@@ -325,7 +333,8 @@ pub fn exact_target_keys(schema: &Schema, table: &str) -> Vec<Vec<String>> {
 }
 
 pub fn child_leading_keys(schema: &Schema, table: &str) -> Vec<Vec<String>> {
-    let mut keys = schema.tables[table].keys.clone();
+    let mut keys = schema.tables[table].primary_keys.clone();
+    keys.extend(schema.tables[table].unique_keys.clone());
     keys.extend(
         schema
             .indexes

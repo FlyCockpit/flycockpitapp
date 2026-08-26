@@ -5,6 +5,100 @@ mod schema_parser;
 
 const SCHEMA: &str = include_str!("../src/db/migrations/0001_initial.sql");
 const EXTENDED_SCHEMA: &str = include_str!("../src/db/migrations/0001_extended_profile.sql");
+const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RelationshipClass {
+    Primary,
+    LocalIdentity,
+    Foreign,
+    External,
+    Polymorphic,
+    Denormalized,
+}
+
+fn relationship_inventory(
+) -> std::collections::BTreeMap<(String, String, String), RelationshipClass> {
+    let mut inventory = std::collections::BTreeMap::new();
+    for line in RELATIONSHIP_INVENTORY
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+    {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        assert_eq!(
+            fields.len(),
+            4,
+            "invalid relationship inventory row: {line}"
+        );
+        let class = match fields[3] {
+            "primary" => RelationshipClass::Primary,
+            "local_identity" => RelationshipClass::LocalIdentity,
+            "foreign" => RelationshipClass::Foreign,
+            "external" => RelationshipClass::External,
+            "polymorphic" => RelationshipClass::Polymorphic,
+            "denormalized" => RelationshipClass::Denormalized,
+            value => panic!("unknown relationship class {value}: {line}"),
+        };
+        let prior = inventory.insert(
+            (
+                fields[0].to_owned(),
+                fields[1].to_owned(),
+                fields[2].to_owned(),
+            ),
+            class,
+        );
+        assert!(
+            prior.is_none(),
+            "duplicate relationship inventory row: {line}"
+        );
+    }
+    inventory
+}
+
+fn reviewed_identifier(column: &str) -> bool {
+    column == "id"
+        || [
+            "_id",
+            "_ids",
+            "_ids_json",
+            "_key",
+            "_uuid",
+            "_token",
+            "_handle",
+            "_digest",
+            "_identity",
+            "_ref",
+        ]
+        .iter()
+        .any(|suffix| column.ends_with(suffix))
+        || matches!(column, "owner" | "namespace")
+}
+
+fn owned_identifier_columns(
+    schema: &schema_parser::Schema,
+    tables: impl Iterator<Item = String>,
+) -> std::collections::BTreeSet<(String, String)> {
+    tables
+        .flat_map(|table_name| {
+            let table = &schema.tables[&table_name];
+            let mut columns = table
+                .columns
+                .iter()
+                .filter(|column| reviewed_identifier(column))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            columns.extend(
+                table
+                    .foreign_keys
+                    .iter()
+                    .flat_map(|foreign_key| foreign_key.child_columns.iter().cloned()),
+            );
+            columns
+                .into_iter()
+                .map(move |column| (table_name.clone(), column))
+        })
+        .collect()
+}
 
 fn source(path: impl AsRef<Path>) -> String {
     std::fs::read_to_string(path).expect("read production query owner")
@@ -89,6 +183,202 @@ fn effective_schema_profiles_are_ordered_closed_and_indexed() {
             }
         }
     }
+}
+
+fn validate_relationship_inventory(
+    profile: &str,
+    schema: &schema_parser::Schema,
+    owned_tables: std::collections::BTreeSet<String>,
+    effective_rows: &std::collections::BTreeMap<(String, String), RelationshipClass>,
+) -> Result<(), String> {
+    let expected = owned_identifier_columns(schema, owned_tables.clone().into_iter());
+    let actual = effective_rows
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual != expected {
+        return Err(format!(
+            "{profile} relationship inventory differs: missing={:?}, stale={:?}",
+            expected.difference(&actual).collect::<Vec<_>>(),
+            actual.difference(&expected).collect::<Vec<_>>()
+        ));
+    }
+
+    let foreign = owned_tables
+        .iter()
+        .flat_map(|table_name| {
+            schema.tables[table_name]
+                .foreign_keys
+                .iter()
+                .flat_map(|foreign_key| {
+                    foreign_key
+                        .child_columns
+                        .iter()
+                        .map(|column| (table_name.clone(), column.clone()))
+                })
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let classified_foreign = effective_rows
+        .iter()
+        .filter(|(_, class)| **class == RelationshipClass::Foreign)
+        .map(|(identity, _)| identity.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if classified_foreign != foreign {
+        return Err(format!(
+            "{profile} Foreign classification is not bidirectional: classified={classified_foreign:?}, parsed={foreign:?}"
+        ));
+    }
+
+    for ((table_name, column), class) in effective_rows {
+        let table = &schema.tables[table_name];
+        let primary = table.primary_keys.iter().any(|key| key.contains(column));
+        let unique = table.unique_keys.iter().any(|key| key.contains(column))
+            || schema.indexes.iter().any(|index| {
+                index.table == *table_name
+                    && index.unique
+                    && !index.partial
+                    && index.columns.contains(column)
+            });
+        match class {
+            RelationshipClass::Primary if !primary => {
+                return Err(format!("{profile}.{table_name}.{column} is not PK-owned"));
+            }
+            RelationshipClass::LocalIdentity if primary || !unique => {
+                return Err(format!(
+                    "{profile}.{table_name}.{column} is not solely nonpartial-UNIQUE-owned"
+                ));
+            }
+            RelationshipClass::Foreign
+                if !foreign.contains(&(table_name.clone(), column.clone())) =>
+            {
+                return Err(format!(
+                    "{profile}.{table_name}.{column} is not an FK child"
+                ));
+            }
+            _ => {}
+        }
+        if primary
+            && !foreign.contains(&(table_name.clone(), column.clone()))
+            && *class != RelationshipClass::Primary
+        {
+            return Err(format!(
+                "{profile}.{table_name}.{column} hides primary identity as {class:?}"
+            ));
+        }
+        if unique
+            && !primary
+            && !foreign.contains(&(table_name.clone(), column.clone()))
+            && *class != RelationshipClass::LocalIdentity
+        {
+            return Err(format!(
+                "{profile}.{table_name}.{column} hides local unique identity as {class:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn identifier_relationship_map_is_exhaustive_and_schema_owned() {
+    let [(_, local), (_, extended)] = effective_profiles();
+    let inventory = relationship_inventory();
+    let local_tables = local
+        .tables
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let extended_tables = extended
+        .tables
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let deferred_tables = extended_tables
+        .difference(&local_tables)
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let manifest_local = inventory
+        .iter()
+        .filter(|((owner, _, _), _)| owner == "local")
+        .map(|((_, table, column), class)| ((table.clone(), column.clone()), *class))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let manifest_deferred = inventory
+        .iter()
+        .filter(|((owner, _, _), _)| owner == "extended")
+        .map(|((_, table, column), class)| ((table.clone(), column.clone()), *class))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut manifest_effective_extended = manifest_local.clone();
+    assert!(
+        manifest_deferred
+            .keys()
+            .all(|key| manifest_effective_extended
+                .insert(key.clone(), manifest_deferred[key])
+                .is_none()),
+        "extended identifier ownership must be an additive table layer"
+    );
+
+    validate_relationship_inventory("local", &local, local_tables.clone(), &manifest_local)
+        .expect("local identifier inventory must be exact");
+    validate_relationship_inventory(
+        "extended-owned",
+        &extended,
+        deferred_tables,
+        &manifest_deferred,
+    )
+    .expect("extended identifier inventory must be exact");
+    validate_relationship_inventory(
+        "extended-effective",
+        &extended,
+        extended_tables,
+        &manifest_effective_extended,
+    )
+    .expect("effective extended identifier inventory must be exact");
+}
+
+#[test]
+fn identifier_inventory_rejects_unannotated_and_misclassified_schema_changes() {
+    let [(_, mut local), _] = effective_profiles();
+    let tables = local
+        .tables
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let inventory = relationship_inventory()
+        .into_iter()
+        .filter(|((owner, _, _), _)| owner == "local")
+        .map(|((_, table, column), class)| ((table, column), class))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    local
+        .tables
+        .get_mut("sessions")
+        .unwrap()
+        .columns
+        .insert("unreviewed_authority_ref".to_owned());
+    assert!(
+        validate_relationship_inventory("adversarial", &local, tables.clone(), &inventory)
+            .unwrap_err()
+            .contains("missing")
+    );
+    local
+        .tables
+        .get_mut("sessions")
+        .unwrap()
+        .columns
+        .remove("unreviewed_authority_ref");
+
+    let foreign_identity = inventory
+        .iter()
+        .find(|(_, class)| **class == RelationshipClass::Foreign)
+        .map(|(identity, _)| identity.clone())
+        .unwrap();
+    let mut misclassified = inventory;
+    misclassified.insert(foreign_identity, RelationshipClass::External);
+    assert!(
+        validate_relationship_inventory("adversarial", &local, tables, &misclassified)
+            .unwrap_err()
+            .contains("bidirectional")
+    );
 }
 
 #[test]

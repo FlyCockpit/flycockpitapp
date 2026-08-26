@@ -589,8 +589,7 @@ impl NotesPane {
         let Some((id, content)) = self.current().map(|n| (n.id, n.content.clone())) else {
             return;
         };
-        self.editor = Composer::new(self.vim_enabled);
-        self.editor.set(content);
+        self.editor = Composer::with_text(content, self.vim_enabled);
         // Park the cursor at the start so a fresh edit begins at the top.
         self.editor.set_cursor(0);
         self.edit_scroll = 0;

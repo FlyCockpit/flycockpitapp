@@ -523,6 +523,17 @@ impl Composer {
         }
     }
 
+    /// Construct a standalone plain-text editor with initial contents.
+    ///
+    /// This is intentionally a constructor rather than a general whole-buffer
+    /// mutator: registered application composers use [`RegisteredComposer`]
+    /// so their text and paste authority cannot be separated.
+    pub(crate) fn with_text(text: impl Into<String>, vim_enabled: bool) -> Self {
+        let mut composer = Self::new(vim_enabled);
+        composer.set_unregistered(text);
+        composer
+    }
+
     pub fn set_vim_enabled(&mut self, enabled: bool) {
         self.vim_enabled = enabled;
         if !enabled {

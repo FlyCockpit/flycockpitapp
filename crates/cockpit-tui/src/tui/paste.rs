@@ -1047,16 +1047,18 @@ impl PasteRegistry {
     ) -> EditorPasteRebuild {
         let mut buffer = String::with_capacity(editor_text.len());
         let mut registry = PasteRegistry::new();
-        let unknown_image_floor = editor_text
+        let unknown_image_max = editor_text
             .match_indices(PASTED_IMAGE_PREFIX)
             .filter_map(|(start, _)| Self::parse_image_placeholder_at(&editor_text[start..]))
             .map(|(number, _)| number)
             .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .expect("external-editor image numbering exhausted");
+            .max();
         registry.next_text_number = snapshot.next_text_number;
-        registry.next_image_number = snapshot.next_image_number.max(unknown_image_floor);
+        registry.next_image_number = unknown_image_max
+            .and_then(|number| number.checked_add(1))
+            .map_or(snapshot.next_image_number, |floor| {
+                snapshot.next_image_number.max(floor)
+            });
         let mut retained_text_numbers = snapshot.text_numbers_by_nonce.clone();
         let mut pos = 0usize;
 
@@ -1841,6 +1843,26 @@ gamma",
                 .registry
                 .register_image(rebuilt.buffer.len(), vec![4]),
             "[Pasted image #3]"
+        );
+    }
+
+    #[test]
+    fn editor_rebuild_preserves_max_unknown_image_without_panicking() {
+        let snapshot = EditorPasteSnapshot {
+            images: BTreeMap::new(),
+            text_numbers_by_nonce: BTreeMap::new(),
+            next_text_number: 1,
+            next_image_number: 7,
+        };
+        let raw = "unknown [Pasted image #4294967295]";
+
+        let mut rebuilt = PasteRegistry::rebuild_from_editor_snapshot(raw, &snapshot, |_| 0);
+
+        assert_eq!(rebuilt.buffer, raw);
+        assert!(rebuilt.registry.is_empty());
+        assert_eq!(
+            rebuilt.registry.register_image(raw.len(), vec![1]),
+            "[Pasted image #7]"
         );
     }
 

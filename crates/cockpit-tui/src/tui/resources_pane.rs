@@ -9,6 +9,7 @@ use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tui::pane::Pane;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
@@ -24,6 +25,7 @@ pub enum ResourcesOutcome {
 }
 
 pub struct ResourcesPane {
+    generation: u64,
     snapshot: Option<ResourceSchedulerSnapshot>,
     error: Option<String>,
     loading: bool,
@@ -66,7 +68,9 @@ impl ResourcesPane {
     }
 
     pub fn open() -> Self {
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
         Self {
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
             snapshot: None,
             error: None,
             loading: true,
@@ -77,6 +81,10 @@ impl ResourcesPane {
             last_body_height: 0,
             last_content_rows: 0,
         }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn apply_snapshot_result(&mut self, result: Result<ResourceSchedulerSnapshot, String>) {

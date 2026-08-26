@@ -2757,6 +2757,14 @@ mod resource_button_dispatch_tests {
         ResourceSchedulerSnapshot,
     };
     use cockpit_proto::ResourceQueuedState;
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+    fn resource_generation(app: &App) -> u64 {
+        match &app.overlay {
+            Overlay::Resources(pane) => pane.generation(),
+            _ => panic!("resources overlay"),
+        }
+    }
 
     fn scheduler_snapshot(display_ids: &[&str]) -> ResourceSchedulerSnapshot {
         ResourceSchedulerSnapshot {
@@ -2817,6 +2825,7 @@ mod resource_button_dispatch_tests {
         pane.apply_snapshot_result(Ok(snapshot));
         let mut app = App::new(None, false);
         app.overlay = Overlay::Resources(pane);
+        let pane_generation = resource_generation(&app);
         app.dispatch_button(ButtonDispatch::ResourcePromote {
             request_id: first_id,
         });
@@ -2835,6 +2844,7 @@ mod resource_button_dispatch_tests {
             kind: AsyncActionKind::DaemonRpc("resources.promote"),
             presentation_stale: false,
             payload: Ok(AsyncActionPayload::PromoteResource {
+                pane_generation: Some(pane_generation),
                 status: cockpit_proto::ResourcePromoteStatus::Promoted,
                 message: "first applied".to_string(),
                 snapshot: scheduler_snapshot(&["first-applied"]),
@@ -2861,6 +2871,7 @@ mod resource_button_dispatch_tests {
     async fn serialized_read_success_survives_following_mutation_failure() {
         let mut app = App::new(None, false);
         app.overlay = Overlay::Resources(ResourcesPane::open());
+        let pane_generation = resource_generation(&app);
         app.start_resources_snapshot_action();
         app.dispatch_button(ButtonDispatch::ResourcePromote {
             request_id: uuid::Uuid::new_v4(),
@@ -2884,9 +2895,10 @@ mod resource_button_dispatch_tests {
             id: ids[0],
             kind: AsyncActionKind::DaemonRpc("resources.snapshot"),
             presentation_stale: false,
-            payload: Ok(AsyncActionPayload::ResourceSnapshot(scheduler_snapshot(&[
-                "read-applied",
-            ]))),
+            payload: Ok(AsyncActionPayload::ResourceSnapshot {
+                pane_generation,
+                result: Ok(scheduler_snapshot(&["read-applied"])),
+            }),
         });
         app.apply_async_action_result(AsyncActionResult {
             id: ids[1],
@@ -2898,6 +2910,62 @@ mod resource_button_dispatch_tests {
             panic!("resources overlay")
         };
         assert_eq!(pane.queued_display_ids(), ["read-applied"]);
+    }
+
+    #[test]
+    fn closed_resource_pane_completions_cannot_populate_reopened_instance() {
+        let old = ResourcesPane::open();
+        let old_generation = old.generation();
+        let old_snapshot = scheduler_snapshot(&["old-request"]);
+        let old_id = old_snapshot.queued[0].id;
+        let mut app = App::new(None, false);
+        app.overlay = Overlay::Resources(old);
+        app.overlay = Overlay::None;
+        app.overlay = Overlay::Resources(ResourcesPane::open());
+        assert_ne!(resource_generation(&app), old_generation);
+
+        app.apply_async_action_result(AsyncActionResult {
+            id: crate::tui::async_action::AsyncActionId::from_raw_for_test(91),
+            kind: AsyncActionKind::DaemonRpc("resources.snapshot"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::ResourceSnapshot {
+                pane_generation: old_generation,
+                result: Ok(old_snapshot.clone()),
+            }),
+        });
+        app.apply_async_action_result(AsyncActionResult {
+            id: crate::tui::async_action::AsyncActionId::from_raw_for_test(92),
+            kind: AsyncActionKind::DaemonRpc("resources.promote"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::PromoteResource {
+                pane_generation: Some(old_generation),
+                status: cockpit_proto::ResourcePromoteStatus::Promoted,
+                message: "old promote settled".to_string(),
+                snapshot: old_snapshot,
+            }),
+        });
+
+        let Overlay::Resources(pane) = &mut app.overlay else {
+            panic!("resources overlay")
+        };
+        assert!(pane.queued_display_ids().is_empty());
+        assert!(
+            pane.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .is_none()
+        );
+        assert!(pane.pointer_promote(old_id).is_none());
+        let mut registry = crate::tui::button::ButtonRegistry::default();
+        registry.begin_frame(true, 1);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                pane.render_with_buttons(frame, Rect::new(0, 0, 80, 12), Some(&mut registry))
+            })
+            .unwrap();
+        assert!(registry.targets().is_empty());
     }
 }
 

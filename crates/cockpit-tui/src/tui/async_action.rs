@@ -209,8 +209,12 @@ pub enum AsyncActionPayload {
         result: Result<cockpit_proto::ClientSubmissionReceiptStatus, String>,
     },
     SessionLiveStatus(std::collections::HashMap<uuid::Uuid, (bool, bool)>),
-    ResourceSnapshot(cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot),
+    ResourceSnapshot {
+        pane_generation: u64,
+        result: Result<cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot, String>,
+    },
     PromoteResource {
+        pane_generation: Option<u64>,
         status: cockpit_proto::ResourcePromoteStatus,
         message: String,
         snapshot: cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot,

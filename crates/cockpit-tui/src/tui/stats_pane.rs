@@ -166,30 +166,36 @@ impl StatsPane {
             return;
         }
         let previous_index = self.selected_recovery_index();
-        let previous_model = self.selected_model.take();
+        let previous_model = self.selected_model.clone();
+        let succeeded = result.result.is_ok();
         self.rollup = match result.result {
             Ok(rollup) => StatsPaneState::Ready(Box::new(rollup)),
             Err(error) => StatsPaneState::Error(error),
         };
         self.expanded = init_expanded(&self.rollup);
         self.list = ListState::default();
-        self.selected_model = self.rollup.ready().and_then(|rollup| {
-            previous_model
-                .filter(|model| {
-                    rollup
-                        .recovery
-                        .by_model
-                        .iter()
-                        .any(|row| row.model == *model)
-                })
-                .or_else(|| {
-                    rollup
-                        .recovery
-                        .by_model
-                        .get(previous_index.min(rollup.recovery.by_model.len().saturating_sub(1)))
-                        .map(|row| row.model.clone())
-                })
-        });
+        if succeeded {
+            self.selected_model = self.rollup.ready().and_then(|rollup| {
+                previous_model
+                    .filter(|model| {
+                        rollup
+                            .recovery
+                            .by_model
+                            .iter()
+                            .any(|row| row.model == *model)
+                    })
+                    .or_else(|| {
+                        rollup
+                            .recovery
+                            .by_model
+                            .get(
+                                previous_index
+                                    .min(rollup.recovery.by_model.len().saturating_sub(1)),
+                            )
+                            .map(|row| row.model.clone())
+                    })
+            });
+        }
     }
 
     fn current_fetch_key(&self) -> StatsPaneFetchKey {
@@ -1466,6 +1472,30 @@ mod tests {
         let mut pane = pane_with(rollup.clone());
         pane.handle_key(press(KeyCode::Down));
         assert_eq!(pane.selected_model.as_deref(), Some("b"));
+
+        rollup.recovery.by_model.reverse();
+        pane.apply_fetch_result(StatsPaneFetchResult {
+            key: pane.current_fetch_key(),
+            result: Ok(rollup),
+        });
+        assert_eq!(pane.selected_model.as_deref(), Some("b"));
+        assert_eq!(pane.selected_recovery_index(), 0);
+    }
+
+    #[test]
+    fn model_selection_survives_error_then_reordered_recovery() {
+        let mut rollup = empty_rollup();
+        rollup.recovery.by_model = vec![recovery_row("a"), recovery_row("b")];
+        let mut pane = pane_with(rollup.clone());
+        pane.handle_key(press(KeyCode::Down));
+        assert_eq!(pane.selected_model.as_deref(), Some("b"));
+
+        pane.apply_fetch_result(StatsPaneFetchResult {
+            key: pane.current_fetch_key(),
+            result: Err("temporarily offline".to_string()),
+        });
+        assert_eq!(pane.selected_model.as_deref(), Some("b"));
+        assert!(matches!(pane.rollup, StatsPaneState::Error(_)));
 
         rollup.recovery.by_model.reverse();
         pane.apply_fetch_result(StatsPaneFetchResult {

@@ -1689,7 +1689,11 @@ impl App {
             AsyncActionKind::DaemonRpc("resources.snapshot") => {
                 if let Overlay::Resources(pane) = &mut self.overlay {
                     let payload = match result.payload {
-                        Ok(AsyncActionPayload::ResourceSnapshot(snapshot)) => Ok(snapshot),
+                        Ok(AsyncActionPayload::ResourceSnapshot {
+                            pane_generation,
+                            result,
+                        }) if pane_generation == pane.generation() => result,
+                        Ok(AsyncActionPayload::ResourceSnapshot { .. }) => return,
                         Ok(_) => Err("unexpected daemon response".to_string()),
                         Err(e) => Err(e),
                     };
@@ -1698,11 +1702,14 @@ impl App {
             }
             AsyncActionKind::DaemonRpc("resources.promote") => match result.payload {
                 Ok(AsyncActionPayload::PromoteResource {
+                    pane_generation,
                     status,
                     message,
                     snapshot,
                 }) => {
-                    if let Overlay::Resources(pane) = &mut self.overlay {
+                    if let Overlay::Resources(pane) = &mut self.overlay
+                        && pane_generation == Some(pane.generation())
+                    {
                         pane.apply_snapshot_result(Ok(snapshot));
                     }
                     let kind = match status {
@@ -2896,26 +2903,37 @@ impl App {
     }
 
     pub(super) fn start_resources_snapshot_action(&mut self) {
+        let Overlay::Resources(pane) = &self.overlay else {
+            return;
+        };
+        let pane_generation = pane.generation();
         let lifecycle = self.lifecycle.clone();
         self.async_actions.start_serialized(
             AsyncActionKind::DaemonRpc("resources.snapshot"),
             AsyncActionKey::new("resources.projection"),
             async {
-                tokio::task::spawn_blocking(move || {
+                let result = tokio::task::spawn_blocking(move || {
                     match crate::tui::agent_runner::resource_snapshot_blocking(lifecycle)? {
-                        cockpit_proto::Response::ResourceSnapshot { snapshot } => {
-                            Ok(AsyncActionPayload::ResourceSnapshot(snapshot))
-                        }
+                        cockpit_proto::Response::ResourceSnapshot { snapshot } => Ok(snapshot),
                         other => Err(format!("unexpected resource_snapshot response: {other:?}")),
                     }
                 })
                 .await
-                .map_err(|error| format!("resources.snapshot worker failed: {error}"))?
+                .map_err(|error| format!("resources.snapshot worker failed: {error}"))
+                .and_then(|result| result);
+                Ok(AsyncActionPayload::ResourceSnapshot {
+                    pane_generation,
+                    result,
+                })
             },
         );
     }
 
     pub(super) fn start_resource_promote_action(&mut self, request_id: uuid::Uuid) {
+        let pane_generation = match &self.overlay {
+            Overlay::Resources(pane) => Some(pane.generation()),
+            _ => None,
+        };
         let session_id = self.current_session_id();
         let request = crate::tui::agent_runner::promote_resource_request(request_id, session_id);
         let lifecycle = self.lifecycle.clone();
@@ -2930,6 +2948,7 @@ impl App {
                             message,
                             snapshot,
                         } => Ok(AsyncActionPayload::PromoteResource {
+                            pane_generation,
                             status,
                             message,
                             snapshot,

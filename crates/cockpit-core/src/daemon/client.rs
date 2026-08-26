@@ -467,9 +467,7 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                             tracing::info!(pid, "daemon version skew auto-restart completed");
                             let client = wait_for_daemon(&discovered.paths.socket).await?;
                             return Ok(ConnectedDaemon {
-                                endpoint: cockpit_client::ClientEndpoint::Wire(
-                                    discovered.paths.socket.clone(),
-                                ),
+                                endpoint: local_daemon_endpoint(&discovered.paths.socket),
                                 client,
                                 owns_daemon: false,
                                 socket: discovered.paths.socket,
@@ -496,11 +494,9 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                                 skew_reason.as_deref(),
                                 reason.as_deref(),
                             );
-                            let client = DaemonClient::connect(&discovered.paths.socket).await?;
+                            let client = connect_local_daemon(&discovered.paths.socket).await?;
                             return Ok(ConnectedDaemon {
-                                endpoint: cockpit_client::ClientEndpoint::Wire(
-                                    discovered.paths.socket.clone(),
-                                ),
+                                endpoint: local_daemon_endpoint(&discovered.paths.socket),
                                 client,
                                 owns_daemon: false,
                                 socket: discovered.paths.socket,
@@ -513,11 +509,9 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                             reason,
                         }) => {
                             tracing::info!("daemon version skew surfaced without auto-restart");
-                            let client = DaemonClient::connect(&discovered.paths.socket).await?;
+                            let client = connect_local_daemon(&discovered.paths.socket).await?;
                             return Ok(ConnectedDaemon {
-                                endpoint: cockpit_client::ClientEndpoint::Wire(
-                                    discovered.paths.socket.clone(),
-                                ),
+                                endpoint: local_daemon_endpoint(&discovered.paths.socket),
                                 client,
                                 owns_daemon: false,
                                 socket: discovered.paths.socket,
@@ -536,9 +530,9 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
                         }
                     }
                 }
-                let client = DaemonClient::connect(&discovered.paths.socket).await?;
+                let client = connect_local_daemon(&discovered.paths.socket).await?;
                 return Ok(ConnectedDaemon {
-                    endpoint: cockpit_client::ClientEndpoint::Wire(discovered.paths.socket.clone()),
+                    endpoint: local_daemon_endpoint(&discovered.paths.socket),
                     client,
                     owns_daemon: false,
                     socket: discovered.paths.socket,
@@ -569,8 +563,8 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
         LifecycleMode::AttachOwnEphemeral => {
             // Daemonless TUI sessions stay in this process. Existing helpers
             // still carry the owned ephemeral socket path as a stable lookup
-            // key, but `DaemonClient::connect` resolves it to the registered
-            // in-process context instead of opening a Unix socket.
+            // key; `connect_local_daemon` resolves a registered in-process
+            // context instead of opening a Unix socket.
             let own = own_ephemeral_paths()?;
             let (in_process_endpoint, guard) = crate::daemon::boot_in_process(
                 own.clone(),
@@ -631,26 +625,51 @@ pub(crate) async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemo
         // sandboxing part 2 precedence). Only an explicit
         // `cockpit daemon start --no-sandbox` sets the daemon-level flag.
         let canonical = DaemonPaths::resolve_canonical()?;
+        // In-process auto-promote binds a hello-capable owner on a dedicated
+        // thread (no OS socket). Connect immediately — do not poll a missing
+        // path for [`SPAWN_DAEMON_TIMEOUT`]. The promote guard / AUTO_PROMOTED
+        // slot holds that owner for the test lifetime; this client does not.
         #[cfg(any(test, feature = "test-support"))]
-        let pid = if crate::daemon::in_process_auto_promote_enabled() {
-            crate::daemon::auto_promote_in_process_persistent().await?
-        } else {
-            spawn_detached(false)?
-        };
-        #[cfg(not(any(test, feature = "test-support")))]
+        if crate::daemon::in_process_auto_promote_enabled() {
+            let pid = crate::daemon::auto_promote_in_process_persistent().await?;
+            tracing::info!(
+                pid,
+                ephemeral = false,
+                "in-process persistent daemon promoted"
+            );
+            let client = connect_local_daemon(&canonical.socket)
+                .await
+                .with_context(|| {
+                    format!(
+                        "in-process auto-promote did not publish a hello-capable owner at {}",
+                        canonical.socket.display()
+                    )
+                })?;
+            return Ok(ConnectedDaemon {
+                endpoint: local_daemon_endpoint(&canonical.socket),
+                client,
+                owns_daemon: false,
+                socket: canonical.socket,
+                startup_notice: None,
+                owned_daemon_guard: None,
+                owned_in_process_guard: None,
+            });
+        }
         let pid = spawn_detached(false)?;
         (canonical, pid, None)
     };
     tracing::info!(pid = pid, ephemeral = ephemeral, "daemon spawned");
 
-    // Wait for the socket + a successful handshake.
+    // Wait for the socket + a successful handshake. In-process auto-promote
+    // returns above after a registered-owner hello; this wait is only for
+    // a spawned child (or an in-process attach that already published).
     let client = wait_for_daemon(&paths.socket).await?;
     if let Some(guard) = owned_daemon_guard.as_ref() {
         guard.bind_published_receipt()?;
     }
 
     Ok(ConnectedDaemon {
-        endpoint: cockpit_client::ClientEndpoint::Wire(paths.socket.clone()),
+        endpoint: local_daemon_endpoint(&paths.socket),
         client,
         owns_daemon: ephemeral,
         socket: paths.socket,
@@ -699,6 +718,26 @@ fn set_own_ephemeral_paths_for_test(paths: crate::daemon::DaemonPaths) {
     *slot.lock().unwrap() = Some(paths);
 }
 
+/// Connect by socket-path key: a registered in-process owner first, otherwise
+/// the Unix socket. In-process auto-promote never publishes an OS socket.
+async fn connect_local_daemon(socket: &Path) -> Result<DaemonClient> {
+    if let Some(endpoint) = crate::daemon::server::registered_in_process_endpoint(socket) {
+        return DaemonClient::connect_endpoint(&cockpit_client::ClientEndpoint::InProcess(
+            endpoint,
+        ))
+        .await;
+    }
+    DaemonClient::connect(socket).await
+}
+
+fn local_daemon_endpoint(socket: &Path) -> cockpit_client::ClientEndpoint {
+    if let Some(endpoint) = crate::daemon::server::registered_in_process_endpoint(socket) {
+        cockpit_client::ClientEndpoint::InProcess(endpoint)
+    } else {
+        cockpit_client::ClientEndpoint::Wire(socket.to_path_buf())
+    }
+}
+
 /// Poll for the daemon socket and an actual DaemonStatus response.
 /// 2ms initial backoff, doubling up to a 50ms ceiling; total cap 30s.
 async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
@@ -713,8 +752,9 @@ async fn wait_for_daemon(socket: &Path) -> Result<DaemonClient> {
     loop {
         if crate::daemon::server::in_process_context(socket).is_some() || socket.exists() {
             // A connect error just means the socket exists but accept hasn't
-            // started yet — fall through to the backoff retry.
-            if let Ok(client) = DaemonClient::connect(socket).await {
+            // started yet — fall through to the backoff retry. A registered
+            // in-process owner hellos here without an OS socket.
+            if let Ok(client) = connect_local_daemon(socket).await {
                 // Sanity check — first request after connect.
                 if client.request_ok(Request::DaemonStatus).await.is_ok() {
                     timer.phase("spawn_to_ready");
@@ -1036,8 +1076,6 @@ mod tests {
         server.await.unwrap();
     }
 
-
-
     /// Daemonless = own ephemeral daemon (`daemonless-tui-ephemeral-lifecycle.md`
     /// §1). `LifecycleMode::AttachOwnEphemeral` attaches to this process's
     /// cached ephemeral daemon when it's already up and reports
@@ -1061,7 +1099,7 @@ mod tests {
         let ctx = crate::daemon::boot_in_process_with_db(paths.clone(), db)
             .await
             .expect("boot local daemon context");
-        let client = DaemonClient::connect(&paths.socket)
+        let client = connect_local_daemon(&paths.socket)
             .await
             .expect("connect by local socket key");
         let response = client
@@ -1118,6 +1156,53 @@ mod tests {
             .expect("owned in-process daemon answers");
 
         reset_own_ephemeral_paths_for_test();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_process_auto_promote_hellos_without_os_socket() {
+        let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+        let runtime = env.path().expect("isolated runtime root").join("runtime");
+        env.set_var("XDG_RUNTIME_DIR", &runtime);
+        let _promote = crate::daemon::enable_in_process_auto_promote();
+
+        let session = super::ensure_persistent_daemon()
+            .await
+            .expect("in-process auto-promote must hello");
+        let paths = crate::daemon::DaemonPaths::resolve_canonical().expect("canonical paths");
+        assert!(
+            !paths.socket.exists(),
+            "in-process auto-promote must not bind {}",
+            paths.socket.display()
+        );
+        session
+            .client
+            .request_ok(Request::DaemonStatus)
+            .await
+            .expect("promoted owner answers DaemonStatus");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn boot_test_persistent_daemon_hellos_without_os_socket() {
+        let env = crate::test_env::TestEnvGuard::isolated_cockpit_home_async().await;
+        let runtime = env.path().expect("isolated runtime root").join("runtime");
+        env.set_var("XDG_RUNTIME_DIR", &runtime);
+        let _daemon = crate::daemon::boot_test_persistent_daemon()
+            .await
+            .expect("boot isolated test daemon");
+
+        let paths = crate::daemon::DaemonPaths::resolve_canonical().expect("canonical paths");
+        let client = connect_local_daemon(&paths.socket)
+            .await
+            .expect("registered owner must hello");
+        assert!(
+            !paths.socket.exists(),
+            "test persistent daemon must not bind {}",
+            paths.socket.display()
+        );
+        client
+            .request_ok(Request::DaemonStatus)
+            .await
+            .expect("booted owner answers DaemonStatus");
     }
 
     #[test]

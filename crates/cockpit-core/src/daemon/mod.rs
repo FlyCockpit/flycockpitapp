@@ -1549,8 +1549,88 @@ pub(crate) async fn boot_in_process(
     ))
 }
 
+/// Isolated persistent daemon for tests. Holds the owner thread so the
+/// registered in-process endpoint can hello without an OS socket. Dropping
+/// this value tears that owner down.
 #[cfg(any(test, feature = "test-support"))]
-pub async fn boot_test_persistent_daemon() -> Result<std::sync::Arc<server::DaemonContext>> {
+#[must_use]
+pub struct TestPersistentDaemon {
+    ctx: std::sync::Arc<server::DaemonContext>,
+    _owner: Option<InProcessDaemonGuard>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestPersistentDaemon {
+    pub fn context(&self) -> &std::sync::Arc<server::DaemonContext> {
+        &self.ctx
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct TestPersistentBootReady {
+    ctx: std::sync::Arc<server::DaemonContext>,
+    force: shutdown::ShutdownSignal,
+}
+
+/// Owner-thread boot used by [`boot_test_persistent_daemon`] and in-process
+/// auto-promote. Endpoint acceptors are spawned on this runtime — never on
+/// the caller's `#[tokio::test(flavor = "current_thread")]` runtime and never
+/// via `spawn_local`.
+#[cfg(any(test, feature = "test-support"))]
+fn spawn_owned_test_persistent_daemon(
+    paths: DaemonPaths,
+    source: config_source::ConfigSource,
+) -> Result<(
+    tokio::sync::oneshot::Receiver<Result<TestPersistentBootReady>>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<Result<()>>,
+    std::thread::JoinHandle<()>,
+)> {
+    let (booted, boot) = tokio::sync::oneshot::channel();
+    let (shutdown, shutdown_request) = tokio::sync::oneshot::channel();
+    let (completion, completed) = tokio::sync::oneshot::channel();
+    let supervisor = std::thread::Builder::new()
+        .name("cockpit-test-persistent-daemon".to_string())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building test persistent daemon runtime")
+                .and_then(|runtime| {
+                    runtime.block_on(async move {
+                        let db = crate::db::Db::open_in_memory()
+                            .context("opening isolated test daemon DB")?;
+                        let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
+                        let ctx = std::sync::Arc::new(server::DaemonContext::new(
+                            db,
+                            locks,
+                            paths,
+                            terminal::default_host_factory(),
+                            source,
+                        ));
+                        let _endpoint = server::register_in_process_context(ctx.clone());
+                        let force = ctx.shutdown_signal().clone();
+                        if booted
+                            .send(Ok(TestPersistentBootReady {
+                                ctx: ctx.clone(),
+                                force,
+                            }))
+                            .is_err()
+                        {
+                            return shutdown_in_process_context(ctx, Vec::new()).await;
+                        }
+                        let _ = shutdown_request.await;
+                        shutdown_in_process_context(ctx, Vec::new()).await
+                    })
+                });
+            let _ = completion.send(result);
+        })
+        .context("spawning test persistent daemon owner thread")?;
+    Ok((boot, shutdown, completed, supervisor))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn boot_test_persistent_daemon() -> Result<TestPersistentDaemon> {
     boot_test_persistent_daemon_with_source(config_source::ConfigSource::fixed(
         Default::default(),
         Default::default(),
@@ -1561,26 +1641,29 @@ pub async fn boot_test_persistent_daemon() -> Result<std::sync::Arc<server::Daem
 #[cfg(any(test, feature = "test-support"))]
 async fn boot_test_persistent_daemon_with_source(
     source: config_source::ConfigSource,
-) -> Result<std::sync::Arc<server::DaemonContext>> {
+) -> Result<TestPersistentDaemon> {
     let paths = DaemonPaths::resolve_canonical()?;
     if let Some(ctx) = server::in_process_context(&paths.socket) {
-        return Ok(ctx);
+        return Ok(TestPersistentDaemon { ctx, _owner: None });
     }
-    let db = crate::db::Db::open_in_memory().context("opening isolated test daemon DB")?;
-    let locks = Arc::new(crate::locks::LockManager::in_memory(db.clone()));
-    let ctx = tokio::task::spawn_blocking(move || {
-        std::sync::Arc::new(server::DaemonContext::new(
-            db,
-            locks,
-            paths,
-            terminal::default_host_factory(),
-            source,
-        ))
+    let (boot, shutdown, completion, supervisor) =
+        spawn_owned_test_persistent_daemon(paths, source)?;
+    let mut pending = PendingInProcessBoot {
+        shutdown: Some(shutdown),
+        supervisor: Some(supervisor),
+    };
+    let ready = boot
+        .await
+        .context("in-process test daemon owner stopped during boot")??;
+    Ok(TestPersistentDaemon {
+        ctx: ready.ctx,
+        _owner: Some(InProcessDaemonGuard {
+            shutdown: pending.shutdown.take(),
+            force: ready.force,
+            completion: Some(completion),
+            supervisor: pending.supervisor.take(),
+        }),
     })
-    .await
-    .context("building isolated test daemon")?;
-    server::register_in_process_context(ctx.clone());
-    Ok(ctx)
 }
 
 /// Test seam for first-run auto-promote: `probe_or_spawn(AttachOrAutoPromote)`
@@ -1594,7 +1677,7 @@ static IN_PROCESS_AUTO_PROMOTE_PRODUCTION_CONFIG: std::sync::atomic::AtomicBool 
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(any(test, feature = "test-support"))]
-static AUTO_PROMOTED_DAEMON: std::sync::Mutex<Option<Arc<server::DaemonContext>>> =
+static AUTO_PROMOTED_DAEMON: std::sync::Mutex<Option<TestPersistentDaemon>> =
     std::sync::Mutex::new(None);
 
 #[cfg(any(test, feature = "test-support"))]

@@ -1404,14 +1404,32 @@ mod tests {
             state_home: &std::path::Path,
         ) -> Self {
             let guard = crate::test_env::lock_async().await;
+            // Production config publication locks the COCKPIT_CONFIG parent and
+            // its `providers/` catalog no-follow. Materialize that tree so the
+            // isolated owner can snapshot without waiting on a missing path.
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create isolated config directory");
+                std::fs::create_dir_all(parent.join("providers"))
+                    .expect("create isolated provider catalog directory");
+            }
+            if !path.exists() {
+                std::fs::write(path, "{}\n").expect("write isolated config stub");
+            }
+            std::fs::create_dir_all(state_home).expect("create isolated state home");
+            let home = state_home.join("home");
+            let xdg_config = state_home.join("xdg-config");
+            std::fs::create_dir_all(&home).expect("create isolated home");
+            std::fs::create_dir_all(&xdg_config).expect("create isolated XDG config");
             guard.set_var(COCKPIT_CONFIG_ENV, path);
+            guard.set_var("HOME", &home);
+            guard.set_var("XDG_CONFIG_HOME", &xdg_config);
             guard.set_var("XDG_STATE_HOME", state_home);
             guard.set_var("XDG_DATA_HOME", state_home);
             // Isolate the daemon socket/runtime namespace so `ensure_persistent_
             // daemon()` never discovers a real user daemon and the in-process
             // promotion binds an isolated canonical path.
             let runtime_dir = state_home.join("runtime");
-            std::fs::create_dir_all(&runtime_dir).ok();
+            std::fs::create_dir_all(&runtime_dir).expect("create isolated runtime directory");
             guard.set_var("XDG_RUNTIME_DIR", &runtime_dir);
             guard.set_var("COCKPIT_TEST_NO_KEYRING", "1");
             // Setup/provider paths now route every secret and config write

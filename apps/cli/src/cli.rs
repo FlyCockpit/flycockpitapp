@@ -2026,7 +2026,14 @@ mod tests {
             cursor += found + needle.len();
         }
 
-        assert!(quickstart.contains("cockpit account"), "{quickstart}");
+        assert!(
+            quickstart.to_ascii_lowercase().contains("local-only"),
+            "quickstart must document the public local-only contract:\n{quickstart}"
+        );
+        assert!(
+            !quickstart.contains("cockpit account"),
+            "public v0.1 quickstart must not document a FlyCockpit account command:\n{quickstart}"
+        );
         assert!(quickstart.contains("cockpit provider"), "{quickstart}");
 
         let commands = quickstart_shell_commands();

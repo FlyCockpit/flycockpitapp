@@ -2168,10 +2168,10 @@ mod tests {
         use clap::{CommandFactory, Parser};
 
         // Init/learn have no --permission-mode / --max-turns / --timeout flags.
-        for sub in ["init", "assistant"] {
+        for sub in ["init", "assistants"] {
             let mut root = Cli::command();
-            let help = if sub == "assistant" {
-                root.find_subcommand_mut("assistant")
+            let help = if sub == "assistants" {
+                root.find_subcommand_mut("assistants")
                     .unwrap()
                     .find_subcommand_mut("learn")
                     .unwrap()
@@ -2203,7 +2203,7 @@ mod tests {
 
         // Parse paths still work without the flag.
         assert!(Cli::try_parse_from(["cockpit", "init"]).is_ok());
-        assert!(Cli::try_parse_from(["cockpit", "assistant", "learn", "how we deploy"]).is_ok());
+        assert!(Cli::try_parse_from(["cockpit", "assistants", "learn", "how we deploy"]).is_ok());
     }
 
     fn approval_question(class: GrantKind) -> proto::InterruptQuestion {

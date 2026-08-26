@@ -17410,7 +17410,7 @@ async fn stage_and_recover_provider_batch(
             })
             .ok_or_else(|| bad_request("no Cockpit provider layer is available"))?;
         let provider_target = canonical_mcp_target_path(&provider_target)?;
-        if provider_target != target {
+        if provider_target.parent() != target.parent() {
             return Err(bad_request(
                 "provider batch spans multiple authority layers; reload the defining layer",
             ));

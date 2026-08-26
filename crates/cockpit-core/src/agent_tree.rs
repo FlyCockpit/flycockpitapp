@@ -3492,7 +3492,6 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let interrupt_id = Uuid::nil();
         let selected_response_for_insert = selected_response_json.clone();
         let selected_candidate_for_insert = selected_candidate_json.clone();
         let selected_candidate_for_ready_handoff = selected_candidate_json.clone();

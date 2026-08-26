@@ -268,8 +268,8 @@ mod tests {
             "short_id": short_id,
             "project_root": "/x",
             "project_id": "p",
-            "started_at": 0,
-            "last_active_at": 0,
+            "started_at_unix_ms": 0,
+            "last_active_at_unix_ms": 0,
             "turns": 0,
             "active_agent": "builder",
         }))

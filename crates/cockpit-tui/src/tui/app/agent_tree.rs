@@ -118,4 +118,132 @@ impl App {
             },
         );
     }
+
+    /// Fetch the focused node's daemon-resolved effective settings and open the
+    /// per-node override controls inside the agent-tree overlay (modes AC5/6/7).
+    pub(super) fn request_agent_effective_settings(&mut self, agent_instance_id: Uuid) {
+        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            if let Overlay::AgentTree(pane) = &mut self.overlay {
+                pane.set_override_error(
+                    "Per-node settings are only available once attached to a session.",
+                );
+            }
+            return;
+        };
+        let attached = runner.attached_request_binding();
+        let session_id = attached.session_id();
+        const EFFECTIVE_SETTINGS_ACTION: &str = "agent_tree.effective_settings";
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc(EFFECTIVE_SETTINGS_ACTION),
+            crate::tui::async_action::AsyncActionPolicy::Replace(
+                crate::tui::async_action::AsyncActionKey::new(EFFECTIVE_SETTINGS_ACTION),
+            ),
+            async move {
+                let response = attached
+                    .request(cockpit_proto::Request::GetAgentEffectiveSettings {
+                        session_id,
+                        agent_instance_id,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(crate::tui::async_action::AsyncActionPayload::AgentEffectiveSettings(response))
+            },
+        );
+    }
+
+    pub(super) fn apply_agent_effective_settings(&mut self, response: cockpit_proto::Response) {
+        let cockpit_proto::Response::AgentEffectiveSettings { snapshot } = response else {
+            return;
+        };
+        if let Overlay::AgentTree(pane) = &mut self.overlay {
+            pane.apply_effective_settings(snapshot);
+        }
+    }
+
+    pub(super) fn apply_agent_effective_settings_error(&mut self, error: String) {
+        if let Overlay::AgentTree(pane) = &mut self.overlay {
+            pane.set_override_error(format!("Per-node settings could not be loaded: {error}"));
+        }
+    }
+
+    /// Submit one typed, non-escalating override for `agent_instance_id` against
+    /// the effective-settings revision. The daemon owns the CAS; on any outcome
+    /// we re-fetch so the controls reflect the current revision and pending
+    /// state (or the daemon's rejection reason).
+    pub(super) fn submit_agent_session_override(
+        &mut self,
+        agent_instance_id: Uuid,
+        expected_override_revision: u64,
+        field: cockpit_proto::AgentSessionOverrideFieldV1,
+    ) {
+        let Some(Ok(runner)) = self.agent_runner.as_ref() else {
+            return;
+        };
+        let attached = runner.attached_request_binding();
+        let session_id = attached.session_id();
+        const APPLY_OVERRIDE_ACTION: &str = "agent_tree.apply_override";
+        self.async_actions.start(
+            crate::tui::async_action::AsyncActionKind::DaemonRpc(APPLY_OVERRIDE_ACTION),
+            crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
+            async move {
+                let response = attached
+                    .request(cockpit_proto::Request::ApplyAgentSessionOverride {
+                        session_id,
+                        agent_instance_id,
+                        expected_override_revision,
+                        field,
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(
+                    crate::tui::async_action::AsyncActionPayload::AgentSessionOverrideOutcome(
+                        response,
+                    ),
+                )
+            },
+        );
+    }
+
+    /// Handle an override outcome: surface any rejection, then re-fetch the
+    /// node's effective settings so the controls show the new revision.
+    pub(super) fn apply_agent_session_override_outcome(&mut self, response: cockpit_proto::Response) {
+        let cockpit_proto::Response::AgentSessionOverrideOutcome {
+            agent_instance_id,
+            status,
+            ..
+        } = response
+        else {
+            return;
+        };
+        if !status.is_applied()
+            && let Overlay::AgentTree(pane) = &mut self.overlay
+        {
+            pane.set_override_error(override_status_message(status));
+        }
+        self.request_agent_effective_settings(agent_instance_id);
+    }
+
+    pub(super) fn set_agent_override_error(&mut self, error: String) {
+        if let Overlay::AgentTree(pane) = &mut self.overlay {
+            pane.set_override_error(format!("The override could not be applied: {error}"));
+        }
+    }
+}
+
+fn override_status_message(status: cockpit_proto::AgentSessionOverrideStatusV1) -> String {
+    use cockpit_proto::AgentSessionOverrideStatusV1 as Status;
+    match status {
+        Status::Applied => "Override applied.".to_string(),
+        Status::StaleRevision => {
+            "The controls were out of date; refreshed to the current settings.".to_string()
+        }
+        Status::RejectedNotFound => "That agent is no longer in the session.".to_string(),
+        Status::RejectedTerminal => {
+            "That agent has finished; its settings are read-only.".to_string()
+        }
+        Status::RejectedEscalation => {
+            "That change would raise authority and was refused.".to_string()
+        }
+        Status::RejectedIncompatible => "That change is not available for this agent.".to_string(),
+    }
 }

@@ -1114,6 +1114,24 @@ impl App {
                 }
                 _ => {}
             },
+            AsyncActionKind::DaemonRpc("agent_tree.effective_settings") => match result.payload {
+                Ok(AsyncActionPayload::AgentEffectiveSettings(response)) => {
+                    self.apply_agent_effective_settings(response);
+                }
+                Err(error) => {
+                    self.apply_agent_effective_settings_error(error);
+                }
+                _ => {}
+            },
+            AsyncActionKind::DaemonRpc("agent_tree.apply_override") => match result.payload {
+                Ok(AsyncActionPayload::AgentSessionOverrideOutcome(response)) => {
+                    self.apply_agent_session_override_outcome(response);
+                }
+                Err(error) => {
+                    self.set_agent_override_error(error);
+                }
+                _ => {}
+            },
             AsyncActionKind::DaemonRpc("guidance.estimate") => {
                 if let Ok(AsyncActionPayload::GuidanceEstimate(estimate)) = result.payload {
                     self.guidance_estimate = Some(estimate);

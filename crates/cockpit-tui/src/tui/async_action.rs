@@ -323,6 +323,8 @@ pub enum AsyncActionPayload {
         attention: Box<cockpit_proto::Response>,
     },
     AgentTreeResolved,
+    AgentEffectiveSettings(cockpit_proto::Response),
+    AgentSessionOverrideOutcome(cockpit_proto::Response),
     NotesRpc(crate::tui::notes_pane::NotesRpcResult),
     LeaksRpc(crate::tui::leaks_pane::LeaksRpcResult),
     PasteTokenCount {

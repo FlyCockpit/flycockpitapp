@@ -1114,6 +1114,22 @@ impl App {
                         self.overlay = Overlay::AgentTree(pane);
                         self.resolve_agent_decision(decision_request_id, agent_instance_id);
                     }
+                    AgentTreeOutcome::OpenOverride { agent_instance_id } => {
+                        self.overlay = Overlay::AgentTree(pane);
+                        self.request_agent_effective_settings(agent_instance_id);
+                    }
+                    AgentTreeOutcome::ApplyOverride {
+                        agent_instance_id,
+                        expected_override_revision,
+                        field,
+                    } => {
+                        self.overlay = Overlay::AgentTree(pane);
+                        self.submit_agent_session_override(
+                            agent_instance_id,
+                            expected_override_revision,
+                            field,
+                        );
+                    }
                 }
                 return false;
             }

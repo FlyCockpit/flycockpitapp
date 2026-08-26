@@ -3910,6 +3910,14 @@ impl Driver {
         };
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
+        // TODO(modes AC5 turn-consumption): consume any pending per-node session
+        // override for the active node here (this is the AC5 "second transaction"
+        // boundary). DB side is ready + tested: `Db::consume_pending_agent_override(
+        // session_id, agent_instance_id, now)` merges pending into effective and
+        // clears pending; active node id is
+        // `self.stack.last().and_then(|f| f.agent_instance_id)`. Applying the
+        // effective sandbox/mode requires node-aware reads (or root->session
+        // mapping) and MUST be compiled + turn-loop-tested — not spliced in blind.
         // Pin the session config snapshot for this turn's duration: a
         // re-resolution that lands mid-turn is observed only at the next turn
         // boundary (`engine-config-snapshot-adoption`).
@@ -9230,6 +9238,14 @@ impl Driver {
         self.preempt_self_improvement_review_for_foreground();
         let lifecycle_turn_id = uuid::Uuid::new_v4().to_string();
         self.current_lifecycle_turn_id = Some(lifecycle_turn_id.clone());
+        // TODO(modes AC5 turn-consumption): consume any pending per-node session
+        // override for the active node here (this is the AC5 "second transaction"
+        // boundary). DB side is ready + tested: `Db::consume_pending_agent_override(
+        // session_id, agent_instance_id, now)` merges pending into effective and
+        // clears pending; active node id is
+        // `self.stack.last().and_then(|f| f.agent_instance_id)`. Applying the
+        // effective sandbox/mode requires node-aware reads (or root->session
+        // mapping) and MUST be compiled + turn-loop-tested — not spliced in blind.
         // Pin the session config snapshot for this turn's duration: a
         // re-resolution that lands mid-turn is observed only at the next turn
         // boundary (`engine-config-snapshot-adoption`).

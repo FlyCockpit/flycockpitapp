@@ -225,3 +225,102 @@ impl AgentSessionOverrideStatusV1 {
         matches!(self, Self::Applied)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip<T>(value: &T) -> T
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let json = serde_json::to_string(value).expect("serialize");
+        serde_json::from_str(&json).expect("deserialize")
+    }
+
+    #[test]
+    fn modes_session_setup_override_field_axis_tag_roundtrips() {
+        // The `axis` tag distinguishes the five override axes on the wire.
+        let sandbox = AgentSessionOverrideFieldV1::Sandbox {
+            mode: SandboxMode::Container,
+        };
+        let json = serde_json::to_value(&sandbox).unwrap();
+        assert_eq!(json["axis"], "sandbox");
+        assert_eq!(json["mode"], "container");
+        assert_eq!(roundtrip(&sandbox), sandbox);
+
+        let question = AgentSessionOverrideFieldV1::Question {
+            policy: AgentQuestionOverrideV1::Reduce {
+                required_decision_timeout_seconds: 45,
+            },
+        };
+        let json = serde_json::to_value(&question).unwrap();
+        assert_eq!(json["axis"], "question");
+        assert_eq!(json["policy"]["kind"], "reduce");
+        assert_eq!(roundtrip(&question), question);
+
+        let verification = AgentSessionOverrideFieldV1::Verification {
+            reduction: AgentVerificationReductionV1::Off {
+                region_id: "rule-1".to_string(),
+            },
+        };
+        assert_eq!(roundtrip(&verification), verification);
+    }
+
+    #[test]
+    fn modes_session_setup_effective_settings_snapshot_roundtrips() {
+        let snapshot = AgentEffectiveSettingsV1 {
+            dto_version: AGENT_EFFECTIVE_SETTINGS_DTO_VERSION,
+            session_id: "s".to_string(),
+            agent_instance_id: "a".to_string(),
+            override_revision: 3,
+            terminal: false,
+            sandbox: AgentSandboxControlV1 {
+                effective: SandboxMode::Sandbox,
+                allowed: vec![SandboxMode::Sandbox, SandboxMode::Container],
+                locked_reason: None,
+                pending: Some(SandboxMode::Container),
+            },
+            mode: AgentModeControlV1 {
+                effective: LlmMode::Normal,
+                allowed: vec![LlmMode::Defensive, LlmMode::Normal],
+                locked_reason: None,
+                pending: None,
+            },
+            verification: AgentVerificationControlV1 {
+                regions: vec![AgentVerificationRegionV1 {
+                    region_id: "rule-1".to_string(),
+                    label: "rule-1".to_string(),
+                    enabled: true,
+                    can_disable: true,
+                    can_restrict: true,
+                    pending: false,
+                }],
+            },
+            question: AgentQuestionControlV1 {
+                effective: Some(AgentQuestionEffectiveV1 {
+                    auto_answer_enabled: true,
+                    required_decision_timeout_seconds: 30,
+                    host_ceiling_seconds: 3600,
+                    can_disable_auto_answer: true,
+                    max_required_decision_timeout_seconds: 3600,
+                }),
+                locked_reason: None,
+                pending: None,
+            },
+        };
+        assert_eq!(roundtrip(&snapshot), snapshot);
+    }
+
+    #[test]
+    fn modes_session_setup_override_status_labels_are_snake_case() {
+        assert_eq!(
+            serde_json::to_value(AgentSessionOverrideStatusV1::StaleRevision).unwrap(),
+            serde_json::json!("stale_revision")
+        );
+        assert_eq!(
+            serde_json::to_value(AgentSessionOverrideStatusV1::RejectedEscalation).unwrap(),
+            serde_json::json!("rejected_escalation")
+        );
+    }
+}

@@ -70,6 +70,7 @@ pub struct NotesPane {
     /// always the `+ new note` affordance at index `notes.len()`.
     sidebar: ListState,
     selection: SidebarSelection,
+    operation_generation: u64,
     mode: Mode,
     /// The reused composer editing engine for the raw-markdown editor. Holds
     /// the note source while [`Mode::Editing`]; honors vim when enabled.
@@ -116,6 +117,7 @@ pub struct NotesRpcAction {
     daemon_socket: std::path::PathBuf,
     project_root: String,
     kind: NotesRpcActionKind,
+    generation: u64,
 }
 
 enum NotesRpcActionKind {
@@ -128,10 +130,12 @@ enum NotesRpcActionKind {
 
 #[derive(Debug, Clone)]
 pub struct NotesRpcResult {
+    generation: u64,
     project_root: String,
     notes: Vec<ProjectNote>,
     selection: SelectionAfterRpc,
     enter_edit: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -146,13 +150,15 @@ impl NotesRpcAction {
         self,
         endpoint: cockpit_client::ClientEndpoint,
     ) -> anyhow::Result<NotesRpcResult> {
+        let generation = self.generation;
+        let error_project_root = self.project_root.clone();
         let project_root = self.project_root;
         let response_project_root = project_root.clone();
         let send = |request| {
             crate::tui::agent_runner::daemon_request_at_blocking(&endpoint, request)
                 .map_err(anyhow::Error::msg)
         };
-        match self.kind {
+        let result: anyhow::Result<NotesRpcResult> = match self.kind {
             NotesRpcActionKind::Load { keep } => {
                 let notes = match send(Request::ListProjectNotes { project_root })? {
                     Response::ProjectNotes { notes } => notes,
@@ -163,6 +169,8 @@ impl NotesRpcAction {
                     notes,
                     selection: keep.map_or(SelectionAfterRpc::Preserve, SelectionAfterRpc::Keep),
                     enter_edit: false,
+                    generation: 0,
+                    error: None,
                 })
             }
             NotesRpcActionKind::Save { id, content } => {
@@ -180,6 +188,8 @@ impl NotesRpcAction {
                     notes,
                     selection: SelectionAfterRpc::Keep(id),
                     enter_edit: false,
+                    generation: 0,
+                    error: None,
                 })
             }
             NotesRpcActionKind::Rename { id, name } => {
@@ -197,6 +207,8 @@ impl NotesRpcAction {
                     notes,
                     selection: SelectionAfterRpc::Keep(id),
                     enter_edit: false,
+                    generation: 0,
+                    error: None,
                 })
             }
             NotesRpcActionKind::Create { name } => {
@@ -216,6 +228,8 @@ impl NotesRpcAction {
                     notes,
                     selection: SelectionAfterRpc::Keep(note.id),
                     enter_edit: true,
+                    generation: 0,
+                    error: None,
                 })
             }
             NotesRpcActionKind::Delete { id, fallback_index } => {
@@ -232,9 +246,25 @@ impl NotesRpcAction {
                     notes,
                     selection: SelectionAfterRpc::Deleted { fallback_index },
                     enter_edit: false,
+                    generation: 0,
+                    error: None,
                 })
             }
-        }
+        };
+        Ok(match result {
+            Ok(mut result) => {
+                result.generation = generation;
+                result
+            }
+            Err(error) => NotesRpcResult {
+                generation,
+                project_root: error_project_root,
+                notes: Vec::new(),
+                selection: SelectionAfterRpc::Preserve,
+                enter_edit: false,
+                error: Some(error.to_string()),
+            },
+        })
     }
 }
 
@@ -309,6 +339,7 @@ impl NotesPane {
             notes: Vec::new(),
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::Uninitialized,
+            operation_generation: 0,
             mode: Mode::Browsing,
             editor: Composer::new(vim_enabled),
             vim_enabled,
@@ -328,6 +359,7 @@ impl NotesPane {
             daemon_socket: self.daemon_socket.clone()?,
             project_root: self.project_root.clone(),
             kind: NotesRpcActionKind::Load { keep: None },
+            generation: self.operation_generation,
         })
     }
 
@@ -365,28 +397,40 @@ impl NotesPane {
                 if result.project_root != self.project_root {
                     return;
                 }
+                let is_current = result.generation == self.operation_generation;
+                if let Some(error) = result.error {
+                    if is_current {
+                        self.status = Some(error);
+                    }
+                    return;
+                }
                 let old_index = self.selected_index();
                 let old_selection = self.selection;
+                let old_mode = self.mode.clone();
                 self.notes = result.notes;
-                let requested = match result.selection {
-                    SelectionAfterRpc::Preserve => match old_selection {
-                        SidebarSelection::Uninitialized => {
-                            self.notes.first().map_or(SidebarSelection::New, |note| {
-                                SidebarSelection::Note(note.id)
-                            })
-                        }
-                        established => established,
-                    },
-                    SelectionAfterRpc::Keep(id) => SidebarSelection::Note(id),
-                    SelectionAfterRpc::Deleted { fallback_index } => {
-                        self.notes.get(fallback_index).map_or_else(
-                            || {
-                                self.notes.last().map_or(SidebarSelection::New, |note| {
+                let requested = if !is_current {
+                    old_selection
+                } else {
+                    match result.selection {
+                        SelectionAfterRpc::Preserve => match old_selection {
+                            SidebarSelection::Uninitialized => {
+                                self.notes.first().map_or(SidebarSelection::New, |note| {
                                     SidebarSelection::Note(note.id)
                                 })
-                            },
-                            |note| SidebarSelection::Note(note.id),
-                        )
+                            }
+                            established => established,
+                        },
+                        SelectionAfterRpc::Keep(id) => SidebarSelection::Note(id),
+                        SelectionAfterRpc::Deleted { fallback_index } => {
+                            self.notes.get(fallback_index).map_or_else(
+                                || {
+                                    self.notes.last().map_or(SidebarSelection::New, |note| {
+                                        SidebarSelection::Note(note.id)
+                                    })
+                                },
+                                |note| SidebarSelection::Note(note.id),
+                            )
+                        }
                     }
                 };
                 let resolved = match requested {
@@ -408,22 +452,32 @@ impl NotesPane {
                 };
                 self.selection = resolved;
                 self.sidebar.select(Some(self.selected_index()));
-                self.mode = Mode::Browsing;
-                self.status = None;
-                if result.enter_edit {
-                    self.enter_edit();
+                if is_current {
+                    self.mode = Mode::Browsing;
+                    self.status = None;
+                    if result.enter_edit {
+                        self.enter_edit();
+                    }
+                } else {
+                    self.mode = old_mode;
                 }
             }
             Err(e) => self.status = Some(e),
         }
     }
 
-    fn action(&self, kind: NotesRpcActionKind) -> Option<NotesRpcAction> {
+    fn action(&mut self, kind: NotesRpcActionKind) -> Option<NotesRpcAction> {
+        self.operation_generation = self.operation_generation.wrapping_add(1);
         Some(NotesRpcAction {
             daemon_socket: self.daemon_socket.clone()?,
             project_root: self.project_root.clone(),
             kind,
+            generation: self.operation_generation,
         })
+    }
+
+    fn invalidate_pending_operations(&mut self) {
+        self.operation_generation = self.operation_generation.wrapping_add(1);
     }
 
     /// Begin editing the selected note: load its source into the reused
@@ -438,6 +492,7 @@ impl NotesPane {
         self.editor.set_cursor(0);
         self.edit_scroll = 0;
         self.edit_scroll_manual = false;
+        self.invalidate_pending_operations();
         self.mode = Mode::Editing;
     }
 
@@ -523,10 +578,11 @@ impl NotesPane {
                 self.enter_edit();
             }
             KeyCode::Char('r') => {
-                if let Some(note) = self.current() {
+                if let Some((id, name)) = self.current().map(|note| (note.id, note.name.clone())) {
+                    self.invalidate_pending_operations();
                     self.mode = Mode::Naming {
-                        for_note: Some(note.id),
-                        buffer: note.name.clone(),
+                        for_note: Some(id),
+                        buffer: name,
                     };
                 }
             }
@@ -547,6 +603,9 @@ impl NotesPane {
     }
 
     fn start_create(&mut self) {
+        self.selection = SidebarSelection::New;
+        self.sidebar.select(Some(self.notes.len()));
+        self.invalidate_pending_operations();
         self.mode = Mode::Naming {
             for_note: None,
             buffer: String::new(),
@@ -682,6 +741,7 @@ impl NotesPane {
             notes: Vec::new(),
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::New,
+            operation_generation: 0,
             mode: Mode::Editing,
             editor: Composer::new(vim_enabled),
             vim_enabled,
@@ -990,6 +1050,7 @@ mod tests {
             }],
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::Note(id),
+            operation_generation: 0,
             mode: Mode::Browsing,
             editor: Composer::new(false),
             vim_enabled: false,
@@ -1065,6 +1126,8 @@ mod tests {
         pane.select_sidebar(1);
 
         pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
             project_root: "/proj".into(),
             notes: vec![
                 note(Uuid::new_v4(), "inserted", "zero"),
@@ -1098,6 +1161,8 @@ mod tests {
 
         pane.select_sidebar(pane.notes.len());
         pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
             project_root: "/proj".into(),
             notes: (0..8)
                 .map(|index| note(Uuid::new_v4(), format!("new-{index}"), "x"))
@@ -1115,6 +1180,8 @@ mod tests {
         ];
         pane.select_sidebar(1);
         pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
             project_root: "/proj".into(),
             notes: vec![
                 note(Uuid::new_v4(), "after", "c"),
@@ -1129,6 +1196,8 @@ mod tests {
 
         let fallback = pane.notes[1].id;
         pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
             project_root: "/proj".into(),
             notes: pane.notes.clone(),
             selection: SelectionAfterRpc::Keep(Uuid::new_v4()),
@@ -1137,6 +1206,8 @@ mod tests {
         assert_eq!(pane.selection, SidebarSelection::Note(fallback));
 
         pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
             project_root: "/proj".into(),
             notes: Vec::new(),
             selection: SelectionAfterRpc::Deleted { fallback_index: 1 },
@@ -1153,6 +1224,8 @@ mod tests {
         initial.notes.clear();
         initial.selection = SidebarSelection::Uninitialized;
         initial.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
             project_root: "/proj".into(),
             notes: vec![
                 note(first, "first", "a"),
@@ -1168,6 +1241,8 @@ mod tests {
         initially_empty.notes.clear();
         initially_empty.selection = SidebarSelection::Uninitialized;
         initially_empty.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
             project_root: "/proj".into(),
             notes: Vec::new(),
             selection: SelectionAfterRpc::Preserve,
@@ -1175,6 +1250,8 @@ mod tests {
         }));
         assert_eq!(initially_empty.selection, SidebarSelection::New);
         initially_empty.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
             project_root: "/proj".into(),
             notes: vec![note(first, "arrived later", "a")],
             selection: SelectionAfterRpc::Preserve,
@@ -1186,9 +1263,19 @@ mod tests {
         let mut retry = pane(true);
         retry.notes.clear();
         retry.selection = SidebarSelection::Uninitialized;
-        retry.apply_rpc_result(Err("temporary daemon failure".into()));
-        assert_eq!(retry.selection, SidebarSelection::Uninitialized);
         retry.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: Some("temporary daemon failure".into()),
+            project_root: "/proj".into(),
+            notes: Vec::new(),
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert_eq!(retry.selection, SidebarSelection::Uninitialized);
+        assert_eq!(retry.status.as_deref(), Some("temporary daemon failure"));
+        retry.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
             project_root: "/proj".into(),
             notes: vec![note(first, "first after retry", "a")],
             selection: SelectionAfterRpc::Preserve,
@@ -1198,6 +1285,8 @@ mod tests {
 
         retry.select_sidebar(retry.notes.len());
         retry.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
             project_root: "/proj".into(),
             notes: vec![
                 note(Uuid::new_v4(), "inserted", "x"),
@@ -1208,6 +1297,46 @@ mod tests {
         }));
         assert_eq!(retry.selection, SidebarSelection::New);
         assert_eq!(retry.selected_index(), 2);
+    }
+
+    #[test]
+    fn pending_initial_completion_preserves_keyboard_and_pointer_new_drafts() {
+        for activation in [KeyCode::Char('n'), KeyCode::Enter] {
+            let mut pane = pane(true);
+            pane.notes.clear();
+            pane.selection = SidebarSelection::Uninitialized;
+            pane.sidebar.select(Some(0));
+            pane.handle_key(press(activation));
+            assert_eq!(pane.selection, SidebarSelection::New);
+            assert!(matches!(pane.mode, Mode::Naming { .. }));
+
+            pane.apply_rpc_result(Ok(NotesRpcResult {
+                generation: 0,
+                error: None,
+                project_root: "/proj".into(),
+                notes: vec![note(Uuid::new_v4(), "arrived", "content")],
+                selection: SelectionAfterRpc::Preserve,
+                enter_edit: false,
+            }));
+            assert_eq!(pane.selection, SidebarSelection::New);
+            assert!(matches!(pane.mode, Mode::Naming { .. }));
+
+            pane.apply_rpc_result(Ok(NotesRpcResult {
+                generation: 0,
+                error: Some("stale load error".into()),
+                project_root: "/proj".into(),
+                notes: Vec::new(),
+                selection: SelectionAfterRpc::Preserve,
+                enter_edit: false,
+            }));
+            assert!(pane.status.is_none());
+            assert!(matches!(pane.mode, Mode::Naming { .. }));
+        }
+
+        let mut pointer = pane(true);
+        pointer.pointer_new_note();
+        assert_eq!(pointer.selection, SidebarSelection::New);
+        assert!(matches!(pointer.mode, Mode::Naming { .. }));
     }
 
     #[test]
@@ -1222,6 +1351,8 @@ mod tests {
         ];
         pane.select_sidebar(1);
         pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
             project_root: "/proj".into(),
             notes: vec![note(first, "first", "a"), note(next, "next", "c")],
             selection: SelectionAfterRpc::Deleted { fallback_index: 1 },
@@ -1230,6 +1361,8 @@ mod tests {
         assert_eq!(pane.selection, SidebarSelection::Note(next));
 
         pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
             project_root: "/proj".into(),
             notes: vec![note(first, "first", "a")],
             selection: SelectionAfterRpc::Deleted { fallback_index: 1 },

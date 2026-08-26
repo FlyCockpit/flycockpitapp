@@ -95,6 +95,9 @@ pub struct NotesPane {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidebarSelection {
+    /// No successful inventory has arrived yet. Visually this occupies the
+    /// only available row, but it is not a user commitment to `New`.
+    Uninitialized,
     Note(Uuid),
     New,
 }
@@ -305,7 +308,7 @@ impl NotesPane {
             daemon_socket,
             notes: Vec::new(),
             sidebar: initial_sidebar_state(),
-            selection: SidebarSelection::New,
+            selection: SidebarSelection::Uninitialized,
             mode: Mode::Browsing,
             editor: Composer::new(vim_enabled),
             vim_enabled,
@@ -338,6 +341,7 @@ impl NotesPane {
 
     fn selected_index(&self) -> usize {
         match self.selection {
+            SidebarSelection::Uninitialized => 0,
             SidebarSelection::Note(id) => self
                 .notes
                 .iter()
@@ -365,7 +369,14 @@ impl NotesPane {
                 let old_selection = self.selection;
                 self.notes = result.notes;
                 let requested = match result.selection {
-                    SelectionAfterRpc::Preserve => old_selection,
+                    SelectionAfterRpc::Preserve => match old_selection {
+                        SidebarSelection::Uninitialized => {
+                            self.notes.first().map_or(SidebarSelection::New, |note| {
+                                SidebarSelection::Note(note.id)
+                            })
+                        }
+                        established => established,
+                    },
                     SelectionAfterRpc::Keep(id) => SidebarSelection::Note(id),
                     SelectionAfterRpc::Deleted { fallback_index } => {
                         self.notes.get(fallback_index).map_or_else(
@@ -379,6 +390,9 @@ impl NotesPane {
                     }
                 };
                 let resolved = match requested {
+                    SidebarSelection::Uninitialized => unreachable!(
+                        "successful notes refresh must resolve initial selection intent"
+                    ),
                     SidebarSelection::New => SidebarSelection::New,
                     SidebarSelection::Note(id) if self.notes.iter().any(|note| note.id == id) => {
                         SidebarSelection::Note(id)
@@ -1130,6 +1144,70 @@ mod tests {
         }));
         assert_eq!(pane.selection, SidebarSelection::New);
         assert_eq!(pane.selected_index(), 0);
+    }
+
+    #[test]
+    fn initial_selection_is_distinct_from_explicit_new_across_loads_and_errors() {
+        let first = Uuid::new_v4();
+        let mut initial = pane(true);
+        initial.notes.clear();
+        initial.selection = SidebarSelection::Uninitialized;
+        initial.apply_rpc_result(Ok(NotesRpcResult {
+            project_root: "/proj".into(),
+            notes: vec![
+                note(first, "first", "a"),
+                note(Uuid::new_v4(), "second", "b"),
+            ],
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert_eq!(initial.selection, SidebarSelection::Note(first));
+        assert_eq!(initial.selected_index(), 0);
+
+        let mut initially_empty = pane(true);
+        initially_empty.notes.clear();
+        initially_empty.selection = SidebarSelection::Uninitialized;
+        initially_empty.apply_rpc_result(Ok(NotesRpcResult {
+            project_root: "/proj".into(),
+            notes: Vec::new(),
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert_eq!(initially_empty.selection, SidebarSelection::New);
+        initially_empty.apply_rpc_result(Ok(NotesRpcResult {
+            project_root: "/proj".into(),
+            notes: vec![note(first, "arrived later", "a")],
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert_eq!(initially_empty.selection, SidebarSelection::New);
+        assert_eq!(initially_empty.selected_index(), 1);
+
+        let mut retry = pane(true);
+        retry.notes.clear();
+        retry.selection = SidebarSelection::Uninitialized;
+        retry.apply_rpc_result(Err("temporary daemon failure".into()));
+        assert_eq!(retry.selection, SidebarSelection::Uninitialized);
+        retry.apply_rpc_result(Ok(NotesRpcResult {
+            project_root: "/proj".into(),
+            notes: vec![note(first, "first after retry", "a")],
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert_eq!(retry.selection, SidebarSelection::Note(first));
+
+        retry.select_sidebar(retry.notes.len());
+        retry.apply_rpc_result(Ok(NotesRpcResult {
+            project_root: "/proj".into(),
+            notes: vec![
+                note(Uuid::new_v4(), "inserted", "x"),
+                note(first, "first after retry", "a"),
+            ],
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert_eq!(retry.selection, SidebarSelection::New);
+        assert_eq!(retry.selected_index(), 2);
     }
 
     #[test]

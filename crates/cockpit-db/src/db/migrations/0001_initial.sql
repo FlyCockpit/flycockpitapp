@@ -37,9 +37,9 @@ CREATE TABLE assistants (
 -- ---- sessions --------------------------------------------------------------
 
 CREATE TABLE sessions (
-    session_id      TEXT    PRIMARY KEY,
-    project_id      TEXT    NOT NULL,
-    project_root    TEXT    NOT NULL,
+    session_id      TEXT    PRIMARY KEY CHECK (length(session_id) = 36),
+    project_id      TEXT    NOT NULL CHECK (length(project_id) BETWEEN 1 AND 1024),
+    project_root    TEXT    NOT NULL CHECK (length(project_root) BETWEEN 1 AND 32768),
     started_at      INTEGER NOT NULL,            -- epoch seconds
     last_active_at  INTEGER NOT NULL CHECK (last_active_at >= started_at),
     ended_at        INTEGER CHECK (ended_at IS NULL OR ended_at >= started_at),
@@ -53,7 +53,7 @@ CREATE TABLE sessions (
         )
     ),
     -- Durable CAS token for active-model mutations (picker, recovery, controls).
-    active_model_revision INTEGER NOT NULL DEFAULT 0,
+    active_model_revision INTEGER NOT NULL DEFAULT 0 CHECK (active_model_revision >= 0),
     session_llm_mode TEXT CHECK (session_llm_mode IN ('defensive', 'normal', 'frontier')),
     tool_surface_override_json TEXT CHECK (
         tool_surface_override_json IS NULL OR (
@@ -78,7 +78,13 @@ CREATE TABLE sessions (
     fork_point_turn_id TEXT,                     -- turn in parent where fork branched; NULL = root
     title              TEXT,                     -- utility-model-generated label (§17d)
     user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
-    short_id           TEXT,                     -- 6-char Crockford base32 display id
+    short_id           TEXT CHECK (
+        short_id IS NULL OR (
+            length(short_id) = 6
+            AND short_id = lower(short_id)
+            AND short_id NOT GLOB '*[^0123456789abcdefghjkmnpqrstvwxyz]*'
+        )
+    ),                     -- 6-char Crockford base32 display id
 
     -- read/unread + archive state for the session browser (GOALS §17f).
     -- A session is UNREAD when the latest agent-produced event is newer
@@ -93,8 +99,16 @@ CREATE TABLE sessions (
     -- so a mid-session in-place edit is detected and injected as a
     -- trailing diff exactly once. Both NULL when no guidance file
     -- resolved at session start.
-    guidance_baseline_hash TEXT,
-    guidance_baseline_path TEXT,
+    guidance_baseline_hash TEXT CHECK (
+        guidance_baseline_hash IS NULL OR (
+            length(guidance_baseline_hash) = 64
+            AND guidance_baseline_hash = lower(guidance_baseline_hash)
+            AND guidance_baseline_hash NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    guidance_baseline_path TEXT CHECK (
+        guidance_baseline_path IS NULL OR length(guidance_baseline_path) BETWEEN 1 AND 32768
+    ),
 
     -- Accumulated session egress redaction table. Stores literal redaction
     -- candidates so resumed raw transcripts remain covered even if the
@@ -131,8 +145,8 @@ CREATE TABLE sessions (
     -- estimate of RAW typed user content, and the last consumed scheduled
     -- title slot (0, 1, 2, 4, 8, or 16) so a resumed session never repeats
     -- the same automatic title opportunity.
-    user_content_tokens INTEGER NOT NULL DEFAULT 0,
-    title_stage         INTEGER NOT NULL DEFAULT 0,
+    user_content_tokens INTEGER NOT NULL DEFAULT 0 CHECK (user_content_tokens >= 0),
+    title_stage         INTEGER NOT NULL DEFAULT 0 CHECK (title_stage IN (0, 1, 2, 4, 8, 16)),
 
     -- Durable one-shot post-auto-title-failure recovery nudge latch (issue
     -- #23): 0 = none, 1 = pending (a title attempt failed and a nudge is
@@ -153,6 +167,9 @@ CREATE TABLE sessions (
 
     CHECK (parent_session_id IS NULL OR parent_session_id <> session_id),
     CHECK (btw_parent_session_id IS NULL OR btw_parent_session_id <> session_id),
+    CHECK ((guidance_baseline_path IS NULL) = (guidance_baseline_hash IS NULL)),
+    CHECK (last_viewed_at IS NULL OR last_viewed_at >= started_at),
+    CHECK (archived_at IS NULL OR archived_at >= started_at),
     FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
     FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
@@ -2285,9 +2302,12 @@ END;
 -- INSERT OR IGNORE).
 
 CREATE TABLE guidance_contents (
-    hash       TEXT PRIMARY KEY,
-    contents   TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    hash       TEXT PRIMARY KEY CHECK (
+        length(hash) = 64 AND hash = lower(hash) AND hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    contents   TEXT NOT NULL CHECK (length(CAST(contents AS BLOB)) <= 8388608),
+    -- Daemon-observed wall-clock time, signed Unix milliseconds.
+    created_at_unix_ms INTEGER NOT NULL
 );
 
 -- ---- subagent_handles (GOALS §3c, plan §3d) ---------------------------------------

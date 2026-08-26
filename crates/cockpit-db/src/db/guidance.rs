@@ -20,6 +20,17 @@ use uuid::Uuid;
 
 use crate::db::Db;
 
+fn validate_guidance_hash(hash: &str) -> Result<()> {
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("guidance content hash must be 64 lowercase hexadecimal characters");
+    }
+    Ok(())
+}
+
 /// The per-session guidance baseline: the `(path, hash)` of the guidance
 /// body baked into this session's frozen system block. Absent when no
 /// guidance file resolved at session start.
@@ -65,7 +76,13 @@ impl Db {
         baseline: Option<&GuidanceBaseline>,
     ) -> Result<()> {
         let (path, hash) = match baseline {
-            Some(b) => (Some(b.path.clone()), Some(b.hash.clone())),
+            Some(b) => {
+                validate_guidance_hash(&b.hash)?;
+                if b.path.is_empty() || b.path.len() > 32_768 {
+                    anyhow::bail!("guidance baseline path must contain between 1 and 32768 bytes");
+                }
+                (Some(b.path.clone()), Some(b.hash.clone()))
+            }
             None => (None, None),
         };
         self.write(move |conn| {
@@ -86,14 +103,18 @@ impl Db {
     /// (`INSERT OR IGNORE`), so repeated snapshots of unchanged content
     /// never churn the row.
     pub async fn put_guidance_contents(&self, hash: &str, contents: &str) -> Result<()> {
-        let now = Utc::now().timestamp();
+        validate_guidance_hash(hash)?;
+        if contents.len() > 8 * 1024 * 1024 {
+            anyhow::bail!("guidance contents exceed the 8 MiB durable limit");
+        }
+        let now_unix_ms = Utc::now().timestamp_millis();
         let hash = hash.to_owned();
         let contents = contents.to_owned();
         self.write(move |conn| {
             conn.execute(
-                "INSERT OR IGNORE INTO guidance_contents (hash, contents, created_at)
+                "INSERT OR IGNORE INTO guidance_contents (hash, contents, created_at_unix_ms)
                  VALUES (?1, ?2, ?3)",
-                params![hash, contents, now],
+                params![hash, contents, now_unix_ms],
             )
             .context("inserting guidance_contents")?;
             Ok(())
@@ -134,22 +155,24 @@ mod tests {
     async fn baseline_round_trips_and_defaults_null() {
         let db = Db::open_in_memory().unwrap();
         let s = db.create_session("p", "/x", "Build").await.unwrap();
+        let first_hash = "de".repeat(32);
+        let second_hash = "ca".repeat(32);
         // Fresh session: no baseline yet.
         assert_eq!(db.guidance_baseline(s.session_id).await.unwrap(), None);
-        db.set_guidance_baseline(s.session_id, Some(&baseline("/x/AGENTS.md", "deadbeef")))
+        db.set_guidance_baseline(s.session_id, Some(&baseline("/x/AGENTS.md", &first_hash)))
             .await
             .unwrap();
         assert_eq!(
             db.guidance_baseline(s.session_id).await.unwrap(),
-            Some(baseline("/x/AGENTS.md", "deadbeef"))
+            Some(baseline("/x/AGENTS.md", &first_hash))
         );
         // Advance (same path, new hash).
-        db.set_guidance_baseline(s.session_id, Some(&baseline("/x/AGENTS.md", "cafef00d")))
+        db.set_guidance_baseline(s.session_id, Some(&baseline("/x/AGENTS.md", &second_hash)))
             .await
             .unwrap();
         assert_eq!(
             db.guidance_baseline(s.session_id).await.unwrap(),
-            Some(baseline("/x/AGENTS.md", "cafef00d"))
+            Some(baseline("/x/AGENTS.md", &second_hash))
         );
         // Clear.
         db.set_guidance_baseline(s.session_id, None).await.unwrap();
@@ -159,20 +182,26 @@ mod tests {
     #[tokio::test]
     async fn guidance_contents_insert_is_idempotent() {
         let db = Db::open_in_memory().unwrap();
-        db.put_guidance_contents("h1", "first body").await.unwrap();
+        let first_hash = "11".repeat(32);
+        let second_hash = "22".repeat(32);
+        db.put_guidance_contents(&first_hash, "first body")
+            .await
+            .unwrap();
         // Re-inserting the same hash with different contents must NOT
         // overwrite (content-addressed: the hash IS the identity).
-        db.put_guidance_contents("h1", "tampered body")
+        db.put_guidance_contents(&first_hash, "tampered body")
             .await
             .unwrap();
         assert_eq!(
-            db.guidance_contents("h1").await.unwrap().as_deref(),
+            db.guidance_contents(&first_hash).await.unwrap().as_deref(),
             Some("first body")
         );
         // A new hash stores independently.
-        db.put_guidance_contents("h2", "second body").await.unwrap();
+        db.put_guidance_contents(&second_hash, "second body")
+            .await
+            .unwrap();
         assert_eq!(
-            db.guidance_contents("h2").await.unwrap().as_deref(),
+            db.guidance_contents(&second_hash).await.unwrap().as_deref(),
             Some("second body")
         );
         // Absent hash returns None.

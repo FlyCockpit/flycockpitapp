@@ -579,6 +579,29 @@ fn semantic_transition_guard_tables(sql: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn assert_production_image_mutations_use_validator(source: &str, table: &str, validator: &str) {
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("image-generation production source is present");
+    let mut starts = ["\nfn ", "\n    pub fn "]
+        .into_iter()
+        .flat_map(|marker| production.match_indices(marker).map(|(index, _)| index))
+        .collect::<Vec<_>>();
+    starts.sort_unstable();
+    starts.dedup();
+    starts.push(production.len());
+    for bounds in starts.windows(2) {
+        let function = &production[bounds[0]..bounds[1]];
+        if function.contains(&format!("UPDATE {table} SET state")) {
+            assert!(
+                function.contains(validator),
+                "production state mutation for {table} bypasses {validator}"
+            );
+        }
+    }
+}
+
 fn sql_registry_edges(sql: &str, registry: &str) -> BTreeSet<String> {
     let values = sql
         .split(&format!("INSERT INTO {registry} VALUES"))
@@ -772,6 +795,17 @@ fn sql_only_edges(name: &str, trigger: &str) -> BTreeSet<String> {
 fn ownership() -> BTreeMap<String, Ownership> {
     let parsed: toml::Value = toml::from_str(include_str!("../schema-ownership.toml"))
         .expect("schema-ownership.toml must be valid TOML");
+    let image_source = include_str!("../src/db/image_generation.rs");
+    assert_production_image_mutations_use_validator(
+        image_source,
+        "image_generation_artifacts",
+        "artifact_transition_allowed",
+    );
+    assert_production_image_mutations_use_validator(
+        image_source,
+        "image_generation_artifact_components",
+        "artifact_component_transition_allowed",
+    );
     let families = parsed
         .get("state_machine_family")
         .and_then(toml::Value::as_table)

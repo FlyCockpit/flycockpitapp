@@ -4157,6 +4157,20 @@ fn finalize_image_generation_late_publication_at_conn(
     expected_lease_version: u64,
     now_unix_ms: i64,
 ) -> Result<()> {
+    ensure!(
+        artifact_transition_allowed(
+            ImageGenerationArtifactState::LateQuarantined,
+            ImageGenerationArtifactState::Retained,
+        ),
+        "late publication artifact transition is not canonical"
+    );
+    ensure!(
+        slot_transition_allowed(
+            ImageGenerationSlotState::LateQuarantined,
+            ImageGenerationSlotState::Published,
+        ),
+        "late publication slot transition is not canonical"
+    );
     let tx = conn.unchecked_transaction()?;
     let projection=tx.query_row("SELECT p.artifact_id,p.artifact_generation,p.job_id,p.slot_id,p.expected_slot_version,p.output_authority_digest,p.output_authority_generation,p.destination_name,p.output_evidence_json FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id JOIN image_generation_slots s ON s.job_id=p.job_id AND s.slot_id=p.slot_id JOIN image_generation_late_publication_authorization_facts f ON f.authorization_digest=p.authorization_digest WHERE p.publication_operation_id=?1 AND p.state='copy_committed' AND p.version=?2 AND a.state='late_quarantined' AND a.generation=p.artifact_generation AND s.state='late_quarantined' AND s.version=p.expected_slot_version AND s.result_after_cancel=1 AND f.revoked_at_unix_ms IS NULL AND f.output_authority_digest=p.output_authority_digest AND f.output_authority_generation=p.output_authority_generation AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=a.artifact_id)",params![publication_operation_id.to_string(),i64::try_from(expected_lease_version)?],|row|Ok(LatePublicationFinalizeProjection{artifact_id:row.get(0)?,artifact_generation:row.get(1)?,job_id:row.get(2)?,slot_id:row.get(3)?,slot_version:row.get(4)?,output_authority_digest:row.get(5)?,output_authority_generation:row.get(6)?,destination_name:row.get(7)?,output_evidence_json:row.get(8)?})).optional()?.context("late publication finalization lost its lease")?;
     tx.execute("INSERT INTO image_generation_user_published_outputs(publication_operation_id,artifact_id,artifact_generation,output_authority_digest,output_authority_generation,destination_name,output_evidence_json,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![publication_operation_id.to_string(),projection.artifact_id,projection.artifact_generation,projection.output_authority_digest,projection.output_authority_generation,projection.destination_name,projection.output_evidence_json,now_unix_ms])?;
@@ -4278,6 +4292,13 @@ impl Db {
         input: &BeginImageGenerationArtifactCleanup,
     ) -> Result<()> {
         ensure!(
+            artifact_transition_allowed(
+                input.expected_state,
+                ImageGenerationArtifactState::CleanupPending,
+            ),
+            "artifact cleanup transition is not canonical"
+        );
+        ensure!(
             matches!(
                 input.expected_state,
                 ImageGenerationArtifactState::Allocating
@@ -4320,6 +4341,13 @@ impl Db {
         conn: &Connection,
         input: &CommitImageGenerationComponentDeletion,
     ) -> Result<()> {
+        ensure!(
+            artifact_component_transition_allowed(
+                ImageGenerationArtifactComponentState::Deleting,
+                ImageGenerationArtifactComponentState::Tombstoned,
+            ),
+            "component tombstone transition is not canonical"
+        );
         ensure_digest(&input.deletion_evidence_digest, "deletion evidence digest")?;
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
@@ -4351,6 +4379,13 @@ impl Db {
         now_unix_ms: i64,
         terminal_reason: &str,
     ) -> Result<()> {
+        ensure!(
+            artifact_transition_allowed(
+                ImageGenerationArtifactState::Deleting,
+                ImageGenerationArtifactState::Tombstoned,
+            ),
+            "artifact tombstone transition is not canonical"
+        );
         ensure!(
             !terminal_reason.is_empty(),
             "artifact terminal reason is empty"

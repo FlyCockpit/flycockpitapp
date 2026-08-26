@@ -838,6 +838,29 @@ fn ownership() -> BTreeMap<String, Ownership> {
         "image_generation_attempts",
         "attempt_transition_allowed",
     );
+    let reconciliation = image_source
+        .split("fn reconcile_image_generation_attempt_inner")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("\n    fn create_image_generation_job_conn")
+                .next()
+        })
+        .expect("reconciliation reducer source is present");
+    for evidence in [
+        "SELECT a.state,s.state,j.state,a.applied_cancellation_version",
+        "attempt_transition_allowed(attempt_state, attempt_next)",
+        "slot_transition_allowed(slot_state, slot_next)",
+        "job_transition_allowed(job_state, ImageGenerationJobState::Running)",
+        ".contains(&(job_state.as_str(), ImageGenerationJobState::Queued.as_str()))",
+        ".contains(&(slot_state.as_str(), slot_next.as_str()))",
+        "state=?9 AND version=?10",
+        "state=?6 AND version=?7",
+    ] {
+        assert!(
+            reconciliation.contains(evidence),
+            "reconciliation exact transition evidence is absent: {evidence}"
+        );
+    }
     let families = parsed
         .get("state_machine_family")
         .and_then(toml::Value::as_table)

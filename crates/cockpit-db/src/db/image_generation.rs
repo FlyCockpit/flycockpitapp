@@ -1996,11 +1996,17 @@ impl Db {
             sealed_media_reservation_id,
         ) = media_authority
             .unwrap_or_else(|| (String::new(), 0, (Vec::new(), String::new()), String::new()));
-        let cancellation: Option<i64> = conn.query_row(
-            "SELECT applied_cancellation_version FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",
+        let (attempt_state, slot_state, job_state, cancellation): (String, String, String, Option<i64>) = conn.query_row(
+            "SELECT a.state,s.state,j.state,a.applied_cancellation_version FROM image_generation_attempts a JOIN image_generation_slots s USING(job_id,slot_id) JOIN image_generation_jobs j USING(job_id) WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3",
             params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
         )?;
+        let attempt_state = ImageGenerationAttemptState::parse(&attempt_state)
+            .context("reconciliation attempt state is unknown")?;
+        let slot_state = ImageGenerationSlotState::parse(&slot_state)
+            .context("reconciliation slot state is unknown")?;
+        let job_state = ImageGenerationJobState::parse(&job_state)
+            .context("reconciliation job state is unknown")?;
         let (journal_next, attempt_next, outcome) = match (proof.outcome, cancellation.is_some()) {
             (ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance, true) => (
                 ExternalJournalState::Cancelled,
@@ -2023,6 +2029,71 @@ impl Db {
                 "authoritative_failure",
             ),
         };
+        ensure!(
+            attempt_transition_allowed(attempt_state, attempt_next),
+            "reconciliation attempt transition is not canonical"
+        );
+        let next_attempt_number = input
+            .attempt_number
+            .checked_add(1)
+            .context("image generation attempt number overflow")?;
+        let retry = if proof.outcome
+            == ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance
+            && cancellation.is_none()
+        {
+            conn.query_row("SELECT m.canonical_media_plan,m.media_plan_digest FROM image_generation_attempts a JOIN image_generation_attempt_media_snapshots m USING(job_id,slot_id,attempt_number) JOIN image_generation_slots s USING(job_id,slot_id) WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state='planned' AND a.attempt_number<=s.max_attempt_count",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(next_attempt_number)],|row|Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,String>(1)?))).optional()?
+        } else {
+            None
+        };
+        let slot_next = if retry.is_some() {
+            ImageGenerationSlotState::Queued
+        } else if matches!(
+            proof.outcome,
+            ImageGenerationReconciliationOutcome::AuthoritativeAccepted
+        ) {
+            if cancellation.is_some() {
+                ImageGenerationSlotState::CancellationRequested
+            } else {
+                ImageGenerationSlotState::Running
+            }
+        } else if cancellation.is_some()
+            && matches!(
+                proof.outcome,
+                ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance
+            )
+        {
+            ImageGenerationSlotState::Cancelled
+        } else {
+            ImageGenerationSlotState::Failed
+        };
+        if retry.is_some() {
+            ensure!(
+                IMAGE_JOB_CONDITIONAL_EDGES
+                    .contains(&(job_state.as_str(), ImageGenerationJobState::Queued.as_str()))
+                    && IMAGE_SLOT_CONDITIONAL_EDGES
+                        .contains(&(slot_state.as_str(), slot_next.as_str())),
+                "reconciled retry edge contract is absent"
+            );
+        } else if !(matches!(
+            proof.outcome,
+            ImageGenerationReconciliationOutcome::AuthoritativeAccepted
+        ) && cancellation.is_some())
+        {
+            ensure!(
+                slot_transition_allowed(slot_state, slot_next),
+                "reconciliation slot transition is not canonical"
+            );
+        }
+        if matches!(
+            proof.outcome,
+            ImageGenerationReconciliationOutcome::AuthoritativeAccepted
+        ) && cancellation.is_none()
+        {
+            ensure!(
+                job_transition_allowed(job_state, ImageGenerationJobState::Running),
+                "reconciliation job transition is not canonical"
+            );
+        }
         match transition_external_operation_conn(
             conn,
             input.external_operation_id,
@@ -2049,52 +2120,14 @@ impl Db {
             evidence_inserted == 1,
             "reconciliation evidence identity is not bound"
         );
-        let attempt_changed=conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,nonacceptance_evidence_digest=CASE WHEN ?4='authoritative_nonacceptance' THEN ?5 ELSE NULL END WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state IN ('reconciling','cancellation_requested') AND version=?9 AND external_operation_id=?10",params![attempt_next.as_str(),i64::try_from(input.attempt_version+1)?,i64::try_from(journal_version)?,outcome,evidence_digest,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.attempt_version)?,input.external_operation_id.to_string()])?;
+        let attempt_changed=conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,nonacceptance_evidence_digest=CASE WHEN ?4='authoritative_nonacceptance' THEN ?5 ELSE NULL END WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state=?9 AND version=?10 AND external_operation_id=?11",params![attempt_next.as_str(),i64::try_from(input.attempt_version+1)?,i64::try_from(journal_version)?,outcome,evidence_digest,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),attempt_state.as_str(),i64::try_from(input.attempt_version)?,input.external_operation_id.to_string()])?;
         ensure!(
             attempt_changed == 1,
             "reconciliation lost attempt compare-and-set"
         );
-        let next_attempt_number = input
-            .attempt_number
-            .checked_add(1)
-            .context("image generation attempt number overflow")?;
-        let retry = if proof.outcome
-            == ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance
-            && cancellation.is_none()
-        {
-            conn.query_row("SELECT m.canonical_media_plan,m.media_plan_digest FROM image_generation_attempts a JOIN image_generation_attempt_media_snapshots m USING(job_id,slot_id,attempt_number) JOIN image_generation_slots s USING(job_id,slot_id) WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state='planned' AND a.attempt_number<=s.max_attempt_count",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(next_attempt_number)],|row|Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,String>(1)?))).optional()?
-        } else {
-            None
-        };
         if retry.is_some() {
-            ensure!(
-                IMAGE_JOB_CONDITIONAL_EDGES.contains(&("submission_unknown", "queued"))
-                    && IMAGE_SLOT_CONDITIONAL_EDGES.contains(&("submission_unknown", "queued")),
-                "reconciled retry edge contract is absent"
-            );
             ensure!(conn.execute("INSERT INTO image_generation_attempt_activation_facts(job_id,slot_id,attempt_number,activation_reason,prior_attempt_number,activated_at_unix_ms) VALUES(?1,?2,?3,'authoritative_retry',?4,?5)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(next_attempt_number),i64::from(input.attempt_number),proof.now_unix_ms])?==1,"reconciled retry activation was not recorded");
         }
-        let slot_next = if retry.is_some() {
-            "queued"
-        } else if matches!(
-            proof.outcome,
-            ImageGenerationReconciliationOutcome::AuthoritativeAccepted
-        ) {
-            if cancellation.is_some() {
-                "cancellation_requested"
-            } else {
-                "running"
-            }
-        } else if cancellation.is_some()
-            && matches!(
-                proof.outcome,
-                ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance
-            )
-        {
-            "cancelled"
-        } else {
-            "failed"
-        };
         let slot_changed = if matches!(
             proof.outcome,
             ImageGenerationReconciliationOutcome::AuthoritativeAccepted
@@ -2102,7 +2135,7 @@ impl Db {
         {
             1
         } else {
-            conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,failure_reason=CASE WHEN ?1='failed' THEN ?3 ELSE NULL END WHERE job_id=?4 AND slot_id=?5 AND state IN ('submission_unknown','cancellation_requested') AND version=?6",params![slot_next,i64::try_from(input.slot_version+1)?,outcome,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.slot_version)?])?
+            conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,failure_reason=CASE WHEN ?1='failed' THEN ?3 ELSE NULL END WHERE job_id=?4 AND slot_id=?5 AND state=?6 AND version=?7",params![slot_next.as_str(),i64::try_from(input.slot_version+1)?,outcome,input.job_id.to_string(),input.slot_id.to_string(),slot_state.as_str(),i64::try_from(input.slot_version)?])?
         };
         ensure!(
             slot_changed == 1,

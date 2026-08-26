@@ -165,6 +165,13 @@ fn obscured_authority_findings(source: &str) -> Vec<String> {
                 "cockpit_core::assistants",
                 "cockpit_core::db",
                 "cockpit_core::config",
+                "cockpit_core::daemon::discover",
+                "cockpit_core::daemon::probe_or_spawn",
+                "cockpit_core::daemon::spawn_detached",
+                "cockpit_core::daemon::ensure_persistent_daemon",
+                "cockpit_core::daemon::EphemeralDaemonGuard",
+                "cockpit_core::daemon::OwnedDaemonGuard",
+                "cockpit_client::DaemonClient",
                 "cockpit_config::extended::ExtendedConfigDoc",
                 "cockpit_config::providers::ConfigDoc",
                 "cockpit_config::dirs::scaffold_config_dir",
@@ -178,6 +185,7 @@ fn obscured_authority_findings(source: &str) -> Vec<String> {
             let root_alias = tokens.starts_with("usestdas")
                 || tokens.starts_with("usetokioas")
                 || tokens.starts_with("usecockpit_coreas")
+                || tokens.starts_with("usecockpit_clientas")
                 || tokens.starts_with("usecockpit_configas");
             // Direct imports remain visible to the separate exact-call
             // ratchet. What this syntax gate forbids is obscuring any

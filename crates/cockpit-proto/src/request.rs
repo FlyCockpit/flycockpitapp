@@ -1320,6 +1320,28 @@ pub enum Request {
         session_id: Uuid,
     },
 
+    /// Return the focused agent node's daemon-resolved effective settings,
+    /// allowed transitions, locked reasons, and effective-settings revision.
+    /// Read-only; the daemon owns every authority fact.
+    GetAgentEffectiveSettings {
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+    },
+
+    /// Apply one typed, non-escalating session override to a focused agent
+    /// node. In a single daemon transaction the request compares
+    /// `expected_override_revision`, deterministically merges its typed field
+    /// into the node's pending override, increments/returns the revision, and
+    /// makes every competing old-revision request stale. Stale, unauthorized,
+    /// completed, or cancelled targets are rejected without a state change. The
+    /// pending override is consumed into effect at the node's next model turn.
+    ApplyAgentSessionOverride {
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        expected_override_revision: u64,
+        field: AgentSessionOverrideFieldV1,
+    },
+
     /// Snapshot the daemon-wide resource scheduler for `/resources`.
     ResourceSnapshot,
 
@@ -3839,6 +3861,8 @@ macro_rules! request_variants {
             (Request::DeleteSession { .. }, "delete_session");
             (Request::GetInventoryBundle { .. }, "get_inventory_bundle");
             (Request::GetSessionSetupSnapshot { .. }, "get_session_setup_snapshot");
+            (Request::GetAgentEffectiveSettings { .. }, "get_agent_effective_settings");
+            (Request::ApplyAgentSessionOverride { .. }, "apply_agent_session_override");
             (Request::ResourceSnapshot, "resource_snapshot");
             (Request::PromoteResource { .. }, "promote_resource");
             (Request::CreateScheduledJob { .. }, "create_scheduled_job");
@@ -4143,6 +4167,8 @@ macro_rules! command {
             (Request::DeleteSession { session_id }, "delete_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::GetInventoryBundle { project_root, session_id, selected_agent }, "get_inventory_bundle", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, path(project_root), "project_root:String|session_id:Uuid|selected_agent:String", [project_root: String => project_root, session_id: Uuid => session, selected_agent: String => param]);
             (Request::GetSessionSetupSnapshot { session_id }, "get_session_setup_snapshot", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
+            (Request::GetAgentEffectiveSettings { session_id, agent_instance_id }, "get_agent_effective_settings", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid|agent_instance_id:Uuid", [session_id: Uuid => session, agent_instance_id: Uuid => param]);
+            (Request::ApplyAgentSessionOverride { session_id, agent_instance_id, expected_override_revision, field }, "apply_agent_session_override", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|agent_instance_id:Uuid|expected_override_revision:u64|field:AgentSessionOverrideFieldV1", [session_id: Uuid => session, agent_instance_id: Uuid => param, expected_override_revision: u64 => param, field: AgentSessionOverrideFieldV1 => param]);
             (Request::ResourceSnapshot, "resource_snapshot", owner_only, none, false, local_only, none, concurrent, none, "-", []);
             (Request::PromoteResource { request_id, session_id }, "promote_resource", owner_only, option_field(session_id), true, local_only, none, serialized, none, "request_id:String|session_id:Option<Uuid>", [request_id: String => param, session_id: Option<Uuid> => session]);
             (Request::CreateScheduledJob { job }, "create_scheduled_job", owner_only, none, true, local_only, none, serialized, none, "job:ScheduledJobCreate", [job: ScheduledJobCreate => scheduled]);

@@ -489,6 +489,17 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 }
             }
         }
+        proto::Response::AgentEffectiveSettings { snapshot } => {
+            // Daemon-owned enums/numbers carry no free text; only the
+            // human region labels pass through the vaulted-secret backstop.
+            // `region_id` is a stable identity the client echoes back and must
+            // never be scrubbed.
+            for region in &mut snapshot.verification.regions {
+                scrub_string(&mut region.label, redact);
+            }
+        }
+        // Only closed enums, a revision, and daemon-owned ids: nothing to scrub.
+        proto::Response::AgentSessionOverrideOutcome { .. } => {}
         proto::Response::ResourceSnapshot { snapshot } => {
             scrub_resource_scheduler_snapshot(snapshot, redact);
         }

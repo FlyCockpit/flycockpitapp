@@ -712,6 +712,23 @@ pub enum Response {
         snapshot: crate::SessionSetupSnapshotV1,
     },
 
+    /// Answer to [`Request::GetAgentEffectiveSettings`]. The focused node's
+    /// effective settings, allowed transitions, locked reasons, and
+    /// effective-settings revision, all daemon-owned.
+    AgentEffectiveSettings {
+        snapshot: crate::AgentEffectiveSettingsV1,
+    },
+
+    /// Outcome of [`Request::ApplyAgentSessionOverride`]. `override_revision` is
+    /// the daemon's current authoritative revision after the attempt (unchanged
+    /// on a stale or rejected apply).
+    AgentSessionOverrideOutcome {
+        session_id: Uuid,
+        agent_instance_id: Uuid,
+        status: crate::AgentSessionOverrideStatusV1,
+        override_revision: u64,
+    },
+
     /// Answer to [`Request::ResourceSnapshot`].
     ResourceSnapshot {
         snapshot: ResourceSchedulerSnapshot,
@@ -1450,6 +1467,8 @@ macro_rules! response_variants {
             (Response::BtwFork { .. }, "btw_fork");
             (Response::InventoryBundle { .. }, "inventory_bundle");
             (Response::SessionSetupSnapshot { .. }, "session_setup_snapshot");
+            (Response::AgentEffectiveSettings { .. }, "agent_effective_settings");
+            (Response::AgentSessionOverrideOutcome { .. }, "agent_session_override_outcome");
             (Response::ResourceSnapshot { .. }, "resource_snapshot");
             (Response::PromoteResourceResult { .. }, "promote_resource_result");
             (Response::ScheduledJob { .. }, "scheduled_job");

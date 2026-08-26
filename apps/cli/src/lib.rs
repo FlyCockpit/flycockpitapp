@@ -24,7 +24,16 @@ pub mod test_env {
         TestEnvGuard::lock().await
     }
 }
-pub(crate) use cockpit_core::daemon;
+pub(crate) mod daemon {
+    pub(crate) use cockpit_core::daemon::{
+        DaemonPaths, DaemonProbe, DaemonStatus, caffeinate, client, discover, image_upload, proto,
+        server, session_worker, terminal,
+    };
+    #[cfg(test)]
+    pub(crate) use cockpit_core::daemon::{
+        boot_test_persistent_daemon, enable_in_process_auto_promote,
+    };
+}
 pub use cockpit_core::{
     agents, approval, assistants, auth, auto_title, browser, computer, container, credentials,
     diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,

@@ -520,7 +520,7 @@ fn retire_late_exact_metadata(
 /// Drop joins the same process-reaper completion used by explicit and
 /// signal-driven shutdown. Socket-only test guards retain the small blocking
 /// fallback used outside an async runtime.
-pub struct EphemeralDaemonGuard {
+pub(crate) struct EphemeralDaemonGuard {
     socket: PathBuf,
     process: Option<ProcessCleanup>,
     /// One joinable teardown result shared by explicit shutdown, signal
@@ -529,7 +529,7 @@ pub struct EphemeralDaemonGuard {
 }
 
 impl EphemeralDaemonGuard {
-    pub fn new(
+    pub(crate) fn new(
         paths: crate::daemon::DaemonPaths,
         child: crate::daemon::DetachedEphemeralChild,
     ) -> Self {
@@ -560,11 +560,11 @@ impl EphemeralDaemonGuard {
     /// Request shutdown and synchronously join its shared result. Idempotent:
     /// the first caller performs teardown and every concurrent/later caller
     /// observes the same completion.
-    pub fn shutdown(&self) -> anyhow::Result<()> {
+    pub(crate) fn shutdown(&self) -> anyhow::Result<()> {
         shutdown_shared(&self.cleanup_state, &self.socket, self.process.clone())
     }
 
-    pub fn bind_published_receipt(&self) -> anyhow::Result<()> {
+    pub(crate) fn bind_published_receipt(&self) -> anyhow::Result<()> {
         let Some(process) = &self.process else {
             return Ok(());
         };
@@ -597,7 +597,7 @@ impl EphemeralDaemonGuard {
     /// Transfer ownership away from this guard without stopping the daemon.
     /// Until an explicit handoff, dropping a provisional owner remains
     /// fail-safe and reaps the daemon it spawned.
-    pub fn disarm(&self) {
+    pub(crate) fn disarm(&self) {
         self.cleanup_state.disarm();
     }
 }
@@ -754,7 +754,7 @@ impl Drop for ProvisionalEphemeralChild {
     }
 }
 
-pub fn aggregate_shutdown_result<T>(
+pub(crate) fn aggregate_shutdown_result<T>(
     command: anyhow::Result<T>,
     shutdown: anyhow::Result<()>,
 ) -> anyhow::Result<T> {
@@ -781,7 +781,7 @@ impl Drop for EphemeralDaemonGuard {
 /// the blocking std `UnixStream`, writes one NDJSON request, and returns —
 /// usable from `Drop`. Any failure (daemon already gone, socket removed) is
 /// swallowed; the watchdog (Layer C) is the final backstop.
-pub fn stop_daemon_blocking(socket: &Path) {
+pub(crate) fn stop_daemon_blocking(socket: &Path) {
     let Ok(envelope) = serde_json::to_string(&Envelope::request(
         uuid::Uuid::new_v4(),
         Request::StopDaemon { grace_secs: None },
@@ -828,7 +828,7 @@ pub fn stop_daemon_blocking(socket: &Path) {
 /// exits the foreground promptly (it has no UI left to run), whereas the
 /// TUI hands control back so its own restore path (leave alt-screen, print
 /// the exit tail) still runs.
-pub fn spawn_signal_shutdown(
+pub(crate) fn spawn_signal_shutdown(
     guard: Option<&EphemeralDaemonGuard>,
     exit_on_signal: bool,
 ) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {

@@ -1993,6 +1993,10 @@ impl super::Db {
             "media component versions, generations, and bytes must be positive"
         );
         ensure!(
+            component.updated_at_unix_ms >= component.created_at_unix_ms,
+            "media component update time precedes creation"
+        );
+        ensure!(
             matches!(
                 component.component_kind.as_str(),
                 "quarantined_original"
@@ -2552,6 +2556,22 @@ fn validate_new_record(record: &MediaAttachmentRecord) -> Result<()> {
         record.source_kind == MediaSourceKind::AuthenticatedSessionUpload
             || record.draft_expires_at_unix_ms.is_none(),
         "draft expiry is upload-only"
+    );
+    ensure!(
+        record.updated_at_unix_ms >= record.created_at_unix_ms,
+        "media attachment update time precedes creation"
+    );
+    ensure!(
+        record
+            .draft_expires_at_unix_ms
+            .is_none_or(|value| value >= record.created_at_unix_ms),
+        "media attachment draft expiry precedes creation"
+    );
+    ensure!(
+        record
+            .first_referenced_at_unix_ms
+            .is_none_or(|value| value >= record.created_at_unix_ms),
+        "media attachment first-reference time precedes creation"
     );
     validate_digest(&record.canonical_project_digest, "project digest")?;
     validate_digest(&record.source_identity_digest, "source identity digest")?;

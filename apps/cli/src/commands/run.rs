@@ -33,7 +33,6 @@ use uuid::Uuid;
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
 use crate::daemon::client::{OwnedDaemonSession, OwnedSessionMode};
-use crate::daemon::ephemeral_guard::aggregate_shutdown_result;
 use crate::daemon::proto::{self, Request, Response};
 
 #[derive(Debug, thiserror::Error)]
@@ -356,7 +355,14 @@ fn finish_owned_run<T>(
     command: anyhow::Result<T>,
     shutdown: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<T> {
-    aggregate_shutdown_result(command, shutdown())
+    match (command, shutdown()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(shutdown)) => Err(shutdown).context("shutting down owned daemon"),
+        (Err(command), Err(shutdown)) => Err(anyhow::anyhow!(
+            "command failed: {command:#}; owned daemon shutdown also failed: {shutdown:#}"
+        )),
+    }
 }
 
 /// Attach, send the prompt, pump events. Split out so the `?` operators

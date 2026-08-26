@@ -208,8 +208,8 @@ END;
 -- INTEGER is signed i64. Application codecs reject zero, leading zeroes and
 -- values outside u64 before any mutation.
 CREATE TABLE media_attachments (
-    attachment_id                  TEXT PRIMARY KEY,
-    session_id                     TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    attachment_id                  TEXT PRIMARY KEY CHECK (length(attachment_id) BETWEEN 1 AND 255),
+    session_id                     TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 255) REFERENCES sessions(session_id) ON DELETE CASCADE,
     canonical_project_digest       TEXT NOT NULL,
     media_kind                     TEXT NOT NULL CHECK (media_kind IN ('image', 'audio', 'video')),
     source_kind                    TEXT NOT NULL CHECK (source_kind IN ('local_path', 'retained_https', 'authenticated_session_upload')),
@@ -228,16 +228,33 @@ CREATE TABLE media_attachments (
     source_identity_digest         TEXT NOT NULL,
     source_byte_length             TEXT NOT NULL,
     source_sha256                  TEXT NOT NULL,
-    selected_video_stream_json     TEXT,
-    selected_audio_stream_json     TEXT,
+    selected_video_stream_json     TEXT CHECK (selected_video_stream_json IS NULL OR (
+        json_valid(selected_video_stream_json)
+        AND json_type(selected_video_stream_json) = 'array'
+        AND length(CAST(selected_video_stream_json AS BLOB)) <= 65536
+    )),
+    selected_audio_stream_json     TEXT CHECK (selected_audio_stream_json IS NULL OR (
+        json_valid(selected_audio_stream_json)
+        AND json_type(selected_audio_stream_json) = 'array'
+        AND length(CAST(selected_audio_stream_json AS BLOB)) <= 65536
+    )),
+    -- Daemon-observed wall-clock times, signed Unix milliseconds.
     created_at_unix_ms             INTEGER NOT NULL,
     updated_at_unix_ms             INTEGER NOT NULL,
     draft_expires_at_unix_ms       INTEGER,
     first_referenced_at_unix_ms    INTEGER,
     UNIQUE (attachment_id, attachment_version),
-    CHECK (length(canonical_project_digest) = 64 AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
-    CHECK (length(source_identity_digest) = 64 AND source_identity_digest NOT GLOB '*[^0-9a-f]*'),
-    CHECK (length(source_sha256) = 64 AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(canonical_project_digest) = 64 AND canonical_project_digest = lower(canonical_project_digest) AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(source_identity_digest) = 64 AND source_identity_digest = lower(source_identity_digest) AND source_identity_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(source_sha256) = 64 AND source_sha256 = lower(source_sha256) AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (attachment_version NOT GLOB '*[^0-9]*' AND attachment_version GLOB '[1-9]*'),
+    CHECK (availability_generation NOT GLOB '*[^0-9]*' AND availability_generation GLOB '[1-9]*'),
+    CHECK (reference_generation NOT GLOB '*[^0-9]*' AND reference_generation GLOB '[1-9]*'),
+    CHECK (captured_capability_generation NOT GLOB '*[^0-9]*' AND captured_capability_generation GLOB '[1-9]*'),
+    CHECK (source_byte_length NOT GLOB '*[^0-9]*' AND source_byte_length GLOB '[1-9]*'),
+    CHECK (updated_at_unix_ms >= created_at_unix_ms),
+    CHECK (draft_expires_at_unix_ms IS NULL OR draft_expires_at_unix_ms >= created_at_unix_ms),
+    CHECK (first_referenced_at_unix_ms IS NULL OR first_referenced_at_unix_ms >= created_at_unix_ms),
     CHECK ((source_kind = 'authenticated_session_upload') OR draft_expires_at_unix_ms IS NULL)
 );
 
@@ -273,7 +290,7 @@ BEGIN
 END;
 
 CREATE TABLE media_attachment_components (
-    component_id          TEXT PRIMARY KEY,
+    component_id          TEXT PRIMARY KEY CHECK (length(component_id) BETWEEN 1 AND 255),
     attachment_id         TEXT NOT NULL,
     attachment_version    TEXT NOT NULL,
     component_kind        TEXT NOT NULL CHECK (component_kind IN ('quarantined_original', 'image_model', 'browser_thumbnail', 'audio_model', 'video_model', 'upload_temporary')),
@@ -287,9 +304,12 @@ CREATE TABLE media_attachment_components (
     deletion_evidence_digest TEXT,
     created_at_unix_ms    INTEGER NOT NULL,
     updated_at_unix_ms    INTEGER NOT NULL,
-    CHECK (length(stable_identity_digest) = 64 AND stable_identity_digest NOT GLOB '*[^0-9a-f]*'),
-    CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
-    CHECK (deletion_evidence_digest IS NULL OR (length(deletion_evidence_digest) = 64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*')),
+    CHECK (length(stable_identity_digest) = 64 AND stable_identity_digest = lower(stable_identity_digest) AND stable_identity_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (deletion_evidence_digest IS NULL OR (length(deletion_evidence_digest) = 64 AND deletion_evidence_digest = lower(deletion_evidence_digest) AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*')),
+    CHECK (component_generation NOT GLOB '*[^0-9]*' AND component_generation GLOB '[1-9]*'),
+    CHECK (byte_length NOT GLOB '*[^0-9]*' AND byte_length GLOB '[1-9]*'),
+    CHECK (updated_at_unix_ms >= created_at_unix_ms),
     FOREIGN KEY (attachment_id, attachment_version)
         REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
 );
@@ -333,7 +353,11 @@ CREATE TABLE media_storage_publication_intents (
     upload_id TEXT PRIMARY KEY REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
     temporary_storage_id TEXT NOT NULL,
     quarantine_storage_id TEXT NOT NULL,
-    derivative_storage_ids_json TEXT NOT NULL,
+    derivative_storage_ids_json TEXT NOT NULL CHECK (
+        json_valid(derivative_storage_ids_json)
+        AND json_type(derivative_storage_ids_json) = 'array'
+        AND length(CAST(derivative_storage_ids_json AS BLOB)) <= 1048576
+    ),
     created_at_unix_ms INTEGER NOT NULL
 );
 

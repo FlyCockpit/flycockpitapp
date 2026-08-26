@@ -41,7 +41,7 @@ pub(crate) mod diagnostics_probe;
 pub mod effective_default_recovery;
 #[cfg(feature = "remote")]
 pub mod egress;
-pub mod ephemeral_guard;
+pub(crate) mod ephemeral_guard;
 pub mod fs_api;
 pub mod image_generation_worker;
 pub mod image_runtime;

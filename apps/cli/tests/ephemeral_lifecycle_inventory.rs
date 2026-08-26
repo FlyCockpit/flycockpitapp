@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use syn::visit::{self, Visit};
@@ -67,10 +68,7 @@ fn inspect_items(items: &[syn::Item], violations: &mut Vec<String>) {
                 let mut paths = Vec::new();
                 flatten_use(&item.tree, &mut Vec::new(), &mut paths);
                 for path in paths {
-                    let public = !matches!(item.vis, syn::Visibility::Inherited);
-                    if (public && path == "cockpit_core::daemon")
-                        || path.ends_with("daemon::client::*")
-                    {
+                    if path == "cockpit_core::daemon" || path.ends_with("daemon::client::*") {
                         violations.push(path);
                     }
                 }
@@ -140,8 +138,17 @@ fn public_core_raw_signatures(source: &str) -> Vec<String> {
 
 #[derive(Default)]
 struct OwnedFlow {
-    acquisitions: Vec<String>,
-    finishes: Vec<String>,
+    scopes: Vec<HashMap<String, Option<u64>>>,
+    acquisitions: Vec<(String, String, u64, usize)>,
+    finishes: Vec<(u64, usize)>,
+    unresolved_finishes: Vec<(String, usize)>,
+    violations: Vec<String>,
+    next_binding: u64,
+    position: usize,
+    function: String,
+    closure_depth: usize,
+    branch_depth: usize,
+    connect_calls: usize,
 }
 
 struct ConnectFinder(bool);
@@ -164,27 +171,148 @@ impl<'ast> Visit<'ast> for ConnectFinder {
 }
 
 impl<'ast> Visit<'ast> for OwnedFlow {
+    fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+        let old = std::mem::replace(&mut self.function, function.sig.ident.to_string());
+        visit::visit_item_fn(self, function);
+        self.function = old;
+    }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        self.scopes.push(HashMap::new());
+        visit::visit_block(self, block);
+        self.scopes.pop();
+    }
+
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        self.closure_depth += 1;
+        visit::visit_expr_closure(self, closure);
+        self.closure_depth -= 1;
+    }
+
+    fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
+        self.branch_depth += 1;
+        visit::visit_expr_if(self, expression);
+        self.branch_depth -= 1;
+    }
+
+    fn visit_expr_match(&mut self, expression: &'ast syn::ExprMatch) {
+        self.branch_depth += 1;
+        visit::visit_expr_match(self, expression);
+        self.branch_depth -= 1;
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        let mut finder = ConnectFinder(false);
+        finder.visit_expr_call(call);
+        if finder.0 {
+            self.connect_calls += 1;
+        }
+        visit::visit_expr_call(self, call);
+    }
+
     fn visit_local(&mut self, local: &'ast syn::Local) {
-        if let syn::Pat::Ident(binding) = &local.pat
-            && let Some(init) = &local.init
-        {
+        self.position += 1;
+        if let Some(init) = &local.init {
             let mut finder = ConnectFinder(false);
             finder.visit_expr(&init.expr);
             if finder.0 {
-                self.acquisitions.push(binding.ident.to_string());
+                let syn::Pat::Ident(binding) = &local.pat else {
+                    self.violations
+                        .push("owned session acquired through non-identifier pattern".into());
+                    visit::visit_local(self, local);
+                    return;
+                };
+                if self.closure_depth > 0 {
+                    self.violations
+                        .push("owned session acquired in a deferred closure".into());
+                }
+                if self.branch_depth > 0 {
+                    self.violations
+                        .push("owned session acquired in a conditional branch".into());
+                }
+                self.next_binding += 1;
+                let id = self.next_binding;
+                self.scopes
+                    .last_mut()
+                    .expect("local scope")
+                    .insert(binding.ident.to_string(), Some(id));
+                self.acquisitions.push((
+                    self.function.clone(),
+                    binding.ident.to_string(),
+                    id,
+                    self.position,
+                ));
+            } else if let syn::Expr::Path(path) = init.expr.as_ref()
+                && let Some(name) = path.path.get_ident()
+                && self.resolve(&name.to_string()).is_some()
+            {
+                self.violations
+                    .push("owned session moved into an alias".into());
+            } else if let syn::Pat::Ident(binding) = &local.pat {
+                self.scopes
+                    .last_mut()
+                    .expect("local scope")
+                    .insert(binding.ident.to_string(), None);
             }
         }
         visit::visit_local(self, local);
     }
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.position += 1;
         if call.method == "finish"
             && let syn::Expr::Path(receiver) = call.receiver.as_ref()
             && let Some(ident) = receiver.path.get_ident()
         {
-            self.finishes.push(ident.to_string());
+            let name = ident.to_string();
+            if let Some(id) = self.resolve(&name) {
+                self.finishes.push((id, self.position));
+            } else {
+                self.unresolved_finishes.push((name, self.position));
+            }
         }
         visit::visit_expr_method_call(self, call);
+    }
+}
+
+impl OwnedFlow {
+    fn resolve(&self, name: &str) -> Option<u64> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(binding) = scope.get(name) {
+                return *binding;
+            }
+        }
+        None
+    }
+
+    fn validate(&self) -> Vec<String> {
+        let mut errors = self.violations.clone();
+        if self.connect_calls != self.acquisitions.len() {
+            errors.push("owned connect call is not a direct local acquisition".into());
+        }
+        for (function, name, id, acquired) in &self.acquisitions {
+            let finishes = self
+                .finishes
+                .iter()
+                .filter(|(finished, _)| finished == id)
+                .collect::<Vec<_>>();
+            if finishes.len() != 1 {
+                errors.push(format!(
+                    "{function}: owned binding {id} finished {} times",
+                    finishes.len()
+                ));
+            } else if finishes[0].1 <= *acquired {
+                errors.push(format!("{function}: finish precedes acquisition"));
+            }
+            if self
+                .unresolved_finishes
+                .iter()
+                .any(|(finished, position)| finished == name && position < acquired)
+            {
+                errors.push(format!("{function}: finish precedes acquisition"));
+            }
+        }
+        errors
     }
 }
 
@@ -301,9 +429,25 @@ fn adversarial_unrelated_finish_does_not_satisfy_owned_acquisition() {
     .unwrap();
     let mut flow = OwnedFlow::default();
     flow.visit_file(&parsed);
-    assert_eq!(flow.acquisitions, ["daemon"]);
-    assert_eq!(flow.finishes, ["other"]);
-    assert!(!flow.finishes.contains(&flow.acquisitions[0]));
+    assert_eq!(flow.acquisitions.len(), 1);
+    assert_eq!(flow.finishes.len(), 0);
+    assert!(!flow.validate().is_empty());
+}
+
+#[test]
+fn adversarial_shadow_move_deferred_and_finish_order_are_rejected() {
+    for source in [
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; { let daemon = Other; daemon.finish(result).await; } }",
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; let moved = daemon; moved.finish(result).await; }",
+        "fn run() { let deferred = || async { let daemon = OwnedDaemonSession::connect(mode).await?; daemon.finish(result).await; }; }",
+        "async fn run() { if condition { let daemon = OwnedDaemonSession::connect(mode).await?; daemon.finish(result).await; } }",
+        "async fn run() { daemon.finish(result).await; let daemon = OwnedDaemonSession::connect(mode).await?; }",
+        "async fn run() { let (daemon,) = (OwnedDaemonSession::connect(mode).await?,); daemon.finish(result).await; }",
+    ] {
+        let mut flow = OwnedFlow::default();
+        flow.visit_file(&syn::parse_file(source).unwrap());
+        assert!(!flow.validate().is_empty(), "accepted: {source}");
+    }
 }
 
 #[test]
@@ -336,25 +480,33 @@ fn omitted_finish_still_aborts_signal_watcher_before_guard_drop() {
 #[test]
 fn every_ephemeral_command_uses_and_finishes_the_owned_session() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
-    for command in [
-        "doctor.rs",
-        "init.rs",
-        "invocation.rs",
-        "learn.rs",
-        "run.rs",
-        "schedule.rs",
-        "session.rs",
+    for (command, expected) in [
+        ("doctor.rs", &["run"][..]),
+        ("init.rs", &["run"][..]),
+        ("invocation.rs", &["cancel", "status"][..]),
+        ("learn.rs", &["run"][..]),
+        ("run.rs", &["run"][..]),
+        (
+            "schedule.rs",
+            &["create", "list", "run_now", "set_enabled"][..],
+        ),
+        ("session.rs", &["answer_inner"][..]),
     ] {
         let source = std::fs::read_to_string(root.join(command)).unwrap();
         let parsed = syn::parse_file(&source).unwrap();
         let mut flow = OwnedFlow::default();
         flow.visit_file(&parsed);
-        assert!(!flow.acquisitions.is_empty(), "{command}: no acquisition");
-        for acquisition in &flow.acquisitions {
-            assert!(
-                flow.finishes.contains(acquisition),
-                "{command}: `{acquisition}` is not the receiver consumed by finish"
-            );
-        }
+        let mut actual = flow
+            .acquisitions
+            .iter()
+            .map(|(function, _, _, _)| function.as_str())
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "{command}: inventory drift");
+        assert!(
+            flow.validate().is_empty(),
+            "{command}: {:?}",
+            flow.validate()
+        );
     }
 }

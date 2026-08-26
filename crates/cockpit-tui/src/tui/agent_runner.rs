@@ -3876,8 +3876,8 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             agent,
             attempt_id: cockpit_client::presentation::AssistantAttemptId::new(attempt_id),
             kind: match kind.as_str() {
-                "cancelled" => cockpit_core::engine::DisplayErrorKind::Cancelled,
-                _ => cockpit_core::engine::DisplayErrorKind::Failed,
+                "cancelled" => cockpit_client::presentation::DisplayErrorKind::Cancelled,
+                _ => cockpit_client::presentation::DisplayErrorKind::Failed,
             },
             message,
             presentation_text,

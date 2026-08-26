@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 pub use cockpit_client::presentation::AssistantAttemptId;
+pub use cockpit_client::presentation::DisplayErrorKind;
 
 /// Durable per-assistant-message response performance snapshot.
 ///
@@ -246,16 +247,6 @@ pub struct DisplayAttemptReset {
     pub replacement_attempt_id: AssistantAttemptId,
     /// Why the failed attempt was reset (diagnostics only).
     pub reason: String,
-}
-
-/// Why a visible primary attempt ended as a live error row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DisplayErrorKind {
-    /// User/daemon cancellation after visible provisional output.
-    Cancelled,
-    /// Terminal failure after visible provisional output.
-    Failed,
 }
 
 /// A terminal display error for an attempt. Converts the provisional row

@@ -18,3 +18,10 @@ impl std::fmt::Display for AssistantAttemptId {
         write!(formatter, "attempt-{}", self.0)
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayErrorKind {
+    Cancelled,
+    Failed,
+}

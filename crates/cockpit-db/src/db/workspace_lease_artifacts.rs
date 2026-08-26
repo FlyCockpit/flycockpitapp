@@ -4,7 +4,7 @@
 //! digests.  It is not a filesystem API: callers prove identity outside this
 //! crate and report the redacted result through the CAS transitions below.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

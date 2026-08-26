@@ -26,7 +26,7 @@ pub struct DoctorChecksFailed;
 pub struct DoctorCouldNotRun(#[source] pub anyhow::Error);
 
 use crate::cli::DoctorArgs;
-use crate::daemon::client::{LifecycleMode, OwnedDaemonSession};
+use crate::daemon::client::{OwnedDaemonSession, OwnedSessionMode};
 use crate::daemon::proto::{Request, Response};
 
 const DIAGNOSTIC_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -73,7 +73,7 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
             })?;
         return finish_snapshot(worker.rendered, worker.has_failures);
     }
-    let daemon = match OwnedDaemonSession::connect(LifecycleMode::AttachOrEphemeral).await {
+    let daemon = match OwnedDaemonSession::connect(OwnedSessionMode::AttachOrEphemeral).await {
         Ok(daemon) => daemon,
         Err(daemon_error) if ephemeral_boot_attempted => {
             return recover_ephemeral_database_boot_failure(&args, no_sandbox, daemon_error).await;

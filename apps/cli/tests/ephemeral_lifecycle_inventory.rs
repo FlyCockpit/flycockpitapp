@@ -1,12 +1,39 @@
 use std::path::{Path, PathBuf};
 
+use syn::visit::{self, Visit};
+
 const RAW_AUTHORITY: &[&str] = &[
     "probe_or_spawn",
     "ConnectedDaemon",
     "take_owned_daemon_guard",
     "spawn_signal_shutdown",
-    "EphemeralDaemonGuard::new",
+    "EphemeralDaemonGuard",
 ];
+
+#[derive(Default)]
+struct RawAuthority(Vec<String>);
+
+impl<'ast> Visit<'ast> for RawAuthority {
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        let ident = ident.to_string();
+        if RAW_AUTHORITY.contains(&ident.as_str()) {
+            self.0.push(ident);
+        }
+    }
+
+    fn visit_macro(&mut self, invocation: &'ast syn::Macro) {
+        for token in invocation
+            .tokens
+            .to_string()
+            .split(|character: char| !character.is_alphanumeric() && character != '_')
+        {
+            if RAW_AUTHORITY.contains(&token) {
+                self.0.push(token.into());
+            }
+        }
+        visit::visit_macro(self, invocation);
+    }
+}
 fn flatten_use(tree: &syn::UseTree, prefix: &mut Vec<String>, paths: &mut Vec<String>) {
     match tree {
         syn::UseTree::Path(path) => {
@@ -59,17 +86,106 @@ fn inspect_items(items: &[syn::Item], violations: &mut Vec<String>) {
 }
 
 fn source_violations(source: &str) -> Vec<String> {
-    let mut violations = RAW_AUTHORITY
-        .iter()
-        .filter(|symbol| source.contains(**symbol))
-        .map(|symbol| (*symbol).to_string())
-        .collect::<Vec<_>>();
     if let Ok(file) = syn::parse_file(source) {
+        let mut raw = RawAuthority::default();
+        raw.visit_file(&file);
+        let mut violations = raw.0;
         inspect_items(&file.items, &mut violations);
+        violations
     } else {
-        violations.push("unparseable Rust source".into());
+        vec!["unparseable Rust source".into()]
+    }
+}
+
+fn public_core_raw_signatures(source: &str) -> Vec<String> {
+    let file = syn::parse_file(source).unwrap();
+    let mut violations = Vec::new();
+    for item in file.items {
+        match item {
+            syn::Item::Fn(function) if matches!(function.vis, syn::Visibility::Public(_)) => {
+                let mut raw = RawAuthority::default();
+                raw.visit_signature(&function.sig);
+                violations.extend(raw.0);
+            }
+            syn::Item::Struct(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                for field in item.fields {
+                    if matches!(field.vis, syn::Visibility::Public(_)) {
+                        let mut raw = RawAuthority::default();
+                        raw.visit_type(&field.ty);
+                        violations.extend(raw.0);
+                    }
+                }
+            }
+            syn::Item::Type(item) if matches!(item.vis, syn::Visibility::Public(_)) => {
+                let mut raw = RawAuthority::default();
+                raw.visit_type(&item.ty);
+                violations.extend(raw.0);
+            }
+            syn::Item::Impl(item) => {
+                for member in item.items {
+                    if let syn::ImplItem::Fn(method) = member
+                        && matches!(method.vis, syn::Visibility::Public(_))
+                    {
+                        let mut raw = RawAuthority::default();
+                        raw.visit_signature(&method.sig);
+                        violations.extend(raw.0);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     violations
+}
+
+#[derive(Default)]
+struct OwnedFlow {
+    acquisitions: Vec<String>,
+    finishes: Vec<String>,
+}
+
+struct ConnectFinder(bool);
+
+impl<'ast> Visit<'ast> for ConnectFinder {
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref() {
+            let segments = path
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            if segments.ends_with(&["OwnedDaemonSession".into(), "connect".into()]) {
+                self.0 = true;
+            }
+        }
+        visit::visit_expr_call(self, call);
+    }
+}
+
+impl<'ast> Visit<'ast> for OwnedFlow {
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if let syn::Pat::Ident(binding) = &local.pat
+            && let Some(init) = &local.init
+        {
+            let mut finder = ConnectFinder(false);
+            finder.visit_expr(&init.expr);
+            if finder.0 {
+                self.acquisitions.push(binding.ident.to_string());
+            }
+        }
+        visit::visit_local(self, local);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "finish"
+            && let syn::Expr::Path(receiver) = call.receiver.as_ref()
+            && let Some(ident) = receiver.path.get_ident()
+        {
+            self.finishes.push(ident.to_string());
+        }
+        visit::visit_expr_method_call(self, call);
+    }
 }
 
 fn rust_sources(root: &Path) -> Vec<PathBuf> {
@@ -110,10 +226,14 @@ fn owned_session_is_the_single_cli_lifecycle_facade() {
     let facade =
         std::fs::read_to_string(workspace.join("crates/cockpit-core/src/daemon/client.rs"))
             .unwrap();
+    assert!(
+        public_core_raw_signatures(&facade).is_empty(),
+        "public core API leaks raw lifecycle authority"
+    );
     for contract in [
         "pub struct OwnedDaemonSession",
-        "pub async fn connect(mode: LifecycleMode)",
-        "let mut connected = probe_or_spawn(mode).await?",
+        "pub async fn connect(mode: OwnedSessionMode)",
+        "let mut connected = probe_or_spawn(mode.lifecycle()).await?",
         "let guard = connected.take_owned_daemon_guard()",
         "spawn_signal_shutdown(",
         "pub fn client(&self) -> &DaemonClient",
@@ -133,6 +253,14 @@ fn owned_session_is_the_single_cli_lifecycle_facade() {
     ] {
         assert!(facade.contains(private_raw_contract));
     }
+    let owned_modes = facade
+        .split_once("pub enum OwnedSessionMode")
+        .unwrap()
+        .1
+        .split_once('}')
+        .unwrap()
+        .0;
+    assert!(!owned_modes.contains("AttachOwnEphemeral"));
     let owned_fields = facade
         .split_once("pub struct OwnedDaemonSession {")
         .unwrap()
@@ -158,8 +286,34 @@ fn adversarial_raw_alias_reexport_glob_and_helper_are_rejected() {
         "use cockpit_core::daemon::client::*;",
         "async fn helper() { crate::daemon::client::probe_or_spawn(mode).await; }",
         "macro_rules! hidden { () => { ConnectedDaemon } }",
+        "use crate::daemon::ephemeral_guard::EphemeralDaemonGuard as Guard; fn leak(value: Guard) { Guard::shutdown(&value); }",
+        "pub fn leak() -> crate::daemon::client::ConnectedDaemon { unreachable!() }",
     ] {
         assert!(!source_violations(source).is_empty(), "accepted: {source}");
+    }
+}
+
+#[test]
+fn adversarial_unrelated_finish_does_not_satisfy_owned_acquisition() {
+    let parsed = syn::parse_file(
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; other.finish(result).await; }",
+    )
+    .unwrap();
+    let mut flow = OwnedFlow::default();
+    flow.visit_file(&parsed);
+    assert_eq!(flow.acquisitions, ["daemon"]);
+    assert_eq!(flow.finishes, ["other"]);
+    assert!(!flow.finishes.contains(&flow.acquisitions[0]));
+}
+
+#[test]
+fn adversarial_public_core_facades_cannot_leak_raw_authority() {
+    for source in [
+        "pub fn leak() -> ConnectedDaemon { unreachable!() }",
+        "pub struct Leak { pub guard: EphemeralDaemonGuard }",
+        "struct Api; impl Api { pub fn leak(&self, value: ConnectedDaemon) {} }",
+    ] {
+        assert!(!public_core_raw_signatures(source).is_empty());
     }
 }
 
@@ -192,13 +346,15 @@ fn every_ephemeral_command_uses_and_finishes_the_owned_session() {
         "session.rs",
     ] {
         let source = std::fs::read_to_string(root.join(command)).unwrap();
-        assert!(
-            source.contains("OwnedDaemonSession"),
-            "{command} does not acquire the owned-session facade"
-        );
-        assert!(
-            source.contains(".finish("),
-            "{command} does not explicitly finish its owned session"
-        );
+        let parsed = syn::parse_file(&source).unwrap();
+        let mut flow = OwnedFlow::default();
+        flow.visit_file(&parsed);
+        assert!(!flow.acquisitions.is_empty(), "{command}: no acquisition");
+        for acquisition in &flow.acquisitions {
+            assert!(
+                flow.finishes.contains(acquisition),
+                "{command}: `{acquisition}` is not the receiver consumed by finish"
+            );
+        }
     }
 }

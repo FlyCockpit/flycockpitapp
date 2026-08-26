@@ -156,9 +156,29 @@ pub struct OwnedDaemonSession {
     signal_task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Foreground command modes that can only resolve to an attached persistent
+/// daemon or an exactly owned child process. In-process TUI ownership is
+/// intentionally absent because it requires a different async guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedSessionMode {
+    AttachOrAutoPromote,
+    AttachOrEphemeral,
+    AlwaysEphemeral,
+}
+
+impl OwnedSessionMode {
+    fn lifecycle(self) -> LifecycleMode {
+        match self {
+            Self::AttachOrAutoPromote => LifecycleMode::AttachOrAutoPromote,
+            Self::AttachOrEphemeral => LifecycleMode::AttachOrEphemeral,
+            Self::AlwaysEphemeral => LifecycleMode::AlwaysEphemeral,
+        }
+    }
+}
+
 impl OwnedDaemonSession {
-    pub async fn connect(mode: LifecycleMode) -> Result<Self> {
-        let mut connected = probe_or_spawn(mode).await?;
+    pub async fn connect(mode: OwnedSessionMode) -> Result<Self> {
+        let mut connected = probe_or_spawn(mode.lifecycle()).await?;
         let guard = connected.take_owned_daemon_guard();
         let signal_task =
             match crate::daemon::ephemeral_guard::spawn_signal_shutdown(guard.as_ref(), true) {

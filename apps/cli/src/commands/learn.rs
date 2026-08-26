@@ -8,16 +8,16 @@
 use anyhow::{Context, Result};
 
 use crate::cli::LearnArgs;
-use crate::daemon::client::{LifecycleMode, OwnedDaemonSession};
+use crate::daemon::client::{OwnedDaemonSession, OwnedSessionMode};
 pub use crate::skills::{build_learn_prompt, subject_from_parts};
 
 pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
     let subject = subject_from_parts(&args.sources);
     let prompt = build_learn_prompt(&subject);
     let mode = if args.ephemeral {
-        LifecycleMode::AlwaysEphemeral
+        OwnedSessionMode::AlwaysEphemeral
     } else {
-        LifecycleMode::AttachOrEphemeral
+        OwnedSessionMode::AttachOrEphemeral
     };
     let daemon = OwnedDaemonSession::connect(mode).await?;
     eprintln!("Authoring a reusable skill from the supplied sources…");

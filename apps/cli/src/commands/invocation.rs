@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use crate::cli::{InvocationCancelArgs, InvocationCommand, InvocationStatusArgs, OutputFormat};
-use crate::daemon::client::{LifecycleMode, OwnedDaemonSession};
+use crate::daemon::client::{OwnedDaemonSession, OwnedSessionMode};
 use crate::daemon::proto::{self, Request, Response};
 
 pub async fn run(cmd: InvocationCommand) -> Result<()> {
@@ -18,7 +18,7 @@ async fn status(args: InvocationStatusArgs) -> Result<()> {
     let id = parse_canonical_uuid(&args.client_submission_id).map_err(|e| {
         exit_usage(2, &e);
     })?;
-    let daemon = connect()
+    let daemon = OwnedDaemonSession::connect(OwnedSessionMode::AttachOrEphemeral)
         .await
         .map_err(|e| exit_transport(4, &format!("{e:#}")))?;
     let result = match daemon
@@ -42,7 +42,7 @@ async fn cancel(args: InvocationCancelArgs) -> Result<()> {
     let id = parse_canonical_uuid(&args.client_submission_id).map_err(|e| {
         exit_usage(2, &e);
     })?;
-    let daemon = connect()
+    let daemon = OwnedDaemonSession::connect(OwnedSessionMode::AttachOrEphemeral)
         .await
         .map_err(|e| exit_transport(4, &format!("{e:#}")))?;
     let result = match daemon
@@ -62,12 +62,6 @@ async fn cancel(args: InvocationCancelArgs) -> Result<()> {
         Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
     };
     finish_invocation_result(daemon.finish(result).await)
-}
-
-async fn connect() -> Result<OwnedDaemonSession> {
-    OwnedDaemonSession::connect(LifecycleMode::AttachOrEphemeral)
-        .await
-        .context("connecting to daemon")
 }
 
 /// Accept only the canonical lowercase hyphenated UUID spelling.

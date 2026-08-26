@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
-use crate::daemon::client::{LifecycleMode, OwnedDaemonSession};
+use crate::daemon::client::{OwnedDaemonSession, OwnedSessionMode};
 use crate::daemon::ephemeral_guard::aggregate_shutdown_result;
 use crate::daemon::proto::{self, Request, Response};
 
@@ -233,9 +233,9 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     }
 
     let mode = if args.ephemeral {
-        LifecycleMode::AlwaysEphemeral
+        OwnedSessionMode::AlwaysEphemeral
     } else {
-        LifecycleMode::AttachOrEphemeral
+        OwnedSessionMode::AttachOrEphemeral
     };
 
     let daemon = match OwnedDaemonSession::connect(mode).await {

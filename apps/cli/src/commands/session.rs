@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::cli::{OutputFormat, SessionAnswerArgs, SessionCommand, SessionListArgs};
-use crate::daemon::client::{LifecycleMode, OwnedDaemonSession, ensure_persistent_daemon};
+use crate::daemon::client::{OwnedDaemonSession, OwnedSessionMode, ensure_persistent_daemon};
 use crate::daemon::proto::{Request, ResolveResponse, Response};
 
 pub async fn run(cmd: SessionCommand) -> Result<()> {
@@ -283,7 +283,7 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
     let interrupt_id = Uuid::parse_str(&args.interrupt).context("parsing --interrupt")?;
     let response = response_from_args(args)?;
 
-    let daemon = OwnedDaemonSession::connect(LifecycleMode::AttachOrEphemeral).await?;
+    let daemon = OwnedDaemonSession::connect(OwnedSessionMode::AttachOrEphemeral).await?;
     let result = async {
         let env_snapshot = crate::env_snapshot::EnvSnapshot::from_process(
             crate::env_snapshot::EnvSnapshotSource::ExplicitCli,

@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 
 use crate::cli::{ScheduleCommand, ScheduleCreateArgs, ScheduleListArgs};
-use crate::daemon::client::{LifecycleMode, OwnedDaemonSession};
+use crate::daemon::client::{OwnedDaemonSession, OwnedSessionMode};
 use crate::daemon::proto::{
     MissedRunPolicy, Request, Response, ScheduledJobCreate, ScheduledJobPayload,
     ScheduledJobSchedule, ScheduledJobSummary,
@@ -19,12 +19,8 @@ pub async fn run(cmd: ScheduleCommand) -> Result<()> {
     }
 }
 
-async fn client() -> Result<OwnedDaemonSession> {
-    OwnedDaemonSession::connect(LifecycleMode::AttachOrAutoPromote).await
-}
-
 async fn list(args: ScheduleListArgs) -> Result<()> {
-    let daemon = client().await?;
+    let daemon = OwnedDaemonSession::connect(OwnedSessionMode::AttachOrAutoPromote).await?;
     let response = daemon
         .client()
         .request_ok(Request::ListScheduledJobs { owner: args.owner })
@@ -45,7 +41,7 @@ async fn list(args: ScheduleListArgs) -> Result<()> {
 
 async fn create(args: ScheduleCreateArgs) -> Result<()> {
     let job = build_create(args)?;
-    let daemon = client().await?;
+    let daemon = OwnedDaemonSession::connect(OwnedSessionMode::AttachOrAutoPromote).await?;
     let response = daemon
         .client()
         .request_ok(Request::CreateScheduledJob { job })
@@ -80,7 +76,7 @@ fn parse_missed_run_policy(raw: &str) -> Result<MissedRunPolicy> {
 }
 
 async fn set_enabled(id: &str, enabled: bool) -> Result<()> {
-    let daemon = client().await?;
+    let daemon = OwnedDaemonSession::connect(OwnedSessionMode::AttachOrAutoPromote).await?;
     let response = daemon
         .client()
         .request_ok(Request::SetScheduledJobEnabled {
@@ -97,7 +93,7 @@ async fn set_enabled(id: &str, enabled: bool) -> Result<()> {
 }
 
 async fn run_now(id: &str) -> Result<()> {
-    let daemon = client().await?;
+    let daemon = OwnedDaemonSession::connect(OwnedSessionMode::AttachOrAutoPromote).await?;
     let response = daemon
         .client()
         .request_ok(Request::RunScheduledJob { id: id.to_string() })

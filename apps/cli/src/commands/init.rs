@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use cockpit_core::init::{InitMode, build_init_prompt, display_target, resolve_target};
 
 use crate::cli::InitArgs;
-use crate::daemon::client::{LifecycleMode, OwnedDaemonSession};
+use crate::daemon::client::{OwnedDaemonSession, OwnedSessionMode};
 
 /// `cockpit init [path]` — headless. Resolves the target, refuses to
 /// clobber an existing file unless `--force` (no interactive prompt in
@@ -53,9 +53,9 @@ pub async fn run(args: InitArgs, no_sandbox: bool) -> Result<()> {
     let prompt = build_init_prompt(&shown, mode);
 
     let mode_lc = if args.ephemeral {
-        LifecycleMode::AlwaysEphemeral
+        OwnedSessionMode::AlwaysEphemeral
     } else {
-        LifecycleMode::AttachOrEphemeral
+        OwnedSessionMode::AttachOrEphemeral
     };
     let daemon = OwnedDaemonSession::connect(mode_lc).await?;
     eprintln!("Exploring the project and writing `{shown}`…");

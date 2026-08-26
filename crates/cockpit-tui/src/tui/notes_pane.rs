@@ -20,6 +20,8 @@
 //! main composer uses. No second vim implementation. When vim is off, editing
 //! is plain text entry through the same path.
 
+use std::collections::VecDeque;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -74,6 +76,8 @@ pub struct NotesPane {
     highest_applied_generation: Option<u64>,
     initial_inventory_unresolved: bool,
     pending_save: Option<PendingSave>,
+    in_flight_generation: Option<u64>,
+    queued_actions: VecDeque<QueuedNotesAction>,
     mode: Mode,
     /// The reused composer editing engine for the raw-markdown editor. Holds
     /// the note source while [`Mode::Editing`]; honors vim when enabled.
@@ -102,6 +106,11 @@ struct PendingSave {
     id: Uuid,
     generation: u64,
     draft: String,
+}
+
+struct QueuedNotesAction {
+    generation: u64,
+    kind: NotesRpcActionKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +362,8 @@ impl NotesPane {
             highest_applied_generation: None,
             initial_inventory_unresolved: true,
             pending_save: None,
+            in_flight_generation: None,
+            queued_actions: VecDeque::new(),
             mode: Mode::Browsing,
             editor: Composer::new(vim_enabled),
             vim_enabled,
@@ -367,13 +378,15 @@ impl NotesPane {
         }
     }
 
-    pub fn initial_load_action(&self) -> Option<NotesRpcAction> {
-        Some(NotesRpcAction {
+    pub fn initial_load_action(&mut self) -> Option<NotesRpcAction> {
+        let action = NotesRpcAction {
             daemon_socket: self.daemon_socket.clone()?,
             project_root: self.project_root.clone(),
             kind: NotesRpcActionKind::Load { keep: None },
             generation: self.operation_generation,
-        })
+        };
+        self.in_flight_generation = Some(action.generation);
+        Some(action)
     }
 
     /// Currently-selected note, if any.
@@ -404,21 +417,25 @@ impl NotesPane {
         self.sidebar.select(Some(index));
     }
 
-    pub fn apply_rpc_result(&mut self, result: Result<NotesRpcResult, String>) {
+    pub fn apply_rpc_result(
+        &mut self,
+        result: Result<NotesRpcResult, String>,
+    ) -> Option<NotesRpcAction> {
         match result {
             Ok(result) => {
                 if result.project_root != self.project_root {
-                    return;
+                    return None;
                 }
-                let is_current = result.generation == self.operation_generation;
                 if (result.generation == 0 && !self.initial_inventory_unresolved)
-                    || !is_current
+                    || self.in_flight_generation != Some(result.generation)
                     || self
                         .highest_applied_generation
                         .is_some_and(|applied| result.generation <= applied)
                 {
-                    return;
+                    return None;
                 }
+                self.in_flight_generation = None;
+                let has_newer_intent = result.generation != self.operation_generation;
                 if let Some(error) = result.error {
                     if let Some(save) = self
                         .pending_save
@@ -427,79 +444,125 @@ impl NotesPane {
                     {
                         debug_assert!(matches!(self.mode, Mode::Editing { id } if id == save.id));
                         debug_assert_eq!(self.editor.text(), save.draft);
+                        self.status = Some(error);
+                    } else if !has_newer_intent {
+                        self.status = Some(error);
                     }
-                    self.status = Some(error);
-                    return;
+                    return self.start_next_queued_action();
                 }
                 let old_index = self.selected_index();
                 let old_selection = self.selection;
                 self.notes = result.notes;
-                let requested = match result.selection {
-                    SelectionAfterRpc::Preserve => match old_selection {
-                        SidebarSelection::Uninitialized => {
-                            self.notes.first().map_or(SidebarSelection::New, |note| {
-                                SidebarSelection::Note(note.id)
-                            })
+                let requested = if has_newer_intent {
+                    old_selection
+                } else {
+                    match result.selection {
+                        SelectionAfterRpc::Preserve => match old_selection {
+                            SidebarSelection::Uninitialized => {
+                                self.notes.first().map_or(SidebarSelection::New, |note| {
+                                    SidebarSelection::Note(note.id)
+                                })
+                            }
+                            established => established,
+                        },
+                        SelectionAfterRpc::Keep(id) => SidebarSelection::Note(id),
+                        SelectionAfterRpc::Deleted { fallback_index } => {
+                            self.notes.get(fallback_index).map_or_else(
+                                || {
+                                    self.notes.last().map_or(SidebarSelection::New, |note| {
+                                        SidebarSelection::Note(note.id)
+                                    })
+                                },
+                                |note| SidebarSelection::Note(note.id),
+                            )
                         }
-                        established => established,
-                    },
-                    SelectionAfterRpc::Keep(id) => SidebarSelection::Note(id),
-                    SelectionAfterRpc::Deleted { fallback_index } => {
-                        self.notes.get(fallback_index).map_or_else(
+                    }
+                };
+                let resolved = if has_newer_intent {
+                    requested
+                } else {
+                    match requested {
+                        SidebarSelection::Uninitialized => unreachable!(
+                            "successful notes refresh must resolve initial selection intent"
+                        ),
+                        SidebarSelection::New => SidebarSelection::New,
+                        SidebarSelection::Note(id)
+                            if self.notes.iter().any(|note| note.id == id) =>
+                        {
+                            SidebarSelection::Note(id)
+                        }
+                        SidebarSelection::Note(_) => self.notes.get(old_index).map_or_else(
                             || {
                                 self.notes.last().map_or(SidebarSelection::New, |note| {
                                     SidebarSelection::Note(note.id)
                                 })
                             },
                             |note| SidebarSelection::Note(note.id),
-                        )
+                        ),
                     }
-                };
-                let resolved = match requested {
-                    SidebarSelection::Uninitialized => unreachable!(
-                        "successful notes refresh must resolve initial selection intent"
-                    ),
-                    SidebarSelection::New => SidebarSelection::New,
-                    SidebarSelection::Note(id) if self.notes.iter().any(|note| note.id == id) => {
-                        SidebarSelection::Note(id)
-                    }
-                    SidebarSelection::Note(_) => self.notes.get(old_index).map_or_else(
-                        || {
-                            self.notes.last().map_or(SidebarSelection::New, |note| {
-                                SidebarSelection::Note(note.id)
-                            })
-                        },
-                        |note| SidebarSelection::Note(note.id),
-                    ),
                 };
                 self.selection = resolved;
                 self.sidebar.select(Some(self.selected_index()));
                 self.highest_applied_generation = Some(result.generation);
-                self.initial_inventory_unresolved = false;
-                self.mode = Mode::Browsing;
-                if self
-                    .pending_save
-                    .as_ref()
-                    .is_some_and(|save| save.generation == result.generation)
-                {
-                    self.pending_save = None;
+                if result.generation == 0 {
+                    self.initial_inventory_unresolved = false;
                 }
-                self.status = None;
-                if result.enter_edit {
-                    self.enter_edit();
+                if !has_newer_intent {
+                    self.mode = Mode::Browsing;
+                    if self
+                        .pending_save
+                        .as_ref()
+                        .is_some_and(|save| save.generation == result.generation)
+                    {
+                        self.pending_save = None;
+                    }
+                    self.status = None;
+                    if result.enter_edit {
+                        self.enter_edit();
+                    }
                 }
+                self.start_next_queued_action()
             }
-            Err(e) => self.status = Some(e),
+            Err(e) => {
+                self.status = Some(e);
+                None
+            }
         }
     }
 
-    fn action(&mut self, kind: NotesRpcActionKind) -> Option<NotesRpcAction> {
+    fn schedule_action(
+        &mut self,
+        kind: NotesRpcActionKind,
+    ) -> Option<(u64, Option<NotesRpcAction>)> {
+        let daemon_socket = self.daemon_socket.clone()?;
         self.operation_generation = self.operation_generation.wrapping_add(1);
+        let generation = self.operation_generation;
+        if self.in_flight_generation.is_some() {
+            self.queued_actions
+                .push_back(QueuedNotesAction { generation, kind });
+            return Some((generation, None));
+        }
+        self.in_flight_generation = Some(generation);
+        Some((
+            generation,
+            Some(NotesRpcAction {
+                daemon_socket,
+                project_root: self.project_root.clone(),
+                kind,
+                generation,
+            }),
+        ))
+    }
+
+    fn start_next_queued_action(&mut self) -> Option<NotesRpcAction> {
+        let queued = self.queued_actions.pop_front()?;
+        let daemon_socket = self.daemon_socket.clone()?;
+        self.in_flight_generation = Some(queued.generation);
         Some(NotesRpcAction {
-            daemon_socket: self.daemon_socket.clone()?,
+            daemon_socket,
             project_root: self.project_root.clone(),
-            kind,
-            generation: self.operation_generation,
+            kind: queued.kind,
+            generation: queued.generation,
         })
     }
 
@@ -535,13 +598,15 @@ impl NotesPane {
     fn leave_edit(&mut self) -> NotesOutcome {
         if let Mode::Editing { id } = self.mode {
             let content = self.editor.text().to_string();
-            if let Some(action) = self.action(NotesRpcActionKind::Save { id, content }) {
+            if let Some((generation, action)) =
+                self.schedule_action(NotesRpcActionKind::Save { id, content })
+            {
                 self.pending_save = Some(PendingSave {
                     id,
-                    generation: action.generation,
+                    generation,
                     draft: self.editor.text().to_string(),
                 });
-                return NotesOutcome::Rpc(action);
+                return action.map_or(NotesOutcome::Stay, NotesOutcome::Rpc);
             }
             self.status = Some("Unavailable — reconnect to the daemon, then Retry".to_string());
         }
@@ -675,8 +740,9 @@ impl NotesPane {
                     Some(id) => NotesRpcActionKind::Rename { id, name },
                     None => NotesRpcActionKind::Create { name },
                 };
-                if let Some(action) = self.action(kind) {
-                    return NotesOutcome::Rpc(action);
+                if let Some((_, action)) = self.schedule_action(kind) {
+                    self.mode = Mode::Browsing;
+                    return action.map_or(NotesOutcome::Stay, NotesOutcome::Rpc);
                 }
             }
             KeyCode::Backspace => {
@@ -700,10 +766,10 @@ impl NotesPane {
                         .iter()
                         .position(|note| note.id == id)
                         .unwrap_or_else(|| self.selected_index());
-                    if let Some(action) =
-                        self.action(NotesRpcActionKind::Delete { id, fallback_index })
+                    if let Some((_, action)) =
+                        self.schedule_action(NotesRpcActionKind::Delete { id, fallback_index })
                     {
-                        return NotesOutcome::Rpc(action);
+                        return action.map_or(NotesOutcome::Stay, NotesOutcome::Rpc);
                     };
                     self.status = Some("notes db unavailable".to_string());
                 }
@@ -790,6 +856,8 @@ impl NotesPane {
             highest_applied_generation: None,
             initial_inventory_unresolved: false,
             pending_save: None,
+            in_flight_generation: None,
+            queued_actions: VecDeque::new(),
             mode: Mode::Editing { id: Uuid::nil() },
             editor: Composer::new(vim_enabled),
             vim_enabled,
@@ -1107,6 +1175,8 @@ mod tests {
             highest_applied_generation: None,
             initial_inventory_unresolved: false,
             pending_save: None,
+            in_flight_generation: None,
+            queued_actions: VecDeque::new(),
             mode: Mode::Browsing,
             editor: Composer::new(false),
             vim_enabled: false,
@@ -1137,6 +1207,7 @@ mod tests {
         pane.highest_applied_generation = None;
         pane.initial_inventory_unresolved = true;
         pane.selection = SidebarSelection::Uninitialized;
+        pane.in_flight_generation = Some(0);
     }
 
     fn rendered_buffer(pane: &mut NotesPane, width: u16, height: u16) -> String {
@@ -1187,8 +1258,9 @@ mod tests {
             note(Uuid::new_v4(), "third", "three"),
         ];
         pane.select_sidebar(1);
+        pane.in_flight_generation = Some(1);
 
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1203,7 +1275,7 @@ mod tests {
         assert_eq!(pane.selected_index(), 2);
         assert_eq!(pane.current().map(|note| note.id), Some(keep));
         let applied_ids = pane.notes.iter().map(|note| note.id).collect::<Vec<_>>();
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1238,7 +1310,8 @@ mod tests {
         ];
 
         pane.select_sidebar(pane.notes.len());
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        pane.in_flight_generation = Some(1);
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1258,7 +1331,8 @@ mod tests {
         ];
         pane.select_sidebar(1);
         pane.operation_generation = 2;
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        pane.in_flight_generation = Some(2);
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: 2,
             error: None,
             project_root: "/proj".into(),
@@ -1275,7 +1349,8 @@ mod tests {
 
         let fallback = pane.notes[1].id;
         pane.operation_generation = 3;
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        pane.in_flight_generation = Some(3);
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: 3,
             error: None,
             project_root: "/proj".into(),
@@ -1286,7 +1361,8 @@ mod tests {
         assert_eq!(pane.selection, SidebarSelection::Note(fallback));
 
         pane.operation_generation = 4;
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        pane.in_flight_generation = Some(4);
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: 4,
             error: None,
             project_root: "/proj".into(),
@@ -1296,7 +1372,7 @@ mod tests {
         }));
         assert_eq!(pane.selection, SidebarSelection::New);
         assert_eq!(pane.selected_index(), 0);
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: 2,
             error: None,
             project_root: "/proj".into(),
@@ -1317,7 +1393,7 @@ mod tests {
         let mut initial = pane(true);
         initial.notes.clear();
         mark_initial_inventory_unresolved(&mut initial);
-        initial.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = initial.apply_rpc_result(Ok(NotesRpcResult {
             generation: 0,
             error: None,
             project_root: "/proj".into(),
@@ -1334,7 +1410,7 @@ mod tests {
         let mut initially_empty = pane(true);
         initially_empty.notes.clear();
         mark_initial_inventory_unresolved(&mut initially_empty);
-        initially_empty.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = initially_empty.apply_rpc_result(Ok(NotesRpcResult {
             generation: 0,
             error: None,
             project_root: "/proj".into(),
@@ -1344,7 +1420,8 @@ mod tests {
         }));
         assert_eq!(initially_empty.selection, SidebarSelection::New);
         initially_empty.operation_generation = 1;
-        initially_empty.apply_rpc_result(Ok(NotesRpcResult {
+        initially_empty.in_flight_generation = Some(1);
+        let _ = initially_empty.apply_rpc_result(Ok(NotesRpcResult {
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1358,7 +1435,7 @@ mod tests {
         let mut retry = pane(true);
         retry.notes.clear();
         mark_initial_inventory_unresolved(&mut retry);
-        retry.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = retry.apply_rpc_result(Ok(NotesRpcResult {
             generation: 0,
             error: Some("temporary daemon failure".into()),
             project_root: "/proj".into(),
@@ -1368,7 +1445,8 @@ mod tests {
         }));
         assert_eq!(retry.selection, SidebarSelection::Uninitialized);
         assert_eq!(retry.status.as_deref(), Some("temporary daemon failure"));
-        retry.apply_rpc_result(Ok(NotesRpcResult {
+        retry.in_flight_generation = Some(0);
+        let _ = retry.apply_rpc_result(Ok(NotesRpcResult {
             generation: 0,
             error: None,
             project_root: "/proj".into(),
@@ -1380,7 +1458,8 @@ mod tests {
 
         retry.select_sidebar(retry.notes.len());
         retry.operation_generation = 1;
-        retry.apply_rpc_result(Ok(NotesRpcResult {
+        retry.in_flight_generation = Some(1);
+        let _ = retry.apply_rpc_result(Ok(NotesRpcResult {
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1406,7 +1485,7 @@ mod tests {
             assert_eq!(pane.selection, SidebarSelection::New);
             assert!(matches!(pane.mode, Mode::Naming { .. }));
 
-            pane.apply_rpc_result(Ok(NotesRpcResult {
+            let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
                 generation: 0,
                 error: None,
                 project_root: "/proj".into(),
@@ -1417,7 +1496,7 @@ mod tests {
             assert_eq!(pane.selection, SidebarSelection::New);
             assert!(matches!(pane.mode, Mode::Naming { .. }));
 
-            pane.apply_rpc_result(Ok(NotesRpcResult {
+            let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
                 generation: 0,
                 error: Some("stale load error".into()),
                 project_root: "/proj".into(),
@@ -1445,9 +1524,10 @@ mod tests {
             note(other, "other", "other"),
         ];
         pane.select_sidebar(0);
+        pane.in_flight_generation = Some(1);
         pane.enter_edit();
         assert!(matches!(pane.mode, Mode::Editing { id } if id == edited));
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1457,8 +1537,8 @@ mod tests {
         }));
         assert_eq!(
             pane.notes.len(),
-            2,
-            "stale inventory is ignored during edit"
+            1,
+            "serialized older completion may refresh inventory during edit"
         );
         let NotesOutcome::Rpc(save) = pane.leave_edit() else {
             panic!("save action");
@@ -1471,9 +1551,10 @@ mod tests {
             note(other, "other", "other"),
         ];
         pane.select_sidebar(0);
+        pane.in_flight_generation = Some(1);
         pane.handle_key(press(KeyCode::Char('d')));
         assert!(matches!(pane.mode, Mode::ConfirmingDelete { id } if id == edited));
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1483,8 +1564,8 @@ mod tests {
         }));
         assert_eq!(
             pane.notes.len(),
-            2,
-            "stale inventory is ignored during confirmation"
+            1,
+            "serialized older completion may refresh inventory during confirmation"
         );
         let NotesOutcome::Rpc(delete) = pane.handle_key(press(KeyCode::Char('y'))) else {
             panic!("delete action");
@@ -1503,7 +1584,7 @@ mod tests {
         let NotesOutcome::Rpc(save) = pane.leave_edit() else {
             panic!("save action");
         };
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: save.generation,
             error: Some("disk full".into()),
             project_root: "/proj".into(),
@@ -1523,7 +1604,7 @@ mod tests {
         assert!(pane.editor.text().contains('!'));
         assert!(pane.pending_save.is_none());
         assert!(!pane.edit_scroll_manual);
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: second_save.generation,
             error: None,
             project_root: "/proj".into(),
@@ -1536,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    fn stalled_initial_snapshot_cannot_overwrite_newer_mutation_results() {
+    fn stalled_initial_load_serializes_before_mutations_and_cannot_replay() {
         let resurrected = Uuid::new_v4();
         let created = Uuid::new_v4();
         let mut pane = pane(true);
@@ -1545,10 +1626,22 @@ mod tests {
 
         pane.handle_key(press(KeyCode::Char('n')));
         pane.paste("created");
-        let NotesOutcome::Rpc(create) = pane.handle_key(press(KeyCode::Enter)) else {
-            panic!("create action");
-        };
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        assert!(matches!(
+            pane.handle_key(press(KeyCode::Enter)),
+            NotesOutcome::Stay
+        ));
+        let create = pane
+            .apply_rpc_result(Ok(NotesRpcResult {
+                generation: 0,
+                error: None,
+                project_root: "/proj".into(),
+                notes: vec![note(resurrected, "old snapshot", "stale")],
+                selection: SelectionAfterRpc::Preserve,
+                enter_edit: false,
+            }))
+            .expect("queued create starts only after initial load completes");
+        assert_eq!(create.generation, pane.in_flight_generation.unwrap());
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: create.generation,
             error: None,
             project_root: "/proj".into(),
@@ -1561,7 +1654,7 @@ mod tests {
         let NotesOutcome::Rpc(save) = pane.leave_edit() else {
             panic!("save action");
         };
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: save.generation,
             error: None,
             project_root: "/proj".into(),
@@ -1575,7 +1668,7 @@ mod tests {
         let NotesOutcome::Rpc(rename) = pane.handle_key(press(KeyCode::Enter)) else {
             panic!("rename action");
         };
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: rename.generation,
             error: None,
             project_root: "/proj".into(),
@@ -1588,7 +1681,7 @@ mod tests {
         let NotesOutcome::Rpc(delete) = pane.handle_key(press(KeyCode::Char('y'))) else {
             panic!("delete action");
         };
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: delete.generation,
             error: None,
             project_root: "/proj".into(),
@@ -1599,7 +1692,7 @@ mod tests {
         assert!(pane.notes.is_empty());
         let applied = pane.highest_applied_generation;
 
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: 0,
             error: None,
             project_root: "/proj".into(),
@@ -1616,6 +1709,117 @@ mod tests {
     }
 
     #[test]
+    fn serialized_saves_execute_a_then_b_and_latest_failure_keeps_b_draft() {
+        let mut pane = pane(true);
+        pane.in_flight_generation = None;
+        pane.enter_edit();
+        let id = match pane.mode {
+            Mode::Editing { id } => id,
+            _ => unreachable!(),
+        };
+        pane.editor.set("draft A".to_string());
+        let NotesOutcome::Rpc(save_a) = pane.leave_edit() else {
+            panic!("A starts immediately");
+        };
+        pane.paste(" + draft B");
+        let b_draft = pane.editor.text().to_string();
+        assert!(matches!(pane.leave_edit(), NotesOutcome::Stay));
+        let b_generation = pane.pending_save.as_ref().unwrap().generation;
+
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: b_generation,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(id, "ideas", &b_draft)],
+            selection: SelectionAfterRpc::Keep(id),
+            enter_edit: false,
+        }));
+        assert_eq!(pane.in_flight_generation, Some(save_a.generation));
+        assert_eq!(pane.editor.text(), b_draft);
+
+        let save_b = pane
+            .apply_rpc_result(Ok(NotesRpcResult {
+                generation: save_a.generation,
+                error: None,
+                project_root: "/proj".into(),
+                notes: vec![note(id, "ideas", "draft A")],
+                selection: SelectionAfterRpc::Keep(id),
+                enter_edit: false,
+            }))
+            .expect("B begins only after A completion");
+        assert_eq!(save_b.generation, b_generation);
+        assert!(matches!(save_b.kind, NotesRpcActionKind::Save { id: saved, .. } if saved == id));
+        assert_eq!(pane.notes[0].content, "draft A");
+        assert!(matches!(pane.mode, Mode::Editing { id: editing } if editing == id));
+
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: save_b.generation,
+            error: Some("disk full on B".into()),
+            project_root: "/proj".into(),
+            notes: Vec::new(),
+            selection: SelectionAfterRpc::Keep(id),
+            enter_edit: false,
+        }));
+        assert_eq!(pane.notes[0].content, "draft A");
+        assert_eq!(pane.editor.text(), b_draft);
+        assert_eq!(pane.status.as_deref(), Some("disk full on B"));
+    }
+
+    #[test]
+    fn projection_lane_orders_duplicate_and_distinct_mutations() {
+        let mut pane = pane(true);
+        pane.in_flight_generation = None;
+        let id = pane.notes[0].id;
+        let (_, first) = pane
+            .schedule_action(NotesRpcActionKind::Rename {
+                id,
+                name: "first".into(),
+            })
+            .unwrap();
+        let first = first.expect("first starts");
+        let (duplicate_generation, duplicate) = pane
+            .schedule_action(NotesRpcActionKind::Rename {
+                id,
+                name: "first".into(),
+            })
+            .unwrap();
+        assert!(duplicate.is_none());
+        let (delete_generation, delete) = pane
+            .schedule_action(NotesRpcActionKind::Delete {
+                id,
+                fallback_index: 0,
+            })
+            .unwrap();
+        assert!(delete.is_none());
+
+        let duplicate = pane
+            .apply_rpc_result(Ok(NotesRpcResult {
+                generation: first.generation,
+                error: None,
+                project_root: "/proj".into(),
+                notes: vec![note(id, "first", "before")],
+                selection: SelectionAfterRpc::Keep(id),
+                enter_edit: false,
+            }))
+            .expect("duplicate rename is next, never concurrent");
+        assert_eq!(duplicate.generation, duplicate_generation);
+        let delete = pane
+            .apply_rpc_result(Ok(NotesRpcResult {
+                generation: duplicate.generation,
+                error: None,
+                project_root: "/proj".into(),
+                notes: vec![note(id, "first", "before")],
+                selection: SelectionAfterRpc::Keep(id),
+                enter_edit: false,
+            }))
+            .expect("distinct delete follows both renames");
+        assert_eq!(delete.generation, delete_generation);
+        assert!(
+            matches!(delete.kind, NotesRpcActionKind::Delete { id: deleted, .. } if deleted == id)
+        );
+    }
+
+    #[test]
     fn delete_fallback_selects_next_then_clamps_to_previous() {
         let mut pane = pane(true);
         let first = Uuid::new_v4();
@@ -1626,7 +1830,8 @@ mod tests {
             note(next, "next", "c"),
         ];
         pane.select_sidebar(1);
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        pane.in_flight_generation = Some(1);
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1637,7 +1842,8 @@ mod tests {
         assert_eq!(pane.selection, SidebarSelection::Note(next));
 
         pane.operation_generation = 2;
-        pane.apply_rpc_result(Ok(NotesRpcResult {
+        pane.in_flight_generation = Some(2);
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             generation: 2,
             error: None,
             project_root: "/proj".into(),

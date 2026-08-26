@@ -1726,13 +1726,18 @@ impl App {
                 Err(e) => self.show_toast(format!("/resources: {e}"), ToastKind::Error),
             },
             AsyncActionKind::Internal("notes.rpc") => {
-                if let Overlay::Notes(pane) = &mut self.overlay {
+                let next = if let Overlay::Notes(pane) = &mut self.overlay {
                     let payload = match result.payload {
                         Ok(AsyncActionPayload::NotesRpc(result)) => Ok(result),
                         Ok(_) => Err("notes db returned an unexpected response".to_string()),
                         Err(e) => Err(e),
                     };
-                    pane.apply_rpc_result(payload);
+                    pane.apply_rpc_result(payload)
+                } else {
+                    None
+                };
+                if let Some(action) = next {
+                    self.start_notes_rpc_action(action);
                 }
             }
             AsyncActionKind::Internal("leaks.rpc") => {

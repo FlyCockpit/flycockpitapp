@@ -1225,6 +1225,11 @@ fn create_migration_backup_with_limit(
     reason: &str,
     quarantine_byte_limit: u64,
 ) -> Result<()> {
+    // Serialize the complete artifact lifecycle across processes, including
+    // callers of the public non-daemon `Db::open`. While this lock is held,
+    // every owned candidate is crash residue: a live creator cannot coexist.
+    let _artifact_lock = BackupArtifactLock::acquire(path)?;
+    remove_stale_backup_candidates(path)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1250,9 +1255,13 @@ fn create_migration_backup_with_limit(
         "v{schema_version}.backup-candidate-{stamp}-{:016x}.sqlite.tmp",
         rand::random::<u64>()
     ));
+    // Arm cleanup before exposing the candidate pathname to SQLite. This also
+    // covers partial files left by an ordinary VACUUM error or later failure.
+    let mut candidate_guard = BackupCandidateGuard::new(candidate.clone());
     if let Err(error) = conn.execute("VACUUM INTO ?1", [candidate.to_string_lossy().as_ref()]) {
         if candidate.exists() {
             remove_backup_candidate(&candidate)?;
+            candidate_guard.disarm();
         }
         return Err(error).with_context(|| {
             format!(
@@ -1261,7 +1270,6 @@ fn create_migration_backup_with_limit(
             )
         });
     }
-    let mut candidate_guard = BackupCandidateGuard::new(candidate.clone());
     files::repair_private_file(&candidate, "database backup candidate")?;
     let candidate_bytes = std::fs::metadata(&candidate)
         .with_context(|| format!("reading backup candidate size {}", candidate.display()))?
@@ -1330,6 +1338,36 @@ fn create_migration_backup_with_limit(
     Ok(())
 }
 
+/// Cross-process serialization for recovery-artifact admission. The sibling
+/// lock file is persistent; its kernel lock, not file existence, is authority.
+struct BackupArtifactLock {
+    file: std::fs::File,
+}
+
+impl BackupArtifactLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        use std::fs::OpenOptions;
+
+        let lock_path = path.with_extension("backup-artifacts.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening backup artifact lock {}", lock_path.display()))?;
+        files::repair_private_file(&lock_path, "database backup artifact lock")?;
+        file.lock()
+            .with_context(|| format!("locking backup artifacts for {}", path.display()))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for BackupArtifactLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
 fn sqlite_allocated_bytes(conn: &Connection) -> Result<u64> {
     let page_count: u64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
     let page_size: u64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
@@ -1367,6 +1405,50 @@ fn remove_backup_candidate(path: &Path) -> Result<()> {
         std::fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
+}
+
+/// Remove candidate files abandoned by a crashed prior lock owner. This must
+/// run only while holding `BackupArtifactLock`; therefore an owned candidate
+/// can never belong to a live creator when it is removed.
+fn remove_stale_backup_candidates(path: &Path) -> Result<usize> {
+    let Some(parent) = path.parent() else {
+        return Ok(0);
+    };
+    let prefix = format!(
+        "{}.",
+        path.file_stem().unwrap_or_default().to_string_lossy()
+    );
+    let mut removed = 0_usize;
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with(&prefix)
+            && name.contains(".backup-candidate-")
+            && name.ends_with(".sqlite.tmp"))
+        {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading backup candidate type {}", entry.path().display()))?;
+        anyhow::ensure!(
+            file_type.is_file() || file_type.is_symlink(),
+            "backup candidate path is not a removable file: {}",
+            entry.path().display()
+        );
+        std::fs::remove_file(entry.path()).with_context(|| {
+            format!("removing stale backup candidate {}", entry.path().display())
+        })?;
+        removed += 1;
+    }
+    if removed > 0 {
+        std::fs::File::open(parent)
+            .with_context(|| format!("opening backup directory {} for fsync", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("fsyncing backup directory {}", parent.display()))?;
+    }
+    Ok(removed)
 }
 
 struct BackupCandidateGuard {
@@ -2645,6 +2727,65 @@ mod tests {
         );
         assert_ne!(file_sha256(&one).unwrap(), file_sha256(&two).unwrap());
         assert_eq!(file_sha256(&one).unwrap(), file_sha256(&one).unwrap());
+    }
+
+    #[test]
+    fn stale_backup_candidates_are_removed_before_artifact_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        for index in 0..4 {
+            std::fs::write(
+                temp.path().join(format!(
+                    "cockpit.v1.backup-candidate-{index}-0000000000000000.sqlite.tmp"
+                )),
+                vec![0_u8; 8],
+            )
+            .unwrap();
+        }
+        let unrelated = temp.path().join("other.v1.backup-candidate-0.sqlite.tmp");
+        std::fs::write(&unrelated, b"not ours").unwrap();
+
+        let _lock = BackupArtifactLock::acquire(&path).unwrap();
+        assert_eq!(remove_stale_backup_candidates(&path).unwrap(), 4);
+        assert_eq!(remove_stale_backup_candidates(&path).unwrap(), 0);
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn backup_artifact_lock_serializes_concurrent_admission_cleanup() {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let first = BackupArtifactLock::acquire(&path).unwrap();
+        let stale = temp
+            .path()
+            .join("cockpit.v1.backup-candidate-crash-0000000000000000.sqlite.tmp");
+        std::fs::write(&stale, b"partial").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _lock = BackupArtifactLock::acquire(&contender_path).unwrap();
+            remove_stale_backup_candidates(&contender_path).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a second artifact admission acquired the live creator's lock"
+        );
+        assert!(stale.exists(), "a contender removed a live candidate");
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        contender.join().unwrap();
+        assert!(!stale.exists());
     }
 
     #[test]

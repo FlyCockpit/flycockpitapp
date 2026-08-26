@@ -179,6 +179,65 @@ pub struct PasteTextCountReplacement {
 }
 
 impl PasteRegistry {
+    fn same_image_identity(left: &PasteKind, right: &PasteKind) -> bool {
+        match (left, right) {
+            (
+                PasteKind::Image {
+                    png: left_png,
+                    hash: left_hash,
+                    ..
+                },
+                PasteKind::Image {
+                    png: right_png,
+                    hash: right_hash,
+                    ..
+                },
+            ) => left_hash == right_hash && left_png == right_png,
+            (
+                PasteKind::ImageHandle {
+                    normalized_byte_length: left_length,
+                    sha256: left_sha256,
+                    hash: left_hash,
+                    ..
+                },
+                PasteKind::ImageHandle {
+                    normalized_byte_length: right_length,
+                    sha256: right_sha256,
+                    hash: right_hash,
+                    ..
+                },
+            ) => {
+                left_hash == right_hash
+                    && left_sha256 == right_sha256
+                    && left_length == right_length
+            }
+            _ => false,
+        }
+    }
+
+    /// Elect the leftmost surviving occurrence of every exact typed image
+    /// identity as its payload carrier. Stored reference roles are derived
+    /// state: deleting or retiring the prior carrier must promote the next
+    /// occurrence before submission and draft-cleanup ownership are queried.
+    fn reelect_image_references(&mut self) {
+        for index in 0..self.blocks.len() {
+            let (prior, current) = self.blocks.split_at_mut(index);
+            let current = &mut current[0];
+            let reference = prior
+                .iter()
+                .any(|block| Self::same_image_identity(&block.kind, &current.kind));
+            match &mut current.kind {
+                PasteKind::Image {
+                    reference: slot, ..
+                }
+                | PasteKind::ImageHandle {
+                    reference: slot, ..
+                } => *slot = reference,
+                PasteKind::Text { .. } => {}
+            }
+        }
+    }
+
     fn expected_placeholder(block: &PasteBlock) -> String {
         match &block.kind {
             PasteKind::Text { tokens, .. } => tokens.map_or_else(
@@ -210,6 +269,7 @@ impl PasteRegistry {
                     .get(block.start..block.end)
                     .is_some_and(|text| text == Self::expected_placeholder(block))
         });
+        self.reelect_image_references();
         debug_assert!(
             self.blocks
                 .windows(2)
@@ -779,6 +839,7 @@ impl PasteRegistry {
             }
         }
         self.blocks.sort_by_key(|block| block.start);
+        self.reelect_image_references();
     }
 
     /// Keep block byte-ranges in sync after an edit of magnitude `delta`
@@ -826,6 +887,7 @@ impl PasteRegistry {
                 }
             }
         }
+        self.reelect_image_references();
     }
 
     /// The block whose closing boundary (`end`) is exactly at `cursor` —

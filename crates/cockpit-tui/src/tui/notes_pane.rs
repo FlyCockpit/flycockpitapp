@@ -747,7 +747,9 @@ impl NotesPane {
                 }
             }
             KeyCode::Backspace => {
-                buffer.pop();
+                if let Some(grapheme) = markdown::semantic_graphemes(buffer).into_iter().last() {
+                    buffer.truncate(buffer.len() - grapheme.len());
+                }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 buffer.push(c);
@@ -1252,6 +1254,28 @@ mod tests {
         };
         pane.sidebar.select(Some(0));
         pane
+    }
+
+    #[test]
+    fn naming_backspace_removes_one_semantic_grapheme() {
+        for cluster in ["e\u{301}", "👩\u{200d}💻", "क्\u{200d}ष"] {
+            let mut pane = pane(true);
+            pane.start_create();
+            let Mode::Naming { buffer, .. } = &mut pane.mode else {
+                panic!("naming mode");
+            };
+            buffer.push_str("prefix");
+            buffer.push_str(cluster);
+
+            assert!(matches!(
+                pane.handle_naming_key(press(KeyCode::Backspace)),
+                NotesOutcome::Stay
+            ));
+            let Mode::Naming { buffer, .. } = &pane.mode else {
+                panic!("naming mode");
+            };
+            assert_eq!(buffer, "prefix");
+        }
     }
 
     fn note(id: Uuid, name: impl Into<String>, content: impl Into<String>) -> ProjectNote {

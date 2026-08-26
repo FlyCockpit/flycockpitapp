@@ -1242,6 +1242,93 @@ mod tests {
     }
 
     #[test]
+    fn deleting_or_reordering_byte_carriers_reelects_the_leftmost_survivor() {
+        let png = vec![1, 2, 3];
+        let mut owner = RegisteredComposer::new(false);
+        assert!(owner.try_insert_image(png.clone()));
+        assert!(owner.try_insert_image(png.clone()));
+        let first = owner.paste_spans().next().unwrap();
+        owner.delete_paste_block(first.start, first.end);
+
+        let (_, images) = owner.wire_parts(true);
+        assert_eq!(images.len(), 1);
+        assert!(matches!(
+            owner.paste_registry.blocks()[0].kind,
+            PasteKind::Image {
+                reference: false,
+                ..
+            }
+        ));
+
+        owner.set_cursor(0);
+        assert!(owner.try_insert_image(png));
+        assert!(matches!(
+            owner.paste_registry.blocks()[0].kind,
+            PasteKind::Image {
+                reference: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            owner.paste_registry.blocks()[1].kind,
+            PasteKind::Image {
+                reference: true,
+                ..
+            }
+        ));
+        assert_eq!(owner.wire_parts(true).1.len(), 1);
+    }
+
+    #[test]
+    fn retiring_a_corrupt_byte_carrier_promotes_its_duplicate() {
+        let png = vec![4, 5, 6];
+        let mut owner = RegisteredComposer::new(false);
+        assert!(owner.try_insert_image(png.clone()));
+        assert!(owner.try_insert_image(png));
+        let first = owner.paste_spans().next().unwrap();
+        owner.composer.set_cursor(first.start);
+        let _ = owner.composer.delete_range(first.start, first.start + 1);
+        owner.composer.insert_char('!');
+        owner.reconcile();
+
+        assert_eq!(owner.paste_registry.blocks().len(), 1);
+        assert!(matches!(
+            owner.paste_registry.blocks()[0].kind,
+            PasteKind::Image {
+                reference: false,
+                ..
+            }
+        ));
+        assert_eq!(owner.wire_parts(true).1.len(), 1);
+    }
+
+    #[test]
+    fn deleting_handle_carrier_promotes_exact_draft_and_preserves_cleanup_ownership() {
+        let mut owner = RegisteredComposer::new(false);
+        let (first_draft, first_ref) = image_authority();
+        let (second_draft, second_ref) = image_authority();
+        assert!(owner.try_insert_image_handle(first_draft.clone(), first_ref, 8, "same".into()));
+        assert!(owner.try_insert_image_handle(
+            second_draft.clone(),
+            second_ref.clone(),
+            8,
+            "same".into()
+        ));
+        let first = owner.paste_spans().next().unwrap();
+        owner.delete_paste_block(first.start, first.end);
+
+        assert_eq!(owner.image_ingress_drafts(), vec![second_draft.clone()]);
+        assert_eq!(owner.wire_image_ingress_drafts(true), vec![second_draft]);
+        let (_, images) = owner.wire_parts(true);
+        assert_eq!(
+            images,
+            vec![cockpit_core::engine::message::SubmissionImage::retained(
+                second_ref
+            )]
+        );
+    }
+
+    #[test]
     fn handle_duplicates_validate_intrinsic_and_retained_metadata_before_limit_bypass() {
         let mut owner = RegisteredComposer::new(false);
         let (draft, image_ref) = image_authority();

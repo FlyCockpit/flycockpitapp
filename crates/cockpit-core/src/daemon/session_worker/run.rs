@@ -1670,9 +1670,9 @@ async fn attach_agent_tree_profile_utility_models(
 }
 
 fn agent_tree_resolver_prompt(packet: &crate::agent_tree::RedactedDecisionPacket) -> anyhow::Result<String> {
-    let packet = serde_json::to_string(packet)
+    let packet_json = serde_json::to_string(packet)
         .context("serializing redacted agent-tree resolver packet")?;
-    let owns_interrupt_continuation = serde_json::from_str::<serde_json::Value>(&packet)
+    let owns_interrupt_continuation = serde_json::from_str::<serde_json::Value>(&packet_json)
         .ok()
         .and_then(|packet| {
             packet
@@ -1704,7 +1704,7 @@ fn agent_tree_resolver_prompt(packet: &crate::agent_tree::RedactedDecisionPacket
     });
     Ok(format!(
         "Resolve this low-risk daemon decision using only its redacted contract.{host_instruction} \\
-         {answer_contract}\n\n{packet}"
+         {answer_contract}\n\n{packet_json}"
     ))
 }
 
@@ -2415,16 +2415,17 @@ async fn deliver_terminal_agent_tree_interrupt(
 /// attached exact-owner continuation accepts it; a send/reply failure releases
 /// the exact claim for restart recovery rather than dropping the user
 /// instruction.
-async fn deliver_live_agent_tree_late_user_steers(
-    session: &Arc<Session>,
+fn deliver_live_agent_tree_late_user_steers<'a>(
+    session: &'a Arc<Session>,
     session_id: uuid::Uuid,
     agent_instance_id: uuid::Uuid,
-    registry: &std::sync::Arc<WorkerAgentTreeResolverRegistry>,
+    registry: &'a std::sync::Arc<WorkerAgentTreeResolverRegistry>,
     recovered_claim: Option<(
         uuid::Uuid,
         Vec<crate::db::agent_tree_decisions::LateUserDecisionSteer>,
     )>,
-) -> anyhow::Result<()> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
     let registered = registry
         .parent_endpoint_registration(session_id, agent_instance_id)
         .context("late user steer has no live exact agent executor")?;
@@ -2757,6 +2758,7 @@ async fn deliver_live_agent_tree_late_user_steers(
         });
     }
     Ok(())
+    })
 }
 
 /// Enqueue a newly pending late steer without ever waiting for an executor's
@@ -2920,12 +2922,12 @@ fn root_parked_interrupt_id_from_snapshot(snapshot_json: &str) -> anyhow::Result
 /// absent from this live scheduler: they are boot/recovery-only work, because
 /// attaching one can require a durable executor reattachment and must never
 /// wait behind a running driver's bounded control mailbox.
-async fn deliver_next_pending_late_user_steer(
-    session: &Arc<Session>,
+fn deliver_next_pending_late_user_steer<'a>(
+    session: &'a Arc<Session>,
     session_id: uuid::Uuid,
     agent_instance_id: uuid::Uuid,
-    registry: &Arc<WorkerAgentTreeResolverRegistry>,
-) -> anyhow::Result<()> {
+    registry: &'a Arc<WorkerAgentTreeResolverRegistry>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     deliver_live_agent_tree_late_user_steers(
         session,
         session_id,
@@ -2933,7 +2935,6 @@ async fn deliver_next_pending_late_user_steer(
         registry,
         None,
     )
-    .await
 }
 
 pub(super) fn redaction_failed_interrupt_decision_payload(
@@ -5106,7 +5107,9 @@ pub(super) async fn run_worker(
             .await
         {
             Ok(Some(receipt)) => {
-                let snapshot: cockpit_proto::HostCapabilitySnapshot = match serde_json::from_str(
+                let snapshot: cockpit_proto::HostCapabilitySnapshot = match serde_json::from_str::<
+                    cockpit_proto::HostCapabilitySnapshot,
+                >(
                     &receipt.result_snapshot_json,
                 ) {
                     Ok(snapshot) if snapshot.generation == receipt.generation => snapshot,
@@ -6392,6 +6395,11 @@ pub(super) async fn run_worker(
                             return;
                         }
                     }
+                    Ok(Ok(_)) => {
+                        activation_gate.abort();
+                        tracing::warn!(%agent_instance_id, "recovered noninteractive child executor installed no resolver mailbox; retaining exact claim");
+                        remaining.push(agent_instance_id);
+                    }
                     Ok(Err(error)) => {
                         activation_gate.abort();
                         tracing::warn!(%error, %agent_instance_id, "recovering noninteractive child executor failed; retaining exact claim");
@@ -7105,13 +7113,16 @@ pub(super) async fn run_worker(
                 // This also drains the completed publication outbox, including
                 // the narrow crash window after completion CAS and before the
                 // in-memory store swap.
-                spawn_ready_host_capability_refresh_operations(
-                    &session,
+                let host_capability_refresh_runtime = {
                     config_snapshot
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .host_capability_refresh_runtime
-                        .clone(),
+                        .clone()
+                };
+                spawn_ready_host_capability_refresh_operations(
+                    &session,
+                    host_capability_refresh_runtime,
                     &global_bus,
                     &redaction,
                     &tree_resolver_registry,
@@ -7226,13 +7237,16 @@ pub(super) async fn run_worker(
                     Ok(crate::agent_tree::DecisionSettlement::Resolved(
                         crate::db::agent_tree_decisions::DecisionState::AutoResolved,
                     )) => {
-                        spawn_ready_host_capability_refresh_operations(
-                            &session,
+                        let host_capability_refresh_runtime = {
                             config_snapshot
                                 .read()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .host_capability_refresh_runtime
-                                .clone(),
+                                .clone()
+                        };
+                        spawn_ready_host_capability_refresh_operations(
+                            &session,
+                            host_capability_refresh_runtime,
                             &global_bus,
                             &redaction,
                             &tree_resolver_registry,
@@ -8505,13 +8519,16 @@ pub(super) async fn run_worker(
                             settlement,
                             crate::agent_tree::DecisionSettlement::Resolved(_)
                         ) {
-                            spawn_ready_host_capability_refresh_operations(
-                                &session,
+                            let host_capability_refresh_runtime = {
                                 config_snapshot
                                     .read()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                                     .host_capability_refresh_runtime
-                                    .clone(),
+                                    .clone()
+                            };
+                            spawn_ready_host_capability_refresh_operations(
+                                &session,
+                                host_capability_refresh_runtime,
                                 &global_bus,
                                 &redaction,
                                 &tree_resolver_registry,
@@ -9007,13 +9024,16 @@ pub(super) async fn run_worker(
                         }
                     }
                     if tree_settlement_won {
-                        spawn_ready_host_capability_refresh_operations(
-                            &session,
+                        let host_capability_refresh_runtime = {
                             config_snapshot
                                 .read()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .host_capability_refresh_runtime
-                                .clone(),
+                                .clone()
+                        };
+                        spawn_ready_host_capability_refresh_operations(
+                            &session,
+                            host_capability_refresh_runtime,
                             &global_bus,
                             &redaction,
                             &tree_resolver_registry,

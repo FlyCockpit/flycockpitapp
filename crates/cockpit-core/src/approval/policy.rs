@@ -1239,7 +1239,7 @@ impl Approver {
             question,
             "image_generation",
             serde_json::json!({
-                "plan_digest": facts.plan_digest,
+                "plan_digest": facts.plan_digest.as_str(),
                 "destinations": facts.destinations,
                 "fanout": facts.fanout,
                 "total_outputs": facts.total_outputs,
@@ -1254,9 +1254,9 @@ impl Approver {
                 "destination_enabled": facts.destination_enabled,
                 "capability_fresh": facts.capability_fresh,
                 "insecure_transport_allowed": facts.insecure_transport_allowed,
-                "output_path_authority": facts.output_path_authority,
+                "output_path_authority": facts.output_path_authority.as_str(),
                 "candidate_effects": [
-                    {"selection": "approve_once", "execute": {"plan_digest": facts.plan_digest, "destinations": facts.destinations, "fanout": facts.fanout, "total_outputs": facts.total_outputs, "cost_maximum": facts.cost_maximum, "output_path_authority": facts.output_path_authority}},
+                    {"selection": "approve_once", "execute": {"plan_digest": facts.plan_digest.as_str(), "destinations": facts.destinations, "fanout": facts.fanout, "total_outputs": facts.total_outputs, "cost_maximum": facts.cost_maximum, "output_path_authority": facts.output_path_authority.as_str()}},
                     {"selection": "reject", "effect": "deny"}
                 ],
             }),

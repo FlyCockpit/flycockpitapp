@@ -1707,33 +1707,35 @@ mod tests {
     fn edit_and_delete_remain_bound_to_captured_note_identity() {
         let edited = Uuid::new_v4();
         let other = Uuid::new_v4();
-        let mut pane = pane(true);
-        pane.notes = vec![
-            note(edited, "edited", "draft"),
-            note(other, "other", "other"),
-        ];
-        pane.select_sidebar(0);
-        pane.pending_generations = VecDeque::from([1]);
-        pane.enter_edit();
-        assert!(matches!(pane.mode, Mode::Editing { id } if id == edited));
-        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
-            instance_id: 0,
-            generation: 1,
-            error: None,
-            project_root: "/proj".into(),
-            notes: vec![note(other, "other", "changed")],
-            selection: SelectionAfterRpc::Preserve,
-            enter_edit: false,
-        }));
-        assert_eq!(
-            pane.notes.len(),
-            1,
-            "serialized older completion may refresh inventory during edit"
-        );
-        let NotesOutcome::Rpc(save) = pane.leave_edit() else {
-            panic!("save action");
-        };
-        assert!(matches!(save.kind, NotesRpcActionKind::Save { id, .. } if id == edited));
+        {
+            let mut pane = pane(true);
+            pane.notes = vec![
+                note(edited, "edited", "draft"),
+                note(other, "other", "other"),
+            ];
+            pane.select_sidebar(0);
+            pane.pending_generations = VecDeque::from([1]);
+            pane.enter_edit();
+            assert!(matches!(pane.mode, Mode::Editing { id } if id == edited));
+            let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+                instance_id: 0,
+                generation: 1,
+                error: None,
+                project_root: "/proj".into(),
+                notes: vec![note(other, "other", "changed")],
+                selection: SelectionAfterRpc::Preserve,
+                enter_edit: false,
+            }));
+            assert_eq!(
+                pane.notes.len(),
+                1,
+                "serialized older completion may refresh inventory during edit"
+            );
+            let NotesOutcome::Rpc(save) = pane.leave_edit() else {
+                panic!("save action");
+            };
+            assert!(matches!(save.kind, NotesRpcActionKind::Save { id, .. } if id == edited));
+        }
 
         let mut pane = pane(true);
         pane.notes = vec![
@@ -2063,7 +2065,7 @@ mod tests {
         pane.pending_generations.clear();
         pane.enter_edit();
         let id = pane.notes[0].id;
-        pane.editor.set("first draft".into());
+        pane.editor.set("first draft".to_string());
         let NotesOutcome::Rpc(first) = pane.leave_edit() else {
             panic!("first save starts");
         };

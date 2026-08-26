@@ -73,12 +73,13 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
             })?;
         return finish_snapshot(worker.rendered, worker.has_failures);
     }
+    let request_args = args.clone();
     let response = match crate::daemon::client::run_owned_daemon(
         OwnedSessionMode::AttachOrEphemeral,
         |client| {
-            Box::pin(async {
+            Box::pin(async move {
                 client
-                    .request(build_doctor_request(&args, no_sandbox))
+                    .request(build_doctor_request(&request_args, no_sandbox))
                     .await
                     .map_err(DoctorCouldNotRun)?
                     .map_err(|error| {

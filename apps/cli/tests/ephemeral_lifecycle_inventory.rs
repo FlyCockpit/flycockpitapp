@@ -99,21 +99,21 @@ fn owned_session_occurrences_in_source(source: &str, relative: &str) -> Vec<Stri
     fn inspect_items(items: &[syn::Item], relative: &str, violations: &mut Vec<String>) {
         for item in items {
             let attrs = match item {
-                syn::Item::Const(item) => &item.attrs,
-                syn::Item::Enum(item) => &item.attrs,
-                syn::Item::ExternCrate(item) => &item.attrs,
-                syn::Item::Fn(item) => &item.attrs,
-                syn::Item::ForeignMod(item) => &item.attrs,
-                syn::Item::Impl(item) => &item.attrs,
-                syn::Item::Macro(item) => &item.attrs,
-                syn::Item::Mod(item) => &item.attrs,
-                syn::Item::Static(item) => &item.attrs,
-                syn::Item::Struct(item) => &item.attrs,
-                syn::Item::Trait(item) => &item.attrs,
-                syn::Item::TraitAlias(item) => &item.attrs,
-                syn::Item::Type(item) => &item.attrs,
-                syn::Item::Union(item) => &item.attrs,
-                syn::Item::Use(item) => &item.attrs,
+                syn::Item::Const(item) => item.attrs.as_slice(),
+                syn::Item::Enum(item) => item.attrs.as_slice(),
+                syn::Item::ExternCrate(item) => item.attrs.as_slice(),
+                syn::Item::Fn(item) => item.attrs.as_slice(),
+                syn::Item::ForeignMod(item) => item.attrs.as_slice(),
+                syn::Item::Impl(item) => item.attrs.as_slice(),
+                syn::Item::Macro(item) => item.attrs.as_slice(),
+                syn::Item::Mod(item) => item.attrs.as_slice(),
+                syn::Item::Static(item) => item.attrs.as_slice(),
+                syn::Item::Struct(item) => item.attrs.as_slice(),
+                syn::Item::Trait(item) => item.attrs.as_slice(),
+                syn::Item::TraitAlias(item) => item.attrs.as_slice(),
+                syn::Item::Type(item) => item.attrs.as_slice(),
+                syn::Item::Union(item) => item.attrs.as_slice(),
+                syn::Item::Use(item) => item.attrs.as_slice(),
                 _ => &[],
             };
             if is_test_only(attrs) {
@@ -662,6 +662,8 @@ fn canonical_runner_body() -> syn::Block {
     )
     .unwrap()
     .block
+    .as_ref()
+    .clone()
 }
 
 fn canonical_owned_method(name: &str) -> syn::ImplItemFn {
@@ -1603,7 +1605,10 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
         "let constructor = OwnedDaemonSession::connect;\n    let session = constructor(mode)",
         1,
     );
-    assert_eq!(raw_owner_acquisitions(&function_item), []);
+    assert_eq!(
+        raw_owner_acquisitions(&function_item),
+        Vec::<String>::new()
+    );
     assert_eq!(raw_owner_connect_path_count(&function_item), 1);
 
     let test_then_production_literal = r#"

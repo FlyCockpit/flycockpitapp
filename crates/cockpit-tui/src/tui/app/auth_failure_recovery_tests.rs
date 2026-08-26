@@ -3,9 +3,8 @@ use std::fs;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, Overlay};
-use cockpit_core::engine::TurnEvent;
-use cockpit_core::engine::model::InferenceErrorClass;
-use cockpit_proto::AuthFailureKind;
+use cockpit_client::presentation::TurnEvent;
+use cockpit_proto::{AuthFailureKind, InferenceErrorClass};
 
 fn write_provider(root: &std::path::Path, template: Option<&str>, url: &str) {
     let cockpit = root.join(".cockpit");

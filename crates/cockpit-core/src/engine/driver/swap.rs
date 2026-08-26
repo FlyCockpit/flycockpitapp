@@ -1454,7 +1454,7 @@ impl Driver {
         // driver could capture Trust, then write a project layer after an
         // IgnoreConfig decision committed.
         let _config_publication_guard =
-            crate::daemon::server::dispatch::CONFIG_PUBLICATION_RPC_LOCK
+            crate::daemon::server::CONFIG_PUBLICATION_RPC_LOCK
                 .lock()
                 .await;
 

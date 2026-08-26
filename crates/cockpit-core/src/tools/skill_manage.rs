@@ -210,7 +210,11 @@ fn skill_mutation_payload_digest(args: &SkillManageArgs) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(b"flycockpit.skill-manage-approval.v1\0");
     hasher.update(canonical);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// The exact effect shape persisted in the selected approval candidate and

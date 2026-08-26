@@ -22,11 +22,13 @@ async fn prune_targets_foreground_subagent_only() {
         ),
         agent: child,
         agent_instance_id: None,
+        endpoint_generation: None,
         history: dup_read_history(),
         answering: None,
         deferred_log: crate::engine::deferred::DeferredLog::new(),
         fallback_decision: None,
         recovery_activation: None,
+        late_user_steer_permit: None,
         _vnext_child_admission: None,
         stop_gate: crate::engine::agent::hooks::StopGateState::default(),
     });
@@ -294,7 +296,9 @@ async fn prune_watermark_cleared_for_popped_child_depth() {
     );
     assert!(driver.prune_watermark.contains_key(&2));
 
-    let _ = driver.pop_child_with_envelope(None, &tx).await;
+    let _ = driver
+        .pop_child_with_envelope(None, None, &[], &tx)
+        .await;
 
     assert_eq!(
         driver.prune_watermark.get(&1).copied(),

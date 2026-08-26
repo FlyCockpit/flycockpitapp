@@ -102,7 +102,7 @@ fn auto_prune_notice_renders_muted() {
     use crate::tui::history::{MarkdownOpts, render_entry};
     use crate::tui::theme::MUTED_COLOR_INDEX;
     use cockpit_config::extended::{DiffStyle, ThinkingDisplay};
-    use cockpit_core::engine::agent::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -335,7 +335,7 @@ fn durable_control_receipt_fences_every_guarded_exit() {
     let mut app = App::new(Some(tmp.path()), false);
     app.daemon_prompt = None;
     app.dialog = crate::tui::settings::Dialog::None;
-    let request_id = cockpit_core::engine::ControlRequestId(41);
+    let request_id = cockpit_client::presentation::ControlRequestId(41);
     app.pending_control_requests.insert(
         request_id,
         PendingControlRequest {

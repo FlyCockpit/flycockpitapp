@@ -279,6 +279,17 @@ pub fn is_protocol_version_mismatch(error: &anyhow::Error) -> bool {
         .is_some_and(|payload| payload.code == proto::ErrorCode::ProtocolVersion)
 }
 
+/// Typed request surface shared by [`DaemonClient`] and lifetime-bound
+/// wrappers that must not convert back into a client handle.
+pub trait DaemonRequestClient: Send + Sync {
+    fn request(
+        &self,
+        request: Request,
+    ) -> impl std::future::Future<
+        Output = Result<std::result::Result<Response, ErrorPayload>>,
+    > + Send;
+}
+
 /// Public handle. Cheap to clone: every clone shares the same
 /// background reader/writer task; only the event-stream subscription
 /// differs.
@@ -474,6 +485,15 @@ impl DaemonClient {
         {
             false
         }
+    }
+}
+
+impl DaemonRequestClient for DaemonClient {
+    async fn request(
+        &self,
+        request: Request,
+    ) -> Result<std::result::Result<Response, ErrorPayload>> {
+        DaemonClient::request(self, request).await
     }
 }
 
@@ -837,6 +857,7 @@ mod tests {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
+            session_entry_mode: Some(proto::SessionEntryMode::Code),
             model_override: None,
             client_protocol_version,
             env_snapshot: None,
@@ -847,6 +868,7 @@ mod tests {
     fn attached_response(session_id: Uuid) -> Response {
         Response::Attached {
             session_id,
+            session_entry_mode: proto::SessionEntryMode::Code,
             short_id: "abc123".to_string(),
             project_root: "/tmp".to_string(),
             project_id: "project".to_string(),
@@ -1260,6 +1282,7 @@ mod tests {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
+            session_entry_mode: Some(proto::SessionEntryMode::Code),
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,

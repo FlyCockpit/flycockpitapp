@@ -2498,7 +2498,7 @@ mod tests {
         let combining_start = composer.text().find(combining).unwrap();
         composer.set_visual_selection(combining_start + 1, combining_start + 1);
         let visual = composer.visual_range().expect("visual range");
-        assert_eq!(visual, combining_start..combining_start + combining.len());
+        assert_eq!(visual, (combining_start, combining_start + combining.len()));
         composer.yank_range(visual.0, visual.1, false);
         assert_eq!(composer.register().text, combining);
     }

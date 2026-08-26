@@ -385,7 +385,7 @@ pub struct InterruptDecision {
     pub lines: Vec<InterruptDecisionLine>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", content = "data")]
 pub enum ResolveResponse {
     Single { selected_id: String },

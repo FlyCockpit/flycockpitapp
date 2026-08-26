@@ -371,7 +371,7 @@ fn leader_does_not_open_over_question_dialog() {
 fn orphan_tool_end_renders_standalone_success_line() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app(&tmp);
-    app.apply_event(cockpit_core::engine::agent::TurnEvent::ToolEnd {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ToolEnd {
         agent: "Build".into(),
         call_id: "orphan-call".into(),
         tool: "read".into(),
@@ -398,13 +398,13 @@ fn read_tool_end_stores_captured_output_but_unlock_does_not() {
         ("read-call", "read", "src/main.rs", "1|fn main() {}"),
         ("unlock-call", "unlock", "src/lib.rs", "SHOULD_NOT_STORE"),
     ] {
-        app.apply_event(cockpit_core::engine::agent::TurnEvent::ToolStart {
+        app.apply_event(cockpit_client::presentation::TurnEvent::ToolStart {
             agent: "Build".into(),
             call_id: call_id.into(),
             tool: tool.into(),
             args: serde_json::json!({ "path": path }),
         });
-        app.apply_event(cockpit_core::engine::agent::TurnEvent::ToolEnd {
+        app.apply_event(cockpit_client::presentation::TurnEvent::ToolEnd {
             agent: "Build".into(),
             call_id: call_id.into(),
             tool: tool.into(),

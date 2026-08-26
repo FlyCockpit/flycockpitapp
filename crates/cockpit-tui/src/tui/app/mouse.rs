@@ -2758,7 +2758,7 @@ mod resource_button_dispatch_tests {
     use crate::tui::button::ButtonDispatch;
     use crate::tui::resources_pane::ResourcesPane;
     use cockpit_proto::{
-        ResourceQueuedSnapshot, ResourceRequestMetadata, ResourceRequirements,
+        ResourceQueuedSnapshot, ResourceQueuedState, ResourceRequestMetadata, ResourceRequirements,
         ResourceSchedulerSnapshot,
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};

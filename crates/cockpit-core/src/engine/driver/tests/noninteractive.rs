@@ -36,7 +36,6 @@ async fn intermediate_noninteractive_continue_checkpoint_survives_cancel_or_fail
                     uuid::Uuid::now_v7(),
                     continuation_id,
                     uuid::Uuid::now_v7(),
-                    7,
                     "accepted late steer body".to_string(),
                     respond_to,
                 ),
@@ -376,6 +375,7 @@ fn single_task(
         task_call_id: task_call_id.to_string(),
         task_provider_item_id: None,
         task_function_call_id: Some(format!("fn-{task_call_id}")),
+        recovery: None,
     }
 }
 

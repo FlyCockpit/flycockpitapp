@@ -214,8 +214,10 @@ cockpit packages prune --dry-run
 
 | Command | Purpose |
 | --- | --- |
-| `cockpit` / `cockpit code` | Launch the Code-mode TUI in the current directory. |
+| `cockpit` | Launch the Code-mode TUI in the current directory. |
+| `cockpit code` | Launch the Code-mode TUI in the current directory. |
 | `cockpit assistant` | Launch the Assistant-mode TUI. |
+| `cockpit assistants` | Manage persistent assistants. |
 | `cockpit computer` | Launch the Computer-mode TUI. |
 | `cockpit ask <package> <question>` | Ask the read-only docs agent about a registered dependency package. |
 | `cockpit run [message]` | Run a non-interactive turn through the daemon; message args beat stdin. |

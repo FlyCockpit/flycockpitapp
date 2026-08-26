@@ -6,7 +6,7 @@ use cockpit_proto::{self as proto, ErrorCode, Request, Response};
 use rand::RngExt as _;
 use sha2::{Digest as _, Sha256};
 
-use crate::DaemonClient;
+use crate::DaemonRequestClient;
 
 pub const INLINE_USER_MESSAGE_TEXT_BYTES: usize = 64 * 1024;
 const STAGED_CHUNK_BYTES: usize = 3 * (proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES / 4);
@@ -26,8 +26,8 @@ pub fn user_message_needs_bulk(text: &str, display_text: Option<&str>) -> bool {
         || display_text.is_some_and(|display| display.len() > INLINE_USER_MESSAGE_TEXT_BYTES)
 }
 
-pub async fn stage_opaque_user_text(
-    client: &DaemonClient,
+pub async fn stage_opaque_user_text<C: DaemonRequestClient>(
+    client: &C,
     text: &str,
 ) -> Result<BulkTransferRef, BulkUserMessageUploadError> {
     let bytes = text.as_bytes();

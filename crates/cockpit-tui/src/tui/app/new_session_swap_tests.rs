@@ -851,7 +851,7 @@ async fn new_session_swap_keeps_in_flight_switch_non_replaceable() {
 #[tokio::test]
 async fn new_session_swap_discards_old_epoch_events_while_provisional() {
     use crate::tui::agent_runner::QueuedTurnEvent;
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -901,7 +901,7 @@ async fn new_session_swap_discards_old_epoch_events_while_provisional() {
                 agent: "Build".into(),
                 provider: "p".into(),
                 model: "m".into(),
-                error_class: cockpit_core::engine::model::InferenceErrorClass::Network,
+                error_class: cockpit_proto::InferenceErrorClass::Network,
                 detail: "boom".into(),
                 auth_failure: None,
             },
@@ -929,7 +929,7 @@ async fn new_session_swap_discards_old_epoch_events_while_provisional() {
 #[tokio::test]
 async fn new_session_swap_buffers_new_epoch_events_until_adoption() {
     use crate::tui::agent_runner::QueuedTurnEvent;
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -997,7 +997,7 @@ async fn new_session_swap_buffers_new_epoch_events_until_adoption() {
 #[tokio::test]
 async fn new_session_swap_mismatched_epoch_rejects_adoption_and_discards_buffer() {
     use crate::tui::agent_runner::QueuedTurnEvent;
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -1047,7 +1047,7 @@ async fn new_session_swap_mismatched_epoch_rejects_adoption_and_discards_buffer(
 #[tokio::test]
 async fn new_session_swap_failed_outcome_discards_buffered_replacement_events() {
     use crate::tui::agent_runner::QueuedTurnEvent;
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -1084,7 +1084,7 @@ async fn new_session_swap_failed_outcome_discards_buffered_replacement_events() 
 #[tokio::test]
 async fn new_session_swap_old_epoch_bookkeeping_settles_fence_without_presentation() {
     use crate::tui::agent_runner::QueuedTurnEvent;
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -1183,7 +1183,7 @@ async fn new_session_swap_old_epoch_bookkeeping_settles_fence_without_presentati
 #[tokio::test]
 async fn provisional_new_bookkeeping_records_dispatch_restored_without_history() {
     use crate::tui::agent_runner::QueuedTurnEvent;
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -1230,7 +1230,7 @@ async fn provisional_new_bookkeeping_records_dispatch_restored_without_history()
 #[tokio::test]
 async fn new_session_swap_failed_keeps_barrier_against_late_events_and_outgoing_dispatch() {
     use crate::tui::agent_runner::QueuedTurnEvent;
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -1573,7 +1573,7 @@ async fn new_session_swap_suppresses_outgoing_delivery_receipt_while_provisional
 #[tokio::test]
 async fn new_session_swap_cancelled_discards_replacement_buffer_and_keeps_cleared_view() {
     use crate::tui::agent_runner::QueuedTurnEvent;
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -1727,7 +1727,7 @@ async fn new_session_swap_failed_barrier_does_not_mark_fence_possibly_sent() {
 #[tokio::test]
 async fn new_session_swap_captures_outgoing_epoch_before_switch_task_advances() {
     use crate::tui::agent_runner::QueuedTurnEvent;
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -1873,7 +1873,7 @@ async fn new_session_swap_failed_pre_dispatch_retry_does_not_dispatch_outgoing()
 #[tokio::test]
 async fn same_session_resync_adopts_visible_epoch_and_renders_new_epoch_events() {
     use crate::tui::agent_runner::{GLOBAL_ATTACHMENT_EPOCH, QueuedTurnEvent};
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -1929,7 +1929,7 @@ async fn same_session_resync_adopts_visible_epoch_and_renders_new_epoch_events()
 #[tokio::test]
 async fn replacement_epoch_advance_without_resync_does_not_adopt_or_render() {
     use crate::tui::agent_runner::QueuedTurnEvent;
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     // Resume (and other replacement attaches) can advance the runner epoch and
     // forward events before App adopts the switch outcome. Matching-epoch
@@ -1995,7 +1995,7 @@ async fn replacement_epoch_advance_without_resync_does_not_adopt_or_render() {
 #[tokio::test]
 async fn provisional_new_ignores_same_session_resync_epoch_adoption() {
     use crate::tui::agent_runner::{GLOBAL_ATTACHMENT_EPOCH, QueuedTurnEvent};
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
@@ -2141,7 +2141,7 @@ async fn provisional_new_fences_stale_async_action_completions() {
 #[tokio::test]
 async fn provisional_new_suppresses_caffeinate_presentation() {
     use crate::tui::agent_runner::{GLOBAL_ATTACHMENT_EPOCH, QueuedTurnEvent};
-    use cockpit_core::engine::TurnEvent;
+    use cockpit_client::presentation::TurnEvent;
 
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);

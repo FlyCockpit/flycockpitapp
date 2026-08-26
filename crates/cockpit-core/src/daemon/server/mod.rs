@@ -6393,6 +6393,7 @@ mod tests;
 
 pub use attachments::validate_png_attachment_blocking;
 pub use dispatch::request_shutdown;
+pub(crate) use dispatch::CONFIG_PUBLICATION_RPC_LOCK;
 pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) -> tokio::task::JoinHandle<()> {
     dispatch::spawn_lock_sweeper(ctx)
 }

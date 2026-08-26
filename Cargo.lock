@@ -1198,6 +1198,7 @@ dependencies = [
  "notify",
  "portable-pty",
  "predicates",
+ "quote",
  "rand 0.10.2",
  "rayon",
  "regex",

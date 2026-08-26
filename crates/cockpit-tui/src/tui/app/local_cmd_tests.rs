@@ -405,7 +405,7 @@ fn tools_warning_suppressed_on_no_cache_provider() {
         ..Default::default()
     };
 
-    let request_id = cockpit_core::engine::ControlRequestId(1);
+    let request_id = cockpit_client::presentation::ControlRequestId(1);
     app.pending_control_requests.insert(
         request_id,
         super::PendingControlRequest {
@@ -417,7 +417,7 @@ fn tools_warning_suppressed_on_no_cache_provider() {
     let before = app.history.len();
     app.apply_control_request_outcome(
         request_id,
-        cockpit_core::engine::ControlRequestOutcome::Applied,
+        cockpit_client::presentation::ControlRequestOutcome::Applied,
     );
     assert_eq!(app.history.len(), before);
 }

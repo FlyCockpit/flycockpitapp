@@ -26,8 +26,10 @@ pub mod test_env {
 }
 pub(crate) mod daemon {
     pub(crate) use cockpit_core::daemon::{
-        DaemonPaths, DaemonProbe, DaemonStatus, caffeinate, discover, proto, server,
-        session_worker, terminal,
+        DaemonPaths, DaemonProbe, DaemonStatus, EventSender, SharedRedactionTable, caffeinate,
+        daemon_pid, derive_restart_no_sandbox, discover, proto, restart_release_timeout,
+        run_foreground, run_foreground_with_resume, send_current_event, server, session_worker,
+        spawn_detached_with_resume, stop, terminal, wait_for_restart_release,
     };
     pub(crate) mod client {
         pub(crate) use cockpit_core::daemon::client::{
@@ -43,8 +45,8 @@ pub(crate) mod daemon {
 pub use cockpit_core::{
     agents, approval, assistants, auth, auto_title, browser, computer, container, credentials,
     diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,
-    knowledge, locks, mcp, media_reservation, model_system_prompt, packages, private_fs, process,
-    providers, redact, secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools,
+    knowledge, locks, mcp, media_reservation, model_system_prompt, packages, providers, redact,
+    secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools,
     user_agent, welcome, wizard,
 };
 
@@ -751,7 +753,7 @@ fn error_stderr_line(err: &anyhow::Error) -> String {
 
 async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
     use clap::FromArgMatches as _;
-    let cli =
+    let cli: crate::cli::Cli =
         crate::cli::PublicCli::from_arg_matches(&crate::cli::public_v0_1_command().get_matches())?
             .into();
 

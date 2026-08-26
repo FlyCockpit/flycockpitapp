@@ -235,18 +235,41 @@ pub fn apply_tool_surface_override(
     def: &mut AgentDef,
     selection: &ToolSurfaceSelection,
 ) -> Result<()> {
-    if def.vnext.is_some() {
-        bail!(
-            "schemaVersion 2 definitions cannot apply legacy tool-surface overrides; tool authority is host-owned"
-        );
-    }
+    // Host-owned session overrides remain valid for schemaVersion 2: v2 markdown
+    // may not declare `tools:`, but the daemon/TUI still projects a concrete
+    // runtime grant onto the in-memory definition before construction.
     let mut candidate = def.clone();
     candidate.tools = Some(selection.tools.clone());
     candidate.tool_tiers = selection.tool_tiers.clone();
-    validate_invariants(&candidate)?;
+    if def.vnext.is_some() {
+        validate_host_tool_surface(&candidate)?;
+    } else {
+        validate_invariants(&candidate)?;
+    }
     def.tools = candidate.tools;
     def.tool_tiers = candidate.tool_tiers;
     Ok(())
+}
+
+/// Validate a host-projected tool grant on a v2 definition. v2
+/// [`validate_invariants`] only checks the closed declarative schema and skips
+/// legacy `tools:` rules, so the host override path applies those grant checks
+/// explicitly against the projected surface.
+fn validate_host_tool_surface(def: &AgentDef) -> Result<()> {
+    let Some(vnext) = &def.vnext else {
+        return validate_invariants(def);
+    };
+    vnext.validate()?;
+    let Some(tools) = &def.tools else {
+        return Ok(());
+    };
+    // Reuse the same name/role checks a legacy `tools:` grant would see. Keep
+    // the definition's existing mode (builtins still carry Primary/Subagent);
+    // workspace v2 documents default to `All`.
+    let mut legacy = def.clone();
+    legacy.vnext = None;
+    legacy.tools = Some(tools.clone());
+    validate_invariants(&legacy)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -2683,6 +2683,7 @@ mod llm_mode_tests {
             ("start_build", ToolEffect::Dynamic),
             ("task", ToolEffect::Dynamic),
             ("todo", ToolEffect::Dynamic),
+            ("transcribe_audio", ToolEffect::Mutating),
             ("artifact_read", ToolEffect::ReadOnly),
             ("artifact_search", ToolEffect::ReadOnly),
             ("unlock", ToolEffect::Dynamic),

@@ -254,7 +254,7 @@ pub enum AsyncActionPayload {
         side_short_id: String,
     },
     SideSessionReturned(Box<crate::tui::agent_runner::SessionSwitchOutcome>),
-    ContainerAvailability(cockpit_core::container::ContainerAvailability),
+    ContainerAvailability(cockpit_proto::ContainerAvailability),
     #[cfg(feature = "remote")]
     RemoteDisclosures {
         project_root: String,

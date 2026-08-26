@@ -2644,7 +2644,7 @@ pub struct App {
     pub(super) sandbox_mode: cockpit_core::tools::sandbox_mode::SandboxMode,
     pub(super) sandbox_intent: cockpit_core::tools::sandbox_mode::SandboxMode,
     pub(super) container_network_enabled: bool,
-    pub(super) container_availability: cockpit_core::container::ContainerAvailability,
+    pub(super) container_availability: cockpit_proto::ContainerAvailability,
     pub(super) host_capabilities: cockpit_proto::HostCapabilitySnapshot,
     pub(super) capability_refresh_queue: Vec<cockpit_proto::HostCapabilitySnapshot>,
     pub(super) capability_refresh_calls: usize,

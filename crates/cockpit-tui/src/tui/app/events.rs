@@ -230,7 +230,7 @@ impl App {
         &mut self,
         mode: cockpit_core::tools::sandbox_mode::SandboxMode,
         container_network_enabled: bool,
-        container_availability: cockpit_core::container::ContainerAvailability,
+        container_availability: cockpit_proto::ContainerAvailability,
         sandbox_supported: bool,
     ) {
         let enabled = mode.enabled();

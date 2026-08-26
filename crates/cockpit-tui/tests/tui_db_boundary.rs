@@ -473,6 +473,9 @@ fn production_uses_cockpit_proto_directly() {
                 ));
             }
             for migrated_wire_type in [
+                "cockpit_core::container::ContainerAvailability",
+                "cockpit_core::container::ContainerRuntimeKind",
+                "cockpit_core::container::ContainerUnavailableReason",
                 "cockpit_core::daemon::caffeinate::CaffeinateMode",
                 "cockpit_core::env_snapshot::EnvDiffSummary",
                 "cockpit_core::env_snapshot::EnvDriftPolicy",
@@ -506,6 +509,9 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::daemon::self"
                     || imported == "cockpit_core::daemon::proto"
                     || imported.starts_with("cockpit_core::daemon::proto::")
+                    || imported == "cockpit_core::container::ContainerAvailability"
+                    || imported == "cockpit_core::container::ContainerRuntimeKind"
+                    || imported == "cockpit_core::container::ContainerUnavailableReason"
                     || imported == "cockpit_core::daemon::caffeinate::CaffeinateMode"
                     || imported == "cockpit_core::env_snapshot::EnvDiffSummary"
                     || imported == "cockpit_core::env_snapshot::EnvDriftPolicy"

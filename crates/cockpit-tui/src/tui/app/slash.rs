@@ -3160,22 +3160,22 @@ pub fn decide_sandbox_set(
 
 #[allow(dead_code)]
 fn container_unavailable_label(
-    availability: &cockpit_core::container::ContainerAvailability,
+    availability: &cockpit_proto::ContainerAvailability,
 ) -> &'static str {
     match availability.reason {
-        Some(cockpit_core::container::ContainerUnavailableReason::HarnessInContainer) => {
+        Some(cockpit_proto::ContainerUnavailableReason::HarnessInContainer) => {
             "Cockpit is running inside a container"
         }
-        Some(cockpit_core::container::ContainerUnavailableReason::PermissionDenied) => {
+        Some(cockpit_proto::ContainerUnavailableReason::PermissionDenied) => {
             "Permission denied for the container engine daemon"
         }
-        Some(cockpit_core::container::ContainerUnavailableReason::SocketUnavailable) => {
+        Some(cockpit_proto::ContainerUnavailableReason::SocketUnavailable) => {
             "Container engine daemon socket is unavailable"
         }
-        Some(cockpit_core::container::ContainerUnavailableReason::DaemonUnavailable) => {
+        Some(cockpit_proto::ContainerUnavailableReason::DaemonUnavailable) => {
             "Container engine daemon is not running"
         }
-        Some(cockpit_core::container::ContainerUnavailableReason::NoRuntime) | None => {
+        Some(cockpit_proto::ContainerUnavailableReason::NoRuntime) | None => {
             "No healthy docker/podman engine available"
         }
     }

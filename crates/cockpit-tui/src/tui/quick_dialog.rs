@@ -39,7 +39,7 @@ pub struct QuickCurrent {
     pub recursion_depth: u32,
     pub sandbox_mode: SandboxMode,
     pub container_network_enabled: bool,
-    pub container_availability: cockpit_core::container::ContainerAvailability,
+    pub container_availability: cockpit_proto::ContainerAvailability,
     pub host_capabilities: cockpit_proto::HostCapabilitySnapshot,
     pub approval_mode: ApprovalMode,
     pub active_model: Option<(String, String)>,
@@ -710,7 +710,7 @@ fn sandbox_mode_label(mode: SandboxMode) -> &'static str {
 
 fn sandbox_mode_description(
     mode: SandboxMode,
-    availability: &cockpit_core::container::ContainerAvailability,
+    availability: &cockpit_proto::ContainerAvailability,
 ) -> String {
     match mode {
         SandboxMode::Off => "shell sandboxing disabled for this session".to_string(),
@@ -724,22 +724,22 @@ fn sandbox_mode_description(
 }
 
 fn container_unavailable_label(
-    availability: &cockpit_core::container::ContainerAvailability,
+    availability: &cockpit_proto::ContainerAvailability,
 ) -> &'static str {
     match availability.reason {
-        Some(cockpit_core::container::ContainerUnavailableReason::HarnessInContainer) => {
+        Some(cockpit_proto::ContainerUnavailableReason::HarnessInContainer) => {
             "Cockpit is running inside a container"
         }
-        Some(cockpit_core::container::ContainerUnavailableReason::PermissionDenied) => {
+        Some(cockpit_proto::ContainerUnavailableReason::PermissionDenied) => {
             "Permission denied for the container engine daemon"
         }
-        Some(cockpit_core::container::ContainerUnavailableReason::SocketUnavailable) => {
+        Some(cockpit_proto::ContainerUnavailableReason::SocketUnavailable) => {
             "Container engine daemon socket is unavailable"
         }
-        Some(cockpit_core::container::ContainerUnavailableReason::DaemonUnavailable) => {
+        Some(cockpit_proto::ContainerUnavailableReason::DaemonUnavailable) => {
             "Container engine daemon is not running"
         }
-        Some(cockpit_core::container::ContainerUnavailableReason::NoRuntime) | None => {
+        Some(cockpit_proto::ContainerUnavailableReason::NoRuntime) | None => {
             "No healthy docker/podman engine available"
         }
     }
@@ -804,8 +804,8 @@ mod tests {
             recursion_depth: 2,
             sandbox_mode: SandboxMode::Sandbox,
             container_network_enabled: false,
-            container_availability: cockpit_core::container::ContainerAvailability {
-                runtime: Some(cockpit_core::container::ContainerRuntimeKind::Docker),
+            container_availability: cockpit_proto::ContainerAvailability {
+                runtime: Some(cockpit_proto::ContainerRuntimeKind::Docker),
                 harness_in_container: false,
                 available: true,
                 reason: None,
@@ -1024,11 +1024,11 @@ mod tests {
     #[test]
     fn sandbox_tab_does_not_stage_unavailable_container_mode() {
         let mut current = current();
-        current.container_availability = cockpit_core::container::ContainerAvailability {
+        current.container_availability = cockpit_proto::ContainerAvailability {
             runtime: None,
             harness_in_container: false,
             available: false,
-            reason: Some(cockpit_core::container::ContainerUnavailableReason::NoRuntime),
+            reason: Some(cockpit_proto::ContainerUnavailableReason::NoRuntime),
         };
         current.host_capabilities = crate::tui::capability_gate::snapshot_with_sandbox_reasons(
             cockpit_proto::FeatureCapabilityState::Available,

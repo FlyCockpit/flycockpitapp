@@ -1725,14 +1725,22 @@ impl App {
                 }
                 Err(e) => self.show_toast(format!("/resources: {e}"), ToastKind::Error),
             },
-            AsyncActionKind::Internal("notes.rpc") => {
+            AsyncActionKind::NotesProjection {
+                instance_id,
+                generation,
+            } => {
                 let next = if let Overlay::Notes(pane) = &mut self.overlay {
-                    let payload = match result.payload {
-                        Ok(AsyncActionPayload::NotesRpc(result)) => Ok(result),
-                        Ok(_) => Err("notes db returned an unexpected response".to_string()),
-                        Err(e) => Err(e),
-                    };
-                    pane.apply_rpc_result(payload)
+                    match result.payload {
+                        Ok(AsyncActionPayload::NotesRpc(result)) => {
+                            pane.apply_rpc_result(Ok(result))
+                        }
+                        Ok(_) => pane.apply_transport_error(
+                            instance_id,
+                            generation,
+                            "notes db returned an unexpected response".to_string(),
+                        ),
+                        Err(error) => pane.apply_transport_error(instance_id, generation, error),
+                    }
                 } else {
                     None
                 };
@@ -3158,26 +3166,26 @@ fn stale_completion_requires_reducer(kind: &AsyncActionKind) -> bool {
                 | "subagent.steer"
                 | "tools.effect"
                 | "workspace-trust.effect"
-        ) | AsyncActionKind::Internal(
-            "btw.runner.attach"
-                | "leaks.rpc"
-                | "notes.rpc"
-                | "oauth.acknowledge"
-                | "oauth.cancel"
-                | "oauth.codex.begin"
-                | "oauth.codex.poll"
-                | "oauth.grok.begin"
-                | "oauth.grok.complete"
-                | "pins.pin"
-                | "pins.toggle"
-                | "pins.unpin"
-                | "runner.attach"
-                | "session.fork"
-                | "session.resume"
-                | "session.side"
-                | "session.side.return"
-                | "session.switch"
-        )
+        ) | AsyncActionKind::NotesProjection { .. }
+            | AsyncActionKind::Internal(
+                "btw.runner.attach"
+                    | "leaks.rpc"
+                    | "oauth.acknowledge"
+                    | "oauth.cancel"
+                    | "oauth.codex.begin"
+                    | "oauth.codex.poll"
+                    | "oauth.grok.begin"
+                    | "oauth.grok.complete"
+                    | "pins.pin"
+                    | "pins.toggle"
+                    | "pins.unpin"
+                    | "runner.attach"
+                    | "session.fork"
+                    | "session.resume"
+                    | "session.side"
+                    | "session.side.return"
+                    | "session.switch"
+            )
     )
 }
 

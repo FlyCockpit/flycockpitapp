@@ -67,8 +67,12 @@ impl App {
         let Some(endpoint) = self.attached_daemon_endpoint() else {
             return;
         };
+        let kind = crate::tui::async_action::AsyncActionKind::NotesProjection {
+            instance_id: action.instance_id(),
+            generation: action.generation(),
+        };
         self.async_actions.start_blocking(
-            crate::tui::async_action::AsyncActionKind::Internal("notes.rpc"),
+            kind,
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
             move || {
                 action

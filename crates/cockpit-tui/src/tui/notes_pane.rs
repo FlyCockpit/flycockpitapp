@@ -21,6 +21,7 @@
 //! is plain text entry through the same path.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -38,6 +39,12 @@ use crate::tui::markdown;
 use crate::tui::pane::Pane;
 use crate::tui::theme::MUTED_COLOR_INDEX;
 use cockpit_proto::{ProjectNote, Request, Response};
+
+static NEXT_NOTES_PANE_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+fn next_notes_pane_instance() -> u64 {
+    NEXT_NOTES_PANE_INSTANCE.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Which part of the dialog has focus / what the user is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +67,7 @@ pub enum Mode {
 /// The notes dialog state. Opened over the chat body; routed input/render by
 /// `App` alongside the other panes.
 pub struct NotesPane {
+    instance_id: u64,
     /// Project-root scoping key (git/worktree root, or launch cwd).
     project_root: String,
     /// Owned DB handle for note CRUD. `None` when the global DB couldn't be
@@ -133,6 +141,7 @@ pub enum NotesOutcome {
 }
 
 pub struct NotesRpcAction {
+    instance_id: u64,
     daemon_socket: std::path::PathBuf,
     project_root: String,
     kind: NotesRpcActionKind,
@@ -149,6 +158,7 @@ enum NotesRpcActionKind {
 
 #[derive(Debug, Clone)]
 pub struct NotesRpcResult {
+    instance_id: u64,
     generation: u64,
     project_root: String,
     notes: Vec<ProjectNote>,
@@ -165,11 +175,20 @@ enum SelectionAfterRpc {
 }
 
 impl NotesRpcAction {
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn run_blocking_rpc(
         self,
         endpoint: cockpit_client::ClientEndpoint,
     ) -> anyhow::Result<NotesRpcResult> {
         let generation = self.generation;
+        let instance_id = self.instance_id;
         let error_project_root = self.project_root.clone();
         let project_root = self.project_root;
         let response_project_root = project_root.clone();
@@ -272,10 +291,12 @@ impl NotesRpcAction {
         };
         Ok(match result {
             Ok(mut result) => {
+                result.instance_id = instance_id;
                 result.generation = generation;
                 result
             }
             Err(error) => NotesRpcResult {
+                instance_id,
                 generation,
                 project_root: error_project_root,
                 notes: Vec::new(),
@@ -353,6 +374,7 @@ impl NotesPane {
             Some("Unavailable — reconnect to the daemon, then Retry".to_string())
         };
         Self {
+            instance_id: next_notes_pane_instance(),
             project_root,
             daemon_socket,
             notes: Vec::new(),
@@ -380,6 +402,7 @@ impl NotesPane {
 
     pub fn initial_load_action(&mut self) -> Option<NotesRpcAction> {
         let action = NotesRpcAction {
+            instance_id: self.instance_id,
             daemon_socket: self.daemon_socket.clone()?,
             project_root: self.project_root.clone(),
             kind: NotesRpcActionKind::Load { keep: None },
@@ -423,7 +446,9 @@ impl NotesPane {
     ) -> Option<NotesRpcAction> {
         match result {
             Ok(result) => {
-                if result.project_root != self.project_root {
+                if result.instance_id != self.instance_id
+                    || result.project_root != self.project_root
+                {
                     return None;
                 }
                 if (result.generation == 0 && !self.initial_inventory_unresolved)
@@ -523,11 +548,24 @@ impl NotesPane {
                 }
                 self.start_next_queued_action()
             }
-            Err(e) => {
-                self.status = Some(e);
-                None
-            }
+            // Transport failures must carry the action envelope; callers route
+            // those through `apply_transport_error` instead.
+            Err(_) => None,
         }
+    }
+
+    pub fn apply_transport_error(
+        &mut self,
+        instance_id: u64,
+        generation: u64,
+        error: String,
+    ) -> Option<NotesRpcAction> {
+        if instance_id != self.instance_id || self.in_flight_generation != Some(generation) {
+            return None;
+        }
+        self.in_flight_generation = None;
+        self.status = Some(error);
+        self.start_next_queued_action()
     }
 
     fn schedule_action(
@@ -546,6 +584,7 @@ impl NotesPane {
         Some((
             generation,
             Some(NotesRpcAction {
+                instance_id: self.instance_id,
                 daemon_socket,
                 project_root: self.project_root.clone(),
                 kind,
@@ -559,6 +598,7 @@ impl NotesPane {
         let daemon_socket = self.daemon_socket.clone()?;
         self.in_flight_generation = Some(queued.generation);
         Some(NotesRpcAction {
+            instance_id: self.instance_id,
             daemon_socket,
             project_root: self.project_root.clone(),
             kind: queued.kind,
@@ -847,6 +887,7 @@ impl NotesPane {
     #[cfg(test)]
     pub(crate) fn editing_for_test(content: &str, vim_enabled: bool) -> Self {
         let mut pane = Self {
+            instance_id: 0,
             project_root: "/proj".to_string(),
             daemon_socket: Some(std::path::PathBuf::from("/test-daemon.sock")),
             notes: Vec::new(),
@@ -1161,6 +1202,7 @@ mod tests {
     fn pane(connected: bool) -> NotesPane {
         let id = Uuid::new_v4();
         let mut pane = NotesPane {
+            instance_id: 0,
             project_root: "/proj".to_string(),
             daemon_socket: connected.then(|| std::path::PathBuf::from("/test-daemon.sock")),
             notes: vec![ProjectNote {
@@ -1261,6 +1303,7 @@ mod tests {
         pane.in_flight_generation = Some(1);
 
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1276,6 +1319,7 @@ mod tests {
         assert_eq!(pane.current().map(|note| note.id), Some(keep));
         let applied_ids = pane.notes.iter().map(|note| note.id).collect::<Vec<_>>();
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1312,6 +1356,7 @@ mod tests {
         pane.select_sidebar(pane.notes.len());
         pane.in_flight_generation = Some(1);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1333,6 +1378,7 @@ mod tests {
         pane.operation_generation = 2;
         pane.in_flight_generation = Some(2);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 2,
             error: None,
             project_root: "/proj".into(),
@@ -1351,6 +1397,7 @@ mod tests {
         pane.operation_generation = 3;
         pane.in_flight_generation = Some(3);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 3,
             error: None,
             project_root: "/proj".into(),
@@ -1363,6 +1410,7 @@ mod tests {
         pane.operation_generation = 4;
         pane.in_flight_generation = Some(4);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 4,
             error: None,
             project_root: "/proj".into(),
@@ -1373,6 +1421,7 @@ mod tests {
         assert_eq!(pane.selection, SidebarSelection::New);
         assert_eq!(pane.selected_index(), 0);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 2,
             error: None,
             project_root: "/proj".into(),
@@ -1394,6 +1443,7 @@ mod tests {
         initial.notes.clear();
         mark_initial_inventory_unresolved(&mut initial);
         let _ = initial.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 0,
             error: None,
             project_root: "/proj".into(),
@@ -1411,6 +1461,7 @@ mod tests {
         initially_empty.notes.clear();
         mark_initial_inventory_unresolved(&mut initially_empty);
         let _ = initially_empty.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 0,
             error: None,
             project_root: "/proj".into(),
@@ -1422,6 +1473,7 @@ mod tests {
         initially_empty.operation_generation = 1;
         initially_empty.in_flight_generation = Some(1);
         let _ = initially_empty.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1436,6 +1488,7 @@ mod tests {
         retry.notes.clear();
         mark_initial_inventory_unresolved(&mut retry);
         let _ = retry.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 0,
             error: Some("temporary daemon failure".into()),
             project_root: "/proj".into(),
@@ -1447,6 +1500,7 @@ mod tests {
         assert_eq!(retry.status.as_deref(), Some("temporary daemon failure"));
         retry.in_flight_generation = Some(0);
         let _ = retry.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 0,
             error: None,
             project_root: "/proj".into(),
@@ -1460,6 +1514,7 @@ mod tests {
         retry.operation_generation = 1;
         retry.in_flight_generation = Some(1);
         let _ = retry.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1486,6 +1541,7 @@ mod tests {
             assert!(matches!(pane.mode, Mode::Naming { .. }));
 
             let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+                instance_id: 0,
                 generation: 0,
                 error: None,
                 project_root: "/proj".into(),
@@ -1497,6 +1553,7 @@ mod tests {
             assert!(matches!(pane.mode, Mode::Naming { .. }));
 
             let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+                instance_id: 0,
                 generation: 0,
                 error: Some("stale load error".into()),
                 project_root: "/proj".into(),
@@ -1528,6 +1585,7 @@ mod tests {
         pane.enter_edit();
         assert!(matches!(pane.mode, Mode::Editing { id } if id == edited));
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1555,6 +1613,7 @@ mod tests {
         pane.handle_key(press(KeyCode::Char('d')));
         assert!(matches!(pane.mode, Mode::ConfirmingDelete { id } if id == edited));
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1585,6 +1644,7 @@ mod tests {
             panic!("save action");
         };
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: save.generation,
             error: Some("disk full".into()),
             project_root: "/proj".into(),
@@ -1605,6 +1665,7 @@ mod tests {
         assert!(pane.pending_save.is_none());
         assert!(!pane.edit_scroll_manual);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: second_save.generation,
             error: None,
             project_root: "/proj".into(),
@@ -1632,6 +1693,7 @@ mod tests {
         ));
         let create = pane
             .apply_rpc_result(Ok(NotesRpcResult {
+                instance_id: 0,
                 generation: 0,
                 error: None,
                 project_root: "/proj".into(),
@@ -1642,6 +1704,7 @@ mod tests {
             .expect("queued create starts only after initial load completes");
         assert_eq!(create.generation, pane.in_flight_generation.unwrap());
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: create.generation,
             error: None,
             project_root: "/proj".into(),
@@ -1655,6 +1718,7 @@ mod tests {
             panic!("save action");
         };
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: save.generation,
             error: None,
             project_root: "/proj".into(),
@@ -1669,6 +1733,7 @@ mod tests {
             panic!("rename action");
         };
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: rename.generation,
             error: None,
             project_root: "/proj".into(),
@@ -1682,6 +1747,7 @@ mod tests {
             panic!("delete action");
         };
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: delete.generation,
             error: None,
             project_root: "/proj".into(),
@@ -1693,6 +1759,7 @@ mod tests {
         let applied = pane.highest_applied_generation;
 
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 0,
             error: None,
             project_root: "/proj".into(),
@@ -1727,6 +1794,7 @@ mod tests {
         let b_generation = pane.pending_save.as_ref().unwrap().generation;
 
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: b_generation,
             error: None,
             project_root: "/proj".into(),
@@ -1739,6 +1807,7 @@ mod tests {
 
         let save_b = pane
             .apply_rpc_result(Ok(NotesRpcResult {
+                instance_id: 0,
                 generation: save_a.generation,
                 error: None,
                 project_root: "/proj".into(),
@@ -1753,6 +1822,7 @@ mod tests {
         assert!(matches!(pane.mode, Mode::Editing { id: editing } if editing == id));
 
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: save_b.generation,
             error: Some("disk full on B".into()),
             project_root: "/proj".into(),
@@ -1794,6 +1864,7 @@ mod tests {
 
         let duplicate = pane
             .apply_rpc_result(Ok(NotesRpcResult {
+                instance_id: 0,
                 generation: first.generation,
                 error: None,
                 project_root: "/proj".into(),
@@ -1805,6 +1876,7 @@ mod tests {
         assert_eq!(duplicate.generation, duplicate_generation);
         let delete = pane
             .apply_rpc_result(Ok(NotesRpcResult {
+                instance_id: 0,
                 generation: duplicate.generation,
                 error: None,
                 project_root: "/proj".into(),
@@ -1820,6 +1892,116 @@ mod tests {
     }
 
     #[test]
+    fn pane_instances_are_monotonic_and_reject_closed_pane_completions() {
+        let first_instance = next_notes_pane_instance();
+        let second_instance = next_notes_pane_instance();
+        assert!(second_instance > first_instance);
+
+        let mut reopened = pane(true);
+        reopened.instance_id = second_instance;
+        reopened.in_flight_generation = Some(1);
+        let original = reopened.notes.clone();
+        let foreign_note = Uuid::new_v4();
+
+        let _ = reopened.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: first_instance,
+            generation: 1,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(foreign_note, "closed pane", "stale")],
+            selection: SelectionAfterRpc::Keep(foreign_note),
+            enter_edit: false,
+        }));
+        assert_eq!(reopened.notes, original);
+        assert_eq!(reopened.in_flight_generation, Some(1));
+        assert!(
+            reopened
+                .apply_transport_error(first_instance, 1, "closed pane error".into())
+                .is_none()
+        );
+        assert_eq!(reopened.in_flight_generation, Some(1));
+
+        let current_note = Uuid::new_v4();
+        let _ = reopened.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: second_instance,
+            generation: 1,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(current_note, "reopened", "current")],
+            selection: SelectionAfterRpc::Keep(current_note),
+            enter_edit: false,
+        }));
+        assert_eq!(reopened.notes[0].id, current_note);
+        assert_eq!(reopened.in_flight_generation, None);
+
+        let _ = reopened.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: first_instance,
+            generation: 1,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(foreign_note, "closed pane", "stale")],
+            selection: SelectionAfterRpc::Keep(foreign_note),
+            enter_edit: false,
+        }));
+        assert_eq!(reopened.notes[0].id, current_note);
+        assert!(
+            reopened
+                .apply_transport_error(first_instance, 1, "late closed pane error".into())
+                .is_none()
+        );
+        assert_eq!(reopened.notes[0].id, current_note);
+    }
+
+    #[test]
+    fn transport_error_advances_one_queued_action_and_duplicate_is_inert() {
+        let mut pane = pane(true);
+        pane.instance_id = 41;
+        pane.in_flight_generation = None;
+        pane.enter_edit();
+        let id = pane.notes[0].id;
+        pane.editor.set("first draft".into());
+        let NotesOutcome::Rpc(first) = pane.leave_edit() else {
+            panic!("first save starts");
+        };
+        pane.paste(" plus queued draft");
+        let queued_draft = pane.editor.text().to_string();
+        assert!(matches!(pane.leave_edit(), NotesOutcome::Stay));
+        let queued_generation = pane.pending_save.as_ref().unwrap().generation;
+
+        let second = pane
+            .apply_transport_error(41, first.generation, "worker stopped".into())
+            .expect("exact current error advances one queued action");
+        assert_eq!(second.instance_id, 41);
+        assert_eq!(second.generation, queued_generation);
+        assert_eq!(pane.in_flight_generation, Some(queued_generation));
+        assert_eq!(pane.editor.text(), queued_draft);
+        assert!(matches!(pane.mode, Mode::Editing { id: editing } if editing == id));
+
+        assert!(
+            pane.apply_transport_error(41, first.generation, "duplicate".into())
+                .is_none()
+        );
+        assert!(
+            pane.apply_transport_error(40, queued_generation, "wrong pane".into())
+                .is_none()
+        );
+        assert_eq!(pane.in_flight_generation, Some(queued_generation));
+        assert!(pane.queued_actions.is_empty());
+
+        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 41,
+            generation: queued_generation,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(id, "ideas", &queued_draft)],
+            selection: SelectionAfterRpc::Keep(id),
+            enter_edit: false,
+        }));
+        assert_eq!(pane.notes[0].content, queued_draft);
+        assert_eq!(pane.in_flight_generation, None);
+    }
+
+    #[test]
     fn delete_fallback_selects_next_then_clamps_to_previous() {
         let mut pane = pane(true);
         let first = Uuid::new_v4();
@@ -1832,6 +2014,7 @@ mod tests {
         pane.select_sidebar(1);
         pane.in_flight_generation = Some(1);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 1,
             error: None,
             project_root: "/proj".into(),
@@ -1844,6 +2027,7 @@ mod tests {
         pane.operation_generation = 2;
         pane.in_flight_generation = Some(2);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
             generation: 2,
             error: None,
             project_root: "/proj".into(),

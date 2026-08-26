@@ -27,6 +27,10 @@ pub enum AsyncActionKind {
     Blocking(&'static str),
     Refresh(&'static str),
     Internal(&'static str),
+    NotesProjection {
+        instance_id: u64,
+        generation: u64,
+    },
 }
 
 /// Process-exit disposition for an asynchronous action.
@@ -69,6 +73,7 @@ impl AsyncActionKind {
         };
 
         match self {
+            Self::NotesProjection { .. } => DurableMutation,
             Self::Refresh(_) => ReadOnly,
             Self::Blocking(label) => match *label {
                 "autocomplete.files"
@@ -147,7 +152,6 @@ impl AsyncActionKind {
                 | "session.side.return"
                 | "session.switch" => SessionLifecycle,
                 "leaks.rpc"
-                | "notes.rpc"
                 | "oauth.acknowledge"
                 | "oauth.cancel"
                 | "oauth.codex.begin"
@@ -1482,6 +1486,13 @@ mod tests {
             (
                 AsyncActionKind::Internal("session.switch"),
                 SessionLifecycle,
+            ),
+            (
+                AsyncActionKind::NotesProjection {
+                    instance_id: 7,
+                    generation: 3,
+                },
+                DurableMutation,
             ),
         ] {
             assert_eq!(

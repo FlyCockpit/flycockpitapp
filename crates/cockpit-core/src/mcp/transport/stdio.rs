@@ -27,6 +27,19 @@ use crate::mcp::transport::timeout::McpTimeouts;
 
 const STDIO_POISON_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum bytes a single line of stdio JSON-RPC may occupy before the
+/// connection is treated as hostile and the read fails.
+///
+/// MCP responses are control messages (tool results included) that in practice
+/// stay small; a line that grows past this bound means a broken or malicious
+/// local server, and reading it with an unbounded `read_line` would let that
+/// server drive the host to OOM. This is the stdio counterpart of the SSE
+/// transport's `SSE_FRAME_MAX_BYTES` frame cap. It is larger than the SSE cap
+/// because a stdio server is a locally-spawned trusted-ish subprocess whose
+/// tool results are more likely to be legitimately large, while still bounding
+/// worst-case memory per line.
+const STDIO_LINE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 pub struct StdioClient<R = ChildStdout, W = ChildStdin> {
     state: Arc<StdioState>,
     stdin: W,
@@ -254,6 +267,63 @@ where
         }
     }
 
+    /// Read one `\n`-terminated line from the child's stdout into `buf`,
+    /// failing if the line would exceed `STDIO_LINE_MAX_BYTES`.
+    ///
+    /// This replaces `AsyncBufReadExt::read_line`, whose accumulator grows
+    /// without bound: a malicious or broken stdio MCP server could emit a
+    /// single newline-free line and OOM the host. We drain the underlying
+    /// `BufReader` a chunk at a time (each chunk bounded by the reader's
+    /// capacity) and abort once the accumulated line crosses the cap. Return
+    /// value matches `read_line`: the number of bytes appended, `0` at EOF.
+    async fn read_line_capped(&mut self, buf: &mut String) -> std::io::Result<usize> {
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            let available = loop {
+                match self.stdout.fill_buf().await {
+                    Ok(chunk) => break chunk,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            };
+            if available.is_empty() {
+                // EOF: return whatever we accumulated before the stream closed
+                // (may be a final unterminated line, exactly as `read_line`).
+                break;
+            }
+            let newline = available.iter().position(|&b| b == b'\n');
+            let take = newline.map(|pos| pos + 1).unwrap_or(available.len());
+            bytes.extend_from_slice(&available[..take]);
+            self.stdout.consume(take);
+            if bytes.len() > STDIO_LINE_MAX_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "stdio MCP line exceeded {STDIO_LINE_MAX_BYTES} bytes; \
+                         treating server as hostile"
+                    ),
+                ));
+            }
+            if newline.is_some() {
+                break;
+            }
+        }
+        // Validate UTF-8 in place rather than via `String::from_utf8`, which
+        // would allocate a second full copy of a large line before `push_str`
+        // copies it a third time — keeping peak memory to `bytes` + `buf`.
+        match std::str::from_utf8(&bytes) {
+            Ok(line) => {
+                buf.push_str(line);
+                Ok(line.len())
+            }
+            // Mirror `read_line`, which rejects non-UTF-8 with `InvalidData`.
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )),
+        }
+    }
+
     async fn request_unbounded(
         &mut self,
         method: &str,
@@ -288,7 +358,7 @@ where
         let mut buf = String::new();
         loop {
             buf.clear();
-            let n = match self.stdout.read_line(&mut buf).await {
+            let n = match self.read_line_capped(&mut buf).await {
                 Ok(n) => n,
                 Err(error) => {
                     return Err(ChildFailure::transport(
@@ -970,6 +1040,46 @@ mod tests {
 
         assert!(state.poisoned.load(Ordering::SeqCst));
         assert!(state.child.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_stdio_line_read_is_capped() {
+        // A newline-free line larger than the cap must fail rather than grow the
+        // read accumulator without bound — a malicious/broken stdio server could
+        // otherwise OOM the host.
+        let oversized = vec![b'x'; STDIO_LINE_MAX_BYTES + 1];
+        let mut client = StdioClient::new(
+            "test-server".to_string(),
+            tokio::io::sink(),
+            std::io::Cursor::new(oversized),
+            None,
+            McpTimeouts::from_secs(10, 10),
+            StdioRuntimeContext::default(),
+        );
+        let mut buf = String::new();
+        let err = client.read_line_capped(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("exceeded"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mcp_stdio_line_read_returns_normal_line() {
+        // A normal, terminated line under the cap reads back intact, and a
+        // second read reports EOF — parity with `AsyncBufReadExt::read_line`.
+        let mut client = StdioClient::new(
+            "test-server".to_string(),
+            tokio::io::sink(),
+            std::io::Cursor::new(b"{\"ok\":true}\n".to_vec()),
+            None,
+            McpTimeouts::from_secs(10, 10),
+            StdioRuntimeContext::default(),
+        );
+        let mut buf = String::new();
+        let n = client.read_line_capped(&mut buf).await.unwrap();
+        assert_eq!(n, buf.len());
+        assert_eq!(buf, "{\"ok\":true}\n");
+        buf.clear();
+        assert_eq!(client.read_line_capped(&mut buf).await.unwrap(), 0);
     }
 
     #[test]

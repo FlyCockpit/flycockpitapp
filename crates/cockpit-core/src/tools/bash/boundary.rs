@@ -24,9 +24,53 @@ pub fn command_directory_escape(
     let mut i = 0;
     let mut command_start = true;
     let mut current_program: Option<String> = None;
+    // Inside a `[[ … ]]` conditional, `<`/`>` are string-comparison operators,
+    // not redirections, and nothing opens a file — so redirect handling is
+    // suppressed while this is set. Bash always terminates `[[` with a
+    // standalone `]]` word, which is the only thing that clears it (word arm).
+    // Clearing solely on `]]` (never on an operator) is what keeps valid
+    // parenthesized (`[[ ( … ) ]]`) and `&&`/`||`-continued multi-line
+    // conditionals from being misread as redirects. The cost is that an
+    // *unterminated* `[[` leaves this set for the rest of the string — but that
+    // is a shell syntax error bash never executes, so nothing is written and no
+    // real escape is missed.
+    let mut in_double_bracket = false;
     while i < tokens.len() {
         match &tokens[i] {
             ShellToken::Operator(op) => {
+                let operand = match tokens.get(i + 1) {
+                    Some(ShellToken::Word(word)) => Some(word.as_str()),
+                    _ => None,
+                };
+                // Redirect handling is suppressed inside `[[ … ]]` (see the
+                // `in_double_bracket` note above); the operator otherwise falls
+                // through to the normal separator/command-start bookkeeping.
+                if !in_double_bracket
+                    && let Some(kind) = redirect_kind(op, operand)
+                {
+                    // The word following a redirection operator is consumed by
+                    // the redirection, not by the command, so it must never be
+                    // re-read as a program or a command operand. Target-file
+                    // forms (`> ../out`, `>> ../out`, `< ../in`, `&> ../out`,
+                    // and `>&file`) are additionally boundary-checked because
+                    // the shell opens them regardless of the current program —
+                    // `echo`/`printf` never open their operands, but the shell
+                    // opens the redirect target. Heredoc/here-string/fd-dup
+                    // forms are skipped without a path check (their operand is a
+                    // delimiter, literal text, or a file descriptor).
+                    if kind == RedirectKind::TargetFile
+                        && let Some(target) = operand
+                        && let Some(outside) =
+                            redirect_target_escape(target, command_cwd, root, tmp_dir)
+                    {
+                        return Some(outside);
+                    }
+                    // A redirection continues the current command, so keep
+                    // `command_start`/`current_program` and step past both the
+                    // operator and its consumed operand word (if present).
+                    i += if operand.is_some() { 2 } else { 1 };
+                    continue;
+                }
                 command_start = matches!(op.as_str(), ";" | "&" | "&&" | "||" | "|" | "(" | "\n");
                 if command_start || op == ")" {
                     current_program = None;
@@ -65,6 +109,11 @@ pub fn command_directory_escape(
                         Some(ShellToken::Word(prog)) => Some(program_basename(prog).to_string()),
                         _ => None,
                     };
+                    // A `[[` keyword opens a conditional in which `<`/`>` are
+                    // comparisons rather than redirections.
+                    if current_program.as_deref() == Some("[[") {
+                        in_double_bracket = true;
+                    }
                     command_start = false;
                     // Advance past the wrapper run and the program token itself.
                     // If no program word was found (trailing wrapper / operator),
@@ -86,6 +135,15 @@ pub fn command_directory_escape(
                 // paths embedded in interpreter `-c`/`-e` code (`python`,
                 // `node`, …, which are excluded from the allowlist); and any
                 // path operand of a command outside the allowlist below.
+                // A closing `]]` ends the conditional; its operands (compared
+                // as strings) are never opened, so no boundary check applies.
+                if in_double_bracket {
+                    if word == "]]" {
+                        in_double_bracket = false;
+                    }
+                    i += 1;
+                    continue;
+                }
                 if current_program.as_deref() == Some("dd")
                     && let Some(value) = dd_file_operand(word)
                     && let Some(outside) =
@@ -110,6 +168,44 @@ pub fn command_directory_escape(
         }
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectKind {
+    /// Operand is a filesystem path the shell opens — boundary-check it.
+    TargetFile,
+    /// Operand is a heredoc delimiter, a here-string literal, or a duplicated
+    /// file descriptor — consumed by the redirection but never a path.
+    NonPath,
+}
+
+/// Classify a shell operator as a redirection, if it is one, given the word
+/// that follows it. The following word is consumed by the shell, not passed to
+/// the command, so the scanner skips it in every case; only `TargetFile` forms
+/// name a real filesystem path to boundary-check.
+///
+/// The `>&` form is operand-sensitive: `>&2` / `>&-` duplicate a file
+/// descriptor (`NonPath`), but `>&file` (a non-numeric operand) truncates and
+/// opens that file for both stdout and stderr — standard bash, identical to
+/// `&>file` — so it is a real `TargetFile`. `<&` has no such filename form
+/// (`<&file` is a bash error), so it stays `NonPath`.
+fn redirect_kind(op: &str, operand: Option<&str>) -> Option<RedirectKind> {
+    match op {
+        ">" | ">>" | ">|" | "<" | "<>" | "&>" | "&>>" => Some(RedirectKind::TargetFile),
+        ">&" => Some(if operand.map(is_fd_operand).unwrap_or(true) {
+            RedirectKind::NonPath
+        } else {
+            RedirectKind::TargetFile
+        }),
+        "<<" | "<<-" | "<<<" | "<&" => Some(RedirectKind::NonPath),
+        _ => None,
+    }
+}
+
+/// A file-descriptor operand for `>&`/`<&`: a bare descriptor number or the
+/// close form `-`. Anything else is a filename.
+fn is_fd_operand(word: &str) -> bool {
+    word == "-" || (!word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn literal_path_operand_command(program: Option<&str>) -> bool {
@@ -333,7 +429,34 @@ fn literal_path_word_escape(
     root: &Path,
     tmp_dir: Option<&Path>,
 ) -> Option<PathBuf> {
-    if word.starts_with('-') || dynamic_shell_path(word) {
+    // A command operand beginning with `-` is an option flag, not a path.
+    if word.starts_with('-') {
+        return None;
+    }
+    path_word_escape(word, command_cwd, root, tmp_dir)
+}
+
+/// Boundary-check a redirection target. Unlike a command operand, a redirect
+/// target is always a pathname — a leading `-` is a literal filename character,
+/// not an option — so the option skip in `literal_path_word_escape` must not
+/// apply (`> -d/../../outside` still escapes). Dynamic/eval targets remain
+/// deferred to the sandbox.
+fn redirect_target_escape(
+    word: &str,
+    command_cwd: &Path,
+    root: &Path,
+    tmp_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    path_word_escape(word, command_cwd, root, tmp_dir)
+}
+
+fn path_word_escape(
+    word: &str,
+    command_cwd: &Path,
+    root: &Path,
+    tmp_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if dynamic_shell_path(word) {
         return None;
     }
     let path = Path::new(word);
@@ -371,6 +494,15 @@ enum ShellToken {
     Operator(String),
 }
 
+/// Tokenizer for the native boundary gate. NOTE: this is a second, independent
+/// shell tokenizer distinct from `super::shell_write_tokens` /
+/// `tokenize_write_line` in `mod.rs`, which drives the SOUL.md/USER.md identity
+/// write-guard and the durable-write hint. The two must be kept in rough sync
+/// on redirection handling — this one additionally recognizes `&>`/`&>>`/`>&`/
+/// `<&`/`<>`, which `tokenize_write_line` does not — but they cannot trivially
+/// share code because that one also slurps heredoc *bodies* (`WriteToken::
+/// HeredocBody`) that this gate deliberately ignores. If you add a redirection
+/// operator here, check whether the write-guard tokenizer needs the same.
 fn shell_tokens(command: &str) -> Vec<ShellToken> {
     let mut tokens = Vec::new();
     let mut word = String::new();
@@ -438,11 +570,92 @@ fn shell_tokens(command: &str) -> Vec<ShellToken> {
                 tokens.push(ShellToken::Operator(ch.to_string()));
                 word_started = false;
             }
-            '&' | '|' => {
+            '|' => {
                 push_word(&mut tokens, &mut word);
-                let mut op = ch.to_string();
-                if chars.peek().copied() == Some(ch) {
-                    op.push(chars.next().unwrap());
+                let mut op = String::from("|");
+                if chars.peek().copied() == Some('|') {
+                    chars.next();
+                    op.push('|');
+                }
+                tokens.push(ShellToken::Operator(op));
+                word_started = false;
+            }
+            '&' => {
+                push_word(&mut tokens, &mut word);
+                let mut op = String::from("&");
+                match chars.peek().copied() {
+                    Some('&') => {
+                        chars.next();
+                        op.push('&');
+                    }
+                    // `&>` / `&>>` redirect both stdout and stderr to a file.
+                    Some('>') => {
+                        chars.next();
+                        op.push('>');
+                        if chars.peek().copied() == Some('>') {
+                            chars.next();
+                            op.push('>');
+                        }
+                    }
+                    _ => {}
+                }
+                tokens.push(ShellToken::Operator(op));
+                word_started = false;
+            }
+            '>' => {
+                push_word(&mut tokens, &mut word);
+                let mut op = String::from(">");
+                match chars.peek().copied() {
+                    Some('>') => {
+                        chars.next();
+                        op.push('>');
+                    }
+                    Some('|') => {
+                        chars.next();
+                        op.push('|');
+                    }
+                    // `>&` duplicates a file descriptor (operand is an fd).
+                    Some('&') => {
+                        chars.next();
+                        op.push('&');
+                    }
+                    _ => {}
+                }
+                tokens.push(ShellToken::Operator(op));
+                word_started = false;
+            }
+            '<' => {
+                push_word(&mut tokens, &mut word);
+                let mut op = String::from("<");
+                match chars.peek().copied() {
+                    Some('<') => {
+                        chars.next();
+                        op.push('<');
+                        match chars.peek().copied() {
+                            // `<<<` here-string: operand is literal text.
+                            Some('<') => {
+                                chars.next();
+                                op.push('<');
+                            }
+                            // `<<-` heredoc: operand is a delimiter word.
+                            Some('-') => {
+                                chars.next();
+                                op.push('-');
+                            }
+                            _ => {}
+                        }
+                    }
+                    // `<>` opens the target for read-write.
+                    Some('>') => {
+                        chars.next();
+                        op.push('>');
+                    }
+                    // `<&` duplicates a file descriptor (operand is an fd).
+                    Some('&') => {
+                        chars.next();
+                        op.push('&');
+                    }
+                    _ => {}
                 }
                 tokens.push(ShellToken::Operator(op));
                 word_started = false;
@@ -745,6 +958,264 @@ mod tests {
         // Basename + wrapper skip also feeds the `dd` if=/of= handler.
         assert_eq!(
             command_directory_escape("/usr/bin/dd if=../../outside", &cwd, &root, None).as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    // Redirection targets are opened by the shell, not the command, so they
+    // must be boundary-checked even behind a program (`echo`, `printf`, …) that
+    // never opens its own operands. These fail pre-fix because the tokenizer
+    // folded `>`/`<` into ordinary word characters, so the target was scanned
+    // under the (non-path-operand) program and slipped through.
+
+    #[test]
+    fn write_redirect_target_is_flagged() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        assert_eq!(
+            command_directory_escape("echo pwned > ../../outside", &cwd, &root, None).as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn write_redirect_target_without_space_is_flagged() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        // No whitespace between `>` and the path — the operator still splits it.
+        assert_eq!(
+            command_directory_escape("echo pwned >../../outside", &cwd, &root, None).as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn append_redirect_target_is_flagged() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        assert_eq!(
+            command_directory_escape("echo pwned >> ../../outside", &cwd, &root, None).as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn clobber_redirect_target_is_flagged() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        assert_eq!(
+            command_directory_escape("echo pwned >| ../../outside", &cwd, &root, None).as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn read_redirect_target_is_flagged() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        // `<` reads a file the shell opens; escaping reads are gated too.
+        assert_eq!(
+            command_directory_escape("grep secret < ../../outside", &cwd, &root, None).as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn fd_prefixed_redirect_target_is_flagged() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        // `2>PATH` — the leading fd digit is a separate token; the `>` operator
+        // still splits off and checks the target.
+        assert_eq!(
+            command_directory_escape("run 2>../../outside", &cwd, &root, None).as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn stdout_stderr_redirect_target_is_flagged() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        // `&>` redirects both stdout and stderr to a file.
+        assert_eq!(
+            command_directory_escape("run &>../../outside", &cwd, &root, None).as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn append_stdout_stderr_redirect_target_is_flagged() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        // `&>>` appends both stdout and stderr to a file.
+        assert_eq!(
+            command_directory_escape("run &>>../../outside", &cwd, &root, None).as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn read_write_redirect_target_is_flagged() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        // `<>` opens the target for read-write; it is a real file operand.
+        assert_eq!(
+            command_directory_escape("run <> ../../outside", &cwd, &root, None).as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn dup_redirect_with_filename_target_is_flagged() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        // `>&file` (non-numeric operand) truncates and opens that file for both
+        // stdout and stderr — standard bash, identical to `&>file`.
+        assert_eq!(
+            command_directory_escape("echo x >& ../../outside", &cwd, &root, None).as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn dup_redirect_with_fd_number_is_not_flagged() {
+        let (_tmp, root, cwd, _outside) = boundary_fixture();
+        // `>&2` duplicates a descriptor; the operand is an fd, not a path.
+        assert!(command_directory_escape("echo x >&2", &cwd, &root, None).is_none());
+    }
+
+    #[test]
+    fn dash_prefixed_redirect_target_is_flagged() {
+        let (_tmp, root, cwd, _outside) = boundary_fixture();
+        // A redirect target is always a pathname: a leading `-` is a literal
+        // filename character, not an option flag, so the option skip that
+        // applies to command operands must not suppress the boundary check.
+        assert!(
+            command_directory_escape("echo x > -d/../../../outside", &cwd, &root, None).is_some()
+        );
+    }
+
+    // `[[ … ]]` is a shell keyword in which `<`/`>` are string-comparison
+    // operators, not redirections; nothing opens a file, so nothing prompts.
+
+    #[test]
+    fn double_bracket_comparison_is_not_a_redirect() {
+        let (_tmp, root, cwd, _outside) = boundary_fixture();
+        assert!(command_directory_escape("[[ ../a < ../b ]]", &cwd, &root, None).is_none());
+        assert!(command_directory_escape("[[ ../a > ../b ]]", &cwd, &root, None).is_none());
+    }
+
+    #[test]
+    fn double_bracket_with_logical_ops_is_not_a_redirect() {
+        let (_tmp, root, cwd, _outside) = boundary_fixture();
+        // `&&`/`||` may appear inside `[[ … ]]`; they must not prematurely
+        // close the conditional and re-enable redirect handling.
+        assert!(
+            command_directory_escape("[[ ../a < ../b && ../c > ../d ]]", &cwd, &root, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn double_bracket_grouping_is_not_a_redirect() {
+        let (_tmp, root, cwd, _outside) = boundary_fixture();
+        // Parentheses group sub-expressions inside `[[ … ]]`; they must not
+        // close the conditional and re-enable redirect handling for `<`/`>`.
+        assert!(
+            command_directory_escape("[[ ( ../a < ../b ) || -n ../c ]]", &cwd, &root, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn double_bracket_multiline_continuation_is_not_a_redirect() {
+        let (_tmp, root, cwd, _outside) = boundary_fixture();
+        // A `[[ … ]]` continued across a newline after `&&` is one conditional;
+        // the newline must not close it and turn `>` into a redirect.
+        assert!(
+            command_directory_escape("[[ ../a < ../b &&\n../c > ../d ]]", &cwd, &root, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn single_bracket_redirect_is_still_flagged() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        // `[ … ]` is the `test` *command* (not a keyword); bash really does
+        // treat a following `<` as a redirection, so it stays gated.
+        assert_eq!(
+            command_directory_escape("[ -n x ] < ../../outside", &cwd, &root, None).as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn redirect_after_double_bracket_is_still_flagged() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        // Once the conditional closes, a redirect on a following command is
+        // gated again — the `[[` suppression does not leak past `]]`/`;`.
+        assert_eq!(
+            command_directory_escape("[[ -n x ]]; cat > ../../outside", &cwd, &root, None)
+                .as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn write_redirect_absolute_target_is_flagged() {
+        let (_tmp, root, cwd, _outside) = boundary_fixture();
+        assert_eq!(
+            command_directory_escape("echo x > /etc/cron.d/x", &cwd, &root, None).as_deref(),
+            Some(Path::new(if cfg!(target_os = "macos") {
+                "/private/etc/cron.d/x"
+            } else {
+                "/etc/cron.d/x"
+            }))
+        );
+    }
+
+    // Negative tests: the redirect handling must not over-flag.
+
+    #[test]
+    fn in_boundary_redirect_target_is_not_flagged() {
+        let (_tmp, root, cwd, _outside) = boundary_fixture();
+        // A redirect that lands inside the session root is allowed silently.
+        assert!(command_directory_escape("echo x > ./out.txt", &cwd, &root, None).is_none());
+    }
+
+    #[test]
+    fn heredoc_delimiter_is_not_treated_as_a_path() {
+        let (_tmp, root, cwd, _outside) = boundary_fixture();
+        // `<<EOF` names a delimiter, not a file; nothing to flag.
+        assert!(command_directory_escape("cat <<EOF", &cwd, &root, None).is_none());
+    }
+
+    #[test]
+    fn here_string_literal_is_not_treated_as_a_path() {
+        let (_tmp, root, cwd, _outside) = boundary_fixture();
+        // `<<<` supplies literal text on stdin; the token is not opened as a
+        // file, and (critically) must not be scanned as `cat`'s path operand.
+        assert!(
+            command_directory_escape("cat <<< ../../outside", &cwd, &root, None).is_none()
+        );
+    }
+
+    #[test]
+    fn fd_duplication_operand_is_not_treated_as_a_path() {
+        let (_tmp, root, cwd, _outside) = boundary_fixture();
+        // `2>&1` duplicates a descriptor; `1` is an fd, not a path.
+        assert!(command_directory_escape("run 2>&1", &cwd, &root, None).is_none());
+    }
+
+    #[test]
+    fn command_after_leading_redirect_is_still_scanned() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        // A leading redirect (`> f cmd …`) is valid bash; the command that
+        // follows the redirect target must still be gated on its own operands.
+        assert_eq!(
+            command_directory_escape("> ./out.txt cat ../../outside", &cwd, &root, None)
+                .as_deref(),
+            Some(outside.as_path())
+        );
+    }
+
+    #[test]
+    fn pipe_still_separates_commands() {
+        let (_tmp, root, cwd, outside) = boundary_fixture();
+        // Restructuring the `&`/`|` tokenizer arms must not break the pipe
+        // separator: the second stage is gated under `cat`, not `echo`.
+        assert_eq!(
+            command_directory_escape("echo hi | cat ../../outside", &cwd, &root, None).as_deref(),
             Some(outside.as_path())
         );
     }

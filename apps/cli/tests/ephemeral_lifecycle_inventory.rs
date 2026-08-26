@@ -747,6 +747,177 @@ fn compact_tokens(tokens: impl quote::ToTokens) -> String {
     tokens.to_token_stream().to_string().replace(' ', "")
 }
 
+fn raw_owner_occurrence_violations(source: &str) -> Vec<String> {
+    struct OwnerOccurrences {
+        function: Option<String>,
+        test_depth: usize,
+        allowed_connect_callee_depth: usize,
+        owned_impl_depth: usize,
+        canonical_self_types: Vec<String>,
+        violations: Vec<String>,
+    }
+
+    impl OwnerOccurrences {
+        fn reject(&mut self, context: &str) {
+            if self.test_depth == 0 {
+                self.violations.push(format!(
+                    "OwnedDaemonSession appears outside canonical authority context: {context}"
+                ));
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for OwnerOccurrences {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            let test = usize::from(is_test_only(&item.attrs));
+            self.test_depth += test;
+            visit::visit_item_mod(self, item);
+            self.test_depth -= test;
+        }
+
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            let previous = self.function.replace(item.sig.ident.to_string());
+            let test = usize::from(is_test_only(&item.attrs));
+            self.test_depth += test;
+            visit::visit_item_fn(self, item);
+            self.test_depth -= test;
+            self.function = previous;
+        }
+
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            let previous = self.function.replace(item.sig.ident.to_string());
+            let test = usize::from(is_test_only(&item.attrs));
+            self.test_depth += test;
+            visit::visit_impl_item_fn(self, item);
+            self.test_depth -= test;
+            self.function = previous;
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            let canonical_self = matches!(&*item.self_ty, syn::Type::Path(path)
+                if path.path.is_ident("OwnedDaemonSession"));
+            if canonical_self && self.test_depth == 0 {
+                let methods = item
+                    .items
+                    .iter()
+                    .filter_map(|implementation_item| match implementation_item {
+                        syn::ImplItem::Fn(method) => Some(method.sig.ident.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let canonical = match &item.trait_ {
+                    None => methods == ["connect", "client", "finish"],
+                    Some((_, path, _)) if path.is_ident("Drop") => methods == ["drop"],
+                    Some(_) => false,
+                };
+                if !canonical || methods.len() != item.items.len() {
+                    self.reject("noncanonical impl or associated item");
+                }
+            }
+            if !canonical_self {
+                self.visit_type(&item.self_ty);
+            }
+            self.visit_generics(&item.generics);
+            if let Some((_, path, _)) = &item.trait_ {
+                self.visit_path(path);
+            }
+            self.owned_impl_depth += usize::from(canonical_self);
+            for implementation_item in &item.items {
+                self.visit_impl_item(implementation_item);
+            }
+            self.owned_impl_depth -= usize::from(canonical_self);
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            let canonical_connect = self.test_depth == 0
+                && self.function.as_deref() == Some("run_owned_daemon")
+                && matches!(&*call.func, syn::Expr::Path(path)
+                    if path.path.segments.iter().map(|segment| segment.ident.to_string())
+                        .eq(["OwnedDaemonSession", "connect"]));
+            self.allowed_connect_callee_depth += usize::from(canonical_connect);
+            self.visit_expr(&call.func);
+            self.allowed_connect_callee_depth -= usize::from(canonical_connect);
+            for argument in &call.args {
+                self.visit_expr(argument);
+            }
+        }
+
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            let contains_owner = path
+                .path
+                .segments
+                .iter()
+                .any(|segment| segment.ident == "OwnedDaemonSession");
+            if contains_owner && self.allowed_connect_callee_depth == 0 {
+                self.reject("value path");
+            }
+            if self.owned_impl_depth > 0 && path.path.is_ident("Self") {
+                self.reject("nonliteral Self value path in owner impl");
+            }
+            visit::visit_expr_path(self, path);
+        }
+
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            if self.test_depth == 0 && self.owned_impl_depth > 0 && path.path.is_ident("Self") {
+                self.canonical_self_types
+                    .push(self.function.clone().unwrap_or_else(|| "<none>".into()));
+            }
+            if path
+                .path
+                .segments
+                .iter()
+                .any(|segment| segment.ident == "OwnedDaemonSession")
+            {
+                self.reject("type path");
+            }
+            visit::visit_type_path(self, path);
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            let mut inspection = UseInspection::default();
+            inspect_use(&item.tree, &mut inspection);
+            if inspection
+                .names
+                .iter()
+                .any(|name| name == "OwnedDaemonSession")
+            {
+                self.reject("use or re-export");
+            }
+            visit::visit_item_use(self, item);
+        }
+
+        fn visit_macro(&mut self, invocation: &'ast syn::Macro) {
+            if invocation
+                .tokens
+                .to_string()
+                .split(|character: char| !character.is_alphanumeric() && character != '_')
+                .any(|token| token == "OwnedDaemonSession")
+            {
+                self.reject("macro tokens");
+            }
+            visit::visit_macro(self, invocation);
+        }
+    }
+
+    let file = syn::parse_file(source).unwrap();
+    let mut visitor = OwnerOccurrences {
+        function: None,
+        test_depth: 0,
+        allowed_connect_callee_depth: 0,
+        owned_impl_depth: 0,
+        canonical_self_types: Vec::new(),
+        violations: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    if visitor.canonical_self_types != ["connect", "connect"] {
+        visitor.violations.push(format!(
+            "OwnedDaemonSession Self type inventory changed: {:?}",
+            visitor.canonical_self_types
+        ));
+    }
+    visitor.violations
+}
+
 fn raw_owner_struct_literals(source: &str) -> Vec<String> {
     struct StructLiteralVisitor {
         function: Option<String>,
@@ -846,6 +1017,11 @@ fn core_runner_is_the_only_raw_owner() {
     assert_eq!(raw_owner_connect_path_count(&source), 1);
     assert_eq!(raw_owner_struct_literals(&source), ["connect"]);
     assert!(raw_owner_aliases(&source).is_empty());
+    assert!(
+        raw_owner_occurrence_violations(&source).is_empty(),
+        "{}",
+        raw_owner_occurrence_violations(&source).join("\n")
+    );
     let session = file
         .items
         .iter()
@@ -983,6 +1159,38 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
     );
     assert_eq!(raw_owner_acquisitions(&function_item), []);
     assert_eq!(raw_owner_connect_path_count(&function_item), 1);
+
+    let test_then_production_literal = r#"
+        #[cfg(test)] mod tests { fn ignored() { let _ = OwnedDaemonSession { field: () }; } }
+        fn production() { let _ = OwnedDaemonSession { field: () }; }
+    "#;
+    assert_eq!(
+        raw_owner_struct_literals(test_then_production_literal),
+        ["production"]
+    );
+
+    for addition in [
+        "fn extra() { let _: OwnedDaemonSession = unsafe { std::mem::zeroed() }; }",
+        "struct Wrapper { owner: OwnedDaemonSession }",
+        "enum Wrapper { Owner(OwnedDaemonSession) }",
+        "union Wrapper { owner: std::mem::ManuallyDrop<OwnedDaemonSession> }",
+        "fn expose(value: OwnedDaemonSession) -> OwnedDaemonSession { value }",
+        "fn generic<T: Into<OwnedDaemonSession>>() {}",
+        "trait Escape { type Owner; const OWNER: Option<OwnedDaemonSession>; }",
+        "struct EscapeImpl; impl Escape for EscapeImpl { type Owner = OwnedDaemonSession; const OWNER: Option<OwnedDaemonSession> = None; }",
+        "static OWNER: Option<OwnedDaemonSession> = None;",
+        "const OWNER: Option<OwnedDaemonSession> = None;",
+        "fn extra() { let constructor = OwnedDaemonSession::connect; let _ = constructor; }",
+        "fn extra() { let _ = OwnedDaemonSession::connect(mode); }",
+        "macro_rules! owner { () => { OwnedDaemonSession::connect(mode) } }",
+        "impl OwnedDaemonSession { fn escape(self) -> Self { self } }",
+    ] {
+        let adversarial = format!("{source}\n{addition}");
+        assert!(
+            !raw_owner_occurrence_violations(&adversarial).is_empty(),
+            "accepted raw owner occurrence: {addition}"
+        );
+    }
 }
 
 #[test]

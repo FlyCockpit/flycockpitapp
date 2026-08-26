@@ -1306,7 +1306,6 @@ fn create_migration_backup_with_limit(
     if validation.is_err() && existing_quarantine_matches(&untrusted, &content_digest)? {
         remove_backup_candidate(&candidate)?;
         candidate_guard.disarm();
-        fsync_file_and_parent(&untrusted)?;
         return Err(validation.unwrap_err()).context(format!(
             "an exact content-identical backup is already durably quarantined at {}",
             untrusted.display()
@@ -1350,13 +1349,14 @@ fn create_migration_backup_with_limit(
 }
 
 fn existing_quarantine_matches(path: &Path, expected_digest: &str) -> Result<bool> {
-    existing_quarantine_matches_after_open(path, expected_digest, || {})
+    existing_quarantine_matches_after_open(path, expected_digest, || {}, || {})
 }
 
 fn existing_quarantine_matches_after_open(
     path: &Path,
     expected_digest: &str,
     after_open: impl FnOnce(),
+    before_parent_sync: impl FnOnce(),
 ) -> Result<bool> {
     let mut file = match open_quarantine_nofollow(path) {
         Ok(file) => file,
@@ -1388,7 +1388,23 @@ fn existing_quarantine_matches_after_open(
     file.rewind()
         .with_context(|| format!("rewinding quarantine artifact {}", path.display()))?;
     let digest_matches = reader_sha256(&mut file)? == expected_digest;
-    Ok(digest_matches && path_still_names_open_quarantine(path, &metadata)?)
+    if !digest_matches {
+        return Ok(false);
+    }
+    file.sync_all()
+        .with_context(|| format!("fsyncing opened quarantine handle {}", path.display()))?;
+    if !path_still_names_open_quarantine(path, &metadata)? {
+        return Ok(false);
+    }
+    before_parent_sync();
+    if !path_still_names_open_quarantine(path, &metadata)? {
+        return Ok(false);
+    }
+    let parent = path
+        .parent()
+        .context("quarantine artifact has no parent directory")?;
+    sync_backup_parent(parent)?;
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -1521,7 +1537,43 @@ fn quarantine_metadata_is_private_and_owned(metadata: &std::fs::Metadata) -> boo
     metadata.is_file()
 }
 
-fn displace_invalid_quarantine(database: &Path, quarantine: &Path) -> Result<PathBuf> {
+fn displace_invalid_quarantine(database: &Path, quarantine: &Path) -> Result<Option<PathBuf>> {
+    displace_invalid_quarantine_after_open(database, quarantine, || {})
+}
+
+fn displace_invalid_quarantine_after_open(
+    database: &Path,
+    quarantine: &Path,
+    after_open: impl FnOnce(),
+) -> Result<Option<PathBuf>> {
+    let file = match open_quarantine_nofollow(quarantine) {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            unlink_quarantine_symlink(quarantine, sync_backup_parent)?;
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "opening invalid quarantine without following it {}",
+                    quarantine.display()
+                )
+            });
+        }
+    };
+    let opened = file.metadata().with_context(|| {
+        format!(
+            "inspecting invalid quarantine handle {}",
+            quarantine.display()
+        )
+    })?;
+    anyhow::ensure!(
+        quarantine_handle_is_regular(&opened),
+        "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: quarantine path {} changed type before displacement; remove that exact path manually and retry",
+        quarantine.display()
+    );
+    after_open();
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1537,8 +1589,49 @@ fn displace_invalid_quarantine(database: &Path, quarantine: &Path) -> Result<Pat
             displaced.display()
         )
     })?;
-    fsync_file_and_parent(&displaced)?;
-    Ok(displaced)
+    let current = std::fs::symlink_metadata(&displaced).with_context(|| {
+        format!(
+            "inspecting displaced quarantine without following it {}",
+            displaced.display()
+        )
+    })?;
+    if current.file_type().is_symlink() {
+        unlink_quarantine_symlink(&displaced, sync_backup_parent)?;
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        current.file_type().is_file() && same_quarantine_file_identity(&opened, &current),
+        "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: displaced quarantine {} changed identity or type; remove that exact path manually and retry",
+        displaced.display()
+    );
+    file.sync_all().with_context(|| {
+        format!(
+            "fsyncing retained invalid quarantine handle {}",
+            displaced.display()
+        )
+    })?;
+    let parent = displaced
+        .parent()
+        .context("displaced quarantine has no parent directory")?;
+    sync_backup_parent(parent)?;
+    Ok(Some(displaced))
+}
+
+#[cfg(unix)]
+fn same_quarantine_file_identity(opened: &std::fs::Metadata, current: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    opened.dev() == current.dev() && opened.ino() == current.ino()
+}
+
+#[cfg(not(unix))]
+fn same_quarantine_file_identity(
+    _opened: &std::fs::Metadata,
+    _current: &std::fs::Metadata,
+) -> bool {
+    // No portable stable file identity is exposed; automatic displacement is
+    // therefore denied rather than trusting a path after rename.
+    false
 }
 
 fn handle_invalid_quarantine_occupant(
@@ -1555,7 +1648,7 @@ fn handle_invalid_quarantine_occupant(
     };
     let file_type = metadata.file_type();
     if file_type.is_file() && !file_type.is_symlink() {
-        return displace_invalid_quarantine(database, quarantine).map(Some);
+        return displace_invalid_quarantine(database, quarantine);
     }
     if file_type.is_symlink() {
         unlink_quarantine_symlink(quarantine, sync_backup_parent)?;
@@ -3012,7 +3105,9 @@ mod tests {
         std::fs::write(&quarantine, &exact_bytes[..4]).unwrap();
         assert!(!existing_quarantine_matches(&quarantine, &digest).unwrap());
 
-        let displaced = displace_invalid_quarantine(&database, &quarantine).unwrap();
+        let displaced = displace_invalid_quarantine(&database, &quarantine)
+            .unwrap()
+            .expect("regular displacement");
         assert!(!quarantine.exists());
         assert_eq!(std::fs::read(displaced).unwrap(), &exact_bytes[..4]);
     }
@@ -3065,10 +3160,15 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
         let displaced = temp.path().join("displaced.sqlite");
         assert!(
-            !existing_quarantine_matches_after_open(&quarantine, &digest, || {
-                std::fs::rename(&quarantine, &displaced).unwrap();
-                symlink(&target, &quarantine).unwrap();
-            })
+            !existing_quarantine_matches_after_open(
+                &quarantine,
+                &digest,
+                || {
+                    std::fs::rename(&quarantine, &displaced).unwrap();
+                    symlink(&target, &quarantine).unwrap();
+                },
+                || {},
+            )
             .unwrap()
         );
         assert_eq!(
@@ -3080,6 +3180,83 @@ mod tests {
             0o640
         );
         assert_eq!(std::fs::read(displaced).unwrap(), opened_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_validation_rechecks_identity_before_parent_sync() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp
+            .path()
+            .join("cockpit.v1.backup-untrusted-race.sqlite.quarantine");
+        let opened_bytes = b"opened quarantine bytes";
+        std::fs::write(&quarantine, opened_bytes).unwrap();
+        let source = temp.path().join("source.sqlite");
+        std::fs::write(&source, opened_bytes).unwrap();
+        let digest = file_sha256(&source).unwrap();
+
+        let target = temp.path().join("target.sqlite");
+        std::fs::write(&target, b"must not be synced through its path").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let displaced = temp.path().join("displaced.sqlite");
+        assert!(
+            !existing_quarantine_matches_after_open(
+                &quarantine,
+                &digest,
+                || {},
+                || {
+                    std::fs::rename(&quarantine, &displaced).unwrap();
+                    symlink(&target, &quarantine).unwrap();
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"must not be synced through its path"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read(displaced).unwrap(), opened_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_displacement_never_follows_pre_rename_symlink_swap() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let quarantine = temp
+            .path()
+            .join("cockpit.v1.backup-untrusted-race.sqlite.quarantine");
+        std::fs::write(&quarantine, b"original invalid quarantine").unwrap();
+        let moved_original = temp.path().join("attacker-moved-original.sqlite");
+        let target = temp.path().join("target.sqlite");
+        std::fs::write(&target, b"must remain untouched").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let displaced = displace_invalid_quarantine_after_open(&database, &quarantine, || {
+            std::fs::rename(&quarantine, &moved_original).unwrap();
+            symlink(&target, &quarantine).unwrap();
+        })
+        .unwrap();
+
+        assert!(displaced.is_none());
+        assert!(!quarantine.exists());
+        assert_eq!(
+            std::fs::read(&moved_original).unwrap(),
+            b"original invalid quarantine"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"must remain untouched");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
     }
 
     #[cfg(unix)]

@@ -111,7 +111,7 @@ fn build_check_message(template: &str, nonce: &str, untrusted: &str) -> String {
 /// The `risk` tool definition advertised to the utility model. One
 /// required string field, `level`, constrained to the three rating
 /// values. Terse per the token-economy rule (GOALS §10).
-fn risk_tool() -> ToolDefinition {
+pub(crate) fn risk_tool() -> ToolDefinition {
     ToolDefinition {
         name: RISK_TOOL_NAME.to_string(),
         description: "Report the prompt-injection risk level of the fenced untrusted text."

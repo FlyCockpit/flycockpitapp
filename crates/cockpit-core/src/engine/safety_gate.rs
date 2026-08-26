@@ -69,7 +69,7 @@ pub enum SafetyUnavailableReason {
 
 /// The `safety` tool definition advertised to the utility model. Two
 /// required booleans. Terse per the token-economy rule (GOALS §10).
-fn safety_tool() -> ToolDefinition {
+pub(crate) fn safety_tool() -> ToolDefinition {
     ToolDefinition {
         name: SAFETY_TOOL_NAME.to_string(),
         description: "Report whether the single command/call is safe to run and whether its result needs an injection re-check."

@@ -19,9 +19,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 
-use crate::tui::pane::{Pane, ScrollList};
+use crate::tui::pane::Pane;
 use crate::tui::pane_shared::{resolve_project_id, short_id};
 use crate::tui::progress::render_bar;
 use crate::tui::theme::MUTED_COLOR_INDEX;
@@ -82,7 +85,8 @@ pub struct StatsPane {
     /// scope/range change (the model set may differ).
     expanded: Vec<bool>,
     /// Cursor over recovery rows plus vertical body scroll.
-    list: ScrollList,
+    list: ListState,
+    selected_model: Option<String>,
     /// Rendered body height at the last draw — drives scroll clamping.
     last_body_height: usize,
     /// Total rendered body rows at the last draw — drives scroll clamp.
@@ -132,7 +136,8 @@ impl StatsPane {
             rollup: StatsPaneState::Loading,
             pending_fetch: Some(key),
             expanded: Vec::new(),
-            list: ScrollList::new(),
+            list: ListState::default(),
+            selected_model: None,
             last_body_height: 0,
             last_content_rows: 0,
         }
@@ -145,7 +150,8 @@ impl StatsPane {
         self.rollup = StatsPaneState::Loading;
         self.pending_fetch = Some(self.current_fetch_key());
         self.expanded = init_expanded(&self.rollup);
-        self.list.reset();
+        self.list = ListState::default();
+        self.selected_model = None;
     }
 
     pub(crate) fn take_pending_fetch_key(&mut self) -> Option<StatsPaneFetchKey> {
@@ -156,12 +162,31 @@ impl StatsPane {
         if result.key != self.current_fetch_key() {
             return;
         }
+        let previous_index = self.selected_recovery_index();
+        let previous_model = self.selected_model.take();
         self.rollup = match result.result {
             Ok(rollup) => StatsPaneState::Ready(Box::new(rollup)),
             Err(error) => StatsPaneState::Error(error),
         };
         self.expanded = init_expanded(&self.rollup);
-        self.list.reset();
+        self.list = ListState::default();
+        self.selected_model = self.rollup.ready().and_then(|rollup| {
+            previous_model
+                .filter(|model| {
+                    rollup
+                        .recovery
+                        .by_model
+                        .iter()
+                        .any(|row| row.model == *model)
+                })
+                .or_else(|| {
+                    rollup
+                        .recovery
+                        .by_model
+                        .get(previous_index.min(rollup.recovery.by_model.len().saturating_sub(1)))
+                        .map(|row| row.model.clone())
+                })
+        });
     }
 
     fn current_fetch_key(&self) -> StatsPaneFetchKey {
@@ -178,6 +203,42 @@ impl StatsPane {
             .ready()
             .map(|r| r.recovery.by_model.len())
             .unwrap_or(0)
+    }
+
+    fn selected_recovery_index(&self) -> usize {
+        let Some(rollup) = self.rollup.ready() else {
+            return 0;
+        };
+        self.selected_model
+            .as_ref()
+            .and_then(|model| {
+                rollup
+                    .recovery
+                    .by_model
+                    .iter()
+                    .position(|row| row.model == *model)
+            })
+            .unwrap_or(0)
+    }
+
+    fn move_selection(&mut self, delta: isize, total: usize) {
+        if total == 0 {
+            self.selected_model = None;
+            self.list.select(None);
+            *self.list.offset_mut() = 0;
+            return;
+        }
+        let current = self.selected_recovery_index();
+        let next = if delta < 0 {
+            crate::tui::nav::wrap_prev(current, total)
+        } else {
+            crate::tui::nav::wrap_next(current, total)
+        };
+        self.selected_model = self
+            .rollup
+            .ready()
+            .and_then(|rollup| rollup.recovery.by_model.get(next))
+            .map(|row| row.model.clone());
     }
 
     /// Handle a key. Returns `true` when the pane should close.
@@ -202,49 +263,48 @@ impl StatsPane {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let n = self.recovery_rows();
-                let prev = self.list.cursor();
-                self.list.move_by(-1, n);
-                if self.list.cursor() > prev {
+                let prev = self.selected_recovery_index();
+                self.move_selection(-1, n);
+                if self.selected_recovery_index() > prev {
                     // Wrapped first → last: jump the body to the bottom so
                     // the now-selected last row is visible.
-                    self.list
-                        .set_scroll(self.last_content_rows.saturating_sub(self.last_body_height));
+                    *self.list.offset_mut() =
+                        self.last_content_rows.saturating_sub(self.last_body_height);
                 } else {
                     self.ensure_cursor_visible();
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 let n = self.recovery_rows();
-                let prev = self.list.cursor();
-                self.list.move_by(1, n);
-                if self.list.cursor() < prev {
+                let prev = self.selected_recovery_index();
+                self.move_selection(1, n);
+                if self.selected_recovery_index() < prev {
                     // Wrapped last → first: jump the body to the top.
-                    self.list.set_scroll(0);
+                    *self.list.offset_mut() = 0;
                 } else {
                     self.ensure_cursor_visible();
                 }
             }
             KeyCode::PageUp => {
-                self.list.set_scroll(
-                    self.list
-                        .scroll()
-                        .saturating_sub(self.last_body_height.max(1)),
-                );
+                *self.list.offset_mut() = self
+                    .list
+                    .offset()
+                    .saturating_sub(self.last_body_height.max(1));
             }
             KeyCode::PageDown => {
                 let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-                self.list.set_scroll(
-                    (self.list.scroll() + self.last_body_height.max(1)).min(max_scroll),
-                );
+                *self.list.offset_mut() =
+                    (self.list.offset() + self.last_body_height.max(1)).min(max_scroll);
             }
-            KeyCode::Char('g') => self.list.set_scroll(0),
+            KeyCode::Char('g') => *self.list.offset_mut() = 0,
             KeyCode::Char('G') => {
-                self.list
-                    .set_scroll(self.last_content_rows.saturating_sub(self.last_body_height));
+                *self.list.offset_mut() =
+                    self.last_content_rows.saturating_sub(self.last_body_height);
             }
             KeyCode::Enter | KeyCode::Char('e') => {
                 // Expand/collapse the recovery row under the cursor.
-                if let Some(flag) = self.expanded.get_mut(self.list.cursor()) {
+                let selected = self.selected_recovery_index();
+                if let Some(flag) = self.expanded.get_mut(selected) {
                     *flag = !*flag;
                 }
             }
@@ -255,15 +315,14 @@ impl StatsPane {
 
     /// Scroll the body up by one row (mouse wheel).
     pub fn scroll_up(&mut self) {
-        self.list.set_scroll(self.list.scroll().saturating_sub(1));
+        *self.list.offset_mut() = self.list.offset().saturating_sub(1);
     }
 
     /// Scroll the body down by one row (mouse wheel), clamped so the
     /// last row can't scroll above the body floor.
     pub fn scroll_down(&mut self) {
         let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-        self.list
-            .set_scroll((self.list.scroll() + 1).min(max_scroll));
+        *self.list.offset_mut() = (self.list.offset() + 1).min(max_scroll);
     }
 
     fn ensure_cursor_visible(&mut self) {
@@ -271,24 +330,24 @@ impl StatsPane {
             return;
         };
         let height = self.last_body_height.max(1);
-        if row < self.list.scroll() {
-            self.list.set_scroll(row);
-        } else if row >= self.list.scroll() + height {
-            self.list.set_scroll(row + 1 - height);
+        if row < self.list.offset() {
+            *self.list.offset_mut() = row;
+        } else if row >= self.list.offset() + height {
+            *self.list.offset_mut() = row + 1 - height;
         }
         let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-        self.list.set_scroll(self.list.scroll().min(max_scroll));
+        *self.list.offset_mut() = self.list.offset().min(max_scroll);
     }
 
     fn cursor_body_line(&self) -> Option<usize> {
         let rollup = self.rollup.ready()?;
         if rollup.recovery.by_model.is_empty()
-            || self.list.cursor() >= rollup.recovery.by_model.len()
+            || self.selected_recovery_index() >= rollup.recovery.by_model.len()
         {
             return None;
         }
         let mut row = section_tokens(&rollup.tokens).len() + 1 + 2;
-        for i in 0..self.list.cursor() {
+        for i in 0..self.selected_recovery_index() {
             row += 1;
             if self.expanded.get(i).copied().unwrap_or(false) {
                 row +=
@@ -314,13 +373,27 @@ impl StatsPane {
         self.last_body_height = body.height as usize;
         // Clamp scroll to the valid range now that we know the heights.
         let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-        if self.list.scroll() > max_scroll {
-            self.list.set_scroll(max_scroll);
+        if self.list.offset() > max_scroll {
+            *self.list.offset_mut() = max_scroll;
         }
-
-        frame.render_widget(
-            Paragraph::new(lines).scroll((self.list.scroll() as u16, 0)),
+        self.list.select(self.cursor_body_line());
+        frame.render_stateful_widget(
+            List::new(lines.into_iter().map(ListItem::new).collect::<Vec<_>>())
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .scroll_padding(1),
             body,
+            &mut self.list,
+        );
+        render_scrollbar(
+            frame,
+            body,
+            self.last_content_rows,
+            self.last_body_height,
+            self.list.offset(),
         );
 
         let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
@@ -379,7 +452,7 @@ impl StatsPane {
                 lines.extend(section_recovery(
                     &r.recovery,
                     &self.expanded,
-                    self.list.cursor(),
+                    self.selected_recovery_index(),
                 ));
                 lines.push(Line::default());
                 lines.extend(section_language(&r.language, width));
@@ -387,6 +460,28 @@ impl StatsPane {
         }
         lines
     }
+}
+
+fn render_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    content_rows: usize,
+    viewport_rows: usize,
+    offset: usize,
+) {
+    if viewport_rows == 0 || content_rows <= viewport_rows || area.width <= 1 {
+        return;
+    }
+    let mut state = ScrollbarState::new(content_rows)
+        .position(offset)
+        .viewport_content_length(viewport_rows);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None),
+        area,
+        &mut state,
+    );
 }
 
 impl Pane for StatsPane {
@@ -826,6 +921,8 @@ mod tests {
         RecoveryToolRow,
     };
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -847,7 +944,8 @@ mod tests {
             rollup: StatsPaneState::Ready(Box::new(rollup)),
             pending_fetch: None,
             expanded,
-            list: ScrollList::new(),
+            list: ListState::default(),
+            selected_model: None,
             last_body_height: 100,
             last_content_rows: 0,
         }
@@ -1094,17 +1192,17 @@ mod tests {
             },
         ];
         let mut pane = pane_with(rollup);
-        assert_eq!(pane.list.cursor(), 0);
+        assert_eq!(pane.selected_recovery_index(), 0);
         pane.handle_key(press(KeyCode::Down));
-        assert_eq!(pane.list.cursor(), 1);
+        assert_eq!(pane.selected_recovery_index(), 1);
         // Wrap last → first.
         pane.handle_key(press(KeyCode::Down));
-        assert_eq!(pane.list.cursor(), 0);
+        assert_eq!(pane.selected_recovery_index(), 0);
         // Wrap first → last.
         pane.handle_key(press(KeyCode::Up));
-        assert_eq!(pane.list.cursor(), 1);
+        assert_eq!(pane.selected_recovery_index(), 1);
         pane.handle_key(press(KeyCode::Up));
-        assert_eq!(pane.list.cursor(), 0);
+        assert_eq!(pane.selected_recovery_index(), 0);
     }
 
     #[test]
@@ -1163,14 +1261,14 @@ mod tests {
 
         let selected = pane.cursor_body_line().unwrap();
         assert!(
-            selected >= pane.list.scroll(),
+            selected >= pane.list.offset(),
             "selected={selected} scroll={}",
-            pane.list.scroll()
+            pane.list.offset()
         );
         assert!(
-            selected < pane.list.scroll() + pane.last_body_height,
+            selected < pane.list.offset() + pane.last_body_height,
             "selected={selected} scroll={}",
-            pane.list.scroll()
+            pane.list.offset()
         );
     }
 
@@ -1245,5 +1343,76 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn rendered_buffer(pane: &mut StatsPane, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, width, height)))
+            .expect("draw stats");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn recovery_row(model: impl Into<String>) -> RecoveryRow {
+        RecoveryRow {
+            model: model.into(),
+            calls: 10,
+            recovered: 2,
+            hard_fail: 1,
+            malformed_pct: 30.0,
+            recovered_pct: 20.0,
+            hard_fail_pct: 10.0,
+        }
+    }
+
+    #[test]
+    fn test_backend_matrix_covers_loading_error_empty_unicode_and_scroll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut loading = StatsPane::open(tmp.path());
+        assert!(rendered_buffer(&mut loading, 24, 7).contains("loading"));
+        loading.rollup = StatsPaneState::Error("offline e\u{301}".to_string());
+        assert!(rendered_buffer(&mut loading, 80, 8).contains("offline"));
+
+        for width in [24, 80, 140] {
+            let mut rollup = empty_rollup();
+            rollup.recovery.by_model = (0..12)
+                .map(|index| recovery_row(format!("模型-e\u{301}-{index:02}")))
+                .collect();
+            let mut pane = pane_with(rollup);
+            let rendered = rendered_buffer(&mut pane, width, 9);
+            assert!(rendered.contains("/stats"));
+            assert!(pane.last_content_rows > pane.last_body_height);
+            for _ in 0..8 {
+                pane.handle_key(press(KeyCode::Down));
+            }
+            let _ = rendered_buffer(&mut pane, width, 9);
+            assert!(pane.list.offset() > 0);
+        }
+
+        let mut empty = pane_with(empty_rollup());
+        assert!(rendered_buffer(&mut empty, 80, 12).contains("no data"));
+    }
+
+    #[test]
+    fn model_selection_survives_refresh_reorder() {
+        let mut rollup = empty_rollup();
+        rollup.recovery.by_model = vec![recovery_row("a"), recovery_row("b")];
+        let mut pane = pane_with(rollup.clone());
+        pane.handle_key(press(KeyCode::Down));
+        assert_eq!(pane.selected_model.as_deref(), Some("b"));
+
+        rollup.recovery.by_model.reverse();
+        pane.apply_fetch_result(StatsPaneFetchResult {
+            key: pane.current_fetch_key(),
+            result: Ok(rollup),
+        });
+        assert_eq!(pane.selected_model.as_deref(), Some("b"));
+        assert_eq!(pane.selected_recovery_index(), 0);
     }
 }

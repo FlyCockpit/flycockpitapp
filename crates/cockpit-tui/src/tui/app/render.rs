@@ -1397,7 +1397,7 @@ impl App {
                     self.overlay = Overlay::Permissions(pane);
                 }
                 Overlay::Resources(mut pane) => {
-                    pane.render(frame, rects.body);
+                    pane.render_with_buttons(frame, rects.body, Some(&mut self.button_registry));
                     self.overlay = Overlay::Resources(pane);
                 }
                 Overlay::Quick(dialog) => {

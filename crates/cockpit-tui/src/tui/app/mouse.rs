@@ -373,10 +373,17 @@ impl App {
             Overlay::Leaks(_) => return,
             // Handled by the modal guard above; unreachable here.
             Overlay::Sealed(_) => return,
+            Overlay::Resources(pane) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => pane.scroll_up(),
+                    MouseEventKind::ScrollDown => pane.scroll_down(),
+                    _ => {}
+                }
+                return;
+            }
             Overlay::ModelPicker(_)
             | Overlay::Multireview(_)
             | Overlay::Usage(_)
-            | Overlay::Resources(_)
             | Overlay::Quick(_) => return,
             Overlay::None => {}
         }

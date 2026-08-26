@@ -5,9 +5,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 
-use crate::tui::pane::{Pane, ScrollList};
+use crate::tui::pane::Pane;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
 use cockpit_core::engine::resource_scheduler::{
     ResourceQueuedSnapshot, ResourceQueuedState, ResourceRunningSnapshot, ResourceSchedulerSnapshot,
@@ -24,7 +27,8 @@ pub struct ResourcesPane {
     snapshot: Option<ResourceSchedulerSnapshot>,
     error: Option<String>,
     loading: bool,
-    list: ScrollList,
+    list: ListState,
+    selected_request_id: Option<String>,
     last_body_height: usize,
     last_content_rows: usize,
 }
@@ -64,7 +68,8 @@ impl ResourcesPane {
             snapshot: None,
             error: None,
             loading: true,
-            list: ScrollList::new(),
+            list: ListState::default(),
+            selected_request_id: None,
             last_body_height: 0,
             last_content_rows: 0,
         }
@@ -75,7 +80,17 @@ impl ResourcesPane {
         match result {
             Ok(snapshot) => {
                 self.error = None;
-                self.list.clamp_cursor(snapshot.queued.len());
+                let previous_index = self.selected_index();
+                self.selected_request_id = self
+                    .selected_request_id
+                    .take()
+                    .filter(|id| snapshot.queued.iter().any(|entry| entry.display_id == *id))
+                    .or_else(|| {
+                        snapshot
+                            .queued
+                            .get(previous_index.min(snapshot.queued.len().saturating_sub(1)))
+                            .map(|entry| entry.display_id.clone())
+                    });
                 self.snapshot = Some(snapshot);
             }
             Err(e) => self.error = Some(e),
@@ -83,7 +98,7 @@ impl ResourcesPane {
     }
 
     pub(crate) fn pointer_promote(&mut self, index: usize) {
-        self.list.set_cursor(index);
+        self.select_index(index);
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<ResourcesOutcome> {
@@ -95,12 +110,12 @@ impl ResourcesPane {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let n = self.queued_len();
-                self.list.move_by(-1, n);
+                self.move_selection(-1, n);
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 let n = self.queued_len();
-                self.list.move_by(1, n);
+                self.move_selection(1, n);
                 None
             }
             KeyCode::Enter | KeyCode::Char(' ') => self
@@ -111,6 +126,15 @@ impl ResourcesPane {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.render_with_buttons(frame, area, None);
+    }
+
+    pub(crate) fn render_with_buttons(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        mut buttons: Option<&mut crate::tui::button::ButtonRegistry>,
+    ) {
         let block = Block::default().borders(Borders::ALL).title(" /resources ");
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -119,19 +143,48 @@ impl ResourcesPane {
         let body = layout[0];
         let help_area = layout[1];
 
-        let (lines, selected_span) = self.body_lines_with_selected_span();
+        let (lines, selected_row, queued_rows) =
+            self.body_lines_with_selected_row(buttons.is_none());
         self.last_content_rows = lines.len();
         self.last_body_height = body.height as usize;
-        let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-        self.list.set_scroll(self.list.scroll().min(max_scroll));
-        if let Some((start, end)) = selected_span {
-            self.list
-                .clamp_visible_span(self.last_body_height, self.last_content_rows, start, end);
-        }
-        frame.render_widget(
-            Paragraph::new(lines).scroll((self.list.scroll() as u16, 0)),
+        self.list.select(selected_row);
+        *self.list.offset_mut() = self
+            .list
+            .offset()
+            .min(self.last_content_rows.saturating_sub(self.last_body_height));
+        frame.render_stateful_widget(
+            List::new(lines.into_iter().map(ListItem::new).collect::<Vec<_>>())
+                .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+                .scroll_padding(1),
             body,
+            &mut self.list,
         );
+        render_scrollbar(
+            frame,
+            body,
+            self.last_content_rows,
+            self.last_body_height,
+            self.list.offset(),
+        );
+        if let Some(registry) = buttons.as_mut() {
+            let offset = self.list.offset();
+            for (index, row) in queued_rows {
+                if row < offset || row >= offset + self.last_body_height {
+                    continue;
+                }
+                let y = body.y.saturating_add((row - offset) as u16);
+                if y >= body.bottom() || body.width < 11 {
+                    continue;
+                }
+                let spec = crate::tui::button::ButtonSpec::new(
+                    crate::tui::button::ButtonId::ResourcePromote { index },
+                    "promote",
+                    crate::tui::button::ButtonDispatch::ResourcePromote { index },
+                )
+                .focused(index == self.selected_index());
+                let _ = registry.paint(frame, body.right().saturating_sub(10), y, 9, spec);
+            }
+        }
         frame.render_widget(
             Paragraph::new(self.help_line())
                 .style(Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX))),
@@ -144,9 +197,11 @@ impl ResourcesPane {
     }
 
     fn selected_request(&self) -> Option<&ResourceQueuedSnapshot> {
-        self.snapshot
+        let snapshot = self.snapshot.as_ref()?;
+        self.selected_request_id
             .as_ref()
-            .and_then(|snapshot| snapshot.queued.get(self.list.cursor()))
+            .and_then(|id| snapshot.queued.iter().find(|entry| entry.display_id == *id))
+            .or_else(|| snapshot.queued.first())
     }
 
     fn help_line(&self) -> Line<'static> {
@@ -155,12 +210,16 @@ impl ResourcesPane {
 
     #[cfg(test)]
     fn body_lines(&self) -> Vec<Line<'static>> {
-        self.body_lines_with_selected_span().0
+        self.body_lines_with_selected_row(true).0
     }
 
-    fn body_lines_with_selected_span(&self) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+    fn body_lines_with_selected_row(
+        &self,
+        show_inline_action: bool,
+    ) -> (Vec<Line<'static>>, Option<usize>, Vec<(usize, usize)>) {
         let mut lines = Vec::new();
-        let mut selected_span = None;
+        let mut selected_row = None;
+        let mut queued_rows = Vec::new();
         if let Some(e) = &self.error {
             lines.push(Line::from(Span::styled(
                 format!("resources unavailable: {e}"),
@@ -173,15 +232,15 @@ impl ResourcesPane {
                 "Loading resources...",
                 Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
             )));
-            return (lines, None);
+            return (lines, None, queued_rows);
         }
         let Some(snapshot) = &self.snapshot else {
             lines.push(muted("No scheduler snapshot loaded."));
-            return (lines, None);
+            return (lines, None, queued_rows);
         };
         if !snapshot.enabled {
             lines.push(muted("Resource scheduler is disabled."));
-            return (lines, None);
+            return (lines, None, queued_rows);
         }
 
         lines.push(section("Pools"));
@@ -212,15 +271,86 @@ impl ResourcesPane {
             lines.push(muted("  none"));
         } else {
             for (i, entry) in snapshot.queued.iter().enumerate() {
-                let start = lines.len();
-                lines.push(queued_line(entry, i == self.list.cursor()));
-                if i == self.list.cursor() {
-                    selected_span = Some((start, start + 1));
+                let selected = i == self.selected_index();
+                if selected {
+                    selected_row = Some(lines.len());
                 }
+                queued_rows.push((i, lines.len()));
+                lines.push(queued_line(entry, selected, show_inline_action));
             }
         }
-        (lines, selected_span)
+        (lines, selected_row, queued_rows)
     }
+
+    fn selected_index(&self) -> usize {
+        let Some(snapshot) = &self.snapshot else {
+            return 0;
+        };
+        self.selected_request_id
+            .as_ref()
+            .and_then(|id| {
+                snapshot
+                    .queued
+                    .iter()
+                    .position(|entry| entry.display_id == *id)
+            })
+            .unwrap_or(0)
+    }
+
+    fn select_index(&mut self, index: usize) {
+        self.selected_request_id = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.queued.get(index))
+            .map(|entry| entry.display_id.clone());
+    }
+
+    fn move_selection(&mut self, delta: isize, total: usize) {
+        if total == 0 {
+            self.selected_request_id = None;
+            self.list.select(None);
+            *self.list.offset_mut() = 0;
+            return;
+        }
+        let current = self.selected_index();
+        let next = if delta < 0 {
+            crate::tui::nav::wrap_prev(current, total)
+        } else {
+            crate::tui::nav::wrap_next(current, total)
+        };
+        self.select_index(next);
+    }
+
+    pub fn scroll_up(&mut self) {
+        *self.list.offset_mut() = self.list.offset().saturating_sub(1);
+    }
+
+    pub fn scroll_down(&mut self) {
+        let max = self.last_content_rows.saturating_sub(self.last_body_height);
+        *self.list.offset_mut() = (self.list.offset() + 1).min(max);
+    }
+}
+
+fn render_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    content_rows: usize,
+    viewport_rows: usize,
+    offset: usize,
+) {
+    if viewport_rows == 0 || content_rows <= viewport_rows || area.width <= 1 {
+        return;
+    }
+    let mut state = ScrollbarState::new(content_rows)
+        .position(offset)
+        .viewport_content_length(viewport_rows);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None),
+        area,
+        &mut state,
+    );
 }
 
 fn section(text: &str) -> Line<'static> {
@@ -265,7 +395,11 @@ fn running_line(entry: &ResourceRunningSnapshot) -> Line<'static> {
     ))
 }
 
-fn queued_line(entry: &ResourceQueuedSnapshot, selected: bool) -> Line<'static> {
+fn queued_line(
+    entry: &ResourceQueuedSnapshot,
+    selected: bool,
+    show_inline_action: bool,
+) -> Line<'static> {
     let marker = if selected { ">" } else { " " };
     let state = match entry.state {
         ResourceQueuedState::Queued => "queued",
@@ -276,9 +410,14 @@ fn queued_line(entry: &ResourceQueuedSnapshot, selected: bool) -> Line<'static> 
     } else {
         Style::default()
     };
+    let action = if show_inline_action {
+        "  [promote]"
+    } else {
+        ""
+    };
     Line::from(vec![Span::styled(
         format!(
-            "{marker} {}  {}  {}  {}  wait {}ms  {}  [promote]",
+            "{marker} {}  {}  {}  {}  wait {}ms  {}{action}",
             entry.display_id,
             actor_label(
                 entry.metadata.agent_id.as_deref(),
@@ -334,6 +473,8 @@ mod tests {
         ResourcePoolSnapshot, ResourceRequestMetadata, ResourceRequirements,
     };
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use uuid::Uuid;
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -400,6 +541,20 @@ mod tests {
             .join("\n")
     }
 
+    fn rendered_buffer(pane: &mut ResourcesPane, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, width, height)))
+            .expect("draw resources");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     #[test]
     fn renders_running_and_queued_snapshot() {
         let mut pane = ResourcesPane::open();
@@ -421,5 +576,58 @@ mod tests {
             Some(ResourcesOutcome::Promote(id)) => assert_eq!(id, "rs-0002"),
             other => panic!("expected promote outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_backend_matrix_covers_loading_unicode_and_widths() {
+        let mut loading = ResourcesPane::open();
+        assert!(rendered_buffer(&mut loading, 24, 6).contains("Loading"));
+
+        for width in [24, 80, 140] {
+            let mut ready = ResourcesPane::open();
+            let mut value = snapshot();
+            value.queued[0].metadata.command_label = Some("e\u{301}dit-工具".to_string());
+            ready.apply_snapshot_result(Ok(value));
+            let rendered = rendered_buffer(&mut ready, width, 10);
+            assert!(rendered.contains("/resources"));
+            assert!(rendered.contains("rs-0002"));
+        }
+    }
+
+    #[test]
+    fn selection_survives_snapshot_reorder_by_request_identity() {
+        let mut pane = ResourcesPane::open();
+        let mut first = snapshot();
+        let mut second = first.queued[0].clone();
+        second.id = Uuid::new_v4();
+        second.display_id = "rs-0003".to_string();
+        first.queued.push(second);
+        pane.apply_snapshot_result(Ok(first.clone()));
+        pane.handle_key(press(KeyCode::Down));
+        assert_eq!(pane.selected_request().unwrap().display_id, "rs-0003");
+
+        first.queued.reverse();
+        pane.apply_snapshot_result(Ok(first));
+        assert_eq!(pane.selected_request().unwrap().display_id, "rs-0003");
+    }
+
+    #[test]
+    fn visible_promote_button_uses_same_pass_row_geometry() {
+        let mut pane = ResourcesPane::open();
+        pane.apply_snapshot_result(Ok(snapshot()));
+        let mut registry = crate::tui::button::ButtonRegistry::default();
+        registry.begin_frame(true, 1);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                pane.render_with_buttons(frame, Rect::new(0, 0, 80, 12), Some(&mut registry))
+            })
+            .expect("draw resources with buttons");
+        assert_eq!(registry.targets().len(), 1);
+        assert!(matches!(
+            registry.targets()[0].id,
+            crate::tui::button::ButtonId::ResourcePromote { index: 0 }
+        ));
+        assert!(registry.targets()[0].rect.y < 11);
     }
 }

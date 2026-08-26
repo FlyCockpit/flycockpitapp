@@ -2516,7 +2516,7 @@ mod tests {
         .unwrap();
         let original_last_active = {
             let row = s.pending_row.lock().unwrap();
-            row.as_ref().unwrap().last_active_at
+            row.as_ref().unwrap().last_active_at_unix_ms
         };
 
         s.set_active_agent("Plan").unwrap();
@@ -2527,8 +2527,8 @@ mod tests {
         s.persist_if_needed().unwrap();
         let row = db.get_session(s.id).await.unwrap().unwrap();
         assert_eq!(row.active_agent, "Plan");
-        assert!(row.last_active_at >= original_last_active);
-        assert!(row.last_viewed_at.is_some());
+        assert!(row.last_active_at_unix_ms >= original_last_active);
+        assert!(row.last_viewed_at_unix_ms.is_some());
     }
 
     #[tokio::test]

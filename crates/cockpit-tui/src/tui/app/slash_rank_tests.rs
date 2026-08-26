@@ -438,8 +438,8 @@ fn skill_dispatcher_is_registered_and_takes_args() {
     );
 }
 
-fn fake_skill(name: &str, description: &str) -> cockpit_core::daemon::proto::SkillSummary {
-    cockpit_core::daemon::proto::SkillSummary {
+fn fake_skill(name: &str, description: &str) -> cockpit_proto::SkillSummary {
+    cockpit_proto::SkillSummary {
         name: name.to_string(),
         description: description.to_string(),
         source: format!("/x/{name}/SKILL.md"),
@@ -449,11 +449,8 @@ fn fake_skill(name: &str, description: &str) -> cockpit_core::daemon::proto::Ski
 
 /// Like [`fake_skill`] but marked `user-invocable: false` (model-only),
 /// so it should be hidden from the user's bare-`/` slash menu.
-fn fake_model_only_skill(
-    name: &str,
-    description: &str,
-) -> cockpit_core::daemon::proto::SkillSummary {
-    cockpit_core::daemon::proto::SkillSummary {
+fn fake_model_only_skill(name: &str, description: &str) -> cockpit_proto::SkillSummary {
+    cockpit_proto::SkillSummary {
         name: name.to_string(),
         description: description.to_string(),
         source: format!("/x/{name}/SKILL.md"),

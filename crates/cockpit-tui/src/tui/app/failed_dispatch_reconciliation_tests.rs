@@ -14,7 +14,7 @@ use crate::tui::async_action::{
     AsyncActionKey, AsyncActionKind, AsyncActionPayload, AsyncActionPolicy,
 };
 use crate::tui::history::HistoryEntry;
-use cockpit_core::engine::message::UserSubmission;
+use cockpit_client::submission::ClientUserSubmission as UserSubmission;
 
 fn runner_with_sender(
     input_tx: mpsc::Sender<RunnerInput>,
@@ -26,7 +26,7 @@ fn runner_with_sender(
 
 fn runner_with_channels(
     input_tx: mpsc::Sender<RunnerInput>,
-    record_tx: mpsc::Sender<cockpit_core::daemon::proto::Request>,
+    record_tx: mpsc::Sender<cockpit_proto::Request>,
     events: Arc<Mutex<Vec<crate::tui::agent_runner::QueuedTurnEvent>>>,
 ) -> AgentRunner {
     let (control_tx, _control_rx) = mpsc::channel(1);
@@ -35,7 +35,7 @@ fn runner_with_channels(
 
 fn runner_with_all_channels(
     input_tx: mpsc::Sender<RunnerInput>,
-    record_tx: mpsc::Sender<cockpit_core::daemon::proto::Request>,
+    record_tx: mpsc::Sender<cockpit_proto::Request>,
     control_tx: mpsc::Sender<ControlRequest>,
     events: Arc<Mutex<Vec<crate::tui::agent_runner::QueuedTurnEvent>>>,
 ) -> AgentRunner {
@@ -62,7 +62,7 @@ fn switch_outcome_with_epoch(session_id: uuid::Uuid, attachment_epoch: u64) -> A
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],
         last_applied_seq: None,
-        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+        foreground_target: Some(cockpit_proto::QueueTarget::root("Build")),
         active_model_state: None,
         project_id: "project".to_string(),
         history: Vec::new(),
@@ -152,6 +152,7 @@ fn seed_session_live_state(app: &mut App) {
 
 fn fake_side_conversation(tmp: &std::path::Path) -> SideConversation {
     SideConversation {
+        endpoint: cockpit_client::ClientEndpoint::Wire(tmp.join("daemon.sock")),
         side_session_id: uuid::Uuid::new_v4(),
         socket: tmp.join("missing-daemon.sock"),
         saved_runner: None,
@@ -215,9 +216,8 @@ fn seed_new_session_reset_state(app: &mut App) -> mpsc::Receiver<ControlRequest>
     app.usage_slash.insert("/new".to_string(), 1);
     app.usage_tags.insert("src/lib.rs".to_string(), 1);
     app.project_id = Some("project-old".to_string());
-    app.pending_usage
-        .push(cockpit_core::daemon::proto::Request::CancelTurn);
-    app.last_usage = Some(cockpit_core::tokens::TokenUsage {
+    app.pending_usage.push(cockpit_proto::Request::CancelTurn);
+    app.last_usage = Some(cockpit_client::presentation::TokenUsage {
         input_tokens: 10,
         output_tokens: 2,
         cached_input_tokens: 3,
@@ -330,7 +330,9 @@ fn transition_failure_removes_identical_queue_rows_by_uuid_not_text() {
         app.queue.push(item.clone());
         let mut submission = UserSubmission::text(format!("wire-{marker}"));
         submission.display_text = Some("same text".to_string());
-        submission.images = vec![marker.as_bytes().to_vec()];
+        submission.images = vec![cockpit_client::image_upload::SubmissionImage::png(
+            marker.as_bytes().to_vec(),
+        )];
         submission.forced_skill = Some(marker.to_string());
         expected_payloads.push(serde_json::to_value(&submission).unwrap());
         app.queue_pending_session_switch_submission_with_optimistic_state(
@@ -374,11 +376,15 @@ fn async_dispatch_failure_reconciles_exact_row_before_next_record_succeeds() {
     )));
     let mut first = UserSubmission::text("wire-a".to_string());
     first.display_text = Some("same visible text".to_string());
-    first.images = vec![vec![1, 2, 3]];
+    first.images = vec![cockpit_client::image_upload::SubmissionImage::png(vec![
+        1, 2, 3,
+    ])];
     first.forced_skill = Some("review".to_string());
     let mut second = UserSubmission::text("wire-b".to_string());
     second.display_text = Some("same visible text".to_string());
-    second.images = vec![vec![4, 5, 6]];
+    second.images = vec![cockpit_client::image_upload::SubmissionImage::png(vec![
+        4, 5, 6,
+    ])];
     second.forced_skill = Some("build".to_string());
     let expected_first = serde_json::to_value(&first).unwrap();
     let expected_second = serde_json::to_value(&second).unwrap();
@@ -487,7 +493,7 @@ fn fresh_a_failure_then_busy_b_fold_reconciles_history_queue_and_duplicate_recor
         display_text: second.submission.display_text.clone(),
         tag_expansions: second.submission.tag_expansions.clone(),
         queue_item_ids: vec![queued_b_id],
-        target: cockpit_core::engine::message::QueueTarget::root("Build"),
+        target: cockpit_proto::QueueTarget::root("Build"),
         seq: Some(92),
         preflight_cleaned: None,
     });
@@ -632,7 +638,7 @@ fn session_switch_busy_guard_interrupts_only_when_busy() {
     app.cancel_outgoing_turn_if_busy();
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(cockpit_core::daemon::proto::Request::CancelTurn)
+        Ok(cockpit_proto::Request::CancelTurn)
     ));
     assert!(control_rx.try_recv().is_err(), "only one cancel is sent");
 }
@@ -671,7 +677,7 @@ fn new_session_clear_failure_is_nonfatal_and_finishes_reset() {
     assert!(changed, "serviced /new must request a follow-up redraw");
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(cockpit_core::daemon::proto::Request::CancelTurn)
+        Ok(cockpit_proto::Request::CancelTurn)
     ));
     assert!(control_rx.try_recv().is_err(), "only one cancel is sent");
     assert!(!app.pending_new_session);
@@ -761,6 +767,7 @@ fn paste_fence_session_switch_ordering_bounds_unconfirmed_and_recovers_after_lin
         },
         assembled_wire_digest: digest,
         slots: Vec::new(),
+        retained_drafts: Vec::new(),
         lifecycle,
     };
     app.submission_fences.insert(
@@ -849,6 +856,7 @@ async fn pending_resume_rejects_created_side_without_mutating_main_view() {
 
     app.apply_side_created(
         parent_session_id,
+        cockpit_client::ClientEndpoint::Wire(tmp.path().join("missing-daemon.sock")),
         tmp.path().join("missing-daemon.sock"),
         uuid::Uuid::new_v4(),
         "side123".to_string(),
@@ -896,6 +904,7 @@ async fn pending_resume_discards_created_fork_instead_of_reusing_existing_action
 
     app.apply_fork_created(
         parent_session_id,
+        cockpit_client::ClientEndpoint::Wire(tmp.path().join("missing-daemon.sock")),
         tmp.path().join("missing-daemon.sock"),
         uuid::Uuid::new_v4(),
         "fork123".to_string(),
@@ -1033,7 +1042,7 @@ async fn successful_side_return_commits_snapshot_restore_and_discard_after_resul
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],
         last_applied_seq: Some(0),
-        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+        foreground_target: Some(cockpit_proto::QueueTarget::root("Build")),
         active_model_state: None,
         project_id: "project-main".to_string(),
         history: Vec::new(),
@@ -1111,17 +1120,19 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
     let exact_submission = UserSubmission {
         expected_model_state_generation: None,
         expected_model: None,
-        kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        kind: cockpit_client::submission::UserSubmissionKind::Compact,
         origin: Default::default(),
         text: "exact wire text".to_string(),
         display_text: Some("visible side draft".to_string()),
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: "src/lib.rs".to_string(),
             detail: "expanded".to_string(),
             ok: true,
         }],
-        images: vec![vec![1, 2, 3, 4]],
+        images: vec![cockpit_client::image_upload::SubmissionImage::png(vec![
+            1, 2, 3, 4,
+        ])],
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some("side-job".to_string()),
@@ -1130,7 +1141,7 @@ async fn failed_side_return_preserves_side_runner_ui_and_exact_queued_submission
         client_submissions: Vec::new(),
         pending_terminal_disposition: None,
         run_invocation_id: None,
-        queue_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+        queue_target: Some(cockpit_proto::QueueTarget::root("Build")),
     };
     let expected_submission = serde_json::to_value(&exact_submission).unwrap();
     app.async_actions.start(
@@ -1218,29 +1229,32 @@ fn complete_dispatch_submission(marker: &str) -> UserSubmission {
     UserSubmission {
         expected_model_state_generation: None,
         expected_model: None,
-        kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        kind: cockpit_client::submission::UserSubmissionKind::Compact,
         origin: Default::default(),
         text: format!("wire-{marker}"),
         display_text: Some(format!("visible-{marker}")),
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: format!("src/{marker}.rs"),
             detail: format!("expanded-{marker}"),
             ok: true,
         }],
-        images: vec![marker.as_bytes().to_vec(), vec![0x89, b'P', b'N', b'G']],
+        images: vec![
+            cockpit_client::image_upload::SubmissionImage::png(marker.as_bytes().to_vec()),
+            cockpit_client::image_upload::SubmissionImage::png(vec![0x89, b'P', b'N', b'G']),
+        ],
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some(format!("job-{marker}")),
         preflight_cleaned: Some(format!("clean-{marker}")),
         queue_item_ids: vec![uuid::Uuid::new_v4(), uuid::Uuid::new_v4()],
-        client_submissions: vec![cockpit_core::engine::message::ClientSubmissionReceipt {
+        client_submissions: vec![cockpit_client::submission::ClientSubmissionReceipt {
             id: uuid::Uuid::new_v4(),
             fingerprint: format!("content-{marker}"),
             wire_fingerprint: format!("wire-fingerprint-{marker}"),
             origin_principal: Some("flycockpit:test-owner".to_string()),
         }],
-        queue_target: Some(cockpit_core::engine::message::QueueTarget::child(
+        queue_target: Some(cockpit_proto::QueueTarget::child(
             "Build",
             1,
             "task-call",
@@ -1621,9 +1635,9 @@ fn busy_submit_queue_full_retries_consumed_wire_payload_exactly() {
     image
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .unwrap();
-    let placeholder = app.paste_registry.register_image(0, png.clone());
-    let display = format!("{placeholder} inspect the staged changes");
-    app.composer.set(display.clone());
+    app.composer.insert_registered_image(png.clone());
+    app.composer.insert_str(" inspect the staged changes");
+    let display = app.composer.text().to_string();
     app.pending_git_blocks
         .push("git diff --binary\nexact-busy-marker".to_string());
 
@@ -1636,7 +1650,10 @@ fn busy_submit_queue_full_retries_consumed_wire_payload_exactly() {
     assert_eq!(app.retained_pre_dispatch_submissions.len(), 1);
     let retained = &app.retained_pre_dispatch_submissions[0].pending.submission;
     assert_eq!(retained.display_text.as_deref(), Some(display.as_str()));
-    assert_eq!(retained.images, vec![png]);
+    assert_eq!(
+        retained.images,
+        vec![cockpit_client::image_upload::SubmissionImage::png(png)]
+    );
     assert!(
         retained
             .text
@@ -1738,7 +1755,7 @@ fn failed_fresh_dispatch_removes_unsent_tag_rows() {
     let mut app = App::new(Some(tmp.path()), false);
     app.agent_runner = Some(Err("model missing".to_string()));
     app.begin_working_span();
-    let tags = vec![cockpit_core::daemon::proto::TagExpansionMeta {
+    let tags = vec![cockpit_proto::TagExpansionMeta {
         tool: "read".to_string(),
         path: "src/lib.rs".to_string(),
         detail: "10 lines".to_string(),
@@ -1826,7 +1843,7 @@ fn multireview_kickoff_queue_full_reconciles_user_row_and_ends_span() {
 
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(cockpit_core::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
+        Ok(cockpit_proto::Request::SetAgent { name }) if name == "Multireview"
     ));
     app.apply_event(cockpit_core::engine::TurnEvent::ControlRequestFinished {
         request_id: cockpit_core::engine::ControlRequestId(1),
@@ -1870,7 +1887,7 @@ fn multireview_kickoff_closed_reconciles_user_row_and_ends_span() {
 
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(cockpit_core::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
+        Ok(cockpit_proto::Request::SetAgent { name }) if name == "Multireview"
     ));
     app.apply_event(cockpit_core::engine::TurnEvent::ControlRequestFinished {
         request_id: cockpit_core::engine::ControlRequestId(1),
@@ -1901,7 +1918,7 @@ fn multireview_kickoff_success_warns_pushes_user_and_dispatches() {
 
     assert!(matches!(
         control_rx.try_recv().map(|request| request.request),
-        Ok(cockpit_core::daemon::proto::Request::SetAgent { name }) if name == "Multireview"
+        Ok(cockpit_proto::Request::SetAgent { name }) if name == "Multireview"
     ));
     app.apply_event(cockpit_core::engine::TurnEvent::ControlRequestFinished {
         request_id: cockpit_core::engine::ControlRequestId(1),
@@ -2009,20 +2026,22 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
     let exact_submission = UserSubmission {
         expected_model_state_generation: None,
         expected_model: None,
-        kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        kind: cockpit_client::submission::UserSubmissionKind::Compact,
         origin: Default::default(),
         text: format!(
             "wire-before{}wire-after",
             cockpit_core::engine::message::IMAGE_PART_SENTINEL
         ),
         display_text: Some("visible composer text".to_string()),
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: "src/lib.rs".to_string(),
             detail: "expanded before switch".to_string(),
             ok: true,
         }],
-        images: vec![vec![0x89, b'P', b'N', b'G']],
+        images: vec![cockpit_client::image_upload::SubmissionImage::png(vec![
+            0x89, b'P', b'N', b'G',
+        ])],
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some("job-before-switch".to_string()),
@@ -2031,7 +2050,7 @@ async fn completed_switch_cannot_be_replaced_before_ui_adopts_it() {
         client_submissions: Vec::new(),
         pending_terminal_disposition: None,
         run_invocation_id: None,
-        queue_target: Some(cockpit_core::engine::message::QueueTarget::child(
+        queue_target: Some(cockpit_proto::QueueTarget::child(
             "Build",
             1,
             "task-call",

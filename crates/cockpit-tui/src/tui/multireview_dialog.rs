@@ -55,6 +55,8 @@ mod tests {
             prompt: TextField::default(),
             error: None,
             done: None,
+            pending_git_request: None,
+            git_request_dispatched: false,
         }
     }
 
@@ -192,6 +194,14 @@ pub struct MultireviewDialog {
     prompt: TextField,
     error: Option<String>,
     done: Option<MultireviewKickoff>,
+    pending_git_request: Option<(uuid::Uuid, Vec<cockpit_proto::GitReadSource>)>,
+    git_request_dispatched: bool,
+}
+
+#[derive(Debug)]
+pub struct GitReviewSourcesCompletion {
+    pub operation_id: uuid::Uuid,
+    pub result: Result<Vec<cockpit_proto::GitReviewSourceResult>, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,7 +222,7 @@ impl MultireviewDialog {
     pub fn open(
         cwd: &Path,
         extended: &cockpit_config::extended::ExtendedConfig,
-        models: &[cockpit_core::daemon::proto::ModelSummary],
+        models: &[cockpit_proto::ModelSummary],
         counts: &std::collections::HashMap<String, u64>,
     ) -> Result<Self, String> {
         let defaults: BTreeSet<String> = extended
@@ -280,6 +290,8 @@ impl MultireviewDialog {
             prompt: TextField::default(),
             error: None,
             done: None,
+            pending_git_request: None,
+            git_request_dispatched: false,
         })
     }
 
@@ -400,42 +412,89 @@ impl MultireviewDialog {
 
     fn handle_prompt(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter | KeyCode::Tab => match self.build_kickoff() {
-                Ok(kickoff) => self.done = Some(kickoff),
-                Err(e) => self.error = Some(e),
-            },
+            KeyCode::Enter | KeyCode::Tab if self.pending_git_request.is_none() => {
+                match self.selected_git_sources() {
+                    Ok(sources) => {
+                        self.pending_git_request = Some((uuid::Uuid::new_v4(), sources));
+                        self.git_request_dispatched = false;
+                        self.error = Some("loading selected git sources…".into());
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+            }
             _ => {
                 self.prompt.handle_key(key);
             }
         }
     }
 
-    fn build_kickoff(&self) -> Result<MultireviewKickoff, String> {
-        let mut commands = Vec::new();
-        let mut skipped = Vec::new();
-        for row in self.sources.iter().filter(|s| s.selected) {
-            let result = match row.label {
-                "Uncommitted changes" => cockpit_core::git::review_source_uncommitted(&self.cwd),
-                "Unstaged changes" => cockpit_core::git::review_source_unstaged(&self.cwd),
-                "Unpushed changes" => cockpit_core::git::review_source_unpushed(&self.cwd),
+    fn selected_git_sources(&self) -> Result<Vec<cockpit_proto::GitReadSource>, String> {
+        self.sources
+            .iter()
+            .filter(|source| source.selected)
+            .map(|source| match source.label {
+                "Uncommitted changes" => Ok(cockpit_proto::GitReadSource::Worktree),
+                "Unstaged changes" => Ok(cockpit_proto::GitReadSource::Unstaged),
+                "Unpushed changes" => Ok(cockpit_proto::GitReadSource::Unpushed),
                 "PR" => {
-                    let pr = row.pr.as_deref().unwrap_or("").trim();
+                    let pr = source.pr.as_deref().unwrap_or("").trim();
                     if pr.is_empty() {
-                        Err(anyhow::anyhow!(
-                            "PR source selected but no PR number or URL was entered"
-                        ))
+                        Err("PR source selected but no PR number or URL was entered".into())
                     } else {
-                        cockpit_core::git::review_source_pr(&self.cwd, pr)
+                        Ok(cockpit_proto::GitReadSource::PullRequest(pr.to_string()))
                     }
                 }
-                _ => continue,
-            };
-            match result {
-                Ok(src) if src.diff.trim().is_empty() => {
-                    skipped.push(format!("- {}: no changes", src.label));
+                _ => Err("unknown multireview source".into()),
+            })
+            .collect()
+    }
+
+    pub fn take_pending_git_request(
+        &mut self,
+    ) -> Option<(uuid::Uuid, Vec<cockpit_proto::GitReadSource>)> {
+        if self.git_request_dispatched {
+            return None;
+        }
+        self.git_request_dispatched = true;
+        self.pending_git_request.clone()
+    }
+
+    pub fn project_root(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn apply_git_sources(&mut self, completion: GitReviewSourcesCompletion) {
+        let Some((operation_id, _)) = self.pending_git_request.as_ref() else {
+            return;
+        };
+        if *operation_id != completion.operation_id {
+            return;
+        }
+        self.pending_git_request = None;
+        self.git_request_dispatched = false;
+        match completion
+            .result
+            .and_then(|sources| self.build_kickoff(sources))
+        {
+            Ok(kickoff) => self.done = Some(kickoff),
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    fn build_kickoff(
+        &self,
+        sources: Vec<cockpit_proto::GitReviewSourceResult>,
+    ) -> Result<MultireviewKickoff, String> {
+        let mut commands = Vec::new();
+        let mut skipped = Vec::new();
+        for source in sources {
+            match (source.has_changes, source.command, source.error) {
+                (true, Some(command), None) => {
+                    commands.push(format!("- {}: `{command}`", source.label));
                 }
-                Ok(src) => commands.push(format!("- {}: `{}`", src.label, src.command)),
-                Err(e) => skipped.push(format!("- {}: {e:#}", row.label)),
+                (false, _, None) => skipped.push(format!("- {}: no changes", source.label)),
+                (_, _, Some(error)) => skipped.push(format!("- {}: {error}", source.label)),
+                _ => skipped.push(format!("- {}: invalid daemon projection", source.label)),
             }
         }
         if commands.is_empty() {

@@ -15,7 +15,7 @@ use super::schema::{
     HostPlatform, PROBE_CAPTURE_BUDGET, ProbePolicy, VERSION_PROBE_DEADLINE, VersionParser,
 };
 use crate::capabilities::{ExecutionTarget, container_provides};
-use crate::process::terminate_group_sync;
+use cockpit_host::process::terminate_group_sync;
 
 /// Cancellation flag for in-flight probes.
 #[derive(Debug, Default)]

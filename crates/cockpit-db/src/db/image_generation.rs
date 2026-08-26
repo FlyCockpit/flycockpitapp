@@ -116,243 +116,796 @@ state_enum!(ImageGenerationArtifactComponentState {
     Tombstoned => "tombstoned", SecurityBlocked => "security_blocked"
 });
 
+pub const IMAGE_ARTIFACT_STATES: &[&str] = &[
+    "allocating",
+    "writing",
+    "retained",
+    "late_quarantined",
+    "cleanup_pending",
+    "deleting",
+    "tombstoned",
+    "security_blocked",
+];
+pub const IMAGE_ARTIFACT_TERMINAL_STATES: &[&str] = &["tombstoned"];
+pub const IMAGE_ARTIFACT_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("allocating", "writing"),
+    ("allocating", "cleanup_pending"),
+    ("allocating", "security_blocked"),
+    ("writing", "retained"),
+    ("writing", "late_quarantined"),
+    ("writing", "cleanup_pending"),
+    ("writing", "security_blocked"),
+    ("retained", "cleanup_pending"),
+    ("retained", "security_blocked"),
+    ("late_quarantined", "retained"),
+    ("late_quarantined", "cleanup_pending"),
+    ("late_quarantined", "security_blocked"),
+    ("cleanup_pending", "deleting"),
+    ("cleanup_pending", "security_blocked"),
+    ("deleting", "tombstoned"),
+    ("deleting", "security_blocked"),
+    ("security_blocked", "cleanup_pending"),
+    ("security_blocked", "retained"),
+];
+pub const IMAGE_ARTIFACT_COMPONENT_STATES: &[&str] = &[
+    "planned",
+    "writing",
+    "ready",
+    "cleanup_pending",
+    "deleting",
+    "tombstoned",
+    "security_blocked",
+];
+pub const IMAGE_ARTIFACT_COMPONENT_TERMINAL_STATES: &[&str] = &["tombstoned"];
+pub const IMAGE_ARTIFACT_COMPONENT_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("planned", "writing"),
+    ("planned", "cleanup_pending"),
+    ("planned", "security_blocked"),
+    ("writing", "ready"),
+    ("writing", "cleanup_pending"),
+    ("writing", "security_blocked"),
+    ("ready", "cleanup_pending"),
+    ("ready", "security_blocked"),
+    ("cleanup_pending", "deleting"),
+    ("cleanup_pending", "security_blocked"),
+    ("deleting", "tombstoned"),
+    ("deleting", "security_blocked"),
+    ("security_blocked", "cleanup_pending"),
+];
+
+pub const IMAGE_JOB_STATES: &[&str] = &[
+    "created",
+    "validating",
+    "awaiting_authorization",
+    "queued",
+    "dispatching",
+    "submission_unknown",
+    "running",
+    "cancellation_requested",
+    "downloading",
+    "validating_output",
+    "publishing",
+    "completed",
+    "completed_after_cancel",
+    "partially_failed",
+    "failed",
+    "cancelled",
+];
+pub const IMAGE_JOB_TERMINAL_STATES: &[&str] = &[
+    "completed",
+    "completed_after_cancel",
+    "partially_failed",
+    "failed",
+    "cancelled",
+];
+pub const IMAGE_JOB_CONDITIONAL_EDGES: &[(&str, &str)] =
+    &[("dispatching", "queued"), ("submission_unknown", "queued")];
+pub const IMAGE_JOB_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("created", "validating"),
+    ("created", "failed"),
+    ("created", "cancelled"),
+    ("validating", "awaiting_authorization"),
+    ("validating", "queued"),
+    ("validating", "failed"),
+    ("validating", "cancelled"),
+    ("awaiting_authorization", "queued"),
+    ("awaiting_authorization", "failed"),
+    ("awaiting_authorization", "cancelled"),
+    ("queued", "dispatching"),
+    ("queued", "cancellation_requested"),
+    ("queued", "failed"),
+    ("queued", "cancelled"),
+    ("dispatching", "submission_unknown"),
+    ("dispatching", "running"),
+    ("dispatching", "cancellation_requested"),
+    ("dispatching", "downloading"),
+    ("dispatching", "partially_failed"),
+    ("dispatching", "failed"),
+    ("dispatching", "cancelled"),
+    ("submission_unknown", "running"),
+    ("submission_unknown", "cancellation_requested"),
+    ("submission_unknown", "downloading"),
+    ("submission_unknown", "completed_after_cancel"),
+    ("submission_unknown", "partially_failed"),
+    ("submission_unknown", "failed"),
+    ("running", "cancellation_requested"),
+    ("running", "downloading"),
+    ("running", "partially_failed"),
+    ("running", "failed"),
+    ("cancellation_requested", "cancelled"),
+    ("cancellation_requested", "downloading"),
+    ("cancellation_requested", "completed_after_cancel"),
+    ("cancellation_requested", "partially_failed"),
+    ("cancellation_requested", "failed"),
+    ("downloading", "validating_output"),
+    ("downloading", "cancellation_requested"),
+    ("downloading", "completed_after_cancel"),
+    ("downloading", "partially_failed"),
+    ("downloading", "failed"),
+    ("validating_output", "publishing"),
+    ("validating_output", "cancellation_requested"),
+    ("validating_output", "completed_after_cancel"),
+    ("validating_output", "partially_failed"),
+    ("validating_output", "failed"),
+    ("publishing", "completed"),
+    ("publishing", "cancellation_requested"),
+    ("publishing", "completed_after_cancel"),
+    ("publishing", "partially_failed"),
+    ("publishing", "failed"),
+];
+
+pub const IMAGE_SLOT_STATES: &[&str] = &[
+    "planned",
+    "queued",
+    "dispatching",
+    "submission_unknown",
+    "running",
+    "cancellation_requested",
+    "downloading",
+    "validating",
+    "ready_to_publish",
+    "published",
+    "late_quarantined",
+    "failed",
+    "cancelled",
+    "discarded",
+];
+pub const IMAGE_SLOT_TERMINAL_STATES: &[&str] = &["published", "failed", "cancelled", "discarded"];
+pub const IMAGE_SLOT_CONDITIONAL_EDGES: &[(&str, &str)] =
+    &[("dispatching", "queued"), ("submission_unknown", "queued")];
+pub const IMAGE_SLOT_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("planned", "queued"),
+    ("planned", "failed"),
+    ("planned", "cancelled"),
+    ("queued", "dispatching"),
+    ("queued", "failed"),
+    ("queued", "cancelled"),
+    ("dispatching", "submission_unknown"),
+    ("dispatching", "running"),
+    ("dispatching", "downloading"),
+    ("dispatching", "cancellation_requested"),
+    ("dispatching", "failed"),
+    ("dispatching", "cancelled"),
+    ("submission_unknown", "running"),
+    ("submission_unknown", "downloading"),
+    ("submission_unknown", "cancellation_requested"),
+    ("submission_unknown", "failed"),
+    ("submission_unknown", "cancelled"),
+    ("running", "downloading"),
+    ("running", "cancellation_requested"),
+    ("running", "failed"),
+    ("cancellation_requested", "cancelled"),
+    ("cancellation_requested", "submission_unknown"),
+    ("cancellation_requested", "downloading"),
+    ("cancellation_requested", "failed"),
+    ("downloading", "validating"),
+    ("downloading", "cancellation_requested"),
+    ("downloading", "failed"),
+    ("validating", "ready_to_publish"),
+    ("validating", "late_quarantined"),
+    ("validating", "cancellation_requested"),
+    ("validating", "failed"),
+    ("ready_to_publish", "published"),
+    ("ready_to_publish", "late_quarantined"),
+    ("ready_to_publish", "failed"),
+    ("late_quarantined", "published"),
+    ("late_quarantined", "discarded"),
+];
+
+pub const IMAGE_ATTEMPT_STATES: &[&str] = &[
+    "planned",
+    "preparing",
+    "prepared",
+    "dispatching",
+    "accepted",
+    "submission_unknown",
+    "reconciling",
+    "running",
+    "downloading",
+    "cancellation_requested",
+    "response_adopted",
+    "failed_not_submitted",
+    "rejected_not_accepted",
+    "cancelled",
+    "succeeded",
+    "completed_after_cancel",
+    "failed_after_acceptance",
+];
+pub const IMAGE_ATTEMPT_TERMINAL_STATES: &[&str] = &[
+    "failed_not_submitted",
+    "rejected_not_accepted",
+    "cancelled",
+    "succeeded",
+    "completed_after_cancel",
+    "failed_after_acceptance",
+];
+pub const IMAGE_ATTEMPT_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("planned", "preparing"),
+    ("planned", "cancelled"),
+    ("planned", "failed_not_submitted"),
+    ("preparing", "prepared"),
+    ("preparing", "cancelled"),
+    ("preparing", "failed_not_submitted"),
+    ("prepared", "dispatching"),
+    ("prepared", "cancelled"),
+    ("prepared", "failed_not_submitted"),
+    ("dispatching", "accepted"),
+    ("dispatching", "submission_unknown"),
+    ("dispatching", "rejected_not_accepted"),
+    ("dispatching", "cancellation_requested"),
+    ("dispatching", "failed_not_submitted"),
+    ("accepted", "running"),
+    ("accepted", "downloading"),
+    ("accepted", "cancellation_requested"),
+    ("accepted", "response_adopted"),
+    ("accepted", "failed_after_acceptance"),
+    ("submission_unknown", "reconciling"),
+    ("submission_unknown", "cancellation_requested"),
+    ("reconciling", "accepted"),
+    ("reconciling", "submission_unknown"),
+    ("reconciling", "rejected_not_accepted"),
+    ("reconciling", "downloading"),
+    ("reconciling", "cancellation_requested"),
+    ("reconciling", "failed_after_acceptance"),
+    ("running", "downloading"),
+    ("running", "cancellation_requested"),
+    ("running", "failed_after_acceptance"),
+    ("downloading", "response_adopted"),
+    ("downloading", "completed_after_cancel"),
+    ("downloading", "cancellation_requested"),
+    ("downloading", "failed_after_acceptance"),
+    ("cancellation_requested", "cancelled"),
+    ("cancellation_requested", "submission_unknown"),
+    ("cancellation_requested", "reconciling"),
+    ("cancellation_requested", "accepted"),
+    ("cancellation_requested", "downloading"),
+    ("cancellation_requested", "completed_after_cancel"),
+    ("cancellation_requested", "failed_after_acceptance"),
+    ("response_adopted", "succeeded"),
+    ("response_adopted", "completed_after_cancel"),
+    ("response_adopted", "failed_after_acceptance"),
+];
+
 state_enum!(ImageGenerationArtifactComponentKind {
     Primary => "primary", NormalizedRaster => "normalized_raster",
     SanitizedSvg => "sanitized_svg", Thumbnail => "thumbnail", ModelPayload => "model_payload"
 });
 
-pub const fn artifact_transition_allowed(
+pub fn artifact_transition_allowed(
     from: ImageGenerationArtifactState,
     to: ImageGenerationArtifactState,
 ) -> bool {
-    use ImageGenerationArtifactState as S;
-    matches!(
-        (from, to),
-        (
-            S::Allocating,
-            S::Writing | S::CleanupPending | S::SecurityBlocked
-        ) | (
-            S::Writing,
-            S::Retained | S::LateQuarantined | S::CleanupPending | S::SecurityBlocked
-        ) | (S::Retained, S::CleanupPending | S::SecurityBlocked)
-            | (
-                S::LateQuarantined,
-                S::Retained | S::CleanupPending | S::SecurityBlocked
-            )
-            | (S::CleanupPending, S::Deleting | S::SecurityBlocked)
-            | (S::Deleting, S::Tombstoned | S::SecurityBlocked)
-            | (S::SecurityBlocked, S::CleanupPending | S::Retained)
-    )
+    IMAGE_ARTIFACT_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 
-pub const fn artifact_component_transition_allowed(
+pub fn artifact_component_transition_allowed(
     from: ImageGenerationArtifactComponentState,
     to: ImageGenerationArtifactComponentState,
 ) -> bool {
-    use ImageGenerationArtifactComponentState as S;
-    matches!(
-        (from, to),
-        (
-            S::Planned,
-            S::Writing | S::CleanupPending | S::SecurityBlocked
-        ) | (
-            S::Writing,
-            S::Ready | S::CleanupPending | S::SecurityBlocked
-        ) | (S::Ready, S::CleanupPending | S::SecurityBlocked)
-            | (S::CleanupPending, S::Deleting | S::SecurityBlocked)
-            | (S::Deleting, S::Tombstoned | S::SecurityBlocked)
-            | (S::SecurityBlocked, S::CleanupPending)
-    )
+    IMAGE_ARTIFACT_COMPONENT_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 
-pub const fn job_transition_allowed(
-    from: ImageGenerationJobState,
-    to: ImageGenerationJobState,
-) -> bool {
-    use ImageGenerationJobState as S;
-    matches!(
-        (from, to),
-        (S::Created, S::Validating | S::Failed | S::Cancelled)
-            | (
-                S::Validating,
-                S::AwaitingAuthorization | S::Queued | S::Failed | S::Cancelled
-            )
-            | (
-                S::AwaitingAuthorization,
-                S::Queued | S::Failed | S::Cancelled
-            )
-            | (
-                S::Queued,
-                S::Dispatching | S::CancellationRequested | S::Failed | S::Cancelled
-            )
-            | (
-                S::Dispatching,
-                S::SubmissionUnknown
-                    | S::Running
-                    | S::CancellationRequested
-                    | S::Downloading
-                    | S::PartiallyFailed
-                    | S::Failed
-                    | S::Cancelled
-            )
-            | (
-                S::SubmissionUnknown,
-                S::Running
-                    | S::CancellationRequested
-                    | S::Downloading
-                    | S::CompletedAfterCancel
-                    | S::PartiallyFailed
-                    | S::Failed
-            )
-            | (
-                S::Running,
-                S::CancellationRequested | S::Downloading | S::PartiallyFailed | S::Failed
-            )
-            | (
-                S::CancellationRequested,
-                S::Cancelled
-                    | S::Downloading
-                    | S::CompletedAfterCancel
-                    | S::PartiallyFailed
-                    | S::Failed
-            )
-            | (
-                S::Downloading,
-                S::ValidatingOutput
-                    | S::CancellationRequested
-                    | S::CompletedAfterCancel
-                    | S::PartiallyFailed
-                    | S::Failed
-            )
-            | (
-                S::ValidatingOutput,
-                S::Publishing
-                    | S::CancellationRequested
-                    | S::CompletedAfterCancel
-                    | S::PartiallyFailed
-                    | S::Failed
-            )
-            | (
-                S::Publishing,
-                S::Completed
-                    | S::CancellationRequested
-                    | S::CompletedAfterCancel
-                    | S::PartiallyFailed
-                    | S::Failed
-            )
-    )
+pub fn job_transition_allowed(from: ImageGenerationJobState, to: ImageGenerationJobState) -> bool {
+    IMAGE_JOB_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 
-pub const fn slot_transition_allowed(
+pub fn slot_transition_allowed(
     from: ImageGenerationSlotState,
     to: ImageGenerationSlotState,
 ) -> bool {
-    use ImageGenerationSlotState as S;
-    matches!(
-        (from, to),
-        (S::Planned, S::Queued | S::Failed | S::Cancelled)
-            | (S::Queued, S::Dispatching | S::Failed | S::Cancelled)
-            | (
-                S::Dispatching,
-                S::SubmissionUnknown
-                    | S::Running
-                    | S::Downloading
-                    | S::CancellationRequested
-                    | S::Failed
-                    | S::Cancelled
-            )
-            | (
-                S::SubmissionUnknown,
-                S::Running | S::Downloading | S::CancellationRequested | S::Failed | S::Cancelled
-            )
-            | (
-                S::Running,
-                S::Downloading | S::CancellationRequested | S::Failed
-            )
-            | (
-                S::CancellationRequested,
-                S::Cancelled | S::SubmissionUnknown | S::Downloading | S::Failed
-            )
-            | (
-                S::Downloading,
-                S::Validating | S::CancellationRequested | S::Failed
-            )
-            | (
-                S::Validating,
-                S::ReadyToPublish | S::LateQuarantined | S::CancellationRequested | S::Failed
-            )
-            | (
-                S::ReadyToPublish,
-                S::Published | S::LateQuarantined | S::Failed
-            )
-            | (S::LateQuarantined, S::Published | S::Discarded)
-    )
+    IMAGE_SLOT_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
 }
 
-pub const fn attempt_transition_allowed(
+pub fn attempt_transition_allowed(
     from: ImageGenerationAttemptState,
     to: ImageGenerationAttemptState,
 ) -> bool {
-    use ImageGenerationAttemptState as S;
-    matches!(
-        (from, to),
-        (
-            S::Planned,
-            S::Preparing | S::Cancelled | S::FailedNotSubmitted
-        ) | (
-            S::Preparing,
-            S::Prepared | S::Cancelled | S::FailedNotSubmitted
-        ) | (
-            S::Prepared,
-            S::Dispatching | S::Cancelled | S::FailedNotSubmitted
-        ) | (
-            S::Dispatching,
-            S::Accepted
-                | S::SubmissionUnknown
-                | S::RejectedNotAccepted
-                | S::CancellationRequested
-                | S::FailedNotSubmitted
-        ) | (
-            S::Accepted,
-            S::Running
-                | S::Downloading
-                | S::CancellationRequested
-                | S::ResponseAdopted
-                | S::FailedAfterAcceptance
-        ) | (
-            S::SubmissionUnknown,
-            S::Reconciling | S::CancellationRequested
-        ) | (
-            S::Reconciling,
-            S::Accepted
-                | S::SubmissionUnknown
-                | S::RejectedNotAccepted
-                | S::Downloading
-                | S::CancellationRequested
-                | S::FailedAfterAcceptance
-        ) | (
-            S::Running,
-            S::Downloading | S::CancellationRequested | S::FailedAfterAcceptance
-        ) | (
-            S::Downloading,
-            S::ResponseAdopted
-                | S::CompletedAfterCancel
-                | S::CancellationRequested
-                | S::FailedAfterAcceptance
-        ) | (
-            S::CancellationRequested,
-            S::Cancelled
-                | S::SubmissionUnknown
-                | S::Reconciling
-                | S::Accepted
-                | S::Downloading
-                | S::CompletedAfterCancel
-                | S::FailedAfterAcceptance
-        ) | (
-            S::ResponseAdopted,
-            S::Succeeded | S::CompletedAfterCancel | S::FailedAfterAcceptance
-        )
-    )
+    IMAGE_ATTEMPT_LEGAL_EDGES.contains(&(from.as_str(), to.as_str()))
+}
+
+#[derive(Clone, Copy)]
+enum ImageJobTransitionContext {
+    Ordinary,
+    AuthoritativeRetry,
+    TerminalProjection,
+}
+
+fn execute_image_job_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    from: ImageGenerationJobState,
+    expected_version: u64,
+    to: ImageGenerationJobState,
+    updated_at_unix_ms: i64,
+    context: ImageJobTransitionContext,
+) -> Result<u64> {
+    let allowed = match context {
+        ImageJobTransitionContext::AuthoritativeRetry => {
+            IMAGE_JOB_CONDITIONAL_EDGES.contains(&(from.as_str(), to.as_str()))
+        }
+        ImageJobTransitionContext::Ordinary | ImageJobTransitionContext::TerminalProjection => {
+            job_transition_allowed(from, to)
+        }
+    };
+    ensure!(allowed, "forbidden image generation job transition");
+    let next_version = expected_version
+        .checked_add(1)
+        .context("image generation job version overflow")?;
+    let changed = match context {
+        ImageJobTransitionContext::TerminalProjection => conn.execute(
+            "UPDATE image_generation_jobs SET state=?1,version=?2,terminal_event_version=?2,updated_at_unix_ms=?3 WHERE job_id=?4 AND state=?5 AND version=?6 AND terminal_event_version IS NULL",
+            params![to.as_str(),i64::try_from(next_version)?,updated_at_unix_ms,job_id.to_string(),from.as_str(),i64::try_from(expected_version)?],
+        )?,
+        ImageJobTransitionContext::Ordinary | ImageJobTransitionContext::AuthoritativeRetry => conn.execute(
+            "UPDATE image_generation_jobs SET state=?1,version=?2,updated_at_unix_ms=?3 WHERE job_id=?4 AND state=?5 AND version=?6",
+            params![to.as_str(),i64::try_from(next_version)?,updated_at_unix_ms,job_id.to_string(),from.as_str(),i64::try_from(expected_version)?],
+        )?,
+    };
+    ensure!(
+        changed == 1,
+        "image generation job transition lost compare-and-set"
+    );
+    Ok(next_version)
+}
+
+fn execute_basic_image_slot_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    from: ImageGenerationSlotState,
+    expected_version: u64,
+    to: ImageGenerationSlotState,
+) -> Result<u64> {
+    ensure!(
+        slot_transition_allowed(from, to),
+        "forbidden image generation slot transition"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("image generation slot version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=?2 WHERE job_id=?3 AND slot_id=?4 AND state=?5 AND version=?6",params![to.as_str(),i64::try_from(next)?,job_id.to_string(),slot_id.to_string(),from.as_str(),i64::try_from(expected_version)?])?==1,"image generation slot transition lost compare-and-set");
+    Ok(next)
+}
+
+fn execute_basic_image_attempt_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    attempt_number: u32,
+    from: ImageGenerationAttemptState,
+    expected_version: u64,
+    to: ImageGenerationAttemptState,
+) -> Result<u64> {
+    ensure!(
+        attempt_transition_allowed(from, to),
+        "forbidden image generation attempt transition"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("image generation attempt version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state=?6 AND version=?7",params![to.as_str(),i64::try_from(next)?,job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),from.as_str(),i64::try_from(expected_version)?])?==1,"image generation attempt transition lost compare-and-set");
+    Ok(next)
+}
+
+fn execute_queue_image_slots_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    expected_count: usize,
+) -> Result<()> {
+    ensure!(
+        slot_transition_allowed(
+            ImageGenerationSlotState::Planned,
+            ImageGenerationSlotState::Queued
+        ),
+        "queue slot transition is not canonical"
+    );
+    let mut statement = conn.prepare(
+        "SELECT slot_id,version FROM image_generation_slots WHERE job_id=?1 ORDER BY slot_index",
+    )?;
+    let inventory = statement
+        .query_map([job_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    ensure!(
+        inventory.len() == expected_count,
+        "image generation queue slot inventory differs"
+    );
+    for (slot_id, version) in inventory {
+        ensure!(
+            version == 1,
+            "image generation queue slot version is not initial"
+        );
+        execute_basic_image_slot_transition_conn(
+            conn,
+            job_id,
+            Uuid::parse_str(&slot_id)?,
+            ImageGenerationSlotState::Planned,
+            u64::try_from(version)?,
+            ImageGenerationSlotState::Queued,
+        )?;
+    }
+    Ok(())
+}
+
+fn execute_image_publication_attempt_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    attempt_number: u32,
+    expected_version: u64,
+) -> Result<u64> {
+    ensure!(
+        attempt_transition_allowed(
+            ImageGenerationAttemptState::ResponseAdopted,
+            ImageGenerationAttemptState::Succeeded
+        ),
+        "publication attempt transition is not canonical"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("publication attempt version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state='succeeded',version=?1 WHERE job_id=?2 AND slot_id=?3 AND attempt_number=?4 AND state='response_adopted' AND version=?5 AND applied_cancellation_version IS NULL",params![i64::try_from(next)?,job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),i64::try_from(expected_version)?])?==1,"publication attempt lost compare-and-set");
+    Ok(next)
+}
+
+fn execute_image_publication_slot_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    expected_version: u64,
+) -> Result<u64> {
+    ensure!(
+        slot_transition_allowed(
+            ImageGenerationSlotState::ReadyToPublish,
+            ImageGenerationSlotState::Published
+        ),
+        "publication slot transition is not canonical"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("publication slot version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_slots SET state='published',version=?1,published_disposition='ordinary',published_disposition_generation=?1 WHERE job_id=?2 AND slot_id=?3 AND state='ready_to_publish' AND version=?4 AND applied_cancellation_version IS NULL AND result_after_cancel=0",params![i64::try_from(next)?,job_id.to_string(),slot_id.to_string(),i64::try_from(expected_version)?])?==1,"publication slot lost compare-and-set");
+    Ok(next)
+}
+
+fn execute_image_dispatch_preparation_transitions_conn(
+    conn: &Connection,
+    input: &PrepareImageGenerationDispatch<'_>,
+    operation: &ExternalJournalRecord,
+) -> Result<()> {
+    ensure!(
+        attempt_transition_allowed(
+            ImageGenerationAttemptState::Planned,
+            ImageGenerationAttemptState::Preparing
+        ) && attempt_transition_allowed(
+            ImageGenerationAttemptState::Preparing,
+            ImageGenerationAttemptState::Prepared
+        ),
+        "dispatch preparation attempt transitions are not canonical"
+    );
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state='preparing',version=version+1,external_operation_id=?1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='planned' AND version=?6",params![operation.operation_id.to_string(),operation.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt preparation lost compare-and-set");
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state='prepared',version=version+1,dispatch_proof_endpoint_id=?5,dispatch_proof_config_generation=?6,dispatch_proof_refresh_epoch=?7,dispatch_proof_connected_ip=?8,dispatch_proof_location_class=?9,dispatch_proof_hops_digest=?10 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='preparing' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version+1)?,input.dispatch_proof.endpoint_id,i64::try_from(input.dispatch_proof.config_generation)?,i64::try_from(input.dispatch_proof.refresh_epoch)?,input.dispatch_proof.connected_ip,input.dispatch_proof.location_class,input.dispatch_proof.hops_digest])?==1,"image generation attempt preparation lost compare-and-set");
+    execute_basic_image_slot_transition_conn(
+        conn,
+        input.job_id,
+        input.slot_id,
+        ImageGenerationSlotState::Queued,
+        input.expected_slot_version,
+        ImageGenerationSlotState::Dispatching,
+    )?;
+    Ok(())
+}
+
+fn execute_image_attempt_handoff_transition_conn(
+    conn: &Connection,
+    prepared: &PreparedImageGenerationDispatch,
+) -> Result<()> {
+    ensure!(
+        attempt_transition_allowed(
+            ImageGenerationAttemptState::Prepared,
+            ImageGenerationAttemptState::Dispatching
+        ),
+        "handoff attempt transition is not canonical"
+    );
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state='dispatching',version=version+1,observed_journal_version=observed_journal_version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='prepared' AND version=?4 AND external_operation_id=?5",params![prepared.job_id.to_string(),prepared.slot_id.to_string(),i64::from(prepared.attempt_number),i64::try_from(prepared.attempt_version)?,prepared.operation.operation_id.to_string()])?==1,"image generation attempt handoff lost compare-and-set");
+    Ok(())
+}
+
+fn execute_image_handoff_outcome_transitions_conn(
+    conn: &Connection,
+    dispatching: &DispatchingImageGenerationAttempt,
+    attempt_to: ImageGenerationAttemptState,
+    slot_to: ImageGenerationSlotState,
+    observed_journal_version: u64,
+    retry: bool,
+) -> Result<()> {
+    ensure!(
+        attempt_transition_allowed(ImageGenerationAttemptState::Dispatching, attempt_to),
+        "handoff outcome attempt transition is not canonical"
+    );
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=version+1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='dispatching' AND version=?6 AND external_operation_id=?7",params![attempt_to.as_str(),i64::try_from(observed_journal_version)?,dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::from(dispatching.attempt_number),i64::try_from(dispatching.attempt_version)?,dispatching.operation.operation_id.to_string()])?==1,"image generation handoff attempt compare-and-set lost");
+    let slot_allowed = if retry {
+        IMAGE_SLOT_CONDITIONAL_EDGES.contains(&(
+            ImageGenerationSlotState::Dispatching.as_str(),
+            slot_to.as_str(),
+        ))
+    } else {
+        slot_transition_allowed(ImageGenerationSlotState::Dispatching, slot_to)
+    };
+    ensure!(
+        slot_allowed,
+        "handoff outcome slot transition is not canonical"
+    );
+    ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=version+1,failure_reason=CASE WHEN ?1='failed' THEN 'definitively_rejected' ELSE NULL END WHERE job_id=?2 AND slot_id=?3 AND state='dispatching' AND version=?4",params![slot_to.as_str(),dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::try_from(dispatching.slot_version)?])?==1,"image generation handoff slot compare-and-set lost");
+    Ok(())
+}
+
+fn execute_reconciliation_claim_attempt_transition_conn(
+    conn: &Connection,
+    input: &ClaimImageGenerationReconciliation,
+    expected_version: u64,
+    observed_journal_version: u64,
+) -> Result<u64> {
+    let from = ImageGenerationAttemptState::SubmissionUnknown;
+    let to = ImageGenerationAttemptState::Reconciling;
+    ensure!(
+        attempt_transition_allowed(from, to),
+        "reconciliation claim attempt transition is not canonical"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("reconciliation claim attempt version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3 WHERE job_id=?4 AND slot_id=?5 AND attempt_number=?6 AND state=?7 AND version=?8",params![to.as_str(),i64::try_from(next)?,i64::try_from(observed_journal_version)?,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),from.as_str(),i64::try_from(expected_version)?])?==1,"reconciliation claim lost attempt compare-and-set");
+    Ok(next)
+}
+
+struct ReconciliationStateTransition<'a> {
+    authority: &'a SealedImageGenerationRecoveryAuthority,
+    attempt_from: ImageGenerationAttemptState,
+    attempt_to: ImageGenerationAttemptState,
+    slot_from: ImageGenerationSlotState,
+    slot_to: Option<ImageGenerationSlotState>,
+    journal_version: u64,
+    outcome: &'a str,
+    evidence_digest: &'a str,
+    retry: bool,
+}
+
+fn execute_reconciliation_state_transitions_conn(
+    conn: &Connection,
+    transition: &ReconciliationStateTransition<'_>,
+) -> Result<()> {
+    ensure!(
+        attempt_transition_allowed(transition.attempt_from, transition.attempt_to),
+        "reconciliation attempt transition is not canonical"
+    );
+    let attempt_next = transition
+        .authority
+        .attempt_version
+        .checked_add(1)
+        .context("reconciliation attempt version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,nonacceptance_evidence_digest=CASE WHEN ?4='authoritative_nonacceptance' THEN ?5 ELSE NULL END WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state=?9 AND version=?10 AND external_operation_id=?11",params![transition.attempt_to.as_str(),i64::try_from(attempt_next)?,i64::try_from(transition.journal_version)?,transition.outcome,transition.evidence_digest,transition.authority.job_id.to_string(),transition.authority.slot_id.to_string(),i64::from(transition.authority.attempt_number),transition.attempt_from.as_str(),i64::try_from(transition.authority.attempt_version)?,transition.authority.external_operation_id.to_string()])?==1,"reconciliation lost attempt compare-and-set");
+    if let Some(slot_to) = transition.slot_to {
+        let allowed = if transition.retry {
+            IMAGE_SLOT_CONDITIONAL_EDGES
+                .contains(&(transition.slot_from.as_str(), slot_to.as_str()))
+        } else {
+            slot_transition_allowed(transition.slot_from, slot_to)
+        };
+        ensure!(allowed, "reconciliation slot transition is not canonical");
+        let slot_next = transition
+            .authority
+            .slot_version
+            .checked_add(1)
+            .context("reconciliation slot version overflow")?;
+        ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,failure_reason=CASE WHEN ?1='failed' THEN ?3 ELSE NULL END WHERE job_id=?4 AND slot_id=?5 AND state=?6 AND version=?7",params![slot_to.as_str(),i64::try_from(slot_next)?,transition.outcome,transition.authority.job_id.to_string(),transition.authority.slot_id.to_string(),transition.slot_from.as_str(),i64::try_from(transition.authority.slot_version)?])?==1,"reconciliation lost slot compare-and-set");
+    }
+    Ok(())
+}
+
+struct AcceptedResponseFailureTransition<'a, 'b> {
+    input: &'a CommitAcceptedImageResponseFailure<'b>,
+    attempt_from: ImageGenerationAttemptState,
+    slot_from: ImageGenerationSlotState,
+}
+
+fn execute_accepted_response_failure_transitions_conn(
+    conn: &Connection,
+    transition: &AcceptedResponseFailureTransition<'_, '_>,
+) -> Result<()> {
+    let input = transition.input;
+    ensure!(
+        attempt_transition_allowed(
+            transition.attempt_from,
+            ImageGenerationAttemptState::FailedAfterAcceptance
+        ),
+        "accepted response failure attempt transition is not canonical"
+    );
+    ensure!(
+        slot_transition_allowed(transition.slot_from, ImageGenerationSlotState::Failed),
+        "accepted response failure slot transition is not canonical"
+    );
+    let attempt_next = input
+        .expected_attempt_version
+        .checked_add(1)
+        .context("accepted response failure attempt version overflow")?;
+    let slot_next = input
+        .expected_slot_version
+        .checked_add(1)
+        .context("accepted response failure slot version overflow")?;
+    let journal_next = input
+        .expected_journal_version
+        .checked_add(1)
+        .context("accepted response failure journal version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state='failed_after_acceptance',version=?1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state=?6 AND version=?7 AND external_operation_id=?8",params![i64::try_from(attempt_next)?,i64::try_from(journal_next)?,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),transition.attempt_from.as_str(),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()])?==1,"accepted response failure lost attempt compare-and-set");
+    ensure!(conn.execute("UPDATE image_generation_slots SET state='failed',version=?1,failure_reason=?2 WHERE job_id=?3 AND slot_id=?4 AND state=?5 AND version=?6",params![i64::try_from(slot_next)?,input.safe_reason,input.job_id.to_string(),input.slot_id.to_string(),transition.slot_from.as_str(),i64::try_from(input.expected_slot_version)?])?==1,"accepted response failure lost slot compare-and-set");
+    Ok(())
+}
+
+struct ResponseAdoptionTransition<'a, 'b> {
+    input: &'a AdoptImageGenerationResponse<'b>,
+    attempt_from: ImageGenerationAttemptState,
+    attempt_to: ImageGenerationAttemptState,
+    slot_from: ImageGenerationSlotState,
+    slot_to: ImageGenerationSlotState,
+    slot_expected_version: u64,
+    cancellation_version: Option<i64>,
+}
+
+fn execute_response_adoption_transitions_conn(
+    conn: &Connection,
+    transition: &ResponseAdoptionTransition<'_, '_>,
+) -> Result<()> {
+    let input = transition.input;
+    ensure!(
+        attempt_transition_allowed(transition.attempt_from, transition.attempt_to),
+        "response adoption attempt transition is not canonical"
+    );
+    ensure!(
+        slot_transition_allowed(transition.slot_from, transition.slot_to),
+        "response adoption slot transition is not canonical"
+    );
+    let attempt_next = input
+        .expected_attempt_version
+        .checked_add(1)
+        .context("response adoption attempt version overflow")?;
+    let slot_next = transition
+        .slot_expected_version
+        .checked_add(1)
+        .context("response adoption slot version overflow")?;
+    let journal_next = input
+        .expected_journal_version
+        .checked_add(1)
+        .context("response adoption journal version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,applied_cancellation_version=?4,response_digest=?5 WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state=?9 AND version=?10 AND external_operation_id=?11",params![transition.attempt_to.as_str(),i64::try_from(attempt_next)?,i64::try_from(journal_next)?,transition.cancellation_version,input.response_digest,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),transition.attempt_from.as_str(),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()])?==1,"attempt response adoption lost its compare-and-set");
+    ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,applied_cancellation_version=?3,result_after_cancel=?4 WHERE job_id=?5 AND slot_id=?6 AND state=?7 AND version=?8",params![transition.slot_to.as_str(),i64::try_from(slot_next)?,transition.cancellation_version,i64::from(transition.cancellation_version.is_some()),input.job_id.to_string(),input.slot_id.to_string(),transition.slot_from.as_str(),i64::try_from(transition.slot_expected_version)?])?==1,"slot response adoption lost its compare-and-set");
+    Ok(())
+}
+
+fn execute_deadline_attempt_journal_binding_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    operation_id: Uuid,
+    expected_version: u64,
+    next_version: u64,
+) -> Result<()> {
+    ensure!(
+        next_version
+            == expected_version
+                .checked_add(1)
+                .context("deadline journal version overflow")?,
+        "deadline journal binding did not advance exactly once"
+    );
+    ensure!(conn.execute("UPDATE image_generation_attempts SET observed_journal_version=?1 WHERE job_id=?2 AND external_operation_id=?3 AND observed_journal_version=?4",params![i64::try_from(next_version)?,job_id.to_string(),operation_id.to_string(),i64::try_from(expected_version)?])?==1,"deadline expiry lost attempt journal binding");
+    Ok(())
+}
+
+struct CancellationAttemptTransition {
+    from: ImageGenerationAttemptState,
+    expected_version: u64,
+    to: ImageGenerationAttemptState,
+    cancellation_version: u64,
+}
+
+fn execute_cancellation_attempt_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    attempt_number: u32,
+    t: CancellationAttemptTransition,
+) -> Result<u64> {
+    ensure!(
+        attempt_transition_allowed(t.from, t.to),
+        "attempt cannot accept cancellation"
+    );
+    let next = t
+        .expected_version
+        .checked_add(1)
+        .context("cancellation attempt version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,applied_cancellation_version=?3 WHERE job_id=?4 AND slot_id=?5 AND attempt_number=?6 AND state=?7 AND version=?8",params![t.to.as_str(),i64::try_from(next)?,i64::try_from(t.cancellation_version)?,job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),t.from.as_str(),i64::try_from(t.expected_version)?])?==1,"cancellation lost attempt compare-and-set");
+    Ok(next)
+}
+
+struct CancellationSlotTransition {
+    from: ImageGenerationSlotState,
+    expected_version: u64,
+    to: ImageGenerationSlotState,
+    cancellation_version: u64,
+    result_after_cancel: bool,
+}
+
+fn execute_cancellation_slot_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    t: CancellationSlotTransition,
+) -> Result<u64> {
+    ensure!(
+        slot_transition_allowed(t.from, t.to),
+        "slot cannot accept cancellation"
+    );
+    let next = t
+        .expected_version
+        .checked_add(1)
+        .context("cancellation slot version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,applied_cancellation_version=?3,result_after_cancel=?4 WHERE job_id=?5 AND slot_id=?6 AND state=?7 AND version=?8",params![t.to.as_str(),i64::try_from(next)?,i64::try_from(t.cancellation_version)?,i64::from(t.result_after_cancel),job_id.to_string(),slot_id.to_string(),t.from.as_str(),i64::try_from(t.expected_version)?])?==1,"cancellation lost slot compare-and-set");
+    Ok(next)
+}
+
+fn execute_validating_slot_cancellation_marker_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    expected_version: u64,
+    cancellation_version: u64,
+) -> Result<u64> {
+    let next = expected_version
+        .checked_add(1)
+        .context("validating cancellation marker version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_slots SET version=?1,applied_cancellation_version=?2,result_after_cancel=1 WHERE job_id=?3 AND slot_id=?4 AND state='validating' AND version=?5 AND applied_cancellation_version IS NULL",params![i64::try_from(next)?,i64::try_from(cancellation_version)?,job_id.to_string(),slot_id.to_string(),i64::try_from(expected_version)?])?==1,"validating result lost cancellation compare-and-set");
+    Ok(next)
+}
+
+fn execute_late_publication_slot_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    expected_version: u64,
+) -> Result<u64> {
+    ensure!(
+        slot_transition_allowed(
+            ImageGenerationSlotState::LateQuarantined,
+            ImageGenerationSlotState::Published
+        ),
+        "late publication slot transition is not canonical"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("late publication slot version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_slots SET state='published',version=?1,published_disposition='late_authorized',published_disposition_generation=?1 WHERE job_id=?2 AND slot_id=?3 AND state='late_quarantined' AND version=?4 AND result_after_cancel=1 AND applied_cancellation_version IS NOT NULL",params![i64::try_from(next)?,job_id.to_string(),slot_id.to_string(),i64::try_from(expected_version)?])?==1,"late publication slot compare-and-set lost");
+    Ok(next)
 }
 
 pub const fn slot_is_job_settled(state: ImageGenerationSlotState) -> bool {
@@ -481,27 +1034,6 @@ fn terminal_slot_vector_valid(slot: ImageGenerationSlotTerminalFact) -> bool {
     }
 }
 
-fn terminal_projection_allowed(
-    current: ImageGenerationJobState,
-    terminal: ImageGenerationJobState,
-) -> bool {
-    !matches!(
-        current,
-        ImageGenerationJobState::Completed
-            | ImageGenerationJobState::CompletedAfterCancel
-            | ImageGenerationJobState::PartiallyFailed
-            | ImageGenerationJobState::Failed
-            | ImageGenerationJobState::Cancelled
-    ) && matches!(
-        terminal,
-        ImageGenerationJobState::Completed
-            | ImageGenerationJobState::CompletedAfterCancel
-            | ImageGenerationJobState::PartiallyFailed
-            | ImageGenerationJobState::Failed
-            | ImageGenerationJobState::Cancelled
-    )
-}
-
 fn commit_terminal_job_projection_conn(
     conn: &Connection,
     job_id: Uuid,
@@ -550,7 +1082,7 @@ fn commit_terminal_job_projection_conn(
     let current = ImageGenerationJobState::parse(&current_state)
         .context("terminal projection current job state is unknown")?;
     ensure!(
-        terminal_projection_allowed(current, terminal),
+        job_transition_allowed(current, terminal),
         "terminal job transition is forbidden"
     );
     let next_version = current_version
@@ -576,7 +1108,15 @@ fn commit_terminal_job_projection_conn(
         "INSERT INTO image_generation_terminal_events(event_id,job_id,job_version,terminal_state,slot_count,published_count,failed_count,cancelled_count,late_published_count,late_quarantined_count,discarded_count,emitted_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         params![event_id,job_id.to_string(),next_version,terminal.as_str(),i64::try_from(rows.len())?,published_count,failed_count,cancelled_count,late_published_count,late_quarantined_count,discarded_count,emitted_at_unix_ms],
     )?;
-    ensure!(conn.execute("UPDATE image_generation_jobs SET state=?1,version=?2,terminal_event_version=?2,updated_at_unix_ms=?3 WHERE job_id=?4 AND state=?5 AND version=?6 AND terminal_event_version IS NULL",params![terminal.as_str(),next_version,emitted_at_unix_ms,job_id.to_string(),current_state,current_version])?==1,"terminal job compare-and-set lost");
+    execute_image_job_transition_conn(
+        conn,
+        job_id,
+        current,
+        u64::try_from(current_version)?,
+        terminal,
+        emitted_at_unix_ms,
+        ImageJobTransitionContext::TerminalProjection,
+    )?;
     Ok(Some(terminal))
 }
 
@@ -1105,7 +1645,10 @@ impl Db {
     ) -> Result<Vec<ImageGenerationDispatchCandidate>> {
         ensure!((1..=64).contains(&limit), "invalid scheduler scan limit");
         let database_now = database_now_unix_ms(conn)?;
-        let mut statement=conn.prepare("SELECT j.job_id,s.slot_id,a.attempt_number,j.version,s.version,a.version,p.canonical_plan,p.plan_digest,m.canonical_media_plan,m.media_plan_digest,COALESCE((SELECT MAX(claim_generation)+1 FROM image_generation_scheduler_claims old WHERE old.job_id=s.job_id AND old.slot_id=s.slot_id AND old.attempt_number=a.attempt_number),1) FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id JOIN image_generation_attempt_activation_facts f ON f.job_id=a.job_id AND f.slot_id=a.slot_id AND f.attempt_number=a.attempt_number JOIN image_generation_plans p ON p.job_id=j.job_id JOIN image_generation_attempt_media_snapshots m ON m.job_id=a.job_id AND m.slot_id=a.slot_id AND m.attempt_number=a.attempt_number WHERE j.state='queued' AND s.state='queued' AND a.state='planned' AND p.deadline_boot_id=?2 AND p.operation_deadline_monotonic_ms>?3 AND NOT EXISTS(SELECT 1 FROM image_generation_scheduler_claims c WHERE c.job_id=s.job_id AND c.slot_id=s.slot_id AND c.attempt_number=a.attempt_number AND c.expires_at_unix_ms>?1 AND NOT EXISTS(SELECT 1 FROM image_generation_scheduler_claim_consumptions x WHERE x.job_id=c.job_id AND x.slot_id=c.slot_id AND x.attempt_number=c.attempt_number AND x.claim_generation=c.claim_generation)) AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts x WHERE x.job_id=j.job_id) ORDER BY j.created_at_unix_ms,j.job_id,s.slot_index,a.attempt_number LIMIT ?4")?;
+        let mut statement=conn.prepare(
+            // schema-hot-query: extended.image-generation.dispatch-scan
+            "SELECT j.job_id,s.slot_id,a.attempt_number,j.version,s.version,a.version,p.canonical_plan,p.plan_digest,m.canonical_media_plan,m.media_plan_digest,COALESCE((SELECT MAX(claim_generation)+1 FROM image_generation_scheduler_claims old WHERE old.job_id=s.job_id AND old.slot_id=s.slot_id AND old.attempt_number=a.attempt_number),1) FROM image_generation_jobs j JOIN image_generation_slots s ON s.job_id=j.job_id JOIN image_generation_attempts a ON a.job_id=s.job_id AND a.slot_id=s.slot_id JOIN image_generation_attempt_activation_facts f ON f.job_id=a.job_id AND f.slot_id=a.slot_id AND f.attempt_number=a.attempt_number JOIN image_generation_plans p ON p.job_id=j.job_id JOIN image_generation_attempt_media_snapshots m ON m.job_id=a.job_id AND m.slot_id=a.slot_id AND m.attempt_number=a.attempt_number WHERE j.state='queued' AND s.state='queued' AND a.state='planned' AND p.deadline_boot_id=?2 AND p.operation_deadline_monotonic_ms>?3 AND NOT EXISTS(SELECT 1 FROM image_generation_scheduler_claims c WHERE c.job_id=s.job_id AND c.slot_id=s.slot_id AND c.attempt_number=a.attempt_number AND c.expires_at_unix_ms>?1 AND NOT EXISTS(SELECT 1 FROM image_generation_scheduler_claim_consumptions x WHERE x.job_id=c.job_id AND x.slot_id=c.slot_id AND x.attempt_number=c.attempt_number AND x.claim_generation=c.claim_generation)) AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts x WHERE x.job_id=j.job_id) ORDER BY j.created_at_unix_ms,j.job_id,s.slot_index,a.attempt_number LIMIT ?4"
+        )?;
         let rows = statement.query_map(
             params![
                 database_now,
@@ -1247,6 +1790,8 @@ pub struct DispatchingImageGenerationAttempt {
     provider_request_identity: String,
     media_reservation_id: String,
     media_reservation_version: u64,
+    slot_version: u64,
+    job_version: u64,
 }
 
 pub struct ImageGenerationProviderHandoffEvidence<'a> {
@@ -1328,6 +1873,8 @@ pub struct ImageGenerationReconciliationObservation<'a> {
 }
 pub struct SealedImageGenerationRecoveryAuthority {
     job_id: Uuid,
+    job_state: ImageGenerationJobState,
+    job_version: u64,
     slot_id: Uuid,
     attempt_number: u32,
     attempt_version: u64,
@@ -1455,6 +2002,23 @@ impl Db {
         media: &[ImageGenerationMediaPlanSnapshot<'_>],
         at_unix_ms: i64,
     ) -> Result<()> {
+        ensure!(
+            job_transition_allowed(
+                ImageGenerationJobState::Created,
+                ImageGenerationJobState::Validating
+            ) && job_transition_allowed(
+                ImageGenerationJobState::Validating,
+                ImageGenerationJobState::Queued
+            ),
+            "image generation queue job transitions are not canonical"
+        );
+        ensure!(
+            slot_transition_allowed(
+                ImageGenerationSlotState::Planned,
+                ImageGenerationSlotState::Queued
+            ),
+            "image generation queue slot transition is not canonical"
+        );
         atomic_conn(conn, "image_generation_queue", || {
             let (canonical_plan, plan_digest): (Vec<u8>, String) = conn.query_row(
                 "SELECT canonical_plan,plan_digest FROM image_generation_plans WHERE job_id=?1",
@@ -1488,21 +2052,34 @@ impl Db {
                     params![authority.job_id.to_string(),slot_id.to_string(),i64::from(attempt.attempt_number),plan_digest,snapshot.canonical_bytes,snapshot.digest],
                 )?;
             }
-            ensure!(conn.execute("UPDATE image_generation_jobs SET state='validating',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='created' AND version=?3",params![at_unix_ms,authority.job_id.to_string(),i64::try_from(authority.job_version)?])?==1,"image generation queue authority is stale");
-            ensure!(conn.execute("UPDATE image_generation_jobs SET state='queued',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='validating' AND version=?3",params![at_unix_ms,authority.job_id.to_string(),i64::try_from(authority.job_version+1)?])?==1,"image generation queue validation lost compare-and-set");
-            let changed=conn.execute("UPDATE image_generation_slots SET state='queued',version=version+1 WHERE job_id=?1 AND state='planned' AND version=1",[authority.job_id.to_string()])?;
+            let validating_version = execute_image_job_transition_conn(
+                conn,
+                authority.job_id,
+                ImageGenerationJobState::Created,
+                authority.job_version,
+                ImageGenerationJobState::Validating,
+                at_unix_ms,
+                ImageJobTransitionContext::Ordinary,
+            )?;
+            execute_image_job_transition_conn(
+                conn,
+                authority.job_id,
+                ImageGenerationJobState::Validating,
+                validating_version,
+                ImageGenerationJobState::Queued,
+                at_unix_ms,
+                ImageJobTransitionContext::Ordinary,
+            )?;
             let expected: i64 = conn.query_row(
                 "SELECT slot_count FROM image_generation_plans WHERE job_id=?1",
                 [authority.job_id.to_string()],
                 |row| row.get(0),
             )?;
-            ensure!(
-                i64::try_from(changed)? == expected,
-                "image generation queue slot graph changed"
-            );
+            let expected = usize::try_from(expected)?;
+            execute_queue_image_slots_conn(conn, authority.job_id, expected)?;
             let activated=conn.execute("INSERT INTO image_generation_attempt_activation_facts(job_id,slot_id,attempt_number,activation_reason,prior_attempt_number,activated_at_unix_ms) SELECT job_id,slot_id,1,'initial',NULL,?1 FROM image_generation_slots WHERE job_id=?2",params![at_unix_ms,authority.job_id.to_string()])?;
             ensure!(
-                activated == changed,
+                activated == expected,
                 "image generation initial attempt activation differs"
             );
             Ok(())
@@ -1513,6 +2090,30 @@ impl Db {
         conn: &Connection,
         input: &PrepareImageGenerationDispatch<'_>,
     ) -> Result<PreparedImageGenerationDispatch> {
+        ensure!(
+            attempt_transition_allowed(
+                ImageGenerationAttemptState::Planned,
+                ImageGenerationAttemptState::Preparing
+            ) && attempt_transition_allowed(
+                ImageGenerationAttemptState::Preparing,
+                ImageGenerationAttemptState::Prepared
+            ),
+            "image generation preparation attempt transitions are not canonical"
+        );
+        ensure!(
+            slot_transition_allowed(
+                ImageGenerationSlotState::Queued,
+                ImageGenerationSlotState::Dispatching
+            ),
+            "image generation dispatch slot transition is not canonical"
+        );
+        ensure!(
+            job_transition_allowed(
+                ImageGenerationJobState::Queued,
+                ImageGenerationJobState::Dispatching
+            ),
+            "image generation dispatch job transition is not canonical"
+        );
         atomic_conn(conn, "image_generation_prepare_dispatch", || {
             let database_now = database_now_unix_ms(conn)?;
             ensure!(conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_scheduler_claims c WHERE c.job_id=?1 AND c.slot_id=?2 AND c.attempt_number=?3 AND c.worker_boot_id=?4 AND c.claim_generation=?5 AND c.expires_at_unix_ms>?6 AND NOT EXISTS(SELECT 1 FROM image_generation_scheduler_claim_consumptions x WHERE x.job_id=c.job_id AND x.slot_id=c.slot_id AND x.attempt_number=c.attempt_number AND x.claim_generation=c.claim_generation))",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.worker_boot_id.to_string(),i64::try_from(input.claim_generation)?,database_now],|row|row.get::<_,bool>(0))?,"image generation scheduler claim is absent, consumed, or stale");
@@ -1598,10 +2199,16 @@ impl Db {
                     digest: &snapshot.1,
                 },
             )?;
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state='preparing',version=version+1,external_operation_id=?1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='planned' AND version=?6",params![operation.operation_id.to_string(),operation.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt preparation lost compare-and-set");
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state='prepared',version=version+1,dispatch_proof_endpoint_id=?5,dispatch_proof_config_generation=?6,dispatch_proof_refresh_epoch=?7,dispatch_proof_connected_ip=?8,dispatch_proof_location_class=?9,dispatch_proof_hops_digest=?10 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='preparing' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version+1)?,input.dispatch_proof.endpoint_id,i64::try_from(input.dispatch_proof.config_generation)?,i64::try_from(input.dispatch_proof.refresh_epoch)?,input.dispatch_proof.connected_ip,input.dispatch_proof.location_class,input.dispatch_proof.hops_digest])?==1,"image generation attempt preparation lost compare-and-set");
-            ensure!(conn.execute("UPDATE image_generation_slots SET state='dispatching',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='queued' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot dispatch lost compare-and-set");
-            ensure!(conn.execute("UPDATE image_generation_jobs SET state='dispatching',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='queued' AND version=?3",params![input.at_unix_ms,input.job_id.to_string(),i64::try_from(input.expected_job_version)?])?==1,"image generation job dispatch lost compare-and-set");
+            execute_image_dispatch_preparation_transitions_conn(conn, input, &operation)?;
+            execute_image_job_transition_conn(
+                conn,
+                input.job_id,
+                ImageGenerationJobState::Queued,
+                input.expected_job_version,
+                ImageGenerationJobState::Dispatching,
+                input.at_unix_ms,
+                ImageJobTransitionContext::Ordinary,
+            )?;
             Ok(PreparedImageGenerationDispatch {
                 job_id: input.job_id,
                 slot_id: input.slot_id,
@@ -1625,6 +2232,13 @@ impl Db {
         at_unix_ms: i64,
         deadline_observation: DeadlineObservationV1,
     ) -> Result<DispatchingImageGenerationAttempt> {
+        ensure!(
+            attempt_transition_allowed(
+                ImageGenerationAttemptState::Prepared,
+                ImageGenerationAttemptState::Dispatching
+            ),
+            "image generation handoff transition is not canonical"
+        );
         atomic_conn(conn, "image_generation_begin_handoff", || {
             let (deadline_boot_id,deadline):(String,i64) = conn.query_row("SELECT p.deadline_boot_id,p.operation_deadline_monotonic_ms FROM image_generation_plans p JOIN image_generation_jobs j ON j.job_id=p.job_id JOIN image_generation_slots s ON s.job_id=j.job_id WHERE j.job_id=?1 AND j.state='dispatching' AND j.version=?2 AND s.slot_id=?3 AND s.state='dispatching' AND s.version=?4 AND NOT EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=j.job_id)",params![prepared.job_id.to_string(),i64::try_from(prepared.job_version)?,prepared.slot_id.to_string(),i64::try_from(prepared.slot_version)?],|row|Ok((row.get(0)?,row.get(1)?))).context("image generation handoff authority is unavailable")?;
             ensure!(
@@ -1641,7 +2255,7 @@ impl Db {
                 ExternalTransitionOutcome::Committed(record) => record,
                 _ => anyhow::bail!("image generation journal handoff lost compare-and-set"),
             };
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state='dispatching',version=version+1,observed_journal_version=observed_journal_version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='prepared' AND version=?4 AND external_operation_id=?5",params![prepared.job_id.to_string(),prepared.slot_id.to_string(),i64::from(prepared.attempt_number),i64::try_from(prepared.attempt_version)?,prepared.operation.operation_id.to_string()])?==1,"image generation attempt handoff lost compare-and-set");
+            execute_image_attempt_handoff_transition_conn(conn, &prepared)?;
             Ok(DispatchingImageGenerationAttempt {
                 operation,
                 job_id: prepared.job_id,
@@ -1656,6 +2270,8 @@ impl Db {
                     .media_reservation_version
                     .checked_add(1)
                     .context("image generation media reservation version overflow")?,
+                slot_version: prepared.slot_version,
+                job_version: prepared.job_version,
             })
         })
     }
@@ -1714,6 +2330,26 @@ impl Db {
                     "submission_unknown",
                 ),
             };
+            let attempt_state = ImageGenerationAttemptState::parse(attempt)
+                .context("handoff produced an unknown attempt state")?;
+            ensure!(
+                attempt_transition_allowed(ImageGenerationAttemptState::Dispatching, attempt_state),
+                "image generation handoff attempt transition is not canonical"
+            );
+            let slot_state = ImageGenerationSlotState::parse(slot)
+                .context("handoff produced an unknown slot state")?;
+            let job_state = ImageGenerationJobState::parse(job)
+                .context("handoff produced an unknown job state")?;
+            if retry.is_none() {
+                ensure!(
+                    slot_transition_allowed(ImageGenerationSlotState::Dispatching, slot_state),
+                    "image generation handoff slot transition is not canonical"
+                );
+                ensure!(
+                    job_transition_allowed(ImageGenerationJobState::Dispatching, job_state),
+                    "image generation handoff job transition is not canonical"
+                );
+            }
             ensure!(
                 outcome.record().state.as_str()
                     == match evidence.outcome {
@@ -1723,15 +2359,38 @@ impl Db {
                     },
                 "image generation handoff evidence differs"
             );
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=version+1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='dispatching' AND version=?6 AND external_operation_id=?7",params![attempt,outcome.record().version,dispatching.job_id.to_string(),dispatching.slot_id.to_string(),i64::from(dispatching.attempt_number),i64::try_from(dispatching.attempt_version)?,dispatching.operation.operation_id.to_string()])?==1,"image generation handoff attempt compare-and-set lost");
             if let Some((next_attempt, _, _)) = &retry {
+                ensure!(
+                    IMAGE_JOB_CONDITIONAL_EDGES.contains(&("dispatching", "queued"))
+                        && IMAGE_SLOT_CONDITIONAL_EDGES.contains(&("dispatching", "queued")),
+                    "authoritative retry edge contract is absent"
+                );
                 ensure!(conn.execute("INSERT INTO image_generation_attempt_activation_facts(job_id,slot_id,attempt_number,activation_reason,prior_attempt_number,activated_at_unix_ms) VALUES(?1,?2,?3,'authoritative_retry',?4,?5)",params![dispatching.job_id.to_string(),dispatching.slot_id.to_string(),next_attempt,i64::from(dispatching.attempt_number),at_unix_ms])?==1,"image generation retry activation was not recorded");
             }
-            ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=version+1,failure_reason=CASE WHEN ?1='failed' THEN 'definitively_rejected' ELSE NULL END WHERE job_id=?2 AND slot_id=?3 AND state='dispatching'",params![slot,dispatching.job_id.to_string(),dispatching.slot_id.to_string()])?==1,"image generation handoff slot compare-and-set lost");
+            execute_image_handoff_outcome_transitions_conn(
+                conn,
+                &dispatching,
+                attempt_state,
+                slot_state,
+                u64::try_from(outcome.record().version)?,
+                retry.is_some(),
+            )?;
             if job == "failed" {
                 commit_terminal_job_projection_conn(conn, dispatching.job_id, at_unix_ms)?;
             } else {
-                ensure!(conn.execute("UPDATE image_generation_jobs SET state=?1,version=version+1,updated_at_unix_ms=?2 WHERE job_id=?3 AND state='dispatching'",params![job,at_unix_ms,dispatching.job_id.to_string()])?==1,"image generation handoff job compare-and-set lost");
+                execute_image_job_transition_conn(
+                    conn,
+                    dispatching.job_id,
+                    ImageGenerationJobState::Dispatching,
+                    dispatching.job_version,
+                    job_state,
+                    at_unix_ms,
+                    if retry.is_some() {
+                        ImageJobTransitionContext::AuthoritativeRetry
+                    } else {
+                        ImageJobTransitionContext::Ordinary
+                    },
+                )?;
             }
             Ok(match retry {
                 Some((attempt, canonical_media_plan, media_plan_digest)) => {
@@ -1752,12 +2411,19 @@ impl Db {
         slot_id: Uuid,
         attempt_number: u32,
     ) -> Result<SealedImageGenerationRecoveryAuthority> {
-        conn.query_row("SELECT a.version,s.version,a.external_operation_id,j.version,a.provider_request_identity,a.provider_idempotency_identity,j.payload_digest FROM image_generation_attempts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN external_journal_operations j ON j.operation_id=a.external_operation_id WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state IN ('reconciling','cancellation_requested') AND s.state IN ('submission_unknown','cancellation_requested') AND j.state IN ('reconciling','cancellation_requested')",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|Ok(SealedImageGenerationRecoveryAuthority{job_id,slot_id,attempt_number,attempt_version:u64::try_from(row.get::<_,i64>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,slot_version:u64::try_from(row.get::<_,i64>(1)?).map_err(|_|rusqlite::Error::InvalidQuery)?,external_operation_id:Uuid::parse_str(&row.get::<_,String>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?,journal_version:u64::try_from(row.get::<_,i64>(3)?).map_err(|_|rusqlite::Error::InvalidQuery)?,provider_request_identity:row.get(4)?,provider_idempotency_identity:row.get(5)?,journal_payload_digest:row.get(6)?,claim_worker_boot_id:None,claim_generation:None})).context("image generation recovery authority unavailable")
+        conn.query_row("SELECT a.version,s.version,a.external_operation_id,j.version,a.provider_request_identity,a.provider_idempotency_identity,j.payload_digest,g.state,g.version FROM image_generation_attempts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_jobs g ON g.job_id=a.job_id JOIN external_journal_operations j ON j.operation_id=a.external_operation_id WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state IN ('reconciling','cancellation_requested') AND s.state IN ('submission_unknown','cancellation_requested') AND g.state IN ('submission_unknown','cancellation_requested') AND j.state IN ('reconciling','cancellation_requested')",params![job_id.to_string(),slot_id.to_string(),i64::from(attempt_number)],|row|Ok(SealedImageGenerationRecoveryAuthority{job_id,job_state:ImageGenerationJobState::parse(&row.get::<_,String>(7)?).ok_or(rusqlite::Error::InvalidQuery)?,job_version:u64::try_from(row.get::<_,i64>(8)?).map_err(|_|rusqlite::Error::InvalidQuery)?,slot_id,attempt_number,attempt_version:u64::try_from(row.get::<_,i64>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,slot_version:u64::try_from(row.get::<_,i64>(1)?).map_err(|_|rusqlite::Error::InvalidQuery)?,external_operation_id:Uuid::parse_str(&row.get::<_,String>(2)?).map_err(|_|rusqlite::Error::InvalidQuery)?,journal_version:u64::try_from(row.get::<_,i64>(3)?).map_err(|_|rusqlite::Error::InvalidQuery)?,provider_request_identity:row.get(4)?,provider_idempotency_identity:row.get(5)?,journal_payload_digest:row.get(6)?,claim_worker_boot_id:None,claim_generation:None})).context("image generation recovery authority unavailable")
     }
     pub fn claim_image_generation_reconciliation_conn(
         conn: &Connection,
         input: &ClaimImageGenerationReconciliation,
     ) -> Result<SealedImageGenerationRecoveryAuthority> {
+        ensure!(
+            attempt_transition_allowed(
+                ImageGenerationAttemptState::SubmissionUnknown,
+                ImageGenerationAttemptState::Reconciling
+            ),
+            "image generation reconciliation claim transition is not canonical"
+        );
         atomic_conn(conn, "image_generation_reconciliation_claim", || {
             ensure!(
                 !input.worker_boot_id.is_nil() && input.claim_generation > 0,
@@ -1791,7 +2457,12 @@ impl Db {
                     ExternalTransitionOutcome::Committed(record) => record,
                     _ => anyhow::bail!("reconciliation claim lost journal compare-and-set"),
                 };
-                ensure!(conn.execute("UPDATE image_generation_attempts SET state='reconciling',version=version+1,observed_journal_version=?1 WHERE job_id=?2 AND slot_id=?3 AND attempt_number=?4 AND state='submission_unknown' AND version=?5",params![record.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),attempt_version])?==1,"reconciliation claim lost attempt compare-and-set");
+                execute_reconciliation_claim_attempt_transition_conn(
+                    conn,
+                    input,
+                    u64::try_from(attempt_version)?,
+                    u64::try_from(record.version)?,
+                )?;
             }
             let mut authority = Self::image_generation_recovery_authority_conn(
                 conn,
@@ -1869,11 +2540,25 @@ impl Db {
             sealed_media_reservation_id,
         ) = media_authority
             .unwrap_or_else(|| (String::new(), 0, (Vec::new(), String::new()), String::new()));
-        let cancellation: Option<i64> = conn.query_row(
-            "SELECT applied_cancellation_version FROM image_generation_attempts WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3",
+        let (attempt_state, slot_state, slot_version, job_state, job_version, cancellation): (String, String, i64, String, i64, Option<i64>) = conn.query_row(
+            "SELECT a.state,s.state,s.version,j.state,j.version,a.applied_cancellation_version FROM image_generation_attempts a JOIN image_generation_slots s USING(job_id,slot_id) JOIN image_generation_jobs j USING(job_id) WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3",
             params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number)],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
         )?;
+        let attempt_state = ImageGenerationAttemptState::parse(&attempt_state)
+            .context("reconciliation attempt state is unknown")?;
+        let slot_state = ImageGenerationSlotState::parse(&slot_state)
+            .context("reconciliation slot state is unknown")?;
+        let job_state = ImageGenerationJobState::parse(&job_state)
+            .context("reconciliation job state is unknown")?;
+        ensure!(
+            slot_version == i64::try_from(input.slot_version)?,
+            "reconciliation slot version is stale"
+        );
+        ensure!(
+            job_state == input.job_state && job_version == i64::try_from(input.job_version)?,
+            "reconciliation job authority differs from the sealed proof"
+        );
         let (journal_next, attempt_next, outcome) = match (proof.outcome, cancellation.is_some()) {
             (ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance, true) => (
                 ExternalJournalState::Cancelled,
@@ -1896,6 +2581,80 @@ impl Db {
                 "authoritative_failure",
             ),
         };
+        ensure!(
+            attempt_transition_allowed(attempt_state, attempt_next),
+            "reconciliation attempt transition is not canonical"
+        );
+        let next_attempt_number = input
+            .attempt_number
+            .checked_add(1)
+            .context("image generation attempt number overflow")?;
+        let retry = if proof.outcome
+            == ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance
+            && cancellation.is_none()
+        {
+            conn.query_row("SELECT m.canonical_media_plan,m.media_plan_digest FROM image_generation_attempts a JOIN image_generation_attempt_media_snapshots m USING(job_id,slot_id,attempt_number) JOIN image_generation_slots s USING(job_id,slot_id) WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state='planned' AND a.attempt_number<=s.max_attempt_count",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(next_attempt_number)],|row|Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,String>(1)?))).optional()?
+        } else {
+            None
+        };
+        let slot_next = if retry.is_some() {
+            ImageGenerationSlotState::Queued
+        } else if matches!(
+            proof.outcome,
+            ImageGenerationReconciliationOutcome::AuthoritativeAccepted
+        ) {
+            if cancellation.is_some() {
+                ImageGenerationSlotState::CancellationRequested
+            } else {
+                ImageGenerationSlotState::Running
+            }
+        } else if cancellation.is_some()
+            && matches!(
+                proof.outcome,
+                ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance
+            )
+        {
+            ImageGenerationSlotState::Cancelled
+        } else {
+            ImageGenerationSlotState::Failed
+        };
+        if retry.is_some() {
+            ensure!(
+                IMAGE_JOB_CONDITIONAL_EDGES
+                    .contains(&(job_state.as_str(), ImageGenerationJobState::Queued.as_str()))
+                    && IMAGE_SLOT_CONDITIONAL_EDGES
+                        .contains(&(slot_state.as_str(), slot_next.as_str())),
+                "reconciled retry edge contract is absent"
+            );
+        } else if !(matches!(
+            proof.outcome,
+            ImageGenerationReconciliationOutcome::AuthoritativeAccepted
+        ) && cancellation.is_some())
+        {
+            ensure!(
+                slot_transition_allowed(slot_state, slot_next),
+                "reconciliation slot transition is not canonical"
+            );
+        } else {
+            ensure!(
+                slot_state == ImageGenerationSlotState::CancellationRequested,
+                "accepted cancellation reconciliation requires the persisted cancellation-requested slot"
+            );
+            ensure!(
+                job_state == input.job_state && job_version == i64::try_from(input.job_version)?,
+                "accepted cancellation reconciliation changed sealed job authority"
+            );
+        }
+        if matches!(
+            proof.outcome,
+            ImageGenerationReconciliationOutcome::AuthoritativeAccepted
+        ) && cancellation.is_none()
+        {
+            ensure!(
+                job_transition_allowed(job_state, ImageGenerationJobState::Running),
+                "reconciliation job transition is not canonical"
+            );
+        }
         match transition_external_operation_conn(
             conn,
             input.external_operation_id,
@@ -1922,68 +2681,58 @@ impl Db {
             evidence_inserted == 1,
             "reconciliation evidence identity is not bound"
         );
-        let attempt_changed=conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,nonacceptance_evidence_digest=CASE WHEN ?4='authoritative_nonacceptance' THEN ?5 ELSE NULL END WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state IN ('reconciling','cancellation_requested') AND version=?9 AND external_operation_id=?10",params![attempt_next.as_str(),i64::try_from(input.attempt_version+1)?,i64::try_from(journal_version)?,outcome,evidence_digest,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.attempt_version)?,input.external_operation_id.to_string()])?;
-        ensure!(
-            attempt_changed == 1,
-            "reconciliation lost attempt compare-and-set"
-        );
-        let next_attempt_number = input
-            .attempt_number
-            .checked_add(1)
-            .context("image generation attempt number overflow")?;
-        let retry = if proof.outcome
-            == ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance
-            && cancellation.is_none()
-        {
-            conn.query_row("SELECT m.canonical_media_plan,m.media_plan_digest FROM image_generation_attempts a JOIN image_generation_attempt_media_snapshots m USING(job_id,slot_id,attempt_number) JOIN image_generation_slots s USING(job_id,slot_id) WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.state='planned' AND a.attempt_number<=s.max_attempt_count",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(next_attempt_number)],|row|Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,String>(1)?))).optional()?
-        } else {
-            None
-        };
         if retry.is_some() {
             ensure!(conn.execute("INSERT INTO image_generation_attempt_activation_facts(job_id,slot_id,attempt_number,activation_reason,prior_attempt_number,activated_at_unix_ms) VALUES(?1,?2,?3,'authoritative_retry',?4,?5)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(next_attempt_number),i64::from(input.attempt_number),proof.now_unix_ms])?==1,"reconciled retry activation was not recorded");
         }
-        let slot_next = if retry.is_some() {
-            "queued"
-        } else if matches!(
+        let accepted_during_cancellation = matches!(
             proof.outcome,
             ImageGenerationReconciliationOutcome::AuthoritativeAccepted
-        ) {
-            if cancellation.is_some() {
-                "cancellation_requested"
-            } else {
-                "running"
-            }
-        } else if cancellation.is_some()
-            && matches!(
-                proof.outcome,
-                ImageGenerationReconciliationOutcome::AuthoritativeNonacceptance
-            )
-        {
-            "cancelled"
-        } else {
-            "failed"
-        };
-        let slot_changed = if matches!(
-            proof.outcome,
-            ImageGenerationReconciliationOutcome::AuthoritativeAccepted
-        ) && cancellation.is_some()
-        {
-            1
-        } else {
-            conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,failure_reason=CASE WHEN ?1='failed' THEN ?3 ELSE NULL END WHERE job_id=?4 AND slot_id=?5 AND state IN ('submission_unknown','cancellation_requested') AND version=?6",params![slot_next,i64::try_from(input.slot_version+1)?,outcome,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.slot_version)?])?
-        };
-        ensure!(
-            slot_changed == 1,
-            "reconciliation lost slot compare-and-set"
-        );
+        ) && cancellation.is_some();
+        if accepted_during_cancellation {
+            ensure!(
+                slot_state == ImageGenerationSlotState::CancellationRequested
+                    && slot_version == i64::try_from(input.slot_version)?,
+                "accepted cancellation reconciliation lost its no-op slot authority"
+            );
+        }
+        execute_reconciliation_state_transitions_conn(
+            conn,
+            &ReconciliationStateTransition {
+                authority: input,
+                attempt_from: attempt_state,
+                attempt_to: attempt_next,
+                slot_from: slot_state,
+                slot_to: (!accepted_during_cancellation).then_some(slot_next),
+                journal_version,
+                outcome,
+                evidence_digest,
+                retry: retry.is_some(),
+            },
+        )?;
         if retry.is_some() {
-            ensure!(conn.execute("UPDATE image_generation_jobs SET state='queued',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='submission_unknown'",params![proof.now_unix_ms,input.job_id.to_string()])?==1,"reconciled retry lost job compare-and-set");
+            execute_image_job_transition_conn(
+                conn,
+                input.job_id,
+                input.job_state,
+                input.job_version,
+                ImageGenerationJobState::Queued,
+                proof.now_unix_ms,
+                ImageJobTransitionContext::AuthoritativeRetry,
+            )?;
         } else if matches!(
             proof.outcome,
             ImageGenerationReconciliationOutcome::AuthoritativeAccepted
         ) {
             if cancellation.is_none() {
-                ensure!(conn.execute("UPDATE image_generation_jobs SET state='running',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='submission_unknown'",params![proof.now_unix_ms,input.job_id.to_string()])?==1,"accepted reconciliation lost job compare-and-set");
+                execute_image_job_transition_conn(
+                    conn,
+                    input.job_id,
+                    input.job_state,
+                    input.job_version,
+                    ImageGenerationJobState::Running,
+                    proof.now_unix_ms,
+                    ImageJobTransitionContext::Ordinary,
+                )?;
             }
             return Ok(ImageGenerationReconciliationDisposition::Settled {
                 external_operation_id: input.external_operation_id,
@@ -2037,7 +2786,7 @@ impl Db {
     /// Inserts the sealed plan and its initial projection in the caller's
     /// transaction. Composition with grants, resources, spend and journal
     /// rows therefore needs no second connection or async boundary.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     fn create_image_generation_job_conn(
         conn: &Connection,
         input: &CreateImageGenerationJob<'_>,
@@ -2202,7 +2951,7 @@ impl Db {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     fn cas_image_generation_job_state_conn(
         conn: &Connection,
         job_id: Uuid,
@@ -2233,7 +2982,7 @@ impl Db {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     fn cas_image_generation_slot_state_conn(
         conn: &Connection,
         job_id: Uuid,
@@ -2277,10 +3026,54 @@ impl Db {
         conn: &Connection,
         input: &BeginImageGenerationDownload,
     ) -> Result<()> {
+        ensure!(
+            attempt_transition_allowed(
+                ImageGenerationAttemptState::Accepted,
+                ImageGenerationAttemptState::Downloading
+            ),
+            "image generation download attempt transition is not canonical"
+        );
+        ensure!(
+            slot_transition_allowed(
+                ImageGenerationSlotState::Running,
+                ImageGenerationSlotState::Downloading
+            ),
+            "image generation download slot transition is not canonical"
+        );
+        ensure!(
+            job_transition_allowed(
+                ImageGenerationJobState::Running,
+                ImageGenerationJobState::Downloading
+            ),
+            "image generation download job transition is not canonical"
+        );
         atomic_conn(conn, "image_generation_begin_download", || {
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state='downloading',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND state='accepted' AND version=?4",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?])?==1,"image generation attempt download compare-and-set lost");
-            ensure!(conn.execute("UPDATE image_generation_slots SET state='downloading',version=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='running' AND version=?3",params![input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation slot download compare-and-set lost");
-            ensure!(conn.execute("UPDATE image_generation_jobs SET state='downloading',version=version+1,updated_at_unix_ms=?1 WHERE job_id=?2 AND state='running' AND version=?3",params![input.at_unix_ms,input.job_id.to_string(),i64::try_from(input.expected_job_version)?])?==1,"image generation job download compare-and-set lost");
+            execute_basic_image_attempt_transition_conn(
+                conn,
+                input.job_id,
+                input.slot_id,
+                input.attempt_number,
+                ImageGenerationAttemptState::Accepted,
+                input.expected_attempt_version,
+                ImageGenerationAttemptState::Downloading,
+            )?;
+            execute_basic_image_slot_transition_conn(
+                conn,
+                input.job_id,
+                input.slot_id,
+                ImageGenerationSlotState::Running,
+                input.expected_slot_version,
+                ImageGenerationSlotState::Downloading,
+            )?;
+            execute_image_job_transition_conn(
+                conn,
+                input.job_id,
+                ImageGenerationJobState::Running,
+                input.expected_job_version,
+                ImageGenerationJobState::Downloading,
+                input.at_unix_ms,
+                ImageJobTransitionContext::Ordinary,
+            )?;
             Ok(())
         })
     }
@@ -2289,9 +3082,41 @@ impl Db {
         conn: &Connection,
         input: &CommitAcceptedImageResponseFailure<'_>,
     ) -> Result<()> {
+        for from in [
+            ImageGenerationAttemptState::Accepted,
+            ImageGenerationAttemptState::Downloading,
+            ImageGenerationAttemptState::CancellationRequested,
+        ] {
+            ensure!(
+                attempt_transition_allowed(
+                    from,
+                    ImageGenerationAttemptState::FailedAfterAcceptance
+                ),
+                "accepted response failure attempt transition is not canonical"
+            );
+        }
+        for from in [
+            ImageGenerationSlotState::Running,
+            ImageGenerationSlotState::Downloading,
+            ImageGenerationSlotState::CancellationRequested,
+        ] {
+            ensure!(
+                slot_transition_allowed(from, ImageGenerationSlotState::Failed),
+                "accepted response failure slot transition is not canonical"
+            );
+        }
         atomic_conn(conn, "image_generation_accepted_response_failure", || {
             let bound: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_response_fetch_outcomes WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND outcome='definitive_failure' AND safe_reason=?4) OR EXISTS(SELECT 1 FROM image_generation_response_reconciliations WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND outcome='definitive_failure' AND safe_reason=?4)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.safe_reason],|row|row.get(0))?;
             ensure!(bound, "accepted response failure evidence is absent");
+            let (attempt_from, slot_from): (String, String) = conn.query_row(
+                "SELECT a.state,s.state FROM image_generation_attempts a JOIN image_generation_slots s USING(job_id,slot_id) WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.version=?4 AND s.version=?5",
+                params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,i64::try_from(input.expected_slot_version)?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).context("accepted response failure authority is unavailable")?;
+            let attempt_from = ImageGenerationAttemptState::parse(&attempt_from)
+                .context("accepted response failure attempt state is unknown")?;
+            let slot_from = ImageGenerationSlotState::parse(&slot_from)
+                .context("accepted response failure slot state is unknown")?;
             match transition_external_operation_conn(
                 conn,
                 input.external_operation_id,
@@ -2302,8 +3127,14 @@ impl Db {
                 ExternalTransitionOutcome::Committed(_) => {}
                 _ => anyhow::bail!("accepted response failure lost journal compare-and-set"),
             }
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state='failed_after_acceptance',version=version+1,observed_journal_version=?1 WHERE job_id=?2 AND slot_id=?3 AND attempt_number=?4 AND state IN ('accepted','downloading','cancellation_requested') AND version=?5 AND external_operation_id=?6",params![i64::try_from(input.expected_journal_version+1)?,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()])?==1,"accepted response failure lost attempt compare-and-set");
-            ensure!(conn.execute("UPDATE image_generation_slots SET state='failed',version=version+1,failure_reason=?1 WHERE job_id=?2 AND slot_id=?3 AND state IN ('running','downloading','cancellation_requested') AND version=?4",params![input.safe_reason,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"accepted response failure lost slot compare-and-set");
+            execute_accepted_response_failure_transitions_conn(
+                conn,
+                &AcceptedResponseFailureTransition {
+                    input,
+                    attempt_from,
+                    slot_from,
+                },
+            )?;
             commit_terminal_job_projection_conn(conn, input.job_id, input.at_unix_ms)?;
             Ok(())
         })
@@ -2366,7 +3197,18 @@ impl Db {
             } else {
                 ImageGenerationSlotState::ReadyToPublish
             };
-            ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=version+1 WHERE job_id=?2 AND slot_id=?3 AND state='validating' AND version=?4",params![next.as_str(),input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"image generation validation compare-and-set lost");
+            ensure!(
+                slot_transition_allowed(ImageGenerationSlotState::Validating, next),
+                "image generation validation transition is not canonical"
+            );
+            execute_basic_image_slot_transition_conn(
+                conn,
+                input.job_id,
+                input.slot_id,
+                ImageGenerationSlotState::Validating,
+                input.expected_slot_version,
+                next,
+            )?;
             if after_cancel {
                 commit_terminal_job_projection_conn(conn, input.job_id, input.at_unix_ms)?;
             }
@@ -2386,6 +3228,15 @@ impl Db {
             "SELECT cancellation_version FROM image_generation_cancellation_facts WHERE job_id=?1",
             [input.job_id.to_string()], |row| row.get(0),
         ).optional()?;
+        let (attempt_from, slot_from): (String, String) = conn.query_row(
+            "SELECT a.state,s.state FROM image_generation_attempts a JOIN image_generation_slots s USING(job_id,slot_id) WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.version=?4 AND s.version=?5",
+            params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,i64::try_from(input.expected_slot_version)?],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).context("response adoption authority is unavailable")?;
+        let attempt_from = ImageGenerationAttemptState::parse(&attempt_from)
+            .context("response adoption attempt state is unknown")?;
+        let mut slot_from = ImageGenerationSlotState::parse(&slot_from)
+            .context("response adoption slot state is unknown")?;
         let ordering = cancellation.map_or(ResponseAdoptionOrdering::Ordinary, |version| {
             ResponseAdoptionOrdering::ResponseAfterCancellation {
                 cancellation_version: version as u64,
@@ -2412,43 +3263,72 @@ impl Db {
         } else {
             ImageGenerationAttemptState::ResponseAdopted
         };
-        let next_attempt_version = input
-            .expected_attempt_version
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("attempt version overflow"))?;
+        let attempt_sources: &[ImageGenerationAttemptState] = if cancellation.is_some() {
+            &[
+                ImageGenerationAttemptState::Accepted,
+                ImageGenerationAttemptState::Downloading,
+                ImageGenerationAttemptState::CancellationRequested,
+            ]
+        } else {
+            &[
+                ImageGenerationAttemptState::Accepted,
+                ImageGenerationAttemptState::Downloading,
+            ]
+        };
+        for &from in attempt_sources {
+            ensure!(
+                attempt_transition_allowed(from, attempt_next),
+                "image generation response adoption attempt transition is not canonical"
+            );
+        }
+        ensure!(
+            attempt_sources.contains(&attempt_from),
+            "response adoption attempt source state is unavailable"
+        );
         if let Some(cancellation_version) = cancellation {
             conn.execute(
                 "INSERT INTO image_generation_cancelled_result_facts(job_id,slot_id,attempt_number,cancellation_version,response_digest,journal_terminal_version,ordering) VALUES(?1,?2,?3,?4,?5,?6,'response_after_cancellation')",
                 params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),cancellation_version,input.response_digest,i64::try_from(input.expected_journal_version+1)?],
             )?;
         }
-        let changed = conn.execute(
-            "UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,applied_cancellation_version=?4,response_digest=?5 WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state IN ('accepted','downloading','cancellation_requested') AND version=?9 AND external_operation_id=?10",
-            params![attempt_next.as_str(),i64::try_from(next_attempt_version)?,i64::try_from(input.expected_journal_version+1)?,applied_cancellation,input.response_digest,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()],
-        )?;
-        ensure!(
-            changed == 1,
-            "attempt response adoption lost its compare-and-set"
-        );
         let slot_next = ImageGenerationSlotState::Validating;
-        let mut slot_expected_version = input.expected_slot_version;
-        if cancellation.is_some() {
-            let changed=conn.execute(
-                "UPDATE image_generation_slots SET state='downloading',version=?1 WHERE job_id=?2 AND slot_id=?3 AND state='cancellation_requested' AND version=?4",
-                params![i64::try_from(slot_expected_version+1)?,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(slot_expected_version)?],
-            )?;
-            if changed == 1 {
-                slot_expected_version += 1;
-            }
-        }
-        let changed = conn.execute(
-            "UPDATE image_generation_slots SET state=?1,version=?2,applied_cancellation_version=?3,result_after_cancel=?4 WHERE job_id=?5 AND slot_id=?6 AND state='downloading' AND version=?7",
-            params![slot_next.as_str(),i64::try_from(slot_expected_version+1)?,applied_cancellation,i64::from(cancellation.is_some()),input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(slot_expected_version)?],
-        )?;
         ensure!(
-            changed == 1,
-            "slot response adoption lost its compare-and-set"
+            slot_transition_allowed(ImageGenerationSlotState::Downloading, slot_next),
+            "image generation response adoption slot transition is not canonical"
         );
+        if cancellation.is_some() {
+            ensure!(
+                slot_transition_allowed(
+                    ImageGenerationSlotState::CancellationRequested,
+                    ImageGenerationSlotState::Downloading
+                ),
+                "image generation cancelled response transition is not canonical"
+            );
+        }
+        let mut slot_expected_version = input.expected_slot_version;
+        if cancellation.is_some() && slot_from == ImageGenerationSlotState::CancellationRequested {
+            slot_expected_version = execute_basic_image_slot_transition_conn(
+                conn,
+                input.job_id,
+                input.slot_id,
+                slot_from,
+                slot_expected_version,
+                ImageGenerationSlotState::Downloading,
+            )?;
+            slot_from = ImageGenerationSlotState::Downloading;
+        }
+        execute_response_adoption_transitions_conn(
+            conn,
+            &ResponseAdoptionTransition {
+                input,
+                attempt_from,
+                attempt_to: attempt_next,
+                slot_from,
+                slot_to: slot_next,
+                slot_expected_version,
+                cancellation_version: applied_cancellation,
+            },
+        )?;
         Ok(ordering)
     }
 
@@ -2465,26 +3345,37 @@ impl Db {
         conn: &Connection,
         input: &CommitImageGenerationPublication,
     ) -> Result<ImageGenerationCasOutcome> {
+        ensure!(
+            attempt_transition_allowed(
+                ImageGenerationAttemptState::ResponseAdopted,
+                ImageGenerationAttemptState::Succeeded
+            ),
+            "image generation publication attempt transition is not canonical"
+        );
+        ensure!(
+            slot_transition_allowed(
+                ImageGenerationSlotState::ReadyToPublish,
+                ImageGenerationSlotState::Published
+            ),
+            "image generation publication slot transition is not canonical"
+        );
         conn.execute(
             "INSERT INTO image_generation_publication_right_facts(job_id,slot_id,attempt_number,slot_version,artifact_generation,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6)",
             params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_slot_version)?,i64::try_from(input.artifact_generation)?,input.now_unix_ms],
         )?;
-        let attempt_changed = conn.execute(
-            "UPDATE image_generation_attempts SET state='succeeded',version=?1 WHERE job_id=?2 AND slot_id=?3 AND attempt_number=?4 AND state='response_adopted' AND version=?5 AND applied_cancellation_version IS NULL",
-            params![i64::try_from(input.expected_attempt_version+1)?,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?],
+        execute_image_publication_attempt_transition_conn(
+            conn,
+            input.job_id,
+            input.slot_id,
+            input.attempt_number,
+            input.expected_attempt_version,
         )?;
-        ensure!(
-            attempt_changed == 1,
-            "publication attempt lost its compare-and-set"
-        );
-        let slot_changed = conn.execute(
-            "UPDATE image_generation_slots SET state='published',version=?1,published_disposition='ordinary',published_disposition_generation=?1 WHERE job_id=?2 AND slot_id=?3 AND state='ready_to_publish' AND version=?4 AND applied_cancellation_version IS NULL AND result_after_cancel=0",
-            params![i64::try_from(input.expected_slot_version+1)?,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?],
+        execute_image_publication_slot_transition_conn(
+            conn,
+            input.job_id,
+            input.slot_id,
+            input.expected_slot_version,
         )?;
-        ensure!(
-            slot_changed == 1,
-            "publication slot lost its compare-and-set"
-        );
         commit_terminal_job_projection_conn(conn, input.job_id, input.now_unix_ms)?;
         Ok(ImageGenerationCasOutcome::Applied {
             version: input.expected_slot_version + 1,
@@ -2726,7 +3617,13 @@ impl Db {
                             anyhow::bail!("deadline expiry lost journal compare-and-set")
                         }
                     };
-                    ensure!(conn.execute("UPDATE image_generation_attempts SET observed_journal_version=?1 WHERE job_id=?2 AND external_operation_id=?3 AND observed_journal_version=?4",params![record.version,job_id.to_string(),operation_id.to_string(),version])?==1,"deadline expiry lost attempt journal binding");
+                    execute_deadline_attempt_journal_binding_conn(
+                        conn,
+                        job_id,
+                        operation_id,
+                        u64::try_from(version)?,
+                        u64::try_from(record.version)?,
+                    )?;
                 }
             }
             let cancellation_version = 1_u64;
@@ -2856,11 +3753,18 @@ impl Db {
                         inserted == 1,
                         "adopted response lost cancellation/publication compare-and-set"
                     );
-                    let changed=conn.execute("UPDATE image_generation_attempts SET state='completed_after_cancel',version=?1,applied_cancellation_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='response_adopted' AND version=?6",params![version+1,cancellation_version,input.job_id.to_string(),&slot_id,attempt_number,version])?;
-                    ensure!(
-                        changed == 1,
-                        "adopted response cancellation lost attempt compare-and-set"
-                    );
+                    execute_cancellation_attempt_transition_conn(
+                        conn,
+                        input.job_id,
+                        Uuid::parse_str(&slot_id)?,
+                        u32::try_from(attempt_number)?,
+                        CancellationAttemptTransition {
+                            from: ImageGenerationAttemptState::ResponseAdopted,
+                            expected_version: u64::try_from(version)?,
+                            to: ImageGenerationAttemptState::CompletedAfterCancel,
+                            cancellation_version: input.cancellation_version,
+                        },
+                    )?;
                     continue;
                 }
                 let attempt_handoff_possible = matches!(
@@ -2910,28 +3814,30 @@ impl Db {
                 } else {
                     ImageGenerationAttemptState::Cancelled
                 };
-                ensure!(
-                    attempt_transition_allowed(
-                        ImageGenerationAttemptState::parse(&state)
+                execute_cancellation_attempt_transition_conn(
+                    conn,
+                    input.job_id,
+                    Uuid::parse_str(&slot_id)?,
+                    u32::try_from(attempt_number)?,
+                    CancellationAttemptTransition {
+                        from: ImageGenerationAttemptState::parse(&state)
                             .ok_or_else(|| anyhow::anyhow!("unknown attempt state"))?,
-                        next
-                    ),
-                    "attempt cannot accept cancellation"
-                );
-                let changed=conn.execute(
-                    "UPDATE image_generation_attempts SET state=?1,version=?2,applied_cancellation_version=?3 WHERE job_id=?4 AND slot_id=?5 AND attempt_number=?6 AND state=?7 AND version=?8",
-                    params![next.as_str(),version+1,cancellation_version,input.job_id.to_string(),&slot_id,attempt_number,&state,version],
+                        expected_version: u64::try_from(version)?,
+                        to: next,
+                        cancellation_version: input.cancellation_version,
+                    },
                 )?;
-                ensure!(changed == 1, "cancellation lost attempt compare-and-set");
             }
             let current = ImageGenerationSlotState::parse(&slot_state)
                 .ok_or_else(|| anyhow::anyhow!("unknown slot state"))?;
             if response_adopted && slot_state == "validating" {
-                let changed=conn.execute("UPDATE image_generation_slots SET version=?1,applied_cancellation_version=?2,result_after_cancel=1 WHERE job_id=?3 AND slot_id=?4 AND state='validating' AND version=?5 AND applied_cancellation_version IS NULL",params![slot_version+1,cancellation_version,input.job_id.to_string(),&slot_id,slot_version])?;
-                ensure!(
-                    changed == 1,
-                    "validating result lost cancellation compare-and-set"
-                );
+                execute_validating_slot_cancellation_marker_conn(
+                    conn,
+                    input.job_id,
+                    Uuid::parse_str(&slot_id)?,
+                    u64::try_from(slot_version)?,
+                    input.cancellation_version,
+                )?;
                 continue;
             }
             let next = if response_adopted && slot_state == "ready_to_publish" {
@@ -2941,15 +3847,18 @@ impl Db {
             } else {
                 ImageGenerationSlotState::Cancelled
             };
-            ensure!(
-                slot_transition_allowed(current, next),
-                "slot cannot accept cancellation"
-            );
-            let changed=conn.execute(
-                "UPDATE image_generation_slots SET state=?1,version=?2,applied_cancellation_version=?3,result_after_cancel=?4 WHERE job_id=?5 AND slot_id=?6 AND state=?7 AND version=?8",
-                params![next.as_str(),slot_version+1,cancellation_version,i64::from(response_adopted),input.job_id.to_string(),&slot_id,&slot_state,slot_version],
+            execute_cancellation_slot_transition_conn(
+                conn,
+                input.job_id,
+                Uuid::parse_str(&slot_id)?,
+                CancellationSlotTransition {
+                    from: current,
+                    expected_version: u64::try_from(slot_version)?,
+                    to: next,
+                    cancellation_version: input.cancellation_version,
+                    result_after_cancel: response_adopted,
+                },
             )?;
-            ensure!(changed == 1, "cancellation lost slot compare-and-set");
         }
         let (job_state, job_version): (String, i64) = conn.query_row(
             "SELECT state,version FROM image_generation_jobs WHERE job_id=?1",
@@ -2975,10 +3884,7 @@ impl Db {
         let reduced = reduce_terminal_job_facts(&projection);
         let next = reduced.unwrap_or(ImageGenerationJobState::CancellationRequested);
         ensure!(
-            reduced.map_or_else(
-                || job_transition_allowed(current, next),
-                |terminal| terminal_projection_allowed(current, terminal)
-            ),
+            job_transition_allowed(current, next),
             "job cannot accept cancellation"
         );
         if reduced.is_some() {
@@ -2991,8 +3897,15 @@ impl Db {
                 "cancellation terminal projection differs"
             );
         } else {
-            let changed=conn.execute("UPDATE image_generation_jobs SET state=?1,version=?2,updated_at_unix_ms=?3 WHERE job_id=?4 AND state=?5 AND version=?6",params![next.as_str(),job_version+1,input.requested_at_unix_ms,input.job_id.to_string(),job_state,job_version])?;
-            ensure!(changed == 1, "cancellation lost job compare-and-set");
+            execute_image_job_transition_conn(
+                conn,
+                input.job_id,
+                current,
+                u64::try_from(job_version)?,
+                next,
+                input.requested_at_unix_ms,
+                ImageJobTransitionContext::Ordinary,
+            )?;
         }
         Ok(ImageGenerationCasOutcome::Applied {
             version: (job_version + 1) as u64,
@@ -3201,24 +4114,89 @@ pub struct CreateImageGenerationArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransitionImageGenerationArtifact {
-    pub artifact_id: Uuid,
-    pub expected_generation: u64,
-    pub from: ImageGenerationArtifactState,
-    pub to: ImageGenerationArtifactState,
-    pub now_unix_ms: i64,
-    pub terminal_reason: Option<String>,
+struct TransitionImageGenerationArtifact {
+    artifact_id: Uuid,
+    expected_generation: u64,
+    from: ImageGenerationArtifactState,
+    to: ImageGenerationArtifactState,
+    now_unix_ms: i64,
+    terminal_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransitionImageGenerationArtifactComponent {
+struct TransitionImageGenerationArtifactComponent {
+    artifact_id: Uuid,
+    component_id: Uuid,
+    expected_generation: u64,
+    from: ImageGenerationArtifactComponentState,
+    to: ImageGenerationArtifactComponentState,
+    stable_identity_json: Option<String>,
+    deletion_evidence_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeginImageGenerationArtifactWrite {
+    pub artifact_id: Uuid,
+    pub expected_generation: u64,
+    pub now_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeginImageGenerationArtifactComponentWrite {
     pub artifact_id: Uuid,
     pub component_id: Uuid,
     pub expected_generation: u64,
-    pub from: ImageGenerationArtifactComponentState,
-    pub to: ImageGenerationArtifactComponentState,
-    pub stable_identity_json: Option<String>,
-    pub deletion_evidence_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitImageGenerationArtifactComponentReady<'a> {
+    pub artifact_id: Uuid,
+    pub component_id: Uuid,
+    pub expected_generation: u64,
+    pub stable_identity_json: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitImageGenerationArtifactRetention {
+    pub artifact_id: Uuid,
+    pub expected_generation: u64,
+    pub now_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverImageGenerationArtifactComponent {
+    pub component_id: Uuid,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitImageGenerationSecurityCleanup<'a> {
+    pub recovery_operation_id: Uuid,
+    pub principal_digest: &'a str,
+    pub artifact_id: Uuid,
+    pub expected_artifact_generation: u64,
+    pub component_set_digest: &'a str,
+    pub cleanup_operation_id: Uuid,
+    pub components: &'a [RecoverImageGenerationArtifactComponent],
+    pub outcome_digest: &'a str,
+    pub now_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitImageGenerationSecurityPublication<'a> {
+    pub recovery_operation_id: Uuid,
+    pub principal_digest: &'a str,
+    pub publication_operation_id: Uuid,
+    pub expected_lease_version: u64,
+    pub artifact_id: Uuid,
+    pub expected_artifact_generation: u64,
+    pub expected_slot_version: u64,
+    pub output_authority_digest: &'a str,
+    pub output_authority_generation: u64,
+    pub destination_name: &'a str,
+    pub output_evidence_json: &'a str,
+    pub outcome_digest: &'a str,
+    pub now_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3613,7 +4591,98 @@ impl Db {
         })
     }
 
-    pub fn transition_image_generation_artifact_conn(
+    pub fn begin_image_generation_artifact_write_conn(
+        conn: &Connection,
+        input: &BeginImageGenerationArtifactWrite,
+    ) -> Result<()> {
+        Self::transition_image_generation_artifact_conn(
+            conn,
+            &TransitionImageGenerationArtifact {
+                artifact_id: input.artifact_id,
+                expected_generation: input.expected_generation,
+                from: ImageGenerationArtifactState::Allocating,
+                to: ImageGenerationArtifactState::Writing,
+                now_unix_ms: input.now_unix_ms,
+                terminal_reason: None,
+            },
+        )
+    }
+
+    pub fn begin_image_generation_artifact_component_write_conn(
+        conn: &Connection,
+        input: &BeginImageGenerationArtifactComponentWrite,
+    ) -> Result<()> {
+        Self::transition_image_generation_artifact_component_conn(
+            conn,
+            &TransitionImageGenerationArtifactComponent {
+                artifact_id: input.artifact_id,
+                component_id: input.component_id,
+                expected_generation: input.expected_generation,
+                from: ImageGenerationArtifactComponentState::Planned,
+                to: ImageGenerationArtifactComponentState::Writing,
+                stable_identity_json: None,
+                deletion_evidence_digest: None,
+            },
+        )
+    }
+
+    pub fn commit_image_generation_artifact_component_ready_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationArtifactComponentReady<'_>,
+    ) -> Result<()> {
+        ensure!(
+            !input.stable_identity_json.is_empty(),
+            "artifact component stable identity is empty"
+        );
+        Self::transition_image_generation_artifact_component_conn(
+            conn,
+            &TransitionImageGenerationArtifactComponent {
+                artifact_id: input.artifact_id,
+                component_id: input.component_id,
+                expected_generation: input.expected_generation,
+                from: ImageGenerationArtifactComponentState::Writing,
+                to: ImageGenerationArtifactComponentState::Ready,
+                stable_identity_json: Some(input.stable_identity_json.to_owned()),
+                deletion_evidence_digest: None,
+            },
+        )
+    }
+
+    pub fn commit_image_generation_artifact_retained_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationArtifactRetention,
+    ) -> Result<()> {
+        Self::transition_image_generation_artifact_conn(
+            conn,
+            &TransitionImageGenerationArtifact {
+                artifact_id: input.artifact_id,
+                expected_generation: input.expected_generation,
+                from: ImageGenerationArtifactState::Writing,
+                to: ImageGenerationArtifactState::Retained,
+                now_unix_ms: input.now_unix_ms,
+                terminal_reason: None,
+            },
+        )
+    }
+
+    pub fn commit_image_generation_artifact_late_quarantined_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationArtifactRetention,
+    ) -> Result<()> {
+        Self::transition_image_generation_artifact_conn(
+            conn,
+            &TransitionImageGenerationArtifact {
+                artifact_id: input.artifact_id,
+                expected_generation: input.expected_generation,
+                from: ImageGenerationArtifactState::Writing,
+                to: ImageGenerationArtifactState::LateQuarantined,
+                now_unix_ms: input.now_unix_ms,
+                terminal_reason: None,
+            },
+        )
+    }
+
+    fn transition_image_generation_artifact_conn(
         conn: &Connection,
         input: &TransitionImageGenerationArtifact,
     ) -> Result<()> {
@@ -3645,7 +4714,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn transition_image_generation_artifact_component_conn(
+    fn transition_image_generation_artifact_component_conn(
         conn: &Connection,
         input: &TransitionImageGenerationArtifactComponent,
     ) -> Result<()> {
@@ -3674,6 +4743,267 @@ impl Db {
             changed == 1,
             "image artifact component compare-and-set lost"
         );
+        Ok(())
+    }
+
+    fn execute_security_blocked_artifact_cleanup_transition_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        expected_generation: u64,
+        now_unix_ms: i64,
+    ) -> Result<u64> {
+        ensure!(
+            artifact_transition_allowed(
+                ImageGenerationArtifactState::SecurityBlocked,
+                ImageGenerationArtifactState::CleanupPending,
+            ),
+            "security recovery artifact cleanup edge is not canonical"
+        );
+        let next = expected_generation
+            .checked_add(1)
+            .context("security recovery artifact generation overflow")?;
+        ensure!(conn.execute("UPDATE image_generation_artifacts SET state='cleanup_pending',generation=?1,updated_at_unix_ms=?2 WHERE artifact_id=?3 AND state='security_blocked' AND generation=?4 AND active_lease_count=0",params![i64::try_from(next)?,now_unix_ms,artifact_id.to_string(),i64::try_from(expected_generation)?])?==1,"security recovery artifact compare-and-set lost");
+        Ok(next)
+    }
+
+    fn execute_ready_component_cleanup_transition_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        component_id: Uuid,
+        expected_generation: u64,
+    ) -> Result<u64> {
+        ensure!(
+            artifact_component_transition_allowed(
+                ImageGenerationArtifactComponentState::Ready,
+                ImageGenerationArtifactComponentState::CleanupPending
+            ),
+            "ready component cleanup edge is not canonical"
+        );
+        let next = expected_generation
+            .checked_add(1)
+            .context("ready component cleanup generation overflow")?;
+        ensure!(conn.execute("UPDATE image_generation_artifact_components SET state='cleanup_pending',generation=?1 WHERE artifact_id=?2 AND component_id=?3 AND state='ready' AND generation=?4",params![i64::try_from(next)?,artifact_id.to_string(),component_id.to_string(),i64::try_from(expected_generation)?])?==1,"ready component cleanup compare-and-set lost");
+        Ok(next)
+    }
+
+    fn execute_security_blocked_component_cleanup_transition_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        component_id: Uuid,
+        expected_generation: u64,
+    ) -> Result<u64> {
+        ensure!(
+            artifact_component_transition_allowed(
+                ImageGenerationArtifactComponentState::SecurityBlocked,
+                ImageGenerationArtifactComponentState::CleanupPending
+            ),
+            "security-blocked component cleanup edge is not canonical"
+        );
+        let next = expected_generation
+            .checked_add(1)
+            .context("security-blocked component cleanup generation overflow")?;
+        ensure!(conn.execute("UPDATE image_generation_artifact_components SET state='cleanup_pending',generation=?1 WHERE artifact_id=?2 AND component_id=?3 AND state='security_blocked' AND generation=?4",params![i64::try_from(next)?,artifact_id.to_string(),component_id.to_string(),i64::try_from(expected_generation)?])?==1,"security-blocked component cleanup compare-and-set lost");
+        Ok(next)
+    }
+
+    fn execute_late_quarantined_artifact_retention_transition_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        expected_generation: u64,
+        now_unix_ms: i64,
+    ) -> Result<u64> {
+        ensure!(
+            artifact_transition_allowed(
+                ImageGenerationArtifactState::LateQuarantined,
+                ImageGenerationArtifactState::Retained
+            ),
+            "late-quarantined artifact retention edge is not canonical"
+        );
+        let next = expected_generation
+            .checked_add(1)
+            .context("late-quarantined artifact retention generation overflow")?;
+        ensure!(conn.execute("UPDATE image_generation_artifacts SET state='retained',generation=?1,updated_at_unix_ms=?2 WHERE artifact_id=?3 AND state='late_quarantined' AND generation=?4",params![i64::try_from(next)?,now_unix_ms,artifact_id.to_string(),i64::try_from(expected_generation)?])?==1,"late-quarantined artifact retention compare-and-set lost");
+        Ok(next)
+    }
+
+    fn execute_security_blocked_artifact_retention_transition_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        expected_generation: u64,
+        now_unix_ms: i64,
+    ) -> Result<u64> {
+        ensure!(
+            artifact_transition_allowed(
+                ImageGenerationArtifactState::SecurityBlocked,
+                ImageGenerationArtifactState::Retained
+            ),
+            "security-blocked artifact retention edge is not canonical"
+        );
+        let next = expected_generation
+            .checked_add(1)
+            .context("security-blocked artifact retention generation overflow")?;
+        ensure!(conn.execute("UPDATE image_generation_artifacts SET state='retained',generation=?1,updated_at_unix_ms=?2 WHERE artifact_id=?3 AND state='security_blocked' AND generation=?4",params![i64::try_from(next)?,now_unix_ms,artifact_id.to_string(),i64::try_from(expected_generation)?])?==1,"security-blocked artifact retention compare-and-set lost");
+        Ok(next)
+    }
+
+    pub fn commit_image_generation_security_cleanup_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationSecurityCleanup<'_>,
+    ) -> Result<()> {
+        atomic_conn(conn, "image_generation_security_cleanup", || {
+            ensure_digest(input.outcome_digest, "security cleanup outcome")?;
+            let expected_component_count: i64 = conn.query_row("SELECT a.expected_component_count FROM image_generation_artifact_security_recovery_audits r JOIN image_generation_artifacts a ON a.artifact_id=r.artifact_id WHERE r.recovery_operation_id=?1 AND r.principal_digest=?2 AND r.artifact_id=?3 AND r.artifact_generation=?4 AND r.component_set_digest=?5 AND r.disposition='resume_verified_cleanup' AND r.state='recorded' AND a.state='security_blocked' AND a.generation=r.artifact_generation AND a.component_set_digest=r.component_set_digest AND a.active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references x WHERE x.artifact_id=a.artifact_id AND x.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=a.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed','security_blocked','delete_authorized'))",params![input.recovery_operation_id.to_string(),input.principal_digest,input.artifact_id.to_string(),i64::try_from(input.expected_artifact_generation)?,input.component_set_digest],|row|row.get(0)).context("security cleanup recovery authority is unavailable")?;
+            ensure!(
+                usize::try_from(expected_component_count)? == input.components.len(),
+                "security cleanup component inventory differs"
+            );
+            let next_artifact_generation = input
+                .expected_artifact_generation
+                .checked_add(1)
+                .context("security cleanup artifact generation overflow")?;
+            ensure!(conn.execute("INSERT INTO image_generation_artifact_cleanup_intents(cleanup_operation_id,artifact_id,expected_artifact_generation,reason,state,version,created_at_unix_ms) VALUES(?1,?2,?3,'owner_recovery','pending',1,?4)",params![input.cleanup_operation_id.to_string(),input.artifact_id.to_string(),i64::try_from(next_artifact_generation)?,input.now_unix_ms])?==1,"security cleanup intent was not recorded");
+            Self::execute_security_blocked_artifact_cleanup_transition_conn(
+                conn,
+                input.artifact_id,
+                input.expected_artifact_generation,
+                input.now_unix_ms,
+            )?;
+            for component in input.components {
+                let state: String = conn.query_row("SELECT state FROM image_generation_artifact_components WHERE artifact_id=?1 AND component_id=?2 AND generation=?3 AND EXISTS(SELECT 1 FROM image_generation_artifact_security_recovery_components WHERE recovery_operation_id=?4 AND artifact_id=?1 AND component_id=?2 AND component_generation=?3)",params![input.artifact_id.to_string(),component.component_id.to_string(),i64::try_from(component.expected_generation)?,input.recovery_operation_id.to_string()],|row|row.get(0)).context("security cleanup component authority is unavailable")?;
+                match ImageGenerationArtifactComponentState::parse(&state) {
+                    Some(ImageGenerationArtifactComponentState::Ready) => {
+                        Self::execute_ready_component_cleanup_transition_conn(
+                            conn,
+                            input.artifact_id,
+                            component.component_id,
+                            component.expected_generation,
+                        )?
+                    }
+                    Some(ImageGenerationArtifactComponentState::SecurityBlocked) => {
+                        Self::execute_security_blocked_component_cleanup_transition_conn(
+                            conn,
+                            input.artifact_id,
+                            component.component_id,
+                            component.expected_generation,
+                        )?
+                    }
+                    _ => anyhow::bail!("security cleanup component source state is unavailable"),
+                };
+            }
+            ensure!(conn.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND disposition='resume_verified_cleanup' AND state='recorded'",params![input.outcome_digest,input.now_unix_ms,input.recovery_operation_id.to_string(),input.principal_digest])?==1,"security cleanup audit compare-and-set lost");
+            Ok(())
+        })
+    }
+
+    pub fn commit_image_generation_security_publication_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationSecurityPublication<'_>,
+    ) -> Result<()> {
+        atomic_conn(conn, "image_generation_security_publication", || {
+            ensure_digest(input.outcome_digest, "security publication outcome")?;
+            ensure!(
+                !input.output_evidence_json.is_empty() && !input.destination_name.is_empty(),
+                "security publication evidence is incomplete"
+            );
+            let authority:(String,String,String)=conn.query_row("SELECT a.state,a.job_id,a.slot_id FROM image_generation_artifact_security_recovery_audits r JOIN image_generation_artifacts a ON a.artifact_id=r.artifact_id JOIN image_generation_late_publication_leases p ON p.publication_operation_id=r.publication_operation_id WHERE r.recovery_operation_id=?1 AND r.principal_digest=?2 AND r.disposition='complete_verified_late_publication' AND r.state='recorded' AND a.artifact_id=?3 AND a.generation=?4 AND p.publication_operation_id=?5 AND p.state='security_blocked' AND p.version=?6 AND p.expected_slot_version=?7 AND p.output_authority_digest=?8 AND p.output_authority_generation=?9 AND p.destination_name=?10",params![input.recovery_operation_id.to_string(),input.principal_digest,input.artifact_id.to_string(),i64::try_from(input.expected_artifact_generation)?,input.publication_operation_id.to_string(),i64::try_from(input.expected_lease_version)?,i64::try_from(input.expected_slot_version)?,input.output_authority_digest,i64::try_from(input.output_authority_generation)?,input.destination_name],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).context("security publication recovery authority is unavailable")?;
+            ensure!(conn.execute("INSERT INTO image_generation_user_published_outputs(publication_operation_id,artifact_id,artifact_generation,output_authority_digest,output_authority_generation,destination_name,output_evidence_json,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![input.publication_operation_id.to_string(),input.artifact_id.to_string(),i64::try_from(input.expected_artifact_generation)?,input.output_authority_digest,i64::try_from(input.output_authority_generation)?,input.destination_name,input.output_evidence_json,input.now_unix_ms])?==1,"security publication output was not recorded");
+            ensure!(conn.execute("UPDATE image_generation_late_publication_leases SET state='published',version=version+1,output_evidence_json=?1,decided_at_unix_ms=?2 WHERE publication_operation_id=?3 AND state='security_blocked' AND version=?4",params![input.output_evidence_json,input.now_unix_ms,input.publication_operation_id.to_string(),i64::try_from(input.expected_lease_version)?])?==1,"security publication lease compare-and-set lost");
+            ensure!(conn.execute("UPDATE image_generation_artifact_security_recovery_audits SET state='applied',outcome_digest=?1,decided_at_unix_ms=?2 WHERE recovery_operation_id=?3 AND principal_digest=?4 AND disposition='complete_verified_late_publication' AND state='recorded'",params![input.outcome_digest,input.now_unix_ms,input.recovery_operation_id.to_string(),input.principal_digest])?==1,"security publication audit compare-and-set lost");
+            match ImageGenerationArtifactState::parse(&authority.0) {
+                Some(ImageGenerationArtifactState::LateQuarantined) => {
+                    Self::execute_late_quarantined_artifact_retention_transition_conn(
+                        conn,
+                        input.artifact_id,
+                        input.expected_artifact_generation,
+                        input.now_unix_ms,
+                    )?
+                }
+                Some(ImageGenerationArtifactState::SecurityBlocked) => {
+                    Self::execute_security_blocked_artifact_retention_transition_conn(
+                        conn,
+                        input.artifact_id,
+                        input.expected_artifact_generation,
+                        input.now_unix_ms,
+                    )?
+                }
+                _ => anyhow::bail!("security publication artifact source state is unavailable"),
+            };
+            execute_late_publication_slot_transition_conn(
+                conn,
+                Uuid::parse_str(&authority.1)?,
+                Uuid::parse_str(&authority.2)?,
+                input.expected_slot_version,
+            )?;
+            Ok(())
+        })
+    }
+
+    fn execute_late_publication_artifact_transition_conn(
+        conn: &Connection,
+        artifact_id: &str,
+        expected_generation: u64,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        ensure!(
+            artifact_transition_allowed(
+                ImageGenerationArtifactState::LateQuarantined,
+                ImageGenerationArtifactState::Retained
+            ),
+            "late publication artifact transition is not canonical"
+        );
+        ensure!(conn.execute("UPDATE image_generation_artifacts SET state='retained',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state='late_quarantined' AND generation=?3",params![now_unix_ms,artifact_id,i64::try_from(expected_generation)?])?==1,"late publication artifact compare-and-set lost");
+        Ok(())
+    }
+
+    fn execute_artifact_cleanup_transition_conn(
+        conn: &Connection,
+        input: &BeginImageGenerationArtifactCleanup,
+    ) -> Result<()> {
+        ensure!(
+            artifact_transition_allowed(
+                input.expected_state,
+                ImageGenerationArtifactState::CleanupPending
+            ),
+            "artifact cleanup transition is not canonical"
+        );
+        let changed=conn.execute("UPDATE image_generation_artifacts SET state='cleanup_pending',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state=?3 AND generation=?4 AND active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references r WHERE r.artifact_id=image_generation_artifacts.artifact_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=image_generation_artifacts.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed','security_blocked','delete_authorized')) AND (immediate_cleanup=1 OR (eligibility_at_unix_ms IS NOT NULL AND eligibility_at_unix_ms<=?1) OR ?5 IN ('invalid_output','restart_recovery','owner_recovery'))",params![input.now_unix_ms,input.artifact_id.to_string(),input.expected_state.as_str(),i64::try_from(input.expected_generation)?,input.reason.as_str()])?;
+        ensure!(
+            changed == 1,
+            "artifact cleanup compare-and-set lost or is ineligible"
+        );
+        Ok(())
+    }
+
+    fn execute_component_tombstone_transition_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationComponentDeletion,
+    ) -> Result<()> {
+        ensure!(
+            artifact_component_transition_allowed(
+                ImageGenerationArtifactComponentState::Deleting,
+                ImageGenerationArtifactComponentState::Tombstoned
+            ),
+            "component tombstone transition is not canonical"
+        );
+        ensure!(conn.execute("UPDATE image_generation_artifact_components SET state='tombstoned',generation=generation+1 WHERE artifact_id=?1 AND component_id=?2 AND state='deleting' AND generation=?3",params![input.artifact_id.to_string(),input.component_id.to_string(),i64::try_from(input.expected_generation)?])?==1,"component tombstone compare-and-set lost");
+        Ok(())
+    }
+
+    fn execute_artifact_tombstone_transition_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        expected_generation: u64,
+        now_unix_ms: i64,
+        terminal_reason: &str,
+    ) -> Result<()> {
+        ensure!(
+            artifact_transition_allowed(
+                ImageGenerationArtifactState::Deleting,
+                ImageGenerationArtifactState::Tombstoned
+            ),
+            "artifact tombstone transition is not canonical"
+        );
+        ensure!(conn.execute("UPDATE image_generation_artifacts SET state='tombstoned',generation=generation+1,terminal_reason=?1,updated_at_unix_ms=?2 WHERE artifact_id=?3 AND state='deleting' AND generation=?4",params![terminal_reason,now_unix_ms,artifact_id.to_string(),i64::try_from(expected_generation)?])?==1,"artifact tombstone compare-and-set lost");
         Ok(())
     }
 
@@ -4079,12 +5409,36 @@ fn finalize_image_generation_late_publication_at_conn(
     expected_lease_version: u64,
     now_unix_ms: i64,
 ) -> Result<()> {
+    ensure!(
+        artifact_transition_allowed(
+            ImageGenerationArtifactState::LateQuarantined,
+            ImageGenerationArtifactState::Retained,
+        ),
+        "late publication artifact transition is not canonical"
+    );
+    ensure!(
+        slot_transition_allowed(
+            ImageGenerationSlotState::LateQuarantined,
+            ImageGenerationSlotState::Published,
+        ),
+        "late publication slot transition is not canonical"
+    );
     let tx = conn.unchecked_transaction()?;
     let projection=tx.query_row("SELECT p.artifact_id,p.artifact_generation,p.job_id,p.slot_id,p.expected_slot_version,p.output_authority_digest,p.output_authority_generation,p.destination_name,p.output_evidence_json FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id JOIN image_generation_slots s ON s.job_id=p.job_id AND s.slot_id=p.slot_id JOIN image_generation_late_publication_authorization_facts f ON f.authorization_digest=p.authorization_digest WHERE p.publication_operation_id=?1 AND p.state='copy_committed' AND p.version=?2 AND a.state='late_quarantined' AND a.generation=p.artifact_generation AND s.state='late_quarantined' AND s.version=p.expected_slot_version AND s.result_after_cancel=1 AND f.revoked_at_unix_ms IS NULL AND f.output_authority_digest=p.output_authority_digest AND f.output_authority_generation=p.output_authority_generation AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=a.artifact_id)",params![publication_operation_id.to_string(),i64::try_from(expected_lease_version)?],|row|Ok(LatePublicationFinalizeProjection{artifact_id:row.get(0)?,artifact_generation:row.get(1)?,job_id:row.get(2)?,slot_id:row.get(3)?,slot_version:row.get(4)?,output_authority_digest:row.get(5)?,output_authority_generation:row.get(6)?,destination_name:row.get(7)?,output_evidence_json:row.get(8)?})).optional()?.context("late publication finalization lost its lease")?;
     tx.execute("INSERT INTO image_generation_user_published_outputs(publication_operation_id,artifact_id,artifact_generation,output_authority_digest,output_authority_generation,destination_name,output_evidence_json,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![publication_operation_id.to_string(),projection.artifact_id,projection.artifact_generation,projection.output_authority_digest,projection.output_authority_generation,projection.destination_name,projection.output_evidence_json,now_unix_ms])?;
     tx.execute("UPDATE image_generation_late_publication_leases SET state='published',version=version+1,decided_at_unix_ms=?3 WHERE publication_operation_id=?1 AND state='copy_committed' AND version=?2",params![publication_operation_id.to_string(),i64::try_from(expected_lease_version)?,now_unix_ms])?;
-    ensure!(tx.execute("UPDATE image_generation_artifacts SET state='retained',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state='late_quarantined' AND generation=?3",params![now_unix_ms,projection.artifact_id,projection.artifact_generation])?==1,"late publication artifact compare-and-set lost");
-    ensure!(tx.execute("UPDATE image_generation_slots SET state='published',version=version+1,published_disposition='late_authorized',published_disposition_generation=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='late_quarantined' AND version=?3 AND result_after_cancel=1 AND applied_cancellation_version IS NOT NULL",params![projection.job_id,projection.slot_id,projection.slot_version])?==1,"late publication slot compare-and-set lost");
+    Db::execute_late_publication_artifact_transition_conn(
+        &tx,
+        &projection.artifact_id,
+        u64::try_from(projection.artifact_generation)?,
+        now_unix_ms,
+    )?;
+    execute_late_publication_slot_transition_conn(
+        &tx,
+        Uuid::parse_str(&projection.job_id)?,
+        Uuid::parse_str(&projection.slot_id)?,
+        u64::try_from(projection.slot_version)?,
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -4200,6 +5554,13 @@ impl Db {
         input: &BeginImageGenerationArtifactCleanup,
     ) -> Result<()> {
         ensure!(
+            artifact_transition_allowed(
+                input.expected_state,
+                ImageGenerationArtifactState::CleanupPending,
+            ),
+            "artifact cleanup transition is not canonical"
+        );
+        ensure!(
             matches!(
                 input.expected_state,
                 ImageGenerationArtifactState::Allocating
@@ -4224,14 +5585,7 @@ impl Db {
             "INSERT INTO image_generation_artifact_cleanup_intents(cleanup_operation_id,artifact_id,expected_artifact_generation,reason,state,version,created_at_unix_ms) VALUES(?1,?2,?3,?4,'pending',1,?5)",
             params![input.cleanup_operation_id.to_string(),input.artifact_id.to_string(),i64::try_from(cleanup_generation)?,input.reason.as_str(),input.now_unix_ms],
         )?;
-        let changed = tx.execute(
-            "UPDATE image_generation_artifacts SET state='cleanup_pending',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state=?3 AND generation=?4 AND active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references r WHERE r.artifact_id=image_generation_artifacts.artifact_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=image_generation_artifacts.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed','security_blocked','delete_authorized')) AND (immediate_cleanup=1 OR (eligibility_at_unix_ms IS NOT NULL AND eligibility_at_unix_ms<=?1) OR ?5 IN ('invalid_output','restart_recovery','owner_recovery'))",
-            params![input.now_unix_ms,input.artifact_id.to_string(),input.expected_state.as_str(),i64::try_from(input.expected_generation)?,input.reason.as_str()],
-        )?;
-        ensure!(
-            changed == 1,
-            "artifact cleanup compare-and-set lost or is ineligible"
-        );
+        Self::execute_artifact_cleanup_transition_conn(&tx, input)?;
         tx.commit()?;
         Ok(())
     }
@@ -4242,6 +5596,13 @@ impl Db {
         conn: &Connection,
         input: &CommitImageGenerationComponentDeletion,
     ) -> Result<()> {
+        ensure!(
+            artifact_component_transition_allowed(
+                ImageGenerationArtifactComponentState::Deleting,
+                ImageGenerationArtifactComponentState::Tombstoned,
+            ),
+            "component tombstone transition is not canonical"
+        );
         ensure_digest(&input.deletion_evidence_digest, "deletion evidence digest")?;
         let tx = conn.unchecked_transaction()?;
         let changed = tx.execute(
@@ -4256,11 +5617,7 @@ impl Db {
             "INSERT INTO image_generation_component_release_facts(artifact_id,component_id,release_operation_id,deletion_evidence_digest,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5)",
             params![input.artifact_id.to_string(),input.component_id.to_string(),input.release_operation_id.to_string(),input.deletion_evidence_digest,input.committed_at_unix_ms],
         )?;
-        let tombstoned = tx.execute(
-            "UPDATE image_generation_artifact_components SET state='tombstoned',generation=generation+1 WHERE artifact_id=?1 AND component_id=?2 AND state='deleting' AND generation=?3",
-            params![input.artifact_id.to_string(),input.component_id.to_string(),i64::try_from(input.expected_generation)?],
-        )?;
-        ensure!(tombstoned == 1, "component tombstone compare-and-set lost");
+        Self::execute_component_tombstone_transition_conn(&tx, input)?;
         tx.commit()?;
         Ok(())
     }
@@ -4274,12 +5631,24 @@ impl Db {
         terminal_reason: &str,
     ) -> Result<()> {
         ensure!(
+            artifact_transition_allowed(
+                ImageGenerationArtifactState::Deleting,
+                ImageGenerationArtifactState::Tombstoned,
+            ),
+            "artifact tombstone transition is not canonical"
+        );
+        ensure!(
             !terminal_reason.is_empty(),
             "artifact terminal reason is empty"
         );
         let tx = conn.unchecked_transaction()?;
-        let artifact=tx.execute("UPDATE image_generation_artifacts SET state='tombstoned',generation=generation+1,terminal_reason=?1,updated_at_unix_ms=?2 WHERE artifact_id=?3 AND state='deleting' AND generation=?4",params![terminal_reason,now_unix_ms,artifact_id.to_string(),i64::try_from(expected_generation)?])?;
-        ensure!(artifact == 1, "artifact tombstone compare-and-set lost");
+        Self::execute_artifact_tombstone_transition_conn(
+            &tx,
+            artifact_id,
+            expected_generation,
+            now_unix_ms,
+            terminal_reason,
+        )?;
         let cleanup=tx.execute("UPDATE image_generation_artifact_cleanup_intents SET state='completed',version=version+1,completed_at_unix_ms=?1 WHERE cleanup_operation_id=?2 AND artifact_id=?3 AND state='deleting'",params![now_unix_ms,cleanup_operation_id.to_string(),artifact_id.to_string()])?;
         ensure!(cleanup == 1, "cleanup completion compare-and-set lost");
         tx.commit()?;
@@ -4393,7 +5762,7 @@ pub fn image_generation_component_set_binding(
     Ok((json, digest))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 mod tests {
     use super::*;
     use crate::db::image_generation_plan::*;

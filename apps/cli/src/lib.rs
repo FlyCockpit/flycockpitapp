@@ -24,24 +24,47 @@ pub mod test_env {
         TestEnvGuard::lock().await
     }
 }
+pub(crate) mod daemon {
+    pub(crate) use cockpit_core::daemon::{
+        DaemonPaths, DaemonProbe, DaemonStatus, caffeinate, discover, proto, server,
+        session_worker, terminal,
+    };
+    pub(crate) mod client {
+        pub(crate) use cockpit_core::daemon::client::{
+            OwnedDaemonRunError, OwnedSessionMode, ScopedDaemonClient, ensure_persistent_daemon,
+            run_owned_daemon,
+        };
+    }
+    #[cfg(test)]
+    pub(crate) use cockpit_core::daemon::{
+        boot_test_persistent_daemon, enable_in_process_auto_promote,
+    };
+}
 pub use cockpit_core::{
     agents, approval, assistants, auth, auto_title, browser, computer, container, credentials,
-    daemon, diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,
+    diagnostics, embeddings, engine, env_snapshot, envref, git, gitignore, harness, intel,
     knowledge, locks, mcp, media_reservation, model_system_prompt, packages, private_fs, process,
     providers, redact, secret_ref, session, skills, startup, sync, sysinfo, text, tokens, tools,
     user_agent, welcome, wizard,
 };
+
+/// Narrow process-boundary fixtures used by the CLI's integration tests.
+/// Production consumers must not gain access to the daemon lifecycle module.
+#[doc(hidden)]
+pub mod integration_test_api {
+    pub use cockpit_core::daemon::agent_installation;
+}
 pub use cockpit_db as db;
 mod terminal_host;
 
 use anyhow::Context;
-use clap::Parser;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+pub use crate::cli::public_v0_1_command;
 use crate::cli::{Cli, Command};
 
 pub mod manpages {
@@ -49,15 +72,15 @@ pub mod manpages {
     use std::io;
     use std::path::{Path, PathBuf};
 
-    use clap::{Command, CommandFactory};
+    use clap::Command;
 
-    use crate::cli::Cli;
+    use crate::cli;
 
     pub fn generate_manpages(output_dir: impl AsRef<Path>) -> io::Result<()> {
         let output_dir = output_dir.as_ref();
         fs::create_dir_all(output_dir)?;
 
-        let mut command = Cli::command();
+        let mut command = cli::public_v0_1_command();
         generate_command_page(&mut command, output_dir, &[String::from("cockpit")])
     }
 
@@ -110,7 +133,7 @@ pub mod integration {
     /// Typed socket client for the integration harness.
     #[derive(Clone)]
     pub struct DaemonClient {
-        inner: crate::daemon::client::DaemonClient,
+        inner: cockpit_client::DaemonClient,
     }
 
     /// Stable subset of the daemon status response needed by harness tests.
@@ -197,7 +220,7 @@ pub mod integration {
     impl DaemonClient {
         pub async fn connect(socket: &Path) -> Result<Self> {
             Ok(Self {
-                inner: crate::daemon::client::DaemonClient::connect(socket).await?,
+                inner: cockpit_client::DaemonClient::connect(socket).await?,
             })
         }
 
@@ -727,7 +750,10 @@ fn error_stderr_line(err: &anyhow::Error) -> String {
 }
 
 async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    use clap::FromArgMatches as _;
+    let cli =
+        crate::cli::PublicCli::from_arg_matches(&crate::cli::public_v0_1_command().get_matches())?
+            .into();
 
     init_tracing(cli.log_level.as_deref(), cli.print_logs);
 
@@ -779,6 +805,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Daemon(sub)) => commands::daemon::run(sub).await,
         Some(Command::Doctor(args)) => commands::doctor::run(args, cli.no_sandbox).await,
         Some(Command::Session(sub)) => commands::session::run(sub).await,
+        #[cfg(feature = "extended")]
         Some(Command::Schedule(sub)) => commands::schedule::run(sub).await,
         Some(Command::Skill(sub)) => commands::skill::run(sub).await,
         Some(Command::Trust(sub)) => commands::trust::run(sub).await,
@@ -788,8 +815,11 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Debug(sub)) => commands::debug::run(sub).await,
         Some(Command::Config(sub)) => commands::config::run(sub).await,
         Some(Command::Mcp(cmd)) => commands::mcp::run(cmd).await,
+        #[cfg(feature = "remote")]
         Some(Command::Login(_)) => Err(commands::RemovedCommandError::new("login").into()),
+        #[cfg(feature = "remote")]
         Some(Command::Logout) => Err(commands::RemovedCommandError::new("logout").into()),
+        #[cfg(feature = "remote")]
         Some(Command::Whoami) => Err(commands::RemovedCommandError::new("whoami").into()),
         #[cfg(feature = "remote")]
         Some(Command::Sync(sub)) => commands::sync::run(sub).await,
@@ -800,10 +830,9 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Init(args)) => commands::init::run(args, cli.no_sandbox).await,
         Some(Command::BashHints(sub)) => commands::bash_hints::run(sub).await,
         Some(Command::Completion { shell }) => {
-            use clap::CommandFactory;
             clap_complete::generate(
                 shell,
-                &mut Cli::command(),
+                &mut crate::cli::public_v0_1_command(),
                 "cockpit",
                 &mut std::io::stdout(),
             );
@@ -923,7 +952,7 @@ fn open_log_file_at(dir: PathBuf) -> Option<RotatingLog> {
     // Logging stays non-fatal: an insecure cache directory disables logging
     // rather than aborting the CLI, but the typed error is logged, not
     // silently discarded.
-    if let Err(error) = cockpit_core::private_fs::ensure_private_dir(&dir) {
+    if let Err(error) = cockpit_host::private_fs::ensure_private_dir(&dir) {
         tracing::warn!(%error, dir = %dir.display(), "log directory could not be secured; logging disabled");
         return None;
     }
@@ -943,13 +972,13 @@ fn rotate_log_state(state: &mut RotatingLogState) -> std::io::Result<()> {
         // single held fd. An attacker who swaps the log-directory entry with a
         // symlink between steps cannot redirect the deletes/renames/open into an
         // attacker-selected directory, because nothing is re-resolved by name.
-        let dir_fd = cockpit_core::private_fs::open_private_dir_handle(&state.dir)
+        let dir_fd = cockpit_host::private_fs::open_private_dir_handle(&state.dir)
             .map_err(std::io::Error::other)?;
         rotate_log_files_fd(&dir_fd)?;
-        state.file = cockpit_core::private_fs::open_private_file_in_dir_fd(
+        state.file = cockpit_host::private_fs::open_private_file_in_dir_fd(
             &dir_fd,
             std::ffi::OsStr::new("cockpit.log"),
-            cockpit_core::private_fs::PrivateFileAccess::Append,
+            cockpit_host::private_fs::PrivateFileAccess::Append,
             "cockpit log",
         )
         .map_err(std::io::Error::other)?;
@@ -1042,10 +1071,10 @@ fn open_private_append(path: &Path) -> std::io::Result<std::fs::File> {
     let name = path
         .file_name()
         .ok_or_else(|| std::io::Error::other("log path has no file name"))?;
-    cockpit_core::private_fs::open_private_file_at(
+    cockpit_host::private_fs::open_private_file_at(
         parent,
         name,
-        cockpit_core::private_fs::PrivateFileAccess::Append,
+        cockpit_host::private_fs::PrivateFileAccess::Append,
         "cockpit log",
     )
     .map_err(std::io::Error::other)
@@ -1290,7 +1319,7 @@ mod tests {
         std::fs::write(log_dir.join("cockpit.log"), b"CURRENT").unwrap();
         std::fs::write(log_dir.join("cockpit.log.1"), b"BACKUP-1").unwrap();
 
-        let dir_fd = cockpit_core::private_fs::open_private_dir_handle(&log_dir).unwrap();
+        let dir_fd = cockpit_host::private_fs::open_private_dir_handle(&log_dir).unwrap();
         rotate_log_files_fd(&dir_fd).unwrap();
 
         assert_eq!(

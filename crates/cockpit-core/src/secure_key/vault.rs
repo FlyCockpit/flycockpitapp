@@ -451,6 +451,9 @@ impl SecretVault {
         decrypt_item(&self.dek, &row.nonce, &row.ciphertext, &aad)
     }
 
+    /// Delete an item inside a caller-owned SQLite transaction without
+    /// decrypting its payload. Corrupt ciphertext therefore remains
+    /// removable, and an absent item is an idempotent success.
     pub fn delete_item_on_conn(
         &self,
         conn: &rusqlite::Connection,

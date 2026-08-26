@@ -195,6 +195,34 @@ pub struct ServerConfig {
     pub timeout_secs: Option<u64>,
 }
 
+/// Whether this server carries credential-store references, OAuth state, or
+/// authored literal secrets rather than environment references.
+pub fn server_has_credential_material(server: &ServerConfig) -> bool {
+    if !server.env_credential_refs.is_empty()
+        || server
+            .env
+            .values()
+            .any(|value| !value.trim().is_empty() && !value.trim_start().starts_with('$'))
+    {
+        return true;
+    }
+    match &server.auth {
+        Auth::Header(header) => {
+            header.credential_ref.is_some()
+                || (!header.value.trim().is_empty() && !header.value.trim_start().starts_with('$'))
+        }
+        Auth::Env(env) => {
+            !env.credential_refs.is_empty()
+                || env
+                    .vars
+                    .values()
+                    .any(|value| !value.trim().is_empty() && !value.trim_start().starts_with('$'))
+        }
+        Auth::Oauth(_) => true,
+        Auth::None => false,
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -370,9 +398,9 @@ impl McpConfig {
     }
 
     pub fn write_private(&self, path: &Path) -> Result<()> {
-        crate::private_fs::ensure_parent_dir_private(path)?;
+        cockpit_host::private_fs::ensure_parent_dir_private(path)?;
         let body = serde_json::to_string_pretty(self).context("serializing mcp.json")?;
-        crate::private_fs::write_private_file(path, format!("{body}\n").as_bytes())
+        cockpit_host::private_fs::write_private_file(path, format!("{body}\n").as_bytes())
     }
 
     /// Enabled servers, sorted by name.

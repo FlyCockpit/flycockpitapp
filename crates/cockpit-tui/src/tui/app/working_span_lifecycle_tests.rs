@@ -172,7 +172,7 @@ fn retracted_message_clears_span_without_finish() {
 
     app.apply_event(TurnEvent::UserMessagesTerminated {
         client_submission_ids: vec![client_submission_id],
-        disposition: cockpit_core::daemon::proto::UserMessageTerminalDisposition::PreflightRejected,
+        disposition: cockpit_proto::UserMessageTerminalDisposition::PreflightRejected,
     });
 
     assert!(!app.busy);

@@ -6,7 +6,7 @@ fn reset_startup_counters() {
     cockpit_config::providers::reset_load_effective_call_count();
     cockpit_core::container::reset_detect_runtime_call_count();
     cockpit_core::daemon::reset_blocking_probe_call_count();
-    cockpit_core::tokens::reset_count_call_count();
+    cockpit_tokenizer::reset_count_call_count();
 }
 
 #[test]
@@ -23,7 +23,7 @@ fn app_new_loads_launch_config_once_and_defers_first_paint_work() {
     assert_eq!(cockpit_config::providers::load_effective_call_count(), 0);
     assert_eq!(cockpit_core::daemon::blocking_probe_call_count(), 1);
     assert_eq!(cockpit_core::container::detect_runtime_call_count(), 0);
-    assert_eq!(cockpit_core::tokens::count_call_count(), 0);
+    assert_eq!(cockpit_tokenizer::count_call_count(), 0);
     assert!(app.guidance_estimate.is_none());
     assert!(!app.startup_background.started);
 }

@@ -108,6 +108,31 @@ pub fn publish_committed_config_generation() -> u64 {
     generation
 }
 
+/// Restore a generation already durably assigned to a recoverable config
+/// journal. Replaying the same journal is idempotent, while a daemon restart
+/// can advance its process-local counter to the durable generation before
+/// publishing the recovered receipt.
+pub fn publish_committed_config_generation_at_least(committed: u64) -> u64 {
+    let mut current = CONFIG_GENERATION.load(Ordering::SeqCst);
+    loop {
+        if current >= committed {
+            return current;
+        }
+        match CONFIG_GENERATION.compare_exchange(
+            current,
+            committed,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                bump_inventory_generation();
+                return committed;
+            }
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 #[cfg(test)]
 pub fn install_inventory_barriers(
     after_acquire: Option<Box<dyn Fn() + Send + Sync>>,

@@ -76,20 +76,20 @@ fn unavailable_raises_persistent_notice_and_sandbox_off_clears_it() {
 
     // `/sandbox off` -> `SandboxState { mode: Off }` clears it.
     app.apply_event(TurnEvent::SandboxState {
-        mode: cockpit_core::tools::sandbox_mode::SandboxMode::Off,
+        mode: cockpit_proto::SandboxMode::Off,
         container_network_enabled: false,
         container_availability: cockpit_core::container::availability_snapshot(),
-        persisted_intent: Some(cockpit_core::tools::sandbox_mode::SandboxMode::Off),
+        persisted_intent: Some(cockpit_proto::SandboxMode::Off),
     });
     assert!(app.sandbox_down_notice.is_none());
     assert_eq!(app.sandbox_notice_lines(), 0);
 
     // Re-enabling does not resurrect a stale notice on its own.
     app.apply_event(TurnEvent::SandboxState {
-        mode: cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox,
+        mode: cockpit_proto::SandboxMode::Sandbox,
         container_network_enabled: false,
         container_availability: cockpit_core::container::availability_snapshot(),
-        persisted_intent: Some(cockpit_core::tools::sandbox_mode::SandboxMode::Sandbox),
+        persisted_intent: Some(cockpit_proto::SandboxMode::Sandbox),
     });
     assert!(app.sandbox_down_notice.is_none());
 }
@@ -267,7 +267,7 @@ fn sandbox_down_notice_survives_off_transition_when_platform_has_no_backend() {
     });
 
     app.apply_sandbox_state(
-        cockpit_core::tools::sandbox_mode::SandboxMode::Off,
+        cockpit_proto::SandboxMode::Off,
         false,
         cockpit_core::container::availability_snapshot(),
         false,
@@ -275,7 +275,7 @@ fn sandbox_down_notice_survives_off_transition_when_platform_has_no_backend() {
     assert!(app.sandbox_down_notice.is_some());
 
     app.apply_sandbox_state(
-        cockpit_core::tools::sandbox_mode::SandboxMode::Off,
+        cockpit_proto::SandboxMode::Off,
         false,
         cockpit_core::container::availability_snapshot(),
         true,

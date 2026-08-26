@@ -27,6 +27,9 @@ host-approval-test-support = []
 # composition capability.  A generic Db caller must not be able to persist an
 # automatically resolvable `low_risk` request merely by choosing that string.
 host-capability-refresh-composition = []
+# Future local-only product domains that are deliberately outside the public
+# v0.1 schema: durable cron and image generation/spend ledgers.
+extended = []
 
 [dependencies]
 anyhow = { workspace = true }

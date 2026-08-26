@@ -4,14 +4,12 @@
 //! refreshes the snapshot first; if the capability is still missing the
 //! previous value stays and the snapshot remedy is shown.
 
-use cockpit_core::daemon::session_worker::{
-    sandbox_mode_available, sandbox_mode_selectable, unpublished_host_capability_snapshot,
-};
+use cockpit_core::daemon::session_worker::{sandbox_mode_available, sandbox_mode_selectable};
 use cockpit_core::host_capabilities::{
     FEATURE_MEDIA_DECODE, FEATURE_SANDBOX_CONTAINER, FEATURE_SANDBOX_HOST,
     FEATURE_SECRET_STORE_KEYRING,
 };
-use cockpit_core::tools::sandbox_mode::SandboxMode;
+use cockpit_proto::SandboxMode;
 #[cfg(test)]
 use cockpit_proto::SecretStoreSnapshot;
 use cockpit_proto::{
@@ -372,23 +370,8 @@ pub fn sandbox_intent_effective_banner(
 /// Daemon-less / pre-attach recheck: compose host + container availability
 /// from in-process probes. Secret-store stays at the current unconfigured
 /// placeholder until a daemon snapshot arrives.
-pub fn local_host_capability_snapshot() -> HostCapabilitySnapshot {
-    use cockpit_core::daemon::session_worker::sandbox_capability_snapshot;
-    let host = if cockpit_core::tools::shell_sandbox::shell_sandbox_supported() {
-        FeatureCapabilityState::Available
-    } else {
-        FeatureCapabilityState::Missing
-    };
-    let container = if cockpit_core::container::availability_snapshot().available {
-        FeatureCapabilityState::Available
-    } else {
-        FeatureCapabilityState::Missing
-    };
-    sandbox_capability_snapshot(host, container)
-}
-
 pub fn empty_capability_snapshot() -> HostCapabilitySnapshot {
-    unpublished_host_capability_snapshot()
+    HostCapabilitySnapshot::unpublished()
 }
 
 #[cfg(test)]

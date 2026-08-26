@@ -213,10 +213,9 @@ pub struct AgentSessionCreateInput {
     pub project_id: String,
     pub project_root: String,
     pub active_agent: String,
-    /// `sessions` uses epoch seconds (unlike the agent records' millisecond
-    /// audit timestamps), so callers must make that conversion explicitly.
-    pub started_at_unix_s: i64,
-    pub last_active_at_unix_s: i64,
+    /// Daemon-observed wall-clock time in signed Unix milliseconds.
+    pub started_at_unix_ms: i64,
+    pub last_active_at_unix_ms: i64,
 }
 
 /// Canonical, redacted evidence for one locally selected model slot.  This is
@@ -1715,9 +1714,10 @@ fn validate_prepare(input: &PrepareAgentSessionInput) -> Result<()> {
         "agent session active agent is required"
     );
     ensure!(
-        input.session_create.started_at_unix_s >= 0
-            && input.session_create.last_active_at_unix_s >= input.session_create.started_at_unix_s,
-        "agent session timestamps must be ordered non-negative epoch seconds"
+        input.session_create.started_at_unix_ms >= 0
+            && input.session_create.last_active_at_unix_ms
+                >= input.session_create.started_at_unix_ms,
+        "agent session timestamps must be ordered non-negative Unix milliseconds"
     );
     ensure!(
         !input.idempotency_key.is_empty(),
@@ -1866,7 +1866,7 @@ fn register_agent_session_preparation_conn(
     }
     let idle: bool = conn
         .query_row(
-            "SELECT started_at = last_active_at AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1) FROM sessions WHERE session_id=?1",
+            "SELECT started_at_unix_ms = last_active_at_unix_ms AND NOT EXISTS(SELECT 1 FROM session_events WHERE session_id=?1) FROM sessions WHERE session_id=?1",
             [session_id.to_string()],
             |row| row.get(0),
         )
@@ -1927,6 +1927,7 @@ fn terminalize_preparation_claim(
     now_unix_ms: i64,
 ) -> Result<()> {
     conn.execute(
+        // schema-hot-query: local.agent-preparation.terminalize
         "UPDATE agent_session_preparation_claims SET claim_state='terminal',terminal_at_unix_ms=?2 WHERE session_id=?1 AND claim_state IN ('claimed', 'running')",
         params![session_id.to_string(), now_unix_ms],
     )
@@ -1944,13 +1945,13 @@ fn create_agent_session_conn(
     create: &AgentSessionCreateInput,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at,active_agent) VALUES(?1,?2,?3,?4,?5,?6)",
+        "INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms,active_agent) VALUES(?1,?2,?3,?4,?5,?6)",
         params![
             session_id.to_string(),
             create.project_id,
             create.project_root,
-            create.started_at_unix_s,
-            create.last_active_at_unix_s,
+            create.started_at_unix_ms,
+            create.last_active_at_unix_ms,
             create.active_agent,
         ],
     )
@@ -1964,7 +1965,7 @@ fn session_preparation_eligibility(
 ) -> Result<SessionPreparationEligibility> {
     let state = conn
         .query_row(
-            "SELECT ended_at,lifecycle FROM sessions WHERE session_id=?1",
+            "SELECT ended_at_unix_ms,lifecycle FROM sessions WHERE session_id=?1",
             [session_id.to_string()],
             |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
         )
@@ -2829,8 +2830,8 @@ mod tests {
                 project_id: "project".into(),
                 project_root: "/workspace".into(),
                 active_agent: "builder".into(),
-                started_at_unix_s: 12,
-                last_active_at_unix_s: 12,
+                started_at_unix_ms: 12_000,
+                last_active_at_unix_ms: 12_000,
             },
             existing_session_claim_token: None,
             idempotency_key: "prepare-key".into(),
@@ -3018,7 +3019,7 @@ mod tests {
         let session = db
             .read(move |conn| {
                 conn.query_row(
-                    "SELECT project_id,project_root,active_agent,lifecycle,ended_at FROM sessions WHERE session_id=?1",
+                    "SELECT project_id,project_root,active_agent,lifecycle,ended_at_unix_ms FROM sessions WHERE session_id=?1",
                     [session_id.to_string()],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<i64>>(4)?)),
                 )
@@ -3225,7 +3226,7 @@ mod tests {
             .unwrap();
         db.transaction(move |conn| {
             conn.execute(
-                "UPDATE sessions SET last_active_at=started_at+1 WHERE session_id=?1",
+                "UPDATE sessions SET last_active_at_unix_ms=started_at_unix_ms+1 WHERE session_id=?1",
                 [busy.session_id.to_string()],
             )?;
             Ok(())

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use cockpit_proto::SecretStorePlacement;
 
-use crate::private_fs::{
+use cockpit_host::private_fs::{
     PRIVATE_FS_POLICY, delete_private_file, ensure_private_dir, read_private_file,
     write_private_file, write_private_file_exclusive,
 };

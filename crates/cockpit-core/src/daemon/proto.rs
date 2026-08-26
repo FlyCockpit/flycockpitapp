@@ -141,7 +141,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                         ttft_ms: p.ttft_ms,
                         generation_ms: p.generation_ms,
                         displayed_tokens: p.displayed_tokens,
-                        encoding: p.encoding.as_str().to_string(),
+                        encoding: p.encoding,
                     }
                 }),
             }]
@@ -185,7 +185,7 @@ pub(crate) fn turn_event_to_proto(event: TurnEvent, session_id: Uuid) -> Vec<Eve
                         ttft_ms: p.ttft_ms,
                         generation_ms: p.generation_ms,
                         displayed_tokens: p.displayed_tokens,
-                        encoding: p.encoding.as_str().to_string(),
+                        encoding: p.encoding,
                     }
                 }),
             }]

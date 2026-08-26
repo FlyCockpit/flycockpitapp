@@ -23,8 +23,7 @@ pub struct VimEditor {
 
 impl VimEditor {
     pub fn new(text: &str, vim_enabled: bool) -> Self {
-        let mut composer = Composer::new(vim_enabled);
-        composer.set(text);
+        let mut composer = Composer::with_text(text, vim_enabled);
         composer.set_cursor(0);
         Self {
             composer,

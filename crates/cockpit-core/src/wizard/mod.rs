@@ -40,7 +40,7 @@ pub enum StepKind {
     Confirm,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WizardAnswer {
     Select(String),
     MultiToggle(Vec<String>),
@@ -49,6 +49,22 @@ pub enum WizardAnswer {
     Secret(String),
     Confirm(bool),
     Acknowledged,
+}
+
+impl std::fmt::Debug for WizardAnswer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Select(value) => formatter.debug_tuple("Select").field(value).finish(),
+            Self::MultiToggle(values) => {
+                formatter.debug_tuple("MultiToggle").field(values).finish()
+            }
+            Self::ToolSurface(value) => formatter.debug_tuple("ToolSurface").field(value).finish(),
+            Self::Text(value) => formatter.debug_tuple("Text").field(value).finish(),
+            Self::Secret(_) => formatter.write_str("Secret([REDACTED])"),
+            Self::Confirm(value) => formatter.debug_tuple("Confirm").field(value).finish(),
+            Self::Acknowledged => formatter.write_str("Acknowledged"),
+        }
+    }
 }
 
 pub type PrefillHook = fn(&WizardRun) -> Option<WizardAnswer>;
@@ -131,6 +147,17 @@ pub struct WizardRun {
     error: Option<String>,
     aborted: bool,
     writes_applied: bool,
+}
+
+impl Drop for WizardRun {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        for answer in self.answers.values_mut() {
+            if let WizardAnswer::Secret(value) = answer {
+                value.zeroize();
+            }
+        }
+    }
 }
 
 impl WizardRun {

@@ -6,6 +6,20 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::db::Db;
 
+const MAX_ASSISTANT_CONFIG_BYTES: usize = 1024 * 1024;
+
+fn validate_config_json(config_json: &str) -> Result<()> {
+    if config_json.len() > MAX_ASSISTANT_CONFIG_BYTES {
+        anyhow::bail!("assistant config exceeds the 1 MiB durable limit");
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(config_json).context("assistant config must be valid JSON")?;
+    if !value.is_object() {
+        anyhow::bail!("assistant config must be a JSON object");
+    }
+    Ok(())
+}
+
 fn validate_content_hash(content_hash: &str) -> Result<()> {
     if content_hash.len() != 64
         || !content_hash
@@ -20,7 +34,8 @@ fn validate_content_hash(content_hash: &str) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantRow {
     pub name: String,
-    pub created_at: i64,
+    /// Daemon-observed creation time as signed Unix milliseconds.
+    pub created_at_unix_ms: i64,
     pub home_dir: String,
     pub config_json: String,
     pub content_hash: String,
@@ -30,7 +45,7 @@ impl AssistantRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             name: row.get("name")?,
-            created_at: row.get("created_at")?,
+            created_at_unix_ms: row.get("created_at_unix_ms")?,
             home_dir: row.get("home_dir")?,
             config_json: row.get("config_json")?,
             content_hash: row.get("content_hash")?,
@@ -85,11 +100,11 @@ impl Db {
             let changed = conn
                 .execute(
                     "DELETE FROM assistants
-                     WHERE name = ?1 AND created_at = ?2 AND home_dir = ?3
+                     WHERE name = ?1 AND created_at_unix_ms = ?2 AND home_dir = ?3
                        AND config_json = ?4 AND content_hash = ?5",
                     params![
                         expected.name,
-                        expected.created_at,
+                        expected.created_at_unix_ms,
                         expected.home_dir,
                         expected.config_json,
                         expected.content_hash,
@@ -97,24 +112,6 @@ impl Db {
                 )
                 .context("conditionally deleting assistant")?;
             Ok(changed > 0)
-        })
-        .await
-    }
-
-    pub async fn update_assistant_config(&self, name: &str, config_json: &str) -> Result<()> {
-        let name = name.to_string();
-        let config_json = config_json.to_string();
-        self.write(move |conn| {
-            let changed = conn
-                .execute(
-                    "UPDATE assistants SET config_json = ?2 WHERE name = ?1",
-                    params![name, config_json],
-                )
-                .context("updating assistant config")?;
-            if changed == 0 {
-                anyhow::bail!("assistant `{name}` does not exist");
-            }
-            Ok(())
         })
         .await
     }
@@ -127,29 +124,8 @@ impl Db {
         config_json: &str,
     ) -> Result<AssistantRow> {
         let config_json = config_json.to_string();
-        serde_json::from_str::<serde_json::Value>(&config_json)
-            .context("assistant config must be valid JSON")?;
         self.write(move |conn| {
-            let changed = conn
-                .execute(
-                    "UPDATE assistants SET config_json = ?6
-                     WHERE name = ?1 AND created_at = ?2 AND home_dir = ?3
-                       AND config_json = ?4 AND content_hash = ?5",
-                    params![
-                        expected.name,
-                        expected.created_at,
-                        expected.home_dir,
-                        expected.config_json,
-                        expected.content_hash,
-                        config_json,
-                    ],
-                )
-                .context("compare-and-swap assistant identity hashes")?;
-            if changed != 1 {
-                anyhow::bail!("assistant registry changed while identity files were read");
-            }
-            Db::get_assistant_conn(conn, &expected.name)?
-                .ok_or_else(|| anyhow::anyhow!("assistant disappeared after identity update"))
+            Db::update_assistant_identity_hashes_cas_conn(conn, expected, &config_json)
         })
         .await
     }
@@ -162,24 +138,74 @@ impl Db {
         expected_hash: &str,
         next_hash: &str,
     ) -> Result<AssistantRow> {
-        validate_content_hash(expected_hash)?;
-        validate_content_hash(next_hash)?;
         let name = name.to_string();
         let home_dir = home_dir.to_string();
         let config_json = config_json.to_string();
         let expected_hash = expected_hash.to_string();
         let next_hash = next_hash.to_string();
         self.write(move |conn| {
-            let changed = conn.execute(
+            Db::update_assistant_content_hash_cas_conn(
+                conn,
+                &name,
+                &home_dir,
+                &config_json,
+                &expected_hash,
+                &next_hash,
+            )
+        })
+        .await
+    }
+
+    pub fn update_assistant_identity_hashes_cas_conn(
+        conn: &rusqlite::Connection,
+        expected: AssistantRow,
+        config_json: &str,
+    ) -> Result<AssistantRow> {
+        validate_config_json(config_json)?;
+        let changed = conn
+            .execute(
+                "UPDATE assistants SET config_json = ?6
+                 WHERE name = ?1 AND created_at_unix_ms = ?2 AND home_dir = ?3
+                   AND config_json = ?4 AND content_hash = ?5",
+                params![
+                    expected.name,
+                    expected.created_at_unix_ms,
+                    expected.home_dir,
+                    expected.config_json,
+                    expected.content_hash,
+                    config_json,
+                ],
+            )
+            .context("compare-and-swap assistant identity hashes")?;
+        if changed != 1 {
+            anyhow::bail!("assistant registry changed while identity files were read");
+        }
+        Db::get_assistant_conn(conn, &expected.name)?
+            .ok_or_else(|| anyhow::anyhow!("assistant disappeared after identity update"))
+    }
+
+    pub fn update_assistant_content_hash_cas_conn(
+        conn: &rusqlite::Connection,
+        name: &str,
+        home_dir: &str,
+        config_json: &str,
+        expected_hash: &str,
+        next_hash: &str,
+    ) -> Result<AssistantRow> {
+        validate_config_json(config_json)?;
+        validate_content_hash(expected_hash)?;
+        validate_content_hash(next_hash)?;
+        let changed = conn
+            .execute(
                 "UPDATE assistants SET content_hash=?5 WHERE name=?1 AND home_dir=?2 AND config_json=?3 AND content_hash=?4",
                 params![name, home_dir, config_json, expected_hash, next_hash],
-            ).context("compare-and-swap assistant definition revision")?;
-            if changed != 1 {
-                anyhow::bail!("assistant registry changed before definition commit");
-            }
-            Db::get_assistant_conn(conn, &name)?
-                .ok_or_else(|| anyhow::anyhow!("assistant `{name}` disappeared after update"))
-        }).await
+            )
+            .context("compare-and-swap assistant definition revision")?;
+        if changed != 1 {
+            anyhow::bail!("assistant registry changed before definition commit");
+        }
+        Db::get_assistant_conn(conn, name)?
+            .ok_or_else(|| anyhow::anyhow!("assistant `{name}` disappeared after update"))
     }
 
     pub fn upsert_assistant_conn(
@@ -190,17 +216,28 @@ impl Db {
         content_hash: &str,
     ) -> Result<AssistantRow> {
         validate_content_hash(content_hash)?;
-        serde_json::from_str::<serde_json::Value>(config_json)
-            .context("assistant config must be valid JSON")?;
-        let created_at = Utc::now().timestamp();
+        validate_config_json(config_json)?;
+        if name.is_empty() || name.len() > 255 {
+            anyhow::bail!("assistant name must contain between 1 and 255 bytes");
+        }
+        if home_dir.is_empty() || home_dir.len() > 32_768 {
+            anyhow::bail!("assistant home directory must contain between 1 and 32768 bytes");
+        }
+        let created_at_unix_ms = Utc::now().timestamp_millis();
         conn.execute(
-            "INSERT INTO assistants (name, created_at, home_dir, config_json, content_hash)
+            "INSERT INTO assistants (name, created_at_unix_ms, home_dir, config_json, content_hash)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(name) DO UPDATE SET
                 home_dir = excluded.home_dir,
                 config_json = excluded.config_json,
                 content_hash = excluded.content_hash",
-            params![name, created_at, home_dir, config_json, content_hash],
+            params![
+                name,
+                created_at_unix_ms,
+                home_dir,
+                config_json,
+                content_hash
+            ],
         )
         .context("upserting assistant")?;
         Db::get_assistant_conn(conn, name)?

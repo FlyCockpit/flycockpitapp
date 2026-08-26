@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use crate::tui::textfield::TextField;
-use cockpit_core::daemon::proto::{LspControlAction, Request};
+use cockpit_proto::{LspControlAction, Request};
 
 use super::pointer_actions::{
     LspAction as PointerLspAction, LspEdit as PointerLspEdit, LspServerId, SettingsPointerAction,
@@ -532,7 +532,7 @@ fn lsp_edit_row<T: ToString>(
     if p.editing == Some(edit) {
         let selected = idx == p.cursor;
         let text = p.buf.text();
-        let cursor = cockpit_core::text::floor_char_boundary(text, p.buf.cursor());
+        let cursor = cockpit_host::text::floor_char_boundary(text, p.buf.cursor());
         let (before, after) = text.split_at(cursor);
         Line::from(vec![
             Span::raw(marker(selected)),

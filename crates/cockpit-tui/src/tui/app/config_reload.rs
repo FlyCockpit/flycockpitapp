@@ -55,11 +55,7 @@ impl App {
             } else {
                 ControlApplied::None
             };
-            self.send_daemon_request(
-                "/settings",
-                cockpit_core::daemon::proto::Request::RefreshConfig,
-                applied,
-            );
+            self.send_daemon_request("/settings", cockpit_proto::Request::RefreshConfig, applied);
         } else {
             self.dirty_response_metrics_tokenizer = None;
             self.refresh_bootstrap_config_snapshot();

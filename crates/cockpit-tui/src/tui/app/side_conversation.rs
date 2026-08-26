@@ -10,6 +10,7 @@ impl App {
     pub(super) fn apply_fork_created(
         &mut self,
         parent_session_id: uuid::Uuid,
+        endpoint: cockpit_client::ClientEndpoint,
         socket: std::path::PathBuf,
         fork_session_id: uuid::Uuid,
         fork_short_id: String,
@@ -23,11 +24,11 @@ impl App {
                 Some(Ok(runner)) if runner.session_id() == parent_session_id
             )
         {
-            self.schedule_created_session_discard(socket, fork_session_id);
+            self.schedule_created_session_discard(endpoint, fork_session_id);
             return;
         }
         if self.has_pending_session_switch_action() {
-            self.schedule_created_session_discard(socket, fork_session_id);
+            self.schedule_created_session_discard(endpoint, fork_session_id);
             self.report_session_switch_busy("/fork");
             return;
         }
@@ -41,7 +42,7 @@ impl App {
             _ => None,
         };
         if let Some(switch_task) = switch_task {
-            let cleanup_socket = socket.clone();
+            let cleanup_endpoint = endpoint.clone();
             let cleanup_short_id = fork_short_id.clone();
             let start = self.async_actions.start(
                 AsyncActionKind::Internal("session.fork"),
@@ -56,7 +57,7 @@ impl App {
                         Err(error) => {
                             let discard = tokio::task::spawn_blocking(move || {
                                 agent_runner::discard_session_blocking(
-                                    &cleanup_socket,
+                                    &cleanup_endpoint,
                                     fork_session_id,
                                 )
                             })
@@ -80,7 +81,7 @@ impl App {
                 },
             );
             if matches!(start, AsyncActionStart::Existing(_)) {
-                self.schedule_created_session_discard(socket, fork_session_id);
+                self.schedule_created_session_discard(endpoint, fork_session_id);
                 self.report_session_switch_busy("/fork");
             } else {
                 self.begin_ephemeral_session_switch_submission_target(
@@ -96,7 +97,7 @@ impl App {
             }
             return;
         }
-        self.schedule_created_session_discard(socket, fork_session_id);
+        self.schedule_created_session_discard(endpoint, fork_session_id);
         self.history.push(HistoryEntry::CommandError {
             line: format!(
                 "/fork: created {fork_short_id}, but the active runner cannot switch sessions"
@@ -106,14 +107,14 @@ impl App {
 
     fn schedule_created_session_discard(
         &mut self,
-        socket: std::path::PathBuf,
+        endpoint: cockpit_client::ClientEndpoint,
         session_id: uuid::Uuid,
     ) {
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("side.discard"),
             AsyncActionPolicy::AllowConcurrent,
             move || {
-                agent_runner::discard_session_blocking(&socket, session_id)
+                agent_runner::discard_session_blocking(&endpoint, session_id)
                     .map(|_| AsyncActionPayload::Unit)
             },
         );
@@ -127,8 +128,12 @@ impl App {
     pub(super) fn enter_side_conversation(&mut self) {
         // Need a live runner: the side fork goes onto the same daemon, and
         // forking off an un-persisted session has nothing to branch from.
-        let (parent_session_id, socket) = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => (runner.session_id(), runner.socket.clone()),
+        let (parent_session_id, endpoint, socket) = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => (
+                runner.session_id(),
+                runner.endpoint.clone(),
+                runner.socket.clone(),
+            ),
             _ => {
                 self.history.push(HistoryEntry::CommandError {
                     line: "/side: no active session to fork from".to_string(),
@@ -149,9 +154,10 @@ impl App {
             AsyncActionPolicy::Dedupe(AsyncActionKey::new("side.start")),
             move || {
                 let (session_id, short_id) =
-                    agent_runner::fork_session_blocking(&socket, parent_session_id, None, true)?;
+                    agent_runner::fork_session_blocking(&endpoint, parent_session_id, None, true)?;
                 Ok(AsyncActionPayload::ForkCreated {
                     parent_session_id,
+                    endpoint,
                     socket,
                     session_id,
                     short_id,
@@ -173,6 +179,7 @@ impl App {
     pub(super) fn apply_side_created(
         &mut self,
         parent_session_id: uuid::Uuid,
+        endpoint: cockpit_client::ClientEndpoint,
         socket: std::path::PathBuf,
         side_session_id: uuid::Uuid,
         side_short_id: String,
@@ -184,11 +191,11 @@ impl App {
                 Some(Ok(runner)) if runner.session_id() == parent_session_id
             )
         {
-            self.schedule_created_session_discard(socket, side_session_id);
+            self.schedule_created_session_discard(endpoint, side_session_id);
             return;
         }
         if self.has_pending_session_switch_action() {
-            self.schedule_created_session_discard(socket, side_session_id);
+            self.schedule_created_session_discard(endpoint, side_session_id);
             self.report_session_switch_busy("/side");
             return;
         }
@@ -215,7 +222,7 @@ impl App {
                 },
             );
             if matches!(start, AsyncActionStart::Existing(_)) {
-                self.schedule_created_session_discard(socket, side_session_id);
+                self.schedule_created_session_discard(endpoint, side_session_id);
                 self.report_session_switch_busy("/side");
                 return;
             }
@@ -229,6 +236,7 @@ impl App {
 
             let side = SideConversation {
                 side_session_id,
+                endpoint,
                 socket,
                 saved_runner: None,
                 saved_history: self.history.clone(),
@@ -266,7 +274,7 @@ impl App {
             self.side_conversation = Some(side);
             return;
         }
-        self.schedule_created_session_discard(socket, side_session_id);
+        self.schedule_created_session_discard(endpoint, side_session_id);
         self.history.push(HistoryEntry::CommandError {
             line: "/side: active runner cannot switch sessions".to_string(),
         });
@@ -314,7 +322,7 @@ impl App {
         let Some(side) = self.side_conversation.take() else {
             return;
         };
-        self.schedule_created_session_discard(side.socket.clone(), side.side_session_id);
+        self.schedule_created_session_discard(side.endpoint.clone(), side.side_session_id);
         if restore_main {
             self.restore_side_snapshot(side);
         }
@@ -393,7 +401,7 @@ impl App {
             .side_conversation
             .take()
             .expect("side preflight preserved conversation");
-        self.schedule_created_session_discard(side.socket.clone(), side.side_session_id);
+        self.schedule_created_session_discard(side.endpoint.clone(), side.side_session_id);
         self.restore_side_snapshot(side);
         // The daemonless ownership guard stays armed throughout — the side
         // fork lives on the same owned daemon, so it's never dropped and
@@ -417,7 +425,7 @@ impl App {
             self.fail_pending_session_switch_submissions();
             return;
         };
-        self.schedule_created_session_discard(side.socket.clone(), side.side_session_id);
+        self.schedule_created_session_discard(side.endpoint.clone(), side.side_session_id);
         self.restore_side_snapshot(side);
         let current_session_persisted = self.current_session_persisted;
         self.apply_session_switch_outcome_preserving_history(outcome, current_session_persisted);

@@ -3,9 +3,9 @@ use std::fs;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{App, Overlay};
-use cockpit_core::daemon::proto::AuthFailureKind;
 use cockpit_core::engine::TurnEvent;
 use cockpit_core::engine::model::InferenceErrorClass;
+use cockpit_proto::AuthFailureKind;
 
 fn write_provider(root: &std::path::Path, template: Option<&str>, url: &str) {
     let cockpit = root.join(".cockpit");
@@ -62,14 +62,15 @@ fn app_for_provider(root: &std::path::Path) -> App {
 /// the request; the promoted daemon context persists across the reducers'
 /// per-call runtimes.
 fn seed_daemon_workspace_trust(root: &std::path::Path) {
-    use cockpit_core::daemon::proto::{Request, Response, WorkspaceTrustMode};
+    use cockpit_proto::{Request, Response, WorkspaceTrustMode};
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("auth-recovery trust seed runtime");
     runtime.block_on(async {
-        let client = crate::tui::settings::settings_daemon_client()
+        let lifecycle = crate::tui::settings::test_lifecycle_client();
+        let client = crate::tui::settings::settings_daemon_client(&lifecycle)
             .await
             .expect("settings daemon client for trust seed");
         let project_root = root.display().to_string();

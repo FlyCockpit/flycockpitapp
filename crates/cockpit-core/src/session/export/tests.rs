@@ -102,7 +102,7 @@ async fn create_test_fork(db: &crate::db::Db, parent_session_id: Uuid) -> Sessio
             None,
             false,
             Uuid::new_v4(),
-            chrono::Utc::now().timestamp(),
+            chrono::Utc::now().timestamp_millis(),
         )
     })
     .await
@@ -4110,13 +4110,14 @@ async fn manifest_has_version_and_session_date() {
     // Epoch matches the session row; ISO string is the RFC-3339 rendering
     // of that same epoch.
     assert_eq!(
-        manifest["session_started_at"].as_i64().unwrap(),
-        target.started_at
+        manifest["session_started_at_unix_ms"].as_i64().unwrap(),
+        target.started_at_unix_ms
     );
     let iso = manifest["session_date"].as_str().unwrap();
-    let expected = chrono::DateTime::<chrono::Utc>::from_timestamp(target.started_at, 0)
-        .unwrap()
-        .to_rfc3339();
+    let expected =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(target.started_at_unix_ms)
+            .unwrap()
+            .to_rfc3339();
     assert_eq!(iso, expected);
 
     let zip = build_zip_with_options_and_env(

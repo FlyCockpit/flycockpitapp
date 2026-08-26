@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -62,7 +62,7 @@ const IN_PROCESS_EVENT_QUEUE: usize = 1024;
 const CLIENT_IO_CHANNEL_CAPACITY: usize = 64;
 const MAX_CONCURRENT_CLIENT_REQUESTS: usize = 16;
 
-static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, Weak<DaemonContext>>>> =
+static IN_PROCESS_CONTEXTS: OnceLock<StdMutex<HashMap<PathBuf, RegisteredInProcessContext>>> =
     OnceLock::new();
 
 fn daemon_process_env() -> HashMap<String, String> {
@@ -225,6 +225,7 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         proto::Response::AgentInstallation(_) => {}
         proto::Response::MediaOwnerRecovery(..)
         | proto::Response::LocalPathMediaRegistration(..)
+        | proto::Response::ImageIngressAdmitted(..)
         | proto::Response::RetainedHttpsMedia(..)
         | proto::Response::MediaAttachmentStatus(..)
         | proto::Response::MediaAttachmentPreview(..)
@@ -566,6 +567,35 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
             }
         }
         proto::Response::GitDiffFile { diff, truncated: _ } => scrub_string(diff, redact),
+        proto::Response::GitDiff {
+            source: _,
+            diff,
+            truncated: _,
+        } => scrub_string(diff, redact),
+        proto::Response::GitReviewSources { sources } => {
+            for source in sources {
+                if let proto::GitReadSource::PullRequest(pr) = &mut source.source {
+                    scrub_string(pr, redact);
+                }
+                scrub_string(&mut source.label, redact);
+                if let Some(command) = &mut source.command {
+                    scrub_string(command, redact);
+                }
+                if let Some(error) = &mut source.error {
+                    scrub_string(error, redact);
+                }
+            }
+        }
+        proto::Response::GitRepoStatus { status } => {
+            if let Some(status) = status {
+                scrub_string(&mut status.branch, redact);
+            }
+        }
+        proto::Response::WorktreeRoot { root } => {
+            if let Some(root) = root {
+                scrub_string(root, redact);
+            }
+        }
         proto::Response::LspControlResult { message } => scrub_string(message, redact),
         proto::Response::DaemonStatus {
             pid: _,
@@ -783,8 +813,9 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         }
         // Metadata-only: a config file path + counts / typed spend settings /
         // version numbers. No user free-text that could embed a secret.
-        proto::Response::PolicyImported { .. }
-        | proto::Response::ImageSpendPolicy { .. }
+        proto::Response::PolicyImported { .. } => {}
+        #[cfg(feature = "extended")]
+        proto::Response::ImageSpendPolicy { .. }
         | proto::Response::ImageSpendPolicySaved { .. } => {}
         // Redacted image-control read reply. Every secret-BEARING field
         // (credential_ref/headers/graph_json/target source_urls) is dropped at
@@ -1580,8 +1611,8 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
         short_id: _,
         project_root,
         project_id: _,
-        started_at: _,
-        last_active_at: _,
+        started_at_unix_ms: _,
+        last_active_at_unix_ms: _,
         turns: _,
         active_agent: _,
         title,
@@ -1590,11 +1621,11 @@ fn scrub_session_summary(summary: &mut proto::SessionSummary, redact: &Redaction
         shared_with_collaborators: _,
         fork_count: _,
         descendant_count: _,
-        last_viewed_at: _,
-        latest_activity_at: _,
+        last_viewed_at_unix_ms: _,
+        latest_activity_at_unix_ms: _,
         open_interrupts: _,
         activity_state: _,
-        archived_at: _,
+        archived_at_unix_ms: _,
         pin_count: _,
     } = summary;
     scrub_string(project_root, redact);
@@ -2514,6 +2545,7 @@ impl DaemonContext {
             .lsp_manager()
             .set_notice_bus(global_events.clone(), global_redaction.clone());
         registry.set_global_bus(global_events.clone());
+        #[cfg(feature = "extended")]
         let scheduler = (!paths.ephemeral).then(|| {
             let executor = Arc::new(crate::daemon::scheduler::ProductionJobExecutor::new(
                 db.clone(),
@@ -2527,6 +2559,8 @@ impl DaemonContext {
             ))
             .start_with_callbacks(shutdown.clone(), callbacks)
         });
+        #[cfg(not(feature = "extended"))]
+        let scheduler: Option<crate::daemon::scheduler::DaemonSchedulerHandle> = None;
         if let Some(handle) = &scheduler {
             registry.set_scheduler(handle.clone());
         }
@@ -2570,6 +2604,7 @@ impl DaemonContext {
         // resolved destinations; concrete provider adapters + the destination map
         // install with the wire-adapters / real-dispatch prompts, so a queued job
         // records a typed `adapter_missing` skip rather than dispatching.
+        #[cfg(feature = "extended")]
         let image_generation_worker = (!paths.ephemeral)
             .then(|| {
                 match crate::daemon::image_runtime::install_standard_image_runtime_registry(
@@ -2606,6 +2641,8 @@ impl DaemonContext {
                 }
             })
             .flatten();
+        #[cfg(not(feature = "extended"))]
+        let image_generation_worker = None;
         Self {
             db,
             media_ledger,
@@ -3389,12 +3426,99 @@ impl Drop for ClientGuard {
     }
 }
 
-pub(crate) fn register_in_process_context(ctx: Arc<DaemonContext>) {
+struct RegisteredInProcessContext {
+    ctx: std::sync::Weak<DaemonContext>,
+    endpoint: cockpit_client::InProcessEndpoint,
+}
+
+pub(crate) fn register_in_process_context(
+    ctx: Arc<DaemonContext>,
+) -> cockpit_client::InProcessEndpoint {
+    // Endpoint service tasks are created on the daemon owner runtime. Callers
+    // receive only the cloneable transport capability; reconnects never spawn
+    // daemon work on a frontend runtime.
+    let endpoint = in_process_endpoint(&ctx);
     let contexts = IN_PROCESS_CONTEXTS.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut contexts = contexts
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    contexts.insert(ctx.paths.socket.clone(), Arc::downgrade(&ctx));
+    contexts.insert(
+        ctx.paths.socket.clone(),
+        RegisteredInProcessContext {
+            ctx: Arc::downgrade(&ctx),
+            endpoint: endpoint.clone(),
+        },
+    );
+    endpoint
+}
+
+pub(crate) fn in_process_endpoint(ctx: &Arc<DaemonContext>) -> cockpit_client::InProcessEndpoint {
+    let (connections, mut requests) =
+        mpsc::channel::<oneshot::Sender<Option<cockpit_client::InProcessConnection>>>(16);
+    let (sensitive, mut sensitive_requests) =
+        mpsc::channel::<cockpit_client::InProcessSensitiveRequest>(4);
+    let weak = Arc::downgrade(ctx);
+    tokio::spawn(async move {
+        while let Some(reply) = requests.recv().await {
+            if reply.is_closed() {
+                continue;
+            }
+            let connection = weak.upgrade().map(spawn_in_process_client);
+            let retired = connection.is_none();
+            let _ = reply.send(connection);
+            if retired {
+                break;
+            }
+        }
+    });
+    let weak = Arc::downgrade(ctx);
+    tokio::spawn(async move {
+        while let Some(mut request) = sensitive_requests.recv().await {
+            if request.reply.is_closed() {
+                continue;
+            }
+            let Some(ctx) = weak.upgrade() else {
+                break;
+            };
+            let response = match crate::daemon::leak_reveal_frame::decode_request(&request.payload)
+            {
+                Ok(decoded) => {
+                    let consume = crate::daemon::leak_reveal::consume_leak_reveal(
+                        &ctx,
+                        decoded.capability_hex.as_str(),
+                        chrono::Utc::now().timestamp_millis(),
+                    );
+                    let consumed = tokio::select! {
+                        biased;
+                        _ = request.reply.closed() => continue,
+                        consumed = consume => consumed,
+                    };
+                    match consumed {
+                        Ok(revealed) => {
+                            crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Ok {
+                                report_id: revealed.report_id,
+                                generation: revealed.generation,
+                                plaintext: revealed.plaintext,
+                            }
+                        }
+                        Err(denied) => {
+                            crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Denied(
+                                denied,
+                            )
+                        }
+                    }
+                }
+                Err(_) => crate::daemon::leak_reveal_frame::LeakRevealSocketResponse::Denied(
+                    crate::daemon::leak_reveal::LeakRevealDenied::Unauthorized,
+                ),
+            };
+            let encoded = zeroize::Zeroizing::new(
+                crate::daemon::leak_reveal_frame::encode_response(&response),
+            );
+            let _ = request.reply.send(encoded);
+        }
+    });
+    cockpit_client::InProcessEndpoint::new(connections, sensitive)
 }
 
 pub(crate) fn in_process_context(socket: &Path) -> Option<Arc<DaemonContext>> {
@@ -3402,13 +3526,29 @@ pub(crate) fn in_process_context(socket: &Path) -> Option<Arc<DaemonContext>> {
     let mut contexts = contexts
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let weak = contexts.get(socket)?;
-    match weak.upgrade() {
+    let registered = contexts.get(socket)?;
+    match registered.ctx.upgrade() {
         Some(ctx) => Some(ctx),
         None => {
             contexts.remove(socket);
             None
         }
+    }
+}
+
+pub(crate) fn registered_in_process_endpoint(
+    socket: &Path,
+) -> Option<cockpit_client::InProcessEndpoint> {
+    let contexts = IN_PROCESS_CONTEXTS.get()?;
+    let mut contexts = contexts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let registered = contexts.get(socket)?;
+    if registered.ctx.upgrade().is_some() {
+        Some(registered.endpoint.clone())
+    } else {
+        contexts.remove(socket);
+        None
     }
 }
 
@@ -4004,20 +4144,25 @@ async fn run_boot_housekeeping(db: &Db) {
 #[cfg(unix)]
 pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    dispatch::recover_all_provider_config_journals(ctx)
+    // Every file-backed recovery family shares one bounded startup deadline.
+    // Target guards themselves live only inside blocking closures, so no
+    // synchronous filesystem lock can cross an async DB/network suspension.
+    let config_publication =
+        crate::daemon::config_publication_recovery::PreSocketConfigPublication::new();
+    dispatch::recover_all_provider_config_journals(ctx, config_publication)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup provider-config journal recovery failed")?;
-    dispatch::recover_all_mcp_config_journals(ctx)
+    dispatch::recover_all_mcp_config_journals(ctx, config_publication)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup MCP-config journal recovery failed")?;
-    crate::daemon::fs_api::recover_extended_config_patch_journals(ctx)
+    crate::daemon::fs_api::recover_extended_config_patch_journals(ctx, config_publication)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup typed-settings journal recovery failed")?;
     let recovered_image_config =
-        image_control_mutations::recover_image_config_mutation_journals(ctx)
+        image_control_mutations::recover_image_config_mutation_journals(ctx, config_publication)
             .await
             .map_err(|error| anyhow::anyhow!(error.message))
             .context("startup image-config mutation journal recovery failed")?;
@@ -4027,12 +4172,12 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
             "reconciled committed image configuration before socket publication"
         );
     }
-    crate::daemon::agent_management::recover_known_workspace_resets(ctx)
+    crate::daemon::agent_management::recover_known_workspace_resets(ctx, config_publication)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup agent reset journal recovery failed")?;
     let recovered_agent_mutations =
-        crate::daemon::agent_management::recover_agent_mutation_journals(ctx)
+        crate::daemon::agent_management::recover_agent_mutation_journals(ctx, config_publication)
             .await
             .map_err(|error| anyhow::anyhow!(error.message))
             .context("startup agent-mutation journal recovery failed")?;
@@ -4069,7 +4214,7 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
             "settled interrupted local operations without re-execution"
         );
     }
-    crate::daemon::agent_management::recover_editor_leases_before_publish(ctx)
+    crate::daemon::agent_management::recover_editor_leases_before_publish(ctx, config_publication)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup editor completion recovery failed")?;
@@ -4077,9 +4222,12 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
         .await
         .map_err(|error| anyhow::anyhow!(error.message))
         .context("startup editor lease recovery failed")?;
-    let recovered = crate::daemon::effective_default_recovery::recover_effective_default_journals(
-        &ctx.db, &cwd, None,
-    )
+    let recovered =
+        crate::daemon::effective_default_recovery::recover_effective_default_journals_before_socket(
+            &ctx.db,
+            &cwd,
+            config_publication,
+        )
     .await
     .context("startup effective-default journal recovery failed")?;
     crate::daemon::effective_default_recovery::deliver_recovered_terminals(ctx, recovered)
@@ -4178,7 +4326,11 @@ fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
     {
         tracing::info!(
             sessions_expired = outcome.sessions_expired,
+            session_cascade_rows_deleted = outcome.session_cascade_rows_deleted,
             payload_rows_deleted = outcome.payload_rows_deleted,
+            transcript_rows_deleted = outcome.transcript_rows_deleted,
+            raw_wire_rows_deleted_or_redacted = outcome.raw_wire_rows_deleted_or_redacted,
+            terminal_evidence_rows_deleted = outcome.terminal_evidence_rows_deleted,
             local_authority_rows_purged = outcome.local_authority_rows_purged,
             vacuumed = outcome.vacuumed,
             "session payload retention pass completed"
@@ -4606,23 +4758,21 @@ pub(super) struct ClientRequestEffects {
     shutdown_after_response: bool,
 }
 
-pub(crate) struct InProcessRequest {
-    pub request: Request,
-    pub reply: oneshot::Sender<std::result::Result<Response, ErrorPayload>>,
-}
-
 pub(crate) fn spawn_in_process_client(
     ctx: Arc<DaemonContext>,
-) -> (mpsc::Sender<InProcessRequest>, mpsc::Receiver<proto::Event>) {
+) -> cockpit_client::InProcessConnection {
     let (request_tx, request_rx) = mpsc::channel(IN_PROCESS_REQUEST_QUEUE);
     let (event_tx, event_rx) = mpsc::channel(IN_PROCESS_EVENT_QUEUE);
     tokio::spawn(run_in_process_client(ctx, request_rx, event_tx));
-    (request_tx, event_rx)
+    cockpit_client::InProcessConnection {
+        requests: request_tx,
+        events: event_rx,
+    }
 }
 
 async fn run_in_process_client(
     ctx: Arc<DaemonContext>,
-    mut request_rx: mpsc::Receiver<InProcessRequest>,
+    mut request_rx: mpsc::Receiver<cockpit_client::InProcessRequest>,
     event_tx: mpsc::Sender<proto::Event>,
 ) {
     let _client_guard = ctx.track_client();
@@ -4729,7 +4879,7 @@ async fn run_in_process_client(
                     }
                 }
                 cmd = request_rx.recv() => {
-                    let Some(InProcessRequest { request, reply }) = cmd else {
+                    let Some(cockpit_client::InProcessRequest { request, reply }) = cmd else {
                         break 'client;
                     };
                     if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {
@@ -5909,7 +6059,7 @@ fn response_envelope_for_shared(
                 ),
             }
         }
-        Err(err) => bounded_error_envelope(Some(id), err),
+        Err(err) => bounded_error_envelope(Some(id), normalize_database_storage_error(err)),
     }
 }
 
@@ -6175,6 +6325,26 @@ fn bad_request(message: impl Into<String>) -> ErrorPayload {
     }
 }
 
+fn normalize_database_storage_error(mut error: ErrorPayload) -> ErrorPayload {
+    if error.code != ErrorCode::Internal {
+        return error;
+    }
+    error.code = if error.message.contains("FCDB_STORAGE_FULL") {
+        ErrorCode::StorageFull
+    } else if error.message.contains("FCDB_STORAGE_MEMORY") {
+        ErrorCode::StorageMemory
+    } else if error.message.contains("FCDB_STORAGE_READ_ONLY") {
+        ErrorCode::StorageReadOnly
+    } else if error.message.contains("FCDB_STORAGE_IO") {
+        ErrorCode::StorageIo
+    } else if error.message.contains("FCDB_STORAGE_CORRUPT") {
+        ErrorCode::StorageCorrupt
+    } else {
+        return error;
+    };
+    error
+}
+
 fn authorization_error(message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: ErrorCode::Authorization,
@@ -6223,6 +6393,6 @@ mod tests;
 
 pub use attachments::validate_png_attachment_blocking;
 pub use dispatch::request_shutdown;
-pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) {
-    dispatch::spawn_lock_sweeper(ctx);
+pub(crate) fn spawn_lock_sweeper(ctx: Arc<DaemonContext>) -> tokio::task::JoinHandle<()> {
+    dispatch::spawn_lock_sweeper(ctx)
 }

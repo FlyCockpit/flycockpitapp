@@ -59,12 +59,14 @@ fn truncate_spans_to_width(spans: Vec<Span<'static>>, max_width: usize) -> Vec<S
     out
 }
 
-/// Resolve the cwd to a `project_id` the same way session creation and
-/// the CLI mirror do (GOALS §15b): prefer the git worktree root for
-/// stability, else the cwd. `None` when the cwd can't be read.
-pub(crate) fn resolve_project_id(cwd: &Path) -> Option<String> {
-    let root = cockpit_core::git::find_worktree_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
-    Some(cockpit_core::session::project_id_for(&root))
+/// Resolve a `project_id` the same way session creation and the CLI mirror do
+/// (GOALS §15b): prefer the git worktree root for stability, else the cwd.
+/// `worktree_root` is the daemon-resolved git root (git authority stays out of
+/// the TUI); it is `None` when the cwd is not in a repo or has not been
+/// resolved yet, in which case we fall back to `cwd`.
+pub(crate) fn resolve_project_id(worktree_root: Option<&Path>, cwd: &Path) -> Option<String> {
+    let root = worktree_root.unwrap_or(cwd);
+    Some(cockpit_core::session::project_id_for(root))
 }
 
 /// Short prefix of a `project_id` hash for the title chip — the full

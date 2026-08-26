@@ -852,7 +852,7 @@ fn read_credential_file_readonly(path: &Path) -> Result<CredentialFile> {
     // mode-wide credential file is a typed refusal (via `PrivateFsError`), never
     // a silent read of an unprovable secret. A genuinely absent file is an empty
     // store, not a compromise.
-    let Some(bytes) = crate::private_fs::read_private_file(path, "credential")? else {
+    let Some(bytes) = cockpit_host::private_fs::read_private_file(path, "credential")? else {
         return Ok(CredentialFile::default());
     };
     let raw = String::from_utf8(bytes)
@@ -892,10 +892,10 @@ fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
     let name = path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("credential lock {} has no file name", path.display()))?;
-    let file = crate::private_fs::open_private_file_at(
+    let file = cockpit_host::private_fs::open_private_file_at(
         parent,
         name,
-        crate::private_fs::PrivateFileAccess::ReadWrite,
+        cockpit_host::private_fs::PrivateFileAccess::ReadWrite,
         "credential lock",
     )
     .with_context(|| format!("opening credential lock {}", path.display()))?;
@@ -922,7 +922,7 @@ fn write_credential_file_atomic(path: &Path, data: &CredentialFile) -> Result<()
     // any bytes are written, fsynced, renamed over the target, with the held
     // destination-directory fd fsynced after the rename. This replaces a bespoke
     // temp/persist that skipped the directory durability barrier.
-    crate::private_fs::write_private_file(path, pretty.as_bytes())?;
+    cockpit_host::private_fs::write_private_file(path, pretty.as_bytes())?;
     // Post-write fail-closed verification: the persisted credential file must be
     // provably private (self-owned, single-linked, exactly 0600, not a symlink),
     // or this returns a typed refusal rather than leaving a suspect secret.
@@ -932,7 +932,7 @@ fn write_credential_file_atomic(path: &Path, data: &CredentialFile) -> Result<()
 
 #[cfg(any(test, feature = "test-support"))]
 fn ensure_parent_dir_private(path: &Path) -> Result<()> {
-    Ok(crate::private_fs::ensure_parent_dir_private(path)?)
+    Ok(cockpit_host::private_fs::ensure_parent_dir_private(path)?)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -940,7 +940,10 @@ fn repair_existing_file_permissions(path: &Path) -> Result<()> {
     // Fail closed: a credential file that cannot be proven private (symlink,
     // foreign owner, hard link, or an unrepairable mode) is a typed refusal,
     // not a warning the caller ignores. On non-Unix this is a documented no-op.
-    Ok(crate::private_fs::repair_private_file(path, "credential")?)
+    Ok(cockpit_host::private_fs::repair_private_file(
+        path,
+        "credential",
+    )?)
 }
 
 #[cfg(test)]

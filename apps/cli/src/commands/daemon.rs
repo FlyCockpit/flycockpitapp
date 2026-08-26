@@ -5,9 +5,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::cli::DaemonCommand;
-use crate::daemon::client::{DaemonClient, is_protocol_version_mismatch};
 use crate::daemon::proto::{self, Request, Response};
 use crate::daemon::{self, DaemonPaths, DaemonStatus};
+use cockpit_client::{DaemonClient, is_protocol_version_mismatch};
 
 const EPHEMERAL_TUI_NOTE: &str =
     "  note: a live TUI may still be connected to a separate ephemeral daemon.";

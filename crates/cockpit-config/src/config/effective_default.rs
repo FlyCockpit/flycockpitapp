@@ -541,6 +541,10 @@ pub struct JournalRecovery<'a, 'o: 'a> {
     /// cache. The cache never changes the *result*, only whether the work is
     /// repeated.
     forced: bool,
+    /// Optional absolute deadline for pre-socket cross-process lock
+    /// acquisition. Normal interactive recovery retains its existing
+    /// unbounded serialization contract.
+    lock_deadline: Option<std::time::Instant>,
 }
 
 impl<'a, 'o: 'a> JournalRecovery<'a, 'o> {
@@ -551,6 +555,7 @@ impl<'a, 'o: 'a> JournalRecovery<'a, 'o> {
             sessions: None,
             sink: None,
             forced: false,
+            lock_deadline: None,
         }
     }
 
@@ -559,6 +564,7 @@ impl<'a, 'o: 'a> JournalRecovery<'a, 'o> {
             sessions: Some(sessions),
             sink: None,
             forced: true,
+            lock_deadline: None,
         }
     }
 
@@ -567,11 +573,17 @@ impl<'a, 'o: 'a> JournalRecovery<'a, 'o> {
         self
     }
 
+    pub fn with_lock_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.lock_deadline = Some(deadline);
+        self
+    }
+
     fn reborrow(&mut self) -> JournalRecovery<'_, 'o> {
         JournalRecovery {
             sessions: self.sessions.as_deref_mut(),
             sink: self.sink.as_deref_mut(),
             forced: self.forced,
+            lock_deadline: self.lock_deadline,
         }
     }
 }
@@ -3240,6 +3252,7 @@ pub fn mutate_effective_default(
                 sessions: None,
                 sink: None,
                 forced: true,
+                lock_deadline: None,
             },
         ),
     };

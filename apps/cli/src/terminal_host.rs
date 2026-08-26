@@ -60,6 +60,9 @@ struct IngressOperation {
     created_at: Instant,
     committed_at: Option<Instant>,
     path: Option<PathBuf>,
+    /// Opaque one-shot token pasted into the PTY. The pathname remains
+    /// daemon-process-local and is never serialized through the TUI protocol.
+    capability: Option<String>,
     verified_file: Option<cockpit_config::config::VerifiedTerminalIngressFile>,
     binding_dir: PathBuf,
     owner: AuthenticatedTerminalContext,
@@ -965,6 +968,7 @@ impl TerminalHost {
                 created_at: Instant::now(),
                 committed_at: None,
                 path: None,
+                capability: None,
                 verified_file: None,
                 binding_dir,
                 owner: binding_record.owner,
@@ -1063,8 +1067,6 @@ impl TerminalHost {
             .clone();
         let name = format!("{}.{}", random_base32(), metadata.media_type.extension());
         let final_path = binding_dir.join(name);
-        let path_text = final_path.to_str().ok_or_else(ingress_path_unavailable)?;
-        validate_path_text(path_text)?;
         cockpit_config::config::ensure_terminal_ingress_private_dir(&binding_dir)
             .map_err(internal)?;
         #[cfg(test)]
@@ -1091,7 +1093,9 @@ impl TerminalHost {
             drop(verified_file);
             return Err(error);
         }
-        let frame = bracketed_paste_bytes(&shell_path_literal(path_text, host_shell_dialect())?);
+        let capability = random_base32();
+        let frame =
+            bracketed_paste_bytes(format!("[flycockpit-private-image:{capability}]").as_bytes());
         #[cfg(test)]
         self.hit_ingress_barrier(IngressMutationEdge::BeforeReserve, &final_path);
         if let Err(error) = reserve_input_locked(&state, frame) {
@@ -1108,6 +1112,7 @@ impl TerminalHost {
         operation.input_sequence = Some(sequence);
         operation.committed_at = Some(Instant::now());
         operation.path = Some(final_path);
+        operation.capability = Some(capability);
         operation.verified_file = Some(verified_file);
         operation.bytes.clear();
         #[cfg(test)]
@@ -1519,6 +1524,77 @@ impl crate::daemon::terminal::TerminalHost for TerminalHost {
         operation_id: Uuid,
     ) -> crate::daemon::terminal::TerminalResult {
         TerminalHost::ingress_status(self, terminal_id, binding, operation_id)
+    }
+
+    fn consume_private_image_ingress(
+        &self,
+        context: &AuthenticatedTerminalContext,
+        session_id: Uuid,
+        capability: &str,
+    ) -> std::result::Result<crate::daemon::terminal::PrivateImageIngress, ErrorPayload> {
+        if capability.len() != 26
+            || !capability
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        {
+            return Err(invalid_ingress());
+        }
+        let terminals = crate::sync::lock_or_recover(&self.inner)
+            .terminals
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for terminal in terminals {
+            let mut state = crate::sync::lock_or_recover(&terminal);
+            sweep_ingress_locked(&mut state);
+            let Some(operation_id) = state.ingress.iter().find_map(|(id, operation)| {
+                (operation.capability.as_deref() == Some(capability)).then_some(*id)
+            }) else {
+                continue;
+            };
+            let operation = state
+                .ingress
+                .get(&operation_id)
+                .ok_or_else(invalid_ingress)?;
+            if operation.state != TerminalIngressState::Committed
+                || operation.owner != *context
+                || operation.session_id != session_id
+                || operation.created_at.elapsed() >= INGRESS_TTL
+            {
+                return Err(invalid_ingress());
+            }
+            let path = operation.path.clone().ok_or_else(invalid_ingress)?;
+            if !operation.binding_dir.starts_with(&self.temp_root)
+                || !path.starts_with(&operation.binding_dir)
+                || path.parent() != Some(operation.binding_dir.as_path())
+            {
+                return Err(invalid_ingress());
+            }
+            let retained = operation
+                .verified_file
+                .as_ref()
+                .ok_or_else(invalid_ingress)?;
+            let (reopened_bytes, reopened) = read_verified_final(&path, operation.metadata.size)?;
+            if reopened.identity != retained.identity
+                || reopened_bytes != retained.bytes
+                || sha256_hex(&reopened_bytes) != operation.metadata.sha256
+            {
+                return Err(invalid_ingress());
+            }
+            drop(reopened);
+            let bytes = reopened_bytes;
+            let identity = retained.identity;
+            let media_type = operation.metadata.media_type;
+            let declared_sha256 = operation.metadata.sha256.clone();
+            state.ingress.remove(&operation_id);
+            remove_if_same_identity(&path, Some(identity));
+            return Ok(crate::daemon::terminal::PrivateImageIngress {
+                bytes,
+                declared_sha256,
+                media_type,
+            });
+        }
+        Err(invalid_ingress())
     }
 
     fn contains(&self, terminal_id: Uuid) -> bool {
@@ -3038,13 +3114,15 @@ mod tests {
             assert_eq!(receipt.input_sequence, Some(1));
 
             let terminal = host.get_terminal(terminal_id).unwrap();
-            let committed_path = crate::sync::lock_or_recover(&terminal).ingress[&operation_id]
-                .path
-                .as_ref()
-                .unwrap()
-                .clone();
+            let (committed_path, capability) = {
+                let state = crate::sync::lock_or_recover(&terminal);
+                let operation = &state.ingress[&operation_id];
+                (
+                    operation.path.as_ref().unwrap().clone(),
+                    operation.capability.as_ref().unwrap().clone(),
+                )
+            };
             assert_eq!(std::fs::read(&committed_path).unwrap(), bytes);
-            let path_text = committed_path.to_str().unwrap();
 
             // What production ACTUALLY delivered onto the terminal PTY at finish,
             // read back off the host's own outbound stream.
@@ -3062,8 +3140,8 @@ mod tests {
 
             // The expected frame is computed ONLY to compare against production's
             // real output; it is never the delivery source.
-            let literal = shell_path_literal(path_text, host_shell_dialect()).unwrap();
-            let expected = bracketed_paste_bytes(&literal);
+            let literal = format!("[flycockpit-private-image:{capability}]");
+            let expected = bracketed_paste_bytes(literal.as_bytes());
             assert_eq!(
                 count_subslice(&observed, BRACKETED_PASTE_START),
                 1,
@@ -3083,14 +3161,14 @@ mod tests {
                 "echo={echo}: production-delivered frame must equal the bracketed-paste frame for the ingress path"
             );
             assert!(
-                find_subslice(delivered, path_text.as_bytes()).is_some(),
-                "echo={echo}: delivered frame must embed the ingress path bytes"
+                find_subslice(delivered, committed_path.as_os_str().as_encoded_bytes()).is_none(),
+                "echo={echo}: delivered frame must not disclose ingress path bytes"
             );
-            // Cockpit-TUI path-probe leg.
+            // Cockpit-TUI opaque-capability leg.
             assert_eq!(
-                cockpit_tui::tui::structured_paste::parse_private_image_path_literal(&literal),
-                Some(committed_path.clone()),
-                "echo={echo}: TUI path probe must recover the committed path"
+                cockpit_tui::tui::structured_paste::parse_private_image_capability(&literal),
+                Some(capability),
+                "echo={echo}: TUI must recover only the opaque capability"
             );
 
             // The committed receipt is stable even if the on-disk file is later
@@ -3110,7 +3188,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_ingress_path_literal() {
+    fn terminal_ingress_capability_literal_and_shell_path_safety() {
         let path = if cfg!(windows) {
             "C:\\private dir\\it's.png"
         } else {
@@ -3128,17 +3206,12 @@ mod tests {
             shell_path_literal(path, IngressShellDialect::Cmd).unwrap(),
             format!("\"{path}\"")
         );
-        for dialect in [
-            IngressShellDialect::Posix,
-            IngressShellDialect::PowerShell,
-            IngressShellDialect::Cmd,
-        ] {
-            let literal = shell_path_literal(path, dialect).unwrap();
-            assert_eq!(
-                cockpit_tui::tui::structured_paste::parse_private_image_path_literal(&literal),
-                Some(PathBuf::from(path))
-            );
-        }
+        assert_eq!(
+            cockpit_tui::tui::structured_paste::parse_private_image_capability(
+                "[flycockpit-private-image:abcdefghijklmnopqrstuvwxyz]"
+            ),
+            Some("abcdefghijklmnopqrstuvwxyz".into())
+        );
         for rejected in [
             "/tmp/a\nb",
             "/tmp/a\rb",

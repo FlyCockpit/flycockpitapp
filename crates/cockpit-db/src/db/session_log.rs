@@ -4151,8 +4151,11 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
-        assert_eq!(after.last_viewed_at, before.last_viewed_at);
-        assert_eq!(after.latest_activity_at, before.latest_activity_at);
+        assert_eq!(after.last_viewed_at_unix_ms, before.last_viewed_at_unix_ms);
+        assert_eq!(
+            after.latest_activity_at_unix_ms,
+            before.latest_activity_at_unix_ms
+        );
     }
 
     // ---- Redacting Debug over trusted request/event bodies -----------------

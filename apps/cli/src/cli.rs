@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 #[derive(Debug, Parser)]
@@ -55,6 +55,85 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+pub fn public_v0_1_command() -> clap::Command {
+    PublicCli::command()
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "cockpit",
+    version,
+    about = "AI coding harness with an interactive terminal UI",
+    propagate_version = true
+)]
+pub struct PublicCli {
+    #[arg(long, value_name = "PATH")]
+    pub project: Option<PathBuf>,
+    #[arg(long, global = true)]
+    pub print_logs: bool,
+    #[arg(long, global = true, value_name = "LEVEL")]
+    pub log_level: Option<String>,
+    #[arg(long, global = true, hide = true)]
+    pub pure: bool,
+    #[arg(long, global = true)]
+    pub debug_last_message: bool,
+    #[arg(long, global = true)]
+    pub no_sandbox: bool,
+    #[command(subcommand)]
+    pub command: Option<PublicCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PublicCommand {
+    Ask(AskArgs),
+    Run(RunArgs),
+    #[command(subcommand)]
+    Agent(AgentCommand),
+    #[command(subcommand, name = "provider")]
+    Provider(ProvidersCommand),
+    Setup(SetupArgs),
+    Models(ModelsArgs),
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+    Doctor(DoctorArgs),
+    #[command(subcommand)]
+    Session(SessionCommand),
+    #[command(subcommand)]
+    Trust(TrustCommand),
+    Export(ExportArgs),
+    #[command(subcommand)]
+    Config(ConfigCommand),
+    Init(InitArgs),
+}
+
+impl From<PublicCli> for Cli {
+    fn from(value: PublicCli) -> Self {
+        Self {
+            project: value.project,
+            print_logs: value.print_logs,
+            log_level: value.log_level,
+            pure: value.pure,
+            debug_last_message: value.debug_last_message,
+            no_sandbox: value.no_sandbox,
+            command: value.command.map(|command| match command {
+                PublicCommand::Ask(args) => Command::Ask(args),
+                PublicCommand::Run(args) => Command::Run(args),
+                PublicCommand::Agent(args) => Command::Agent(args),
+                PublicCommand::Provider(args) => Command::Provider(args),
+                PublicCommand::Setup(args) => Command::Setup(args),
+                PublicCommand::Models(args) => Command::Models(args),
+                PublicCommand::Daemon(args) => Command::Daemon(args),
+                PublicCommand::Doctor(args) => Command::Doctor(args),
+                PublicCommand::Session(args) => Command::Session(args),
+                PublicCommand::Trust(args) => Command::Trust(args),
+                PublicCommand::Export(args) => Command::Export(args),
+                PublicCommand::Config(args) => Command::Config(args),
+                PublicCommand::Init(args) => Command::Init(args),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Ask a registered dependency package using the read-only docs agent.
@@ -96,7 +175,7 @@ pub enum Command {
     Account(AccountCommand),
 
     /// Manage AI providers and credentials.
-    #[command(subcommand, name = "provider", alias = "providers", alias = "auth")]
+    #[command(subcommand, name = "provider")]
     Provider(ProvidersCommand),
 
     /// Run an interactive setup wizard.
@@ -133,6 +212,7 @@ pub enum Command {
     Session(SessionCommand),
 
     /// Manage durable daemon scheduler jobs.
+    #[cfg(feature = "extended")]
     #[command(subcommand)]
     Schedule(ScheduleCommand),
 
@@ -166,14 +246,17 @@ pub enum Command {
     Mcp(McpCommand),
 
     /// Removed: use `cockpit account login` or `cockpit provider add`.
+    #[cfg(feature = "remote")]
     #[command(hide = true)]
     Login(RemovedCommandArgs),
 
     /// Removed: use `cockpit account logout` or `cockpit provider add`.
+    #[cfg(feature = "remote")]
     #[command(hide = true)]
     Logout,
 
     /// Removed: use `cockpit account whoami` or `cockpit provider add`.
+    #[cfg(feature = "remote")]
     #[command(hide = true)]
     Whoami,
 
@@ -426,6 +509,7 @@ pub struct SkillCuratorRollbackArgs {
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
     /// Show or save explicit image-generation spend policy.
+    #[cfg(feature = "extended")]
     #[command(name = "image-spend")]
     ImageSpend(ImageSpendArgs),
     /// Export portable provider/model policy JSON without credentials.
@@ -436,6 +520,7 @@ pub enum ConfigCommand {
     ImportPolicy(ConfigImportPolicyArgs),
 }
 
+#[cfg(feature = "extended")]
 #[derive(Debug, clap::Args)]
 pub struct ImageSpendArgs {
     /// Save the reviewed JSON policy from this file.
@@ -1765,7 +1850,7 @@ mod tests {
     #[cfg(not(feature = "remote"))]
     #[test]
     fn local_release_rejects_remote_command_surface() {
-        for command in ["account", "sync", "connect"] {
+        for command in ["account", "sync", "connect", "login", "logout", "whoami"] {
             assert!(
                 Cli::try_parse_from(["cockpit", command]).is_err(),
                 "local release unexpectedly exposed `{command}`"
@@ -1774,33 +1859,14 @@ mod tests {
     }
 
     #[test]
-    fn provider_aliases_parse() {
-        for root in ["provider", "providers", "auth"] {
-            let cli = Cli::try_parse_from(["cockpit", root, "list"]).unwrap();
-            assert!(matches!(
-                cli.command,
-                Some(Command::Provider(ProvidersCommand::List))
-            ));
-
-            let cli =
-                Cli::try_parse_from(["cockpit", root, "usage", "--provider", "openai"]).unwrap();
-            match cli.command {
-                Some(Command::Provider(ProvidersCommand::Usage(args))) => {
-                    assert_eq!(args.provider.as_deref(), Some("openai"));
-                }
-                other => panic!("expected provider usage command, got {other:?}"),
-            }
-
-            let cli = Cli::try_parse_from(["cockpit", root, "logout", "codex-oauth"]).unwrap();
-            match cli.command {
-                Some(Command::Provider(ProvidersCommand::Logout(args))) => {
-                    assert_eq!(args.provider, "codex-oauth");
-                }
-                other => panic!("expected provider logout command, got {other:?}"),
-            }
+    fn provider_has_no_public_root_aliases() {
+        assert!(PublicCli::try_parse_from(["cockpit", "provider", "list"]).is_ok());
+        for alias in ["providers", "auth"] {
+            assert!(PublicCli::try_parse_from(["cockpit", alias, "list"]).is_err());
         }
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn removed_login_stub_parses_but_is_hidden_from_help() {
         let cli = Cli::try_parse_from(["cockpit", "login", "--force"]).unwrap();

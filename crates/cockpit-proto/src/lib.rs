@@ -41,8 +41,8 @@ pub use agent_installation::{
 pub use agent_management::{
     AgentEditSnapshot, AgentEditTarget, AgentEditorCompletion, AgentEditorLease,
     AgentEditorSettlementStatus, AgentEntryKind, AgentInventoryEntry, AgentMutation,
-    AgentMutationOutcome, AgentMutationResult, AgentSourceLayer, GoalSupervisionPatch,
-    MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
+    AgentMutationExpectations, AgentMutationOutcome, AgentMutationResult, AgentSourceLayer,
+    GoalSupervisionPatch, MAX_AGENT_MARKDOWN_BYTES, MAX_AGENT_METADATA_BYTES, MAX_AGENT_NAME_BYTES,
     MAX_ASSISTANT_CONFIG_BYTES, MAX_ASSISTANT_DIAGNOSTIC_BYTES, MAX_ASSISTANT_HOME_BYTES,
     agent_edit_projection_material, agent_inventory_entry_projection_material,
     agent_mutation_intent_hash, agent_mutation_name, assistant_mutation_intent_hash,
@@ -59,12 +59,14 @@ pub use config_management::{
 pub mod bulk_transfer;
 pub mod host_capabilities;
 pub mod image_control;
+pub mod launch;
 pub mod provider_management;
 pub use host_capabilities::{
     CatalogDependencyImportance, CatalogDependencyRow, CatalogDependencyState,
     CatalogExecutionTarget, FeatureCapabilityRow, FeatureCapabilityState, HostCapabilitySnapshot,
     SecretStoreIntent, SecretStorePlacement, SecretStoreSnapshot,
 };
+pub use launch::{LaunchBundle, LaunchInfo, RepoStatus};
 pub use provider_management::{
     ProviderLayerMetadataPatch, ProviderMutationBatch, ProviderMutationDelete,
     ProviderMutationUpsert, ProviderSecretValue,
@@ -362,6 +364,12 @@ pub struct ProviderConfigView {
     /// contains no header/env literals or credential values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_config_json: Option<String>,
+    /// Daemon-redacted contents of the single authored MCP layer selected by
+    /// `mcp_config_path`. This is deliberately separate from the effective
+    /// projection above: clients may render inherited servers, but mutations
+    /// are computed against and applied only to this document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_authored_config_json: Option<String>,
     /// Daemon-selected canonical MCP authority root and write target for this
     /// snapshot. These bind a later save receipt without making the frontend
     /// rediscover layered config paths.
@@ -383,6 +391,43 @@ pub struct ProviderConfigView {
     /// not load legacy config.json literals locally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extended_config_json: Option<String>,
+}
+
+/// A target-layer MCP edit. The daemon applies these operations to the raw
+/// authored document under its config lock; it never persists a client's
+/// flattened effective projection.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct McpConfigPatch {
+    pub operations: Vec<McpConfigPatchOperation>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum McpConfigPatchOperation {
+    AddServer {
+        name: String,
+        /// A redacted/reference-bearing `ServerConfig` JSON object. Keeping
+        /// the core type out of this crate preserves the protocol boundary.
+        server_json: SensitiveWirePayload,
+    },
+    /// Copy an inherited effective server into this authored layer with an
+    /// intentional override. This is distinct from add so ownership changes
+    /// cannot happen accidentally.
+    MaterializeInheritedServer {
+        name: String,
+        server_json: SensitiveWirePayload,
+    },
+    /// Change known fields on a server already authored in this layer. Values
+    /// are a JSON object keyed by `ServerConfig` field; omitted raw/unknown
+    /// sibling fields are preserved by the daemon.
+    UpdateAuthoredServer {
+        name: String,
+        set_fields_json: SensitiveWirePayload,
+        unset_fields: Vec<String>,
+    },
+    /// Delete an entry authored in the selected layer. The daemon rejects
+    /// deletion of an inherited-only server; MCP has no tombstone syntax.
+    DeleteAuthoredServer { name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -751,6 +796,17 @@ pub struct ContainerAvailability {
     pub harness_in_container: bool,
     pub available: bool,
     pub reason: Option<ContainerUnavailableReason>,
+}
+
+impl ContainerAvailability {
+    pub fn unpublished() -> Self {
+        Self {
+            runtime: None,
+            harness_in_container: false,
+            available: false,
+            reason: Some(ContainerUnavailableReason::NoRuntime),
+        }
+    }
 }
 
 impl Default for ContainerAvailability {
@@ -1669,8 +1725,8 @@ impl<'de> Deserialize<'de> for RemoteOperationIdentityV1 {
 
 mod request;
 pub use request::{
-    ActiveModelSwitchTrigger, AttachmentPurpose, LspControlAction, Request, RunInvocationOptions,
-    UsageKind,
+    ActiveModelSwitchTrigger, AttachmentPurpose, ImageIngressSourceV1, LspControlAction, Request,
+    RunInvocationOptions, UsageKind,
 };
 #[cfg(feature = "remote")]
 pub use request::{
@@ -1715,6 +1771,29 @@ pub struct FsEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitStatusEntry {
     pub raw: String,
+}
+
+/// Read-only Git projection requested by a daemon client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum GitReadSource {
+    Worktree,
+    Staged,
+    Unstaged,
+    Unpushed,
+    PullRequest(String),
+}
+
+/// Display-safe result for one independently requested review source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitReviewSourceResult {
+    pub source: GitReadSource,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    pub has_changes: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1832,8 +1911,8 @@ impl DelegationSteerResult {
 
 mod response;
 pub use response::{
-    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, Response,
-    RunInvocationCancelOutcome, RunInvocationCancelResultV1, RunInvocationLifecycleState,
+    ActiveModelState, BtwForkInfo, ClientSubmissionReceiptStatus, ImageIngressAdmissionReceiptV1,
+    Response, RunInvocationCancelOutcome, RunInvocationCancelResultV1, RunInvocationLifecycleState,
     RunInvocationStatusV1, RunInvocationTerminalReason,
 };
 #[cfg(feature = "remote")]
@@ -1988,6 +2067,16 @@ pub enum ErrorCode {
     TerminalGenerationGone,
     /// `SetSandbox` asked for a mode the host capability snapshot cannot honor.
     SandboxCapabilityMissing,
+    /// SQLite could not extend durable storage. Commit outcome may be unknown.
+    StorageFull,
+    /// SQLite could not allocate memory for durable work. Outcome may be unknown.
+    StorageMemory,
+    /// The database or its directory is not writable.
+    StorageReadOnly,
+    /// SQLite reported a storage-device/filesystem I/O failure. Outcome may be unknown.
+    StorageIo,
+    /// SQLite reported database corruption or a non-database file.
+    StorageCorrupt,
     /// Anything else.
     Internal,
     /// Error code from a future peer that this binary does not know yet.
@@ -2043,6 +2132,11 @@ impl<'de> Deserialize<'de> for ErrorCode {
             "ingress_path_unavailable" => Self::IngressPathUnavailable,
             "terminal_generation_gone" => Self::TerminalGenerationGone,
             "sandbox_capability_missing" => Self::SandboxCapabilityMissing,
+            "storage_full" => Self::StorageFull,
+            "storage_memory" => Self::StorageMemory,
+            "storage_read_only" => Self::StorageReadOnly,
+            "storage_io" => Self::StorageIo,
+            "storage_corrupt" => Self::StorageCorrupt,
             "internal" => Self::Internal,
             _ => Self::Other(raw),
         })
@@ -2085,6 +2179,11 @@ impl std::fmt::Display for ErrorCode {
             Self::IngressPathUnavailable => "ingress_path_unavailable",
             Self::TerminalGenerationGone => "terminal_generation_gone",
             Self::SandboxCapabilityMissing => "sandbox_capability_missing",
+            Self::StorageFull => "storage_full",
+            Self::StorageMemory => "storage_memory",
+            Self::StorageReadOnly => "storage_read_only",
+            Self::StorageIo => "storage_io",
+            Self::StorageCorrupt => "storage_corrupt",
             Self::Internal => "internal",
             Self::Other(raw) => raw,
         };
@@ -2282,7 +2381,7 @@ pub struct LiveStatus {
 #[allow(unused_imports)]
 pub use cockpit_config::{
     config::extended::{ApprovalMode, LlmMode},
-    config::providers::PromptCacheRetention,
+    config::providers::{ActiveModelRef, PromptCacheRetention, ThinkingMode},
     config::sandbox_mode::SandboxMode,
 };
 
@@ -3270,13 +3369,45 @@ pub struct TagExpansionMeta {
     pub ok: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueueTarget {
     pub id: String,
     pub agent: String,
     pub depth: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_call_id: Option<String>,
+}
+
+impl Default for QueueTarget {
+    fn default() -> Self {
+        Self::root("")
+    }
+}
+
+impl QueueTarget {
+    pub fn root(agent: impl Into<String>) -> Self {
+        Self {
+            id: "root".to_string(),
+            agent: agent.into(),
+            depth: 0,
+            task_call_id: None,
+        }
+    }
+
+    pub fn child(
+        agent: impl Into<String>,
+        depth: usize,
+        task_call_id: impl Into<String>,
+        label: impl AsRef<str>,
+    ) -> Self {
+        let task_call_id = task_call_id.into();
+        Self {
+            id: format!("task:{task_call_id}:{}", label.as_ref()),
+            agent: agent.into(),
+            depth,
+            task_call_id: Some(task_call_id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -6984,9 +7115,8 @@ mod tests {
                 config_path: "/tmp/project/.cockpit/mcp.json".into(),
                 expected_revision: "00".repeat(32),
                 mutation_intent_hash: "11".repeat(32),
-                config_json: "{}".into(),
+                patch: r#"{"operations":[]}"#.into(),
                 secret_values_json: SensitiveWirePayload::new("{}".into()),
-                cleanup_names_json: "[]".into(),
             },
             Request::ApplyExtendedConfigPatch {
                 client_operation_id: "patch-config".into(),
@@ -7030,6 +7160,7 @@ mod tests {
                 begin_client_operation_id: "begin-mcp".into(),
                 flow_id: Some("flow".into()),
             },
+            #[cfg(feature = "extended")]
             Request::SaveImageSpendPolicy {
                 client_operation_id: "save-image-spend".into(),
                 project_key: "project".into(),
@@ -7051,7 +7182,9 @@ mod tests {
                 client_operation_id: "complete-editor".into(),
                 project_root: "/tmp/project".into(),
                 lease_id: Uuid::nil().to_string(),
-                markdown: None,
+                markdown: Some(SensitiveWirePayload::new(
+                    "---\nschemaVersion: 2\n---\nBe helpful.\n".into(),
+                )),
             },
             Request::GetAgentEditorLeaseSettlement {
                 client_operation_id: "complete-editor".into(),
@@ -7161,6 +7294,7 @@ mod tests {
                 config_generation: 7,
                 credential_count: 0,
             },
+            #[cfg(feature = "extended")]
             Response::ImageSpendPolicySaved {
                 client_operation_id: "save-image-spend".into(),
                 project_key: "project".into(),
@@ -7891,6 +8025,15 @@ mod tests {
         }
         assert_eq!(mcp["expected_revision"].as_str().map(str::len), Some(64));
         assert_eq!(mcp["mutation_intent_hash"].as_str().map(str::len), Some(64));
+        let patch: McpConfigPatch = serde_json::from_str(
+            mcp["patch"]
+                .as_str()
+                .expect("MCP patch must use the zeroizing wire envelope"),
+        )
+        .expect("current MCP patch fixture must be typed");
+        assert!(!patch.operations.is_empty());
+        assert!(mcp.get("config_json").is_none());
+        assert!(mcp.get("cleanup_names_json").is_none());
         for tag in ["cancel_provider_oauth", "cancel_mcp_oauth"] {
             assert!(requests[tag]["params"]["begin_client_operation_id"].is_string());
         }
@@ -7948,6 +8091,7 @@ mod tests {
             assert!(requests[tag]["params"]["client_operation_id"].is_string());
             assert!(requests[tag]["params"]["lease_id"].is_string());
         }
+        assert!(requests["complete_agent_editor_lease"]["params"]["markdown"].is_string());
         assert!(
             requests["get_agent_editor_lease_settlement"]["params"]
                 .get("markdown")
@@ -7961,6 +8105,8 @@ mod tests {
         assert!(receipt["client_operation_id"].is_string());
         assert!(receipt["lease_id"].is_string());
         assert!(receipt["consumed_revision"].is_string());
+        assert_eq!(receipt["consumed_config_generation"], 7);
+        assert_eq!(receipt["result_config_generation"], 8);
         assert!(receipt["status"]["result_revision"].is_string());
         assert!(receipt.get("markdown").is_none());
         assert!(receipt.get("snapshot").is_none());

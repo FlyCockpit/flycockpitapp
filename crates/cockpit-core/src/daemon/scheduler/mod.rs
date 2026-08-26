@@ -1168,7 +1168,7 @@ fn row_to_job(row: ScheduledJobRow) -> Result<ScheduledJob> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;

@@ -419,7 +419,7 @@ fn preflight_and_terminal_events_target_only_the_correlated_optimistic_row() {
 
     app.apply_event(TurnEvent::UserMessagesTerminated {
         client_submission_ids: vec![first_id],
-        disposition: cockpit_core::daemon::proto::UserMessageTerminalDisposition::PreflightRejected,
+        disposition: cockpit_proto::UserMessageTerminalDisposition::PreflightRejected,
     });
     app.apply_event(TurnEvent::UserMessageRetracted {
         client_submission_ids: vec![first_id],

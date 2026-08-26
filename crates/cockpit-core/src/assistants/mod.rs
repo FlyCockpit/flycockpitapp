@@ -210,7 +210,7 @@ fn create_assistant_with_installation_id_sync(
     if spec.home_dir != canonical_home {
         bail!("assistant creation requires the daemon-owned canonical home");
     }
-    crate::private_fs::ensure_private_dir(&spec.home_dir)
+    cockpit_host::private_fs::ensure_private_dir(&spec.home_dir)
         .with_context(|| format!("creating assistant home {}", spec.home_dir.display()))?;
     let path = assistant_definition_path(&spec.home_dir);
     let _guard = cockpit_config::config::hold_config_mutation_lock(&path)?;
@@ -481,7 +481,7 @@ pub fn registration_revision(row: &AssistantRow) -> String {
     crate::daemon::authority_token::mint(
         b"assistant-registration-revision/v1",
         &[
-            &row.created_at.to_le_bytes(),
+            &row.created_at_unix_ms.to_le_bytes(),
             row.name.as_bytes(),
             row.home_dir.as_bytes(),
             row.config_json.as_bytes(),
@@ -564,7 +564,7 @@ fn recover_creation_journal_locked(db: &Db, home: &Path) -> Result<()> {
     let target = assistant_definition_path(home);
     let row_for_validation = AssistantRow {
         name: journal.name.clone(),
-        created_at: 0,
+        created_at_unix_ms: 0,
         home_dir: journal.home_dir.clone(),
         config_json: journal.config_json.clone(),
         content_hash: journal.content_hash.clone(),
@@ -904,15 +904,14 @@ fn save_definition_cas_sync(
     let expected = row.clone();
     let next_hash_for_db = next_hash.clone();
     let updated = match db.write_blocking(move |conn| {
-        let changed = conn.execute(
-            "UPDATE assistants SET content_hash=?5 WHERE name=?1 AND home_dir=?2 AND config_json=?3 AND content_hash=?4",
-            rusqlite::params![expected.name, expected.home_dir, expected.config_json, expected.content_hash, next_hash_for_db],
-        )?;
-        if changed != 1 {
-            bail!("assistant registry changed before definition commit");
-        }
-        crate::db::Db::get_assistant_conn(conn, &expected.name)?
-            .context("assistant disappeared after definition update")
+        crate::db::Db::update_assistant_content_hash_cas_conn(
+            conn,
+            &expected.name,
+            &expected.home_dir,
+            &expected.config_json,
+            &expected.content_hash,
+            &next_hash_for_db,
+        )
     }) {
         Ok(updated) => updated,
         Err(error) => {
@@ -999,7 +998,7 @@ struct UnregisterJournal {
     operation_id: String,
     phase: UnregisterPhase,
     name: String,
-    created_at: i64,
+    created_at_unix_ms: i64,
     home_dir: String,
     config_json: String,
     content_hash: String,
@@ -1008,7 +1007,7 @@ struct UnregisterJournal {
 
 fn row_matches_unregister_journal(row: &AssistantRow, journal: &UnregisterJournal) -> bool {
     row.name == journal.name
-        && row.created_at == journal.created_at
+        && row.created_at_unix_ms == journal.created_at_unix_ms
         && row.home_dir == journal.home_dir
         && row.config_json == journal.config_json
         && row.content_hash == journal.content_hash
@@ -1097,7 +1096,7 @@ fn build_unregister_journal(
         operation_id,
         phase: UnregisterPhase::Prepared,
         name: row.name.clone(),
-        created_at: row.created_at,
+        created_at_unix_ms: row.created_at_unix_ms,
         home_dir: row.home_dir.clone(),
         config_json: row.config_json.clone(),
         content_hash: row.content_hash.clone(),
@@ -1107,7 +1106,7 @@ fn build_unregister_journal(
 
 fn persist_unregister_journal(journal: &UnregisterJournal) -> Result<()> {
     let root = unregister_journal_root()?;
-    crate::private_fs::ensure_private_dir(&root)?;
+    cockpit_host::private_fs::ensure_private_dir(&root)?;
     let bytes = serde_json::to_vec_pretty(journal)?;
     cockpit_config::config::write_config_bytes_atomic(&unregister_journal_path(journal)?, &bytes)?;
     cockpit_config::config::sync_directory_nofollow(&root)
@@ -1129,9 +1128,9 @@ fn quarantine_unregister_journals(
     journal: &UnregisterJournal,
 ) -> Result<()> {
     let root = home.join(".assistant-unregister-quarantine");
-    crate::private_fs::ensure_private_dir(&root)?;
+    cockpit_host::private_fs::ensure_private_dir(&root)?;
     let operation = quarantine_operation_dir(home, journal);
-    crate::private_fs::ensure_private_dir(&operation)?;
+    cockpit_host::private_fs::ensure_private_dir(&operation)?;
     cockpit_config::config::sync_directory_nofollow(&root)?;
     cockpit_config::config::sync_directory_nofollow(&operation)?;
     for artifact in &journal.artifacts {
@@ -1181,8 +1180,8 @@ fn delete_registered_row_cas(db: &Db, journal: &UnregisterJournal) -> Result<boo
     let journal = journal.clone();
     db.write_blocking(move |conn| {
         let changed = conn.execute(
-            "DELETE FROM assistants WHERE name=?1 AND created_at=?2 AND home_dir=?3 AND config_json=?4 AND content_hash=?5",
-            rusqlite::params![journal.name, journal.created_at, journal.home_dir, journal.config_json, journal.content_hash],
+            "DELETE FROM assistants WHERE name=?1 AND created_at_unix_ms=?2 AND home_dir=?3 AND config_json=?4 AND content_hash=?5",
+            rusqlite::params![journal.name, journal.created_at_unix_ms, journal.home_dir, journal.config_json, journal.content_hash],
         )?;
         Ok(changed == 1)
     })

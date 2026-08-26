@@ -8,7 +8,8 @@
 //!   - `Dialog::CreateConfig`    no config yet — pick a location to scaffold
 //!   - `Dialog::Settings`        navigate the settings tree
 //!
-//! The Settings page tree (root has 16 nodes; see `root_nodes()`):
+//! The Settings page tree has 15 default-profile nodes and one additional
+//! extended-profile node; see `root_nodes()`:
 //!
 //! ```text
 //! Root
@@ -48,6 +49,7 @@ pub(crate) mod disk_daemon_fake;
 mod grab;
 mod harnesses_page;
 mod image_generation;
+#[cfg(feature = "extended")]
 mod image_spend;
 mod lsp_page;
 mod mcp_page;
@@ -96,11 +98,19 @@ use providers::initial_list_cursor;
 /// daemon.  Keeping this tiny helper here makes accidental local vault opens
 /// in settings code both unnecessary and easy for the boundary ratchet to
 /// reject.
-pub(crate) async fn settings_daemon_client()
--> anyhow::Result<cockpit_core::daemon::client::DaemonClient> {
-    Ok(cockpit_core::daemon::client::ensure_persistent_daemon()
-        .await?
-        .client)
+pub(crate) async fn settings_daemon_client(
+    lifecycle: &cockpit_client::LifecycleClient,
+) -> anyhow::Result<cockpit_client::DaemonClient> {
+    let resolved = lifecycle
+        .resolve(cockpit_client::LifecycleIntent::EnsurePersistent)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    cockpit_client::DaemonClient::connect_endpoint(&resolved.endpoint).await
+}
+
+#[cfg(test)]
+pub(crate) fn test_lifecycle_client() -> cockpit_client::LifecycleClient {
+    cockpit_core::daemon::client::test_lifecycle_client()
 }
 
 /// A transport captured on the reducer thread and then owned by an async
@@ -108,20 +118,23 @@ pub(crate) async fn settings_daemon_client()
 /// another runtime worker; production performs the request on the daemon's
 /// asynchronous client.
 pub(crate) struct CapturedSettingsDaemon {
+    lifecycle: cockpit_client::LifecycleClient,
     #[cfg(test)]
     effect: Arc<dyn SettingsDaemonEffect>,
 }
 
-pub(crate) fn capture_settings_daemon() -> CapturedSettingsDaemon {
+pub(crate) fn capture_settings_daemon(
+    lifecycle: cockpit_client::LifecycleClient,
+) -> CapturedSettingsDaemon {
     #[cfg(test)]
     {
         let effect = TEST_SETTINGS_DAEMON_EFFECT
             .with(|slot| slot.borrow().clone())
             .unwrap_or_else(disk_daemon_fake::default_effect);
-        return CapturedSettingsDaemon { effect };
+        return CapturedSettingsDaemon { lifecycle, effect };
     }
     #[cfg(not(test))]
-    CapturedSettingsDaemon {}
+    CapturedSettingsDaemon { lifecycle }
 }
 
 impl CapturedSettingsDaemon {
@@ -132,7 +145,7 @@ impl CapturedSettingsDaemon {
         }
         #[cfg(not(test))]
         {
-            let client = settings_daemon_client()
+            let client = settings_daemon_client(&self.lifecycle)
                 .await
                 .map_err(|error| error.to_string())?;
             tokio::time::timeout(std::time::Duration::from_secs(15), client.request(request))
@@ -185,6 +198,13 @@ pub(crate) struct SettingsBlockingEffectRequest {
 }
 
 pub(crate) enum SettingsBlockingEffectWork {
+    PathSuggestions {
+        editor_generation: uuid::Uuid,
+        draft_generation: u64,
+        cwd: std::path::PathBuf,
+        value: String,
+        mode: crate::tui::dir_suggest::PathSuggestMode,
+    },
     PrepareAgentEditor {
         staging_id: uuid::Uuid,
         seed: String,
@@ -205,9 +225,27 @@ pub(crate) enum SettingsBlockingEffectWork {
     },
 }
 
+impl SettingsBlockingEffectWork {
+    pub(crate) fn action_label(&self) -> &'static str {
+        match self {
+            Self::PathSuggestions { .. } => "settings.path-suggest",
+            _ => "settings.blocking-effect",
+        }
+    }
+}
+
 impl std::fmt::Debug for SettingsBlockingEffectWork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PathSuggestions {
+                editor_generation,
+                draft_generation,
+                ..
+            } => f
+                .debug_struct("PathSuggestions")
+                .field("editor_generation", editor_generation)
+                .field("draft_generation", draft_generation)
+                .finish(),
             Self::PrepareAgentEditor { staging_id, .. } => f
                 .debug_struct("PrepareAgentEditor")
                 .field("staging_id", staging_id)
@@ -237,6 +275,11 @@ impl std::fmt::Debug for SettingsBlockingEffectWork {
 }
 
 pub(crate) enum SettingsBlockingOutcome {
+    PathSuggestions {
+        editor_generation: uuid::Uuid,
+        draft_generation: u64,
+        entries: Vec<crate::tui::dir_suggest::DirSuggestion>,
+    },
     AgentEditorPrepared {
         staging_id: uuid::Uuid,
         staging: agents_page::AgentExternalEditStaging,
@@ -258,6 +301,16 @@ pub(crate) enum SettingsBlockingOutcome {
 impl std::fmt::Debug for SettingsBlockingOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::PathSuggestions {
+                editor_generation,
+                draft_generation,
+                entries,
+            } => f
+                .debug_struct("PathSuggestions")
+                .field("editor_generation", editor_generation)
+                .field("draft_generation", draft_generation)
+                .field("entries", &entries.len())
+                .finish(),
             Self::AgentEditorPrepared { staging_id, .. } => f
                 .debug_struct("AgentEditorPrepared")
                 .field("staging_id", staging_id)
@@ -286,6 +339,17 @@ pub(crate) fn execute_settings_blocking_work(
     work: SettingsBlockingEffectWork,
 ) -> Result<SettingsBlockingOutcome, String> {
     match work {
+        SettingsBlockingEffectWork::PathSuggestions {
+            editor_generation,
+            draft_generation,
+            cwd,
+            value,
+            mode,
+        } => Ok(SettingsBlockingOutcome::PathSuggestions {
+            editor_generation,
+            draft_generation,
+            entries: crate::tui::dir_suggest::suggest_paths(&cwd, &value, mode),
+        }),
         SettingsBlockingEffectWork::PrepareAgentEditor { staging_id, seed } => {
             let staging = agents_page::prepare_agent_external_edit_staging(&seed)?;
             Ok(SettingsBlockingOutcome::AgentEditorPrepared {
@@ -340,9 +404,8 @@ pub(crate) enum SettingsDaemonEffectWork {
         config_path: String,
         expected_revision: String,
         mutation_intent_hash: String,
-        config_json: String,
+        patch: cockpit_proto::McpConfigPatch,
         secret_values_json: SecretPayload,
-        cleanup_names_json: String,
     },
     ProviderMutation(ProviderMutationPlan),
     TypedDocumentEdit(TypedDocumentEditPlan),
@@ -479,6 +542,7 @@ fn provider_plan_intent_hash(
                 cockpit_proto::ProviderLayerMetadataPatch {
                     category_defaults: category_defaults.clone(),
                     on_unlisted_models_fetch: *on_unlisted_models_fetch,
+                    active_model: None,
                 }
             }),
     }
@@ -513,8 +577,9 @@ pub(crate) struct CommittedRefreshNeeded {
 
 pub(crate) async fn execute_settings_daemon_work(
     work: SettingsDaemonEffectWork,
+    lifecycle: cockpit_client::LifecycleClient,
 ) -> Result<SettingsDaemonWorkOutcome, String> {
-    let client = settings_daemon_client()
+    let client = settings_daemon_client(&lifecycle)
         .await
         .map_err(|error| error.to_string())?;
     match work {
@@ -585,9 +650,8 @@ pub(crate) async fn execute_settings_daemon_work(
             config_path,
             expected_revision,
             mutation_intent_hash,
-            config_json,
+            patch,
             secret_values_json,
-            cleanup_names_json,
         } => Ok(SettingsDaemonWorkOutcome {
             response: client
                 .request(Request::SaveMcpConfig {
@@ -598,11 +662,12 @@ pub(crate) async fn execute_settings_daemon_work(
                     config_path,
                     expected_revision,
                     mutation_intent_hash,
-                    config_json,
+                    patch: cockpit_proto::SensitiveWirePayload::new(
+                        serde_json::to_string(&patch).map_err(|error| error.to_string())?,
+                    ),
                     secret_values_json: cockpit_proto::SensitiveWirePayload::new(
                         secret_values_json.take(),
                     ),
-                    cleanup_names_json,
                 })
                 .await
                 .map_err(|error| error.to_string())?
@@ -647,6 +712,7 @@ pub(crate) async fn execute_settings_daemon_work(
                         cockpit_proto::ProviderLayerMetadataPatch {
                             category_defaults,
                             on_unlisted_models_fetch,
+                            active_model: None,
                         }
                     }),
             };
@@ -754,7 +820,7 @@ pub(crate) async fn execute_settings_daemon_work(
             let expected_layer_id = layer.layer_id.clone();
             let expected_layer_kind = layer.kind;
             let expected_revision = layer.revision.clone();
-            let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+            let patch = cockpit_proto::ExtendedConfigPatch {
                 operations,
                 materialize: true,
                 denylist: Vec::new(),
@@ -847,7 +913,7 @@ pub(crate) async fn execute_settings_daemon_work(
                     layer,
                     consumed_revision,
                     result_revision,
-                    status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+                    status: cockpit_proto::ConfigCommitStatus::Committed,
                     config_generation,
                     ..
                 } if client_operation_id == plan.client_operation_id
@@ -934,60 +1000,12 @@ pub(crate) struct SettingsBlockingEffectMetadata {
     pub(crate) target: SettingsEffectTarget,
 }
 
-/// Run a short daemon RPC from an input reducer. Production reducers execute
-/// beneath the application's multi-thread Tokio runtime. Unit reducers are
-/// intentionally synchronous, so give those tests the same daemon boundary
-/// instead of panicking before the request can be exercised.
-fn run_settings_daemon<T>(
-    future: impl std::future::Future<Output = Result<T, String>>,
-) -> Result<T, String> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        if matches!(
-            handle.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            return tokio::task::block_in_place(|| handle.block_on(future));
-        }
-        return Err("settings daemon RPC requires a multi-thread application runtime".to_string());
-    }
-    #[cfg(test)]
-    {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())?
-            .block_on(future)
-    }
-    #[cfg(not(test))]
-    Err("settings daemon RPC requires the application runtime".to_string())
-}
-
 /// Injectable transport boundary for settings daemon effects.  Both the real
 /// client and tests feed responses through the same snapshot/patch/receipt
 /// validation below; a test double may replace only transport, never config
 /// loading or persistence.
 trait SettingsDaemonEffect: Send + Sync {
     fn request(&self, request: Request) -> Result<Response, String>;
-}
-
-#[cfg(not(test))]
-struct ProductionSettingsDaemonEffect;
-
-#[cfg(not(test))]
-impl SettingsDaemonEffect for ProductionSettingsDaemonEffect {
-    fn request(&self, request: Request) -> Result<Response, String> {
-        run_settings_daemon(async move {
-            let client = settings_daemon_client()
-                .await
-                .map_err(|error| error.to_string())?;
-            client
-                .request(request)
-                .await
-                .map_err(|error| error.to_string())?
-                .map_err(|error| error.to_string())
-        })
-    }
 }
 
 #[cfg(test)]
@@ -1004,13 +1022,9 @@ pub(crate) fn test_daemon_request(request: Request) -> Result<Response, String> 
     disk_daemon_fake::default_effect().request(request)
 }
 
+#[cfg(test)]
 fn settings_daemon_request(request: Request) -> Result<Response, String> {
-    #[cfg(test)]
-    {
-        return test_daemon_request(request);
-    }
-    #[cfg(not(test))]
-    ProductionSettingsDaemonEffect.request(request)
+    test_daemon_request(request)
 }
 
 #[cfg(test)]
@@ -1090,7 +1104,7 @@ fn extended_config_layer_snapshot(
 }
 
 fn decode_extended_layer(
-    layer: cockpit_core::daemon::proto::ExtendedConfigLayerSnapshot,
+    layer: cockpit_proto::ExtendedConfigLayerSnapshot,
     config_generation: u64,
 ) -> Result<(ExtendedConfig, serde_json::Value, String), String> {
     let layer_uuid = uuid::Uuid::parse_str(&layer.layer_id)
@@ -1158,7 +1172,7 @@ fn decode_extended_layer(
 #[derive(Debug, Clone)]
 pub(super) enum SettingsPatchOutcome {
     Reconciled {
-        layer: cockpit_core::daemon::proto::ExtendedConfigLayerSnapshot,
+        layer: cockpit_proto::ExtendedConfigLayerSnapshot,
         config_generation: u64,
     },
     CommittedRefreshNeeded {
@@ -1188,20 +1202,20 @@ enum PendingSettingsOperation {
         snapshot_session_id: String,
         layer_id: String,
         mutation_intent_hash: String,
-        expected_layer: cockpit_core::daemon::proto::CockpitConfigLayer,
+        expected_layer: cockpit_proto::CockpitConfigLayer,
         expected_revision: String,
         expected_generation: u64,
-        operations: Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>,
-        denylist_plan: Vec<cockpit_core::daemon::proto::DesiredDenylistEntry>,
+        operations: Vec<cockpit_proto::ExtendedConfigPathMutation>,
+        denylist_plan: Vec<cockpit_proto::DesiredDenylistEntry>,
     },
     ExtendedRefresh {
         target: SettingsEffectTarget,
         requested_path: String,
-        expected_layer: cockpit_core::daemon::proto::CockpitConfigLayer,
+        expected_layer: cockpit_proto::CockpitConfigLayer,
         result_revision: String,
         result_generation: u64,
-        operations: Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>,
-        committed_denylist: Vec<cockpit_core::daemon::proto::CommittedDenylistEntry>,
+        operations: Vec<cockpit_proto::ExtendedConfigPathMutation>,
+        committed_denylist: Vec<cockpit_proto::CommittedDenylistEntry>,
         warning: Option<String>,
     },
     ProviderCatalog {
@@ -1214,6 +1228,7 @@ enum PendingSettingsOperation {
         target: SettingsEffectTarget,
         prompt: category::ShadowedGlobalPrompt,
     },
+    #[cfg(feature = "extended")]
     ImageSpendLoad {
         target: SettingsEffectTarget,
         project_key: String,
@@ -1292,7 +1307,6 @@ impl PendingSettingsOperation {
             },
             Self::ExtendedRefresh { target, .. }
             | Self::ProjectShadowSnapshot { target, .. }
-            | Self::ImageSpendLoad { target, .. }
             | Self::ProviderMutation { target, .. }
             | Self::Followup { target, .. }
             | Self::SimpleMutation { target, .. }
@@ -1301,6 +1315,8 @@ impl PendingSettingsOperation {
             | Self::TypedDocumentEdit { target, .. }
             | Self::CategoryExternalPrepare { target, .. }
             | Self::CategoryExternalRead { target, .. } => target.clone(),
+            #[cfg(feature = "extended")]
+            Self::ImageSpendLoad { target, .. } => target.clone(),
             Self::ProviderCatalog {
                 project_root,
                 provider_id,
@@ -1354,7 +1370,6 @@ enum SettingsMutationAction {
         expected_config_path: String,
         snapshot_capability: String,
         expected_consumed_revision: String,
-        expected_result_revision: String,
         expected_request_intent_hash: String,
     },
     McpOAuthBegin {
@@ -1396,6 +1411,7 @@ enum SettingsMutationAction {
         project_root: String,
         expected_request_hash: String,
     },
+    #[cfg(feature = "extended")]
     ImageSpendSave {
         client_operation_id: String,
         project_key: String,
@@ -1418,6 +1434,7 @@ impl SettingsMutationAction {
                 "put_provider_credential"
             }
             Self::CopilotSetup { .. } => "setup_copilot_auth",
+            #[cfg(feature = "extended")]
             Self::ImageSpendSave { .. } => "save_image_spend_policy",
         }
     }
@@ -1455,8 +1472,9 @@ impl SettingsMutationAction {
             | Self::CopilotSetup {
                 client_operation_id,
                 ..
-            }
-            | Self::ImageSpendSave {
+            } => client_operation_id,
+            #[cfg(feature = "extended")]
+            Self::ImageSpendSave {
                 client_operation_id,
                 ..
             } => client_operation_id,
@@ -1465,6 +1483,7 @@ impl SettingsMutationAction {
 
     fn matches_durable_receipt(&self, response: &Response) -> bool {
         match (self, response) {
+            #[cfg(feature = "extended")]
             (
                 Self::ImageSpendSave {
                     client_operation_id,
@@ -1544,7 +1563,6 @@ impl SettingsMutationAction {
                     expected_owner_root,
                     expected_config_path,
                     expected_consumed_revision,
-                    expected_result_revision,
                     expected_request_intent_hash,
                     ..
                 },
@@ -1566,7 +1584,7 @@ impl SettingsMutationAction {
                     && owner_root == expected_owner_root
                     && config_path == expected_config_path
                     && consumed_revision == expected_consumed_revision
-                    && result_revision == expected_result_revision
+                    && cockpit_proto::is_opaque_authority_token(result_revision)
                     && mutation_intent_hash == expected_request_intent_hash
                     && cockpit_proto::is_opaque_authority_token(request_hash)
                     && *config_generation > 0
@@ -1709,12 +1727,13 @@ fn settlement_hash_matches(operation: &PendingSettingsOperation, observed: &str)
             | SettingsMutationAction::McpOAuthCancel {
                 expected_request_hash,
                 ..
-            }
-            | SettingsMutationAction::ImageSpendSave {
+            } => Some(expected_request_hash.as_str()),
+            #[cfg(feature = "extended")]
+            SettingsMutationAction::ImageSpendSave {
                 expected_request_hash,
                 ..
-            }
-            | SettingsMutationAction::ProviderCredentialDelete {
+            } => Some(expected_request_hash.as_str()),
+            SettingsMutationAction::ProviderCredentialDelete {
                 expected_request_hash,
                 ..
             }
@@ -1785,7 +1804,7 @@ fn apply_settings_patch_via_daemon(
     let operations = changed_extended_paths(base, &desired_value)?;
     let denylist = denylist_mutations(base, &desired.redact.denylist)?;
     let denylist_receipt_plan = denylist.clone();
-    let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+    let patch = cockpit_proto::ExtendedConfigPatch {
         operations: operations.clone(),
         materialize: false,
         denylist,
@@ -1825,7 +1844,7 @@ fn apply_settings_patch_via_daemon(
             layer,
             consumed_revision,
             result_revision,
-            status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+            status: cockpit_proto::ConfigCommitStatus::Committed,
             publication,
             denylist: committed_denylist,
             ..
@@ -1839,7 +1858,7 @@ fn apply_settings_patch_via_daemon(
                 || config_generation == expected_generation.saturating_add(1)) =>
         {
             let warning = (publication
-                == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded)
+                == cockpit_proto::ConfigPublicationStatus::Degraded)
                 .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
             Ok((
                 result_revision,
@@ -1910,7 +1929,7 @@ pub(super) fn apply_typed_settings_document_edit(
     let operations = changed_extended_paths(&authority_base, &desired_value)?;
     let denylist = denylist_mutations(&authority_base, &desired.redact.denylist)?;
     let denylist_receipt_plan = denylist.clone();
-    let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+    let patch = cockpit_proto::ExtendedConfigPatch {
         operations: operations.clone(),
         materialize: true,
         denylist,
@@ -1950,7 +1969,7 @@ pub(super) fn apply_typed_settings_document_edit(
             layer,
             consumed_revision,
             result_revision,
-            status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+            status: cockpit_proto::ConfigCommitStatus::Committed,
             publication,
             denylist: committed_denylist,
             ..
@@ -1964,7 +1983,7 @@ pub(super) fn apply_typed_settings_document_edit(
                 || config_generation == expected_generation.saturating_add(1)) =>
         {
             let warning = (publication
-                == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded)
+                == cockpit_proto::ConfigPublicationStatus::Degraded)
                 .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
             Ok((
                 result_revision,
@@ -2041,8 +2060,8 @@ fn apply_json_merge_patch_local(target: &mut serde_json::Value, patch: serde_jso
 fn changed_extended_paths(
     base: &serde_json::Value,
     desired: &serde_json::Value,
-) -> Result<Vec<cockpit_core::daemon::proto::ExtendedConfigPathMutation>, String> {
-    use cockpit_core::daemon::proto::{ExtendedConfigField, ExtendedConfigPathMutation as M};
+) -> Result<Vec<cockpit_proto::ExtendedConfigPathMutation>, String> {
+    use cockpit_proto::{ExtendedConfigField, ExtendedConfigPathMutation as M};
     let base = base
         .as_object()
         .ok_or_else(|| "settings base is not an object".to_string())?;
@@ -2106,7 +2125,7 @@ fn changed_extended_paths(
 }
 
 fn validate_settings_operations(
-    operations: &[cockpit_core::daemon::proto::ExtendedConfigPathMutation],
+    operations: &[cockpit_proto::ExtendedConfigPathMutation],
     snapshot: &serde_json::Value,
     authored_paths: &[Vec<String>],
 ) -> Result<(), String> {
@@ -2133,7 +2152,7 @@ fn validate_settings_operations(
     }
     for operation in operations {
         match operation {
-            cockpit_core::daemon::proto::ExtendedConfigPathMutation::Set { path, value } => {
+            cockpit_proto::ExtendedConfigPathMutation::Set { path, value } => {
                 if !authored_paths
                     .iter()
                     .any(|authored| authored == path || authored.starts_with(path))
@@ -2144,7 +2163,7 @@ fn validate_settings_operations(
                     );
                 }
             }
-            cockpit_core::daemon::proto::ExtendedConfigPathMutation::Unset { path } => {
+            cockpit_proto::ExtendedConfigPathMutation::Unset { path } => {
                 if authored_paths
                     .iter()
                     .any(|authored| authored == path || authored.starts_with(path))
@@ -2162,10 +2181,8 @@ fn validate_settings_operations(
 fn denylist_mutations(
     base: &serde_json::Value,
     desired: &[String],
-) -> Result<Vec<cockpit_core::daemon::proto::DesiredDenylistEntry>, String> {
-    use cockpit_core::daemon::proto::{
-        DesiredDenylistEntry as D, RedactedDenylistEntry, SensitiveWireLiteral,
-    };
+) -> Result<Vec<cockpit_proto::DesiredDenylistEntry>, String> {
+    use cockpit_proto::{DesiredDenylistEntry as D, RedactedDenylistEntry, SensitiveWireLiteral};
     let entries: Vec<RedactedDenylistEntry> = serde_json::from_value(
         base.get("__cockpit_denylist_entries")
             .cloned()
@@ -2208,8 +2225,8 @@ fn denylist_mutations(
 }
 
 fn validate_committed_denylist(
-    planned: &[cockpit_core::daemon::proto::DesiredDenylistEntry],
-    committed: &[cockpit_core::daemon::proto::CommittedDenylistEntry],
+    planned: &[cockpit_proto::DesiredDenylistEntry],
+    committed: &[cockpit_proto::CommittedDenylistEntry],
 ) -> Result<(), String> {
     if planned.len() != committed.len() {
         return Err("denylist receipt has the wrong length".into());
@@ -2225,10 +2242,10 @@ fn validate_committed_denylist(
             );
         }
         match planned {
-            cockpit_core::daemon::proto::DesiredDenylistEntry::Existing { entry_id }
+            cockpit_proto::DesiredDenylistEntry::Existing { entry_id }
                 if committed.client_nonce.is_none()
                     && committed.consumed_entry_id.as_ref() == Some(entry_id) => {}
-            cockpit_core::daemon::proto::DesiredDenylistEntry::New {
+            cockpit_proto::DesiredDenylistEntry::New {
                 client_nonce,
                 literal: _,
             } if committed.client_nonce.as_ref() == Some(client_nonce)
@@ -2244,8 +2261,8 @@ fn validate_committed_denylist(
 }
 
 fn same_denylist_occurrences(
-    authoritative: &[cockpit_core::daemon::proto::RedactedDenylistEntry],
-    receipt: &[cockpit_core::daemon::proto::CommittedDenylistEntry],
+    authoritative: &[cockpit_proto::RedactedDenylistEntry],
+    receipt: &[cockpit_proto::CommittedDenylistEntry],
 ) -> bool {
     authoritative.len() == receipt.len()
         && authoritative.iter().zip(receipt).all(|(left, right)| {
@@ -2259,25 +2276,22 @@ fn same_denylist_occurrences(
 /// keyset-paginated; callers must not treat the first page as the whole
 /// answer, and a concurrent mutation requires restarting the traversal.
 pub(crate) async fn secret_inventory_contains(
-    client: &cockpit_core::daemon::client::DaemonClient,
+    client: &cockpit_client::DaemonClient,
     name: &str,
-    kind: Option<cockpit_core::daemon::proto::SecretInventoryKind>,
+    kind: Option<cockpit_proto::SecretInventoryKind>,
 ) -> Result<bool, String> {
     let mut cursor = None;
     let mut restarts = 0;
     loop {
         let response = match client
-            .request(cockpit_core::daemon::proto::Request::ListSecretInventory {
+            .request(cockpit_proto::Request::ListSecretInventory {
                 cursor: cursor.clone(),
-                limit: Some(cockpit_core::daemon::proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES as u16),
+                limit: Some(cockpit_proto::MAX_OWNER_INVENTORY_PAGE_ENTRIES as u16),
             })
             .await
         {
             Ok(Ok(response)) => response,
-            Ok(Err(error))
-                if error.code == cockpit_core::daemon::proto::ErrorCode::Conflict
-                    && restarts < 2 =>
-            {
+            Ok(Err(error)) if error.code == cockpit_proto::ErrorCode::Conflict && restarts < 2 => {
                 restarts += 1;
                 cursor = None;
                 continue;
@@ -2285,7 +2299,7 @@ pub(crate) async fn secret_inventory_contains(
             Err(error) => return Err(error.to_string()),
             Ok(Err(error)) => return Err(error.to_string()),
         };
-        let cockpit_core::daemon::proto::Response::SecretInventory {
+        let cockpit_proto::Response::SecretInventory {
             entries,
             next_cursor,
         } = response
@@ -2304,8 +2318,7 @@ pub(crate) async fn secret_inventory_contains(
         cursor = Some(next_cursor);
     }
 }
-use cockpit_core::daemon::proto::{Request, Response};
-use cockpit_core::providers::models_fetch::FetchOutcome;
+use cockpit_proto::{ProviderModelFetchOutcome as FetchOutcome, Request, Response};
 use shell::{
     SettingsHeaderAction, SettingsPointerAction, SettingsPointerSurface, SettingsScrollStates,
     marker, muted_style, selected_or_field,
@@ -2665,13 +2678,16 @@ fn boxed_page(page: Page) -> PageBox {
 #[allow(private_interfaces)]
 #[cfg(test)]
 pub(crate) enum TestPageRef<'a> {
-    Root { cursor: usize },
+    Root {
+        cursor: usize,
+    },
     DefaultModel(&'a DefaultModelPage),
     Agents(&'a AgentsPage),
     Tools(&'a ToolsPage),
     Harnesses(&'a HarnessesPage),
     Providers(&'a ProvidersPage),
     Category(&'a CategoryPage),
+    #[cfg(feature = "extended")]
     ImageSpend(&'a image_spend::ImageSpendPage),
     Instructions(&'a InstructionsPage),
     RedactPatterns(&'a RedactPatternsPage),
@@ -2692,12 +2708,15 @@ pub(crate) enum TestPageRef<'a> {
 
 #[cfg(test)]
 enum TestPageMut<'a> {
-    Root { cursor: &'a mut usize },
+    Root {
+        cursor: &'a mut usize,
+    },
     Agents(&'a mut AgentsPage),
     Tools(&'a mut ToolsPage),
     Harnesses(&'a mut HarnessesPage),
     Providers(&'a mut ProvidersPage),
     Category(&'a mut CategoryPage),
+    #[cfg(feature = "extended")]
     ImageSpend(&'a mut image_spend::ImageSpendPage),
     Instructions(&'a mut InstructionsPage),
     RedactPatterns(&'a mut RedactPatternsPage),
@@ -2727,6 +2746,7 @@ impl std::fmt::Debug for TestPageRef<'_> {
             Self::Harnesses(_) => f.write_str("Harnesses"),
             Self::Providers(_) => f.write_str("Providers"),
             Self::Category(_) => f.write_str("Category"),
+            #[cfg(feature = "extended")]
             Self::ImageSpend(_) => f.write_str("ImageSpend"),
             Self::Instructions(_) => f.write_str("Instructions"),
             Self::RedactPatterns(_) => f.write_str("RedactPatterns"),
@@ -2757,6 +2777,7 @@ impl std::fmt::Debug for TestPageMut<'_> {
             Self::Harnesses(_) => f.write_str("Harnesses"),
             Self::Providers(_) => f.write_str("Providers"),
             Self::Category(_) => f.write_str("Category"),
+            #[cfg(feature = "extended")]
             Self::ImageSpend(_) => f.write_str("ImageSpend"),
             Self::Instructions(_) => f.write_str("Instructions"),
             Self::RedactPatterns(_) => f.write_str("RedactPatterns"),
@@ -2778,6 +2799,7 @@ impl std::fmt::Debug for TestPageMut<'_> {
 }
 
 pub struct SettingsCx {
+    lifecycle: cockpit_client::LifecycleClient,
     dialog_id: uuid::Uuid,
     daemon_effects: VecDeque<SettingsDaemonEffectRequest>,
     blocking_effects: VecDeque<SettingsBlockingEffectRequest>,
@@ -2832,6 +2854,10 @@ pub struct SettingsCx {
     /// Daemon-redacted MCP snapshot. MCP config is never read from disk by
     /// the TUI; saves replace this cache only after the owner RPC succeeds.
     pub(super) mcp_config: cockpit_core::mcp::config::McpConfig,
+    /// Redacted contents of the daemon-selected authored target layer. Deltas
+    /// are computed against this baseline; inherited effective entries are
+    /// never materialized by an unrelated edit.
+    pub(super) mcp_authored_config: cockpit_core::mcp::config::McpConfig,
     /// Daemon-selected authority metadata for `mcp_config`. A save is not
     /// eligible until all three values came from the same catalog snapshot.
     pub(super) mcp_owner_root: Option<String>,
@@ -2948,6 +2974,7 @@ impl SettingsCx {
         operation_id
     }
 
+    #[cfg(feature = "extended")]
     pub(super) fn queue_image_spend_load(
         &mut self,
         project_key: String,
@@ -2974,6 +3001,19 @@ impl SettingsCx {
         );
     }
 
+    #[cfg(not(feature = "extended"))]
+    pub(super) fn queue_image_spend_load(
+        &mut self,
+        _project_key: String,
+        page_instance_id: uuid::Uuid,
+    ) {
+        self.completed_image_spend = Some(ImageSpendCompletion::Failed {
+            page_instance_id,
+            message: "image-generation budgets require the extended build profile".into(),
+        });
+    }
+
+    #[cfg(feature = "extended")]
     fn queue_image_spend_save(
         &mut self,
         project_key: String,
@@ -3016,6 +3056,17 @@ impl SettingsCx {
             },
         );
         Ok(())
+    }
+
+    #[cfg(not(feature = "extended"))]
+    fn queue_image_spend_save(
+        &mut self,
+        _project_key: String,
+        _settings: cockpit_config::config::image_spend::ImageSpendSettings,
+        _expected_policy_version: Option<u64>,
+        _page_instance_id: uuid::Uuid,
+    ) -> Result<(), String> {
+        Err("image-generation budgets require the extended build profile".into())
     }
 
     fn enqueue_settlement_effect(
@@ -3130,6 +3181,7 @@ impl SettingsCx {
                     });
                 }
                 SettingsMutationAction::ProviderCredentialPut { .. } => {}
+                #[cfg(feature = "extended")]
                 SettingsMutationAction::ImageSpendSave {
                     page_instance_id, ..
                 } => {
@@ -3402,7 +3454,7 @@ impl SettingsCx {
         let requested_path = self.extended_path.display().to_string();
         let snapshot_session_id = settings_snapshot_session_id().to_owned();
         let client_operation_id = uuid::Uuid::new_v4().to_string();
-        let patch = cockpit_core::daemon::proto::ExtendedConfigPatch {
+        let patch = cockpit_proto::ExtendedConfigPatch {
             operations: operations.clone(),
             materialize: false,
             denylist: denylist.clone(),
@@ -3619,6 +3671,7 @@ impl SettingsCx {
                     self.pending_shadow_prompt = Some(prompt);
                 }
             }
+            #[cfg(feature = "extended")]
             PendingSettingsOperation::ImageSpendLoad {
                 target,
                 project_key: _,
@@ -3697,21 +3750,27 @@ impl SettingsCx {
                         self.mcp_config_path = None;
                         self.mcp_edit_capability = None;
                         self.mcp_revision = None;
+                        self.mcp_authored_config = cockpit_core::mcp::config::McpConfig::default();
                         if let (
                             Some(raw),
+                            Some(authored_raw),
                             Some(owner_root),
                             Some(config_path),
                             Some(capability),
                             Some(revision),
                         ) = (
                             config.mcp_config_json,
+                            config.mcp_authored_config_json,
                             config.mcp_owner_root,
                             config.mcp_config_path,
                             config.mcp_edit_capability,
                             config.mcp_revision,
-                        ) && let Ok(mcp) = cockpit_core::mcp::config::McpConfig::parse(&raw)
-                        {
+                        ) && let (Ok(mcp), Ok(authored)) = (
+                            cockpit_core::mcp::config::McpConfig::parse(&raw),
+                            cockpit_core::mcp::config::McpConfig::parse(&authored_raw),
+                        ) {
                             self.mcp_config = mcp;
+                            self.mcp_authored_config = authored;
                             self.mcp_owner_root = Some(owner_root);
                             self.mcp_config_path = Some(config_path);
                             self.mcp_edit_capability = Some(capability);
@@ -3756,7 +3815,7 @@ impl SettingsCx {
                         layer,
                         consumed_revision,
                         result_revision,
-                        status: cockpit_core::daemon::proto::ConfigCommitStatus::Committed,
+                        status: cockpit_proto::ConfigCommitStatus::Committed,
                         publication,
                         denylist,
                     }) if returned_operation_id == client_operation_id
@@ -3772,7 +3831,7 @@ impl SettingsCx {
                             || config_generation == expected_generation.saturating_add(1)) =>
                     {
                         let warning = (publication
-                            == cockpit_core::daemon::proto::ConfigPublicationStatus::Degraded)
+                            == cockpit_proto::ConfigPublicationStatus::Degraded)
                             .then(|| "settings committed, but redaction publication is degraded; restart the daemon before continuing".to_string());
                         Ok((result_revision, config_generation, denylist, warning))
                     }
@@ -3924,6 +3983,7 @@ impl SettingsCx {
                     return Ok(());
                 }
                 let result = match (action, completion.response) {
+                    #[cfg(feature = "extended")]
                     (
                         SettingsMutationAction::ImageSpendSave {
                             client_operation_id,
@@ -3964,7 +4024,6 @@ impl SettingsCx {
                             expected_config_path,
                             snapshot_capability,
                             expected_consumed_revision,
-                            expected_result_revision,
                             expected_request_intent_hash,
                         },
                         Ok(Response::McpConfigCommitted {
@@ -3985,7 +4044,7 @@ impl SettingsCx {
                         && config_path == expected_config_path
                         && !snapshot_capability.is_empty()
                         && consumed_revision == expected_consumed_revision
-                        && result_revision == expected_result_revision
+                        && cockpit_proto::is_opaque_authority_token(&result_revision)
                         && mutation_intent_hash == expected_request_intent_hash
                         && cockpit_proto::is_opaque_authority_token(&request_hash)
                         && config_generation > 0 =>
@@ -3997,7 +4056,7 @@ impl SettingsCx {
                         // later edit must refresh and receive a new authority
                         // token instead of reusing this stale snapshot.
                         self.mcp_edit_capability = None;
-                        self.mcp_revision = Some(expected_result_revision);
+                        self.mcp_revision = Some(result_revision);
                         self.invalidate_secret_inventory();
                         if let Some((name, edited)) = self.pending_mcp_navigation.take() {
                             self.completed_mcp_navigation = Some((name, edited, Ok(())));
@@ -4182,9 +4241,7 @@ impl SettingsCx {
                     {
                         self.invalidate_secret_inventory_entry(
                             &provider_id,
-                            Some(
-                                cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord,
-                            ),
+                            Some(cockpit_proto::SecretInventoryKind::CredentialRecord),
                         );
                         Ok(format!("stored credential for {provider_id}"))
                     }
@@ -4221,9 +4278,7 @@ impl SettingsCx {
                     {
                         self.invalidate_secret_inventory_entry(
                             &provider_id,
-                            Some(
-                                cockpit_core::daemon::proto::SecretInventoryKind::CredentialRecord,
-                            ),
+                            Some(cockpit_proto::SecretInventoryKind::CredentialRecord),
                         );
                         self.completed_web_credential = Some((provider_id.clone(), Ok(())));
                         Ok(format!("stored credential for {provider_id}"))
@@ -4576,7 +4631,7 @@ impl SettingsCx {
     pub(super) fn cached_secret_inventory_contains(
         &self,
         name: &str,
-        kind: Option<cockpit_core::daemon::proto::SecretInventoryKind>,
+        kind: Option<cockpit_proto::SecretInventoryKind>,
     ) -> Option<bool> {
         let key = format!("{kind:?}:{name}");
         if let Ok(cache) = self.secret_inventory_cache.lock()
@@ -4584,49 +4639,13 @@ impl SettingsCx {
         {
             return Some(*value);
         }
-        self.refresh_secret_inventory_entry(name.to_string(), kind);
         None
-    }
-
-    pub(super) fn refresh_secret_inventory_entry(
-        &self,
-        name: String,
-        kind: Option<cockpit_core::daemon::proto::SecretInventoryKind>,
-    ) {
-        // Synchronous unit-render tests intentionally have no Tokio runtime;
-        // leave their cache miss as "checking" rather than panicking.
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let key = format!("{kind:?}:{name}");
-        let Ok(mut pending) = self.secret_inventory_pending.lock() else {
-            return;
-        };
-        if !pending.insert(key.clone()) {
-            return;
-        }
-        let cache = Arc::clone(&self.secret_inventory_cache);
-        let pending = Arc::clone(&self.secret_inventory_pending);
-        tokio::spawn(async move {
-            let present = match settings_daemon_client().await {
-                Ok(client) => secret_inventory_contains(&client, &name, kind).await,
-                Err(error) => Err(error.to_string()),
-            };
-            if let Ok(present) = present
-                && let Ok(mut cache) = cache.lock()
-            {
-                cache.insert(key.clone(), present);
-            }
-            if let Ok(mut pending) = pending.lock() {
-                pending.remove(&key);
-            }
-        });
     }
 
     pub(super) fn invalidate_secret_inventory_entry(
         &self,
         name: &str,
-        kind: Option<cockpit_core::daemon::proto::SecretInventoryKind>,
+        kind: Option<cockpit_proto::SecretInventoryKind>,
     ) {
         let key = format!("{kind:?}:{name}");
         if let Ok(mut cache) = self.secret_inventory_cache.lock() {
@@ -4894,7 +4913,7 @@ fn lsp_page(page: LspPage) -> PageBox {
 use agents_page::AgentsPage;
 use category::{Category, CategoryPage};
 #[cfg(test)]
-use cockpit_core::daemon::proto::LspControlAction;
+use cockpit_proto::LspControlAction;
 use harnesses_page::HarnessesPage;
 use lsp_page::LspPage;
 #[cfg(test)]
@@ -4978,6 +4997,15 @@ pub(super) enum Nav {
 // ── Dialog top-level ─────────────────────────────────────────────────────
 
 impl Dialog {
+    pub(crate) fn bind_lifecycle(&mut self, lifecycle: cockpit_client::LifecycleClient) {
+        if let Self::Settings(settings) = self {
+            settings.cx.lifecycle = lifecycle;
+        }
+    }
+    pub(crate) fn has_unsettled_local_authority(&self) -> bool {
+        matches!(self, Dialog::Settings(settings) if settings.authority_operation_pending())
+    }
+
     pub(crate) fn handle_settings_pointer(
         &mut self,
         mouse: MouseEvent,
@@ -5656,7 +5684,19 @@ impl Dialog {
         &mut self,
     ) -> Option<SettingsBlockingEffectRequest> {
         match self {
-            Dialog::Settings(settings) => settings.cx.take_blocking_effect(),
+            Dialog::Settings(settings) => {
+                if let Some(page) = settings.page.downcast_mut::<CategoryPage>()
+                    && let Some(work) = page.take_path_suggestion_work()
+                {
+                    let target = SettingsEffectTarget {
+                        surface: "settings.path-suggestions",
+                        owner: "category-path-editor".into(),
+                        revision: None,
+                    };
+                    settings.cx.enqueue_blocking_work(target, work);
+                }
+                settings.cx.take_blocking_effect()
+            }
             _ => None,
         }
     }
@@ -6026,11 +6066,15 @@ impl SettingsDialog {
                     ));
                 }
                 if let Some(completion) = self.cx.completed_image_spend.take() {
+                    let mut completion = Some(completion);
+                    #[cfg(feature = "extended")]
                     if let Some(page) = self.page.downcast_mut::<image_spend::ImageSpendPage>() {
-                        page.apply_daemon_completion(completion);
-                    } else if let Some(page) = self
-                        .page
-                        .downcast_mut::<image_generation::BudgetEditorPage>()
+                        page.apply_daemon_completion(completion.take().unwrap());
+                    }
+                    if let Some(completion) = completion
+                        && let Some(page) = self
+                            .page
+                            .downcast_mut::<image_generation::BudgetEditorPage>()
                     {
                         page.apply_daemon_completion(completion);
                     }
@@ -6160,6 +6204,15 @@ impl SettingsDialog {
     }
 
     fn apply_blocking_completion(&mut self, completion: SettingsBlockingEffectCompletion) {
+        if matches!(
+            &completion.outcome,
+            Ok(SettingsBlockingOutcome::PathSuggestions { .. })
+        ) {
+            if let Some(page) = self.page.downcast_mut::<CategoryPage>() {
+                page.apply_path_suggestions(completion);
+            }
+            return;
+        }
         let category_operation = matches!(
             self.cx.pending_settings.get(&completion.operation_id),
             Some(
@@ -6234,6 +6287,7 @@ impl SettingsDialog {
         if let Some(p) = self.page.downcast_ref::<CategoryPage>() {
             return TestPageRef::Category(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self.page.downcast_ref::<image_spend::ImageSpendPage>() {
             return TestPageRef::ImageSpend(p);
         }
@@ -6326,6 +6380,7 @@ impl SettingsDialog {
         if self.page.as_any().is::<CategoryPage>() {
             return TestPageMut::Category(self.page.downcast_mut::<CategoryPage>().unwrap());
         }
+        #[cfg(feature = "extended")]
         if self.page.as_any().is::<image_spend::ImageSpendPage>() {
             return TestPageMut::ImageSpend(
                 self.page
@@ -6474,6 +6529,7 @@ impl SettingsDialog {
             page: root_page(0),
             stack: Vec::new(),
             cx: SettingsCx {
+                lifecycle: cockpit_client::LifecycleClient::disconnected(),
                 dialog_id: uuid::Uuid::new_v4(),
                 daemon_effects: VecDeque::new(),
                 blocking_effects: VecDeque::new(),
@@ -6506,6 +6562,7 @@ impl SettingsDialog {
                 extended_revision,
                 extended_warnings,
                 mcp_config,
+                mcp_authored_config: cockpit_core::mcp::config::McpConfig::default(),
                 mcp_owner_root: None,
                 mcp_config_path: None,
                 mcp_edit_capability: None,
@@ -6633,6 +6690,7 @@ impl SettingsDialog {
     }
 
     fn tick(&mut self) {
+        #[cfg(feature = "extended")]
         if let Some(page) = self.page.downcast_mut::<image_spend::ImageSpendPage>() {
             page.poll();
         }
@@ -7457,6 +7515,7 @@ impl SettingsPage for RootPage {
                         cx.reload_extended();
                         Some(category_page(CategoryPage::new(Category::Behavior)))
                     }
+                    #[cfg(feature = "extended")]
                     "Image spend budgets" => {
                         let project_key = cx
                             .active_project_root
@@ -7613,7 +7672,12 @@ pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 /// `Default model for new sessions` leads, then the locked scheme in order;
 /// MCP/LSP are kept as extra nodes so integration settings stay reachable
 /// from the menu.
-fn root_nodes() -> [NavNode; 16] {
+#[cfg(feature = "extended")]
+const ROOT_NODE_COUNT: usize = 16;
+#[cfg(not(feature = "extended"))]
+const ROOT_NODE_COUNT: usize = 15;
+
+fn root_nodes() -> [NavNode; ROOT_NODE_COUNT] {
     [
         NavNode {
             id: pointer_actions::RootNodeId::DefaultModel,
@@ -7645,6 +7709,7 @@ fn root_nodes() -> [NavNode; 16] {
             title: "Behavior",
             description: "Session & agent behavior: default agent, llm mode, approval mode, plan isolation, prediction, shell compression, the utility model, instructions files, and (Advanced) tuning + plan-execution knobs.",
         },
+        #[cfg(feature = "extended")]
         NavNode {
             id: pointer_actions::RootNodeId::ImageSpend,
             title: "Image spend budgets",
@@ -8171,9 +8236,7 @@ fn merge_dialog_provider_config(
     }
 }
 
-fn providers_config_from_view(
-    view: &cockpit_core::daemon::proto::ProviderConfigView,
-) -> ProvidersConfig {
+fn providers_config_from_view(view: &cockpit_proto::ProviderConfigView) -> ProvidersConfig {
     ProvidersConfig {
         providers: view
             .providers
@@ -8202,7 +8265,7 @@ fn providers_config_from_view(
 }
 
 fn provider_view_matches_mutation(
-    view: &cockpit_core::daemon::proto::ProviderConfigView,
+    view: &cockpit_proto::ProviderConfigView,
     upserts: &[(String, ProviderEntry)],
     deletes: &[String],
     metadata: Option<&cockpit_proto::ProviderLayerMetadataPatch>,
@@ -8255,7 +8318,7 @@ fn daemon_provider_snapshot(
 fn daemon_provider_view_snapshot(
     cwd: &std::path::Path,
     provider_id: Option<&str>,
-) -> Option<cockpit_core::daemon::proto::ProviderConfigView> {
+) -> Option<cockpit_proto::ProviderConfigView> {
     let project_root = cwd.display().to_string();
     let provider_id = provider_id.map(str::to_string);
     daemon_provider_view_snapshot_inner(project_root, provider_id)
@@ -8265,7 +8328,7 @@ fn daemon_provider_view_snapshot(
 fn daemon_provider_view_snapshot_inner(
     project_root: String,
     provider_id: Option<String>,
-) -> Option<cockpit_core::daemon::proto::ProviderConfigView> {
+) -> Option<cockpit_proto::ProviderConfigView> {
     match settings_daemon_request(Request::GetProviderCatalogSnapshot {
         project_root,
         provider_id,

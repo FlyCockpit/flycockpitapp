@@ -30,9 +30,19 @@ impl ProviderMutationBatch {
     /// bytes are represented only by positional presence bits.
     pub fn sanitized_intent_hash(&self) -> Result<String, serde_json::Error> {
         let upserts = self.upserts.iter().map(|upsert| {
+            let mut entry = upsert.entry.clone();
+            for (index, header) in entry.headers.iter_mut().enumerate() {
+                if upsert
+                    .header_secrets
+                    .get(index)
+                    .is_some_and(Option::is_some)
+                {
+                    header.value = "[STAGED_SECRET]".into();
+                }
+            }
             serde_json::json!({
                 "provider_id": upsert.provider_id,
-                "entry": upsert.entry,
+                "entry": entry,
                 "header_secret_present": upsert.header_secrets.iter().map(Option::is_some).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>();
@@ -78,6 +88,10 @@ pub struct ProviderMutationDelete {
 pub struct ProviderLayerMetadataPatch {
     pub category_defaults: BTreeMap<String, cockpit_config::config::providers::ProviderModelRef>,
     pub on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch,
+    /// Optional owner-selected default model. Absence preserves the current
+    /// layer value; setup uses `Some` to make its selected model authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<cockpit_config::config::providers::ActiveModelRef>,
 }
 
 #[derive(Clone)]
@@ -167,6 +181,13 @@ mod tests {
         assert_eq!(
             first.sanitized_intent_hash().unwrap(),
             second.sanitized_intent_hash().unwrap()
+        );
+        let mut literal = batch("first-secret");
+        literal.upserts[0].entry.headers[0].value = "guessable-credential".into();
+        assert_eq!(
+            first.sanitized_intent_hash().unwrap(),
+            literal.sanitized_intent_hash().unwrap(),
+            "a staged header's literal bytes must not influence its public intent digest"
         );
         let mut absent = batch("unused");
         absent.upserts[0].header_secrets[0] = None;

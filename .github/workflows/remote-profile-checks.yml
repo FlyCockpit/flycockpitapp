@@ -1,0 +1,28 @@
+name: Remote profile checks
+
+on:
+  schedule:
+    - cron: "17 4 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
+
+jobs:
+  remote-workspace-static:
+    name: Non-blocking remote profile compile contract
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: remote-workspace
+          workspaces: . -> target
+      - run: cargo check --locked -p cockpit-cli --all-targets --features remote
+      - run: cargo check --locked -p tenant-authority --all-targets --features remote

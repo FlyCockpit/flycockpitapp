@@ -2945,7 +2945,7 @@
     {
       "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "client_operation_id:string|flow_id:string|input:option<string>",
+      "fcorCanonicalSchema": "client_operation_id:string|flow_id:string|input:option<sha256-redacted>",
       "fcorRoles": [
         {
           "field": "client_operation_id",
@@ -2960,7 +2960,7 @@
         {
           "field": "input",
           "role": "param",
-          "type": "Option<String>"
+          "type": "Option<SensitiveWirePayload>"
         }
       ],
       "fcorSchema": "client_operation_id:String|flow_id:String|input:Option<SensitiveWirePayload>",
@@ -3020,7 +3020,7 @@
     {
       "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "client_operation_id:string|flow_id:string|input:option<string>",
+      "fcorCanonicalSchema": "client_operation_id:string|flow_id:string|input:option<sha256-redacted>",
       "fcorRoles": [
         {
           "field": "client_operation_id",
@@ -3035,7 +3035,7 @@
         {
           "field": "input",
           "role": "param",
-          "type": "Option<String>"
+          "type": "Option<SensitiveWirePayload>"
         }
       ],
       "fcorSchema": "client_operation_id:String|flow_id:String|input:Option<SensitiveWirePayload>",
@@ -3289,7 +3289,7 @@
     {
       "class": "nonrepeatable_mutation",
       "evidence": null,
-      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|snapshot_capability:string|owner_root:string|config_path:string|expected_revision:string|mutation_intent_hash:string|config_json:string|secret_values_json:sha256-redacted|cleanup_names_json:string",
+      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|snapshot_capability:string|owner_root:string|config_path:string|expected_revision:string|mutation_intent_hash:string|patch:sha256-redacted|secret_values_json:sha256-redacted",
       "fcorRoles": [
         {
           "field": "client_operation_id",
@@ -3327,22 +3327,17 @@
           "type": "String"
         },
         {
-          "field": "config_json",
+          "field": "patch",
           "role": "param",
-          "type": "String"
+          "type": "SensitiveWirePayload"
         },
         {
           "field": "secret_values_json",
           "role": "param",
           "type": "SensitiveWirePayload"
-        },
-        {
-          "field": "cleanup_names_json",
-          "role": "param",
-          "type": "String"
         }
       ],
-      "fcorSchema": "client_operation_id:String|project_root:String|snapshot_capability:String|owner_root:String|config_path:String|expected_revision:String|mutation_intent_hash:String|config_json:String|secret_values_json:SensitiveWirePayload|cleanup_names_json:String",
+      "fcorSchema": "client_operation_id:String|project_root:String|snapshot_capability:String|owner_root:String|config_path:String|expected_revision:String|mutation_intent_hash:String|patch:SensitiveWirePayload|secret_values_json:SensitiveWirePayload",
       "strategy": "nonrepeatable_dispatch",
       "tag": "save_mcp_config"
     },
@@ -3434,8 +3429,13 @@
     {
       "class": "local_only",
       "evidence": null,
-      "fcorCanonicalSchema": "project_root:string|lease_id:string|markdown:option<string>",
+      "fcorCanonicalSchema": "client_operation_id:string|project_root:string|lease_id:string|markdown:option<sha256-redacted>",
       "fcorRoles": [
+        {
+          "field": "client_operation_id",
+          "role": "param",
+          "type": "String"
+        },
         {
           "field": "project_root",
           "role": "project_root",
@@ -3449,10 +3449,10 @@
         {
           "field": "markdown",
           "role": "param",
-          "type": "Option<String>"
+          "type": "Option<SensitiveWirePayload>"
         }
       ],
-      "fcorSchema": "project_root:String|lease_id:String|markdown:Option<String>",
+      "fcorSchema": "client_operation_id:String|project_root:String|lease_id:String|markdown:Option<SensitiveWirePayload>",
       "strategy": "none",
       "tag": "complete_agent_editor_lease"
     },
@@ -4320,6 +4320,40 @@
       "fcorSchema": "-",
       "strategy": "none",
       "tag": "register_local_path_media"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "project_root:string|path:sha256-redacted|admission_id:uuid",
+      "fcorRoles": [
+        {
+          "field": "project_root",
+          "role": "project_root",
+          "type": "String"
+        },
+        {
+          "field": "path",
+          "role": "param",
+          "type": "SensitiveWirePayload"
+        },
+        {
+          "field": "admission_id",
+          "role": "param",
+          "type": "Uuid"
+        }
+      ],
+      "fcorSchema": "project_root:String|path:SensitiveWirePayload|admission_id:Uuid",
+      "strategy": "none",
+      "tag": "admit_image_ingress"
+    },
+    {
+      "class": "local_only",
+      "evidence": null,
+      "fcorCanonicalSchema": "-",
+      "fcorRoles": [],
+      "fcorSchema": "-",
+      "strategy": "none",
+      "tag": "discard_image_ingress_draft"
     },
     {
       "class": "local_only",

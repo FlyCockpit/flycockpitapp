@@ -1,5 +1,62 @@
 use super::*;
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ImageIngressSourceV1 {
+    /// One-shot token minted by the in-process terminal host. It resolves to
+    /// a retained no-follow handle; it is not a pathname or filename.
+    PrivateTerminalCapability { capability: String },
+    /// Clipboard pixels are captured and PNG-encoded by the terminal UI, then
+    /// admitted by the same daemon policy/retention pipeline.
+    ClipboardPng {
+        png_base64: SensitiveWirePayload,
+        byte_length: u64,
+        #[serde(deserialize_with = "deserialize_lower_hex_sha256")]
+        sha256: String,
+    },
+}
+
+impl std::fmt::Debug for ImageIngressSourceV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrivateTerminalCapability { capability } => formatter
+                .debug_struct("PrivateTerminalCapability")
+                .field(
+                    "capability",
+                    &format_args!("[REDACTED; {} bytes]", capability.len()),
+                )
+                .finish(),
+            Self::ClipboardPng {
+                byte_length,
+                sha256,
+                ..
+            } => formatter
+                .debug_struct("ClipboardPng")
+                .field("png_base64", &"[REDACTED]")
+                .field("byte_length", byte_length)
+                .field("sha256", sha256)
+                .finish(),
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+impl crate::remote_operation_fcor::CanonicalFcorValueV1 for ImageIngressSourceV1 {
+    fn encode_fcor_value_v1(
+        &self,
+        out: &mut crate::remote_operation_fcor::CanonicalParamsV1,
+    ) -> anyhow::Result<()> {
+        use sha2::Digest as _;
+        let material = zeroize::Zeroizing::new(serde_json::to_vec(self)?);
+        out.push_bytes(sha2::Sha256::digest(material.as_slice()).as_slice())
+    }
+}
+
 fn deserialize_optional_nonempty_string<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error>
@@ -965,6 +1022,34 @@ pub enum Request {
         path: String,
     },
 
+    /// Read a complete worktree/index projection through daemon-owned Git
+    /// authority. The response is capped before crossing the wire.
+    GitDiff {
+        project_root: String,
+        source: crate::GitReadSource,
+    },
+
+    /// Resolve the selected `/multireview` sources in one daemon operation.
+    GitReviewSources {
+        project_root: String,
+        sources: Vec<crate::GitReadSource>,
+    },
+
+    /// Read the branch/ahead-behind status pill through daemon-owned Git
+    /// authority. Backs the TUI chrome poller so the terminal process never
+    /// shells out to `git` itself.
+    GitRepoStatus {
+        project_root: String,
+    },
+
+    /// Resolve `path` to its git worktree root through daemon-owned Git
+    /// authority (`git rev-parse --show-toplevel`). `None` when `path` is not
+    /// inside a repository. Lets TUI panes discover the worktree root without
+    /// shelling out to `git` themselves.
+    FindWorktreeRoot {
+        path: String,
+    },
+
     OpenTerminal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
@@ -1777,6 +1862,7 @@ pub enum Request {
 
     /// Persist non-secret provider configuration through the daemon's
     /// trust-aware config writer.
+    #[cfg(feature = "remote")]
     UpsertProviderConfig {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -1789,13 +1875,14 @@ pub enum Request {
     /// and persist the corresponding reference-only provider configuration.
     /// `header_secrets` is positional with `entry.headers`; only the daemon
     /// assigns durable vault record names.
+    #[cfg(feature = "remote")]
     SaveProviderConfig {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         provider_id: String,
         entry: cockpit_config::config::providers::ProviderEntry,
-        header_secrets: Vec<Option<String>>,
+        header_secrets: Vec<Option<crate::ProviderSecretValue>>,
     },
 
     /// Ask the daemon to acquire Copilot credentials from its own environment
@@ -1813,6 +1900,7 @@ pub enum Request {
     /// Apply the security or model setup wizard through the daemon owner.
     /// Answers are validated against the daemon's current descriptor; the
     /// descriptor itself never crosses the wire.
+    #[cfg(feature = "remote")]
     ApplySetupWizard {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -1840,12 +1928,10 @@ pub enum Request {
         expected_revision: String,
         #[serde(deserialize_with = "deserialize_owner_identifier")]
         mutation_intent_hash: String,
-        #[serde(deserialize_with = "deserialize_owner_mcp_json")]
-        config_json: String,
+        #[serde(deserialize_with = "deserialize_owner_mcp_secret_json")]
+        patch: SensitiveWirePayload,
         #[serde(deserialize_with = "deserialize_owner_mcp_secret_json")]
         secret_values_json: SensitiveWirePayload,
-        #[serde(deserialize_with = "deserialize_owner_mcp_json")]
-        cleanup_names_json: String,
     },
 
     /// Discover the effective daemon-owned agent inventory for a workspace.
@@ -1896,7 +1982,7 @@ pub enum Request {
         project_root: String,
         lease_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        markdown: Option<String>,
+        markdown: Option<SensitiveWirePayload>,
     },
 
     /// Query the durable outcome of an exact external-editor settlement
@@ -1960,12 +2046,14 @@ pub enum Request {
     },
 
     /// Return the current daemon-owned image spend policy.
+    #[cfg(feature = "extended")]
     GetImageSpendPolicy {
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         project_key: String,
     },
 
     /// Validate and persist an image spend policy through the daemon owner.
+    #[cfg(feature = "extended")]
     SaveImageSpendPolicy {
         /// Stable owner-chosen id used for durable replay and settlement.
         client_operation_id: String,
@@ -2190,6 +2278,7 @@ pub enum Request {
     },
 
     /// Remove a provider entry through the daemon's trust-aware writer.
+    #[cfg(feature = "remote")]
     DeleteProviderConfig {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -2203,6 +2292,7 @@ pub enum Request {
     },
 
     /// Persist layer-wide non-secret provider metadata through the daemon.
+    #[cfg(feature = "remote")]
     SetProviderLayerMetadata {
         #[serde(deserialize_with = "deserialize_owner_project_root")]
         project_root: String,
@@ -2277,6 +2367,25 @@ pub enum Request {
 
     /// Register a project-contained local file while retaining its verified handle.
     RegisterLocalPathMedia(cockpit_db::media_attachments::RegisterLocalPathMediaV1),
+
+    /// Consume an opaque terminal-host capability or admit clipboard PNG
+    /// bytes into daemon-owned retained media. Host paths never cross this
+    /// protocol boundary.
+    AdmitImageIngress {
+        session_id: Uuid,
+        source: ImageIngressSourceV1,
+        admission_id: Uuid,
+    },
+
+    /// Dispose an admitted image draft that never crossed the daemon's
+    /// first-reference boundary. The daemon derives principal/project and
+    /// current generations; these opaque identities only bind the exact
+    /// admission and idempotent operation.
+    DiscardImageIngressDraft {
+        session_id: Uuid,
+        admission_id: Uuid,
+        local_operation_id: Uuid,
+    },
 
     /// Owner-only daemon-local retained HTTPS ingress.
     RetainHttpsMedia(cockpit_db::media_attachments::RetainHttpsMediaV1),
@@ -2907,6 +3016,7 @@ impl Request {
                     validate_owner_project_root(project_root)?;
                 }
             }
+            #[cfg(feature = "remote")]
             Self::UpsertProviderConfig {
                 project_root,
                 provider_id,
@@ -2962,6 +3072,7 @@ impl Request {
                     }
                 }
             }
+            #[cfg(feature = "remote")]
             Self::SaveProviderConfig {
                 project_root,
                 provider_id,
@@ -3000,6 +3111,7 @@ impl Request {
                 validate_owner_project_root(project_root)?;
                 validate_owner_identifier("provider id", provider_id, MAX_OWNER_PROVIDER_ID_BYTES)?;
             }
+            #[cfg(feature = "remote")]
             Self::ApplySetupWizard {
                 project_root,
                 wizard_id,
@@ -3043,9 +3155,8 @@ impl Request {
                 config_path,
                 expected_revision,
                 mutation_intent_hash,
-                config_json,
+                patch,
                 secret_values_json,
-                cleanup_names_json,
             } => {
                 validate_owner_identifier("client operation", client_operation_id, 128)?;
                 validate_owner_project_root(project_root)?;
@@ -3055,9 +3166,8 @@ impl Request {
                 validate_owner_identifier("MCP expected revision", expected_revision, 64)?;
                 validate_owner_identifier("MCP mutation intent", mutation_intent_hash, 64)?;
                 for (label, value) in [
-                    ("MCP config", config_json.as_str()),
+                    ("MCP patch", patch.as_str()),
                     ("MCP secret values", secret_values_json.as_str()),
-                    ("MCP cleanup names", cleanup_names_json.as_str()),
                 ] {
                     if value.len() > MAX_OWNER_PROVIDER_METADATA_JSON_BYTES {
                         return Err(format!("{label} JSON exceeds maximum length"));
@@ -3312,9 +3422,11 @@ impl Request {
                     return Err("policy bundle exceeds maximum length".to_string());
                 }
             }
+            #[cfg(feature = "extended")]
             Self::GetImageSpendPolicy { project_key } => {
                 validate_owner_identifier("project key", project_key, MAX_OWNER_PROVIDER_ID_BYTES)?;
             }
+            #[cfg(feature = "extended")]
             Self::SaveImageSpendPolicy {
                 client_operation_id,
                 project_key,
@@ -3541,6 +3653,7 @@ impl Request {
                     }
                 }
             }
+            #[cfg(feature = "remote")]
             Self::SetProviderLayerMetadata {
                 project_root,
                 category_defaults_json,
@@ -3551,6 +3664,7 @@ impl Request {
                     return Err("provider metadata exceeds maximum length".to_string());
                 }
             }
+            #[cfg(feature = "remote")]
             Self::DeleteProviderConfig {
                 project_root,
                 provider_id,
@@ -3689,6 +3803,10 @@ macro_rules! request_variants {
             (Request::FsDelete { .. }, "fs_delete");
             (Request::GitStatus { .. }, "git_status");
             (Request::GitDiffFile { .. }, "git_diff_file");
+            (Request::GitDiff { .. }, "git_diff");
+            (Request::GitReviewSources { .. }, "git_review_sources");
+            (Request::GitRepoStatus { .. }, "git_repo_status");
+            (Request::FindWorktreeRoot { .. }, "find_worktree_root");
             (Request::OpenTerminal { .. }, "open_terminal");
             (Request::AttachTerminal { .. }, "attach_terminal");
             (Request::TerminalInput { .. }, "terminal_input");
@@ -3778,9 +3896,12 @@ macro_rules! request_variants {
             (Request::ApplyProviderMutation { .. }, "apply_provider_mutation");
             (Request::FetchProviderModels { .. }, "fetch_provider_models");
             (Request::GetProviderUsageSnapshot { .. }, "get_provider_usage_snapshot");
+            #[cfg(feature = "remote")]
             (Request::UpsertProviderConfig { .. }, "upsert_provider_config");
+            #[cfg(feature = "remote")]
             (Request::SaveProviderConfig { .. }, "save_provider_config");
             (Request::SetupCopilotAuth { .. }, "setup_copilot_auth");
+            #[cfg(feature = "remote")]
             (Request::ApplySetupWizard { .. }, "apply_setup_wizard");
             (Request::SaveMcpConfig { .. }, "save_mcp_config");
             (Request::GetAgentInventory { .. }, "get_agent_inventory");
@@ -3794,7 +3915,9 @@ macro_rules! request_variants {
             (Request::SaveExtendedConfig { .. }, "save_extended_config");
             (Request::ExportPolicy { .. }, "export_policy");
             (Request::ImportPolicy { .. }, "import_policy");
+            #[cfg(feature = "extended")]
             (Request::GetImageSpendPolicy { .. }, "get_image_spend_policy");
+            #[cfg(feature = "extended")]
             (Request::SaveImageSpendPolicy { .. }, "save_image_spend_policy");
             (Request::ImageEndpointList { .. }, "image_endpoint_list");
             (Request::ImageEndpointGet { .. }, "image_endpoint_get");
@@ -3812,7 +3935,9 @@ macro_rules! request_variants {
             (Request::ImageWorkflowUpload { .. }, "image_workflow_upload");
             (Request::ImageWorkflowBind { .. }, "image_workflow_bind");
             (Request::ImageWorkflowDelete { .. }, "image_workflow_delete");
+            #[cfg(feature = "remote")]
             (Request::DeleteProviderConfig { .. }, "delete_provider_config");
+            #[cfg(feature = "remote")]
             (Request::SetProviderLayerMetadata { .. }, "set_provider_layer_metadata");
             (Request::DaemonStatus, "daemon_status");
             (Request::RefreshEnv { .. }, "refresh_env");
@@ -3823,6 +3948,8 @@ macro_rules! request_variants {
             (Request::GuidanceEstimate { .. }, "guidance_estimate");
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media");
             (Request::RegisterLocalPathMedia(..), "register_local_path_media");
+            (Request::AdmitImageIngress { .. }, "admit_image_ingress");
+            (Request::DiscardImageIngressDraft { .. }, "discard_image_ingress_draft");
             (Request::RetainHttpsMedia(..), "retain_https_media");
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status");
             (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview");
@@ -3980,6 +4107,10 @@ macro_rules! command {
             (Request::FsDelete { project_root, path }, "fs_delete", owner_only, none, true, local_only, none, serialized, path(path), "project_root:String|path:String", [project_root: String => project_root, path: String => file_existing(project_root)]);
             (Request::GitStatus { project_root }, "git_status", project_files(project_root), none, false, read_only, none, concurrent, none, "project_root:String", [project_root: String => project_root]);
             (Request::GitDiffFile { project_root, path }, "git_diff_file", project_files(project_root), none, false, read_only, none, concurrent, path(path), "project_root:String|path:String", [project_root: String => project_root, path: String => file_existing(project_root)]);
+            (Request::GitDiff { project_root, source }, "git_diff", owner_only, none, false, local_only, none, concurrent, none, "project_root:String|source:crate::GitReadSource", [project_root: String => project_root, source: $crate::GitReadSource => param]);
+            (Request::GitReviewSources { project_root, sources }, "git_review_sources", owner_only, none, false, local_only, none, concurrent, none, "project_root:String|sources:Vec<crate::GitReadSource>", [project_root: String => project_root, sources: Vec<$crate::GitReadSource> => param]);
+            (Request::GitRepoStatus { project_root }, "git_repo_status", owner_only, none, false, local_only, none, concurrent, none, "project_root:String", [project_root: String => project_root]);
+            (Request::FindWorktreeRoot { path }, "find_worktree_root", owner_only, none, false, local_only, none, concurrent, none, "path:String", [path: String => param]);
             (Request::OpenTerminal { cwd, cols, rows }, "open_terminal", terminal, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "cwd:Option<String>|cols:u16|rows:u16", [cwd: Option<String> => param, cols: u16 => param, rows: u16 => param]);
             (Request::AttachTerminal { terminal_id, cols, rows }, "attach_terminal", terminal, none, false, read_only, none, serialized, none, "terminal_id:Uuid|cols:u16|rows:u16", [terminal_id: Uuid => terminal, cols: u16 => param, rows: u16 => param]);
             (Request::TerminalInput { terminal_id, bytes }, "terminal_input", terminal, none, false, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|bytes:Vec<u8>", [terminal_id: Uuid => terminal, bytes: Vec<u8> => param]);
@@ -4069,28 +4200,32 @@ macro_rules! command {
             #[cfg(feature = "remote")]
             (Request::GetFlycockpitAccount, "get_flycockpit_account", owner_only, none, false, read_only, none, serialized, none, "-", []);
             (Request::GetProviderCatalogSnapshot { project_root, provider_id, snapshot_session_id }, "get_provider_catalog_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|provider_id:Option<String>|snapshot_session_id:String", [project_root: String => project_root, provider_id: Option<String> => param, snapshot_session_id: String => param]);
-            (Request::ApplyProviderMutation { snapshot_session_id, layer_id, expected_revision, client_operation_id, mutation_intent_hash, mutation }, "apply_provider_mutation", owner_only, none, true, local_only, none, serialized, none, "snapshot_session_id:String|layer_id:String|expected_revision:String|client_operation_id:String|mutation_intent_hash:String|mutation:crate::ProviderMutationBatch", [snapshot_session_id: String => param, layer_id: String => param, expected_revision: String => param, client_operation_id: String => param, mutation_intent_hash: String => param, mutation: crate::ProviderMutationBatch => param]);
+            (Request::ApplyProviderMutation { snapshot_session_id, layer_id, expected_revision, client_operation_id, mutation_intent_hash, mutation }, "apply_provider_mutation", owner_only, none, true, local_only, none, serialized, none, "snapshot_session_id:String|layer_id:String|expected_revision:String|client_operation_id:String|mutation_intent_hash:String|mutation:crate::ProviderMutationBatch", [snapshot_session_id: String => param, layer_id: String => param, expected_revision: String => param, client_operation_id: String => param, mutation_intent_hash: String => param, mutation: cockpit_proto::ProviderMutationBatch => param]);
             (Request::FetchProviderModels { project_root, provider_id, model_id, deep, on_unlisted, allow_fallback }, "fetch_provider_models", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:Option<String>|model_id:Option<String>|deep:bool|on_unlisted:Option<cockpit_config::config::providers::OnUnlistedModelsFetch>|allow_fallback:bool", [project_root: String => project_root, provider_id: Option<String> => param, model_id: Option<String> => param, deep: bool => param, on_unlisted: Option<cockpit_config::config::providers::OnUnlistedModelsFetch> => param, allow_fallback: bool => param]);
             (Request::GetProviderUsageSnapshot { project_root, provider_id }, "get_provider_usage_snapshot", owner_only, none, false, read_only, none, serialized, path(project_root), "project_root:String|provider_id:Option<String>", [project_root: String => project_root, provider_id: Option<String> => param]);
+            #[cfg(feature = "remote")]
             (Request::UpsertProviderConfig { project_root, provider_id, entry }, "upsert_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param]);
-            (Request::SaveProviderConfig { project_root, provider_id, entry, header_secrets }, "save_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<String>>", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param, header_secrets: Vec<Option<String>> => param]);
+            #[cfg(feature = "remote")]
+            (Request::SaveProviderConfig { project_root, provider_id, entry, header_secrets }, "save_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|entry:cockpit_config::config::providers::ProviderEntry|header_secrets:Vec<Option<crate::ProviderSecretValue>>", [project_root: String => project_root, provider_id: String => param, entry: cockpit_config::config::providers::ProviderEntry => param, header_secrets: Vec<Option<cockpit_proto::ProviderSecretValue>> => param]);
             (Request::SetupCopilotAuth { client_operation_id, project_root, provider_id }, "setup_copilot_auth", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|provider_id:String", [client_operation_id: String => param, project_root: String => project_root, provider_id: String => param]);
+            #[cfg(feature = "remote")]
             (Request::ApplySetupWizard { project_root, wizard_id, answers_json }, "apply_setup_wizard", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|wizard_id:String|answers_json:String", [project_root: String => project_root, wizard_id: String => param, answers_json: String => param]);
             // Composite MCP publication is reserved in the remote ledger
             // before dispatch. The daemon's journal + staged vault commit
             // makes the nonrepeatable outcome replay-safe.
-            (Request::SaveMcpConfig { client_operation_id, project_root, snapshot_capability, owner_root, config_path, expected_revision, mutation_intent_hash, config_json, secret_values_json, cleanup_names_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|snapshot_capability:String|owner_root:String|config_path:String|expected_revision:String|mutation_intent_hash:String|config_json:String|secret_values_json:SensitiveWirePayload|cleanup_names_json:String", [client_operation_id: String => param, project_root: String => project_root, snapshot_capability: String => param, owner_root: String => param, config_path: String => param, expected_revision: String => param, mutation_intent_hash: String => param, config_json: String => param, secret_values_json: SensitiveWirePayload => param, cleanup_names_json: String => param]);
+            (Request::SaveMcpConfig { client_operation_id, project_root, snapshot_capability, owner_root, config_path, expected_revision, mutation_intent_hash, patch, secret_values_json }, "save_mcp_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "client_operation_id:String|project_root:String|snapshot_capability:String|owner_root:String|config_path:String|expected_revision:String|mutation_intent_hash:String|patch:SensitiveWirePayload|secret_values_json:SensitiveWirePayload", [client_operation_id: String => param, project_root: String => project_root, snapshot_capability: String => param, owner_root: String => param, config_path: String => param, expected_revision: String => param, mutation_intent_hash: String => param, patch: SensitiveWirePayload => param, secret_values_json: SensitiveWirePayload => param]);
             (Request::GetAgentInventory { project_root }, "get_agent_inventory", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::GetAgentEditSnapshot { project_root, name }, "get_agent_edit_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|name:String", [project_root: String => project_root, name: String => param]);
-            (Request::MutateAgent { client_operation_id, mutation_intent_hash, project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, mutation: crate::AgentMutation => param, expected_revision: Option<String> => param]);
+            (Request::MutateAgent { client_operation_id, mutation_intent_hash, project_root, mutation, expected_revision }, "mutate_agent", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|mutation:crate::AgentMutation|expected_revision:Option<String>", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, mutation: cockpit_proto::AgentMutation => param, expected_revision: Option<String> => param]);
             (Request::BeginAgentEditorLease { client_operation_id, project_root, name, expected_revision }, "begin_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|name:String|expected_revision:String", [client_operation_id: String => param, project_root: String => project_root, name: String => param, expected_revision: String => param]);
-            (Request::CompleteAgentEditorLease { client_operation_id, project_root, lease_id, markdown }, "complete_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|lease_id:String|markdown:Option<String>", [client_operation_id: String => param, project_root: String => project_root, lease_id: String => param, markdown: Option<String> => param]);
+            (Request::CompleteAgentEditorLease { client_operation_id, project_root, lease_id, markdown }, "complete_agent_editor_lease", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|lease_id:String|markdown:Option<SensitiveWirePayload>", [client_operation_id: String => param, project_root: String => project_root, lease_id: String => param, markdown: Option<SensitiveWirePayload> => param]);
             (Request::GetAgentEditorLeaseSettlement { client_operation_id, project_root, lease_id }, "get_agent_editor_lease_settlement", owner_only, none, false, local_only, none, concurrent, path(project_root), "client_operation_id:String|project_root:String|lease_id:String", [client_operation_id: String => param, project_root: String => project_root, lease_id: String => param]);
             (Request::GetExtendedConfigSnapshot { project_root, snapshot_session_id }, "get_extended_config_snapshot", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|snapshot_session_id:String", [project_root: String => project_root, snapshot_session_id: String => param]);
-            (Request::ApplyExtendedConfigPatch { client_operation_id, project_root, layer_id, patch, expected_revision, snapshot_session_id }, "apply_extended_config_patch", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|layer_id:String|patch:crate::ExtendedConfigPatch|expected_revision:String|snapshot_session_id:String", [client_operation_id: String => param, project_root: String => project_root, layer_id: String => param, patch: crate::ExtendedConfigPatch => param, expected_revision: String => param, snapshot_session_id: String => param]);
+            (Request::ApplyExtendedConfigPatch { client_operation_id, project_root, layer_id, patch, expected_revision, snapshot_session_id }, "apply_extended_config_patch", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|project_root:String|layer_id:String|patch:crate::ExtendedConfigPatch|expected_revision:String|snapshot_session_id:String", [client_operation_id: String => param, project_root: String => project_root, layer_id: String => param, patch: cockpit_proto::ExtendedConfigPatch => param, expected_revision: String => param, snapshot_session_id: String => param]);
             (Request::SaveExtendedConfig { project_root, path, content, base_hash }, "save_extended_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => param, content: String => param, base_hash: Option<String> => param]);
             (Request::ExportPolicy { project_root }, "export_policy", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::ImportPolicy { project_root, bundle_json, replace }, "import_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|bundle_json:String|replace:bool", [project_root: String => project_root, bundle_json: String => param, replace: bool => param]);
+            #[cfg(feature = "extended")]
             (Request::GetImageSpendPolicy { project_key }, "get_image_spend_policy", owner_only, none, false, local_only, none, concurrent, none, "project_key:String", [project_key: String => param]);
             (Request::ImageEndpointList { project_root, limit, cursor }, "image_endpoint_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
             (Request::ImageEndpointGet { project_root, endpoint_id }, "image_endpoint_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|endpoint_id:String", [project_root: String => project_root, endpoint_id: String => param]);
@@ -4098,18 +4233,21 @@ macro_rules! command {
             (Request::ImageTargetGet { project_root, target_id }, "image_target_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|target_id:String", [project_root: String => project_root, target_id: String => param]);
             (Request::ImageWorkflowList { project_root, limit, cursor }, "image_workflow_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
             (Request::ImageWorkflowGet { project_root, workflow_id }, "image_workflow_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|workflow_id:String", [project_root: String => project_root, workflow_id: String => param]);
+            #[cfg(feature = "extended")]
             (Request::SaveImageSpendPolicy { client_operation_id, project_key, settings_json, expected_policy_version }, "save_image_spend_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|project_key:String|settings_json:String|expected_policy_version:Option<u64>", [client_operation_id: String => param, project_key: String => param, settings_json: String => param, expected_policy_version: Option<u64> => param]);
-            (Request::ImageEndpointCreate { client_operation_id, mutation_intent_hash, project_root, endpoint_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_create", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
-            (Request::ImageEndpointUpdate { client_operation_id, mutation_intent_hash, project_root, endpoint_id, endpoint_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_update", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_id:String|endpoint_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_id: String => param, endpoint_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
-            (Request::ImageEndpointDelete { client_operation_id, mutation_intent_hash, project_root, endpoint_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
-            (Request::ImageTargetCreate { client_operation_id, mutation_intent_hash, project_root, target_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_create", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
-            (Request::ImageTargetUpdate { client_operation_id, mutation_intent_hash, project_root, target_id, target_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_update", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|target_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, target_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
-            (Request::ImageTargetDelete { client_operation_id, mutation_intent_hash, project_root, target_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
-            (Request::ImageTargetSetDefault { client_operation_id, mutation_intent_hash, project_root, target_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_set_default", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
-            (Request::ImageWorkflowUpload { client_operation_id, mutation_intent_hash, project_root, workflow_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_upload", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
-            (Request::ImageWorkflowBind { client_operation_id, mutation_intent_hash, project_root, workflow_id, bindings_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_bind", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|bindings_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_id: String => param, bindings_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
-            (Request::ImageWorkflowDelete { client_operation_id, mutation_intent_hash, project_root, workflow_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageEndpointCreate { client_operation_id, mutation_intent_hash, project_root, endpoint_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_create", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageEndpointUpdate { client_operation_id, mutation_intent_hash, project_root, endpoint_id, endpoint_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_update", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_id:String|endpoint_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_id: String => param, endpoint_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageEndpointDelete { client_operation_id, mutation_intent_hash, project_root, endpoint_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageTargetCreate { client_operation_id, mutation_intent_hash, project_root, target_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_create", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageTargetUpdate { client_operation_id, mutation_intent_hash, project_root, target_id, target_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_update", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|target_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, target_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageTargetDelete { client_operation_id, mutation_intent_hash, project_root, target_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageTargetSetDefault { client_operation_id, mutation_intent_hash, project_root, target_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_target_set_default", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|target_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, target_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageWorkflowUpload { client_operation_id, mutation_intent_hash, project_root, workflow_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_upload", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageWorkflowBind { client_operation_id, mutation_intent_hash, project_root, workflow_id, bindings_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_bind", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|bindings_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_id: String => param, bindings_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            (Request::ImageWorkflowDelete { client_operation_id, mutation_intent_hash, project_root, workflow_id, expected_config_generation, expected_config_revision, mutation_capability }, "image_workflow_delete", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|workflow_id:String|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, workflow_id: String => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: cockpit_proto::image_control::ImageConfigMutationCapabilityV1 => param]);
+            #[cfg(feature = "remote")]
             (Request::DeleteProviderConfig { project_root, provider_id, delete_stored_secrets }, "delete_provider_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|provider_id:String|delete_stored_secrets:bool", [project_root: String => project_root, provider_id: String => param, delete_stored_secrets: bool => param]);
+            #[cfg(feature = "remote")]
             (Request::SetProviderLayerMetadata { project_root, category_defaults_json, on_unlisted_models_fetch }, "set_provider_layer_metadata", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|category_defaults_json:String|on_unlisted_models_fetch:cockpit_config::config::providers::OnUnlistedModelsFetch", [project_root: String => project_root, category_defaults_json: String => param, on_unlisted_models_fetch: cockpit_config::config::providers::OnUnlistedModelsFetch => param]);
             (Request::DaemonStatus, "daemon_status", public_read, none, false, read_only, none, concurrent, none, "-", []);
             (Request::RefreshEnv { vars }, "refresh_env", session_writer, attached, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "vars:HashMap<String,String>", [vars: HashMap<String,String> => param]);
@@ -4120,6 +4258,11 @@ macro_rules! command {
             (Request::GuidanceEstimate { project_root, provider, model }, "guidance_estimate", project_read(project_root), none, false, read_only, none, concurrent, none, "project_root:String|provider:Option<String>|model:Option<String>", [project_root: String => project_root, provider: Option<String> => provider_model_left(model), model: Option<String> => provider_model_right(provider)]);
             (Request::RecoverSecurityBlockedMedia(..), "recover_security_blocked_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::RegisterLocalPathMedia(..), "register_local_path_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
+            (Request::AdmitImageIngress { session_id, source, admission_id }, "admit_image_ingress", session_writer, attached, true, local_only, none, serialized, none, "session_id:Uuid|source:ImageIngressSourceV1|admission_id:Uuid", [session_id: Uuid => session, source: ImageIngressSourceV1 => param, admission_id: Uuid => param]);
+            // Disposal remains available after the frontend has switched its
+            // attached session, but requires the same session-writer authority
+            // that could create the exact admission in the first place.
+            (Request::DiscardImageIngressDraft { session_id, admission_id, local_operation_id }, "discard_image_ingress_draft", session_row_writer(session_id), none, true, local_only, none, serialized, none, "session_id:Uuid|admission_id:Uuid|local_operation_id:Uuid", [session_id: Uuid => session, admission_id: Uuid => param, local_operation_id: Uuid => param]);
             (Request::RetainHttpsMedia(..), "retain_https_media", owner_only, none, true, local_only, none, serialized, none, "-", []);
             (Request::GetMediaAttachmentStatus(..), "get_media_attachment_status", public_read, none, false, read_only, none, serialized, none, "-", []);
             (Request::GetMediaAttachmentPreview(..), "get_media_attachment_preview", public_read, none, false, read_only, none, serialized, none, "-", []);
@@ -4486,6 +4629,8 @@ fn canonical_fcor_codec_for_rust_type(ty: &str) -> Option<&'static str> {
         // Secret-bearing JSON payloads contribute only a SHA-256 digest, never
         // plaintext, to FCOR's ordinary canonical byte buffer.
         "SensitiveWirePayload" => "sha256-redacted",
+        "ImageIngressSourceV1" => "sha256-redacted",
+        "Option<SensitiveWirePayload>" => "option<sha256-redacted>",
         "crate::image_control::ImageConfigMutationCapabilityV1" => "sha256-redacted",
         "Uuid" => "uuid",
         "Vec<u8>" => "bytes",
@@ -4659,6 +4804,19 @@ mod tests {
             assert!(
                 validate_agent_interrupt_response(&response).is_err(),
                 "empty response shape must be rejected: {response:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn optional_sensitive_wire_payload_fcor_is_exactly_digest_redacted() {
+        for tag in ["complete_provider_oauth", "complete_mcp_oauth"] {
+            let schema = canonical_remote_operation_fcor_schema_for_tag(tag)
+                .expect("OAuth completion has a canonical FCOR schema");
+            assert_eq!(
+                schema,
+                "client_operation_id:string|flow_id:string|input:option<sha256-redacted>"
             );
         }
     }
@@ -5514,6 +5672,7 @@ mod tests {
     #[test]
     fn owner_provider_rpcs_bound_typed_and_wire_ingress() {
         let oversized_provider_id = "p".repeat(MAX_OWNER_PROVIDER_ID_BYTES + 1);
+        let oversized_metadata = "x".repeat(MAX_OWNER_PROVIDER_METADATA_JSON_BYTES + 1);
         assert!(
             Request::PutSubscriptionAck {
                 client_operation_id: "subscription-ack".into(),
@@ -5523,27 +5682,6 @@ mod tests {
             .is_err()
         );
 
-        let oversized_metadata = "x".repeat(MAX_OWNER_PROVIDER_METADATA_JSON_BYTES + 1);
-        assert!(
-            Request::SetProviderLayerMetadata {
-                project_root: "/repo".into(),
-                category_defaults_json: oversized_metadata.clone(),
-                on_unlisted_models_fetch:
-                    cockpit_config::config::providers::OnUnlistedModelsFetch::Keep,
-            }
-            .validate_semantics()
-            .is_err()
-        );
-        assert!(
-            Request::SetProviderLayerMetadata {
-                project_root: "".into(),
-                category_defaults_json: "{}".into(),
-                on_unlisted_models_fetch:
-                    cockpit_config::config::providers::OnUnlistedModelsFetch::Keep,
-            }
-            .validate_semantics()
-            .is_err()
-        );
         assert!(
             Request::FetchProviderModels {
                 project_root: "/repo".into(),
@@ -5590,6 +5728,7 @@ mod tests {
         assert!(serde_json::from_value::<Request>(fetch_wire).is_err());
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn provider_config_owner_ingress_rejects_credential_bearing_urls() {
         let request = Request::UpsertProviderConfig {
@@ -5615,6 +5754,29 @@ mod tests {
         let error = request.validate_semantics().unwrap_err();
         assert!(error.contains("query string"));
         assert!(!error.contains("secret"));
+    }
+
+    #[cfg(not(feature = "remote"))]
+    #[test]
+    fn local_v17_rejects_revisionless_provider_mutation_tags() {
+        for tag in [
+            "upsert_provider_config",
+            "save_provider_config",
+            "delete_provider_config",
+            "set_provider_layer_metadata",
+            "apply_setup_wizard",
+        ] {
+            let wire = serde_json::json!({ "request": tag, "params": {} });
+            assert!(
+                serde_json::from_value::<Request>(wire).is_err(),
+                "local protocol unexpectedly accepts legacy provider mutation `{tag}`"
+            );
+        }
+        // Full-shape daemon fixtures are intentionally remote-profile
+        // archaeology and are exhaustively checked only with `remote`.
+        // This test is the local-profile source of truth: it exercises the
+        // actual default-feature deserializer rather than inspecting that
+        // remote fixture as if it represented a local binary.
     }
 
     #[cfg(feature = "remote")]

@@ -446,6 +446,38 @@
     },
     "request": "git_diff_file"
   },
+  "git_diff": {
+    "params": {
+      "project_root": "project_root-fixture",
+      "source": {
+        "kind": "worktree"
+      }
+    },
+    "request": "git_diff"
+  },
+  "git_review_sources": {
+    "params": {
+      "project_root": "project_root-fixture",
+      "sources": [
+        {
+          "kind": "worktree"
+        }
+      ]
+    },
+    "request": "git_review_sources"
+  },
+  "git_repo_status": {
+    "params": {
+      "project_root": "project_root-fixture"
+    },
+    "request": "git_repo_status"
+  },
+  "find_worktree_root": {
+    "params": {
+      "path": "path-fixture"
+    },
+    "request": "find_worktree_root"
+  },
   "git_status": {
     "params": {
       "project_root": "project_root-fixture"
@@ -1189,6 +1221,25 @@
     },
     "request": "register_local_path_media"
   },
+  "admit_image_ingress": {
+    "params": {
+      "session_id": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "source": {
+        "kind": "privateTerminalCapability",
+        "capability": "abcdefghijklmnopqrstuvwxyz"
+      },
+      "admission_id": "01890f3e-7bcd-7abc-8abc-000000000021"
+    },
+    "request": "admit_image_ingress"
+  },
+  "discard_image_ingress_draft": {
+    "params": {
+      "session_id": "01890f3e-7bcd-7abc-8abc-000000000002",
+      "admission_id": "01890f3e-7bcd-7abc-8abc-000000000021",
+      "local_operation_id": "01890f3e-7bcd-7abc-8abc-000000000022"
+    },
+    "request": "discard_image_ingress_draft"
+  },
   "retain_https_media": {
     "params": {
       "schemaVersion": 1,
@@ -1466,10 +1517,7 @@
   "upsert_provider_config": {
     "params": {
       "entry": {
-        "cache": {
-          "mode": "none",
-          "ttl_secs": 300
-        },
+        "cache": { "mode": "none", "ttl_secs": 300 },
         "context": {
           "auto_compact_pct": null,
           "auto_prune_pct": 50,
@@ -1481,14 +1529,8 @@
         },
         "headers": [],
         "models": [],
-        "shrink": {
-          "margin_secs": 30,
-          "strategy": "prune"
-        },
-        "timeout": {
-          "idle_secs": 90,
-          "ttft_secs": 120
-        },
+        "shrink": { "margin_secs": 30, "strategy": "prune" },
+        "timeout": { "idle_secs": 90, "ttft_secs": 120 },
         "url": "https://example.test"
       },
       "project_root": "/tmp/project",
@@ -1564,10 +1606,7 @@
       "project_root": "/tmp/project",
       "provider_id": "example",
       "entry": {
-        "cache": {
-          "mode": "none",
-          "ttl_secs": 300
-        },
+        "cache": { "mode": "none", "ttl_secs": 300 },
         "context": {
           "auto_compact_pct": null,
           "auto_prune_pct": 50,
@@ -1579,14 +1618,8 @@
         },
         "headers": [],
         "models": [],
-        "shrink": {
-          "margin_secs": 30,
-          "strategy": "prune"
-        },
-        "timeout": {
-          "idle_secs": 90,
-          "ttft_secs": 120
-        },
+        "shrink": { "margin_secs": 30, "strategy": "prune" },
+        "timeout": { "idle_secs": 90, "ttft_secs": 120 },
         "url": "https://example.test"
       },
       "header_secrets": []
@@ -1602,9 +1635,8 @@
       "config_path": "/tmp/project/.cockpit/mcp.json",
       "expected_revision": "0000000000000000000000000000000000000000000000000000000000000000",
       "mutation_intent_hash": "1111111111111111111111111111111111111111111111111111111111111111",
-      "config_json": "{}",
-      "secret_values_json": "{}",
-      "cleanup_names_json": "[]"
+      "patch": "{\"operations\":[{\"operation\":\"delete_authored_server\",\"name\":\"fixture\"}]}",
+      "secret_values_json": "{}"
     },
     "request": "save_mcp_config"
   },
@@ -1952,7 +1984,8 @@
     "params": {
       "client_operation_id": "33333333-3333-4333-8333-333333333333",
       "project_root": "/tmp/project",
-      "lease_id": "11111111-1111-4111-8111-111111111111"
+      "lease_id": "11111111-1111-4111-8111-111111111111",
+      "markdown": "---\nschemaVersion: 2\n---\nBe helpful.\n"
     },
     "request": "complete_agent_editor_lease"
   },
@@ -2072,41 +2105,5 @@
       "offline": false
     },
     "request": "get_doctor_snapshot"
-  },
-  "read_agent_tree": {
-    "params": {
-      "session_id": "11111111-1111-4111-8111-111111111111",
-      "root_agent_instance_id": "22222222-2222-4222-8222-222222222222",
-      "after": {
-        "created_at_unix_ms": 1700000000000,
-        "id": "33333333-3333-4333-8333-333333333333"
-      },
-      "limit": 25
-    },
-    "request": "read_agent_tree"
-  },
-  "read_agent_attention": {
-    "params": {
-      "session_id": "11111111-1111-4111-8111-111111111111",
-      "after": null,
-      "limit": 25
-    },
-    "request": "read_agent_attention"
-  },
-  "resolve_agent_decision": {
-    "params": {
-      "session_id": "11111111-1111-4111-8111-111111111111",
-      "decision_request_id": "44444444-4444-4444-8444-444444444444",
-      "answer": {
-        "kind": "interrupt_response",
-        "response": {
-          "kind": "single",
-          "data": {
-            "selected_id": "option:018f47a2-7b3c-7def-8123-000000000001"
-          }
-        }
-      }
-    },
-    "request": "resolve_agent_decision"
   }
 }

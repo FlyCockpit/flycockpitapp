@@ -16,9 +16,10 @@
 -- ---- assistants ------------------------------------------------------------
 
 CREATE TABLE assistants (
-    name         TEXT    PRIMARY KEY,
-    created_at   INTEGER NOT NULL,
-    home_dir     TEXT    NOT NULL,
+    name         TEXT    PRIMARY KEY CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 255),
+    -- Daemon-observed wall-clock time, signed Unix milliseconds.
+    created_at_unix_ms INTEGER NOT NULL,
+    home_dir     TEXT    NOT NULL CHECK (length(CAST(home_dir AS BLOB)) BETWEEN 1 AND 32768),
     config_json  TEXT    NOT NULL DEFAULT '{}' CHECK (
         json_valid(config_json) AND json_type(config_json) = 'object'
         AND length(CAST(config_json AS BLOB)) <= 1048576
@@ -33,51 +34,24 @@ CREATE TABLE assistants (
     )
 );
 
--- ---- scheduled_jobs --------------------------------------------------------
-
-CREATE TABLE scheduled_jobs (
-    id                TEXT    PRIMARY KEY,
-    owner             TEXT    NOT NULL,
-    schedule_json     TEXT    NOT NULL CHECK (
-        json_valid(schedule_json) AND json_type(schedule_json) = 'object'
-        AND length(CAST(schedule_json AS BLOB)) <= 65536
-    ),
-    payload_json      TEXT    NOT NULL CHECK (
-        json_valid(payload_json)
-        AND length(CAST(payload_json AS BLOB)) <= 1048576
-    ),
-    enabled           INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
-    missed_run_policy TEXT    NOT NULL CHECK (missed_run_policy IN ('skip', 'run_once_on_start')),
-    created_at        INTEGER NOT NULL,
-    updated_at        INTEGER NOT NULL CHECK (updated_at >= created_at),
-    last_run_at       INTEGER,
-    next_run_at       INTEGER,
-    last_result_json  TEXT CHECK (
-        last_result_json IS NULL OR (
-            json_valid(last_result_json)
-            AND length(CAST(last_result_json AS BLOB)) <= 1048576
-        )
-    ),
-    failure_count     INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
-    backoff_until     INTEGER,
-    disabled_notice   TEXT
-);
-
-CREATE INDEX idx_scheduled_jobs_next_run
-    ON scheduled_jobs(enabled, next_run_at);
-
-CREATE INDEX idx_scheduled_jobs_owner
-    ON scheduled_jobs(owner);
-
 -- ---- sessions --------------------------------------------------------------
 
 CREATE TABLE sessions (
-    session_id      TEXT    PRIMARY KEY,
-    project_id      TEXT    NOT NULL,
-    project_root    TEXT    NOT NULL,
-    started_at      INTEGER NOT NULL,            -- epoch seconds
-    last_active_at  INTEGER NOT NULL CHECK (last_active_at >= started_at),
-    ended_at        INTEGER CHECK (ended_at IS NULL OR ended_at >= started_at),
+    session_id      TEXT    PRIMARY KEY CHECK (
+        length(session_id) = 36 AND session_id = lower(session_id)
+        AND substr(session_id, 9, 1) = '-' AND substr(session_id, 14, 1) = '-'
+        AND substr(session_id, 19, 1) = '-' AND substr(session_id, 24, 1) = '-'
+        AND length(replace(session_id, '-', '')) = 32
+        AND replace(session_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    project_id      TEXT    NOT NULL CHECK (length(CAST(project_id AS BLOB)) BETWEEN 1 AND 1024),
+    project_root    TEXT    NOT NULL CHECK (length(CAST(project_root AS BLOB)) BETWEEN 1 AND 32768),
+    -- Daemon-observed wall-clock times, signed Unix milliseconds.
+    started_at_unix_ms      INTEGER NOT NULL,
+    last_active_at_unix_ms  INTEGER NOT NULL CHECK (last_active_at_unix_ms >= started_at_unix_ms),
+    ended_at_unix_ms        INTEGER CHECK (ended_at_unix_ms IS NULL OR ended_at_unix_ms >= started_at_unix_ms),
+    -- [relationship:denormalized] Immutable-attribution display snapshots;
+    -- provider/model registry changes never rewrite session history.
     provider        TEXT,
     model           TEXT,
     model_selection_json TEXT CHECK (
@@ -88,7 +62,7 @@ CREATE TABLE sessions (
         )
     ),
     -- Durable CAS token for active-model mutations (picker, recovery, controls).
-    active_model_revision INTEGER NOT NULL DEFAULT 0,
+    active_model_revision INTEGER NOT NULL DEFAULT 0 CHECK (active_model_revision >= 0),
     session_llm_mode TEXT CHECK (session_llm_mode IN ('defensive', 'normal', 'frontier')),
     session_entry_mode TEXT NOT NULL DEFAULT 'code'
         CHECK (session_entry_mode IN ('code', 'assistant', 'computer')),
@@ -107,31 +81,50 @@ CREATE TABLE sessions (
         )
     ),
     active_agent    TEXT    NOT NULL DEFAULT 'orchestrator-build',
+    -- [relationship:denormalized] Historical assistant label. Assistant
+    -- deletion is RESTRICT-free by design because sessions preserve history.
     assistant_name  TEXT,
 
     -- fork tree + auto-titling (GOALS §17). SQLite owns parent integrity
     -- and cascades deletion through the complete fork subtree.
+    -- [relationship:foreign] parent_session_id owns the fork subtree.
     parent_session_id  TEXT,                     -- NULL = root
-    fork_point_turn_id TEXT,                     -- turn in parent where fork branched; NULL = root
+    -- [relationship:foreign] Optional historical event sequence in that exact
+    -- parent session. NULL means the parent's durable tail at fork time.
+    fork_point_turn_id TEXT,
     title              TEXT,                     -- utility-model-generated label (§17d)
     user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
-    short_id           TEXT,                     -- 6-char Crockford base32 display id
+    short_id           TEXT CHECK (
+        short_id IS NULL OR (
+            length(short_id) = 6
+            AND short_id = lower(short_id)
+            AND short_id NOT GLOB '*[^0123456789abcdefghjkmnpqrstvwxyz]*'
+        )
+    ),                     -- 6-char Crockford base32 display id
 
     -- read/unread + archive state for the session browser (GOALS §17f).
     -- A session is UNREAD when the latest agent-produced event is newer
-    -- than last_viewed_at (NULL = never viewed). archived_at is a
+    -- than last_viewed_at_unix_ms (NULL = never viewed). archived_at_unix_ms is a
     -- recoverable soft-delete; NULL = live. Archive cascades the fork
     -- subtree app-side (src/db/sessions.rs).
-    last_viewed_at INTEGER,
-    archived_at    INTEGER,
+    last_viewed_at_unix_ms INTEGER,
+    archived_at_unix_ms    INTEGER,
 
     -- live guidance-file diff injection: hash + path of the resolved
     -- agent-guidance body baked into this session's frozen system block,
     -- so a mid-session in-place edit is detected and injected as a
     -- trailing diff exactly once. Both NULL when no guidance file
     -- resolved at session start.
-    guidance_baseline_hash TEXT,
-    guidance_baseline_path TEXT,
+    guidance_baseline_hash TEXT CHECK (
+        guidance_baseline_hash IS NULL OR (
+            length(guidance_baseline_hash) = 64
+            AND guidance_baseline_hash = lower(guidance_baseline_hash)
+            AND guidance_baseline_hash NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    guidance_baseline_path TEXT CHECK (
+        guidance_baseline_path IS NULL OR length(CAST(guidance_baseline_path AS BLOB)) BETWEEN 1 AND 32768
+    ),
 
     -- Accumulated session egress redaction table. Stores literal redaction
     -- candidates so resumed raw transcripts remain covered even if the
@@ -168,8 +161,8 @@ CREATE TABLE sessions (
     -- estimate of RAW typed user content, and the last consumed scheduled
     -- title slot (0, 1, 2, 4, 8, or 16) so a resumed session never repeats
     -- the same automatic title opportunity.
-    user_content_tokens INTEGER NOT NULL DEFAULT 0,
-    title_stage         INTEGER NOT NULL DEFAULT 0,
+    user_content_tokens INTEGER NOT NULL DEFAULT 0 CHECK (user_content_tokens >= 0),
+    title_stage         INTEGER NOT NULL DEFAULT 0 CHECK (title_stage IN (0, 1, 2, 4, 8, 16)),
 
     -- Durable one-shot post-auto-title-failure recovery nudge latch (issue
     -- #23): 0 = none, 1 = pending (a title attempt failed and a nudge is
@@ -189,9 +182,21 @@ CREATE TABLE sessions (
     lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'deleting')),
 
     CHECK (parent_session_id IS NULL OR parent_session_id <> session_id),
+    CHECK (fork_point_turn_id IS NULL OR (
+        parent_session_id IS NOT NULL
+        AND length(fork_point_turn_id) > 0
+        AND fork_point_turn_id NOT GLOB '*[^0-9]*'
+        AND fork_point_turn_id = CAST(CAST(fork_point_turn_id AS INTEGER) AS TEXT)
+    )),
     CHECK (btw_parent_session_id IS NULL OR btw_parent_session_id <> session_id),
-    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
-    FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    CHECK ((guidance_baseline_path IS NULL) = (guidance_baseline_hash IS NULL)),
+    CHECK (last_viewed_at_unix_ms IS NULL OR last_viewed_at_unix_ms >= started_at_unix_ms),
+    CHECK (archived_at_unix_ms IS NULL OR archived_at_unix_ms >= started_at_unix_ms),
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (parent_session_id, fork_point_turn_id)
+        REFERENCES session_events(session_id, seq)
+        ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- Parent links form an acyclic ownership graph. The recursive UNION is also
@@ -245,8 +250,14 @@ END;
 -- INTEGER is signed i64. Application codecs reject zero, leading zeroes and
 -- values outside u64 before any mutation.
 CREATE TABLE media_attachments (
-    attachment_id                  TEXT PRIMARY KEY,
-    session_id                     TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    attachment_id                  TEXT PRIMARY KEY CHECK (
+        length(attachment_id) = 36 AND attachment_id = lower(attachment_id)
+        AND substr(attachment_id, 9, 1) = '-' AND substr(attachment_id, 14, 1) = '-'
+        AND substr(attachment_id, 19, 1) = '-' AND substr(attachment_id, 24, 1) = '-'
+        AND length(replace(attachment_id, '-', '')) = 32
+        AND replace(attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    session_id                     TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     canonical_project_digest       TEXT NOT NULL,
     media_kind                     TEXT NOT NULL CHECK (media_kind IN ('image', 'audio', 'video')),
     source_kind                    TEXT NOT NULL CHECK (source_kind IN ('local_path', 'retained_https', 'authenticated_session_upload')),
@@ -265,16 +276,43 @@ CREATE TABLE media_attachments (
     source_identity_digest         TEXT NOT NULL,
     source_byte_length             TEXT NOT NULL,
     source_sha256                  TEXT NOT NULL,
-    selected_video_stream_json     TEXT,
-    selected_audio_stream_json     TEXT,
+    selected_video_stream_json     TEXT CHECK (selected_video_stream_json IS NULL OR (
+        json_valid(selected_video_stream_json)
+        AND json_type(selected_video_stream_json) = 'array'
+        AND json_array_length(selected_video_stream_json) = 2
+        AND json_type(selected_video_stream_json, '$[0]') = 'integer'
+        AND json_extract(selected_video_stream_json, '$[0]') BETWEEN 0 AND 4294967295
+        AND json_type(selected_video_stream_json, '$[1]') = 'text'
+        AND length(CAST(json_extract(selected_video_stream_json, '$[1]') AS BLOB)) BETWEEN 1 AND 255
+        AND length(CAST(selected_video_stream_json AS BLOB)) <= 65536
+    )),
+    selected_audio_stream_json     TEXT CHECK (selected_audio_stream_json IS NULL OR (
+        json_valid(selected_audio_stream_json)
+        AND json_type(selected_audio_stream_json) = 'array'
+        AND json_array_length(selected_audio_stream_json) = 2
+        AND json_type(selected_audio_stream_json, '$[0]') = 'integer'
+        AND json_extract(selected_audio_stream_json, '$[0]') BETWEEN 0 AND 4294967295
+        AND json_type(selected_audio_stream_json, '$[1]') = 'text'
+        AND length(CAST(json_extract(selected_audio_stream_json, '$[1]') AS BLOB)) BETWEEN 1 AND 255
+        AND length(CAST(selected_audio_stream_json AS BLOB)) <= 65536
+    )),
+    -- Daemon-observed wall-clock times, signed Unix milliseconds.
     created_at_unix_ms             INTEGER NOT NULL,
     updated_at_unix_ms             INTEGER NOT NULL,
     draft_expires_at_unix_ms       INTEGER,
     first_referenced_at_unix_ms    INTEGER,
     UNIQUE (attachment_id, attachment_version),
-    CHECK (length(canonical_project_digest) = 64 AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
-    CHECK (length(source_identity_digest) = 64 AND source_identity_digest NOT GLOB '*[^0-9a-f]*'),
-    CHECK (length(source_sha256) = 64 AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(canonical_project_digest) = 64 AND canonical_project_digest = lower(canonical_project_digest) AND canonical_project_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(source_identity_digest) = 64 AND source_identity_digest = lower(source_identity_digest) AND source_identity_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(source_sha256) = 64 AND source_sha256 = lower(source_sha256) AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (attachment_version NOT GLOB '*[^0-9]*' AND attachment_version GLOB '[1-9]*'),
+    CHECK (availability_generation NOT GLOB '*[^0-9]*' AND availability_generation GLOB '[1-9]*'),
+    CHECK (reference_generation NOT GLOB '*[^0-9]*' AND reference_generation GLOB '[1-9]*'),
+    CHECK (captured_capability_generation NOT GLOB '*[^0-9]*' AND captured_capability_generation GLOB '[1-9]*'),
+    CHECK (source_byte_length NOT GLOB '*[^0-9]*' AND source_byte_length GLOB '[1-9]*'),
+    CHECK (updated_at_unix_ms >= created_at_unix_ms),
+    CHECK (draft_expires_at_unix_ms IS NULL OR draft_expires_at_unix_ms >= created_at_unix_ms),
+    CHECK (first_referenced_at_unix_ms IS NULL OR first_referenced_at_unix_ms >= created_at_unix_ms),
     CHECK ((source_kind = 'authenticated_session_upload') OR draft_expires_at_unix_ms IS NULL)
 );
 
@@ -284,7 +322,7 @@ CREATE INDEX idx_media_attachments_cleanup
     ON media_attachments(availability, draft_expires_at_unix_ms);
 
 CREATE TABLE media_attachment_failure_reasons (
-    attachment_id TEXT PRIMARY KEY REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    attachment_id TEXT PRIMARY KEY REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     reason TEXT NOT NULL CHECK (reason IN (
         'ambiguous_or_unsupported_container', 'unsupported_codec',
         'unsupported_color_profile', 'invalid_media', 'resource_limit',
@@ -310,7 +348,13 @@ BEGIN
 END;
 
 CREATE TABLE media_attachment_components (
-    component_id          TEXT PRIMARY KEY,
+    component_id          TEXT PRIMARY KEY CHECK (
+        length(component_id) = 36 AND component_id = lower(component_id)
+        AND substr(component_id, 9, 1) = '-' AND substr(component_id, 14, 1) = '-'
+        AND substr(component_id, 19, 1) = '-' AND substr(component_id, 24, 1) = '-'
+        AND length(replace(component_id, '-', '')) = 32
+        AND replace(component_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
     attachment_id         TEXT NOT NULL,
     attachment_version    TEXT NOT NULL,
     component_kind        TEXT NOT NULL CHECK (component_kind IN ('quarantined_original', 'image_model', 'browser_thumbnail', 'audio_model', 'video_model', 'upload_temporary')),
@@ -324,24 +368,27 @@ CREATE TABLE media_attachment_components (
     deletion_evidence_digest TEXT,
     created_at_unix_ms    INTEGER NOT NULL,
     updated_at_unix_ms    INTEGER NOT NULL,
-    CHECK (length(stable_identity_digest) = 64 AND stable_identity_digest NOT GLOB '*[^0-9a-f]*'),
-    CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
-    CHECK (deletion_evidence_digest IS NULL OR (length(deletion_evidence_digest) = 64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*')),
+    CHECK (length(stable_identity_digest) = 64 AND stable_identity_digest = lower(stable_identity_digest) AND stable_identity_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (deletion_evidence_digest IS NULL OR (length(deletion_evidence_digest) = 64 AND deletion_evidence_digest = lower(deletion_evidence_digest) AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*')),
+    CHECK (component_generation NOT GLOB '*[^0-9]*' AND component_generation GLOB '[1-9]*'),
+    CHECK (byte_length NOT GLOB '*[^0-9]*' AND byte_length GLOB '[1-9]*'),
+    CHECK (updated_at_unix_ms >= created_at_unix_ms),
     FOREIGN KEY (attachment_id, attachment_version)
-        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_media_attachment_components_attachment
     ON media_attachment_components(attachment_id, component_id);
 
 CREATE TABLE media_image_component_dimensions (
-    component_id TEXT PRIMARY KEY REFERENCES media_attachment_components(component_id) ON DELETE CASCADE,
+    component_id TEXT PRIMARY KEY REFERENCES media_attachment_components(component_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     width INTEGER NOT NULL CHECK(width > 0 AND width <= 8192),
     height INTEGER NOT NULL CHECK(height > 0 AND height <= 8192)
 );
 
 CREATE TABLE media_attachment_transition_evidence (
-    attachment_id TEXT NOT NULL REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    attachment_id TEXT NOT NULL REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     availability_generation TEXT NOT NULL,
     from_state TEXT NOT NULL,
     to_state TEXT NOT NULL,
@@ -351,7 +398,7 @@ CREATE TABLE media_attachment_transition_evidence (
 );
 
 CREATE TABLE media_av_normalization_evidence (
-    attachment_id TEXT PRIMARY KEY REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    attachment_id TEXT PRIMARY KEY REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     runtime_fingerprint TEXT NOT NULL,
     probe_digest TEXT NOT NULL,
     decode_digest TEXT NOT NULL,
@@ -367,11 +414,83 @@ CREATE TABLE media_av_normalization_evidence (
 );
 
 CREATE TABLE media_storage_publication_intents (
-    upload_id TEXT PRIMARY KEY REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
+    upload_id TEXT PRIMARY KEY REFERENCES media_uploads(upload_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     temporary_storage_id TEXT NOT NULL,
     quarantine_storage_id TEXT NOT NULL,
-    derivative_storage_ids_json TEXT NOT NULL,
+    derivative_storage_ids_json TEXT NOT NULL CHECK (
+        json_valid(derivative_storage_ids_json)
+        AND json_type(derivative_storage_ids_json) = 'array'
+        AND json(derivative_storage_ids_json) = derivative_storage_ids_json
+        AND length(CAST(derivative_storage_ids_json AS BLOB)) <= 1048576
+    ),
     created_at_unix_ms INTEGER NOT NULL
+);
+
+CREATE TRIGGER media_storage_publication_derivative_ids_insert
+BEFORE INSERT ON media_storage_publication_intents
+WHEN EXISTS (
+    SELECT 1 FROM json_each(NEW.derivative_storage_ids_json)
+    WHERE type <> 'text' OR length(value) <> 36 OR value <> lower(value)
+       OR substr(value, 9, 1) <> '-' OR substr(value, 14, 1) <> '-'
+       OR substr(value, 19, 1) <> '-' OR substr(value, 24, 1) <> '-'
+       OR length(replace(value, '-', '')) <> 32
+       OR replace(value, '-', '') GLOB '*[^0-9a-f]*'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'media derivative storage ids must be canonical UUIDs');
+END;
+
+CREATE TRIGGER media_storage_publication_derivative_ids_update
+BEFORE UPDATE OF derivative_storage_ids_json ON media_storage_publication_intents
+WHEN EXISTS (
+    SELECT 1 FROM json_each(NEW.derivative_storage_ids_json)
+    WHERE type <> 'text' OR length(value) <> 36 OR value <> lower(value)
+       OR substr(value, 9, 1) <> '-' OR substr(value, 14, 1) <> '-'
+       OR substr(value, 19, 1) <> '-' OR substr(value, 24, 1) <> '-'
+       OR length(replace(value, '-', '')) <> 32
+       OR replace(value, '-', '') GLOB '*[^0-9a-f]*'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'media derivative storage ids must be canonical UUIDs');
+END;
+
+-- Crash fence for daemon-owned clipboard/private-terminal ingress. The
+-- opaque admission id is the client idempotency identity; the retained
+-- object is not visible until its attachment row and reservation publication
+-- commit atomically and this intent is removed.
+CREATE TABLE media_ingress_publication_intents (
+    admission_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    reservation_id TEXT NOT NULL UNIQUE REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    storage_id TEXT NOT NULL UNIQUE,
+    source_sha256 TEXT NOT NULL,
+    request_source_digest TEXT NOT NULL,
+    created_at_unix_ms INTEGER NOT NULL,
+    CHECK (length(admission_id) = 36),
+    CHECK (length(source_sha256) = 64 AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(request_source_digest) = 64 AND request_source_digest NOT GLOB '*[^0-9a-f]*')
+);
+
+CREATE TABLE media_ingress_admission_receipts (
+    admission_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    attachment_id TEXT NOT NULL UNIQUE REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    attachment_version TEXT NOT NULL,
+    availability_generation TEXT NOT NULL,
+    reservation_id TEXT NOT NULL UNIQUE REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    normalized_sha256 TEXT NOT NULL,
+    request_source_digest TEXT NOT NULL,
+    normalized_byte_length TEXT NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    committed_at_unix_ms INTEGER NOT NULL,
+    CHECK (length(admission_id) = 36),
+    CHECK (CAST(attachment_version AS INTEGER) > 0),
+    CHECK (CAST(availability_generation AS INTEGER) > 0),
+    CHECK (length(normalized_sha256) = 64 AND normalized_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(request_source_digest) = 64 AND request_source_digest NOT GLOB '*[^0-9a-f]*'),
+    CHECK (CAST(normalized_byte_length AS INTEGER) > 0),
+    CHECK (width > 0 AND height > 0)
 );
 
 CREATE TRIGGER media_attachment_component_compatibility_insert
@@ -424,7 +543,7 @@ CREATE TABLE media_attachment_references (
     released_at_unix_ms   INTEGER,
     UNIQUE (attachment_id, attachment_version, consumer_kind, consumer_id),
     FOREIGN KEY (attachment_id, attachment_version)
-        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_media_attachment_references_live
@@ -437,7 +556,7 @@ CREATE TABLE media_attachment_component_leases (
     lease_id                       TEXT PRIMARY KEY,
     attachment_id                  TEXT NOT NULL,
     attachment_version             TEXT NOT NULL,
-    component_id                   TEXT NOT NULL REFERENCES media_attachment_components(component_id) ON DELETE CASCADE,
+    component_id                   TEXT NOT NULL REFERENCES media_attachment_components(component_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     lease_kind                     TEXT NOT NULL CHECK (lease_kind IN ('preview', 'model')),
     expected_availability_generation TEXT NOT NULL,
     captured_capability_generation TEXT NOT NULL,
@@ -448,7 +567,7 @@ CREATE TABLE media_attachment_component_leases (
     acquired_at_unix_ms            INTEGER NOT NULL,
     released_at_unix_ms            INTEGER,
     FOREIGN KEY (attachment_id, attachment_version)
-        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE UNIQUE INDEX idx_media_attachment_component_leases_live_id
@@ -458,19 +577,19 @@ CREATE INDEX idx_media_attachment_component_leases_live_attachment
     ON media_attachment_component_leases(attachment_id, attachment_version, released_at_unix_ms);
 
 CREATE TABLE media_component_lease_reconciliation_evidence (
-    lease_id TEXT PRIMARY KEY REFERENCES media_attachment_component_leases(lease_id) ON DELETE CASCADE,
+    lease_id TEXT PRIMARY KEY REFERENCES media_attachment_component_leases(lease_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     reason TEXT NOT NULL CHECK(reason = 'daemon_restart'),
     released_at_unix_ms INTEGER NOT NULL
 );
 
 CREATE TABLE media_component_security_evidence (
-    lease_id TEXT PRIMARY KEY REFERENCES media_attachment_component_leases(lease_id) ON DELETE CASCADE,
+    lease_id TEXT PRIMARY KEY REFERENCES media_attachment_component_leases(lease_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id TEXT NOT NULL,
     component_id TEXT NOT NULL,
     reason TEXT NOT NULL CHECK(reason = 'storage_security_violation'),
     recorded_at_unix_ms INTEGER NOT NULL,
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
-    FOREIGN KEY (component_id) REFERENCES media_attachment_components(component_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (component_id) REFERENCES media_attachment_components(component_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE media_attachment_cleanup_intents (
@@ -485,11 +604,11 @@ CREATE TABLE media_attachment_cleanup_intents (
     completed_at_unix_ms             INTEGER,
     CHECK (length(component_set_digest) = 64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
     FOREIGN KEY (attachment_id, attachment_version)
-        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE media_component_deletion_intents (
-    component_id TEXT PRIMARY KEY REFERENCES media_attachment_components(component_id) ON DELETE CASCADE,
+    component_id TEXT PRIMARY KEY REFERENCES media_attachment_components(component_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id TEXT NOT NULL,
     storage_id TEXT NOT NULL,
     stable_identity_digest TEXT NOT NULL,
@@ -533,13 +652,13 @@ CREATE TABLE media_security_recovery_operations (
     CHECK (length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(affected_set_digest) = 64 AND affected_set_digest NOT GLOB '*[^0-9a-f]*'),
     FOREIGN KEY (attachment_id, attachment_version)
-        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE media_local_path_registration_operations (
     local_operation_id       TEXT PRIMARY KEY,
     authoritative_operation_id TEXT NOT NULL,
-    session_id               TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id               TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     canonical_project_digest TEXT NOT NULL,
     client_draft_id          TEXT NOT NULL,
     request_binding_digest   TEXT NOT NULL,
@@ -561,7 +680,7 @@ CREATE TABLE media_local_path_registration_evidence (
     source_mtime_unix_ns      TEXT NOT NULL,
     reservation_id           TEXT NOT NULL,
     reservation_digest       TEXT NOT NULL,
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE media_local_path_registration_audit (
@@ -573,7 +692,7 @@ CREATE TABLE media_local_path_registration_audit (
 CREATE TABLE media_retained_https_operations (
     local_operation_id         TEXT PRIMARY KEY,
     authoritative_operation_id TEXT NOT NULL,
-    session_id                 TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id                 TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     canonical_project_digest   TEXT NOT NULL,
     client_draft_id            TEXT NOT NULL,
     request_binding_digest     TEXT NOT NULL,
@@ -602,7 +721,7 @@ CREATE TABLE media_retained_https_evidence (
     reservation_digest       TEXT NOT NULL,
     CHECK (length(source_evidence_digest) = 64 AND source_evidence_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(reservation_digest) = 64 AND reservation_digest NOT GLOB '*[^0-9a-f]*'),
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE media_retained_https_audit (
@@ -637,46 +756,46 @@ CREATE TABLE media_attachment_processing_jobs (
     claim_attempt                    INTEGER NOT NULL DEFAULT 0,
     created_at_unix_ms               INTEGER NOT NULL,
     completed_at_unix_ms             INTEGER,
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 CREATE TABLE media_attachment_processing_security_evidence (
-    job_id             TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    job_id             TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id      TEXT NOT NULL,
     component_id       TEXT NOT NULL,
     reason             TEXT NOT NULL CHECK(reason = 'storage_security_violation'),
     recorded_at_unix_ms INTEGER NOT NULL,
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
-    FOREIGN KEY (component_id) REFERENCES media_attachment_components(component_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (component_id) REFERENCES media_attachment_components(component_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 CREATE TABLE media_attachment_processing_publication_intents (
-    job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     output_ids_json TEXT NOT NULL,
     created_at_unix_ms INTEGER NOT NULL
 );
 CREATE TABLE media_attachment_processing_cleanup_evidence (
-    job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     evidence_digest TEXT NOT NULL,
     completed_at_unix_ms INTEGER NOT NULL,
     CHECK (length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*')
 );
 CREATE TABLE media_attachment_processing_failure_evidence (
-    job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id TEXT NOT NULL,
     reason TEXT NOT NULL CHECK(reason IN ('processing_failed','model_runtime_unavailable')),
     recorded_at_unix_ms INTEGER NOT NULL,
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 CREATE TABLE media_attachment_processing_output_security_evidence (
-    job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id TEXT NOT NULL,
     output_ids_json TEXT NOT NULL,
     reason TEXT NOT NULL CHECK(reason='storage_security_violation'),
     recorded_at_unix_ms INTEGER NOT NULL,
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE media_uploads (
-    upload_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE, canonical_project_digest TEXT NOT NULL,
+    upload_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT, canonical_project_digest TEXT NOT NULL,
     client_draft_id TEXT NOT NULL, media_kind TEXT NOT NULL CHECK(media_kind IN ('image','audio','video')),
     state TEXT NOT NULL CHECK(state IN ('open','finalizing','materialized','cancelled','expired','failed')),
     upload_generation TEXT NOT NULL, declared_total_bytes TEXT NOT NULL, acknowledged_chunks INTEGER NOT NULL,
@@ -691,7 +810,7 @@ CREATE TABLE media_uploads (
 CREATE TABLE media_upload_chunks (
     upload_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, byte_length INTEGER NOT NULL,
     sha256 TEXT NOT NULL, storage_offset TEXT NOT NULL, acknowledged_at_unix_ms INTEGER NOT NULL,
-    PRIMARY KEY(upload_id,chunk_index), FOREIGN KEY(upload_id) REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
+    PRIMARY KEY(upload_id,chunk_index), FOREIGN KEY(upload_id) REFERENCES media_uploads(upload_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK(byte_length>0 AND byte_length<=262144), CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*')
 );
 CREATE TRIGGER media_upload_publication_intent_complete
@@ -702,7 +821,7 @@ BEGIN
 END;
 CREATE TABLE media_attachment_upload_origins(
     attachment_id TEXT PRIMARY KEY,client_draft_id TEXT NOT NULL,upload_id TEXT NOT NULL UNIQUE,upload_generation TEXT NOT NULL,
-    FOREIGN KEY(attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+    FOREIGN KEY(attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 CREATE TABLE local_media_operations (
     local_operation_id TEXT PRIMARY KEY, authoritative_operation_id TEXT NOT NULL, action TEXT NOT NULL,
@@ -729,7 +848,7 @@ CREATE TABLE media_reservations (
     queue_sequence INTEGER NOT NULL UNIQUE CHECK(queue_sequence >= 1),
     deadline_monotonic_ms INTEGER NOT NULL CHECK(deadline_monotonic_ms >= 0),
     created_wall_ms INTEGER NOT NULL,
-    external_operation_id TEXT UNIQUE REFERENCES external_journal_operations(operation_id),
+    external_operation_id TEXT UNIQUE REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     quarantined INTEGER NOT NULL DEFAULT 0 CHECK(quarantined IN (0,1)),
     published INTEGER NOT NULL DEFAULT 0 CHECK(published IN (0,1)),
     cancellation_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancellation_requested IN (0,1))
@@ -776,7 +895,7 @@ WHEN (OLD.state || '>' || NEW.state) NOT IN (
 )
 BEGIN SELECT RAISE(ABORT, 'illegal media reservation state transition'); END;
 CREATE TABLE media_reservation_plan_facts (
-    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     dimension TEXT NOT NULL,
     plan_json TEXT NOT NULL,
     PRIMARY KEY(reservation_id, dimension)
@@ -784,7 +903,7 @@ CREATE TABLE media_reservation_plan_facts (
 CREATE TRIGGER media_plan_fact_immutable_update BEFORE UPDATE ON media_reservation_plan_facts BEGIN SELECT RAISE(ABORT,'media plan facts are immutable'); END;
 CREATE TRIGGER media_plan_fact_immutable_delete BEFORE DELETE ON media_reservation_plan_facts BEGIN SELECT RAISE(ABORT,'media plan facts are immutable'); END;
 CREATE TABLE media_reservation_versions (
-    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     version INTEGER NOT NULL CHECK(version >= 1),
     state TEXT NOT NULL,
     recorded_wall_ms INTEGER NOT NULL,
@@ -804,12 +923,12 @@ INSERT INTO media_scheduler_cursor(singleton,last_session_id) VALUES(1,NULL);
 -- input. Keeping readiness durable lets the atomic fair claimant distinguish
 -- a slow upload from work that is actually waiting for an execution permit.
 CREATE TABLE media_execution_ready (
-    reservation_id TEXT PRIMARY KEY REFERENCES media_reservations(reservation_id),
+    reservation_id TEXT PRIMARY KEY REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     ready_wall_ms INTEGER NOT NULL
 );
 CREATE TABLE media_reservation_deltas (
     delta_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     reservation_version INTEGER NOT NULL CHECK(reservation_version >= 1),
     dimension TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
     estimated INTEGER NOT NULL CHECK(estimated >= 0), delta INTEGER NOT NULL,
@@ -832,7 +951,7 @@ CREATE TABLE media_accounting_blocks (
     PRIMARY KEY(scope_kind, scope_id)
 );
 CREATE TABLE media_artifact_facts (
-    artifact_id TEXT PRIMARY KEY, reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    artifact_id TEXT PRIMARY KEY, reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     dimension TEXT NOT NULL, byte_count INTEGER NOT NULL CHECK(byte_count >= 0), checksum TEXT NOT NULL,
     quarantined INTEGER NOT NULL CHECK(quarantined IN (0,1)), deletion_tombstone_checksum TEXT
 );
@@ -841,14 +960,14 @@ CREATE TRIGGER media_artifact_immutable_update BEFORE UPDATE ON media_artifact_f
 WHEN NEW.artifact_id!=OLD.artifact_id OR NEW.reservation_id!=OLD.reservation_id OR NEW.dimension!=OLD.dimension OR NEW.byte_count!=OLD.byte_count OR NEW.checksum!=OLD.checksum OR NEW.quarantined!=OLD.quarantined OR OLD.deletion_tombstone_checksum IS NOT NULL OR NEW.deletion_tombstone_checksum IS NULL
 BEGIN SELECT RAISE(ABORT,'media artifact facts are immutable'); END;
 CREATE TABLE media_cleanup_attestations (
-    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id), dimension TEXT NOT NULL,
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT, dimension TEXT NOT NULL,
     attestation_kind TEXT NOT NULL CHECK(attestation_kind='zero_materialized_or_verified_cleaned'),
     checksum TEXT NOT NULL, created_wall_ms INTEGER NOT NULL, PRIMARY KEY(reservation_id,dimension)
 );
 CREATE TRIGGER media_cleanup_attestation_immutable_update BEFORE UPDATE ON media_cleanup_attestations BEGIN SELECT RAISE(ABORT,'media cleanup attestations are immutable'); END;
 CREATE TRIGGER media_cleanup_attestation_immutable_delete BEFORE DELETE ON media_cleanup_attestations BEGIN SELECT RAISE(ABORT,'media cleanup attestations are immutable'); END;
 CREATE TABLE media_accounting_corruption_facts (
-    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id), reservation_version INTEGER NOT NULL CHECK(reservation_version >= 1),
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT, reservation_version INTEGER NOT NULL CHECK(reservation_version >= 1),
     dimension TEXT NOT NULL, unrepresentable_actual TEXT NOT NULL, reason TEXT NOT NULL, created_wall_ms INTEGER NOT NULL,
     PRIMARY KEY(reservation_id, reservation_version, dimension)
 );
@@ -868,27 +987,31 @@ CREATE TRIGGER media_repair_state_graph BEFORE UPDATE OF state ON media_repair_a
     (OLD.state='verifying' AND NEW.state IN ('committed','failed')) OR OLD.state=NEW.state
 ) BEGIN SELECT RAISE(ABORT, 'invalid media repair state transition'); END;
 CREATE TABLE media_counter_shadow (
-    attempt_id TEXT NOT NULL REFERENCES media_repair_attempts(attempt_id) ON DELETE CASCADE,
+    attempt_id TEXT NOT NULL REFERENCES media_repair_attempts(attempt_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     dimension TEXT NOT NULL, charged INTEGER NOT NULL CHECK(charged >= 0), PRIMARY KEY(attempt_id, dimension)
 );
 CREATE TABLE media_downstream_ownership (
-    reservation_id TEXT PRIMARY KEY REFERENCES media_reservations(reservation_id),
+    reservation_id TEXT PRIMARY KEY REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     invocation_id TEXT NOT NULL,
     bound_wall_ms INTEGER NOT NULL,
     released_wall_ms INTEGER
 );
 CREATE INDEX idx_media_downstream_invocation ON media_downstream_ownership(invocation_id);
 
-CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at DESC);
-CREATE INDEX idx_sessions_last_active     ON sessions (last_active_at DESC);
-CREATE INDEX idx_sessions_open            ON sessions (ended_at) WHERE ended_at IS NULL;
+CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at_unix_ms DESC);
+CREATE INDEX idx_sessions_last_active     ON sessions (last_active_at_unix_ms DESC);
+CREATE INDEX idx_sessions_open
+    ON sessions (ephemeral, last_active_at_unix_ms DESC)
+    WHERE ended_at_unix_ms IS NULL;
+CREATE INDEX idx_sessions_parent_fork_point ON sessions(parent_session_id, fork_point_turn_id);
+CREATE INDEX idx_sessions_parent_started ON sessions (parent_session_id, started_at_unix_ms DESC);
 CREATE INDEX idx_sessions_parent          ON sessions (parent_session_id);
 -- Partial so rows whose short_id is still NULL (lazily backfilled on next
 -- touch by src/db/sessions.rs) don't trip the uniqueness constraint.
 CREATE UNIQUE INDEX idx_sessions_short_id_project
     ON sessions (project_id, short_id)
     WHERE short_id IS NOT NULL;
-CREATE INDEX idx_sessions_archived  ON sessions (archived_at);
+CREATE INDEX idx_sessions_archived  ON sessions (archived_at_unix_ms);
 CREATE INDEX idx_sessions_ephemeral ON sessions (ephemeral);
 CREATE INDEX idx_sessions_btw_parent ON sessions (btw_parent_session_id);
 CREATE UNIQUE INDEX idx_sessions_one_live_btw
@@ -897,7 +1020,7 @@ CREATE UNIQUE INDEX idx_sessions_one_live_btw
 CREATE INDEX idx_sessions_created_by_principal ON sessions (created_by_principal);
 CREATE INDEX idx_sessions_shared_project ON sessions (project_root, shared_with_collaborators)
   WHERE shared_with_collaborators = 1;
-CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at DESC)
+CREATE INDEX idx_sessions_assistant ON sessions (assistant_name, last_active_at_unix_ms DESC)
   WHERE assistant_name IS NOT NULL;
 
 -- ---- sealed_values ---------------------------------------------------------
@@ -911,7 +1034,7 @@ CREATE TABLE sealed_values (
     origin     TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (session_id, value_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_sealed_values_session_created
@@ -932,6 +1055,8 @@ CREATE TABLE tool_call_events (
     event_id            TEXT    PRIMARY KEY,
     session_id          TEXT    NOT NULL,
     call_id             TEXT    NOT NULL,
+    -- [relationship:foreign] Same-session parent tool call. Historical
+    -- attribution is retained with the child and cannot cross sessions.
     parent_call_id      TEXT    DEFAULT NULL,
     parent_child_index  INTEGER DEFAULT NULL,
     timestamp           INTEGER NOT NULL,
@@ -987,13 +1112,18 @@ CREATE TABLE tool_call_events (
     -- provider wire identity for the call: the provider-native item/call
     -- ids, where the call id came from, the wire API flavor, and the
     -- provider family.
+    -- [relationship:external] Provider-owned opaque wire identifiers, not
+    -- local registry keys and therefore intentionally not foreign keys.
     provider_item_id        TEXT DEFAULT NULL,
     provider_call_id        TEXT DEFAULT NULL,
     provider_call_id_source TEXT DEFAULT NULL,
     wire_api                TEXT DEFAULT NULL,
     provider_family         TEXT DEFAULT NULL,
 
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (session_id, parent_call_id)
+        REFERENCES tool_call_events(session_id, call_id)
+        ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_tce_session_ts ON tool_call_events (session_id, timestamp);
@@ -1001,7 +1131,8 @@ CREATE INDEX idx_tce_project_ts ON tool_call_events (project_id, timestamp);
 CREATE INDEX idx_tce_model_ts   ON tool_call_events (model, timestamp);
 CREATE INDEX idx_tce_tool_ts    ON tool_call_events (tool, timestamp);
 CREATE INDEX idx_tce_lang_ts    ON tool_call_events (language, timestamp);
-CREATE INDEX idx_tce_parent     ON tool_call_events (parent_call_id);
+CREATE UNIQUE INDEX uq_tce_session_call ON tool_call_events(session_id, call_id);
+CREATE INDEX idx_tce_parent     ON tool_call_events (session_id, parent_call_id);
 
 -- ---- inference_calls -------------------------------------------------------
 
@@ -1029,7 +1160,7 @@ CREATE TABLE inference_calls (
     -- expectation (GOALS §10) against measured reality.
     cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
 
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_ic_session_ts ON inference_calls (session_id, timestamp);
@@ -1043,7 +1174,7 @@ CREATE TABLE lock_state (
     agent_id    TEXT    NOT NULL,
     session_id  TEXT    NOT NULL,
     acquired_at INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_lock_state_session ON lock_state (session_id);
@@ -1055,7 +1186,7 @@ CREATE TABLE lock_reads (
     read_at     INTEGER NOT NULL,
     read_hash   INTEGER,
     PRIMARY KEY (session_id, agent_id, path),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- ---- needs_attention (GOALS §3b) --------------------------------------------
@@ -1097,13 +1228,13 @@ CREATE TABLE agent_instances (
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (agent_instance_id, session_id),
     UNIQUE (session_id, runtime_key),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (parent_agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
-    FOREIGN KEY (task_delegation_job_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE RESTRICT,
-    FOREIGN KEY (task_delegation_child_uuid) REFERENCES task_delegation_children(child_uuid) ON DELETE RESTRICT,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (task_delegation_job_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (task_delegation_child_uuid) REFERENCES task_delegation_children(child_uuid) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (resolved_profile_snapshot_id, session_id)
-        REFERENCES agent_profile_snapshots(snapshot_id, session_id) ON DELETE RESTRICT
+        REFERENCES agent_profile_snapshots(snapshot_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_agent_instances_session_state
@@ -1229,7 +1360,7 @@ CREATE TABLE decision_requests (
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (decision_request_id, session_id),
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_decision_requests_agent_state
@@ -1270,9 +1401,9 @@ CREATE TABLE decision_receipts (
     session_event_seq INTEGER,
     created_at_unix_ms INTEGER NOT NULL,
     FOREIGN KEY (decision_request_id, session_id)
-        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE,
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (session_id, session_event_seq)
-        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT
+        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE TABLE agent_transition_receipts (
@@ -1285,9 +1416,9 @@ CREATE TABLE agent_transition_receipts (
     created_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY (agent_instance_id, terminal_state),
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (session_id, session_event_seq)
-        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT
+        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 -- Only the trusted daemon host creates these identities, before it raises a
@@ -2015,10 +2146,10 @@ CREATE TABLE needs_attention (
         -- state machine owns terminal projection, not the data itself.
         OR question_json IS NOT NULL OR questions_json IS NOT NULL
     ),
-    FOREIGN KEY (decision_request_id) REFERENCES decision_requests(decision_request_id) ON DELETE CASCADE,
+    FOREIGN KEY (decision_request_id) REFERENCES decision_requests(decision_request_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_na_session_open ON needs_attention (session_id, state);
@@ -2032,7 +2163,7 @@ CREATE TABLE decision_attention_mutation_guards (
     decision_request_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
     FOREIGN KEY (decision_request_id, session_id)
-        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TRIGGER needs_attention_decision_session_insert
@@ -2210,7 +2341,7 @@ CREATE TABLE tokenizer_calibration (
 -- The index is on-demand (no file watcher): the central `index_target`
 -- helper re-stats tracked files on each tool call and re-indexes
 -- stale/removed ones before answering. `intel_files` is the parent; the
--- per-file tables FK to it ON DELETE CASCADE so dropping a deleted or
+-- per-file tables FK to it ON DELETE CASCADE ON UPDATE RESTRICT so dropping a deleted or
 -- stale file's row purges its symbols/imports/identifiers/deps/callsites
 -- in one statement.
 
@@ -2243,7 +2374,7 @@ CREATE TABLE intel_symbols (
     parent     TEXT,
     visibility TEXT,
     signature  TEXT,
-    FOREIGN KEY (root, path) REFERENCES intel_files(root, path) ON DELETE CASCADE
+    FOREIGN KEY (root, path) REFERENCES intel_files(root, path) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE intel_imports (
@@ -2251,7 +2382,7 @@ CREATE TABLE intel_imports (
     path   TEXT NOT NULL,
     target TEXT NOT NULL,
     line   INTEGER NOT NULL,
-    FOREIGN KEY (root, path) REFERENCES intel_files(root, path) ON DELETE CASCADE
+    FOREIGN KEY (root, path) REFERENCES intel_files(root, path) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE intel_identifiers (
@@ -2259,7 +2390,7 @@ CREATE TABLE intel_identifiers (
     path  TEXT NOT NULL,
     token TEXT NOT NULL,
     line  INTEGER NOT NULL,
-    FOREIGN KEY (root, path) REFERENCES intel_files(root, path) ON DELETE CASCADE
+    FOREIGN KEY (root, path) REFERENCES intel_files(root, path) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE intel_deps (
@@ -2268,7 +2399,7 @@ CREATE TABLE intel_deps (
     importee   TEXT,
     raw_target TEXT NOT NULL,
     line       INTEGER NOT NULL,
-    FOREIGN KEY (root, importer) REFERENCES intel_files(root, path) ON DELETE CASCADE
+    FOREIGN KEY (root, importer) REFERENCES intel_files(root, path) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE intel_callsites (
@@ -2278,7 +2409,7 @@ CREATE TABLE intel_callsites (
     caller_symbol TEXT,
     callee_name   TEXT NOT NULL,
     callee_kind   TEXT,
-    FOREIGN KEY (root, caller_file) REFERENCES intel_files(root, path) ON DELETE CASCADE
+    FOREIGN KEY (root, caller_file) REFERENCES intel_files(root, path) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX intel_symbols_name      ON intel_symbols(name);
@@ -2372,7 +2503,7 @@ CREATE TABLE inference_requests (
     goal_id TEXT,                               -- immutable host-goal attribution at dispatch
     goal_attempt_generation INTEGER,            -- attempt generation captured with goal_id
     PRIMARY KEY (call_id, ordinal),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_ireq_session ON inference_requests (session_id);
@@ -2413,7 +2544,7 @@ CREATE TABLE session_events (
     model_id TEXT,                                 -- authoring model id, NULL for model-less events
     llm_mode TEXT CHECK (llm_mode IN ('defensive', 'normal', 'frontier')), -- authoring LLM mode, NULL for model-less events
     model_trust TEXT,                              -- write-time resolved model trust, NULL for model-less events
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE UNIQUE INDEX uq_session_events_session_seq ON session_events (session_id, seq);
@@ -2456,9 +2587,9 @@ CREATE TABLE verification_operations (
     created_at_unix_ms INTEGER NOT NULL,
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (operation_id, session_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     CHECK ((estimate_state = 'available' AND budget_action IS NULL) OR
            (estimate_state = 'estimate_unavailable' AND budget_action IS NOT NULL)),
     CHECK ((state = 'skipped_budget_refused') = (budget_action = 'refuse')),
@@ -2490,7 +2621,7 @@ CREATE TABLE verification_candidates (
     UNIQUE (candidate_id, operation_id),
     UNIQUE (candidate_id, session_id),
     FOREIGN KEY (operation_id, session_id)
-        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_verification_candidates_operation_state
@@ -2512,9 +2643,9 @@ CREATE TABLE verification_candidate_artifacts (
     mode_digest TEXT CHECK (length(mode_digest) = 64 AND mode_digest NOT GLOB '*[^0-9a-f]*'),
     PRIMARY KEY (candidate_id, ordinal),
     FOREIGN KEY (candidate_id, operation_id)
-        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE CASCADE,
+        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (candidate_id, session_id)
-        REFERENCES verification_candidates(candidate_id, session_id) ON DELETE CASCADE,
+        REFERENCES verification_candidates(candidate_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK ((operation_kind = 'rename') = (prior_path_digest IS NOT NULL)),
     CHECK ((operation_kind = 'mode') = (mode_digest IS NOT NULL))
 );
@@ -2529,11 +2660,11 @@ CREATE TABLE verification_late_results (
     received_at_unix_ms INTEGER NOT NULL,
     UNIQUE (candidate_id, result_digest),
     FOREIGN KEY (candidate_id, operation_id)
-        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE CASCADE,
+        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (candidate_id, session_id)
-        REFERENCES verification_candidates(candidate_id, session_id) ON DELETE CASCADE,
+        REFERENCES verification_candidates(candidate_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (operation_id, session_id)
-        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE verification_syntheses (
@@ -2551,9 +2682,9 @@ CREATE TABLE verification_syntheses (
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (operation_id, session_id),
     FOREIGN KEY (operation_id, session_id)
-        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE,
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (selected_candidate_id, operation_id)
-        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE RESTRICT,
+        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     CHECK ((state = 'selected' AND selected_candidate_id IS NOT NULL AND artifact_kind = 'proposed_call' AND canonical_call_digest IS NOT NULL)
         OR (state = 'synthesized_write' AND selected_candidate_id IS NULL AND artifact_kind = 'write_change_set' AND write_union_receipt_digest IS NOT NULL)
         OR (state IN ('pending', 'refused', 'no_valid_candidate', 'failed') AND selected_candidate_id IS NULL))
@@ -2569,9 +2700,9 @@ CREATE TABLE verification_synthesis_artifacts (
     source_artifact_ordinal INTEGER NOT NULL CHECK (source_artifact_ordinal >= 0),
     PRIMARY KEY (synthesis_id, ordinal),
     UNIQUE (synthesis_id, source_candidate_id, source_artifact_ordinal),
-    FOREIGN KEY (synthesis_id) REFERENCES verification_syntheses(synthesis_id) ON DELETE CASCADE,
+    FOREIGN KEY (synthesis_id) REFERENCES verification_syntheses(synthesis_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (source_candidate_id, source_artifact_ordinal)
-        REFERENCES verification_candidate_artifacts(candidate_id, ordinal) ON DELETE RESTRICT
+        REFERENCES verification_candidate_artifacts(candidate_id, ordinal) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE TABLE verification_projection_envelopes (
@@ -2589,7 +2720,7 @@ CREATE TABLE verification_projection_envelopes (
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (operation_id, session_id),
     FOREIGN KEY (operation_id, session_id)
-        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE verification_dispatch_attempts (
@@ -2606,7 +2737,7 @@ CREATE TABLE verification_dispatch_attempts (
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (operation_id, session_id),
     FOREIGN KEY (operation_id, session_id)
-        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE verification_projections (
@@ -2620,7 +2751,7 @@ CREATE TABLE verification_projections (
     UNIQUE (projection_id, session_id),
     UNIQUE (operation_id, session_id),
     FOREIGN KEY (operation_id, session_id)
-        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE verification_projection_events (
@@ -2631,9 +2762,9 @@ CREATE TABLE verification_projection_events (
     PRIMARY KEY (projection_id, ordinal),
     UNIQUE (projection_id, session_event_seq),
     FOREIGN KEY (projection_id, session_id)
-        REFERENCES verification_projections(projection_id, session_id) ON DELETE CASCADE,
+        REFERENCES verification_projections(projection_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (session_id, session_event_seq)
-        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT
+        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_verification_projection_events_session
@@ -2654,7 +2785,7 @@ CREATE TABLE client_submission_terminal_receipts (
     )),
     created_at_ms       INTEGER NOT NULL,
     PRIMARY KEY (session_id, client_submission_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- Authoritative terminal receipts for config-only SetDefaultModel requests.
@@ -2725,7 +2856,7 @@ CREATE TABLE message_operation_receipts (
     ),
     CHECK (state = 'terminal_rejected' OR artifact_terminal_reason IS NULL),
     CHECK ((artifact_model_fence_generation IS NULL) = (artifact_model_fence_json IS NULL)),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE message_submission_receipts (
@@ -2748,10 +2879,10 @@ CREATE TABLE message_submission_receipts (
     CHECK ((state = 'materialized') = (message_seq IS NOT NULL AND fold_ordinal IS NOT NULL)),
     CHECK (state = 'terminal_rejected' OR artifact_terminal_reason IS NULL),
     FOREIGN KEY (session_id, operation_id)
-      REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE,
+      REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (session_id, operation_id, client_submission_id, message_request_digest)
       REFERENCES message_operation_receipts(session_id, operation_id, client_submission_id, message_request_digest)
-      ON DELETE CASCADE
+      ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE message_queue_items (
@@ -2771,7 +2902,7 @@ CREATE TABLE message_queue_items (
     UNIQUE (session_id, client_submission_id),
     CHECK (state = 'terminal_rejected' OR artifact_terminal_reason IS NULL),
     FOREIGN KEY (session_id, client_submission_id)
-      REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE
+      REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE message_attachment_references (
@@ -2790,7 +2921,7 @@ CREATE TABLE message_attachment_references (
     UNIQUE (session_id, client_submission_id, attachment_id),
     CHECK (released_at IS NULL OR released_at >= acquired_at),
     FOREIGN KEY (session_id, client_submission_id)
-      REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE
+      REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- Large compaction records spill out of the inline event JSON as one canonical
@@ -2801,7 +2932,7 @@ CREATE TABLE compaction_handoffs (
     session_id  TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     created_at   INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_compaction_handoffs_session ON compaction_handoffs(session_id);
@@ -2814,7 +2945,7 @@ CREATE TABLE compaction_shadows (
     payload_json TEXT NOT NULL,
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- ---- approval_grants (sandboxing part 1, §2) -------------------------------------
@@ -2854,7 +2985,7 @@ CREATE TABLE approval_grants (
             OR ((grant_kind <> 'command' OR verdict <> 'allow') AND risk_tier IS NULL)
         ),
     PRIMARY KEY (session_id, grant_kind, grant_key),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_approval_grants_session ON approval_grants (session_id);
@@ -2874,7 +3005,7 @@ CREATE TABLE loop_guard_rules (
     rule_verdict  TEXT    NOT NULL CHECK (rule_verdict IN ('accept', 'reject')),
     recorded_at   INTEGER NOT NULL,
     PRIMARY KEY (session_id, signature),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_loop_guard_rules_session ON loop_guard_rules (session_id);
@@ -2906,10 +3037,10 @@ CREATE VIRTUAL TABLE session_fts USING fts5(
 CREATE TABLE session_fts_docs (
     rowid      INTEGER PRIMARY KEY,
     row_kind   TEXT NOT NULL CHECK (row_kind IN ('title', 'message', 'compaction')),
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     seq        INTEGER,
     FOREIGN KEY (session_id, seq)
-        REFERENCES session_events(session_id, seq) ON DELETE CASCADE,
+        REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT,
     UNIQUE(row_kind, session_id, seq)
 );
 
@@ -3127,9 +3258,12 @@ END;
 -- INSERT OR IGNORE).
 
 CREATE TABLE guidance_contents (
-    hash       TEXT PRIMARY KEY,
-    contents   TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    hash       TEXT PRIMARY KEY CHECK (
+        length(hash) = 64 AND hash = lower(hash) AND hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    contents   TEXT NOT NULL CHECK (length(CAST(contents AS BLOB)) <= 8388608),
+    -- Daemon-observed wall-clock time, signed Unix milliseconds.
+    created_at_unix_ms INTEGER NOT NULL
 );
 
 -- ---- subagent_handles (GOALS §3c, plan §3d) ---------------------------------------
@@ -3145,7 +3279,7 @@ CREATE TABLE guidance_contents (
 CREATE TABLE subagent_handles (
     handle          TEXT PRIMARY KEY,
     session_id      TEXT NOT NULL
-        REFERENCES sessions (session_id) ON DELETE CASCADE,
+        REFERENCES sessions (session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     agent           TEXT NOT NULL,
     transcript_json TEXT NOT NULL,
     created_at      INTEGER NOT NULL,
@@ -3193,7 +3327,7 @@ CREATE TABLE pins (
     pinned_ms   INTEGER NOT NULL,             -- epoch milliseconds (pin order)
     PRIMARY KEY (session_id, seq),
     FOREIGN KEY (session_id, seq)
-        REFERENCES session_events(session_id, seq) ON DELETE CASCADE
+        REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_pins_session ON pins (session_id, pinned_ms);
@@ -3210,7 +3344,7 @@ CREATE INDEX idx_pins_session ON pins (session_id, pinned_ms);
 
 CREATE TABLE prune_ledger (
     session_id  TEXT PRIMARY KEY
-        REFERENCES sessions (session_id) ON DELETE CASCADE,
+        REFERENCES sessions (session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     ledger_json TEXT NOT NULL,
     updated_at  INTEGER NOT NULL
 );
@@ -3239,7 +3373,7 @@ CREATE TABLE tandem_inference (
     response_json TEXT,                             -- full raw completion (text + tool calls)
     usage_json    TEXT,                             -- provider-reported token usage
     status        TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'errored', 'timed_out', 'cancelled')),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_tandem_session ON tandem_inference (session_id);
@@ -3252,7 +3386,7 @@ CREATE INDEX idx_tandem_parent  ON tandem_inference (parent_call_id);
 
 CREATE TABLE task_todos (
     id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     content TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed', 'cancelled')),
     priority INTEGER NOT NULL DEFAULT 0,
@@ -3271,8 +3405,8 @@ CREATE INDEX idx_task_todos_session_status_priority
 
 CREATE TABLE task_todo_notes (
     id TEXT PRIMARY KEY,
-    todo_id TEXT NOT NULL REFERENCES task_todos(id) ON DELETE CASCADE,
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    todo_id TEXT NOT NULL REFERENCES task_todos(id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     kind TEXT NOT NULL CHECK (kind IN ('summary', 'finding', 'decision', 'artifact', 'blocker', 'handoff')),
     body TEXT NOT NULL,
     author_agent TEXT NOT NULL,
@@ -3288,8 +3422,8 @@ CREATE INDEX idx_task_todo_notes_session
 
 CREATE TABLE task_todo_assignments (
     id TEXT PRIMARY KEY,
-    todo_id TEXT NOT NULL REFERENCES task_todos(id) ON DELETE CASCADE,
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    todo_id TEXT NOT NULL REFERENCES task_todos(id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     task_call_id TEXT NOT NULL,
     label TEXT NOT NULL DEFAULT 'default',
     child_agent TEXT NOT NULL,
@@ -3309,7 +3443,7 @@ CREATE INDEX idx_task_todo_assignments_session
 
 CREATE TABLE session_goals (
     id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     project_id TEXT NOT NULL,
     objective TEXT NOT NULL,
     context TEXT,
@@ -3354,7 +3488,7 @@ CREATE INDEX idx_session_goals_session_status
 
 CREATE TABLE goal_control_jobs (
     job_id TEXT PRIMARY KEY,
-    goal_id TEXT NOT NULL REFERENCES session_goals(id) ON DELETE CASCADE,
+    goal_id TEXT NOT NULL REFERENCES session_goals(id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attempt_generation INTEGER NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('planner', 'evaluator', 'gatekeeper', 'cold_skeptic')),
     slot INTEGER NOT NULL CHECK (slot >= 0),
@@ -3371,7 +3505,7 @@ CREATE INDEX idx_goal_control_jobs_registered
     ON goal_control_jobs(goal_id, state, attempt_generation);
 
 CREATE TABLE goal_root_turns (
-    goal_id TEXT NOT NULL REFERENCES session_goals(id) ON DELETE CASCADE,
+    goal_id TEXT NOT NULL REFERENCES session_goals(id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attempt_generation INTEGER NOT NULL,
     turn_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'finished', 'cancelled')),
@@ -3432,15 +3566,15 @@ CREATE TABLE session_text_artifacts (
     CHECK((kind = 'tool_result' AND capture_reason IN ('display_truncation', 'prune_boundary')) OR (kind IN ('user_input_source', 'user_input_projection') AND capture_reason = 'oversized_user_input')),
     CHECK((owner_relation = 'source_user_input' AND owner_slot = -1) OR (owner_relation <> 'source_user_input' AND owner_slot >= 0)),
     CHECK((content_representation = 'raw' AND archive_import_id IS NULL) OR (content_representation = 'export_redacted' AND archive_import_id IS NOT NULL)),
-    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
-    FOREIGN KEY(archive_import_id) REFERENCES session_text_artifact_archive_imports(import_id) ON DELETE RESTRICT,
+    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY(archive_import_id) REFERENCES session_text_artifact_archive_imports(import_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     -- This deferred circular ownership FK is intentionally the database-level
     -- backstop for direct SQL: an artifact cannot commit without exactly its
     -- one matching ref, while the normal composition can insert the immutable
     -- body before its ref in the same transaction.
     FOREIGN KEY(session_id,artifact_id,owner_event_seq,owner_relation,owner_slot)
       REFERENCES session_text_artifact_event_refs(session_id,artifact_id,event_seq,relation,owner_slot)
-      ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+      ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED
 );
 
 CREATE INDEX idx_session_text_artifacts_session_created
@@ -3454,7 +3588,7 @@ CREATE TABLE session_user_message_model_envelopes (
     event_seq INTEGER NOT NULL CHECK(typeof(event_seq) = 'integer' AND event_seq > 0),
     envelope_json TEXT NOT NULL CHECK(typeof(envelope_json) = 'text' AND length(CAST(envelope_json AS BLOB)) <= 131072 AND json_valid(envelope_json) AND json_type(envelope_json) = 'object'),
     PRIMARY KEY(session_id, event_seq),
-    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE
+    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- An accepted submission is immutable.  In particular, a restart must never
@@ -3474,8 +3608,8 @@ CREATE TABLE session_text_artifact_event_refs (
     owner_slot INTEGER NOT NULL CHECK(typeof(owner_slot) = 'integer' AND owner_slot >= -1),
     artifact_id TEXT NOT NULL CHECK(typeof(artifact_id) = 'text' AND length(artifact_id) = 36),
     PRIMARY KEY(session_id, artifact_id),
-    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE,
-    FOREIGN KEY(session_id, artifact_id) REFERENCES session_text_artifacts(session_id, artifact_id) ON DELETE CASCADE,
+    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY(session_id, artifact_id) REFERENCES session_text_artifacts(session_id, artifact_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK((relation = 'source_user_input' AND projection_slot IS NULL AND owner_slot = -1) OR (relation <> 'source_user_input' AND projection_slot IS NOT NULL AND owner_slot = projection_slot)),
     UNIQUE(session_id,artifact_id,event_seq,relation,owner_slot)
 );
@@ -3505,8 +3639,9 @@ CREATE TABLE session_text_artifact_projection_pending_slots (
     projection_slot INTEGER NOT NULL CHECK(typeof(projection_slot) = 'integer' AND projection_slot >= 0),
     unresolved INTEGER NOT NULL DEFAULT 1 CHECK(unresolved = 1),
     PRIMARY KEY(session_id, event_seq, projection_slot),
-    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE,
+    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY(unresolved) REFERENCES session_text_artifact_projection_pending_sentinel(unresolved)
+        ON DELETE RESTRICT ON UPDATE RESTRICT
         DEFERRABLE INITIALLY DEFERRED
 );
 
@@ -3966,9 +4101,9 @@ CREATE TABLE session_text_artifact_quota_reservations (
     updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at BETWEEN -9223372036854775808 AND 9223372036854775807),
     PRIMARY KEY(session_id, client_submission_id),
     CHECK((model_fence_generation IS NULL) = (model_fence_json IS NULL)),
-    FOREIGN KEY(session_id, client_submission_id) REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE,
-    FOREIGN KEY(session_id, operation_id) REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE,
-    FOREIGN KEY(session_id, queue_item_id) REFERENCES message_queue_items(session_id, queue_item_id) ON DELETE CASCADE
+    FOREIGN KEY(session_id, client_submission_id) REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY(session_id, operation_id) REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY(session_id, queue_item_id) REFERENCES message_queue_items(session_id, queue_item_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 -- The Rust admission planner is an optimization only. These transaction-safe
 -- SQL guards make committed bodies plus live worst-case reservations a hard
@@ -4052,17 +4187,18 @@ CREATE INDEX idx_text_artifact_reservations_expiry
 -- Per-root workspace trust decisions.
 
 CREATE TABLE workspace_trust (
-    root_path TEXT PRIMARY KEY,
+    root_path TEXT PRIMARY KEY CHECK (length(CAST(root_path AS BLOB)) BETWEEN 1 AND 32768),
     mode TEXT NOT NULL CHECK (mode IN ('trust', 'ignore-config', 'untrusted')),
     -- Monotonic per-root policy fence.  Timestamps are observability only and
     -- cannot safely linearize two decisions made in the same clock tick.
     revision INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    -- Daemon-observed wall-clock times, signed Unix milliseconds.
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms)
 );
 
 CREATE INDEX idx_workspace_trust_updated_at
-    ON workspace_trust(updated_at DESC);
+    ON workspace_trust(updated_at_unix_ms DESC);
 
 -- ---- task delegations -----------------------------------------------------------------------
 -- Durable state for delegated `task` runs: one job per task call, one
@@ -4090,7 +4226,7 @@ CREATE TABLE task_delegation_jobs (
     final_delivered INTEGER NOT NULL DEFAULT 0 CHECK (final_delivered IN (0, 1)),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE task_delegation_children (
@@ -4121,7 +4257,7 @@ CREATE TABLE task_delegation_children (
     requested_cwd TEXT,
     resolved_cwd TEXT,
     PRIMARY KEY (task_call_id, label),
-    FOREIGN KEY (task_call_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE CASCADE
+    FOREIGN KEY (task_call_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_task_delegation_jobs_session_status
@@ -4157,7 +4293,7 @@ CREATE TABLE task_delegation_steers (
     delivered INTEGER NOT NULL DEFAULT 0 CHECK (delivered IN (0, 1)),
     created_at INTEGER NOT NULL,
     delivered_at INTEGER,
-    FOREIGN KEY (task_call_id, label) REFERENCES task_delegation_children(task_call_id, label) ON DELETE CASCADE
+    FOREIGN KEY (task_call_id, label) REFERENCES task_delegation_children(task_call_id, label) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_task_delegation_steers_pending
@@ -4177,8 +4313,8 @@ CREATE TABLE task_delegation_payloads (
     created_at INTEGER NOT NULL,
     delivered_at INTEGER,
     PRIMARY KEY (task_call_id, label),
-    FOREIGN KEY (task_call_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE CASCADE,
-    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (task_call_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK ((body_inline IS NOT NULL) OR (sidecar_path IS NOT NULL))
 );
 
@@ -4249,7 +4385,7 @@ CREATE TABLE paused_session_work (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     resolved_at INTEGER,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_paused_session_work_status_updated
@@ -4267,7 +4403,7 @@ CREATE TABLE skill_pairs (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (session_id, call_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_skill_pairs_session_owner
@@ -4320,7 +4456,7 @@ CREATE TABLE retention_meta (
 -- The session's living plan document (plan mode), one row per session.
 
 CREATE TABLE session_plan_docs (
-    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     content TEXT NOT NULL,
     revision INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
@@ -4359,7 +4495,7 @@ CREATE TABLE secure_key_versions (
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL,
     PRIMARY KEY (namespace, version),
-    FOREIGN KEY (namespace) REFERENCES secure_key_namespaces(namespace)
+    FOREIGN KEY (namespace) REFERENCES secure_key_namespaces(namespace) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_secure_key_versions_state
@@ -4377,7 +4513,7 @@ CREATE TABLE secure_key_sagas (
     key_digest  TEXT,
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL,
-    FOREIGN KEY (namespace) REFERENCES secure_key_namespaces(namespace)
+    FOREIGN KEY (namespace) REFERENCES secure_key_namespaces(namespace) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_secure_key_sagas_ns ON secure_key_sagas (namespace, kind);
@@ -4398,7 +4534,7 @@ CREATE TABLE secure_key_consumer_refs (
     updated_at      INTEGER NOT NULL,
     UNIQUE (namespace, version, consumer_kind, consumer_id),
     FOREIGN KEY (namespace, version)
-        REFERENCES secure_key_versions(namespace, version)
+        REFERENCES secure_key_versions(namespace, version) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_secure_key_refs_version_state
@@ -4487,8 +4623,8 @@ CREATE TABLE session_text_artifact_run_invocation_bindings (
     run_invocation_id TEXT NOT NULL,
     origin_principal_digest TEXT NOT NULL,
     PRIMARY KEY(session_id, client_submission_id),
-    FOREIGN KEY(session_id, client_submission_id) REFERENCES session_text_artifact_quota_reservations(session_id, client_submission_id) ON DELETE CASCADE,
-    FOREIGN KEY(run_invocation_id) REFERENCES run_invocations(client_submission_id) ON DELETE RESTRICT
+    FOREIGN KEY(session_id, client_submission_id) REFERENCES session_text_artifact_quota_reservations(session_id, client_submission_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY(run_invocation_id) REFERENCES run_invocations(client_submission_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 CREATE TRIGGER text_artifact_run_binding_validate_insert
 BEFORE INSERT ON session_text_artifact_run_invocation_bindings
@@ -4559,7 +4695,7 @@ CREATE TABLE execution_containments (
     created_at_wall_ms      INTEGER NOT NULL,
     updated_at_wall_ms      INTEGER NOT NULL,
     emptied_at_wall_ms      INTEGER,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_execution_containments_session
@@ -4611,10 +4747,10 @@ CREATE TABLE write_scope_leases (
     created_at_wall_ms      INTEGER NOT NULL,
     updated_at_wall_ms      INTEGER NOT NULL,
     released_at_wall_ms     INTEGER,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
-    FOREIGN KEY (parent_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (parent_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_write_scope_leases_session
@@ -4735,9 +4871,9 @@ CREATE TABLE write_scope_transfers (
     version                     INTEGER NOT NULL,
     created_at_wall_ms          INTEGER NOT NULL,
     updated_at_wall_ms          INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
-    FOREIGN KEY (parent_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT,
-    FOREIGN KEY (child_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (parent_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (child_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_write_scope_transfers_parent
@@ -4862,8 +4998,8 @@ CREATE TABLE write_scope_permits (
     containment_id          TEXT,
     acquired_at_wall_ms     INTEGER NOT NULL,
     released_at_wall_ms     INTEGER,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
-    FOREIGN KEY (lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_write_scope_permits_lease
@@ -4900,12 +5036,12 @@ CREATE TABLE workspace_leases (
     created_at_unix_ms        INTEGER NOT NULL,
     updated_at_unix_ms        INTEGER NOT NULL,
     UNIQUE (workspace_lease_id, session_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
-    FOREIGN KEY (write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (pinned_by_agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     CHECK ((pinned_at_unix_ms IS NULL) = (pinned_by_agent_instance_id IS NULL)),
     CHECK ((state = 'cleaned') = (terminal_reason IS NOT NULL)),
     CHECK (
@@ -5022,11 +5158,11 @@ CREATE TABLE task_artifacts (
     -- Artifact provenance is session-owned even though its source lease and
     -- agent references use restrictive composite FKs for normal lifecycle
     -- operations. Session teardown must collect the whole recovery graph.
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (source_workspace_lease_id, session_id)
-        REFERENCES workspace_leases(workspace_lease_id, session_id) ON DELETE RESTRICT,
+        REFERENCES workspace_leases(workspace_lease_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_task_artifacts_source_state
@@ -5065,10 +5201,10 @@ CREATE TABLE task_artifact_integration_receipts (
     -- Keep the immutable receipt in the session-owned cascade graph as well
     -- as under its artifact. This avoids a restrictive target-scope FK
     -- disconnecting receipt cleanup from session lifecycle ownership.
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (artifact_id, session_id)
-        REFERENCES task_artifacts(artifact_id, session_id) ON DELETE CASCADE,
-    FOREIGN KEY (target_write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+        REFERENCES task_artifacts(artifact_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (target_write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_task_artifact_receipts_target
@@ -5221,7 +5357,7 @@ END;
 -- paths/URLs, credentials, headers, provider payloads, or signed query
 -- values, and never spool HMAC key material.
 --
--- Deliberately NOT `ON DELETE CASCADE` from sessions: session deletion writes
+-- Deliberately NOT `ON DELETE CASCADE ON UPDATE RESTRICT` from sessions: session deletion writes
 -- an external_journal_session_tombstones row and unresolved operations
 -- survive it, so late provider evidence still resolves exactly once without
 -- recreating session content.
@@ -5302,7 +5438,7 @@ CREATE TABLE external_journal_events (
     cancellation_requested_at_wall_ms INTEGER,
     emitted_at_wall_ms                INTEGER NOT NULL,
     FOREIGN KEY (operation_id)
-        REFERENCES external_journal_operations (operation_id) ON DELETE CASCADE
+        REFERENCES external_journal_operations (operation_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE UNIQUE INDEX uq_external_journal_events_version
@@ -5329,7 +5465,7 @@ CREATE TABLE external_journal_spool_capsules (
     quarantined        INTEGER NOT NULL DEFAULT 0 CHECK (quarantined IN (0, 1)),
     created_at_wall_ms INTEGER NOT NULL,
     FOREIGN KEY (operation_id)
-        REFERENCES external_journal_operations (operation_id) ON DELETE CASCADE
+        REFERENCES external_journal_operations (operation_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_external_journal_capsules_partition
@@ -5630,7 +5766,7 @@ CREATE TABLE sealed_global_project_grants (
     project_key   TEXT    NOT NULL,
     granted_at_ms INTEGER NOT NULL,
     PRIMARY KEY (record_id, project_key),
-    FOREIGN KEY (record_id) REFERENCES sealed_value_records(record_id) ON DELETE CASCADE
+    FOREIGN KEY (record_id) REFERENCES sealed_value_records(record_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- The exact grant tuple for one immutable action instance. Every targeting
@@ -5653,11 +5789,11 @@ CREATE TABLE sealed_action_grants (
     issued_at_ms       INTEGER NOT NULL,
     expires_at_ms      INTEGER,
     revoked_at_ms      INTEGER,
-    FOREIGN KEY (record_id) REFERENCES sealed_value_records(record_id) ON DELETE CASCADE,
+    FOREIGN KEY (record_id) REFERENCES sealed_value_records(record_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     -- A grant names an exact session. When that session is deleted the grant
     -- must go with it: an outstanding grant naming a dead session would be a
     -- capability nobody can see and nobody can revoke.
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_sealed_action_grants_lookup
@@ -5796,7 +5932,7 @@ CREATE INDEX idx_sealed_recovery_audit_record
 -- blocks or aliases a fresh append.
 CREATE TABLE protected_redaction_history (
     history_id       TEXT    PRIMARY KEY,
-    session_id       TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id       TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     sealed_record_id TEXT,
     sealed_version   INTEGER,
     source           TEXT    NOT NULL CHECK (source IN ('Sealed', 'Environment', 'Credential', 'ContainedLeak')),
@@ -5843,7 +5979,7 @@ CREATE TABLE protected_redaction_artifact_refs (
     history_id    TEXT    NOT NULL,
     created_at_ms INTEGER NOT NULL,
     PRIMARY KEY (artifact_kind, artifact_id, history_id),
-    FOREIGN KEY (history_id) REFERENCES protected_redaction_history(history_id) ON DELETE CASCADE
+    FOREIGN KEY (history_id) REFERENCES protected_redaction_history(history_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_protected_redaction_artifact_refs_history
@@ -5865,7 +6001,7 @@ CREATE INDEX idx_protected_redaction_artifact_refs_artifact
 -- safe `seen` metadata and clears rotation state.
 CREATE TABLE protected_leak_records (
     report_id        TEXT    PRIMARY KEY,
-    session_id       TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id       TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     history_id       TEXT    NOT NULL,
     -- Keyed fingerprint: SHA-256(session_id || source || literal_fingerprint).
     -- Safe to expose; does not reveal the literal.
@@ -5896,1130 +6032,13 @@ CREATE TABLE protected_leak_records (
     last_reported_ms  INTEGER NOT NULL,
     contained_at_ms   INTEGER,
     retired_at_ms     INTEGER,
-    FOREIGN KEY (history_id) REFERENCES protected_redaction_history(history_id) ON DELETE CASCADE,
+    FOREIGN KEY (history_id) REFERENCES protected_redaction_history(history_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     UNIQUE (session_id, leak_fingerprint)
 );
 CREATE INDEX idx_protected_leak_records_session
     ON protected_leak_records (session_id, status, last_reported_ms);
 CREATE INDEX idx_protected_leak_records_history
     ON protected_leak_records (history_id);
-
--- Explicit, versioned image-generation monetary policy. JSON is validated by
--- the typed boundary before insertion; old versions remain referenced by the
--- immutable ledger and are never rewritten by a settings change.
-CREATE TABLE image_spend_policy_versions (
-    project_key  TEXT NOT NULL,
-    version      INTEGER NOT NULL CHECK(version >= 1),
-    epoch_policy_version INTEGER NOT NULL CHECK(epoch_policy_version >= 1),
-    settings_json TEXT NOT NULL,
-    saved_at_ms  INTEGER NOT NULL,
-    -- Server-owned rolling-epoch anchor. Present iff the policy's project_epoch
-    -- is Rolling; the anchor is never stored inside settings_json so it can
-    -- never be supplied or altered through the user-constructible settings type.
-    rolling_anchor_unix_ms INTEGER,
-    rolling_anchor_sequence INTEGER CHECK(rolling_anchor_sequence IS NULL OR rolling_anchor_sequence >= 1),
-    PRIMARY KEY(project_key, version),
-    CHECK((rolling_anchor_unix_ms IS NULL) = (rolling_anchor_sequence IS NULL))
-);
-
-CREATE TABLE image_spend_reservations (
-    reservation_id TEXT PRIMARY KEY,
-    plan_digest TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    project_key TEXT NOT NULL,
-    policy_version INTEGER NOT NULL CHECK(policy_version >= 1),
-    epoch_policy_version INTEGER NOT NULL CHECK(epoch_policy_version >= 1),
-    epoch_sequence INTEGER NOT NULL CHECK(epoch_sequence >= 0),
-    reserved_usd_micros BLOB CHECK(reserved_usd_micros IS NULL OR length(reserved_usd_micros)=8),
-    cost_unknown INTEGER NOT NULL CHECK(cost_unknown IN (0,1)),
-    state TEXT NOT NULL CHECK(state IN ('reserved','released','reconciled','budget_violation')),
-    release_proof_identity TEXT,
-    created_at_ms INTEGER NOT NULL,
-    released_at_ms INTEGER,
-    FOREIGN KEY(project_key,policy_version) REFERENCES image_spend_policy_versions(project_key,version),
-    CHECK((cost_unknown=1 AND reserved_usd_micros IS NULL) OR (cost_unknown=0 AND reserved_usd_micros IS NOT NULL))
-);
-
-CREATE TABLE image_spend_attempts (
-    reservation_id TEXT NOT NULL,
-    attempt_id TEXT NOT NULL,
-    maximum_usd_micros BLOB CHECK(maximum_usd_micros IS NULL OR length(maximum_usd_micros)=8),
-    PRIMARY KEY(reservation_id,attempt_id),
-    FOREIGN KEY(reservation_id) REFERENCES image_spend_reservations(reservation_id) ON DELETE RESTRICT
-);
-
--- One immutable external-effect identity per paid attempt. The referenced
--- journal row is prepared in the same transaction as this binding and must
--- reach `dispatching` before provider contact. Acceptance ambiguity and
--- definitive rejection therefore come only from the generic journal graph.
-CREATE TABLE image_spend_attempt_dispatches (
-    reservation_id TEXT NOT NULL,
-    attempt_id TEXT NOT NULL,
-    external_operation_id TEXT NOT NULL UNIQUE,
-    PRIMARY KEY(reservation_id,attempt_id),
-    FOREIGN KEY(reservation_id,attempt_id) REFERENCES image_spend_attempts(reservation_id,attempt_id) ON DELETE RESTRICT,
-    FOREIGN KEY(external_operation_id) REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT
-);
-
-CREATE TABLE image_spend_scope_usage (
-    reservation_id TEXT NOT NULL,
-    scope_kind TEXT NOT NULL CHECK(scope_kind IN ('request','session','project')),
-    scope_key TEXT NOT NULL,
-    policy_version INTEGER NOT NULL,
-    epoch_policy_version INTEGER NOT NULL CHECK(epoch_policy_version >= 0),
-    epoch_sequence INTEGER NOT NULL CHECK(epoch_sequence >= 0),
-    reserved_usd_micros BLOB NOT NULL CHECK(length(reserved_usd_micros)=8),
-    charged_usd_micros BLOB NOT NULL CHECK(length(charged_usd_micros)=8),
-    debt_usd_micros BLOB NOT NULL CHECK(length(debt_usd_micros)=8),
-    PRIMARY KEY(reservation_id,scope_kind),
-    FOREIGN KEY(reservation_id) REFERENCES image_spend_reservations(reservation_id) ON DELETE RESTRICT
-);
-CREATE INDEX idx_image_spend_scope_budget ON image_spend_scope_usage(scope_kind,scope_key,policy_version,epoch_sequence);
-CREATE INDEX idx_image_spend_reservation_policy ON image_spend_reservations(project_key,policy_version);
-
--- Raw provider billing payloads are intentionally absent. Only a normalized,
--- non-secret evidence reference and authoritative integer amount are durable.
-CREATE TABLE image_spend_cost_events (
-    cost_identity TEXT PRIMARY KEY,
-    reservation_id TEXT NOT NULL,
-    attempt_id TEXT NOT NULL,
-    actual_usd_micros BLOB NOT NULL CHECK(length(actual_usd_micros)=8),
-    evidence_ref TEXT NOT NULL,
-    recorded_at_ms INTEGER NOT NULL,
-    FOREIGN KEY(reservation_id,attempt_id) REFERENCES image_spend_attempts(reservation_id,attempt_id) ON DELETE RESTRICT
-);
-CREATE INDEX idx_image_spend_cost_reservation ON image_spend_cost_events(reservation_id);
-CREATE UNIQUE INDEX uq_image_spend_cost_attempt ON image_spend_cost_events(reservation_id,attempt_id);
-
-CREATE TABLE image_spend_debt_resolutions (
-    reservation_id TEXT NOT NULL,
-    resolution_ref TEXT NOT NULL,
-    resolved_debt_usd_micros BLOB NOT NULL CHECK(length(resolved_debt_usd_micros)=8 AND resolved_debt_usd_micros <> X'0000000000000000'),
-    resolved_at_ms INTEGER NOT NULL,
-    PRIMARY KEY(reservation_id,resolution_ref),
-    FOREIGN KEY(reservation_id) REFERENCES image_spend_reservations(reservation_id) ON DELETE RESTRICT
-);
-
-CREATE TABLE image_spend_epoch_heads (
-    project_key TEXT NOT NULL,
-    epoch_policy_version INTEGER NOT NULL,
-    epoch_sequence INTEGER NOT NULL CHECK(epoch_sequence >= 1),
-    membership_key TEXT NOT NULL,
-    interval_start_ms INTEGER NOT NULL,
-    resolved_at_ms INTEGER NOT NULL,
-    PRIMARY KEY(project_key,epoch_policy_version)
-);
-
--- Provider-neutral image generation. Plans are immutable canonical bytes;
--- mutable projections cite monotonically increasing row and journal versions.
-CREATE TABLE image_generation_plans (
-    job_id TEXT PRIMARY KEY,
-    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
-    plan_digest TEXT NOT NULL UNIQUE CHECK(length(plan_digest) = 64),
-    canonical_plan BLOB NOT NULL,
-    slot_count INTEGER NOT NULL CHECK(slot_count > 0),
-    max_attempt_count INTEGER NOT NULL CHECK(max_attempt_count > 0),
-    deadline_boot_id TEXT NOT NULL CHECK(length(deadline_boot_id) = 36 AND deadline_boot_id <> '00000000-0000-0000-0000-000000000000'),
-    enqueue_started_monotonic_ms INTEGER NOT NULL CHECK(enqueue_started_monotonic_ms >= 0),
-    operation_deadline_monotonic_ms INTEGER NOT NULL,
-    CHECK(operation_deadline_monotonic_ms > enqueue_started_monotonic_ms),
-    UNIQUE(job_id,plan_digest)
-);
-
-CREATE TABLE image_generation_jobs (
-    job_id TEXT PRIMARY KEY REFERENCES image_generation_plans(job_id) ON DELETE RESTRICT,
-    state TEXT NOT NULL CHECK(state IN ('created','validating','awaiting_authorization','queued','dispatching','submission_unknown','running','cancellation_requested','downloading','validating_output','publishing','completed','completed_after_cancel','partially_failed','failed','cancelled')),
-    version INTEGER NOT NULL CHECK(version >= 1),
-    terminal_event_version INTEGER,
-    created_at_unix_ms INTEGER NOT NULL,
-    updated_at_unix_ms INTEGER NOT NULL,
-    CHECK(terminal_event_version IS NULL OR terminal_event_version >= 1)
-);
-
--- Terminal-event counts are a DISJOINT partition of the job's slots: every slot
--- contributes to EXACTLY ONE column, keyed by (state, and for published slots
--- the result_after_cancel bit). The six buckets are ordinary-published
--- (published & result_after_cancel=0), late-published-after-cancel
--- (published & result_after_cancel=1), failed, cancelled, late-still-quarantined
--- (late_quarantined), and discarded. Because the partitions are mutually
--- exclusive by construction and every terminal slot lands in one, the sum equals
--- slot_count identically -- not by an ordering accident. A late-then-published
--- slot is counted once (late_published_count), never double-counted as both
--- published and "late".
-CREATE TABLE image_generation_terminal_events (
-    event_id TEXT PRIMARY KEY,
-    job_id TEXT NOT NULL UNIQUE REFERENCES image_generation_jobs(job_id) ON DELETE RESTRICT,
-    job_version INTEGER NOT NULL CHECK(job_version>=1),
-    terminal_state TEXT NOT NULL CHECK(terminal_state IN ('completed','completed_after_cancel','partially_failed','failed','cancelled')),
-    slot_count INTEGER NOT NULL CHECK(slot_count>0),
-    published_count INTEGER NOT NULL CHECK(published_count>=0),
-    failed_count INTEGER NOT NULL CHECK(failed_count>=0),
-    cancelled_count INTEGER NOT NULL CHECK(cancelled_count>=0),
-    late_published_count INTEGER NOT NULL CHECK(late_published_count>=0),
-    late_quarantined_count INTEGER NOT NULL CHECK(late_quarantined_count>=0),
-    discarded_count INTEGER NOT NULL CHECK(discarded_count>=0),
-    emitted_at_unix_ms INTEGER NOT NULL,
-    UNIQUE(job_id,job_version),
-    CHECK(published_count+failed_count+cancelled_count+late_published_count+late_quarantined_count+discarded_count=slot_count)
-);
-CREATE TRIGGER image_generation_terminal_event_immutable BEFORE UPDATE ON image_generation_terminal_events BEGIN SELECT RAISE(ABORT,'image generation terminal event is immutable'); END;
-CREATE TRIGGER image_generation_terminal_event_no_delete BEFORE DELETE ON image_generation_terminal_events BEGIN SELECT RAISE(ABORT,'image generation terminal event is immutable'); END;
-CREATE TRIGGER image_generation_terminal_event_insert_guard BEFORE INSERT ON image_generation_terminal_events
-WHEN NOT EXISTS(
-  SELECT 1 FROM image_generation_jobs j WHERE j.job_id=NEW.job_id AND j.terminal_event_version IS NULL AND NEW.job_version=j.version+1
-) OR NEW.slot_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id)
- OR NEW.published_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='published' AND s.result_after_cancel=0)
- OR NEW.failed_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='failed')
- OR NEW.cancelled_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='cancelled')
- OR NEW.late_published_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='published' AND s.result_after_cancel=1)
- OR NEW.late_quarantined_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='late_quarantined')
- OR NEW.discarded_count<>(SELECT count(*) FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state='discarded')
- OR EXISTS(SELECT 1 FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.state NOT IN ('published','failed','cancelled','discarded','late_quarantined'))
- OR NEW.terminal_state<>(CASE
-   WHEN EXISTS(SELECT 1 FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.result_after_cancel=1) THEN 'completed_after_cancel'
-   WHEN NEW.published_count=NEW.slot_count THEN 'completed'
-   WHEN NEW.published_count>0 THEN 'partially_failed'
-   WHEN NEW.failed_count>0 THEN 'failed'
-   ELSE 'cancelled' END)
-BEGIN SELECT RAISE(ABORT,'image generation terminal event projection differs'); END;
-CREATE TRIGGER image_generation_job_terminal_event_required BEFORE UPDATE ON image_generation_jobs
-WHEN NEW.state IN ('completed','completed_after_cancel','partially_failed','failed','cancelled')
- AND NOT EXISTS(SELECT 1 FROM image_generation_terminal_events e WHERE e.job_id=NEW.job_id AND e.job_version=NEW.version AND e.terminal_state=NEW.state AND NEW.terminal_event_version=NEW.version)
-BEGIN SELECT RAISE(ABORT,'image generation terminal state requires exact event'); END;
-CREATE TRIGGER image_generation_job_terminal_event_forbidden BEFORE UPDATE ON image_generation_jobs
-WHEN NEW.state NOT IN ('completed','completed_after_cancel','partially_failed','failed','cancelled') AND NEW.terminal_event_version IS NOT NULL
-BEGIN SELECT RAISE(ABORT,'nonterminal image generation job cannot cite terminal event'); END;
-
--- Durable bookkeeping for the scheduler-error attention threshold. One row per
--- (worker_boot_id, job_id, slot_id, attempt_number, stage). `failure_count` is
--- incremented once per recorded scheduler pass error. When it reaches the
--- attention threshold a SINGLE `needs_attention` row is raised and its id is
--- stamped into `attention_interrupt_id`; further failures for the same tuple in
--- the same boot bump `failure_count`/`last_failed_at_unix_ms` but never raise a
--- second attention row. This is bookkeeping only -- the operator attention
--- channel remains the shared `needs_attention` table.
-CREATE TABLE image_generation_scheduler_error_counts (
-    worker_boot_id TEXT NOT NULL CHECK(length(worker_boot_id)=36 AND worker_boot_id<>'00000000-0000-0000-0000-000000000000'),
-    job_id TEXT NOT NULL,
-    slot_id TEXT NOT NULL,
-    attempt_number INTEGER NOT NULL CHECK(attempt_number>=1),
-    stage TEXT NOT NULL,
-    failure_count INTEGER NOT NULL CHECK(failure_count>=1),
-    attention_interrupt_id TEXT,
-    first_failed_at_unix_ms INTEGER NOT NULL,
-    last_failed_at_unix_ms INTEGER NOT NULL,
-    PRIMARY KEY(worker_boot_id, job_id, slot_id, attempt_number, stage)
-);
-
-CREATE TABLE image_generation_slots (
-    job_id TEXT NOT NULL REFERENCES image_generation_jobs(job_id) ON DELETE RESTRICT,
-    slot_id TEXT NOT NULL,
-    slot_index INTEGER NOT NULL CHECK(slot_index >= 0),
-    sample_index INTEGER NOT NULL CHECK(sample_index >= 0),
-    managed_artifact_id TEXT NOT NULL,
-    max_attempt_count INTEGER NOT NULL CHECK(max_attempt_count > 0),
-    state TEXT NOT NULL CHECK(state IN ('planned','queued','dispatching','submission_unknown','running','cancellation_requested','downloading','validating','ready_to_publish','published','late_quarantined','failed','cancelled','discarded')),
-    version INTEGER NOT NULL CHECK(version >= 1),
-    applied_cancellation_version INTEGER,
-    result_after_cancel INTEGER NOT NULL DEFAULT 0 CHECK(result_after_cancel IN (0,1)),
-    published_disposition TEXT CHECK(published_disposition IN ('ordinary','late_authorized')),
-    published_disposition_generation INTEGER CHECK(published_disposition_generation>=1),
-    failure_reason TEXT,
-    PRIMARY KEY(job_id,slot_id),
-    UNIQUE(job_id,slot_index),
-    UNIQUE(managed_artifact_id),
-    CHECK(
-      (state IN ('planned','queued','ready_to_publish') AND applied_cancellation_version IS NULL AND result_after_cancel=0) OR
-      (state IN ('dispatching','submission_unknown','running','downloading') AND result_after_cancel=0) OR
-      (state='cancellation_requested' AND applied_cancellation_version IS NOT NULL AND result_after_cancel=0) OR
-      (state='validating' AND ((applied_cancellation_version IS NULL AND result_after_cancel=0) OR (applied_cancellation_version IS NOT NULL AND result_after_cancel=1))) OR
-      (state='published' AND ((applied_cancellation_version IS NULL AND result_after_cancel=0) OR (applied_cancellation_version IS NOT NULL AND result_after_cancel=1))) OR
-      (state IN ('late_quarantined','discarded') AND applied_cancellation_version IS NOT NULL AND result_after_cancel=1) OR
-      (state='cancelled' AND applied_cancellation_version IS NOT NULL AND result_after_cancel=0) OR
-      (state='failed' AND ((applied_cancellation_version IS NULL AND result_after_cancel=0) OR applied_cancellation_version IS NOT NULL))
-    ),
-    CHECK((state='published' AND published_disposition IS NOT NULL AND published_disposition_generation=version) OR (state!='published' AND published_disposition IS NULL AND published_disposition_generation IS NULL))
-);
-
-CREATE TABLE image_generation_attempts (
-    job_id TEXT NOT NULL,
-    slot_id TEXT NOT NULL,
-    attempt_number INTEGER NOT NULL CHECK(attempt_number >= 1),
-    provider_request_identity TEXT NOT NULL,
-    provider_idempotency_identity TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('planned','preparing','prepared','dispatching','accepted','submission_unknown','reconciling','running','downloading','cancellation_requested','response_adopted','failed_not_submitted','rejected_not_accepted','cancelled','succeeded','completed_after_cancel','failed_after_acceptance')),
-    version INTEGER NOT NULL CHECK(version >= 1),
-    external_operation_id TEXT UNIQUE,
-    observed_journal_version INTEGER,
-    applied_cancellation_version INTEGER,
-    response_digest TEXT CHECK(response_digest IS NULL OR length(response_digest)=64),
-    nonacceptance_evidence_digest TEXT CHECK(nonacceptance_evidence_digest IS NULL OR length(nonacceptance_evidence_digest)=64),
-    -- Dispatch-time destination/health proof bound at prepare (never reused across
-    -- a location-class or configuration-generation change; a stale proof cannot be
-    -- reissued because prepare always re-runs revalidation and writes the fresh
-    -- result under the single 'prepared' transition below). Credential material is
-    -- never stored here -- only opaque endpoint/config/epoch identifiers and the
-    -- connection observation (connected IP, location class, and a digest of the
-    -- ordered connection hops).
-    dispatch_proof_endpoint_id TEXT,
-    dispatch_proof_config_generation INTEGER CHECK(dispatch_proof_config_generation IS NULL OR dispatch_proof_config_generation >= 0),
-    dispatch_proof_refresh_epoch INTEGER CHECK(dispatch_proof_refresh_epoch IS NULL OR dispatch_proof_refresh_epoch >= 0),
-    dispatch_proof_connected_ip TEXT,
-    dispatch_proof_location_class TEXT CHECK(dispatch_proof_location_class IS NULL OR dispatch_proof_location_class IN ('loopback','private_lan','public_network','forbidden')),
-    dispatch_proof_hops_digest TEXT CHECK(dispatch_proof_hops_digest IS NULL OR length(dispatch_proof_hops_digest)=64),
-    PRIMARY KEY(job_id,slot_id,attempt_number),
-    UNIQUE(provider_request_identity),
-    UNIQUE(provider_idempotency_identity),
-    FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
-    FOREIGN KEY(external_operation_id) REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT,
-    CHECK((external_operation_id IS NULL AND observed_journal_version IS NULL) OR (external_operation_id IS NOT NULL AND observed_journal_version >= 1)),
-    -- The six proof columns are written as one indivisible group or not at all,
-    -- so a half-written proof can never exist.
-    CHECK((dispatch_proof_endpoint_id IS NULL AND dispatch_proof_config_generation IS NULL AND dispatch_proof_refresh_epoch IS NULL AND dispatch_proof_connected_ip IS NULL AND dispatch_proof_location_class IS NULL AND dispatch_proof_hops_digest IS NULL) OR (dispatch_proof_endpoint_id IS NOT NULL AND dispatch_proof_config_generation IS NOT NULL AND dispatch_proof_refresh_epoch IS NOT NULL AND dispatch_proof_connected_ip IS NOT NULL AND dispatch_proof_location_class IS NOT NULL AND dispatch_proof_hops_digest IS NOT NULL)),
-    -- A 'prepared' or 'dispatching' attempt cannot exist without its proof: both
-    -- states are reached in production only through prepare_image_generation_dispatch_conn
-    -- (the single writer of 'prepared', which binds the full proof in the same
-    -- UPDATE) and begin_image_generation_handoff_conn ('prepared' -> 'dispatching').
-    -- This is the DB-level fail-closed invariant behind that single-writer discipline,
-    -- so no attempt can be handed to a provider without a successful revalidation.
-    CHECK(state NOT IN ('prepared','dispatching') OR dispatch_proof_endpoint_id IS NOT NULL)
-);
-CREATE TABLE image_generation_handoff_evidence (
- job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
- external_operation_id TEXT NOT NULL UNIQUE,
- outcome TEXT NOT NULL CHECK(outcome IN ('accepted','definitively_rejected','submission_unknown')),
- evidence BLOB NOT NULL CHECK(length(evidence) BETWEEN 1 AND 65536),
- evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64),
- recorded_at_unix_ms INTEGER NOT NULL,
- PRIMARY KEY(job_id,slot_id,attempt_number),
- FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT,
- FOREIGN KEY(external_operation_id) REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT
-);
-CREATE TRIGGER image_generation_handoff_evidence_immutable BEFORE UPDATE ON image_generation_handoff_evidence BEGIN SELECT RAISE(ABORT,'image generation handoff evidence is immutable'); END;
-CREATE TRIGGER image_generation_handoff_evidence_no_delete BEFORE DELETE ON image_generation_handoff_evidence BEGIN SELECT RAISE(ABORT,'image generation handoff evidence is immutable'); END;
-
-CREATE TABLE image_generation_response_fetches (
- job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
- response_digest TEXT NOT NULL CHECK(length(response_digest)=64),
- response_bytes BLOB NOT NULL CHECK(length(response_bytes) BETWEEN 1 AND 67108864),
- fetch_evidence BLOB NOT NULL CHECK(length(fetch_evidence) BETWEEN 1 AND 65536),
- fetch_evidence_digest TEXT NOT NULL CHECK(length(fetch_evidence_digest)=64),
- fetched_at_unix_ms INTEGER NOT NULL,
- PRIMARY KEY(job_id,slot_id,attempt_number),
- FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
-);
-CREATE TRIGGER image_generation_response_fetch_immutable BEFORE UPDATE ON image_generation_response_fetches BEGIN SELECT RAISE(ABORT,'image generation response fetch is immutable'); END;
-CREATE TRIGGER image_generation_response_fetch_no_delete BEFORE DELETE ON image_generation_response_fetches BEGIN SELECT RAISE(ABORT,'image generation response fetch is immutable'); END;
-CREATE TRIGGER image_generation_response_fetch_guard BEFORE INSERT ON image_generation_response_fetches
-WHEN NOT EXISTS(SELECT 1 FROM image_generation_attempts a JOIN image_generation_handoff_evidence h USING(job_id,slot_id,attempt_number) WHERE a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id AND a.attempt_number=NEW.attempt_number AND a.state IN ('accepted','downloading','cancellation_requested') AND h.outcome='accepted')
-BEGIN SELECT RAISE(ABORT,'response fetch lacks accepted handoff authority'); END;
-CREATE TABLE image_generation_response_fetch_outcomes (
- job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
- outcome TEXT NOT NULL CHECK(outcome IN ('fetched','definitive_failure','outcome_unknown')),
- safe_reason TEXT CHECK((outcome='definitive_failure' AND length(safe_reason) BETWEEN 1 AND 128) OR (outcome!='definitive_failure' AND safe_reason IS NULL)),
- evidence BLOB NOT NULL CHECK(length(evidence) BETWEEN 1 AND 65536),
- evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64),
- recorded_at_unix_ms INTEGER NOT NULL,
- PRIMARY KEY(job_id,slot_id,attempt_number),
- FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
-);
-CREATE TRIGGER image_generation_response_fetch_outcome_immutable BEFORE UPDATE ON image_generation_response_fetch_outcomes BEGIN SELECT RAISE(ABORT,'image generation response fetch outcome is immutable'); END;
-CREATE TRIGGER image_generation_response_fetch_outcome_no_delete BEFORE DELETE ON image_generation_response_fetch_outcomes BEGIN SELECT RAISE(ABORT,'image generation response fetch outcome is immutable'); END;
-CREATE TRIGGER image_generation_response_fetch_outcome_guard BEFORE INSERT ON image_generation_response_fetch_outcomes
-WHEN NOT EXISTS(SELECT 1 FROM image_generation_attempts a JOIN image_generation_handoff_evidence h USING(job_id,slot_id,attempt_number) WHERE a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id AND a.attempt_number=NEW.attempt_number AND a.state IN ('accepted','downloading','cancellation_requested') AND h.outcome='accepted')
-BEGIN SELECT RAISE(ABORT,'response fetch outcome lacks accepted handoff authority'); END;
-CREATE TABLE image_generation_response_reconciliation_claims (
- job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
- claim_generation INTEGER NOT NULL CHECK(claim_generation>=1), worker_boot_id TEXT NOT NULL,
- claimed_at_unix_ms INTEGER NOT NULL, expires_at_unix_ms INTEGER NOT NULL CHECK(expires_at_unix_ms>claimed_at_unix_ms AND expires_at_unix_ms<=claimed_at_unix_ms+60000),
- PRIMARY KEY(job_id,slot_id,attempt_number,claim_generation),
- FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_response_fetch_outcomes(job_id,slot_id,attempt_number) ON DELETE RESTRICT
-);
-CREATE TABLE image_generation_response_reconciliations (
- job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, claim_generation INTEGER NOT NULL,
- outcome TEXT NOT NULL CHECK(outcome IN ('fetched','definitive_failure','outcome_unknown')),
- safe_reason TEXT CHECK((outcome='definitive_failure' AND length(safe_reason) BETWEEN 1 AND 128) OR (outcome!='definitive_failure' AND safe_reason IS NULL)),
- evidence BLOB NOT NULL CHECK(length(evidence) BETWEEN 1 AND 65536), evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64),
- response_digest TEXT CHECK((outcome='fetched')=(response_digest IS NOT NULL) AND (response_digest IS NULL OR length(response_digest)=64)), response_bytes BLOB CHECK((outcome='fetched')=(response_bytes IS NOT NULL) AND (response_bytes IS NULL OR length(response_bytes) BETWEEN 1 AND 67108864)),
- recorded_at_unix_ms INTEGER NOT NULL,
- PRIMARY KEY(job_id,slot_id,attempt_number,claim_generation),
- FOREIGN KEY(job_id,slot_id,attempt_number,claim_generation) REFERENCES image_generation_response_reconciliation_claims(job_id,slot_id,attempt_number,claim_generation) ON DELETE RESTRICT
-);
-CREATE TRIGGER image_generation_response_reconciliation_immutable BEFORE UPDATE ON image_generation_response_reconciliations BEGIN SELECT RAISE(ABORT,'image response reconciliation is immutable'); END;
-CREATE TRIGGER image_generation_response_reconciliation_no_delete BEFORE DELETE ON image_generation_response_reconciliations BEGIN SELECT RAISE(ABORT,'image response reconciliation is immutable'); END;
-CREATE TABLE image_generation_response_publication_intents (
- publication_operation_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
- artifact_id TEXT NOT NULL UNIQUE, component_id TEXT NOT NULL UNIQUE, temporary_name TEXT NOT NULL, destination_name TEXT NOT NULL,
- response_digest TEXT NOT NULL CHECK(length(response_digest)=64), state TEXT NOT NULL CHECK(state IN ('pending','applied','security_blocked')),
- version INTEGER NOT NULL CHECK(version>=1), held_evidence_json TEXT, recovery_evidence_json TEXT, failure_evidence_digest TEXT,
- created_at_unix_ms INTEGER NOT NULL, decided_at_unix_ms INTEGER,
- FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT,
- CHECK((state='pending' AND held_evidence_json IS NULL AND recovery_evidence_json IS NULL AND failure_evidence_digest IS NULL AND decided_at_unix_ms IS NULL) OR (state='applied' AND held_evidence_json IS NOT NULL AND recovery_evidence_json IS NULL AND failure_evidence_digest IS NULL AND decided_at_unix_ms IS NOT NULL) OR (state='security_blocked' AND recovery_evidence_json IS NOT NULL AND failure_evidence_digest IS NOT NULL AND decided_at_unix_ms IS NOT NULL))
-);
-CREATE TRIGGER image_generation_response_publication_intent_guard BEFORE INSERT ON image_generation_response_publication_intents
-WHEN NOT EXISTS(SELECT 1 FROM image_generation_response_fetches f JOIN image_generation_attempts a USING(job_id,slot_id,attempt_number) WHERE f.job_id=NEW.job_id AND f.slot_id=NEW.slot_id AND f.attempt_number=NEW.attempt_number AND f.response_digest=NEW.response_digest AND a.state IN ('accepted','downloading','cancellation_requested','response_adopted','completed_after_cancel'))
-BEGIN SELECT RAISE(ABORT,'response publication intent lacks fetched authority'); END;
-CREATE TRIGGER image_generation_response_publication_intent_transition BEFORE UPDATE ON image_generation_response_publication_intents
-WHEN OLD.state!='pending' OR NEW.version!=OLD.version+1 OR NEW.state NOT IN ('applied','security_blocked') OR NEW.publication_operation_id!=OLD.publication_operation_id OR NEW.job_id!=OLD.job_id OR NEW.slot_id!=OLD.slot_id OR NEW.attempt_number!=OLD.attempt_number OR NEW.artifact_id!=OLD.artifact_id OR NEW.component_id!=OLD.component_id OR NEW.temporary_name!=OLD.temporary_name OR NEW.destination_name!=OLD.destination_name OR NEW.response_digest!=OLD.response_digest
-BEGIN SELECT RAISE(ABORT,'forbidden response publication intent transition'); END;
-CREATE TRIGGER image_generation_response_publication_intent_no_delete BEFORE DELETE ON image_generation_response_publication_intents BEGIN SELECT RAISE(ABORT,'response publication intent is durable'); END;
-
-CREATE TABLE image_generation_scheduler_claims (
- job_id TEXT NOT NULL,
- slot_id TEXT NOT NULL,
- attempt_number INTEGER NOT NULL CHECK(attempt_number>=1),
- worker_boot_id TEXT NOT NULL CHECK(length(worker_boot_id)=36 AND worker_boot_id=lower(worker_boot_id)),
- claim_generation INTEGER NOT NULL CHECK(claim_generation>=1),
- claimed_at_unix_ms INTEGER NOT NULL,
- expires_at_unix_ms INTEGER NOT NULL CHECK(expires_at_unix_ms>claimed_at_unix_ms AND expires_at_unix_ms<=claimed_at_unix_ms+60000),
- PRIMARY KEY(job_id,slot_id,attempt_number,claim_generation),
- FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
-);
-CREATE TABLE image_generation_scheduler_claim_consumptions (
- job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, claim_generation INTEGER NOT NULL,
- consumed_at_unix_ms INTEGER NOT NULL,
- PRIMARY KEY(job_id,slot_id,attempt_number,claim_generation),
- FOREIGN KEY(job_id,slot_id,attempt_number,claim_generation) REFERENCES image_generation_scheduler_claims(job_id,slot_id,attempt_number,claim_generation) ON DELETE RESTRICT
-);
-CREATE TRIGGER image_generation_scheduler_claim_consumption_immutable BEFORE UPDATE ON image_generation_scheduler_claim_consumptions BEGIN SELECT RAISE(ABORT,'image generation scheduler claim consumption is immutable'); END;
-CREATE TRIGGER image_generation_scheduler_claim_consumption_no_delete BEFORE DELETE ON image_generation_scheduler_claim_consumptions BEGIN SELECT RAISE(ABORT,'image generation scheduler claim consumption is immutable'); END;
-CREATE TABLE image_generation_attempt_activation_facts (
- job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
- activation_reason TEXT NOT NULL CHECK(activation_reason IN ('initial','authoritative_retry')),
- prior_attempt_number INTEGER,
- activated_at_unix_ms INTEGER NOT NULL,
- PRIMARY KEY(job_id,slot_id,attempt_number),
- FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT,
- CHECK((activation_reason='initial' AND attempt_number=1 AND prior_attempt_number IS NULL) OR (activation_reason='authoritative_retry' AND attempt_number>1 AND prior_attempt_number=attempt_number-1))
-);
-CREATE TABLE image_generation_reconciliation_claims (
- job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, claim_generation INTEGER NOT NULL CHECK(claim_generation>=1),
- worker_boot_id TEXT NOT NULL, claimed_at_unix_ms INTEGER NOT NULL, expires_at_unix_ms INTEGER NOT NULL CHECK(expires_at_unix_ms>claimed_at_unix_ms AND expires_at_unix_ms<=claimed_at_unix_ms+60000),
- PRIMARY KEY(job_id,slot_id,attempt_number,claim_generation),
- FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
-);
-CREATE TABLE image_generation_reconciliation_claim_completions (
- job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, claim_generation INTEGER NOT NULL,
- completed_at_unix_ms INTEGER NOT NULL,
- PRIMARY KEY(job_id,slot_id,attempt_number,claim_generation),
- FOREIGN KEY(job_id,slot_id,attempt_number,claim_generation) REFERENCES image_generation_reconciliation_claims(job_id,slot_id,attempt_number,claim_generation) ON DELETE RESTRICT
-);
-CREATE TABLE image_generation_provider_cancel_evidence (
- job_id TEXT NOT NULL,slot_id TEXT NOT NULL,attempt_number INTEGER NOT NULL,
- external_operation_id TEXT NOT NULL UNIQUE,outcome TEXT NOT NULL CHECK(outcome IN ('cancelled','too_late_or_accepted','outcome_unknown')),
- evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64),recorded_at_unix_ms INTEGER NOT NULL,
- PRIMARY KEY(job_id,slot_id,attempt_number),
- FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
-);
-CREATE TABLE image_generation_provider_cancel_claims (
- job_id TEXT NOT NULL,slot_id TEXT NOT NULL,attempt_number INTEGER NOT NULL,
- claim_generation INTEGER NOT NULL CHECK(claim_generation>=1),worker_boot_id TEXT NOT NULL,
- claimed_at_unix_ms INTEGER NOT NULL,expires_at_unix_ms INTEGER NOT NULL
-   CHECK(expires_at_unix_ms>claimed_at_unix_ms AND expires_at_unix_ms<=claimed_at_unix_ms+60000),
- PRIMARY KEY(job_id,slot_id,attempt_number,claim_generation),
- FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
-);
-CREATE TRIGGER image_generation_provider_cancel_evidence_immutable BEFORE UPDATE ON image_generation_provider_cancel_evidence BEGIN SELECT RAISE(ABORT,'image provider cancel evidence is immutable'); END;
-CREATE TRIGGER image_generation_provider_cancel_evidence_no_delete BEFORE DELETE ON image_generation_provider_cancel_evidence BEGIN SELECT RAISE(ABORT,'image provider cancel evidence is immutable'); END;
-CREATE TRIGGER image_generation_provider_cancel_claim_immutable BEFORE UPDATE ON image_generation_provider_cancel_claims BEGIN SELECT RAISE(ABORT,'image provider cancel claim is immutable'); END;
-CREATE TRIGGER image_generation_provider_cancel_claim_no_delete BEFORE DELETE ON image_generation_provider_cancel_claims BEGIN SELECT RAISE(ABORT,'image provider cancel claim is immutable'); END;
-CREATE TRIGGER image_generation_reconciliation_claim_immutable BEFORE UPDATE ON image_generation_reconciliation_claims BEGIN SELECT RAISE(ABORT,'image reconciliation claim is immutable'); END;
-CREATE TRIGGER image_generation_reconciliation_claim_no_delete BEFORE DELETE ON image_generation_reconciliation_claims BEGIN SELECT RAISE(ABORT,'image reconciliation claim is immutable'); END;
-CREATE TRIGGER image_generation_reconciliation_completion_immutable BEFORE UPDATE ON image_generation_reconciliation_claim_completions BEGIN SELECT RAISE(ABORT,'image reconciliation completion is immutable'); END;
-CREATE TRIGGER image_generation_reconciliation_completion_no_delete BEFORE DELETE ON image_generation_reconciliation_claim_completions BEGIN SELECT RAISE(ABORT,'image reconciliation completion is immutable'); END;
-CREATE TRIGGER image_generation_attempt_activation_immutable BEFORE UPDATE ON image_generation_attempt_activation_facts BEGIN SELECT RAISE(ABORT,'image generation attempt activation is immutable'); END;
-CREATE TRIGGER image_generation_attempt_activation_no_delete BEFORE DELETE ON image_generation_attempt_activation_facts BEGIN SELECT RAISE(ABORT,'image generation attempt activation is immutable'); END;
-CREATE TABLE image_generation_attempt_media_snapshots (
- job_id TEXT NOT NULL,
- slot_id TEXT NOT NULL,
- attempt_number INTEGER NOT NULL,
- plan_digest TEXT NOT NULL CHECK(length(plan_digest)=64),
- canonical_media_plan BLOB NOT NULL CHECK(length(canonical_media_plan)>0 AND length(canonical_media_plan)<=65536),
- media_plan_digest TEXT NOT NULL CHECK(length(media_plan_digest)=64),
- PRIMARY KEY(job_id,slot_id,attempt_number),
- FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT,
- FOREIGN KEY(job_id,plan_digest) REFERENCES image_generation_plans(job_id,plan_digest) ON DELETE RESTRICT
-);
-CREATE TRIGGER image_generation_attempt_media_snapshot_immutable BEFORE UPDATE ON image_generation_attempt_media_snapshots BEGIN SELECT RAISE(ABORT,'image generation media snapshot is immutable'); END;
-CREATE TRIGGER image_generation_attempt_media_snapshot_no_delete BEFORE DELETE ON image_generation_attempt_media_snapshots BEGIN SELECT RAISE(ABORT,'image generation media snapshot is immutable'); END;
-CREATE TRIGGER image_generation_scheduler_claim_immutable BEFORE UPDATE ON image_generation_scheduler_claims BEGIN SELECT RAISE(ABORT,'image generation scheduler claim is immutable'); END;
-CREATE TRIGGER image_generation_scheduler_claim_no_delete BEFORE DELETE ON image_generation_scheduler_claims BEGIN SELECT RAISE(ABORT,'image generation scheduler claim is immutable'); END;
-CREATE TRIGGER image_generation_scheduler_claim_insert_guard BEFORE INSERT ON image_generation_scheduler_claims
-WHEN NOT EXISTS(SELECT 1 FROM image_generation_attempt_activation_facts a WHERE a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id AND a.attempt_number=NEW.attempt_number)
- OR (NEW.claim_generation=1 AND EXISTS(SELECT 1 FROM image_generation_scheduler_claims c WHERE c.job_id=NEW.job_id AND c.slot_id=NEW.slot_id AND c.attempt_number=NEW.attempt_number))
- OR (NEW.claim_generation>1 AND NOT EXISTS(SELECT 1 FROM image_generation_scheduler_claims c WHERE c.job_id=NEW.job_id AND c.slot_id=NEW.slot_id AND c.attempt_number=NEW.attempt_number AND c.claim_generation=NEW.claim_generation-1 AND (c.expires_at_unix_ms<=CAST(unixepoch('subsec')*1000 AS INTEGER) OR EXISTS(SELECT 1 FROM image_generation_scheduler_claim_consumptions x WHERE x.job_id=c.job_id AND x.slot_id=c.slot_id AND x.attempt_number=c.attempt_number AND x.claim_generation=c.claim_generation)) AND c.claim_generation=(SELECT MAX(m.claim_generation) FROM image_generation_scheduler_claims m WHERE m.job_id=NEW.job_id AND m.slot_id=NEW.slot_id AND m.attempt_number=NEW.attempt_number)))
-BEGIN SELECT RAISE(ABORT,'image generation scheduler claim generation is not available'); END;
-
-CREATE TABLE image_generation_cancellation_facts (
-    job_id TEXT PRIMARY KEY REFERENCES image_generation_jobs(job_id) ON DELETE RESTRICT,
-    cancellation_version INTEGER NOT NULL CHECK(cancellation_version >= 1),
-    requested_at_unix_ms INTEGER NOT NULL,
-    request_operation_id TEXT NOT NULL UNIQUE,
-    UNIQUE(job_id,cancellation_version)
-);
-
-CREATE TABLE image_generation_deadline_expiry_facts (
-    job_id TEXT PRIMARY KEY REFERENCES image_generation_jobs(job_id) ON DELETE RESTRICT,
-    schema_version INTEGER NOT NULL CHECK(schema_version=1),
-    state TEXT NOT NULL CHECK(state IN ('cleanup_required','cancellation_requested')),
-    deadline_boot_id TEXT NOT NULL,
-    deadline_monotonic_ms INTEGER NOT NULL CHECK(deadline_monotonic_ms>=0),
-    observed_boot_id TEXT NOT NULL,
-    observed_monotonic_ms INTEGER NOT NULL CHECK(observed_monotonic_ms>=0),
-    cancellation_version INTEGER NOT NULL CHECK(cancellation_version>=1),
-    cancellation_operation_id TEXT NOT NULL UNIQUE,
-    cleanup_operation_id TEXT NOT NULL UNIQUE,
-    media_reservation_id TEXT NOT NULL,
-    media_reservation_version INTEGER NOT NULL CHECK(media_reservation_version>=1),
-    spend_reservation_id TEXT NOT NULL,
-    spend_reservation_version INTEGER NOT NULL CHECK(spend_reservation_version>=1),
-    recorded_at_unix_ms INTEGER NOT NULL,
-    FOREIGN KEY(job_id,cancellation_version) REFERENCES image_generation_cancellation_facts(job_id,cancellation_version) ON DELETE RESTRICT
-);
-CREATE TRIGGER image_generation_deadline_expiry_immutable BEFORE UPDATE ON image_generation_deadline_expiry_facts BEGIN SELECT RAISE(ABORT,'image generation deadline expiry evidence is immutable'); END;
-CREATE TRIGGER image_generation_deadline_expiry_no_delete BEFORE DELETE ON image_generation_deadline_expiry_facts BEGIN SELECT RAISE(ABORT,'image generation deadline expiry evidence is immutable'); END;
-
-CREATE TABLE image_generation_cancelled_result_facts (
-    job_id TEXT NOT NULL,
-    slot_id TEXT NOT NULL,
-    attempt_number INTEGER NOT NULL,
-    cancellation_version INTEGER NOT NULL,
-    response_digest TEXT NOT NULL CHECK(length(response_digest)=64),
-    journal_terminal_version INTEGER NOT NULL CHECK(journal_terminal_version >= 1),
-    ordering TEXT NOT NULL CHECK(ordering IN ('response_after_cancellation','response_adopted_before_cancellation')),
-    PRIMARY KEY(job_id,slot_id,attempt_number),
-    FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT,
-    FOREIGN KEY(job_id,cancellation_version) REFERENCES image_generation_cancellation_facts(job_id,cancellation_version) ON DELETE RESTRICT
-);
-
-CREATE TABLE image_generation_publication_right_facts (
-    job_id TEXT NOT NULL,
-    slot_id TEXT NOT NULL,
-    attempt_number INTEGER NOT NULL,
-    slot_version INTEGER NOT NULL CHECK(slot_version >= 1),
-    artifact_generation INTEGER NOT NULL CHECK(artifact_generation >= 1),
-    committed_at_unix_ms INTEGER NOT NULL,
-    PRIMARY KEY(job_id,slot_id),
-    FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
-);
-CREATE TABLE image_generation_reconciliation_evidence (
- job_id TEXT NOT NULL, slot_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
- journal_version INTEGER NOT NULL CHECK(journal_version>=1),
- evidence_digest TEXT NOT NULL CHECK(length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*'),
- provider_request_identity TEXT NOT NULL,
- provider_idempotency_identity TEXT NOT NULL,
- journal_payload_digest TEXT NOT NULL CHECK(length(journal_payload_digest)=64 AND journal_payload_digest NOT GLOB '*[^0-9a-f]*'),
- outcome TEXT NOT NULL CHECK(outcome IN ('authoritative_nonacceptance','authoritative_accepted','authoritative_failure')),
- PRIMARY KEY(job_id,slot_id,attempt_number,journal_version),
- FOREIGN KEY(job_id,slot_id,attempt_number) REFERENCES image_generation_attempts(job_id,slot_id,attempt_number) ON DELETE RESTRICT
-);
-
--- Managed image artifacts are a separate retained aggregate. They are never
--- attachment rows and user-published copies are never members of this graph.
-CREATE TABLE image_generation_artifacts (
- artifact_id TEXT PRIMARY KEY,
- job_id TEXT NOT NULL,
- slot_id TEXT NOT NULL,
- state TEXT NOT NULL CHECK(state IN ('allocating','writing','retained','late_quarantined','cleanup_pending','deleting','tombstoned','security_blocked')),
- generation INTEGER NOT NULL CHECK(generation>=1),
- expected_component_count INTEGER NOT NULL CHECK(expected_component_count>=1),
- active_lease_count INTEGER NOT NULL DEFAULT 0 CHECK(active_lease_count>=0),
- component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
- component_set_json TEXT NOT NULL,
- eligibility_at_unix_ms INTEGER,
- immediate_cleanup INTEGER NOT NULL DEFAULT 0 CHECK(immediate_cleanup IN (0,1)),
- terminal_reason TEXT,
- created_at_unix_ms INTEGER NOT NULL,
- updated_at_unix_ms INTEGER NOT NULL,
- UNIQUE(job_id,slot_id),
- FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
- CHECK((state='tombstoned' AND terminal_reason IS NOT NULL) OR state!='tombstoned')
-);
-
-CREATE TABLE image_generation_artifact_components (
- artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
- component_id TEXT NOT NULL,
- component_kind TEXT NOT NULL CHECK(component_kind IN ('primary','normalized_raster','sanitized_svg','thumbnail','model_payload')),
- state TEXT NOT NULL CHECK(state IN ('planned','writing','ready','cleanup_pending','deleting','tombstoned','security_blocked')),
- generation INTEGER NOT NULL CHECK(generation>=1),
- relative_storage_key TEXT NOT NULL,
- byte_length_hi INTEGER NOT NULL CHECK(byte_length_hi BETWEEN 0 AND 4294967295),
- byte_length_lo INTEGER NOT NULL CHECK(byte_length_lo BETWEEN 0 AND 4294967295),
- sha256 TEXT NOT NULL CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
- stable_identity_json TEXT,
- expected_link_count INTEGER NOT NULL DEFAULT 1 CHECK(expected_link_count=1),
- resource_reservation_id TEXT NOT NULL,
- release_operation_id TEXT NOT NULL UNIQUE,
- deletion_evidence_digest TEXT CHECK(deletion_evidence_digest IS NULL OR (length(deletion_evidence_digest)=64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*')),
- PRIMARY KEY(artifact_id,component_id),
- UNIQUE(artifact_id,component_kind),
- UNIQUE(relative_storage_key),
- CHECK((state='tombstoned' AND deletion_evidence_digest IS NOT NULL) OR state!='tombstoned')
-);
-
-CREATE TABLE image_generation_artifact_cleanup_intents (
- cleanup_operation_id TEXT PRIMARY KEY,
- artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
- expected_artifact_generation INTEGER NOT NULL CHECK(expected_artifact_generation>=1),
- reason TEXT NOT NULL CHECK(reason IN ('retention_expired','discard_late_result','invalid_output','restart_recovery','owner_recovery')),
- state TEXT NOT NULL CHECK(state IN ('pending','deleting','completed','security_blocked')),
- version INTEGER NOT NULL CHECK(version>=1),
- created_at_unix_ms INTEGER NOT NULL,
- completed_at_unix_ms INTEGER,
- UNIQUE(artifact_id),
- CHECK((state='completed')=(completed_at_unix_ms IS NOT NULL))
-);
-
-CREATE TABLE image_generation_component_release_facts (
- artifact_id TEXT NOT NULL,
- component_id TEXT NOT NULL,
- release_operation_id TEXT NOT NULL,
- deletion_evidence_digest TEXT NOT NULL CHECK(length(deletion_evidence_digest)=64 AND deletion_evidence_digest NOT GLOB '*[^0-9a-f]*'),
- committed_at_unix_ms INTEGER NOT NULL,
- PRIMARY KEY(artifact_id,component_id),
- UNIQUE(release_operation_id),
- FOREIGN KEY(artifact_id,component_id) REFERENCES image_generation_artifact_components(artifact_id,component_id) ON DELETE RESTRICT
-);
-
-CREATE TABLE image_generation_artifact_references (
- reference_id TEXT PRIMARY KEY,
- artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
- reference_kind TEXT NOT NULL CHECK(reference_kind IN ('message','tool','publication_operation')),
- released_at_unix_ms INTEGER
-);
-
-CREATE TABLE image_generation_artifact_authorization_facts (
- authorization_digest TEXT PRIMARY KEY CHECK(length(authorization_digest)=64 AND authorization_digest NOT GLOB '*[^0-9a-f]*'),
- artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
- artifact_generation INTEGER NOT NULL CHECK(artifact_generation>=1),
- job_id TEXT NOT NULL,
- job_generation INTEGER NOT NULL CHECK(job_generation>=1),
- slot_id TEXT NOT NULL,
- slot_generation INTEGER NOT NULL CHECK(slot_generation>=1),
- consumer_purpose TEXT NOT NULL CHECK(consumer_purpose IN ('serve_artifact','serve_thumbnail','tool_input','model_input','internal_verification','internal_cleanup')),
- consumer_route TEXT NOT NULL CHECK(consumer_route IN ('artifact_full','artifact_range','thumbnail','tool','model_payload','verification','cleanup')),
- principal_digest TEXT NOT NULL CHECK(length(principal_digest)=64 AND principal_digest NOT GLOB '*[^0-9a-f]*'),
- created_at_unix_ms INTEGER NOT NULL,
- revoked_at_unix_ms INTEGER,
- FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT
-);
-
-CREATE TABLE image_generation_artifact_leases (
- lease_id TEXT PRIMARY KEY,
- artifact_id TEXT NOT NULL,
- artifact_generation INTEGER NOT NULL CHECK(artifact_generation>=1),
- owning_job_id TEXT NOT NULL,
- owning_job_generation INTEGER NOT NULL CHECK(owning_job_generation>=1),
- owning_slot_id TEXT NOT NULL,
- owning_slot_generation INTEGER NOT NULL CHECK(owning_slot_generation>=1),
- published_disposition TEXT NOT NULL CHECK(published_disposition IN ('ordinary','late_authorized')),
- published_disposition_generation INTEGER NOT NULL CHECK(published_disposition_generation>=1),
- component_id TEXT NOT NULL,
- component_kind TEXT NOT NULL CHECK(component_kind IN ('primary','normalized_raster','sanitized_svg','thumbnail','model_payload')),
- component_generation INTEGER NOT NULL CHECK(component_generation>=1),
- component_checksum TEXT NOT NULL CHECK(length(component_checksum)=64 AND component_checksum NOT GLOB '*[^0-9a-f]*'),
- consumer_purpose TEXT NOT NULL CHECK(consumer_purpose IN ('serve_artifact','serve_thumbnail','tool_input','model_input','internal_verification','internal_cleanup')),
- consumer_route TEXT NOT NULL CHECK(consumer_route IN ('artifact_full','artifact_range','thumbnail','tool','model_payload','verification','cleanup')),
- read_kind TEXT NOT NULL CHECK(read_kind IN ('full','range')),
- range_start_hi INTEGER NOT NULL CHECK(range_start_hi BETWEEN 0 AND 4294967295),
- range_start_lo INTEGER NOT NULL CHECK(range_start_lo BETWEEN 0 AND 4294967295),
- requested_length_hi INTEGER NOT NULL CHECK(requested_length_hi BETWEEN 0 AND 4294967295),
- requested_length_lo INTEGER NOT NULL CHECK(requested_length_lo BETWEEN 0 AND 4294967295),
- component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
- authorization_digest TEXT NOT NULL CHECK(length(authorization_digest)=64 AND authorization_digest NOT GLOB '*[^0-9a-f]*'),
- daemon_boot_id TEXT NOT NULL,
- committed_at_monotonic INTEGER NOT NULL CHECK(committed_at_monotonic>=0),
- deadline_monotonic INTEGER NOT NULL,
- released_at INTEGER,
- FOREIGN KEY(artifact_id,component_id) REFERENCES image_generation_artifact_components(artifact_id,component_id) ON DELETE RESTRICT,
- FOREIGN KEY(owning_job_id,owning_slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
- CHECK(deadline_monotonic=committed_at_monotonic+60000),
- CHECK((consumer_purpose='serve_artifact' AND consumer_route IN ('artifact_full','artifact_range')) OR
-       (consumer_purpose='serve_thumbnail' AND consumer_route='thumbnail') OR
-       (consumer_purpose='tool_input' AND consumer_route='tool') OR
-       (consumer_purpose='model_input' AND consumer_route='model_payload') OR
-       (consumer_purpose='internal_verification' AND consumer_route='verification') OR
-       (consumer_purpose='internal_cleanup' AND consumer_route='cleanup')),
- CHECK((read_kind='range' AND consumer_route='artifact_range' AND (requested_length_hi>0 OR requested_length_lo>0)) OR
-       (read_kind='full' AND consumer_route!='artifact_range' AND range_start_hi=0 AND range_start_lo=0))
-);
-
-CREATE TABLE image_generation_late_publication_leases (
- publication_operation_id TEXT PRIMARY KEY,
- artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
- artifact_generation INTEGER NOT NULL CHECK(artifact_generation>=1),
- job_id TEXT NOT NULL,
- slot_id TEXT NOT NULL,
- expected_slot_version INTEGER NOT NULL CHECK(expected_slot_version>=1),
- component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
- component_set_json TEXT NOT NULL,
- authorization_digest TEXT NOT NULL CHECK(length(authorization_digest)=64 AND authorization_digest NOT GLOB '*[^0-9a-f]*'),
- output_authority_digest TEXT NOT NULL CHECK(length(output_authority_digest)=64 AND output_authority_digest NOT GLOB '*[^0-9a-f]*'),
- output_authority_generation INTEGER NOT NULL CHECK(output_authority_generation>=1),
- destination_name TEXT NOT NULL,
- temporary_name TEXT NOT NULL,
- created_at_unix_ms INTEGER NOT NULL,
- deadline_unix_ms INTEGER NOT NULL,
- worker_boot_id TEXT,
- claim_generation INTEGER CHECK(claim_generation IS NULL OR claim_generation>=1),
- state TEXT NOT NULL CHECK(state IN ('reserved','copy_authorized','copy_committed','published','aborted','expired','security_blocked','delete_authorized')),
- version INTEGER NOT NULL CHECK(version>=1),
- temporary_evidence_json TEXT,
- output_evidence_json TEXT,
- recovery_evidence_json TEXT,
- decided_at_unix_ms INTEGER,
- FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
- CHECK(deadline_unix_ms=created_at_unix_ms+300000),
- CHECK((worker_boot_id IS NULL)=(claim_generation IS NULL)),
- CHECK((state='reserved' AND temporary_evidence_json IS NULL AND output_evidence_json IS NULL AND decided_at_unix_ms IS NULL) OR
-       (state='copy_authorized' AND temporary_evidence_json IS NOT NULL AND output_evidence_json IS NULL AND recovery_evidence_json IS NULL AND decided_at_unix_ms IS NULL) OR
-       (state='copy_committed' AND temporary_evidence_json IS NOT NULL AND output_evidence_json IS NOT NULL AND recovery_evidence_json IS NULL AND decided_at_unix_ms IS NULL) OR
-       (state='delete_authorized' AND temporary_evidence_json IS NOT NULL AND output_evidence_json IS NOT NULL AND recovery_evidence_json IS NOT NULL AND json_valid(output_evidence_json) AND json_extract(output_evidence_json,'$.kind')='output_durable' AND json_valid(recovery_evidence_json) AND json_extract(recovery_evidence_json,'$.kind')='security_ambiguous' AND decided_at_unix_ms IS NULL) OR
-       (state='published' AND output_evidence_json IS NOT NULL AND decided_at_unix_ms IS NOT NULL) OR
-       (state IN ('aborted','expired','security_blocked') AND recovery_evidence_json IS NOT NULL AND decided_at_unix_ms IS NOT NULL))
-);
-CREATE TABLE image_generation_late_publication_authorization_facts (
- authorization_digest TEXT PRIMARY KEY CHECK(length(authorization_digest)=64 AND authorization_digest NOT GLOB '*[^0-9a-f]*'),
- artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
- artifact_generation INTEGER NOT NULL CHECK(artifact_generation>=1),
- job_id TEXT NOT NULL,
- slot_id TEXT NOT NULL,
- slot_generation INTEGER NOT NULL CHECK(slot_generation>=1),
- component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
- output_authority_digest TEXT NOT NULL CHECK(length(output_authority_digest)=64 AND output_authority_digest NOT GLOB '*[^0-9a-f]*'),
- output_authority_generation INTEGER NOT NULL CHECK(output_authority_generation>=1),
- destination_name TEXT NOT NULL,
- temporary_name TEXT NOT NULL,
- principal_digest TEXT NOT NULL CHECK(length(principal_digest)=64 AND principal_digest NOT GLOB '*[^0-9a-f]*'),
- created_at_unix_ms INTEGER NOT NULL,
- revoked_at_unix_ms INTEGER,
- FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT
-);
-CREATE UNIQUE INDEX image_generation_one_live_late_publication
-ON image_generation_late_publication_leases(artifact_id)
-WHERE state IN ('reserved','copy_authorized','copy_committed','security_blocked','delete_authorized');
-CREATE TABLE image_generation_user_published_outputs (
- publication_operation_id TEXT PRIMARY KEY REFERENCES image_generation_late_publication_leases(publication_operation_id) ON DELETE RESTRICT,
- artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
- artifact_generation INTEGER NOT NULL CHECK(artifact_generation>=1),
- output_authority_digest TEXT NOT NULL CHECK(length(output_authority_digest)=64 AND output_authority_digest NOT GLOB '*[^0-9a-f]*'),
- output_authority_generation INTEGER NOT NULL CHECK(output_authority_generation>=1),
- destination_name TEXT NOT NULL,
- output_evidence_json TEXT NOT NULL,
- committed_at_unix_ms INTEGER NOT NULL
-);
-CREATE TABLE image_generation_artifact_security_recovery_audits (
- recovery_operation_id TEXT PRIMARY KEY,
- artifact_id TEXT NOT NULL REFERENCES image_generation_artifacts(artifact_id) ON DELETE RESTRICT,
- artifact_generation INTEGER NOT NULL CHECK(artifact_generation>=1),
- job_id TEXT NOT NULL,
- slot_id TEXT NOT NULL,
- slot_generation INTEGER NOT NULL CHECK(slot_generation>=1),
- principal_digest TEXT NOT NULL CHECK(length(principal_digest)=64 AND principal_digest NOT GLOB '*[^0-9a-f]*'),
- component_set_digest TEXT NOT NULL CHECK(length(component_set_digest)=64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
- component_identity_digest TEXT NOT NULL CHECK(length(component_identity_digest)=64 AND component_identity_digest NOT GLOB '*[^0-9a-f]*'),
- publication_operation_id TEXT,
- publication_lease_version INTEGER CHECK(publication_lease_version IS NULL OR publication_lease_version>=1),
- output_identity_digest TEXT CHECK(output_identity_digest IS NULL OR (length(output_identity_digest)=64 AND output_identity_digest NOT GLOB '*[^0-9a-f]*')),
- disposition TEXT NOT NULL CHECK(disposition IN ('retain_blocked','resume_verified_cleanup','remove_verified_external_copy','complete_verified_late_publication')),
- state TEXT NOT NULL CHECK(state IN ('recorded','applied','denied','proof_failed','stale')),
- outcome_digest TEXT CHECK(outcome_digest IS NULL OR (length(outcome_digest)=64 AND outcome_digest NOT GLOB '*[^0-9a-f]*')),
- created_at_unix_ms INTEGER NOT NULL,
- decided_at_unix_ms INTEGER,
- FOREIGN KEY(job_id,slot_id) REFERENCES image_generation_slots(job_id,slot_id) ON DELETE RESTRICT,
- FOREIGN KEY(publication_operation_id) REFERENCES image_generation_late_publication_leases(publication_operation_id) ON DELETE RESTRICT,
- CHECK((state='recorded' AND decided_at_unix_ms IS NULL AND outcome_digest IS NULL) OR (state!='recorded' AND decided_at_unix_ms IS NOT NULL AND outcome_digest IS NOT NULL)),
- CHECK((publication_operation_id IS NULL AND publication_lease_version IS NULL AND output_identity_digest IS NULL) OR (publication_operation_id IS NOT NULL AND publication_lease_version IS NOT NULL AND output_identity_digest IS NOT NULL))
-);
-CREATE TABLE image_generation_artifact_security_recovery_attempts (
- recovery_operation_id TEXT PRIMARY KEY,
- principal_digest TEXT NOT NULL CHECK(length(principal_digest)=64 AND principal_digest NOT GLOB '*[^0-9a-f]*'),
- request_digest TEXT NOT NULL CHECK(length(request_digest)=64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
- state TEXT NOT NULL CHECK(state IN ('received','validated','denied')),
- outcome_digest TEXT CHECK(outcome_digest IS NULL OR (length(outcome_digest)=64 AND outcome_digest NOT GLOB '*[^0-9a-f]*')),
- created_at_unix_ms INTEGER NOT NULL,
- decided_at_unix_ms INTEGER,
- CHECK((state='received' AND outcome_digest IS NULL AND decided_at_unix_ms IS NULL) OR (state!='received' AND outcome_digest IS NOT NULL AND decided_at_unix_ms IS NOT NULL))
-);
-CREATE TABLE image_generation_artifact_security_recovery_components (
- recovery_operation_id TEXT NOT NULL REFERENCES image_generation_artifact_security_recovery_audits(recovery_operation_id) ON DELETE RESTRICT,
- artifact_id TEXT NOT NULL,
- component_id TEXT NOT NULL,
- component_kind TEXT NOT NULL CHECK(component_kind IN ('primary','normalized_raster','sanitized_svg','thumbnail','model_payload')),
- component_generation INTEGER NOT NULL CHECK(component_generation>=1),
- stable_identity_digest TEXT NOT NULL CHECK(length(stable_identity_digest)=64 AND stable_identity_digest NOT GLOB '*[^0-9a-f]*'),
- security_digest TEXT NOT NULL CHECK(length(security_digest)=64 AND security_digest NOT GLOB '*[^0-9a-f]*'),
- sha256 TEXT NOT NULL CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
- PRIMARY KEY(recovery_operation_id,component_id),
- FOREIGN KEY(artifact_id,component_id) REFERENCES image_generation_artifact_components(artifact_id,component_id) ON DELETE RESTRICT
-);
-CREATE TRIGGER image_generation_security_recovery_component_insert_guard BEFORE INSERT ON image_generation_artifact_security_recovery_components
-WHEN NOT EXISTS(SELECT 1 FROM image_generation_artifact_security_recovery_audits r JOIN image_generation_artifact_components c ON c.artifact_id=r.artifact_id WHERE r.recovery_operation_id=NEW.recovery_operation_id AND r.artifact_id=NEW.artifact_id AND r.state='recorded' AND c.component_id=NEW.component_id AND c.component_kind=NEW.component_kind AND c.generation=NEW.component_generation AND c.sha256=NEW.sha256 AND json_valid(c.stable_identity_json)=1 AND json_extract(c.stable_identity_json,'$.identityDigest')=NEW.stable_identity_digest AND json_extract(c.stable_identity_json,'$.securityDigest')=NEW.security_digest AND c.state IN ('ready','security_blocked'))
-BEGIN SELECT RAISE(ABORT,'security recovery component lacks exact held identity'); END;
-CREATE TRIGGER image_generation_security_recovery_component_immutable BEFORE UPDATE ON image_generation_artifact_security_recovery_components BEGIN SELECT RAISE(ABORT,'security recovery component identity is immutable'); END;
-CREATE TRIGGER image_generation_security_recovery_component_delete_forbidden BEFORE DELETE ON image_generation_artifact_security_recovery_components BEGIN SELECT RAISE(ABORT,'security recovery component identity is durable'); END;
-CREATE TRIGGER image_generation_security_recovery_attempt_identity_immutable BEFORE UPDATE OF recovery_operation_id,principal_digest,request_digest,created_at_unix_ms ON image_generation_artifact_security_recovery_attempts BEGIN SELECT RAISE(ABORT,'security recovery attempt identity is immutable'); END;
-CREATE TRIGGER image_generation_security_recovery_attempt_transition_guard BEFORE UPDATE OF state,outcome_digest,decided_at_unix_ms ON image_generation_artifact_security_recovery_attempts WHEN OLD.state!='received' OR NEW.state NOT IN ('validated','denied') OR NEW.outcome_digest IS NULL OR NEW.decided_at_unix_ms IS NULL BEGIN SELECT RAISE(ABORT,'security recovery attempt outcome is invalid'); END;
-CREATE TRIGGER image_generation_security_recovery_attempt_delete_forbidden BEFORE DELETE ON image_generation_artifact_security_recovery_attempts BEGIN SELECT RAISE(ABORT,'security recovery attempt audit is durable'); END;
-
-CREATE TABLE image_generation_artifact_transitions(from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
-INSERT INTO image_generation_artifact_transitions VALUES
-('allocating','writing'),('allocating','cleanup_pending'),('allocating','security_blocked'),
-('writing','retained'),('writing','late_quarantined'),('writing','cleanup_pending'),('writing','security_blocked'),
-('retained','cleanup_pending'),('retained','security_blocked'),
-('late_quarantined','retained'),('late_quarantined','cleanup_pending'),('late_quarantined','security_blocked'),
-('cleanup_pending','deleting'),('cleanup_pending','security_blocked'),
-('deleting','tombstoned'),('deleting','security_blocked'),
-('security_blocked','cleanup_pending'),('security_blocked','retained');
-CREATE TABLE image_generation_component_transitions(from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
-INSERT INTO image_generation_component_transitions VALUES
-('planned','writing'),('planned','cleanup_pending'),('planned','security_blocked'),
-('writing','ready'),('writing','cleanup_pending'),('writing','security_blocked'),
-('ready','cleanup_pending'),('ready','security_blocked'),
-('cleanup_pending','deleting'),('cleanup_pending','security_blocked'),
-('deleting','tombstoned'),('deleting','security_blocked'),
-('security_blocked','cleanup_pending');
-CREATE TABLE image_generation_cleanup_transitions(from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
-INSERT INTO image_generation_cleanup_transitions VALUES
-('pending','deleting'),('pending','security_blocked'),('deleting','completed'),('deleting','security_blocked'),('security_blocked','pending');
-CREATE TABLE image_generation_late_publication_transitions(from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
-INSERT INTO image_generation_late_publication_transitions VALUES
-('reserved','copy_authorized'),('reserved','aborted'),('reserved','expired'),('reserved','security_blocked'),
-('copy_authorized','copy_committed'),('copy_authorized','aborted'),('copy_authorized','security_blocked'),
-('copy_committed','published'),('copy_committed','security_blocked'),('security_blocked','published'),('security_blocked','delete_authorized'),('delete_authorized','aborted'),('delete_authorized','security_blocked');
-
-CREATE TRIGGER image_generation_artifact_transition_guard BEFORE UPDATE OF state,generation ON image_generation_artifacts
-WHEN NEW.generation!=OLD.generation+1 OR NOT EXISTS(SELECT 1 FROM image_generation_artifact_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
-BEGIN SELECT RAISE(ABORT,'forbidden image artifact transition'); END;
-CREATE TRIGGER image_generation_artifact_slot_binding_guard BEFORE INSERT ON image_generation_artifacts
-WHEN NOT EXISTS(SELECT 1 FROM image_generation_slots s WHERE s.job_id=NEW.job_id AND s.slot_id=NEW.slot_id AND s.managed_artifact_id=NEW.artifact_id)
-BEGIN SELECT RAISE(ABORT,'image artifact is not the sealed slot artifact'); END;
-CREATE TRIGGER image_generation_artifact_identity_immutable BEFORE UPDATE OF artifact_id,job_id,slot_id,expected_component_count,component_set_digest,component_set_json,created_at_unix_ms ON image_generation_artifacts
-BEGIN SELECT RAISE(ABORT,'image artifact identity graph is immutable'); END;
-CREATE TRIGGER image_generation_artifact_delete_forbidden BEFORE DELETE ON image_generation_artifacts
-BEGIN SELECT RAISE(ABORT,'image artifact tombstones are retained'); END;
-CREATE TRIGGER image_generation_component_insert_guard BEFORE INSERT ON image_generation_artifact_components
-WHEN (SELECT state FROM image_generation_artifacts WHERE artifact_id=NEW.artifact_id)!='allocating'
-BEGIN SELECT RAISE(ABORT,'image artifact component graph is sealed'); END;
-CREATE TRIGGER image_generation_component_identity_immutable BEFORE UPDATE OF artifact_id,component_id,component_kind,relative_storage_key,byte_length_hi,byte_length_lo,sha256,expected_link_count,resource_reservation_id,release_operation_id ON image_generation_artifact_components
-BEGIN SELECT RAISE(ABORT,'image artifact component identity is immutable'); END;
-CREATE TRIGGER image_generation_component_delete_forbidden BEFORE DELETE ON image_generation_artifact_components
-BEGIN SELECT RAISE(ABORT,'image artifact component tombstones are retained'); END;
-CREATE TRIGGER image_generation_component_transition_guard BEFORE UPDATE OF state,generation ON image_generation_artifact_components
-WHEN NEW.generation!=OLD.generation+1 OR NOT EXISTS(SELECT 1 FROM image_generation_component_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
-BEGIN SELECT RAISE(ABORT,'forbidden image artifact component transition'); END;
-CREATE TRIGGER image_generation_cleanup_transition_guard BEFORE UPDATE OF state,version ON image_generation_artifact_cleanup_intents
-WHEN NEW.version!=OLD.version+1 OR NOT EXISTS(SELECT 1 FROM image_generation_cleanup_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
-BEGIN SELECT RAISE(ABORT,'forbidden image artifact cleanup transition'); END;
-CREATE TRIGGER image_generation_late_publication_transition_guard BEFORE UPDATE OF state,version ON image_generation_late_publication_leases
-WHEN NEW.version!=OLD.version+1 OR ((NEW.state!=OLD.state AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_transitions WHERE from_state=OLD.state AND to_state=NEW.state)) OR (NEW.state=OLD.state AND NOT (OLD.state='reserved' AND NEW.claim_generation>COALESCE(OLD.claim_generation,0))))
-BEGIN SELECT RAISE(ABORT,'forbidden late image publication transition'); END;
-CREATE TRIGGER image_generation_late_publication_insert_guard BEFORE INSERT ON image_generation_late_publication_leases
-WHEN NOT EXISTS(SELECT 1 FROM image_generation_artifacts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_late_publication_authorization_facts f ON f.authorization_digest=NEW.authorization_digest
- WHERE a.artifact_id=NEW.artifact_id AND a.generation=NEW.artifact_generation AND a.state='late_quarantined' AND a.active_lease_count=0 AND a.component_set_digest=NEW.component_set_digest AND a.component_set_json=NEW.component_set_json AND a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id
- AND s.version=NEW.expected_slot_version AND s.state='late_quarantined' AND s.result_after_cancel=1 AND s.applied_cancellation_version IS NOT NULL
- AND f.artifact_id=a.artifact_id AND f.artifact_generation=a.generation AND f.job_id=a.job_id AND f.slot_id=a.slot_id AND f.slot_generation=s.version AND f.component_set_digest=a.component_set_digest AND f.output_authority_digest=NEW.output_authority_digest AND f.output_authority_generation=NEW.output_authority_generation AND f.destination_name=NEW.destination_name AND f.temporary_name=NEW.temporary_name AND f.revoked_at_unix_ms IS NULL
- AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=a.artifact_id)
- AND (SELECT count(*) FROM image_generation_artifact_components c WHERE c.artifact_id=a.artifact_id AND c.state='ready')=a.expected_component_count)
-BEGIN SELECT RAISE(ABORT,'late publication reservation lacks exact authority'); END;
-CREATE TRIGGER image_generation_late_publication_evidence_guard BEFORE UPDATE OF state ON image_generation_late_publication_leases
-WHEN (NEW.state='copy_authorized' AND (NEW.temporary_evidence_json IS NULL OR OLD.state!='reserved' OR CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)>=OLD.deadline_unix_ms))
- OR (NEW.state='copy_committed' AND (NEW.output_evidence_json IS NULL OR OLD.state!='copy_authorized'))
- OR (NEW.state='delete_authorized' AND (OLD.state!='security_blocked' OR NEW.output_evidence_json IS NULL OR NEW.recovery_evidence_json IS NULL OR NEW.decided_at_unix_ms IS NOT NULL))
- OR (NEW.state IN ('aborted','expired','security_blocked') AND NEW.recovery_evidence_json IS NULL)
- OR (NEW.state='expired' AND (OLD.state!='reserved' OR CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)<OLD.deadline_unix_ms))
- OR (NEW.state='published' AND (OLD.state NOT IN ('copy_committed','security_blocked') OR NOT EXISTS(SELECT 1 FROM image_generation_user_published_outputs o WHERE o.publication_operation_id=NEW.publication_operation_id AND o.artifact_id=NEW.artifact_id AND o.artifact_generation=NEW.artifact_generation AND o.output_authority_digest=NEW.output_authority_digest AND o.output_authority_generation=NEW.output_authority_generation AND o.destination_name=NEW.destination_name AND o.output_evidence_json=NEW.output_evidence_json)))
-BEGIN SELECT RAISE(ABORT,'late publication transition lacks state-dependent evidence'); END;
-CREATE TRIGGER image_generation_artifact_retained_projection_guard BEFORE UPDATE OF state ON image_generation_artifacts
-WHEN NEW.state IN ('retained','late_quarantined') AND (((SELECT count(*) FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id)!=NEW.expected_component_count) OR ((SELECT count(*) FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id AND c.state='ready')!=NEW.expected_component_count))
-BEGIN SELECT RAISE(ABORT,'retained image artifact lacks complete ready component set'); END;
-CREATE TRIGGER image_generation_artifact_late_publication_guard BEFORE UPDATE OF state ON image_generation_artifacts
-WHEN OLD.state='late_quarantined' AND NEW.state='retained' AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=NEW.artifact_id AND p.state='published' AND p.artifact_generation=OLD.generation)
-BEGIN SELECT RAISE(ABORT,'late artifact retention lacks exact published disposition lease'); END;
-CREATE TRIGGER image_generation_artifact_security_recovery_guard BEFORE UPDATE OF state ON image_generation_artifacts
-WHEN OLD.state='security_blocked' AND NEW.state='cleanup_pending' AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=NEW.artifact_id AND i.reason='owner_recovery' AND i.expected_artifact_generation=NEW.generation)
-BEGIN SELECT RAISE(ABORT,'security-blocked artifact lacks Owner recovery intent'); END;
-CREATE TRIGGER image_generation_artifact_security_publication_guard BEFORE UPDATE OF state ON image_generation_artifacts
-WHEN OLD.state='security_blocked' AND NEW.state='retained' AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_security_recovery_audits r JOIN image_generation_late_publication_leases p ON p.publication_operation_id=r.publication_operation_id WHERE r.artifact_id=NEW.artifact_id AND r.artifact_generation=OLD.generation AND r.disposition='complete_verified_late_publication' AND r.state='applied' AND p.state='published')
-BEGIN SELECT RAISE(ABORT,'security-blocked artifact lacks verified Owner publication'); END;
-CREATE TRIGGER image_generation_component_security_recovery_guard BEFORE UPDATE OF state ON image_generation_artifact_components
-WHEN OLD.state='security_blocked' AND NEW.state='cleanup_pending' AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=NEW.artifact_id AND i.reason='owner_recovery')
-BEGIN SELECT RAISE(ABORT,'security-blocked component lacks Owner recovery intent'); END;
-CREATE TRIGGER image_generation_artifact_tombstone_projection_guard BEFORE UPDATE OF state ON image_generation_artifacts
-WHEN NEW.state='tombstoned' AND (EXISTS(SELECT 1 FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id AND c.state!='tombstoned') OR EXISTS(SELECT 1 FROM image_generation_artifact_components c LEFT JOIN image_generation_component_release_facts r ON r.artifact_id=c.artifact_id AND r.component_id=c.component_id WHERE c.artifact_id=NEW.artifact_id AND r.component_id IS NULL))
-BEGIN SELECT RAISE(ABORT,'image artifact tombstone lacks component deletion and release evidence'); END;
-CREATE TRIGGER image_generation_component_tombstone_guard BEFORE UPDATE OF state ON image_generation_artifact_components
-WHEN NEW.state='tombstoned' AND NOT EXISTS(SELECT 1 FROM image_generation_component_release_facts r WHERE r.artifact_id=NEW.artifact_id AND r.component_id=NEW.component_id AND r.deletion_evidence_digest=NEW.deletion_evidence_digest)
-BEGIN SELECT RAISE(ABORT,'component tombstone lacks matching release evidence'); END;
-CREATE TRIGGER image_generation_release_guard BEFORE INSERT ON image_generation_component_release_facts
-WHEN NOT EXISTS(SELECT 1 FROM image_generation_artifact_components c WHERE c.artifact_id=NEW.artifact_id AND c.component_id=NEW.component_id AND c.state='deleting' AND c.release_operation_id=NEW.release_operation_id AND c.deletion_evidence_digest=NEW.deletion_evidence_digest)
-BEGIN SELECT RAISE(ABORT,'resource release precedes verified component deletion evidence'); END;
-CREATE TRIGGER image_generation_release_immutable BEFORE UPDATE ON image_generation_component_release_facts BEGIN SELECT RAISE(ABORT,'component release evidence is immutable'); END;
-CREATE TRIGGER image_generation_release_delete_forbidden BEFORE DELETE ON image_generation_component_release_facts BEGIN SELECT RAISE(ABORT,'component release evidence is immutable'); END;
-CREATE TRIGGER image_generation_cleanup_identity_immutable BEFORE UPDATE OF cleanup_operation_id,artifact_id,expected_artifact_generation,reason,created_at_unix_ms ON image_generation_artifact_cleanup_intents BEGIN SELECT RAISE(ABORT,'cleanup intent identity is immutable'); END;
-CREATE TRIGGER image_generation_cleanup_delete_forbidden BEFORE DELETE ON image_generation_artifact_cleanup_intents BEGIN SELECT RAISE(ABORT,'cleanup intent is durable'); END;
-CREATE TRIGGER image_generation_lease_identity_immutable BEFORE UPDATE OF lease_id,artifact_id,artifact_generation,owning_job_id,owning_job_generation,owning_slot_id,owning_slot_generation,published_disposition,published_disposition_generation,component_id,component_kind,component_generation,component_checksum,consumer_purpose,consumer_route,read_kind,range_start_hi,range_start_lo,requested_length_hi,requested_length_lo,component_set_digest,authorization_digest,daemon_boot_id,committed_at_monotonic,deadline_monotonic ON image_generation_artifact_leases BEGIN SELECT RAISE(ABORT,'artifact lease identity is immutable'); END;
-CREATE TRIGGER image_generation_lease_delete_forbidden BEFORE DELETE ON image_generation_artifact_leases BEGIN SELECT RAISE(ABORT,'artifact lease is durable'); END;
-CREATE TRIGGER image_generation_lease_insert_guard BEFORE INSERT ON image_generation_artifact_leases
-WHEN NOT EXISTS(SELECT 1 FROM image_generation_artifacts a JOIN image_generation_jobs j ON j.job_id=a.job_id JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id JOIN image_generation_artifact_components c ON c.artifact_id=a.artifact_id JOIN image_generation_artifact_authorization_facts f ON f.authorization_digest=NEW.authorization_digest
- WHERE a.artifact_id=NEW.artifact_id AND a.state='retained' AND a.generation=NEW.artifact_generation AND a.component_set_digest=NEW.component_set_digest AND a.active_lease_count=(SELECT count(*) FROM image_generation_artifact_leases l WHERE l.artifact_id=a.artifact_id AND l.released_at IS NULL)
- AND j.job_id=NEW.owning_job_id AND j.version=NEW.owning_job_generation AND s.slot_id=NEW.owning_slot_id AND s.state='published' AND s.version=NEW.owning_slot_generation AND NEW.published_disposition_generation=s.published_disposition_generation AND NEW.published_disposition=s.published_disposition
- AND ((s.published_disposition='ordinary' AND s.result_after_cancel=0) OR (s.published_disposition='late_authorized' AND s.result_after_cancel=1 AND s.applied_cancellation_version IS NOT NULL))
- AND c.component_id=NEW.component_id AND c.component_kind=NEW.component_kind AND c.state='ready' AND c.generation=NEW.component_generation AND c.sha256=NEW.component_checksum
- AND f.artifact_id=a.artifact_id AND f.artifact_generation=a.generation AND f.job_id=j.job_id AND f.job_generation=j.version AND f.slot_id=s.slot_id AND f.slot_generation=s.version AND f.consumer_purpose=NEW.consumer_purpose AND f.consumer_route=NEW.consumer_route AND f.revoked_at_unix_ms IS NULL
- AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=a.artifact_id)
- AND ((NEW.consumer_purpose='serve_artifact' AND NEW.consumer_route IN ('artifact_full','artifact_range')) OR (NEW.consumer_purpose='serve_thumbnail' AND NEW.consumer_route='thumbnail') OR (NEW.consumer_purpose='tool_input' AND NEW.consumer_route='tool') OR (NEW.consumer_purpose='model_input' AND NEW.consumer_route='model_payload') OR (NEW.consumer_purpose='internal_verification' AND NEW.consumer_route='verification') OR (NEW.consumer_purpose='internal_cleanup' AND NEW.consumer_route='cleanup'))
- AND ((NEW.read_kind='full' AND NEW.consumer_route!='artifact_range' AND NEW.range_start_hi=0 AND NEW.range_start_lo=0 AND NEW.requested_length_hi=c.byte_length_hi AND NEW.requested_length_lo=c.byte_length_lo) OR
-      (NEW.read_kind='range' AND NEW.consumer_route='artifact_range' AND (NEW.requested_length_hi>0 OR NEW.requested_length_lo>0) AND NEW.range_start_hi+NEW.requested_length_hi+CASE WHEN NEW.range_start_lo+NEW.requested_length_lo>=4294967296 THEN 1 ELSE 0 END<=4294967295 AND (NEW.range_start_hi+NEW.requested_length_hi+CASE WHEN NEW.range_start_lo+NEW.requested_length_lo>=4294967296 THEN 1 ELSE 0 END<c.byte_length_hi OR (NEW.range_start_hi+NEW.requested_length_hi+CASE WHEN NEW.range_start_lo+NEW.requested_length_lo>=4294967296 THEN 1 ELSE 0 END=c.byte_length_hi AND (NEW.range_start_lo+NEW.requested_length_lo)%4294967296<=c.byte_length_lo))))
-)
-BEGIN SELECT RAISE(ABORT,'artifact lease lacks exact current authority'); END;
-CREATE TRIGGER image_generation_lease_count_insert AFTER INSERT ON image_generation_artifact_leases
-BEGIN UPDATE image_generation_artifacts SET active_lease_count=active_lease_count+1 WHERE artifact_id=NEW.artifact_id; END;
-CREATE TRIGGER image_generation_lease_release_guard BEFORE UPDATE OF released_at ON image_generation_artifact_leases
-WHEN OLD.released_at IS NOT NULL OR NEW.released_at IS NULL OR NEW.released_at<OLD.committed_at_monotonic
-BEGIN SELECT RAISE(ABORT,'artifact lease release is not monotonic'); END;
-CREATE TRIGGER image_generation_lease_count_release AFTER UPDATE OF released_at ON image_generation_artifact_leases
-WHEN OLD.released_at IS NULL AND NEW.released_at IS NOT NULL
-BEGIN UPDATE image_generation_artifacts SET active_lease_count=active_lease_count-1 WHERE artifact_id=NEW.artifact_id AND active_lease_count>0; END;
-CREATE TRIGGER image_generation_active_lease_count_guard BEFORE UPDATE OF active_lease_count ON image_generation_artifacts
-WHEN NEW.active_lease_count!=(SELECT count(*) FROM image_generation_artifact_leases l WHERE l.artifact_id=NEW.artifact_id AND l.released_at IS NULL)
-BEGIN SELECT RAISE(ABORT,'artifact active lease count differs from durable leases'); END;
-CREATE TRIGGER image_generation_artifact_authorization_immutable BEFORE UPDATE OF authorization_digest,artifact_id,artifact_generation,job_id,job_generation,slot_id,slot_generation,consumer_purpose,consumer_route,principal_digest,created_at_unix_ms ON image_generation_artifact_authorization_facts BEGIN SELECT RAISE(ABORT,'artifact authorization identity is immutable'); END;
-CREATE TRIGGER image_generation_artifact_authorization_delete_forbidden BEFORE DELETE ON image_generation_artifact_authorization_facts BEGIN SELECT RAISE(ABORT,'artifact authorization fact is durable'); END;
-CREATE TRIGGER image_generation_artifact_authorization_revoke_guard BEFORE UPDATE OF revoked_at_unix_ms ON image_generation_artifact_authorization_facts
-WHEN OLD.revoked_at_unix_ms IS NOT NULL OR NEW.revoked_at_unix_ms IS NULL OR NEW.revoked_at_unix_ms<OLD.created_at_unix_ms
-BEGIN SELECT RAISE(ABORT,'artifact authorization revocation is not monotonic'); END;
-CREATE TRIGGER image_generation_late_publication_identity_immutable BEFORE UPDATE OF publication_operation_id,artifact_id,artifact_generation,job_id,slot_id,expected_slot_version,component_set_digest,component_set_json,authorization_digest,output_authority_digest,output_authority_generation,destination_name,temporary_name,created_at_unix_ms,deadline_unix_ms ON image_generation_late_publication_leases BEGIN SELECT RAISE(ABORT,'late publication identity is immutable'); END;
-CREATE TRIGGER image_generation_late_publication_delete_forbidden BEFORE DELETE ON image_generation_late_publication_leases BEGIN SELECT RAISE(ABORT,'late publication lease is durable'); END;
-CREATE TRIGGER image_generation_late_publication_claim_guard BEFORE UPDATE OF worker_boot_id,claim_generation ON image_generation_late_publication_leases
-WHEN OLD.state!='reserved' OR NEW.state!='reserved' OR NEW.worker_boot_id IS NULL OR NEW.claim_generation IS NULL OR NEW.claim_generation<=COALESCE(OLD.claim_generation,0) OR (OLD.claim_generation IS NOT NULL AND NEW.recovery_evidence_json IS NULL) OR CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)>=OLD.deadline_unix_ms
-BEGIN SELECT RAISE(ABORT,'late publication claim lacks fresh fenced authority'); END;
-CREATE TRIGGER image_generation_late_publication_evidence_immutable BEFORE UPDATE OF temporary_evidence_json,output_evidence_json,recovery_evidence_json ON image_generation_late_publication_leases
-WHEN (OLD.temporary_evidence_json IS NOT NULL AND NEW.temporary_evidence_json!=OLD.temporary_evidence_json) OR (OLD.output_evidence_json IS NOT NULL AND NEW.output_evidence_json!=OLD.output_evidence_json) OR (OLD.recovery_evidence_json IS NOT NULL AND NEW.recovery_evidence_json!=OLD.recovery_evidence_json AND NOT (OLD.state='delete_authorized' AND NEW.state='aborted' AND json_valid(NEW.recovery_evidence_json) AND json_extract(NEW.recovery_evidence_json,'$.schema_version')=1 AND json_extract(NEW.recovery_evidence_json,'$.kind') IN ('temporary_deleted','exact_absence')))
-BEGIN SELECT RAISE(ABORT,'late publication evidence is immutable'); END;
-CREATE TRIGGER image_generation_late_publication_decision_immutable BEFORE UPDATE OF decided_at_unix_ms ON image_generation_late_publication_leases
-WHEN NOT ((OLD.decided_at_unix_ms IS NULL AND NEW.decided_at_unix_ms IS NOT NULL) OR (OLD.state='security_blocked' AND NEW.state='delete_authorized' AND OLD.decided_at_unix_ms IS NOT NULL AND NEW.decided_at_unix_ms IS NULL))
-BEGIN SELECT RAISE(ABORT,'late publication decision is immutable'); END;
-CREATE TRIGGER image_generation_user_published_output_immutable BEFORE UPDATE ON image_generation_user_published_outputs BEGIN SELECT RAISE(ABORT,'published output evidence is immutable'); END;
-CREATE TRIGGER image_generation_user_published_output_delete_forbidden BEFORE DELETE ON image_generation_user_published_outputs BEGIN SELECT RAISE(ABORT,'published output evidence is durable'); END;
-CREATE TRIGGER image_generation_security_recovery_audit_identity_immutable BEFORE UPDATE OF recovery_operation_id,artifact_id,artifact_generation,job_id,slot_id,slot_generation,principal_digest,component_set_digest,component_identity_digest,publication_operation_id,publication_lease_version,output_identity_digest,disposition,created_at_unix_ms ON image_generation_artifact_security_recovery_audits BEGIN SELECT RAISE(ABORT,'security recovery audit identity is immutable'); END;
-CREATE TRIGGER image_generation_security_recovery_audit_insert_guard BEFORE INSERT ON image_generation_artifact_security_recovery_audits
-WHEN NOT EXISTS(SELECT 1 FROM image_generation_artifacts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id WHERE a.artifact_id=NEW.artifact_id AND a.generation=NEW.artifact_generation AND a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id AND a.component_set_digest=NEW.component_set_digest AND (a.state='security_blocked' OR NEW.disposition IN ('complete_verified_late_publication','remove_verified_external_copy')) AND s.version=NEW.slot_generation)
- OR (NEW.publication_operation_id IS NULL AND NEW.disposition='complete_verified_late_publication')
- OR (NEW.publication_operation_id IS NOT NULL AND (NEW.disposition NOT IN ('complete_verified_late_publication','remove_verified_external_copy') OR NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.publication_operation_id=NEW.publication_operation_id AND p.artifact_id=NEW.artifact_id AND p.artifact_generation=NEW.artifact_generation AND p.version=NEW.publication_lease_version AND p.state='security_blocked' AND p.output_evidence_json IS NOT NULL AND json_extract(p.output_evidence_json,'$.identity_digest')=NEW.output_identity_digest)))
-BEGIN SELECT RAISE(ABORT,'security recovery audit lacks exact blocked authority'); END;
-CREATE TRIGGER image_generation_security_recovery_audit_transition_guard BEFORE UPDATE OF state,outcome_digest,decided_at_unix_ms ON image_generation_artifact_security_recovery_audits WHEN OLD.state!='recorded' OR NEW.state NOT IN ('applied','denied','proof_failed','stale') OR NEW.outcome_digest IS NULL OR length(NEW.outcome_digest)!=64 OR NEW.outcome_digest GLOB '*[^0-9a-f]*' OR NEW.decided_at_unix_ms IS NULL BEGIN SELECT RAISE(ABORT,'security recovery audit outcome is immutable'); END;
-CREATE TRIGGER image_generation_security_recovery_audit_delete_forbidden BEFORE DELETE ON image_generation_artifact_security_recovery_audits BEGIN SELECT RAISE(ABORT,'security recovery audit is durable'); END;
-CREATE TRIGGER image_generation_late_publication_authorization_immutable BEFORE UPDATE OF authorization_digest,artifact_id,artifact_generation,job_id,slot_id,slot_generation,component_set_digest,output_authority_digest,output_authority_generation,destination_name,temporary_name,principal_digest,created_at_unix_ms ON image_generation_late_publication_authorization_facts BEGIN SELECT RAISE(ABORT,'late publication authorization identity is immutable'); END;
-CREATE TRIGGER image_generation_late_publication_authorization_delete_forbidden BEFORE DELETE ON image_generation_late_publication_authorization_facts BEGIN SELECT RAISE(ABORT,'late publication authorization fact is durable'); END;
-CREATE TRIGGER image_generation_late_publication_authorization_revoke_guard BEFORE UPDATE OF revoked_at_unix_ms ON image_generation_late_publication_authorization_facts WHEN OLD.revoked_at_unix_ms IS NOT NULL OR NEW.revoked_at_unix_ms IS NULL OR NEW.revoked_at_unix_ms<OLD.created_at_unix_ms BEGIN SELECT RAISE(ABORT,'late publication authorization revocation is not monotonic'); END;
-CREATE TRIGGER image_generation_user_published_output_insert_guard BEFORE INSERT ON image_generation_user_published_outputs
-WHEN NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.publication_operation_id=NEW.publication_operation_id AND p.artifact_id=NEW.artifact_id AND p.artifact_generation=NEW.artifact_generation AND p.state IN ('copy_committed','security_blocked') AND p.output_authority_digest=NEW.output_authority_digest AND p.output_authority_generation=NEW.output_authority_generation AND p.destination_name=NEW.destination_name AND p.output_evidence_json=NEW.output_evidence_json)
-BEGIN SELECT RAISE(ABORT,'published output fact lacks exact durable lease evidence'); END;
-CREATE TRIGGER image_generation_owner_recovery_cleanup_intent_insert_guard BEFORE INSERT ON image_generation_artifact_cleanup_intents
-WHEN NEW.reason='owner_recovery' AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_security_recovery_audits r JOIN image_generation_artifacts a ON a.artifact_id=r.artifact_id WHERE r.artifact_id=NEW.artifact_id AND r.disposition='resume_verified_cleanup' AND r.state='recorded' AND NEW.expected_artifact_generation=r.artifact_generation+1 AND a.generation=r.artifact_generation AND a.state='security_blocked')
-BEGIN SELECT RAISE(ABORT,'owner recovery cleanup intent lacks recorded audit'); END;
-CREATE TRIGGER image_generation_external_delete_authority_guard BEFORE UPDATE OF state ON image_generation_late_publication_leases
-WHEN NEW.state='delete_authorized' AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_security_recovery_audits r WHERE r.publication_operation_id=OLD.publication_operation_id AND r.publication_lease_version=OLD.version AND r.artifact_id=OLD.artifact_id AND r.artifact_generation=OLD.artifact_generation AND r.output_identity_digest=json_extract(OLD.output_evidence_json,'$.identity_digest') AND r.disposition='remove_verified_external_copy' AND r.state='recorded')
-BEGIN SELECT RAISE(ABORT,'external publication deletion lacks recorded authority'); END;
-CREATE TRIGGER image_generation_external_delete_evidence_guard BEFORE UPDATE OF state,recovery_evidence_json ON image_generation_late_publication_leases
-WHEN OLD.state='delete_authorized' AND (NEW.state!='aborted' OR json_valid(NEW.recovery_evidence_json)!=1 OR json_extract(NEW.recovery_evidence_json,'$.schema_version')!=1 OR json_extract(NEW.recovery_evidence_json,'$.kind') NOT IN ('temporary_deleted','exact_absence') OR (json_extract(NEW.recovery_evidence_json,'$.kind')='temporary_deleted' AND (length(json_extract(NEW.recovery_evidence_json,'$.identity_digest'))!=64 OR length(json_extract(NEW.recovery_evidence_json,'$.deletion_digest'))!=64 OR length(json_extract(NEW.recovery_evidence_json,'$.parent_sync_digest'))!=64)) OR (json_extract(NEW.recovery_evidence_json,'$.kind')='exact_absence' AND (length(json_extract(NEW.recovery_evidence_json,'$.absence_digest'))!=64 OR length(json_extract(NEW.recovery_evidence_json,'$.parent_identity_digest'))!=64)))
-BEGIN SELECT RAISE(ABORT,'external publication deletion evidence is invalid'); END;
-CREATE TRIGGER image_generation_artifact_transition_registry_sealed BEFORE INSERT ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
-CREATE TRIGGER image_generation_artifact_transition_registry_update_sealed BEFORE UPDATE ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
-CREATE TRIGGER image_generation_artifact_transition_registry_delete_sealed BEFORE DELETE ON image_generation_artifact_transitions BEGIN SELECT RAISE(ABORT,'image artifact transition registry is sealed'); END;
-CREATE TRIGGER image_generation_component_transition_registry_sealed BEFORE INSERT ON image_generation_component_transitions BEGIN SELECT RAISE(ABORT,'image component transition registry is sealed'); END;
-CREATE TRIGGER image_generation_component_transition_registry_update_sealed BEFORE UPDATE ON image_generation_component_transitions BEGIN SELECT RAISE(ABORT,'image component transition registry is sealed'); END;
-CREATE TRIGGER image_generation_component_transition_registry_delete_sealed BEFORE DELETE ON image_generation_component_transitions BEGIN SELECT RAISE(ABORT,'image component transition registry is sealed'); END;
-CREATE TRIGGER image_generation_cleanup_transition_registry_sealed BEFORE INSERT ON image_generation_cleanup_transitions BEGIN SELECT RAISE(ABORT,'image cleanup transition registry is sealed'); END;
-CREATE TRIGGER image_generation_cleanup_transition_registry_update_sealed BEFORE UPDATE ON image_generation_cleanup_transitions BEGIN SELECT RAISE(ABORT,'image cleanup transition registry is sealed'); END;
-CREATE TRIGGER image_generation_cleanup_transition_registry_delete_sealed BEFORE DELETE ON image_generation_cleanup_transitions BEGIN SELECT RAISE(ABORT,'image cleanup transition registry is sealed'); END;
-CREATE TRIGGER image_generation_late_publication_transition_registry_sealed BEFORE INSERT ON image_generation_late_publication_transitions BEGIN SELECT RAISE(ABORT,'late publication transition registry is sealed'); END;
-CREATE TRIGGER image_generation_late_publication_transition_registry_update_sealed BEFORE UPDATE ON image_generation_late_publication_transitions BEGIN SELECT RAISE(ABORT,'late publication transition registry is sealed'); END;
-CREATE TRIGGER image_generation_late_publication_transition_registry_delete_sealed BEFORE DELETE ON image_generation_late_publication_transitions BEGIN SELECT RAISE(ABORT,'late publication transition registry is sealed'); END;
-
-CREATE TABLE image_generation_job_transitions (from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
-INSERT INTO image_generation_job_transitions VALUES
-('created','validating'),('created','failed'),('created','cancelled'),
-('validating','awaiting_authorization'),('validating','queued'),('validating','failed'),('validating','cancelled'),
-('awaiting_authorization','queued'),('awaiting_authorization','failed'),('awaiting_authorization','cancelled'),
-('queued','dispatching'),('queued','cancellation_requested'),('queued','failed'),('queued','cancelled'),
-('dispatching','submission_unknown'),('dispatching','running'),('dispatching','cancellation_requested'),('dispatching','downloading'),('dispatching','partially_failed'),('dispatching','failed'),('dispatching','cancelled'),
-('submission_unknown','running'),('submission_unknown','cancellation_requested'),('submission_unknown','downloading'),('submission_unknown','completed_after_cancel'),('submission_unknown','partially_failed'),('submission_unknown','failed'),
-('running','cancellation_requested'),('running','downloading'),('running','partially_failed'),('running','failed'),
-('cancellation_requested','cancelled'),('cancellation_requested','downloading'),('cancellation_requested','completed_after_cancel'),('cancellation_requested','partially_failed'),('cancellation_requested','failed'),
-('downloading','validating_output'),('downloading','cancellation_requested'),('downloading','completed_after_cancel'),('downloading','partially_failed'),('downloading','failed'),
-('validating_output','publishing'),('validating_output','cancellation_requested'),('validating_output','completed_after_cancel'),('validating_output','partially_failed'),('validating_output','failed'),
-('publishing','completed'),('publishing','cancellation_requested'),('publishing','completed_after_cancel'),('publishing','partially_failed'),('publishing','failed');
-
-CREATE TABLE image_generation_slot_transitions (from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
-INSERT INTO image_generation_slot_transitions VALUES
-('planned','queued'),('planned','failed'),('planned','cancelled'),('queued','dispatching'),('queued','failed'),('queued','cancelled'),
-('dispatching','submission_unknown'),('dispatching','running'),('dispatching','downloading'),('dispatching','cancellation_requested'),('dispatching','failed'),('dispatching','cancelled'),
-('submission_unknown','running'),('submission_unknown','downloading'),('submission_unknown','cancellation_requested'),('submission_unknown','failed'),('submission_unknown','cancelled'),
-('running','downloading'),('running','cancellation_requested'),('running','failed'),
-('cancellation_requested','cancelled'),('cancellation_requested','submission_unknown'),('cancellation_requested','downloading'),('cancellation_requested','failed'),
-('downloading','validating'),('downloading','cancellation_requested'),('downloading','failed'),
-('validating','ready_to_publish'),('validating','late_quarantined'),('validating','cancellation_requested'),('validating','failed'),
-('ready_to_publish','published'),('ready_to_publish','late_quarantined'),('ready_to_publish','failed'),
-('late_quarantined','published'),('late_quarantined','discarded');
-
-CREATE TABLE image_generation_attempt_transitions (from_state TEXT NOT NULL,to_state TEXT NOT NULL,PRIMARY KEY(from_state,to_state));
-INSERT INTO image_generation_attempt_transitions VALUES
-('planned','preparing'),('planned','cancelled'),('planned','failed_not_submitted'),('preparing','prepared'),('preparing','cancelled'),('preparing','failed_not_submitted'),('prepared','dispatching'),('prepared','cancelled'),('prepared','failed_not_submitted'),
-('dispatching','accepted'),('dispatching','submission_unknown'),('dispatching','rejected_not_accepted'),('dispatching','cancellation_requested'),('dispatching','failed_not_submitted'),
-('accepted','running'),('accepted','downloading'),('accepted','cancellation_requested'),('accepted','response_adopted'),('accepted','failed_after_acceptance'),
-('submission_unknown','reconciling'),('submission_unknown','cancellation_requested'),
-('reconciling','accepted'),('reconciling','submission_unknown'),('reconciling','rejected_not_accepted'),('reconciling','downloading'),('reconciling','cancellation_requested'),('reconciling','failed_after_acceptance'),
-('running','downloading'),('running','cancellation_requested'),('running','failed_after_acceptance'),
-('downloading','response_adopted'),('downloading','completed_after_cancel'),('downloading','cancellation_requested'),('downloading','failed_after_acceptance'),
-('cancellation_requested','cancelled'),('cancellation_requested','submission_unknown'),('cancellation_requested','reconciling'),('cancellation_requested','accepted'),('cancellation_requested','downloading'),('cancellation_requested','completed_after_cancel'),('cancellation_requested','failed_after_acceptance'),
-('response_adopted','succeeded'),('response_adopted','completed_after_cancel'),('response_adopted','failed_after_acceptance');
-
-CREATE TRIGGER image_generation_job_transition_guard BEFORE UPDATE OF state,version ON image_generation_jobs
-WHEN NEW.version != OLD.version+1 OR (
- NOT EXISTS(SELECT 1 FROM image_generation_job_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
- AND NOT (
-   OLD.state IN ('dispatching','submission_unknown') AND NEW.state='queued' AND EXISTS(
-     SELECT 1 FROM image_generation_slots s
-     JOIN image_generation_attempt_activation_facts f ON f.job_id=s.job_id AND f.slot_id=s.slot_id AND f.activation_reason='authoritative_retry'
-     JOIN image_generation_attempts prior ON prior.job_id=f.job_id AND prior.slot_id=f.slot_id AND prior.attempt_number=f.prior_attempt_number AND prior.state='rejected_not_accepted'
-     JOIN external_journal_operations j ON j.operation_id=prior.external_operation_id AND j.state='rejected'
-     JOIN image_generation_attempt_media_snapshots m ON m.job_id=f.job_id AND m.slot_id=f.slot_id AND m.attempt_number=f.attempt_number
-     WHERE s.job_id=OLD.job_id AND s.state='queued' AND (EXISTS(SELECT 1 FROM image_generation_handoff_evidence e WHERE e.job_id=prior.job_id AND e.slot_id=prior.slot_id AND e.attempt_number=prior.attempt_number AND e.external_operation_id=j.operation_id AND e.outcome='definitively_rejected') OR EXISTS(SELECT 1 FROM image_generation_reconciliation_evidence e WHERE e.job_id=prior.job_id AND e.slot_id=prior.slot_id AND e.attempt_number=prior.attempt_number AND e.outcome='authoritative_nonacceptance'))
-   )
- )
- AND NOT (
-   OLD.terminal_event_version IS NULL
-   AND NEW.terminal_event_version=NEW.version
-   AND EXISTS(
-     SELECT 1 FROM image_generation_terminal_events e
-     WHERE e.job_id=OLD.job_id
-       AND e.job_version=NEW.version
-       AND e.terminal_state=NEW.state
-   )
- )
-)
-BEGIN SELECT RAISE(ABORT,'forbidden image generation job transition'); END;
-CREATE TRIGGER image_generation_slot_transition_guard BEFORE UPDATE OF state,version ON image_generation_slots
-WHEN NEW.version != OLD.version+1 OR (
- (NEW.state != OLD.state AND NOT EXISTS(SELECT 1 FROM image_generation_slot_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
-  AND NOT (OLD.state IN ('dispatching','submission_unknown') AND NEW.state='queued' AND EXISTS(
-    SELECT 1 FROM image_generation_attempt_activation_facts f
-    JOIN image_generation_attempts prior ON prior.job_id=f.job_id AND prior.slot_id=f.slot_id AND prior.attempt_number=f.prior_attempt_number AND prior.state='rejected_not_accepted'
-    JOIN external_journal_operations j ON j.operation_id=prior.external_operation_id AND j.state='rejected'
-    JOIN image_generation_attempt_media_snapshots m ON m.job_id=f.job_id AND m.slot_id=f.slot_id AND m.attempt_number=f.attempt_number
-    WHERE f.job_id=OLD.job_id AND f.slot_id=OLD.slot_id AND f.attempt_number=f.prior_attempt_number+1 AND (EXISTS(SELECT 1 FROM image_generation_handoff_evidence e WHERE e.job_id=prior.job_id AND e.slot_id=prior.slot_id AND e.attempt_number=prior.attempt_number AND e.external_operation_id=j.operation_id AND e.outcome='definitively_rejected') OR EXISTS(SELECT 1 FROM image_generation_reconciliation_evidence e WHERE e.job_id=prior.job_id AND e.slot_id=prior.slot_id AND e.attempt_number=prior.attempt_number AND e.outcome='authoritative_nonacceptance'))
-  ))) OR
- (NEW.state = OLD.state AND NOT (OLD.state='validating' AND OLD.applied_cancellation_version IS NULL AND OLD.result_after_cancel=0 AND NEW.applied_cancellation_version IS NOT NULL AND NEW.result_after_cancel=1))
-)
-BEGIN SELECT RAISE(ABORT,'forbidden image generation slot transition'); END;
-CREATE TRIGGER image_generation_attempt_transition_guard BEFORE UPDATE OF state,version ON image_generation_attempts
-WHEN NEW.version != OLD.version+1 OR NOT EXISTS(SELECT 1 FROM image_generation_attempt_transitions WHERE from_state=OLD.state AND to_state=NEW.state)
-BEGIN SELECT RAISE(ABORT,'forbidden image generation attempt transition'); END;
-CREATE TRIGGER image_generation_attempt_retry_guard BEFORE UPDATE OF state ON image_generation_attempts
-WHEN OLD.state='planned' AND NEW.state='preparing' AND NEW.attempt_number>1 AND NOT EXISTS(
- SELECT 1 FROM image_generation_attempts prior WHERE prior.job_id=NEW.job_id AND prior.slot_id=NEW.slot_id
- AND prior.attempt_number=NEW.attempt_number-1 AND prior.state IN ('failed_not_submitted','rejected_not_accepted'))
-BEGIN SELECT RAISE(ABORT,'image generation retry lacks authoritative nonacceptance'); END;
-CREATE TRIGGER image_generation_attempt_plan_bound_guard BEFORE INSERT ON image_generation_attempts
-WHEN NEW.attempt_number > (SELECT max_attempt_count FROM image_generation_slots WHERE job_id=NEW.job_id AND slot_id=NEW.slot_id)
-BEGIN SELECT RAISE(ABORT,'image generation attempt exceeds sealed plan'); END;
-CREATE TRIGGER image_generation_slot_plan_bound_guard BEFORE INSERT ON image_generation_slots
-WHEN NEW.slot_index >= (SELECT slot_count FROM image_generation_plans WHERE job_id=NEW.job_id)
-BEGIN SELECT RAISE(ABORT,'image generation slot exceeds sealed plan'); END;
-CREATE TRIGGER image_generation_response_adopted_guard AFTER UPDATE OF state ON image_generation_attempts
-WHEN NEW.state='response_adopted' AND (
- NEW.applied_cancellation_version IS NOT NULL OR NEW.response_digest IS NULL OR NOT EXISTS(
-  SELECT 1 FROM external_journal_operations j WHERE j.operation_id=NEW.external_operation_id
-  AND j.state='succeeded' AND j.version=NEW.observed_journal_version)
- OR EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=NEW.job_id))
-BEGIN SELECT RAISE(ABORT,'response-adopted attempt lacks exact uncancelled journal evidence'); END;
-CREATE TRIGGER image_generation_attempt_reconciliation_failure_guard BEFORE UPDATE OF state ON image_generation_attempts
-WHEN OLD.state IN ('submission_unknown','reconciling') AND NEW.state IN ('rejected_not_accepted','failed_after_acceptance') AND NOT EXISTS(
- SELECT 1 FROM image_generation_reconciliation_evidence e WHERE e.job_id=NEW.job_id AND e.slot_id=NEW.slot_id AND e.attempt_number=NEW.attempt_number AND e.journal_version=NEW.observed_journal_version)
-BEGIN SELECT RAISE(ABORT,'attempt failure lacks authoritative reconciliation evidence'); END;
-CREATE TRIGGER image_generation_slot_reconciliation_failure_guard BEFORE UPDATE OF state ON image_generation_slots
-WHEN OLD.state IN ('submission_unknown','cancellation_requested') AND NEW.state='failed' AND NOT EXISTS(
- SELECT 1 FROM image_generation_attempts a JOIN image_generation_reconciliation_evidence e ON e.job_id=a.job_id AND e.slot_id=a.slot_id AND e.attempt_number=a.attempt_number AND e.journal_version=a.observed_journal_version
- WHERE a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id)
-BEGIN SELECT RAISE(ABORT,'slot failure lacks authoritative reconciliation evidence'); END;
-CREATE TRIGGER image_generation_job_reconciliation_failure_guard BEFORE UPDATE OF state ON image_generation_jobs
-WHEN OLD.state='submission_unknown' AND NEW.state='failed' AND NOT EXISTS(
- SELECT 1 FROM image_generation_reconciliation_evidence e WHERE e.job_id=NEW.job_id)
-BEGIN SELECT RAISE(ABORT,'job failure lacks authoritative reconciliation evidence'); END;
-CREATE TRIGGER image_generation_failed_not_submitted_guard BEFORE UPDATE OF state ON image_generation_attempts
-WHEN OLD.state='dispatching' AND NEW.state='failed_not_submitted' AND NEW.nonacceptance_evidence_digest IS NULL
-BEGIN SELECT RAISE(ABORT,'dispatch failure lacks zero-handoff evidence'); END;
-CREATE TRIGGER image_generation_job_cancellation_fact_guard BEFORE UPDATE OF state ON image_generation_jobs
-WHEN NEW.state IN ('cancellation_requested','cancelled','completed_after_cancel') AND NOT EXISTS(
- SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=NEW.job_id)
-BEGIN SELECT RAISE(ABORT,'image generation cancellation projection lacks fact'); END;
-CREATE TRIGGER image_generation_slot_cancellation_fact_guard BEFORE UPDATE OF state ON image_generation_slots
-WHEN NEW.state IN ('cancellation_requested','cancelled','late_quarantined','discarded') AND NOT EXISTS(
- SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=NEW.job_id AND c.cancellation_version=NEW.applied_cancellation_version)
-BEGIN SELECT RAISE(ABORT,'image generation slot cancellation projection lacks fact'); END;
-CREATE TRIGGER image_generation_job_transition_registry_sealed BEFORE INSERT ON image_generation_job_transitions BEGIN SELECT RAISE(ABORT,'image generation transition registry is sealed'); END;
-CREATE TRIGGER image_generation_job_transition_registry_update_sealed BEFORE UPDATE ON image_generation_job_transitions BEGIN SELECT RAISE(ABORT,'image generation transition registry is sealed'); END;
-CREATE TRIGGER image_generation_job_transition_registry_delete_sealed BEFORE DELETE ON image_generation_job_transitions BEGIN SELECT RAISE(ABORT,'image generation transition registry is sealed'); END;
-CREATE TRIGGER image_generation_slot_transition_registry_sealed BEFORE INSERT ON image_generation_slot_transitions BEGIN SELECT RAISE(ABORT,'image generation transition registry is sealed'); END;
-CREATE TRIGGER image_generation_slot_transition_registry_update_sealed BEFORE UPDATE ON image_generation_slot_transitions BEGIN SELECT RAISE(ABORT,'image generation transition registry is sealed'); END;
-CREATE TRIGGER image_generation_slot_transition_registry_delete_sealed BEFORE DELETE ON image_generation_slot_transitions BEGIN SELECT RAISE(ABORT,'image generation transition registry is sealed'); END;
-CREATE TRIGGER image_generation_attempt_transition_registry_sealed BEFORE INSERT ON image_generation_attempt_transitions BEGIN SELECT RAISE(ABORT,'image generation transition registry is sealed'); END;
-CREATE TRIGGER image_generation_attempt_transition_registry_update_sealed BEFORE UPDATE ON image_generation_attempt_transitions BEGIN SELECT RAISE(ABORT,'image generation transition registry is sealed'); END;
-CREATE TRIGGER image_generation_attempt_transition_registry_delete_sealed BEFORE DELETE ON image_generation_attempt_transitions BEGIN SELECT RAISE(ABORT,'image generation transition registry is sealed'); END;
-
-CREATE TRIGGER image_generation_slot_cancellation_vector_insert BEFORE INSERT ON image_generation_slots
-WHEN NEW.applied_cancellation_version IS NOT NULL AND NOT EXISTS(
-  SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=NEW.job_id AND c.cancellation_version=NEW.applied_cancellation_version)
-BEGIN SELECT RAISE(ABORT,'image generation slot cites unknown cancellation'); END;
-CREATE TRIGGER image_generation_slot_cancellation_vector_update BEFORE UPDATE ON image_generation_slots
-WHEN NEW.applied_cancellation_version IS NOT NULL AND NOT EXISTS(
-  SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=NEW.job_id AND c.cancellation_version=NEW.applied_cancellation_version)
-BEGIN SELECT RAISE(ABORT,'image generation slot cites unknown cancellation'); END;
-CREATE TRIGGER image_generation_attempt_cancellation_vector_update BEFORE UPDATE ON image_generation_attempts
-WHEN NEW.applied_cancellation_version IS NOT NULL AND NOT EXISTS(
-  SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=NEW.job_id AND c.cancellation_version=NEW.applied_cancellation_version)
-BEGIN SELECT RAISE(ABORT,'image generation attempt cites unknown cancellation'); END;
-CREATE TRIGGER image_generation_cancelled_attempt_fact_guard AFTER UPDATE OF state ON image_generation_attempts
-WHEN NEW.state='completed_after_cancel' AND NOT EXISTS(
-  SELECT 1 FROM image_generation_cancelled_result_facts f WHERE f.job_id=NEW.job_id AND f.slot_id=NEW.slot_id AND f.attempt_number=NEW.attempt_number AND f.cancellation_version=NEW.applied_cancellation_version)
-BEGIN SELECT RAISE(ABORT,'completed-after-cancel attempt lacks exact fact'); END;
-CREATE TRIGGER image_generation_succeeded_attempt_fact_guard AFTER UPDATE OF state ON image_generation_attempts
-WHEN NEW.state='succeeded' AND (NEW.applied_cancellation_version IS NOT NULL OR NOT EXISTS(
-  SELECT 1 FROM image_generation_publication_right_facts f WHERE f.job_id=NEW.job_id AND f.slot_id=NEW.slot_id AND f.attempt_number=NEW.attempt_number))
-BEGIN SELECT RAISE(ABORT,'succeeded attempt lacks ordinary publication right'); END;
-CREATE TRIGGER image_generation_cancelled_result_ordering_guard BEFORE INSERT ON image_generation_cancelled_result_facts
-WHEN NOT EXISTS(
- SELECT 1 FROM image_generation_attempts a JOIN external_journal_operations j ON j.operation_id=a.external_operation_id
- WHERE a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id AND a.attempt_number=NEW.attempt_number
- AND j.version=NEW.journal_terminal_version
- AND ((NEW.ordering='response_after_cancellation' AND j.state='completed_after_cancel') OR (NEW.ordering='response_adopted_before_cancellation' AND j.state='succeeded')))
-BEGIN SELECT RAISE(ABORT,'cancelled-result ordering lacks journal evidence'); END;
-CREATE TRIGGER image_generation_publication_right_guard BEFORE INSERT ON image_generation_publication_right_facts
-WHEN EXISTS(SELECT 1 FROM image_generation_cancellation_facts c WHERE c.job_id=NEW.job_id)
- OR NOT EXISTS(SELECT 1 FROM image_generation_attempts a JOIN image_generation_slots s ON s.job_id=a.job_id AND s.slot_id=a.slot_id
-   WHERE a.job_id=NEW.job_id AND a.slot_id=NEW.slot_id AND a.attempt_number=NEW.attempt_number
-   AND a.state='response_adopted' AND a.applied_cancellation_version IS NULL AND s.state='ready_to_publish'
-   AND s.version=NEW.slot_version AND s.applied_cancellation_version IS NULL AND s.result_after_cancel=0)
-BEGIN SELECT RAISE(ABORT,'ordinary publication right lost its compare-and-set'); END;
-
-CREATE TRIGGER image_generation_plans_immutable
-BEFORE UPDATE ON image_generation_plans BEGIN
-  SELECT RAISE(ABORT, 'image generation plans are immutable');
-END;
-CREATE TRIGGER image_generation_cancellations_immutable
-BEFORE UPDATE ON image_generation_cancellation_facts BEGIN
-  SELECT RAISE(ABORT, 'image generation cancellation facts are immutable');
-END;
-CREATE TRIGGER image_generation_cancelled_results_immutable
-BEFORE UPDATE ON image_generation_cancelled_result_facts BEGIN
-  SELECT RAISE(ABORT, 'image generation cancelled-result facts are immutable');
-END;
-CREATE TRIGGER image_generation_publication_rights_immutable
-BEFORE UPDATE ON image_generation_publication_right_facts BEGIN
-  SELECT RAISE(ABORT, 'image generation publication-right facts are immutable');
-END;
 
 -- ---- wrap-key secret vault -------------------------------------------------
 -- Coordination + AEAD ciphertext + wrapped DEKs only. KEK bytes and DEK
@@ -7067,7 +6086,7 @@ CREATE TABLE secret_vault_items (
         'redaction_table'
     )),
     item_id       TEXT    NOT NULL,
-    key_version   INTEGER NOT NULL REFERENCES secret_vault_keys(key_version),
+    key_version   INTEGER NOT NULL REFERENCES secret_vault_keys(key_version) ON DELETE RESTRICT ON UPDATE RESTRICT,
     nonce         BLOB    NOT NULL CHECK (length(nonce) = 12),
     ciphertext    BLOB    NOT NULL CHECK (length(ciphertext) >= 16),
     created_at    INTEGER NOT NULL,
@@ -7154,11 +6173,18 @@ CREATE TABLE provider_config_journals (
     project_root     TEXT NOT NULL,
     provider_id      TEXT NOT NULL,
     action           TEXT NOT NULL CHECK (action IN ('save', 'delete', 'batch')),
+    config_path      TEXT,
+    consumed_revision TEXT CHECK (consumed_revision IS NULL OR length(consumed_revision) = 64),
+    intended_revision TEXT CHECK (intended_revision IS NULL OR length(intended_revision) = 64),
+    consumed_config_generation INTEGER CHECK (consumed_config_generation IS NULL OR consumed_config_generation >= 0),
+    intended_config_generation INTEGER CHECK (intended_config_generation IS NULL OR intended_config_generation > 0),
     entry_json       TEXT,
     cleanup_named_json TEXT NOT NULL
         CHECK (json_valid(cleanup_named_json) AND json_type(cleanup_named_json) = 'array'),
     cleanup_credential_json TEXT NOT NULL
         CHECK (json_valid(cleanup_credential_json) AND json_type(cleanup_credential_json) = 'array'),
+    settlement_phase TEXT NOT NULL DEFAULT 'publication_pending'
+        CHECK (settlement_phase IN ('publication_pending', 'cleanup_pending')),
     created_at       INTEGER NOT NULL,
     CHECK (length(trim(journal_id)) > 0),
     CHECK (length(trim(project_root)) > 0),
@@ -7174,7 +6200,15 @@ CREATE TABLE provider_config_journals (
         OR (action = 'batch' AND provider_id = '__provider_batch__'
             AND entry_json IS NOT NULL AND json_valid(entry_json)
             AND json_type(entry_json) = 'object')
-    )
+    ),
+    CHECK (config_path IS NOT NULL
+       AND consumed_revision IS NOT NULL
+       AND intended_revision IS NOT NULL
+       AND consumed_config_generation IS NOT NULL
+       AND intended_config_generation IS NOT NULL),
+    CHECK (consumed_config_generation IS NULL
+       OR intended_config_generation = consumed_config_generation + 1),
+    CHECK (config_path IS NULL OR length(trim(config_path)) > 0)
 );
 CREATE INDEX provider_config_journals_scope
 ON provider_config_journals(project_root, provider_id, created_at);
@@ -7182,7 +6216,9 @@ CREATE UNIQUE INDEX provider_config_journals_operation
 ON provider_config_journals(owner_digest, client_operation_id);
 
 -- Recoverable bridge between the owner vault and the MCP configuration file.
--- `config_json` is reference-only; private bytes remain in vault rows.
+-- `config_json` is the exact authored target recovery image, never a flattened
+-- effective projection. Newly touched credential fields are reference-only;
+-- untouched legacy/unknown fields are preserved byte-semantically.
 CREATE TABLE mcp_config_journals (
     journal_id        TEXT PRIMARY KEY,
     owner_digest      TEXT NOT NULL,
@@ -7193,10 +6229,14 @@ CREATE TABLE mcp_config_journals (
     project_root      TEXT NOT NULL,
     config_path       TEXT NOT NULL,
     config_json       TEXT NOT NULL,
+    patch_intent_json TEXT NOT NULL CHECK (json_valid(patch_intent_json)),
     consumed_revision TEXT NOT NULL CHECK (length(consumed_revision) = 64),
     intended_revision TEXT NOT NULL CHECK (length(intended_revision) = 64),
+    intended_config_generation INTEGER NOT NULL CHECK (intended_config_generation > 0),
     cleanup_names_json TEXT NOT NULL,
     phase             TEXT NOT NULL CHECK (phase IN ('staged', 'published')),
+    settlement_phase  TEXT NOT NULL DEFAULT 'publication_pending'
+        CHECK (settlement_phase IN ('publication_pending', 'cleanup_pending')),
     created_at        INTEGER NOT NULL
 );
 CREATE INDEX mcp_config_journals_scope
@@ -7290,7 +6330,7 @@ CREATE TABLE assistant_mutation_journals (
     PRIMARY KEY (owner_digest, client_operation_id),
     FOREIGN KEY (owner_digest, client_operation_id)
         REFERENCES local_operation_receipts(owner_digest, client_operation_id)
-        ON UPDATE RESTRICT ON DELETE CASCADE,
+        ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK (length(trim(owner_digest)) > 0),
     CHECK (length(trim(client_operation_id)) > 0),
     CHECK (length(trim(requested_project_root)) > 0),
@@ -7425,8 +6465,29 @@ CREATE TABLE agent_editor_leases (
     ),
     completion_handle TEXT,
     completion_operation_id TEXT,
+    publication_phase TEXT NOT NULL DEFAULT 'none' CHECK (
+        publication_phase IN ('none', 'intent', 'published')
+    ),
+    consumed_projection_identity TEXT CHECK (
+        consumed_projection_identity IS NULL OR (
+            length(consumed_projection_identity) = 64 AND
+            consumed_projection_identity NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    intended_projection_identity TEXT CHECK (
+        intended_projection_identity IS NULL OR (
+            length(intended_projection_identity) = 64 AND
+            intended_projection_identity NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
     publication_result_revision TEXT CHECK (
         publication_result_revision IS NULL OR length(trim(publication_result_revision)) > 0
+    ),
+    consumed_config_generation INTEGER CHECK (
+        consumed_config_generation IS NULL OR consumed_config_generation >= 0
+    ),
+    result_config_generation INTEGER CHECK (
+        result_config_generation IS NULL OR result_config_generation >= 0
     ),
     terminal_result_json TEXT CHECK (
         terminal_result_json IS NULL OR json_valid(terminal_result_json)
@@ -7449,6 +6510,14 @@ CREATE TABLE agent_editor_leases (
     CHECK ((state = 'open') = (completion_operation_id IS NULL)),
     CHECK ((state = 'open') = (completion_identity IS NULL)),
     CHECK ((state = 'completing') = (completion_handle IS NOT NULL)),
+    CHECK ((publication_phase = 'none') = (consumed_projection_identity IS NULL)),
+    CHECK ((publication_phase = 'none') = (intended_projection_identity IS NULL)),
+    CHECK (publication_phase = 'none' OR state IN ('completing', 'terminal')),
+    CHECK ((publication_phase = 'published') = (publication_result_revision IS NOT NULL)),
+    CHECK ((consumed_config_generation IS NULL) = (result_config_generation IS NULL)),
+    CHECK (result_config_generation IS NULL OR result_config_generation >= consumed_config_generation),
+    CHECK (publication_phase = 'none' OR consumed_config_generation IS NOT NULL),
+    CHECK (publication_phase <> 'published' OR result_config_generation IS NOT NULL),
     CHECK (publication_result_revision IS NULL OR state IN ('completing', 'terminal')),
     CHECK ((state = 'terminal') = ((terminal_result_json IS NOT NULL) OR (terminal_error_json IS NOT NULL))),
     CHECK (terminal_result_json IS NULL OR terminal_error_json IS NULL),
@@ -7473,6 +6542,13 @@ WHEN NEW.owner_digest <> OLD.owner_digest
   OR (OLD.completion_operation_id IS NOT NULL AND NEW.completion_operation_id IS NOT OLD.completion_operation_id)
   OR (OLD.completion_handle IS NOT NULL AND NEW.completion_handle IS NOT OLD.completion_handle AND NEW.state <> 'terminal')
   OR (OLD.publication_result_revision IS NOT NULL AND NEW.publication_result_revision IS NOT OLD.publication_result_revision)
+  OR (OLD.consumed_config_generation IS NOT NULL AND NEW.consumed_config_generation IS NOT OLD.consumed_config_generation)
+  OR (OLD.result_config_generation IS NOT NULL AND NEW.result_config_generation IS NOT OLD.result_config_generation)
+  OR (OLD.publication_phase = 'none' AND NEW.publication_phase NOT IN ('none', 'intent'))
+  OR (OLD.publication_phase = 'intent' AND NEW.publication_phase NOT IN ('intent', 'published'))
+  OR (OLD.publication_phase = 'published' AND NEW.publication_phase <> 'published')
+  OR (OLD.consumed_projection_identity IS NOT NULL AND NEW.consumed_projection_identity IS NOT OLD.consumed_projection_identity)
+  OR (OLD.intended_projection_identity IS NOT NULL AND NEW.intended_projection_identity IS NOT OLD.intended_projection_identity)
   OR (NEW.snapshot_handle IS NOT OLD.snapshot_handle AND NEW.state NOT IN ('completing', 'terminal'))
   OR NEW.expires_at_unix_ms <> OLD.expires_at_unix_ms
   OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
@@ -7524,12 +6600,13 @@ CREATE TABLE image_config_mutation_journals (
     consumed_revision      TEXT NOT NULL CHECK (length(consumed_revision) = 64 AND consumed_revision = lower(consumed_revision)),
     intended_revision      TEXT NOT NULL CHECK (length(intended_revision) = 64 AND intended_revision = lower(intended_revision)),
     consumed_generation    INTEGER NOT NULL CHECK (consumed_generation >= 0),
+    publication_phase      TEXT NOT NULL CHECK (publication_phase IN ('prepared', 'publication_authorized')),
     terminal_response_json TEXT NOT NULL CHECK (json_valid(terminal_response_json)),
     created_at_unix_ms     INTEGER NOT NULL,
     PRIMARY KEY (owner_digest, client_operation_id),
     FOREIGN KEY (owner_digest, client_operation_id)
         REFERENCES local_operation_receipts(owner_digest, client_operation_id)
-        ON DELETE CASCADE,
+        ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK (length(trim(project_root)) > 0),
     CHECK (length(trim(target_path)) > 0)
 );
@@ -7547,9 +6624,10 @@ WHEN NEW.owner_digest <> OLD.owner_digest
   OR NEW.consumed_revision <> OLD.consumed_revision
   OR NEW.intended_revision <> OLD.intended_revision
   OR NEW.consumed_generation <> OLD.consumed_generation
+  OR (OLD.publication_phase = 'publication_authorized' AND NEW.publication_phase <> OLD.publication_phase)
   OR NEW.created_at_unix_ms <> OLD.created_at_unix_ms
 BEGIN
-    SELECT RAISE(ABORT, 'image config mutation journal is immutable');
+    SELECT RAISE(ABORT, 'image config mutation journal identity is immutable and publication phase is monotonic');
 END;
 
 -- Durable ownership claims for daemon-generated provider/MCP named secrets.
@@ -7603,7 +6681,7 @@ CREATE TABLE agent_installations (
 );
 
 CREATE TABLE installation_observations (
-    installation_id              TEXT PRIMARY KEY REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    installation_id              TEXT PRIMARY KEY REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     observed_digest              TEXT NOT NULL,
     observation_revision         INTEGER NOT NULL CHECK (observation_revision >= 1),
     review_state                  TEXT NOT NULL CHECK (review_state IN ('reviewed', 'rebind_required')),
@@ -7612,7 +6690,7 @@ CREATE TABLE installation_observations (
 
 CREATE TABLE agent_model_bindings (
     binding_id                    TEXT PRIMARY KEY,
-    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     definition_digest             TEXT NOT NULL,
     slot_id                       TEXT NOT NULL,
     provider_profile_handle       TEXT NOT NULL,
@@ -7655,7 +6733,7 @@ CREATE TABLE installation_operations (
 
 CREATE TABLE installation_continuations (
     continuation_token           TEXT PRIMARY KEY,
-    operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE,
+    operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     choice_set_json              TEXT NOT NULL,
     expires_at_unix_ms           INTEGER NOT NULL,
     submitted_choice_id          TEXT,
@@ -7668,7 +6746,7 @@ ON installation_continuations(state, expires_at_unix_ms);
 
 CREATE TABLE installation_journals (
     journal_id                   TEXT PRIMARY KEY,
-    operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE,
+    operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     checkpoint                   TEXT NOT NULL CHECK (checkpoint IN ('staged', 'db_committed', 'file_renamed', 'complete')),
     staged_file_metadata_json    TEXT,
     prior_file_metadata_json     TEXT,
@@ -7680,12 +6758,12 @@ CREATE TABLE installation_journals (
 -- Bind requests get their own receipt because a retry must be distinguished
 -- from a different mutation that happens to choose identical model metadata.
 CREATE TABLE agent_binding_receipts (
-    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     definition_digest             TEXT NOT NULL,
     slot_id                       TEXT NOT NULL,
     idempotency_key               TEXT NOT NULL,
     request_fingerprint           TEXT NOT NULL,
-    binding_id                    TEXT NOT NULL REFERENCES agent_model_bindings(binding_id) ON DELETE RESTRICT,
+    binding_id                    TEXT NOT NULL REFERENCES agent_model_bindings(binding_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     created_at_unix_ms            INTEGER NOT NULL,
     PRIMARY KEY (installation_id, definition_digest, slot_id, idempotency_key)
 );
@@ -7696,8 +6774,8 @@ CREATE TABLE agent_profile_snapshots (
     -- immutable snapshots for delegated children. The preparation receipt
     -- owns root selection; a UNIQUE session_id here would silently force
     -- every child utility decision onto the root binding.
-    session_id                    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    session_id                    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     schema_version                INTEGER NOT NULL CHECK (schema_version >= 1),
     canonical_payload             BLOB NOT NULL,
     canonical_payload_digest      TEXT NOT NULL,
@@ -7709,10 +6787,10 @@ CREATE TABLE agent_profile_snapshots (
 );
 
 CREATE TABLE agent_session_preparations (
-    session_id                    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id                    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     idempotency_key               TEXT NOT NULL,
     request_fingerprint           TEXT NOT NULL,
-    snapshot_id                   TEXT NOT NULL UNIQUE REFERENCES agent_profile_snapshots(snapshot_id) ON DELETE CASCADE,
+    snapshot_id                   TEXT NOT NULL UNIQUE REFERENCES agent_profile_snapshots(snapshot_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     -- This receipt is the module-owned Prepared marker.  A pre-existing
     -- ordinary active session can never acquire a profile snapshot later.
     -- `0` means the caller atomically claimed a pre-registered, idle
@@ -7732,13 +6810,15 @@ CREATE TABLE agent_session_preparations (
 -- the same transaction as its immutable snapshot; an ordinary active session
 -- has no marker and is therefore never silently adopted.
 CREATE TABLE agent_session_preparation_claims (
-    session_id                    TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id                    TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     claim_token                   TEXT NOT NULL UNIQUE,
     claim_state                   TEXT NOT NULL CHECK (claim_state IN ('eligible', 'claimed', 'running', 'terminal')),
     created_at_unix_ms            INTEGER NOT NULL,
     claimed_at_unix_ms            INTEGER,
     terminal_at_unix_ms           INTEGER
 );
+CREATE INDEX idx_agent_session_preparation_claims_recovery
+    ON agent_session_preparation_claims(claim_state, session_id);
 
 -- Once an owner has offered an existing idle session to agent preparation,
 -- ordinary dispatch must not race in work before the preparation claim either

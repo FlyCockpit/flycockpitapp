@@ -18,6 +18,8 @@ mod daemon_state_freshness;
 mod debug;
 #[cfg(unix)]
 mod doctor;
+#[cfg(unix)]
+mod local_offline_acceptance;
 mod mangen;
 #[cfg(unix)]
 mod multi_client_queue;

@@ -6,6 +6,10 @@ rust-version = "1.95"
 license = "Apache-2.0"
 publish = false
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 serde = { workspace = true }
 tiktoken-rs = "0.12"

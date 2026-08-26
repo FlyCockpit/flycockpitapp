@@ -24,8 +24,8 @@
 //!     `cockpit_core::mcp::config::redact_config_for_owner_view`), no
 //!     capability TTL, and no reset-all journal,
 //!   - `SaveMcpConfig` restores redaction sentinels like the daemon (shared
-//!     helper) but has no secret vault: credential literals stay in the
-//!     written `mcp.json` instead of migrating to references,
+//!     helper) but has no secret vault, so credential-bearing mutations fail
+//!     closed,
 //!   - file-identity CAS is reduced to content CAS.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use cockpit_config::extended::ExtendedConfig;
 use cockpit_core::agents::{AgentKind, BUILTIN_AGENT_NAMES};
-use cockpit_core::daemon::proto::{
+use cockpit_proto::{
     AgentEditSnapshot, AgentEditTarget, AgentEditorCompletion, AgentEditorLease,
     AgentEditorSettlementStatus, AgentEntryKind, AgentInventoryEntry, AgentMutation,
     AgentMutationOutcome, AgentMutationResult, AgentSourceLayer, CockpitConfigLayer,
@@ -122,13 +122,22 @@ impl SettingsDaemonEffect for DiskDaemonFake {
             Request::SaveMcpConfig {
                 client_operation_id,
                 project_root,
-                config_json,
+                snapshot_capability,
+                owner_root,
+                config_path,
+                expected_revision,
+                mutation_intent_hash,
+                patch,
                 secret_values_json,
-                ..
             } => save_mcp_config(
                 &client_operation_id,
                 Path::new(&project_root),
-                &config_json,
+                &snapshot_capability,
+                &owner_root,
+                &config_path,
+                &expected_revision,
+                &mutation_intent_hash,
+                &patch,
                 &secret_values_json,
             ),
             Request::GetAgentInventory { project_root } => {
@@ -139,41 +148,40 @@ impl SettingsDaemonEffect for DiskDaemonFake {
                     .map(Response::AgentEditSnapshot)
             }
             Request::MutateAgent {
+                client_operation_id,
+                mutation_intent_hash,
                 project_root,
                 mutation,
                 expected_revision,
-                client_operation_id,
-                mutation_intent_hash,
             } => mutate_agent(
-                Path::new(&project_root),
-                &project_root,
                 client_operation_id,
                 mutation_intent_hash,
+                Path::new(&project_root),
                 mutation,
                 expected_revision,
             )
             .map(Response::AgentMutated),
             Request::BeginAgentEditorLease {
+                client_operation_id,
                 project_root,
                 name,
                 expected_revision,
-                client_operation_id,
             } => begin_editor_lease(
+                client_operation_id,
                 Path::new(&project_root),
                 &name,
                 expected_revision,
-                client_operation_id,
             ),
             Request::CompleteAgentEditorLease {
+                client_operation_id,
                 project_root,
                 lease_id,
                 markdown,
-                client_operation_id,
             } => complete_editor_lease(
+                client_operation_id,
                 Path::new(&project_root),
                 &lease_id,
                 markdown,
-                client_operation_id,
             ),
             // The assistant registry lives in the daemon database, so the disk
             // fake projects an empty registry and refuses every mutation rather
@@ -951,7 +959,7 @@ fn provider_catalog_snapshot(
             let headers = entry
                 .headers
                 .iter()
-                .map(|header| cockpit_core::daemon::proto::ProviderHeaderView {
+                .map(|header| cockpit_proto::ProviderHeaderView {
                     name: header.name.clone(),
                     value: "[redacted]".to_string(),
                     redacted: true,
@@ -962,7 +970,7 @@ fn provider_catalog_snapshot(
             projected.headers.clear();
             (
                 id.clone(),
-                cockpit_core::daemon::proto::ProviderEntryView {
+                cockpit_proto::ProviderEntryView {
                     entry: projected,
                     headers,
                     credential_configured,
@@ -970,6 +978,10 @@ fn provider_catalog_snapshot(
             )
         })
         .collect();
+    let mcp_path = mcp_target_path(root);
+    let _mcp_lock = cockpit_config::config::hold_config_mutation_lock(&mcp_path)
+        .map_err(|error| error.to_string())?;
+    let mcp_raw_revision = mcp_revision(root);
     // Same owner-view redaction the daemon applies, through the shared
     // helper, so /mcp tests exercise the real sentinel round-trip.
     let mcp_config_json = {
@@ -977,17 +989,26 @@ fn provider_catalog_snapshot(
         cockpit_core::mcp::config::redact_config_for_owner_view(&mut config);
         serde_json::to_string(&config).ok()
     };
+    let mcp_authored_config_json = {
+        let mut config = std::fs::read_to_string(&mcp_path)
+            .ok()
+            .and_then(|raw| cockpit_core::mcp::config::McpConfig::parse(&raw).ok())
+            .unwrap_or_default();
+        cockpit_core::mcp::config::redact_config_for_owner_view(&mut config);
+        serde_json::to_string(&config).ok()
+    };
     Ok(Response::ProviderCatalogSnapshot {
-        config: cockpit_core::daemon::proto::ProviderConfigView {
+        config: cockpit_proto::ProviderConfigView {
             providers,
             category_defaults: config.category_defaults.clone(),
             on_unlisted_models_fetch: config.on_unlisted_models_fetch,
             active_model: config.active_model.clone(),
             mcp_config_json,
-            mcp_owner_root: None,
-            mcp_config_path: None,
-            mcp_edit_capability: None,
-            mcp_revision: None,
+            mcp_authored_config_json,
+            mcp_owner_root: Some(root.display().to_string()),
+            mcp_config_path: Some(mcp_path.display().to_string()),
+            mcp_edit_capability: Some(mcp_edit_capability(root, &mcp_path, &mcp_raw_revision)),
+            mcp_revision: Some(mcp_raw_revision.clone()),
             // No TUI surface reads the extended projection from this response;
             // settings loads it through its own layer snapshot instead.
             extended_config_json: None,
@@ -995,56 +1016,263 @@ fn provider_catalog_snapshot(
         snapshot_session_id: snapshot_session_id.to_string(),
         layer_id: mint(b"mcp-layer/v1", &[root.as_os_str().as_encoded_bytes()]),
         owner_root: root.display().to_string(),
-        base_revision: mcp_revision(root),
+        base_revision: mcp_raw_revision,
         config_generation: current_config_generation(),
     })
 }
 
 fn mcp_revision(root: &Path) -> String {
-    let config = cockpit_core::mcp::config::McpConfig::discover(root);
-    serde_json::to_vec(&config)
+    let value: serde_json::Value = std::fs::read_to_string(mcp_target_path(root))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::to_vec(&value)
         .map(|bytes| content_hash(&bytes))
-        .unwrap_or_else(|_| content_hash(b"invalid-mcp-projection"))
+        .unwrap_or_else(|_| content_hash(b"invalid-mcp-layer"))
 }
 
-/// Disk-backed `SaveMcpConfig`. Runs the daemon's sentinel-restore contract
-/// through the shared [`cockpit_core::mcp::config::restore_owner_view_redactions`]
-/// helper, then publishes to the most specific `mcp.json` layer.
+fn mcp_target_path(root: &Path) -> PathBuf {
+    cockpit_config::dirs::mcp_file_paths_for_load(root)
+        .last()
+        .cloned()
+        .unwrap_or_else(|| root.join(".cockpit").join("mcp.json"))
+}
+
+fn mcp_edit_capability(root: &Path, path: &Path, revision: &str) -> String {
+    mint(
+        b"mcp-edit-capability/v1",
+        &[
+            root.as_os_str().as_encoded_bytes(),
+            path.as_os_str().as_encoded_bytes(),
+            revision.as_bytes(),
+        ],
+    )
+}
+
+fn merge_fake_mcp_server_field(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    key: String,
+    value: serde_json::Value,
+) {
+    if key != "auth" {
+        target.insert(key, value);
+        return;
+    }
+    let replacement = value.as_object().cloned();
+    let same_kind = target
+        .get("auth")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|auth| auth.get("kind"))
+        == replacement.as_ref().and_then(|auth| auth.get("kind"));
+    if !same_kind {
+        target.insert(key, value);
+        return;
+    }
+    let Some(replacement) = replacement else {
+        target.insert(key, value);
+        return;
+    };
+    let Some(existing) = target
+        .get_mut("auth")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        target.insert(key, value);
+        return;
+    };
+    for auth_key in [
+        "kind",
+        "header",
+        "value",
+        "credential_ref",
+        "vars",
+        "credential_refs",
+        "authorize_url",
+        "token_url",
+        "client_id",
+        "scopes",
+    ] {
+        if let Some(value) = replacement.get(auth_key) {
+            existing.insert(auth_key.into(), value.clone());
+        } else {
+            existing.remove(auth_key);
+        }
+    }
+}
+
+/// Disk-backed `SaveMcpConfig`. It mirrors the daemon's authored-layer patch
+/// shape and preserves unknown raw JSON, but intentionally has no vault.
 ///
-/// Divergences from production: there is no secret vault, so restored or
-/// staged credential literals stay in the written config instead of migrating
-/// to credential references, and none of the ownership-claim, journal, or
-/// redaction-publication machinery runs.
+/// Divergences from production: there is no secret vault, so staged-secret
+/// mutations fail closed; ownership claims, journaling, and redaction-table
+/// publication are unavailable.
 fn save_mcp_config(
     client_operation_id: &str,
     root: &Path,
-    config_json: &str,
+    snapshot_capability: &str,
+    owner_root: &str,
+    config_path: &str,
+    expected_revision: &str,
+    supplied_mutation_intent_hash: &str,
+    patch_wire: &str,
     secret_values_json: &str,
 ) -> Result<Response, String> {
+    let path = mcp_target_path(root);
+    let expected_path = path.display().to_string();
+    let expected_owner = root.display().to_string();
+    if owner_root != expected_owner
+        || config_path != expected_path
+        || snapshot_capability != mcp_edit_capability(root, &path, expected_revision)
+    {
+        return Err("MCP edit authority does not match the selected raw layer".into());
+    }
+    let mutation_intent_hash =
+        serde_json::to_vec(&("save_mcp_config", root.display().to_string(), patch_wire))
+            .map(|bytes| content_hash(&bytes))
+            .map_err(|error| error.to_string())?;
+    if mutation_intent_hash != supplied_mutation_intent_hash {
+        return Err("MCP mutation intent does not match its typed patch".into());
+    }
+    cockpit_host::private_fs::ensure_parent_dir_private(&path)
+        .map_err(|error| error.to_string())?;
+    let _file_lock = cockpit_config::config::hold_config_mutation_lock(&path)
+        .map_err(|error| error.to_string())?;
     let consumed_revision = mcp_revision(root);
-    let mut config = cockpit_core::mcp::config::McpConfig::parse(config_json)
-        .map_err(|error| format!("invalid MCP config: {error}"))?;
-    let secret_values: BTreeMap<String, String> = serde_json::from_str(secret_values_json)
-        .map_err(|error| format!("invalid MCP secret values: {error}"))?;
-    let prior = cockpit_core::mcp::config::McpConfig::discover(root);
-    let restored = cockpit_core::mcp::config::restore_owner_view_redactions(&mut config, &prior);
-    let path = cockpit_config::dirs::mcp_file_paths_for_load(root)
-        .last()
-        .cloned()
-        .unwrap_or_else(|| root.join(".cockpit").join("mcp.json"));
-    config
-        .write_private(&path)
+    if consumed_revision != expected_revision {
+        return Err("MCP target changed since the authority snapshot".into());
+    }
+    let secret_values: BTreeMap<String, cockpit_proto::SensitiveWirePayload> =
+        serde_json::from_str(secret_values_json)
+            .map_err(|error| format!("invalid MCP secret values: {error}"))?;
+    if !secret_values.is_empty() {
+        return Err("daemonless MCP fallback cannot persist staged secrets".into());
+    }
+    let mut raw: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let prior = cockpit_core::mcp::config::McpConfig::parse(
+        &serde_json::to_string(&raw).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let effective = cockpit_core::mcp::config::McpConfig::discover(root);
+    let servers = raw
+        .as_object_mut()
+        .ok_or("invalid authored MCP document")?
+        .entry("servers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("invalid authored MCP servers")?;
+    let patch: cockpit_proto::McpConfigPatch =
+        serde_json::from_str(patch_wire).map_err(|error| error.to_string())?;
+    let mut touched = BTreeSet::new();
+    for operation in patch.operations {
+        match operation {
+            cockpit_proto::McpConfigPatchOperation::AddServer { name, server_json } => {
+                if effective.servers.contains_key(&name) {
+                    return Err(format!("MCP server `{name}` has the wrong layer ownership"));
+                }
+                touched.insert(name.clone());
+                let server: serde_json::Value = serde_json::from_str(&server_json)
+                    .map_err(|error| format!("invalid MCP server: {error}"))?;
+                servers.insert(name, server);
+            }
+            cockpit_proto::McpConfigPatchOperation::MaterializeInheritedServer {
+                name,
+                server_json,
+            } => {
+                if prior.servers.contains_key(&name) || !effective.servers.contains_key(&name) {
+                    return Err(format!("MCP server `{name}` has the wrong layer ownership"));
+                }
+                if cockpit_core::mcp::config::server_has_credential_material(
+                    &effective.servers[&name],
+                ) {
+                    return Err(format!(
+                        "daemonless MCP fallback cannot materialize credential-bearing server `{name}`"
+                    ));
+                }
+                touched.insert(name.clone());
+                let server: serde_json::Value = serde_json::from_str(&server_json)
+                    .map_err(|error| format!("invalid MCP server: {error}"))?;
+                servers.insert(name, server);
+            }
+            cockpit_proto::McpConfigPatchOperation::UpdateAuthoredServer {
+                name,
+                set_fields_json,
+                unset_fields,
+            } => {
+                if !prior.servers.contains_key(&name) {
+                    return Err(format!("MCP server `{name}` is not authored"));
+                }
+                touched.insert(name.clone());
+                let object = servers
+                    .get_mut(&name)
+                    .and_then(serde_json::Value::as_object_mut)
+                    .ok_or_else(|| format!("MCP server `{name}` is not authored"))?;
+                let fields: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(&set_fields_json).map_err(|error| error.to_string())?;
+                for (key, value) in fields {
+                    merge_fake_mcp_server_field(object, key, value);
+                }
+                for field in unset_fields {
+                    object.remove(&field);
+                }
+            }
+            cockpit_proto::McpConfigPatchOperation::DeleteAuthoredServer { name } => {
+                if !prior.servers.contains_key(&name) {
+                    return Err(format!("MCP server `{name}` is not authored"));
+                }
+                servers.remove(&name);
+            }
+        }
+    }
+    let encoded = serde_json::to_string(&raw).map_err(|error| error.to_string())?;
+    let mut config = cockpit_core::mcp::config::McpConfig::parse(&encoded)
+        .map_err(|error| format!("invalid patched MCP config: {error}"))?;
+    cockpit_core::mcp::config::restore_owner_view_redactions(&mut config, &prior);
+    for name in &touched {
+        let server = config
+            .servers
+            .get(name)
+            .ok_or_else(|| format!("MCP server `{name}` disappeared during validation"))?;
+        if cockpit_core::mcp::config::server_has_credential_material(server) {
+            return Err(format!(
+                "daemonless MCP fallback cannot persist credential-bearing server `{name}`"
+            ));
+        }
+    }
+    let servers = raw
+        .get_mut("servers")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or("invalid authored MCP servers")?;
+    for name in touched {
+        if let Some(server) = config.servers.get(&name) {
+            let normalized = serde_json::to_value(server).map_err(|error| error.to_string())?;
+            let normalized = normalized
+                .as_object()
+                .ok_or("invalid normalized MCP server")?;
+            let raw_server = servers
+                .get_mut(&name)
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or("invalid raw MCP server")?;
+            for (key, value) in normalized {
+                merge_fake_mcp_server_field(raw_server, key.clone(), value.clone());
+            }
+        }
+    }
+    let body = serde_json::to_string_pretty(&raw).map_err(|error| error.to_string())?;
+    if mcp_revision(root) != consumed_revision {
+        return Err("MCP target changed before publication".into());
+    }
+    cockpit_host::private_fs::ensure_parent_dir_private(&path)
+        .map_err(|error| error.to_string())?;
+    cockpit_host::private_fs::write_private_file(&path, format!("{body}\n").as_bytes())
         .map_err(|error| format!("writing mcp.json: {error}"))?;
-    let credential_count = secret_values
-        .keys()
-        .chain(restored.keys())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
+    let credential_count = 0;
     let config_generation = publish_config_generation();
     Ok(Response::McpConfigCommitted {
         client_operation_id: client_operation_id.to_string(),
-        request_hash: content_hash(config_json.as_bytes()),
-        mutation_intent_hash: content_hash(config_json.as_bytes()),
+        request_hash: content_hash(patch_wire.as_bytes()),
+        mutation_intent_hash,
         project_root: root.display().to_string(),
         owner_root: root.display().to_string(),
         config_path: path.display().to_string(),
@@ -1317,8 +1545,8 @@ fn agent_inventory(root: &Path) -> Result<Response, String> {
     Ok(Response::AgentInventory {
         entries,
         inventory_revision,
-        project_root: root.display().to_string(),
-        requested_project_root: root.display().to_string(),
+        project_root: root.to_string_lossy().into_owned(),
+        requested_project_root: root.to_string_lossy().into_owned(),
         config_generation: current_config_generation(),
     })
 }
@@ -1368,13 +1596,13 @@ fn reset_all_builtins(root: &Path) -> Result<u32, String> {
 }
 
 fn mutate_agent(
-    root: &Path,
-    project_root: &str,
     client_operation_id: String,
     mutation_intent_hash: String,
+    root: &Path,
     mutation: AgentMutation,
     expected_revision: Option<String>,
 ) -> Result<AgentMutationResult, String> {
+    let agent_name = cockpit_proto::agent_mutation_name(&mutation).map(str::to_owned);
     let consumed_revision = expected_revision.clone();
     let generation_before = current_config_generation();
     let resets_inventory = matches!(&mutation, AgentMutation::ResetAllBuiltins);
@@ -1548,15 +1776,25 @@ fn mutate_agent(
         .transpose()?;
     let result_revision = snapshot
         .as_ref()
-        .map(|s| s.revision.clone())
+        .map(|snapshot| snapshot.revision.clone())
         .or_else(|| result_inventory_revision.clone())
-        .unwrap_or_else(|| consumed_revision.clone().unwrap_or_default());
+        .unwrap_or_else(|| {
+            content_hash(
+                format!(
+                    "agent-mutation-tombstone:{}:{}:{}",
+                    root.display(),
+                    agent_name.as_deref().unwrap_or("inventory"),
+                    config_generation
+                )
+                .as_bytes(),
+            )
+        });
     Ok(AgentMutationResult {
         client_operation_id,
         mutation_intent_hash,
-        project_root: project_root.to_string(),
-        requested_project_root: project_root.to_string(),
-        owner_scope: root.display().to_string(),
+        project_root: root.to_string_lossy().into_owned(),
+        requested_project_root: root.to_string_lossy().into_owned(),
+        owner_scope: format!("project:{}", root.to_string_lossy()),
         agent_name,
         changed,
         affected,
@@ -1573,10 +1811,10 @@ fn mutate_agent(
 }
 
 fn begin_editor_lease(
+    client_operation_id: String,
     root: &Path,
     name: &str,
     expected_revision: String,
-    client_operation_id: String,
 ) -> Result<Response, String> {
     let snapshot = agent_edit_snapshot(root, name)?;
     ensure_revision(&snapshot.revision, Some(&expected_revision))?;
@@ -1601,10 +1839,10 @@ fn begin_editor_lease(
 }
 
 fn complete_editor_lease(
+    client_operation_id: String,
     root: &Path,
     lease_id: &str,
-    markdown: Option<String>,
-    client_operation_id: String,
+    markdown: Option<cockpit_proto::SensitiveWirePayload>,
 ) -> Result<Response, String> {
     let lease = editor_leases()
         .lock()
@@ -1615,50 +1853,70 @@ fn complete_editor_lease(
     if lease.root != root {
         return Err("editor lease belongs to another workspace".to_string());
     }
-    let project_root = root.display().to_string();
-    let completion = match markdown {
+    // The lease stays reserved until completion reaches a terminal state, so a
+    // failed save leaves the same retryable token in place.
+    let is_save = markdown.is_some();
+    let mut result = match markdown {
         Some(markdown) => {
-            let mutation = AgentMutation::SaveDefinition {
-                name: lease.name.clone(),
-                markdown,
-            };
-            let mutation_intent_hash = cockpit_proto::agent_mutation_intent_hash(
-                &project_root,
-                &mutation,
-                Some(&lease.revision),
-            );
-            let result = mutate_agent(
-                root,
-                &project_root,
+            let mut markdown = markdown.into_zeroizing();
+            mutate_agent(
                 client_operation_id.clone(),
-                mutation_intent_hash,
-                mutation,
-                Some(lease.revision.clone()),
-            )?;
-            AgentEditorCompletion {
-                client_operation_id,
-                project_root,
-                agent_name: lease.name.clone(),
-                lease_id: lease_id.to_string(),
-                consumed_revision: lease.revision.clone(),
-                status: AgentEditorSettlementStatus::Saved {
-                    result_revision: result.result_revision,
-                    outcome: result.outcome,
+                content_hash(format!("editor-save:{lease_id}:{}", lease.name).as_bytes()),
+                root,
+                AgentMutation::SaveDefinition {
+                    name: lease.name.clone(),
+                    markdown: std::mem::take(&mut *markdown),
                 },
+                Some(lease.revision.clone()),
+            )?
+        }
+        None => {
+            let generation = current_config_generation();
+            AgentMutationResult {
+                client_operation_id: client_operation_id.clone(),
+                mutation_intent_hash: content_hash(format!("editor-cancel:{lease_id}").as_bytes()),
+                project_root: root.to_string_lossy().into_owned(),
+                requested_project_root: root.to_string_lossy().into_owned(),
+                owner_scope: format!("project:{}", root.to_string_lossy()),
+                agent_name: Some(lease.name.clone()),
+                changed: false,
+                affected: 0,
+                snapshot: None,
+                consumed_config_generation: generation,
+                result_config_generation: generation,
+                config_generation: generation,
+                inventory_revision: None,
+                consumed_revision: Some(lease.revision.clone()),
+                result_revision: lease.revision.clone(),
+                completed_lease_id: None,
+                outcome: AgentMutationOutcome::Reconciled,
             }
         }
-        None => AgentEditorCompletion {
-            client_operation_id,
-            project_root,
-            agent_name: lease.name.clone(),
-            lease_id: lease_id.to_string(),
-            consumed_revision: lease.revision.clone(),
-            status: AgentEditorSettlementStatus::Cancelled,
-        },
+    };
+    result.completed_lease_id = Some(lease_id.to_string());
+    let consumed_config_generation = result.consumed_config_generation;
+    let result_config_generation = result.result_config_generation;
+    let status = if is_save {
+        AgentEditorSettlementStatus::Saved {
+            result_revision: result.result_revision.clone(),
+            outcome: result.outcome.clone(),
+        }
+    } else {
+        AgentEditorSettlementStatus::Cancelled
     };
     editor_leases()
         .lock()
         .map_err(|_| poisoned("agent editor lease"))?
         .remove(lease_id);
-    Ok(Response::AgentEditorLeaseCompleted(completion))
+    Ok(Response::AgentEditorLeaseCompleted(AgentEditorCompletion {
+        client_operation_id,
+        project_root: root.to_string_lossy().into_owned(),
+        owner_scope: format!("project:{}", root.to_string_lossy()),
+        agent_name: lease.name,
+        lease_id: lease_id.to_string(),
+        consumed_revision: lease.revision,
+        consumed_config_generation: Some(consumed_config_generation),
+        result_config_generation: Some(result_config_generation),
+        status,
+    }))
 }

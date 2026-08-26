@@ -1734,7 +1734,9 @@ fn model_switch_driver() -> (Driver, tempfile::TempDir) {
     // the test driver's grant snapshot so later refresh can extend it with
     // workspace-authored portable children after those files exist.
     let grant = driver.stack[0].agent.vnext_grant.clone();
-    args.vnext_host_policy = grant.as_ref().map(|g| std::sync::Arc::new(g.host_policy.clone()));
+    args.vnext_host_policy = grant
+        .as_ref()
+        .map(|g| std::sync::Arc::new(g.host_policy.clone()));
     let mut agent = crate::engine::builtin::load("Build", &args).unwrap();
     agent.vnext_grant = grant;
     driver.stack[0].agent = Arc::new(agent);

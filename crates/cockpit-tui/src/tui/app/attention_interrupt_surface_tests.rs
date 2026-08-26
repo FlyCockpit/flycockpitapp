@@ -1,8 +1,8 @@
 use super::{App, Overlay, ToastKind};
-use cockpit_core::daemon::proto::{
+use cockpit_core::engine::TurnEvent;
+use cockpit_proto::{
     InterruptOption, InterruptQuestion, InterruptQuestionSet, InterruptRaiseReason,
 };
-use cockpit_core::engine::TurnEvent;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::Instant;
 use uuid::Uuid;

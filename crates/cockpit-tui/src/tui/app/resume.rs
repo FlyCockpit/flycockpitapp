@@ -11,7 +11,7 @@ impl App {
         result: crate::tui::dialog::question::QuestionResult,
     ) {
         use crate::tui::dialog::question::QuestionResult;
-        use cockpit_core::daemon::proto::{Request, ResolveResponse};
+        use cockpit_proto::{Request, ResolveResponse};
         let (interrupt_id, response) = match result {
             QuestionResult::Submit {
                 interrupt_id,
@@ -32,9 +32,7 @@ impl App {
                     AsyncActionPolicy::AllowConcurrent,
                     async move {
                         match binding.request(request).await? {
-                            cockpit_core::daemon::proto::Response::Ack => {
-                                Ok(AsyncActionPayload::Unit)
-                            }
+                            cockpit_proto::Response::Ack => Ok(AsyncActionPayload::Unit),
                             other => {
                                 Err(format!("unexpected resolve-interrupt response: {other:?}"))
                             }
@@ -89,7 +87,7 @@ impl App {
         self.pending_prune_confirm = false;
         self.send_daemon_request(
             "/prune",
-            cockpit_core::daemon::proto::Request::Prune,
+            cockpit_proto::Request::Prune,
             ControlApplied::None,
         );
     }
@@ -102,7 +100,7 @@ impl App {
 
     /// `/compact`: enqueue an in-place compaction turn on the active session.
     pub(super) fn start_compact(&mut self) {
-        let submission = cockpit_core::engine::message::UserSubmission::compact_notice();
+        let submission = ClientUserSubmission::compact_notice();
         if !matches!(self.agent_runner, Some(Ok(_))) {
             self.start_runner_attach(true, RunnerAttachContinuation::Compact);
             self.push_plain("/compact: connecting".to_string());
@@ -211,14 +209,12 @@ impl App {
     pub(super) fn maybe_prompt_paused_work(
         &mut self,
         session_id: uuid::Uuid,
-        paused_work: Vec<cockpit_core::daemon::proto::PausedWorkSummary>,
+        paused_work: Vec<cockpit_proto::PausedWorkSummary>,
     ) {
         if paused_work.is_empty() {
             return;
         }
-        use cockpit_core::daemon::proto::{
-            InterruptOption, InterruptQuestion, InterruptQuestionSet,
-        };
+        use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
         let pending_tools: i64 = paused_work.iter().map(|item| item.pending_tool_count).sum();
         let agents = paused_work
             .iter()
@@ -274,13 +270,8 @@ impl App {
         );
     }
 
-    pub(super) fn maybe_prompt_resume_repair(
-        &mut self,
-        state: cockpit_core::daemon::proto::ResumeRepairState,
-    ) {
-        use cockpit_core::daemon::proto::{
-            InterruptOption, InterruptQuestion, InterruptQuestionSet,
-        };
+    pub(super) fn maybe_prompt_resume_repair(&mut self, state: cockpit_proto::ResumeRepairState) {
+        use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
         let ids = if state.failing_tool_call_ids.is_empty() {
             "unknown tool id".to_string()
         } else {
@@ -370,8 +361,12 @@ impl App {
                     });
                     return;
                 };
-                let (parent_session_id, socket) = match self.agent_runner.as_ref() {
-                    Some(Ok(runner)) => (runner.session_id(), runner.socket.clone()),
+                let (parent_session_id, endpoint, socket) = match self.agent_runner.as_ref() {
+                    Some(Ok(runner)) => (
+                        runner.session_id(),
+                        runner.endpoint.clone(),
+                        runner.socket.clone(),
+                    ),
                     _ => {
                         self.history.push(HistoryEntry::CommandError {
                             line: "/resume: no active session to fork from".to_string(),
@@ -385,13 +380,14 @@ impl App {
                     move || {
                         let fork_point_turn_id = Some(seq.to_string());
                         let (session_id, short_id) = agent_runner::fork_session_blocking(
-                            &socket,
+                            &endpoint,
                             parent_session_id,
                             fork_point_turn_id,
                             false,
                         )?;
                         Ok(AsyncActionPayload::ForkCreated {
                             parent_session_id,
+                            endpoint,
                             socket,
                             session_id,
                             short_id,
@@ -415,7 +411,7 @@ impl App {
                 self.push_plain("/resume: applying explicit synthetic repair.".to_string());
                 self.send_daemon_request(
                     "/resume",
-                    cockpit_core::daemon::proto::Request::RepairResume {
+                    cockpit_proto::Request::RepairResume {
                         session_id: pending.state.session_id,
                     },
                     ControlApplied::RepairResume,
@@ -448,12 +444,12 @@ impl App {
         daemon_version: &str,
         compatible: bool,
     ) {
-        if compatible || daemon_version == cockpit_core::daemon::proto::DAEMON_VERSION {
+        if compatible || daemon_version == cockpit_proto::DAEMON_VERSION {
             return;
         }
         self.push_plain(format!(
             "daemon {daemon_version} is newer than this client {}; relaunch cockpit to refresh",
-            cockpit_core::daemon::proto::DAEMON_VERSION
+            cockpit_proto::DAEMON_VERSION
         ));
     }
 }

@@ -1959,7 +1959,7 @@ pub(super) fn tandem_choice_usage(
     choice: Vec<AssistantContent>,
     usage: rig::completion::Usage,
 ) -> (Vec<AssistantContent>, Option<TokenUsage>) {
-    let usage = Some(TokenUsage::from(usage)).filter(|u| !u.is_empty());
+    let usage = Some(crate::tokens::token_usage_from_rig(usage)).filter(|u| !u.is_empty());
     (choice, usage)
 }
 
@@ -2159,7 +2159,7 @@ where
     .await?;
     // rig requests `stream_options.include_usage = true` on every stream;
     // providers that omit it now surface as an empty default usage value.
-    let usage = TokenUsage::from(stream.usage());
+    let usage = crate::tokens::token_usage_from_rig(stream.usage());
     let usage = (!usage.is_empty()).then_some(usage);
     Ok((stream.message_id.clone(), stream.choice.clone(), usage))
 }

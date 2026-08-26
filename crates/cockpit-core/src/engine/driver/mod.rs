@@ -1125,7 +1125,7 @@ pub struct Driver {
     goal_usage_limit_auto_resume_attempts: u8,
     goal_supervision_round: Option<GoalSupervisionRound>,
     goal_root_turn: Option<(uuid::Uuid, i64, uuid::Uuid)>,
-    goal_scratch: Option<crate::goal_scratch::GoalScratchRoot>,
+    goal_scratch: Option<cockpit_host::goal_scratch::GoalScratchRoot>,
     pending_idle_reason: Option<crate::engine::IdleReason>,
     /// Interrupt wakeup hub (GOALS §3b) threaded into every tool call so
     /// the `question` tool can block on a human answer. Defaults to a
@@ -5364,7 +5364,9 @@ impl Driver {
         }
         let cfg = self.goal_supervision_config_for(goal)?;
         if self.goal_scratch.is_none() {
-            self.goal_scratch = Some(crate::goal_scratch::GoalScratchRoot::create(goal.id)?);
+            self.goal_scratch = Some(cockpit_host::goal_scratch::GoalScratchRoot::create(
+                goal.id,
+            )?);
         }
         // Validate every role directory before leasing durable work. Once a row
         // is leased, no fallible filesystem setup may orphan it outside a round.

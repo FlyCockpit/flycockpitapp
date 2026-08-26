@@ -4,7 +4,7 @@
 //! nearest project-local `.cockpit/mcp.json`; `list`/`test` read the
 //! discovered config for the cwd.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
 
@@ -89,7 +89,7 @@ async fn add(args: McpAddArgs) -> Result<()> {
     if returned_snapshot_id != snapshot_session_id {
         bail!("daemon returned a mismatched MCP authority snapshot");
     }
-    let mut cfg = McpConfig::parse(
+    let cfg = McpConfig::parse(
         config
             .mcp_config_json
             .as_deref()
@@ -116,7 +116,7 @@ async fn add(args: McpAddArgs) -> Result<()> {
         );
     }
 
-    let server = ServerConfig {
+    let mut server = ServerConfig {
         transport,
         endpoint: args.endpoint.clone(),
         command: args.command.clone(),
@@ -145,31 +145,37 @@ async fn add(args: McpAddArgs) -> Result<()> {
     // key. The daemon `SaveMcpConfig` path normalizes the literal to a
     // reference. OAuth/env/none carry no literal secret at add time.
     let mut secret_values: BTreeMap<String, String> = BTreeMap::new();
-    if let Auth::Header(header) = &server.auth {
+    if let Auth::Header(header) = &mut server.auth {
         let value = header.value.trim();
         if !value.is_empty() {
-            secret_values.insert(
-                crate::mcp::auth::header_cred_key(&args.name),
-                value.to_string(),
-            );
+            let key = crate::mcp::auth::header_cred_key(&args.name);
+            secret_values.insert(key.clone(), value.to_string());
+            header.value.clear();
+            header.credential_ref = Some(key);
         }
     }
-
-    cfg.servers.insert(args.name.clone(), server);
 
     // Route through the owner-remoted daemon RPC so the write inherits the
     // atomic cross-kind ownership guard: `mcp add --auth oauth --name victim`
     // cannot publish/consume an `mcp:victim` token owned by another kind or
     // workspace. The daemon derives its own write target and cleanup set from
-    // `project_root`; `cleanup_names_json` is advisory and ignored server-side.
-    let config_json = serde_json::to_string(&cfg).context("serializing MCP config")?;
+    // `project_root`; cleanup is derived from the daemon's raw target layer.
+    let patch = cockpit_proto::McpConfigPatch {
+        operations: vec![cockpit_proto::McpConfigPatchOperation::AddServer {
+            name: args.name.clone(),
+            server_json: serde_json::to_string(&server)
+                .context("serializing MCP server")?
+                .into(),
+        }],
+    };
     let secret_values_json =
         serde_json::to_string(&secret_values).context("serializing MCP secret values")?;
-    let cleanup_names_json = serde_json::to_string(&BTreeSet::<String>::new())
-        .context("serializing MCP cleanup names")?;
+    for value in secret_values.values_mut() {
+        zeroize::Zeroize::zeroize(value);
+    }
     let client_operation_id = uuid::Uuid::new_v4().to_string();
-    let mutation_intent_hash =
-        cockpit_proto::mcp_mutation_intent_hash(&project_root, &config_json, &cleanup_names_json);
+    let patch_wire = serde_json::to_string(&patch).context("serializing MCP patch")?;
+    let mutation_intent_hash = cockpit_proto::mcp_mutation_intent_hash(&project_root, &patch_wire);
     match daemon
         .client
         .request(Request::SaveMcpConfig {
@@ -180,9 +186,8 @@ async fn add(args: McpAddArgs) -> Result<()> {
             config_path: config_path.clone(),
             expected_revision: expected_revision.clone(),
             mutation_intent_hash: mutation_intent_hash.clone(),
-            config_json,
-            secret_values_json: secret_values_json.into(),
-            cleanup_names_json,
+            patch: cockpit_proto::SensitiveWirePayload::new(patch_wire),
+            secret_values_json: cockpit_proto::SensitiveWirePayload::new(secret_values_json),
         })
         .await?
     {

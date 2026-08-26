@@ -1,5 +1,22 @@
 use super::*;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageIngressAdmissionReceiptV1 {
+    pub schema_version: u8,
+    pub kind: String,
+    pub admission_id: Uuid,
+    pub session_id: Uuid,
+    pub image_ref: ImageAttachmentRef,
+    pub attachment_version: u64,
+    pub availability_generation: u64,
+    pub reservation_id: String,
+    pub normalized_sha256: String,
+    pub normalized_byte_length: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
 // ---- Responses -------------------------------------------------------------
 
 /// Daemon → client RPC responses. Each variant is the typed answer to
@@ -16,6 +33,8 @@ pub enum Response {
     MediaOwnerRecovery(cockpit_db::media_attachments::LocalMediaOwnerReceiptV1),
 
     LocalPathMediaRegistration(cockpit_db::media_attachments::LocalPathRegistrationReceiptV1),
+
+    ImageIngressAdmitted(ImageIngressAdmissionReceiptV1),
 
     RetainedHttpsMedia(cockpit_db::media_attachments::RetainedHttpsMediaReceiptV1),
 
@@ -814,11 +833,13 @@ pub enum Response {
         provider_count: u32,
     },
 
+    #[cfg(feature = "extended")]
     ImageSpendPolicy {
         settings: Option<cockpit_config::config::image_spend::ImageSpendSettings>,
         policy_version: Option<u64>,
     },
 
+    #[cfg(feature = "extended")]
     ImageSpendPolicySaved {
         client_operation_id: String,
         project_key: String,
@@ -845,6 +866,24 @@ pub enum Response {
     GitDiffFile {
         diff: String,
         truncated: bool,
+    },
+
+    GitDiff {
+        source: crate::GitReadSource,
+        diff: String,
+        truncated: bool,
+    },
+
+    GitReviewSources {
+        sources: Vec<crate::GitReviewSourceResult>,
+    },
+
+    GitRepoStatus {
+        status: Option<crate::RepoStatus>,
+    },
+
+    WorktreeRoot {
+        root: Option<String>,
     },
 
     TerminalOpened {
@@ -1307,6 +1346,7 @@ macro_rules! response_variants {
             (Response::Ack, "ack");
             (Response::MediaOwnerRecovery(..), "media_owner_recovery");
             (Response::LocalPathMediaRegistration(..), "local_path_media_registration");
+            (Response::ImageIngressAdmitted(..), "image_ingress_admitted");
             (Response::RetainedHttpsMedia(..), "retained_https_media");
             (Response::MediaAttachmentStatus(..), "media_attachment_status");
             (Response::MediaAttachmentPreview(..), "media_attachment_preview");
@@ -1432,12 +1472,18 @@ macro_rules! response_variants {
             (Response::SetupWizardApplied { .. }, "setup_wizard_applied");
             (Response::PolicyExported { .. }, "policy_exported");
             (Response::PolicyImported { .. }, "policy_imported");
+            #[cfg(feature = "extended")]
             (Response::ImageSpendPolicy { .. }, "image_spend_policy");
+            #[cfg(feature = "extended")]
             (Response::ImageSpendPolicySaved { .. }, "image_spend_policy_saved");
             (Response::ImageControlRead(..), "image_control_read");
             (Response::ImageControlMutated(..), "image_control_mutated");
             (Response::GitStatus { .. }, "git_status");
             (Response::GitDiffFile { .. }, "git_diff_file");
+            (Response::GitDiff { .. }, "git_diff");
+            (Response::GitReviewSources { .. }, "git_review_sources");
+            (Response::GitRepoStatus { .. }, "git_repo_status");
+            (Response::WorktreeRoot { .. }, "worktree_root");
             (Response::TerminalOpened { .. }, "terminal_opened");
             (Response::LspControlResult { .. }, "lsp_control_result");
             (Response::DaemonStatus { .. }, "daemon_status");

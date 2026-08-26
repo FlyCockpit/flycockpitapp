@@ -204,7 +204,7 @@ pub(crate) struct GoalSettingsEffect {
     pub(crate) agent_name: String,
     pub(crate) project_root: String,
     pub(crate) expected_revision: Option<String>,
-    pub(crate) request: cockpit_core::daemon::proto::Request,
+    pub(crate) request: cockpit_proto::Request,
 }
 
 #[derive(Debug)]
@@ -221,8 +221,8 @@ enum GoalSettingsPending {
         agent_name: String,
         project_root: String,
         expected_revision: String,
-        mutation: cockpit_core::daemon::proto::AgentMutation,
-        patch: cockpit_core::daemon::proto::GoalSupervisionPatch,
+        mutation: cockpit_proto::AgentMutation,
+        patch: cockpit_proto::GoalSupervisionPatch,
         prior_goal_json: Option<String>,
         override_json: Option<String>,
         querying: bool,
@@ -246,14 +246,20 @@ pub(crate) struct GoalSettingsCompletion {
     pub(crate) agent_name: String,
     pub(crate) project_root: String,
     pub(crate) expected_revision: Option<String>,
-    pub(crate) response: Result<cockpit_core::daemon::proto::Response, String>,
+    pub(crate) response: Result<cockpit_proto::Response, String>,
 }
 
 impl GoalSettingsPane {
+    /// A save owns durable agent authority until its exact receipt is known.
+    /// The initial snapshot load is deliberately excluded: it is read-only.
+    pub(crate) fn has_unsettled_local_authority(&self) -> bool {
+        matches!(self.in_flight, Some(GoalSettingsPending::SaveAgent { .. }))
+    }
+
     pub(crate) fn open(cwd: &Path, agent_name: &str, root_foreground: bool) -> Result<Self> {
         let operation_id = uuid::Uuid::new_v4();
         let project_root = cwd.to_string_lossy().into_owned();
-        let request = cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+        let request = cockpit_proto::Request::GetAgentEditSnapshot {
             project_root: project_root.clone(),
             name: agent_name.to_string(),
         };
@@ -300,8 +306,8 @@ impl GoalSettingsPane {
         agent_name: String,
         project_root: String,
         expected_revision: String,
-        mutation: cockpit_core::daemon::proto::AgentMutation,
-        patch: cockpit_core::daemon::proto::GoalSupervisionPatch,
+        mutation: cockpit_proto::AgentMutation,
+        patch: cockpit_proto::GoalSupervisionPatch,
         prior_goal_json: Option<String>,
         override_json: Option<String>,
         schedule_query: bool,
@@ -318,7 +324,7 @@ impl GoalSettingsPane {
                 agent_name: agent_name.clone(),
                 project_root: project_root.clone(),
                 expected_revision: Some(expected_revision.clone()),
-                request: cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                request: cockpit_proto::Request::GetLocalOperationSettlement {
                     client_operation_id: client_operation_id.clone(),
                 },
             });
@@ -362,7 +368,7 @@ impl GoalSettingsPane {
             agent_name: agent_name.clone(),
             project_root: project_root.clone(),
             expected_revision: Some(expected_revision.clone()),
-            request: cockpit_core::daemon::proto::Request::MutateAgent {
+            request: cockpit_proto::Request::MutateAgent {
                 client_operation_id: client_operation_id.clone(),
                 mutation_intent_hash: mutation_intent_hash.clone(),
                 project_root: project_root.clone(),
@@ -441,9 +447,7 @@ impl GoalSettingsPane {
                     return None;
                 }
                 let loaded = completion.response.and_then(|response| {
-                    let cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) =
-                        response
-                    else {
+                    let cockpit_proto::Response::AgentEditSnapshot(snapshot) = response else {
                         return Err("daemon returned an unexpected agent snapshot".to_string());
                     };
                     super::settings::agents_page::validate_agent_snapshot(
@@ -528,7 +532,10 @@ impl GoalSettingsPane {
                             Some(&expected_revision),
                             None,
                         )?;
-                        if let cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded { warning } = &result.outcome {
+                        if let cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                            warning,
+                        } = &result.outcome
+                        {
                             let original = override_json
                                 .as_deref()
                                 .map(serde_json::from_str::<serde_json::Value>)
@@ -823,7 +830,7 @@ impl GoalSettingsPane {
             } else {
                 Some(serde_json::to_string(&self.draft.original)?)
             };
-            let goal_patch = cockpit_core::daemon::proto::GoalSupervisionPatch {
+            let goal_patch = cockpit_proto::GoalSupervisionPatch {
                 cold_skeptic_count: Some(self.draft.cold_skeptic_count),
                 cold_skeptic_model: Some(
                     self.draft
@@ -835,7 +842,7 @@ impl GoalSettingsPane {
                 ),
                 max_verification_attempts: Some(self.draft.max_verification_attempts),
             };
-            let mutation = cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision {
+            let mutation = cockpit_proto::AgentMutation::SaveGoalSupervision {
                 name: self.agent_name.clone(),
                 patch: goal_patch.clone(),
             };
@@ -855,7 +862,7 @@ impl GoalSettingsPane {
                 agent_name: self.agent_name.clone(),
                 project_root: project_root.clone(),
                 expected_revision: Some(expected_revision.clone()),
-                request: cockpit_core::daemon::proto::Request::MutateAgent {
+                request: cockpit_proto::Request::MutateAgent {
                     client_operation_id: client_operation_id.clone(),
                     mutation_intent_hash: mutation_intent_hash.clone(),
                     project_root: project_root.clone(),

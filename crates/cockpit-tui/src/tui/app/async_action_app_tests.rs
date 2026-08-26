@@ -94,7 +94,7 @@ fn attach_coalescing_retains_typed_model_and_btw_continuations() {
         "/model",
         active.clone(),
         false,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+        cockpit_proto::ActiveModelSwitchTrigger::Picker,
     ));
     app.start_runner_attach(
         true,
@@ -368,6 +368,9 @@ async fn stale_fork_result_is_ignored_after_context_changes() {
         async {
             Ok(AsyncActionPayload::ForkCreated {
                 parent_session_id: uuid::Uuid::new_v4(),
+                endpoint: cockpit_client::ClientEndpoint::Wire(std::path::PathBuf::from(
+                    "/tmp/missing.sock",
+                )),
                 socket: std::path::PathBuf::from("/tmp/missing.sock"),
                 session_id: uuid::Uuid::new_v4(),
                 short_id: "fork01".to_string(),

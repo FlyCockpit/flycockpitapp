@@ -27,6 +27,148 @@ pub enum AsyncActionKind {
     Blocking(&'static str),
     Refresh(&'static str),
     Internal(&'static str),
+    NotesProjection {
+        instance_id: u64,
+        generation: u64,
+    },
+}
+
+/// Process-exit disposition for an asynchronous action.
+///
+/// This classification belongs to the action type, rather than to an App
+/// screen, so every exit route observes the same authority boundary. Unknown
+/// blocking, daemon, and internal actions fail closed: a newly introduced
+/// action must be deliberately classified as read-only before it can be
+/// abandoned during process exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncActionAuthority {
+    /// A projection or cancellable computation that cannot have committed a
+    /// durable or host-visible side effect.
+    ReadOnly,
+    /// A durable daemon mutation whose correlated terminal receipt is needed.
+    DurableMutation,
+    /// A host-side publication or external process interaction.
+    HostMutation,
+    /// Session/runner lifecycle authority that must be reconciled.
+    SessionLifecycle,
+    /// An unclassified action. This is deliberately authority-owning.
+    Unclassified,
+}
+
+impl AsyncActionAuthority {
+    pub const fn owns_local_authority(self) -> bool {
+        !matches!(self, Self::ReadOnly)
+    }
+}
+
+impl AsyncActionKind {
+    /// Return the authoritative process-exit classification for this action.
+    ///
+    /// Keep the string inventory here exhaustive for production labels. The
+    /// conservative fallback means an omitted/new label cannot silently punch
+    /// through the global exit fence.
+    pub fn authority(&self) -> AsyncActionAuthority {
+        use AsyncActionAuthority::{
+            DurableMutation, HostMutation, ReadOnly, SessionLifecycle, Unclassified,
+        };
+
+        match self {
+            Self::NotesProjection { .. } => DurableMutation,
+            Self::Refresh(_) => ReadOnly,
+            Self::Blocking(label) => match *label {
+                "autocomplete.files"
+                | "doctor.snapshot"
+                | "settings.path-suggest"
+                | "thread-check" => ReadOnly,
+                "btw.teardown"
+                | "paste.delivery_receipt"
+                | "queue.edit"
+                | "settings.blocking-effect" => DurableMutation,
+                "copy.file" | "curator.command" | "export.debug" | "export.transcript"
+                | "local.command" | "mouse.copy" => HostMutation,
+                // `blocking-create` is a test-only unknown-action fixture. It
+                // remains fenced, exactly like a newly added production label.
+                _ => Unclassified,
+            },
+            Self::DaemonRpc(label) => match *label {
+                "guidance.estimate"
+                | "git.diff"
+                | "git.review_sources"
+                | "history.page"
+                | "inventory.bundle"
+                | "leaks-list"
+                | "resources.snapshot"
+                | "sessions.list"
+                | "sessions.live"
+                | "sessions.preview"
+                | "skills.list"
+                | "subagent.history.page" => ReadOnly,
+                "assistant.resolve"
+                | "btw.resolve-interrupt"
+                | "fork.create"
+                | "side.discard"
+                | "side.start" => SessionLifecycle,
+                "goal.clear"
+                | "goal.create"
+                | "goal.disposition"
+                | "goal.set"
+                | "goal-settings.effect"
+                | "leaks"
+                | "leaks-delete"
+                | "leaks-rotate"
+                | "mcp.local"
+                | "note"
+                | "paste.image_path_admission"
+                | "paste.image_ingress_discard"
+                | "rename"
+                | "resources.promote"
+                | "sealed"
+                | "sealed.effect"
+                | "sessions.mutation"
+                | "settings.effect"
+                | "subagent.steer"
+                | "tools.effect"
+                | "workspace-trust.effect" => DurableMutation,
+                _ => Unclassified,
+            },
+            Self::Internal(label) => match *label {
+                "app-drop"
+                | "complete"
+                | "paste.deadline"
+                | "paste.native_image"
+                | "paste.reducer_progress"
+                | "paste.test_probe"
+                | "paste.token_count"
+                | "pending"
+                | "pins.review"
+                | "shutdown"
+                | "startup.dependencies"
+                | "startup.guidance.estimate"
+                | "startup.remote_disclosures"
+                | "subagent.history" => ReadOnly,
+                "btw.runner.attach"
+                | "runner.attach"
+                | "session.fork"
+                | "session.resume"
+                | "session.side"
+                | "session.side.return"
+                | "session.switch" => SessionLifecycle,
+                "leaks.rpc"
+                | "oauth.acknowledge"
+                | "oauth.cancel"
+                | "oauth.codex.begin"
+                | "oauth.codex.poll"
+                | "oauth.grok.begin"
+                | "oauth.grok.complete"
+                | "pins.pin"
+                | "pins.toggle"
+                | "pins.unpin"
+                | "rename.auto" => DurableMutation,
+                "oauth.host.present" => HostMutation,
+                _ => Unclassified,
+            },
+        }
+    }
 }
 
 /// Classified auto-copy delivery. Never carries plaintext or OS error detail.
@@ -59,28 +201,33 @@ pub enum AsyncActionPayload {
     Text(String),
     Bool(bool),
     #[allow(dead_code)]
-    DaemonResponse(Box<cockpit_core::daemon::proto::Response>),
-    Sessions(Vec<cockpit_core::daemon::proto::SessionSummary>),
+    DaemonResponse(Box<cockpit_proto::Response>),
+    Sessions(Vec<cockpit_proto::SessionSummary>),
     SessionsMutation(crate::tui::sessions_pane::SessionsMutationCompletion),
     SessionMessages {
         session_id: uuid::Uuid,
         before_seq: Option<i64>,
-        messages: Vec<cockpit_core::daemon::proto::SessionMessage>,
+        messages: Vec<cockpit_proto::SessionMessage>,
         has_more: bool,
     },
     ClientSubmissionReceipt {
         client_submission_id: uuid::Uuid,
-        result: Result<cockpit_core::daemon::proto::ClientSubmissionReceiptStatus, String>,
+        result: Result<cockpit_proto::ClientSubmissionReceiptStatus, String>,
     },
     SessionLiveStatus(std::collections::HashMap<uuid::Uuid, (bool, bool)>),
-    ResourceSnapshot(cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot),
+    ResourceSnapshot {
+        pane_generation: u64,
+        result: Result<cockpit_proto::ResourceSchedulerSnapshot, String>,
+    },
     PromoteResource {
-        status: cockpit_core::daemon::proto::ResourcePromoteStatus,
+        pane_generation: Option<u64>,
+        status: cockpit_proto::ResourcePromoteStatus,
         message: String,
-        snapshot: cockpit_core::engine::resource_scheduler::ResourceSchedulerSnapshot,
+        snapshot: cockpit_proto::ResourceSchedulerSnapshot,
     },
     ForkCreated {
         parent_session_id: uuid::Uuid,
+        endpoint: cockpit_client::ClientEndpoint,
         socket: std::path::PathBuf,
         session_id: uuid::Uuid,
         short_id: String,
@@ -90,7 +237,7 @@ pub enum AsyncActionPayload {
     NoteRecorded {
         text: String,
     },
-    DelegationSteer(cockpit_core::daemon::proto::DelegationSteerResult),
+    DelegationSteer(cockpit_proto::DelegationSteerResult),
     GuidanceEstimate(crate::tui::agent_runner::GuidanceEstimate),
     StartupGuidanceEstimate {
         cwd: std::path::PathBuf,
@@ -109,7 +256,7 @@ pub enum AsyncActionPayload {
         side_short_id: String,
     },
     SideSessionReturned(Box<crate::tui::agent_runner::SessionSwitchOutcome>),
-    ContainerAvailability(cockpit_core::container::ContainerAvailability),
+    ContainerAvailability(cockpit_proto::ContainerAvailability),
     #[cfg(feature = "remote")]
     RemoteDisclosures {
         project_root: String,
@@ -118,14 +265,16 @@ pub enum AsyncActionPayload {
         launch_session_id: Option<uuid::Uuid>,
         session_id: Option<uuid::Uuid>,
         attachment_epoch: Option<u64>,
-        org: Option<cockpit_core::daemon::proto::OrgSyncDisclosure>,
-        connector: Option<cockpit_core::daemon::proto::ConnectorDisclosure>,
+        org: Option<cockpit_proto::OrgSyncDisclosure>,
+        connector: Option<cockpit_proto::ConnectorDisclosure>,
     },
     AssistantSessionResolved {
         session_id: uuid::Uuid,
         source_session_id: Option<uuid::Uuid>,
     },
     StatsRollup(crate::tui::stats_pane::StatsPaneFetchResult),
+    GitDiff(crate::tui::diff_pane::DiffPaneFetchResult),
+    GitReviewSources(crate::tui::multireview_dialog::GitReviewSourcesCompletion),
     SubagentHistory {
         session_id: uuid::Uuid,
         task_call_id: String,
@@ -162,9 +311,12 @@ pub enum AsyncActionPayload {
         label: String,
         message: String,
     },
-    ProviderUsage(Vec<cockpit_core::providers::usage::ProviderUsageSnapshot>),
+    ProviderUsage {
+        pane_generation: u64,
+        result: Result<Vec<cockpit_proto::ProviderUsageSnapshotView>, String>,
+    },
     Skills(crate::tui::skills_pane::SkillsPaneFetchResult),
-    InventoryBundle(cockpit_core::daemon::proto::Response),
+    InventoryBundle(cockpit_proto::Response),
     NotesRpc(crate::tui::notes_pane::NotesRpcResult),
     LeaksRpc(crate::tui::leaks_pane::LeaksRpcResult),
     PasteTokenCount {
@@ -178,7 +330,7 @@ pub enum AsyncActionPayload {
         original: String,
         source_draft_generation: u64,
         cursor: usize,
-        png: Option<Vec<u8>>,
+        admission: Option<DaemonImagePathAdmission>,
     },
     NativeImagePaste {
         request_id: uuid::Uuid,
@@ -186,7 +338,7 @@ pub enum AsyncActionPayload {
         terminal_generation: Option<u64>,
         source_draft_generation: u64,
         cursor: usize,
-        png: Option<Vec<u8>>,
+        admission: Option<DaemonImagePathAdmission>,
     },
     PinState {
         session_id: uuid::Uuid,
@@ -202,7 +354,7 @@ pub enum AsyncActionPayload {
     },
     PinsReview {
         session_id: uuid::Uuid,
-        pins: Vec<cockpit_core::daemon::proto::PinnedMessage>,
+        pins: Vec<cockpit_proto::PinnedMessage>,
     },
     PinMessage {
         session_id: uuid::Uuid,
@@ -223,6 +375,7 @@ pub enum AsyncActionPayload {
         failed: bool,
         git_args: Option<String>,
     },
+    #[cfg(test)]
     DaemonProbe {
         cwd: std::path::PathBuf,
         status: cockpit_core::daemon::DaemonStatus,
@@ -264,7 +417,7 @@ pub enum AsyncActionPayload {
         suggestions: Vec<cockpit_core::tags::Suggestion>,
     },
     BtwTransition {
-        created: Option<cockpit_core::daemon::proto::BtwForkInfo>,
+        created: Option<cockpit_proto::BtwForkInfo>,
         ended: bool,
         question: Option<String>,
         error: Option<String>,
@@ -276,12 +429,25 @@ pub enum AsyncActionPayload {
     SettingsDaemon(crate::tui::settings::SettingsDaemonEffectCompletion),
     SettingsBlocking(crate::tui::settings::SettingsBlockingEffectCompletion),
     McpLocal(crate::tui::app::McpLocalCompletion),
+    ImageIngressDraftDiscard(crate::tui::app::ImageIngressDraftDiscardCompletion),
     AgentRunnerAttached(Box<crate::tui::agent_runner::AgentRunner>),
     BtwRunnerAttached {
         session_id: uuid::Uuid,
         runner: Box<crate::tui::agent_runner::AgentRunner>,
     },
     MouseCopy(MouseCopyResult),
+}
+
+#[derive(Debug)]
+pub struct DaemonImagePathAdmission {
+    pub admission_id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+    pub discard_operation_id: uuid::Uuid,
+    pub image_ref: cockpit_proto::ImageAttachmentRef,
+    pub normalized_byte_length: u64,
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +482,10 @@ pub enum OAuthAsyncResult {
 pub struct AsyncActionResult {
     pub id: AsyncActionId,
     pub kind: AsyncActionKind,
+    /// The owning view moved on while this action was running. Authority
+    /// owners must still consume the correlated settlement, but may suppress
+    /// user-facing presentation derived from it.
+    pub presentation_stale: bool,
     pub payload: Result<AsyncActionPayload, String>,
 }
 
@@ -770,25 +940,18 @@ impl AsyncActionRunner {
         self.pending.len()
     }
 
-    /// Advance the UI ownership fence and cancel blocking work owned by the
-    /// previous view. Exports and non-blocking work may keep running; their
-    /// completions are discarded by `drain_completed`, which also releases the
-    /// corresponding pending/keyed slots so later deduped requests are not
-    /// permanently blocked.
+    /// Advance the UI presentation fence. Only discardable read-only blocking
+    /// work is cancelled; authority-owning work remains registered until its
+    /// correlated terminal completion is consumed.
     pub fn advance_view_generation(&mut self) {
         self.view_generation = self.view_generation.wrapping_add(1).max(1);
         let stale = self
             .pending
             .iter()
             .filter_map(|(id, pending)| {
-                matches!(&pending.kind, AsyncActionKind::Blocking(_))
+                (matches!(&pending.kind, AsyncActionKind::Blocking(_))
+                    && pending.kind.authority() == AsyncActionAuthority::ReadOnly)
                     .then_some(*id)
-                    .filter(|_| {
-                        !matches!(
-                            &pending.kind,
-                            AsyncActionKind::Blocking("export.transcript" | "export.debug")
-                        )
-                    })
             })
             .collect::<Vec<_>>();
         for id in stale {
@@ -802,6 +965,7 @@ impl AsyncActionRunner {
             .iter()
             .filter_map(|(id, pending)| {
                 (matches!(&pending.kind, AsyncActionKind::Blocking(_))
+                    && pending.kind.authority() == AsyncActionAuthority::ReadOnly
                     && now.saturating_duration_since(pending.started_at) >= timeout)
                     .then_some((*id, pending.kind.clone()))
             })
@@ -812,6 +976,7 @@ impl AsyncActionRunner {
                 self.abort_id_inner(id, false).then_some(AsyncActionResult {
                     id,
                     kind,
+                    presentation_stale: false,
                     payload: Err("operation timed out".to_string()),
                 })
             })
@@ -824,6 +989,14 @@ impl AsyncActionRunner {
             .values()
             .map(|pending| pending.kind.clone())
             .collect()
+    }
+
+    /// Whether any pending action still owns durable, host-publication, or
+    /// lifecycle authority. Unknown action labels are fenced by default.
+    pub fn has_unsettled_local_authority(&self) -> bool {
+        self.pending
+            .values()
+            .any(|pending| pending.kind.authority().owns_local_authority())
     }
 
     #[cfg(test)]
@@ -1111,17 +1284,16 @@ impl AsyncActionRunner {
             {
                 self.keyed.remove(&key);
             }
-            // Stale-view completions (exports left running across
-            // `advance_view_generation`, non-blocking work, etc.) must still
-            // release pending/keyed ownership so a later same-key action is
-            // not permanently stuck behind a discarded result.
-            if stale_view && !matches!(&completed.kind, AsyncActionKind::DaemonRpc("sealed.effect"))
-            {
+            // Read-only stale results are presentation-only and discardable.
+            // Authority-owning results must reach their correlated settlement
+            // owner even after the presenting view has moved on.
+            if stale_view && completed.kind.authority() == AsyncActionAuthority::ReadOnly {
                 continue;
             }
             results.push(AsyncActionResult {
                 id: completed.id,
                 kind: completed.kind,
+                presentation_stale: stale_view,
                 payload: completed.payload,
             });
         }
@@ -1142,6 +1314,7 @@ impl AsyncActionRunner {
             self.cancelled.push(AsyncActionResult {
                 id,
                 kind: pending.kind,
+                presentation_stale: false,
                 payload: Err("operation cancelled by shutdown".to_string()),
             });
         }
@@ -1188,6 +1361,7 @@ impl AsyncActionRunner {
             self.cancelled.push(AsyncActionResult {
                 id,
                 kind: pending.kind,
+                presentation_stale: false,
                 payload: Err("operation cancelled by shutdown".to_string()),
             });
         }
@@ -1274,6 +1448,7 @@ impl AsyncActionRunner {
             self.cancelled.push(AsyncActionResult {
                 id,
                 kind: pending.kind,
+                presentation_stale: false,
                 payload: Err("operation cancelled".to_string()),
             });
         }
@@ -1293,6 +1468,74 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::oneshot;
     use tokio::time::{Duration, sleep};
+
+    #[test]
+    fn action_authority_is_enum_owned_and_fails_closed() {
+        use AsyncActionAuthority::{
+            DurableMutation, HostMutation, ReadOnly, SessionLifecycle, Unclassified,
+        };
+
+        for (kind, expected) in [
+            (AsyncActionKind::Refresh("future-projection"), ReadOnly),
+            (AsyncActionKind::Blocking("doctor.snapshot"), ReadOnly),
+            (AsyncActionKind::Blocking("copy.file"), HostMutation),
+            (
+                AsyncActionKind::DaemonRpc("settings.effect"),
+                DurableMutation,
+            ),
+            (
+                AsyncActionKind::DaemonRpc("session.switch.unknown"),
+                Unclassified,
+            ),
+            (
+                AsyncActionKind::Internal("session.switch"),
+                SessionLifecycle,
+            ),
+            (
+                AsyncActionKind::NotesProjection {
+                    instance_id: 7,
+                    generation: 3,
+                },
+                DurableMutation,
+            ),
+        ] {
+            assert_eq!(
+                kind.authority(),
+                expected,
+                "wrong classification for {kind:?}"
+            );
+        }
+
+        for unknown in [
+            AsyncActionKind::Blocking("new-blocking-action"),
+            AsyncActionKind::DaemonRpc("new-daemon-action"),
+            AsyncActionKind::Internal("new-internal-action"),
+        ] {
+            assert_eq!(unknown.authority(), Unclassified);
+            assert!(
+                unknown.authority().owns_local_authority(),
+                "unknown actions must never bypass the process exit fence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_computes_authority_from_every_pending_action() {
+        let mut runner = AsyncActionRunner::default();
+        runner.start(
+            AsyncActionKind::Refresh("status"),
+            AsyncActionPolicy::AllowConcurrent,
+            std::future::pending(),
+        );
+        assert!(!runner.has_unsettled_local_authority());
+
+        runner.start(
+            AsyncActionKind::Internal("new-unclassified-action"),
+            AsyncActionPolicy::AllowConcurrent,
+            std::future::pending(),
+        );
+        assert!(runner.has_unsettled_local_authority());
+    }
 
     async fn wait_for_results(runner: &mut AsyncActionRunner) -> Vec<AsyncActionResult> {
         for _ in 0..20 {
@@ -1402,6 +1645,49 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn serialized_notes_intents_outlive_view_and_error_releases_once() {
+        let mut runner = AsyncActionRunner::default();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_first, first_barrier) = oneshot::channel::<()>();
+        let key = AsyncActionKey::new("notes.projection:/proj");
+        let first_order = Arc::clone(&order);
+        runner.start_serialized(
+            AsyncActionKind::NotesProjection {
+                instance_id: 1,
+                generation: 1,
+            },
+            key.clone(),
+            async move {
+                first_barrier.await.unwrap();
+                first_order.lock().unwrap().push(1);
+                Err("first worker failed".into())
+            },
+        );
+        let second_order = Arc::clone(&order);
+        runner.start_serialized(
+            AsyncActionKind::NotesProjection {
+                instance_id: 1,
+                generation: 2,
+            },
+            key,
+            async move {
+                second_order.lock().unwrap().push(2);
+                Ok(AsyncActionPayload::Unit)
+            },
+        );
+
+        // No pane/view object is retained by either durable intent.
+        tokio::task::yield_now().await;
+        assert!(order.lock().unwrap().is_empty());
+        release_first.send(()).unwrap();
+        let results = wait_for_results(&mut runner).await;
+        assert_eq!(*order.lock().unwrap(), [1, 2]);
+        assert_eq!(results.len(), 2, "each intent settles exactly once");
+        assert!(results.iter().any(|result| result.payload.is_err()));
+        assert!(results.iter().any(|result| result.payload.is_ok()));
     }
 
     #[tokio::test]

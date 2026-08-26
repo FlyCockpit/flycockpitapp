@@ -111,7 +111,7 @@ impl Harness {
     /// The canonical workspace root as a scope.
     pub fn root_scope(&self) -> CanonicalScope {
         CanonicalScope::from_canonical(
-            crate::path_containment::effective_path(self.root()).unwrap(),
+            cockpit_host::path_containment::effective_path(self.root()).unwrap(),
         )
     }
 

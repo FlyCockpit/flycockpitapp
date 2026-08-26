@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::tui::composer::{FindSpec, Operator, Register, VimMode};
+use crate::tui::composer::{ComposerMotion, FindSpec, Operator, Register, VimMode};
 use crate::tui::history::HistoryEntry;
 use crate::tui::textfield::normalize_shift_char;
 
@@ -18,8 +18,62 @@ use super::{
 use crate::tui::agent_runner;
 use crate::tui::async_action::{AsyncActionKey, AsyncActionPayload, AsyncActionPolicy};
 use crate::tui::settings::Dialog;
-use cockpit_core::daemon::proto::{self, Request, Response};
-use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
+use cockpit_proto::QueueItem as QueuedUserMessage;
+use cockpit_proto::QueueItemStatus;
+use cockpit_proto::{self as proto, Request, Response};
+
+async fn admit_image_ingress_via_daemon(
+    daemon: crate::tui::agent_runner::AttachedRequestBinding,
+    session_id: uuid::Uuid,
+    source: cockpit_proto::ImageIngressSourceV1,
+    admission_id: uuid::Uuid,
+) -> Result<crate::tui::async_action::DaemonImagePathAdmission, String> {
+    // Retry once with the exact same durable id and source binding. A lost
+    // response must recover the daemon receipt rather than minting a second
+    // charged attachment (and terminal capabilities are intentionally
+    // one-shot, so a retry with a fresh id could never be correct).
+    let request = || cockpit_proto::Request::AdmitImageIngress {
+        session_id,
+        source: source.clone(),
+        admission_id,
+    };
+    let response = match daemon.request(request()).await {
+        Ok(response) => response,
+        Err(first_error) => daemon
+            .request(request())
+            .await
+            .map_err(|second_error| format!("{first_error}; retry failed: {second_error}"))?,
+    };
+    let cockpit_proto::Response::ImageIngressAdmitted(admission) = response else {
+        return Err("daemon returned an unexpected image ingress response".into());
+    };
+    if admission.schema_version != 1
+        || admission.kind != "imageIngressAdmissionReceipt"
+        || admission.admission_id != admission_id
+        || admission.session_id != session_id
+        || admission.attachment_version == 0
+        || admission.availability_generation == 0
+        || admission.reservation_id.is_empty()
+        || admission.normalized_byte_length == 0
+        || admission.normalized_byte_length as usize > cockpit_proto::MAX_SINGLE_IMAGE_BYTES
+        || admission.width == 0
+        || admission.height == 0
+        || admission.width > cockpit_proto::MAX_IMAGE_DIMENSION_PIXELS
+        || admission.height > cockpit_proto::MAX_IMAGE_DIMENSION_PIXELS
+    {
+        return Err("daemon returned an invalid image ingress receipt".into());
+    }
+    Ok(crate::tui::async_action::DaemonImagePathAdmission {
+        admission_id,
+        session_id,
+        discard_operation_id: uuid::Uuid::now_v7(),
+        image_ref: admission.image_ref,
+        normalized_byte_length: admission.normalized_byte_length,
+        sha256: admission.normalized_sha256,
+        width: admission.width,
+        height: admission.height,
+    })
+}
 
 impl App {
     /// Replay a rapid-paste candidate through the composer route that owned
@@ -174,11 +228,12 @@ impl App {
             if let Some(action_id) = action_id {
                 self.async_actions.abort_id(action_id);
             }
-            if let Some(path) =
-                crate::tui::structured_paste::parse_private_image_path_literal(&data)
+            if let Some(capability) =
+                crate::tui::structured_paste::parse_private_image_capability(&data)
             {
-                let kind =
-                    crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe");
+                let kind = crate::tui::async_action::AsyncActionKind::DaemonRpc(
+                    "paste.image_path_admission",
+                );
                 let Some(fence_request) =
                     self.submission_fences.get_mut(&fence_id).and_then(|fence| {
                         fence.slots.iter_mut().find_map(|slot| match slot {
@@ -195,6 +250,7 @@ impl App {
                 else {
                     return;
                 };
+                let admission_id = uuid::Uuid::new_v4();
                 self.pending_paste_probes.insert(
                     correlation_id,
                     super::PendingPasteProbe {
@@ -204,10 +260,17 @@ impl App {
                         owner_fence: Some(fence_id),
                         original_offset,
                         deadline,
+                        image_admission_id: Some(admission_id),
                         async_action_id: None,
                     },
                 );
                 let original = data;
+                let session_id = self.launch.session_id.unwrap_or(uuid::Uuid::nil());
+                let daemon = self
+                    .agent_runner
+                    .as_ref()
+                    .and_then(|runner| runner.as_ref().ok())
+                    .map(|runner| runner.attached_request_binding());
                 let terminal_generation = self.terminal_input_generation;
                 let action_id = self
                     .async_actions
@@ -215,12 +278,18 @@ impl App {
                         kind,
                         crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
                         async move {
-                            let png = tokio::task::spawn_blocking(move || {
-                                crate::tui::image_path_probe::normalize_private_image(&path)
-                            })
-                            .await
-                            .ok()
-                            .and_then(Result::ok);
+                            let admission = if let Some(daemon) = daemon {
+                                admit_image_ingress_via_daemon(
+                                    daemon,
+                                    session_id,
+                                    cockpit_proto::ImageIngressSourceV1::PrivateTerminalCapability { capability },
+                                    admission_id,
+                                )
+                                .await
+                                .ok()
+                            } else {
+                                None
+                            };
                             Ok(
                                 crate::tui::async_action::AsyncActionPayload::ImagePathProbe {
                                     request_id: correlation_id,
@@ -229,7 +298,7 @@ impl App {
                                     original,
                                     source_draft_generation,
                                     cursor: original_offset,
-                                    png,
+                                    admission,
                                 },
                             )
                         },
@@ -287,6 +356,7 @@ impl App {
                 owner_fence: None,
                 original_offset: self.composer.cursor(),
                 deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
+                image_admission_id: None,
                 async_action_id: None,
             })
         } else {
@@ -309,6 +379,7 @@ impl App {
     }
 
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> bool {
+        self.dialog.bind_lifecycle(self.lifecycle.clone());
         let composer_before = self.composer.text().to_string();
         let exit = self.handle_key_inner(key);
         let clears_or_recalls_without_editing =
@@ -415,7 +486,7 @@ impl App {
             && matches!(key.code, KeyCode::Char('d'))
         {
             return if self.ctrl_d_can_exit_immediately() {
-                true
+                self.request_guarded_exit()
             } else {
                 self.handle_ctrl_c()
             };
@@ -650,28 +721,12 @@ impl App {
             let choice = prompt.take_choice();
             match choice {
                 Some(crate::tui::daemon_prompt::DaemonChoice::StartAndConnect) => {
-                    // The TUI promotes a *persistent* daemon here; the
-                    // client's `--no-sandbox` is a per-session default
-                    // applied at attach, not a daemon-level launch flag
-                    // (sandboxing part 2 precedence).
-                    match cockpit_core::daemon::DaemonPaths::resolve()
-                        .and_then(|_| cockpit_core::daemon::spawn_detached(false))
-                    {
-                        Ok(pid) => {
-                            self.push_plain(format!(
-                                "daemon: spawned (pid {pid}); stop later with `cockpit daemon stop`"
-                            ));
-                            self.daemon_connected = true;
-                            self.daemon_prompt = None;
-                            self.reset_display_attach_backoff();
-                            self.maybe_open_add_provider_wizard();
-                        }
-                        Err(e) => {
-                            if let Some(p) = self.daemon_prompt.as_mut() {
-                                p.set_error(format!("failed to spawn daemon: {e}"));
-                            }
-                        }
-                    }
+                    // Resolution and any required spawn occur asynchronously
+                    // in the CLI-owned lifecycle composition task.
+                    self.daemon_connected = true;
+                    self.daemon_prompt = None;
+                    self.reset_display_attach_backoff();
+                    self.maybe_open_add_provider_wizard();
                 }
                 Some(crate::tui::daemon_prompt::DaemonChoice::ContinueWithout) => {
                     // Daemonless mode: this TUI owns its own pid+nonce
@@ -692,7 +747,7 @@ impl App {
                     self.maybe_open_add_provider_wizard();
                 }
                 Some(crate::tui::daemon_prompt::DaemonChoice::Exit) | None => {
-                    return true;
+                    return self.request_guarded_exit();
                 }
             }
             return false;
@@ -824,8 +879,12 @@ impl App {
             Overlay::Multireview(mut dialog) => {
                 let should_close = dialog.handle_key(key);
                 let kickoff = dialog.take_done();
+                let request = dialog.take_pending_git_request();
                 if !should_close && kickoff.is_none() {
                     self.overlay = Overlay::Multireview(dialog);
+                }
+                if let Some((operation_id, sources)) = request {
+                    self.start_git_review_sources_action(operation_id, sources);
                 }
                 if let Some(kickoff) = kickoff {
                     self.start_multireview(kickoff.prompt);
@@ -1020,7 +1079,11 @@ impl App {
             }
             Overlay::Diff(mut pane) => {
                 if !pane.handle_key(key) {
+                    let fetch = pane.take_pending_fetch();
                     self.overlay = Overlay::Diff(pane);
+                    if let Some((operation_id, source)) = fetch {
+                        self.start_git_diff_action(operation_id, source);
+                    }
                 }
                 return false;
             }
@@ -1446,8 +1509,7 @@ impl App {
                 // (deliberate — too easy to hit accidentally for an
                 // exit path; `/exit`, Ctrl+C, Ctrl+D cover that).
                 if self.slash_query().is_some() {
-                    self.composer.clear();
-                    self.paste_registry.clear();
+                    self.clear_composer_buffer();
                     self.reset_slash_window();
                 } else if self.composer.vim_enabled() {
                     self.composer.set_vim_mode(VimMode::Normal);
@@ -1459,7 +1521,7 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::SHIFT)
                     || key.modifiers.contains(KeyModifiers::ALT)
                 {
-                    self.composer_insert_char('\n');
+                    self.composer.insert_char('\n');
                     self.refresh_at_dismiss();
                     self.reset_slash_window();
                     false
@@ -1474,7 +1536,7 @@ impl App {
             // canonical LF on every Unix terminal and survives every
             // multiplexer hop.
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.composer_insert_char('\n');
+                self.composer.insert_char('\n');
                 self.reset_slash_window();
                 false
             }
@@ -1482,8 +1544,8 @@ impl App {
                 // Whole-block delete (paste blocks): cursor immediately
                 // right of `]` removes the entire block. Checked before
                 // the `@`-tag path since blocks are explicit + atomic.
-                if let Some((s, e)) = self.paste_block_left() {
-                    self.delete_paste_block(s, e);
+                if let Some((s, e)) = self.composer.paste_block_left() {
+                    self.composer.delete_paste_block(s, e);
                     self.refresh_at_dismiss();
                     self.reset_at_window();
                     return false;
@@ -1494,12 +1556,12 @@ impl App {
                 if !self.at_popup_active()
                     && let Some((s, e)) = self.completed_tag_left()
                 {
-                    self.composer.delete_range(s, e);
+                    let _ = self.composer.delete_range(s, e);
                     self.refresh_at_dismiss();
                     self.reset_at_window();
                     return false;
                 }
-                self.composer_delete_left();
+                let _ = self.composer.delete_left();
                 // Two-keystroke trailing space: if we just removed a
                 // space that sat right after a completed tag, keep the
                 // popup suppressed so the *next* Backspace deletes the
@@ -1516,8 +1578,8 @@ impl App {
             KeyCode::Delete => {
                 // Whole-block forward delete: cursor immediately left of
                 // `[` removes the entire block.
-                if let Some((s, e)) = self.paste_block_right() {
-                    self.delete_paste_block(s, e);
+                if let Some((s, e)) = self.composer.paste_block_right() {
+                    self.composer.delete_paste_block(s, e);
                     self.refresh_at_dismiss();
                     self.reset_at_window();
                     return false;
@@ -1525,23 +1587,23 @@ impl App {
                 if !self.at_popup_active()
                     && let Some((s, e)) = self.completed_tag_right()
                 {
-                    self.composer.delete_range(s, e);
+                    let _ = self.composer.delete_range(s, e);
                     self.refresh_at_dismiss();
                     self.reset_at_window();
                     return false;
                 }
-                self.composer_delete_right();
+                let _ = self.composer.delete_right();
                 self.refresh_at_dismiss();
                 self.reset_at_window();
                 self.reset_slash_window();
                 false
             }
             KeyCode::Left => {
-                self.composer_move_left();
+                self.composer.move_left();
                 false
             }
             KeyCode::Right => {
-                self.composer_move_right();
+                self.composer.move_right();
                 false
             }
             KeyCode::Up => {
@@ -1561,7 +1623,7 @@ impl App {
                 false
             }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.composer_insert_char(normalize_shift_char(&key, ch));
+                self.composer.insert_char(normalize_shift_char(&key, ch));
                 // Note: we deliberately do NOT reset
                 // `prompt_history_cursor` here. Edits made while in
                 // recall mode stay in the buffer, but pressing Down
@@ -1623,14 +1685,12 @@ impl App {
             self.staged_draft = if draft.is_empty() { None } else { Some(draft) };
             self.prompt_history_cursor = 1;
             let idx = self.prompt_history.len() - 1;
-            self.composer.set(self.prompt_history[idx].clone());
-            self.paste_registry.clear();
+            self.replace_composer_buffer(self.prompt_history[idx].clone());
             self.invalidate_primary_paste();
         } else if self.prompt_history_cursor < self.prompt_history.len() {
             self.prompt_history_cursor += 1;
             let idx = self.prompt_history.len() - self.prompt_history_cursor;
-            self.composer.set(self.prompt_history[idx].clone());
-            self.paste_registry.clear();
+            self.replace_composer_buffer(self.prompt_history[idx].clone());
             self.invalidate_primary_paste();
         }
     }
@@ -1673,16 +1733,15 @@ impl App {
         if self.prompt_history_cursor == 0 {
             // Out of history — restore the saved draft, if any.
             match self.staged_draft.take() {
-                Some(draft) => self.composer.set(draft),
-                None => self.composer.clear(),
+                Some(draft) => self.replace_composer_buffer(draft),
+                None => self.clear_composer_buffer(),
             }
         } else {
             let idx = self.prompt_history.len() - self.prompt_history_cursor;
-            self.composer.set(self.prompt_history[idx].clone());
+            self.replace_composer_buffer(self.prompt_history[idx].clone());
         }
-        // History navigation always lands on plain recalled text — no
-        // paste blocks survive.
-        self.paste_registry.clear();
+        // History navigation always lands on plain recalled text; the
+        // whole-buffer helper retired the old paste authority atomically.
     }
 
     /// If the composer no longer has an active `@partial` token, clear
@@ -1892,7 +1951,7 @@ impl App {
         let chosen = self.slash_selected.min(n - 1);
         // `set` resets the cursor to the end — exactly after the inserted
         // command (and its trailing space, if any).
-        self.composer.set(completions[chosen].clone());
+        self.replace_composer_buffer(completions[chosen].clone());
         true
     }
 
@@ -1914,7 +1973,9 @@ impl App {
         }
         let idx = self.at_selected.min(suggestions.len() - 1);
         let sug = suggestions[idx].clone();
-        self.composer.replace_at_token(&sug.replacement);
+        let Some(_) = self.composer.replace_at_token(&sug.replacement) else {
+            return false;
+        };
         self.at_selected = 0;
         self.at_scroll = 0;
 
@@ -1929,7 +1990,7 @@ impl App {
             // commit, so it's deliberately not counted here.
             let project_id = self.project_id.clone();
             self.record_usage(
-                cockpit_core::daemon::proto::UsageKind::Tag,
+                cockpit_proto::UsageKind::Tag,
                 sug.replacement.clone(),
                 project_id,
             );
@@ -1947,10 +2008,7 @@ impl App {
     /// line in the chat (GOALS §1e). One line per tag, in the same
     /// `→ tool(path)` idiom the agent's own tools use, with a ✓/✗ + the
     /// detail (lines read / entries listed / why it was skipped).
-    pub(super) fn push_tag_call_entries(
-        &mut self,
-        expansions: &[cockpit_core::daemon::proto::TagExpansionMeta],
-    ) {
+    pub(super) fn push_tag_call_entries(&mut self, expansions: &[cockpit_proto::TagExpansionMeta]) {
         for e in expansions {
             let mark = if e.ok { '✓' } else { '✗' };
             self.push_plain(format!("  → {}({}) {mark} {}", e.tool, e.path, e.detail));
@@ -2057,31 +2115,42 @@ impl App {
                 }
                 // `ge` / `gE` — backward end-of-word (the `g` was pending).
                 if was_pending_g && (ch == 'e' || ch == 'E') {
-                    self.vim_motion(|c| c.move_word_end_backward(ch == 'E'), false);
+                    self.composer
+                        .move_cursor(ComposerMotion::WordEndBackward { big: ch == 'E' });
                     return false;
                 }
                 match ch {
-                    'h' => self.composer_move_left(),
-                    'l' => self.composer_move_right(),
+                    'h' => self.composer.move_left(),
+                    'l' => self.composer.move_right(),
                     'k' => self.history_up(),
                     'j' => self.history_down(),
-                    'w' => self.vim_motion(|c| c.move_word_forward(false), true),
-                    'W' => self.vim_motion(|c| c.move_word_forward(true), true),
-                    'b' => self.vim_motion(|c| c.move_word_backward(false), false),
-                    'B' => self.vim_motion(|c| c.move_word_backward(true), false),
-                    'e' => self.vim_motion(|c| c.move_word_end(false), true),
-                    'E' => self.vim_motion(|c| c.move_word_end(true), true),
+                    'w' => self
+                        .composer
+                        .move_cursor(ComposerMotion::WordForward { big: false }),
+                    'W' => self
+                        .composer
+                        .move_cursor(ComposerMotion::WordForward { big: true }),
+                    'b' => self
+                        .composer
+                        .move_cursor(ComposerMotion::WordBackward { big: false }),
+                    'B' => self
+                        .composer
+                        .move_cursor(ComposerMotion::WordBackward { big: true }),
+                    'e' => self
+                        .composer
+                        .move_cursor(ComposerMotion::WordEnd { big: false }),
+                    'E' => self
+                        .composer
+                        .move_cursor(ComposerMotion::WordEnd { big: true }),
                     '0' => self.composer.move_line_start(),
                     '$' => self.composer.move_line_end(),
                     'G' => self.composer.move_buffer_end(),
-                    '%' => self.vim_motion(|c| c.match_bracket(), true),
+                    '%' => self.composer.move_cursor(ComposerMotion::MatchBracket),
                     ';' => {
                         self.composer.repeat_find(false);
-                        self.snap_off_block(true);
                     }
                     ',' => {
                         self.composer.repeat_find(true);
-                        self.snap_off_block(false);
                     }
                     'g' => {
                         if was_pending_g {
@@ -2106,7 +2175,7 @@ impl App {
                         self.composer.set_vim_mode(VimMode::Insert);
                     }
                     'a' => {
-                        self.composer_move_right();
+                        self.composer.move_right();
                         self.composer.set_vim_mode(VimMode::Insert);
                     }
                     'A' => {
@@ -2118,17 +2187,15 @@ impl App {
                         // sits at a block's opening `[`, remove the whole
                         // block; else ordinary forward-delete (yanking the
                         // removed char into the register).
-                        if let Some((s, e)) = self.paste_block_right() {
-                            self.delete_paste_block(s, e);
+                        if let Some((s, e)) = self.composer.paste_block_right() {
+                            self.composer.delete_paste_block(s, e);
                         } else {
                             self.vim_cut_char_forward();
                         }
                     }
-                    'D' => {
-                        self.block_aware_delete(|c| c.move_line_end(), |c| c.delete_to_line_end())
-                    }
+                    'D' => self.composer.delete_to_line_end(),
                     'C' => {
-                        self.block_aware_delete(|c| c.move_line_end(), |c| c.delete_to_line_end());
+                        self.composer.delete_to_line_end();
                         self.composer.set_vim_mode(VimMode::Insert);
                     }
                     'o' => {
@@ -2230,7 +2297,7 @@ impl App {
                 if c == 'g' {
                     // `dgg` — operate from buffer start to cursor.
                     let from = self.composer.cursor();
-                    let to = self.composer.probe_motion(|c| c.move_buffer_start());
+                    let to = self.composer.probe_motion(ComposerMotion::BufferStart);
                     self.apply_operator_range(op, to, from);
                 } else {
                     // `dge` — backward end-of-word (inclusive of the
@@ -2239,7 +2306,7 @@ impl App {
                     let from = self.composer.cursor();
                     let to = self
                         .composer
-                        .probe_motion(|comp| comp.move_word_end_backward(big));
+                        .probe_motion(ComposerMotion::WordEndBackward { big });
                     self.apply_operator_range(op, to, from);
                 }
                 return false;
@@ -2280,38 +2347,48 @@ impl App {
             _ => {}
         }
         let applied = match key.code {
-            KeyCode::Char('w') => self.apply_operator_motion(op, |c| c.move_word_forward(false)),
-            KeyCode::Char('W') => self.apply_operator_motion(op, |c| c.move_word_forward(true)),
-            KeyCode::Char('b') => self.apply_operator_motion(op, |c| c.move_word_backward(false)),
-            KeyCode::Char('B') => self.apply_operator_motion(op, |c| c.move_word_backward(true)),
+            KeyCode::Char('w') => {
+                self.apply_operator_motion(op, ComposerMotion::WordForward { big: false }, false)
+            }
+            KeyCode::Char('W') => {
+                self.apply_operator_motion(op, ComposerMotion::WordForward { big: true }, false)
+            }
+            KeyCode::Char('b') => {
+                self.apply_operator_motion(op, ComposerMotion::WordBackward { big: false }, false)
+            }
+            KeyCode::Char('B') => {
+                self.apply_operator_motion(op, ComposerMotion::WordBackward { big: true }, false)
+            }
             KeyCode::Char('e') => {
-                self.apply_operator_motion_inclusive(op, |c| c.move_word_end(false))
+                self.apply_operator_motion(op, ComposerMotion::WordEnd { big: false }, true)
             }
             KeyCode::Char('E') => {
-                self.apply_operator_motion_inclusive(op, |c| c.move_word_end(true))
+                self.apply_operator_motion(op, ComposerMotion::WordEnd { big: true }, true)
             }
-            KeyCode::Char('%') => self.apply_operator_motion_inclusive(op, |c| c.match_bracket()),
-            KeyCode::Char(';') => self.apply_operator_motion(op, |c| {
-                c.repeat_find(false);
-            }),
-            KeyCode::Char(',') => self.apply_operator_motion(op, |c| {
-                c.repeat_find(true);
-            }),
-            KeyCode::Char('$') => self.apply_operator_motion(op, |c| c.move_line_end()),
-            KeyCode::Char('0') => self.apply_operator_motion(op, |c| c.move_line_start()),
+            KeyCode::Char('%') => {
+                self.apply_operator_motion(op, ComposerMotion::MatchBracket, true)
+            }
+            KeyCode::Char(';') => {
+                self.apply_operator_motion(op, ComposerMotion::RepeatFind { reverse: false }, false)
+            }
+            KeyCode::Char(',') => {
+                self.apply_operator_motion(op, ComposerMotion::RepeatFind { reverse: true }, false)
+            }
+            KeyCode::Char('$') => self.apply_operator_motion(op, ComposerMotion::LineEnd, false),
+            KeyCode::Char('0') => self.apply_operator_motion(op, ComposerMotion::LineStart, false),
             KeyCode::Char('G') => {
-                let len = self.composer.len();
-                self.apply_operator_motion(op, move |c| c.set_cursor(len))
+                let end = self.composer.len();
+                self.apply_operator_motion(op, ComposerMotion::Absolute(end), false)
             }
             KeyCode::Char('d') if matches!(op, Operator::Delete) => {
-                self.delete_current_line_block_aware();
+                self.composer.delete_current_line();
                 true
             }
             KeyCode::Char('c') if matches!(op, Operator::Change) => {
                 // `cc` changes the current line: clear the line's content,
                 // leave the line itself, and enter Insert.
                 self.composer.move_line_start();
-                self.block_aware_delete(|c| c.move_line_end(), |c| c.delete_to_line_end());
+                self.composer.delete_to_line_end();
                 true
             }
             KeyCode::Char('y') if matches!(op, Operator::Yank) => {
@@ -2344,46 +2421,17 @@ impl App {
     /// Apply `op` over the (exclusive) motion range from the cursor to the
     /// motion's landing point, block-aware. Yank copies; Delete/Change cut.
     /// Returns `true` when the motion covered a non-empty range.
-    fn apply_operator_motion<F>(&mut self, op: Operator, motion: F) -> bool
-    where
-        F: FnOnce(&mut crate::tui::composer::Composer),
-    {
-        let from = self.composer.cursor();
-        let to = self.composer.probe_motion(motion);
-        if from == to {
-            return false;
+    fn apply_operator_motion(
+        &mut self,
+        op: Operator,
+        motion: ComposerMotion,
+        inclusive: bool,
+    ) -> bool {
+        let applied = self.composer.apply_operator_motion(op, motion, inclusive);
+        if applied {
+            self.mirror_register_to_clipboard();
         }
-        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
-        self.apply_operator_range_no_mode(op, lo, hi);
-        true
-    }
-
-    /// Like [`Self::apply_operator_motion`] but inclusive of the landing
-    /// char (for `e`/`E`/`%` which land *on* the last char to operate on).
-    fn apply_operator_motion_inclusive<F>(&mut self, op: Operator, motion: F) -> bool
-    where
-        F: FnOnce(&mut crate::tui::composer::Composer),
-    {
-        let from = self.composer.cursor();
-        let to = self.composer.probe_motion(motion);
-        if from == to {
-            return false;
-        }
-        let (lo, hi) = if from <= to {
-            // Include the char at `to`.
-            let hi = self
-                .composer
-                .text()
-                .get(to..)
-                .and_then(|s| s.chars().next())
-                .map(|c| to + c.len_utf8())
-                .unwrap_or(to);
-            (from, hi)
-        } else {
-            (to, from)
-        };
-        self.apply_operator_range_no_mode(op, lo, hi);
-        true
+        applied
     }
 
     /// Apply `op` over an explicit byte range `[lo, hi)`, then set the
@@ -2401,23 +2449,8 @@ impl App {
     /// swallow any paste block the range crosses (atomic blocks) and keeps
     /// the registry in sync. Yank copies into the register + clipboard;
     /// Delete/Change cut into the register + clipboard.
-    fn apply_operator_range_no_mode(&mut self, op: Operator, mut lo: usize, mut hi: usize) {
-        if let Some((bs, be)) = self.paste_registry.block_crossed_by(lo, hi) {
-            lo = lo.min(bs);
-            hi = hi.max(be);
-        }
-        match op {
-            Operator::Yank => {
-                self.composer.yank_range(lo, hi, false);
-                // Cursor goes to the start of a yank (vim).
-                self.composer.set_cursor(lo);
-            }
-            Operator::Delete | Operator::Change => {
-                self.composer.cut_range(lo, hi, false);
-                self.paste_registry
-                    .shift_for_edit(lo, -((hi - lo) as isize));
-            }
-        }
+    fn apply_operator_range_no_mode(&mut self, op: Operator, lo: usize, hi: usize) {
+        self.composer.apply_operator_range(op, lo, hi);
         self.mirror_register_to_clipboard();
     }
 
@@ -2426,8 +2459,7 @@ impl App {
         // command (GOALS §1k). Never reaches the agent or the wire.
         if self.composer.text().starts_with('!') {
             let cmd = self.composer.text()[1..].to_string();
-            self.composer.clear();
-            self.paste_registry.clear();
+            self.clear_composer_buffer();
             self.run_shell_command(&cmd);
             self.at_dismissed = false;
             self.at_selected = 0;
@@ -2492,11 +2524,7 @@ impl App {
         // The *displayed* message expands text paste placeholders for the
         // transcript, but keeps that marker-free display separate from the
         // paste-marked model wire built below.
-        let submitted = self
-            .paste_registry
-            .expand_display(self.composer.text())
-            .trim()
-            .to_string();
+        let submitted = self.composer.display_text().trim().to_string();
         let mut pending_probe_ids = self
             .pending_paste_probes
             .iter()
@@ -2512,7 +2540,7 @@ impl App {
                 .map(|probe| probe.request.paste_generation)
                 .unwrap_or_default()
         });
-        if submitted.is_empty() && self.paste_registry.is_empty() && pending_probe_ids.is_empty() {
+        if submitted.is_empty() && self.composer.paste_is_empty() && pending_probe_ids.is_empty() {
             return false;
         }
         // A selection in flight is deliberately *not* a missing-model state.
@@ -2595,8 +2623,7 @@ impl App {
         // active model's resolved image capability at *this* send time — a
         // `/model` switch since paste round-trips the same blocks differently.
         let vision = self.active_model_supports_images();
-        let (paste_wire, paste_images) =
-            self.paste_registry.build_wire(self.composer.text(), vision);
+        let (paste_wire, paste_images) = self.composer.wire_parts(vision);
         let paste_wire = paste_wire.trim().to_string();
         if paste_wire.is_empty() && paste_images.is_empty() && pending_probe_ids.is_empty() {
             let _ = self.submission_order.complete(fence_sequence);
@@ -2607,6 +2634,10 @@ impl App {
             self.show_toast(message, super::ToastKind::Error);
             return false;
         }
+        // Only handles embedded in the wire submission cross the reference
+        // boundary. On a no-vision model the registry renders text notes, so
+        // those admitted drafts remain disposal-owned by the frontend.
+        let retained_drafts = self.composer.wire_image_ingress_drafts(vision);
 
         let captured_model = self.active_model_selection.clone().unwrap_or_else(|| {
             cockpit_config::providers::ActiveModelRef {
@@ -2683,6 +2714,7 @@ impl App {
                 },
                 assembled_wire_digest: None,
                 slots,
+                retained_drafts,
                 lifecycle: fence_lifecycle,
             },
         );
@@ -2739,9 +2771,9 @@ impl App {
         let tag_expansions = expanded
             .expansions
             .into_iter()
-            .map(cockpit_core::daemon::proto::TagExpansionMeta::from)
+            .map(cockpit_proto::TagExpansionMeta::from)
             .collect::<Vec<_>>();
-        let submission = cockpit_core::engine::message::UserSubmission {
+        let submission = ClientUserSubmission {
             expected_model_state_generation: self
                 .active_model_state_confirmed
                 .then_some(self.active_model_state_generation),
@@ -2749,21 +2781,14 @@ impl App {
                 .active_model_state_confirmed
                 .then(|| self.active_model_selection.clone())
                 .flatten(),
-            kind: cockpit_core::engine::message::UserSubmissionKind::User,
-            origin: cockpit_core::engine::message::SubmissionOrigin::ExternalRoot,
+            kind: cockpit_client::submission::UserSubmissionKind::User,
+            origin: cockpit_client::submission::SubmissionOrigin::ExternalRoot,
             text: wire.clone(),
             display_text: Some(submitted.clone()),
             tag_expansions: tag_expansions.clone(),
             images: paste_images,
             forced_skill: None,
-            origin_principal: None,
-            job_id: None,
-            preflight_cleaned: None,
-            queue_item_ids: Vec::new(),
-            client_submissions: Vec::new(),
-            queue_target: None,
-            pending_terminal_disposition: None,
-            run_invocation_id: None,
+            ..Default::default()
         };
         // A model switch is itself the earlier ordered intent. Attach this
         // fence to that transaction rather than treating it as a generic
@@ -2810,8 +2835,7 @@ impl App {
                     parked_fence_sequence: None,
                 },
             );
-            self.composer.clear();
-            self.paste_registry.clear();
+            self.clear_composer_buffer();
             self.draft_generation = self.draft_generation.saturating_add(1);
             self.at_dismissed = false;
             self.at_selected = 0;
@@ -2951,10 +2975,9 @@ impl App {
                 outcome
             }
         };
-        self.composer.clear();
+        self.clear_composer_buffer();
         self.draft_generation = self.draft_generation.saturating_add(1);
         // The buffer is gone — its paste blocks go with it.
-        self.paste_registry.clear();
         self.at_dismissed = false;
         self.at_selected = 0;
         self.at_scroll = 0;
@@ -3230,8 +3253,7 @@ impl App {
     pub(super) fn apply_queue_edit_outcome(&mut self, outcome: QueueEditOutcome) -> bool {
         match outcome {
             QueueEditOutcome::Edited { text, partial } => {
-                self.composer.set(text);
-                self.paste_registry.clear();
+                self.replace_composer_buffer(text);
                 if partial {
                     if self.toast.is_none() || self.has_owned_queue_edit_pending_notice() {
                         self.push_queue_edit_notice("some queued messages already started");
@@ -3351,26 +3373,12 @@ pub(super) fn optimistic_queue_item_with_id(
         status: QueueItemStatus::Queued,
         text,
         display_text,
-        target: cockpit_core::engine::message::QueueTarget::root(""),
+        target: cockpit_proto::QueueTarget::root(""),
     }
 }
 
 pub(super) fn queue_item_from_proto(item: proto::QueueItem) -> QueuedUserMessage {
-    QueuedUserMessage {
-        id: item.id,
-        status: match item.status {
-            proto::QueueItemStatus::Queued => QueueItemStatus::Queued,
-            proto::QueueItemStatus::Folding => QueueItemStatus::Folding,
-        },
-        text: item.text,
-        display_text: item.display_text,
-        target: cockpit_core::engine::message::QueueTarget {
-            id: item.target.id,
-            agent: item.target.agent,
-            depth: item.target.depth,
-            task_call_id: item.target.task_call_id,
-        },
-    }
+    item
 }
 
 /// The checked option ids from a closed `/toggle-redaction` multiselect, or
@@ -3380,7 +3388,7 @@ fn redaction_selected_ids(
     result: &crate::tui::dialog::question::QuestionResult,
 ) -> Option<Vec<String>> {
     use crate::tui::dialog::question::QuestionResult;
-    use cockpit_core::daemon::proto::ResolveResponse;
+    use cockpit_proto::ResolveResponse;
     match result {
         QuestionResult::Submit { responses, .. } => match responses.first() {
             Some(ResolveResponse::Multi { selected_ids }) => Some(selected_ids.clone()),
@@ -3394,7 +3402,7 @@ fn redaction_selected_ids(
 /// `None` for cancel / a malformed response.
 fn init_selected_id(result: &crate::tui::dialog::question::QuestionResult) -> Option<String> {
     use crate::tui::dialog::question::QuestionResult;
-    use cockpit_core::daemon::proto::ResolveResponse;
+    use cockpit_proto::ResolveResponse;
     match result {
         QuestionResult::Submit { responses, .. } => match responses.first() {
             Some(ResolveResponse::Single { selected_id }) => Some(selected_id.clone()),
@@ -3410,7 +3418,7 @@ impl App {
     // A genuine bracketed paste arrives as one `Event::Paste(String)`.
     // Images come from the system clipboard read on the same gesture. Both
     // collapse into atomic placeholder blocks tracked in
-    // `self.paste_registry`, kept byte-range-synced with the composer.
+    // the registry privately owned and byte-range-synced by the composer.
 
     /// Route a bracketed-paste event. First checks the clipboard for an
     /// image (a paste gesture over an image puts the bytes there, while
@@ -3527,6 +3535,7 @@ impl App {
                         owner_fence: None,
                         original_offset: self.composer.cursor(),
                         deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
+                        image_admission_id: None,
                         async_action_id: None,
                     })
             }) else {
@@ -3538,8 +3547,16 @@ impl App {
             probe.original_data = data.clone();
             let source_draft_generation = probe.source_draft_generation;
             let cursor = probe.original_offset;
+            let admission_id = probe.image_admission_id.unwrap_or_else(uuid::Uuid::new_v4);
+            probe.image_admission_id = Some(admission_id);
             self.pending_paste_probes.insert(request_id, probe);
             let terminal_generation = self.terminal_input_generation;
+            let session_id = self.launch.session_id.unwrap_or(uuid::Uuid::nil());
+            let daemon = self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(|runner| runner.attached_request_binding());
             let action_id = self
                 .async_actions
                 .start(
@@ -3551,6 +3568,31 @@ impl App {
                             .ok()
                             .and_then(Result::ok)
                             .flatten();
+                        let admission = if let (Some(png), Some(daemon)) = (png, daemon) {
+                            use base64::Engine as _;
+                            use sha2::{Digest as _, Sha256};
+                            let sha256: String = Sha256::digest(&png)
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect();
+                            let byte_length = png.len() as u64;
+                            admit_image_ingress_via_daemon(
+                                daemon,
+                                session_id,
+                                cockpit_proto::ImageIngressSourceV1::ClipboardPng {
+                                    png_base64: cockpit_proto::SensitiveWirePayload::new(
+                                        base64::engine::general_purpose::STANDARD.encode(png),
+                                    ),
+                                    byte_length,
+                                    sha256,
+                                },
+                                admission_id,
+                            )
+                            .await
+                            .ok()
+                        } else {
+                            None
+                        };
                         Ok(
                             crate::tui::async_action::AsyncActionPayload::NativeImagePaste {
                                 request_id,
@@ -3558,7 +3600,7 @@ impl App {
                                 terminal_generation,
                                 source_draft_generation,
                                 cursor,
-                                png,
+                                admission,
                             },
                         )
                     },
@@ -3570,9 +3612,11 @@ impl App {
             return;
         }
 
-        if let Some(path) = crate::tui::structured_paste::parse_private_image_path_literal(&data) {
+        if let Some(capability) =
+            crate::tui::structured_paste::parse_private_image_capability(&data)
+        {
             let kind =
-                crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe");
+                crate::tui::async_action::AsyncActionKind::DaemonRpc("paste.image_path_admission");
             if self.async_actions.pending_kind_count(&kind) >= 8 {
                 self.show_toast("Paste unavailable", super::ToastKind::Error);
                 return;
@@ -3586,6 +3630,7 @@ impl App {
                         owner_fence: None,
                         original_offset: self.composer.cursor(),
                         deadline: self.event_loop_monotonic_now + std::time::Duration::from_secs(2),
+                        image_admission_id: None,
                         async_action_id: None,
                     })
             }) else {
@@ -3597,8 +3642,16 @@ impl App {
             probe.original_data = data.clone();
             let source_draft_generation = probe.source_draft_generation;
             let cursor = probe.original_offset;
+            let admission_id = probe.image_admission_id.unwrap_or_else(uuid::Uuid::new_v4);
+            probe.image_admission_id = Some(admission_id);
             self.pending_paste_probes.insert(request_id, probe);
             let original = data.clone();
+            let session_id = self.launch.session_id.unwrap_or(uuid::Uuid::nil());
+            let daemon = self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.as_ref().ok())
+                .map(|runner| runner.attached_request_binding());
             let terminal_generation = self.terminal_input_generation;
             let action_id = self
                 .async_actions
@@ -3606,12 +3659,20 @@ impl App {
                     kind,
                     crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
                     async move {
-                        let normalized = tokio::task::spawn_blocking(move || {
-                            crate::tui::image_path_probe::normalize_private_image(&path)
-                        })
-                        .await
-                        .ok()
-                        .and_then(Result::ok);
+                        let admission = if let Some(daemon) = daemon {
+                            admit_image_ingress_via_daemon(
+                                daemon,
+                                session_id,
+                                cockpit_proto::ImageIngressSourceV1::PrivateTerminalCapability {
+                                    capability,
+                                },
+                                admission_id,
+                            )
+                            .await
+                            .ok()
+                        } else {
+                            None
+                        };
                         Ok(
                             crate::tui::async_action::AsyncActionPayload::ImagePathProbe {
                                 request_id,
@@ -3620,7 +3681,7 @@ impl App {
                                 original,
                                 source_draft_generation,
                                 cursor,
-                                png: normalized,
+                                admission,
                             },
                         )
                     },
@@ -3643,26 +3704,8 @@ impl App {
         }
         self.last_composer_edit_at = Some(Instant::now());
 
-        // Re-paste-to-expand: cursor at a text block's right edge + the
-        // paste equals that block's stored content → expand in place.
-        let cursor = self.composer.cursor();
-        if let Some((start, end, full)) = self.paste_registry.expandable_text_at(cursor, &data) {
-            // Replace the placeholder span with the raw text and drop the
-            // block from the registry.
-            self.composer.delete_range(start, end);
-            self.paste_registry.remove_range(start, end);
-            self.composer.set_cursor(start);
-            self.insert_text_raw(&full);
-            self.refresh_at_dismiss();
-            self.reset_at_window();
-            self.reset_slash_window();
-            return;
-        }
-
-        if crate::tui::paste::should_condense(&data) {
-            self.insert_text_block(data);
-        } else {
-            self.insert_text_raw(&data);
+        if let Some((block_id, full)) = self.composer.insert_pasted_text(data) {
+            self.start_paste_token_count(block_id, full);
         }
         self.refresh_at_dismiss();
         self.reset_at_window();
@@ -3704,42 +3747,12 @@ impl App {
             && self.transcript_find.is_none()
     }
 
-    /// Insert raw (non-condensed) pasted text at the cursor, snapping the
-    /// insertion point to a block boundary first and shifting the registry
-    /// for the inserted length.
-    fn insert_text_raw(&mut self, text: &str) {
-        let at = self
-            .paste_registry
-            .resolve_insertion(self.composer.cursor());
-        self.composer.set_cursor(at);
-        self.composer.insert_str(text);
-        self.paste_registry.shift_for_edit(at, text.len() as isize);
-    }
-
-    /// Condense a long text paste into a pending `[Pasted text #N, counting
-    /// tokens]` block. The placeholder occupies the buffer immediately; the
-    /// full text lives in the registry and is inlined at send time. Exact
-    /// token counting runs off the synchronous input path and updates this
-    /// display-only placeholder later if the block is still live.
-    fn insert_text_block(&mut self, full: String) {
-        let at = self
-            .paste_registry
-            .resolve_insertion(self.composer.cursor());
-        self.composer.set_cursor(at);
-        let (block_id, placeholder) = self.paste_registry.register_text_pending(at, full.clone());
-        self.composer.insert_str(&placeholder);
-        // `register_text_pending` already recorded the block at `[at, at+len)`;
-        // shift only the blocks that were *after* the insertion point.
-        self.shift_other_blocks_after_insert(at, placeholder.len());
-        self.start_paste_token_count(block_id, full);
-    }
-
     fn start_paste_token_count(&mut self, block_id: u64, full: String) {
         self.async_actions.start_blocking(
             crate::tui::async_action::AsyncActionKind::Internal("paste.token_count"),
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
             move || {
-                let tokens = std::panic::catch_unwind(|| cockpit_core::tokens::count(&full))
+                let tokens = std::panic::catch_unwind(|| cockpit_tokenizer::count(&full))
                     .map_err(|_| "paste token count panicked".to_string())?;
                 Ok(
                     crate::tui::async_action::AsyncActionPayload::PasteTokenCount {
@@ -3752,53 +3765,17 @@ impl App {
     }
 
     pub(super) fn apply_paste_token_count(&mut self, block_id: u64, tokens: usize) -> bool {
-        let Some(replacement) = self.paste_registry.apply_text_token_count(block_id, tokens) else {
-            return false;
-        };
-        let cursor = self.composer.cursor();
-        let old_len = replacement.end - replacement.start;
-        let new_len = replacement.replacement.len();
-        self.composer
-            .delete_range(replacement.start, replacement.end);
-        self.composer.insert_str(&replacement.replacement);
-        let new_end = replacement.start + new_len;
-        let new_cursor = if cursor <= replacement.start {
-            cursor
-        } else if cursor >= replacement.end {
-            if new_len >= old_len {
-                cursor + (new_len - old_len)
-            } else {
-                cursor.saturating_sub(old_len - new_len)
-            }
-        } else {
-            new_end
-        };
-        self.composer.set_cursor(new_cursor);
-        true
+        self.composer.apply_paste_token_count(block_id, tokens)
     }
 
     /// Insert a pasted image as a `[Pasted image #N]` block. On a
     /// non-vision model, also toast that it'll be sent as a text note —
     /// the bytes are retained either way and re-evaluated at send time.
     pub(super) fn insert_image_block(&mut self, png: Vec<u8>) {
-        let retained = self.paste_registry.image_payloads_by_number();
-        let total = retained
-            .values()
-            .try_fold(png.len(), |sum, image| sum.checked_add(image.len()));
-        if png.len() > cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES
-            || total.is_none_or(|total| total > cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES)
-            || retained.len() >= cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE
-        {
+        if !self.composer.try_insert_image(png) {
             self.show_toast("Paste unavailable", super::ToastKind::Error);
             return;
         }
-        let at = self
-            .paste_registry
-            .resolve_insertion(self.composer.cursor());
-        self.composer.set_cursor(at);
-        let placeholder = self.paste_registry.register_image(at, png);
-        self.composer.insert_str(&placeholder);
-        self.shift_other_blocks_after_insert(at, placeholder.len());
         self.refresh_at_dismiss();
         self.reset_at_window();
         self.reset_slash_window();
@@ -3810,17 +3787,36 @@ impl App {
         }
     }
 
-    /// After [`crate::tui::paste::PasteRegistry::register_text`] /
-    /// `register_image` recorded a new block at `[at, at+len)`, shift the
-    /// *other* blocks that started at/after `at` (the new one is exact).
-    /// `register_*` inserts the new block sorted, so we shift every block
-    /// whose start is `> at` (i.e. excluding the one we just added).
-    fn shift_other_blocks_after_insert(&mut self, at: usize, len: usize) {
-        for b in self.paste_registry.blocks_mut() {
-            if b.start > at {
-                b.start += len;
-                b.end += len;
-            }
+    pub(super) fn insert_image_handle_block(
+        &mut self,
+        admission: crate::tui::async_action::DaemonImagePathAdmission,
+    ) {
+        let draft = crate::tui::composer::ImageIngressDraftAuthority {
+            session_id: admission.session_id,
+            admission_id: admission.admission_id,
+            attachment_id: admission.image_ref.id,
+            local_operation_id: admission.discard_operation_id,
+        };
+        self.image_ingress_draft_discards
+            .entry(draft.admission_id)
+            .or_insert_with(|| (draft.clone(), false));
+        if !self.composer.try_insert_image_handle(
+            draft,
+            admission.image_ref,
+            admission.normalized_byte_length,
+            admission.sha256,
+        ) {
+            self.show_toast("Paste unavailable", super::ToastKind::Error);
+            return;
+        }
+        self.refresh_at_dismiss();
+        self.reset_at_window();
+        self.reset_slash_window();
+        if !self.active_model_supports_images() {
+            self.show_toast(
+                "Current model has no image support — this image will be sent as a text note.",
+                super::ToastKind::Info,
+            );
         }
     }
 
@@ -3829,57 +3825,6 @@ impl App {
     /// without a re-paste.
     pub(super) fn active_model_supports_images(&self) -> bool {
         self.launch.active_model_supports_images
-    }
-
-    /// `dd` — delete the current line, block-aware. Any paste block on
-    /// that line is removed whole (the whole line goes), and the registry
-    /// is reconciled for the removed byte range. The line's byte range is
-    /// computed up front (start of the line through its trailing `\n`, or
-    /// the preceding `\n` on the last line) so we can shift the registry
-    /// by the exact removed extent before delegating to the composer.
-    fn delete_current_line_block_aware(&mut self) {
-        if self.paste_registry.is_empty() {
-            self.composer.delete_current_line();
-            return;
-        }
-        let before = self.composer.len();
-        let cursor = self.composer.cursor();
-        let text = self.composer.text();
-        let line_start = text[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        self.composer.delete_current_line();
-        let removed = before - self.composer.len();
-        if removed > 0 {
-            // `delete_current_line` removes either `[line_start, …]` or,
-            // on the last line, `[line_start-1, …]`. The lower anchor is
-            // the smaller of the original line start and the post-delete
-            // cursor (which lands at the new line's start).
-            let anchor = line_start.min(self.composer.cursor());
-            self.paste_registry
-                .shift_for_edit(anchor, -(removed as isize));
-        }
-    }
-
-    /// Block whose closing `]` is exactly at the cursor (Backspace
-    /// whole-block delete). Mirrors `completed_tag_left` for `@`-tags.
-    fn paste_block_left(&self) -> Option<(usize, usize)> {
-        self.paste_registry
-            .block_ending_at(self.composer.cursor())
-            .map(|b| (b.start, b.end))
-    }
-
-    /// Block whose opening `[` is exactly at the cursor (forward-`Delete`
-    /// whole-block delete). Mirrors `completed_tag_right`.
-    fn paste_block_right(&self) -> Option<(usize, usize)> {
-        self.paste_registry
-            .block_starting_at(self.composer.cursor())
-            .map(|b| (b.start, b.end))
-    }
-
-    /// Delete the block at `[start, end)` from both the buffer and the
-    /// registry, leaving the cursor at `start`.
-    fn delete_paste_block(&mut self, start: usize, end: usize) {
-        self.composer.delete_range(start, end);
-        self.paste_registry.remove_range(start, end);
     }
 
     /// Apply a Tab press to the pending ghost prediction
@@ -3899,8 +3844,7 @@ impl App {
                 // (full) stage off the ghost.
             }
             GhostAccept::Fill(text) => {
-                self.composer.set(text);
-                self.paste_registry.clear();
+                self.replace_composer_buffer(text);
                 // Consume the ghost + its cache: the text is real now, and
                 // clearing the box later must not restore this prediction
                 // (the user has acted on it).
@@ -3909,197 +3853,18 @@ impl App {
         }
     }
 
-    /// Insert one char, block-aware. Fast-paths to the plain composer
-    /// insert when no blocks exist (so ordinary typing is byte-identical
-    /// to today). Otherwise snaps the insertion point out of any block
-    /// interior and shifts trailing block ranges.
-    fn composer_insert_char(&mut self, ch: char) {
-        if self.paste_registry.is_empty() {
-            self.composer.insert_char(ch);
-            return;
-        }
-        let at = self
-            .paste_registry
-            .resolve_insertion(self.composer.cursor());
-        self.composer.set_cursor(at);
-        self.composer.insert_char(ch);
-        self.paste_registry
-            .shift_for_edit(at, ch.len_utf8() as isize);
-    }
-
-    /// Backspace, block-aware. (The whole-block case is handled by the
-    /// caller via `paste_block_left`; this is the ordinary single-char
-    /// path.) Snaps the cursor off a left boundary first so a Backspace
-    /// just *inside* the text after a block can't reach into it, then
-    /// shifts trailing blocks for the removed byte.
-    fn composer_delete_left(&mut self) {
-        if self.paste_registry.is_empty() {
-            self.composer.delete_left();
-            return;
-        }
-        let cursor = self.composer.cursor();
-        // Never delete from inside a block interior — snap to its start.
-        let cursor = self.paste_registry.skip_cursor(cursor, false);
-        self.composer.set_cursor(cursor);
-        let before = self.composer.len();
-        self.composer.delete_left();
-        let removed = before - self.composer.len();
-        if removed > 0 {
-            // delete_left removes the char ending at the old cursor; the
-            // edit anchor is the new cursor position.
-            self.paste_registry
-                .shift_for_edit(self.composer.cursor(), -(removed as isize));
-        }
-    }
-
-    /// Forward-delete (`Delete` / vim `x`), block-aware ordinary-char
-    /// path. The whole-block case is handled by `paste_block_right`.
-    fn composer_delete_right(&mut self) {
-        if self.paste_registry.is_empty() {
-            self.composer.delete_right();
-            return;
-        }
-        let cursor = self.composer.cursor();
-        let cursor = self.paste_registry.skip_cursor(cursor, true);
-        self.composer.set_cursor(cursor);
-        let at = self.composer.cursor();
-        let before = self.composer.len();
-        self.composer.delete_right();
-        let removed = before - self.composer.len();
-        if removed > 0 {
-            self.paste_registry.shift_for_edit(at, -(removed as isize));
-        }
-    }
-
-    /// Run a vim normal-mode motion (`w`/`W`/`b`/`B`) then snap the cursor
-    /// off any block interior to the far boundary in the direction of
-    /// travel (`forward`), so a word motion treats a paste block as one
-    /// unit. Fast-paths when there are no blocks.
-    fn vim_motion<F: FnOnce(&mut crate::tui::composer::Composer)>(
-        &mut self,
-        motion: F,
-        forward: bool,
-    ) {
-        motion(&mut self.composer);
-        if self.paste_registry.is_empty() {
-            return;
-        }
-        let landed = self
-            .paste_registry
-            .skip_cursor(self.composer.cursor(), forward);
-        self.composer.set_cursor(landed);
-    }
-
-    /// Move left one unit, treating a block as a single step: landing on a
-    /// block's right boundary then moving left jumps to its left boundary.
-    fn composer_move_left(&mut self) {
-        if self.paste_registry.is_empty() {
-            self.composer.move_left();
-            return;
-        }
-        let cursor = self.composer.cursor();
-        // If we're exactly at a block's right edge, jump the whole block.
-        if let Some(b) = self.paste_registry.block_ending_at(cursor) {
-            self.composer.set_cursor(b.start);
-            return;
-        }
-        self.composer.move_left();
-        // If the plain move landed inside a block, snap to its start.
-        let landed = self
-            .paste_registry
-            .skip_cursor(self.composer.cursor(), false);
-        self.composer.set_cursor(landed);
-    }
-
-    /// Move right one unit, treating a block as a single step.
-    fn composer_move_right(&mut self) {
-        if self.paste_registry.is_empty() {
-            self.composer.move_right();
-            return;
-        }
-        let cursor = self.composer.cursor();
-        if let Some(b) = self.paste_registry.block_starting_at(cursor) {
-            self.composer.set_cursor(b.end);
-            return;
-        }
-        self.composer.move_right();
-        let landed = self
-            .paste_registry
-            .skip_cursor(self.composer.cursor(), true);
-        self.composer.set_cursor(landed);
-    }
-
-    /// Run a vim motion-delete (`dw`, `db`, `cw`, `d$`, `d0`, `dG`,
-    /// `dgg`, …) block-aware via a motion closure that moves the composer
-    /// cursor to the far end of the operator's range and a matching plain
-    /// `delete` closure for the no-blocks fast path. When blocks exist, we
-    /// delete the byte span between the start and the motion's landing
-    /// point, widened to a block boundary if it crosses any paste block,
-    /// so the block is removed whole. When no blocks exist we just run the
-    /// plain composer delete — vim editing is byte-identical to today.
-    fn block_aware_delete<M, D>(&mut self, motion: M, delete: D)
-    where
-        M: FnOnce(&mut crate::tui::composer::Composer),
-        D: FnOnce(&mut crate::tui::composer::Composer),
-    {
-        if self.paste_registry.is_empty() {
-            delete(&mut self.composer);
-            return;
-        }
-        let from = self.composer.cursor();
-        let to = self.composer.probe_motion(motion);
-        if from == to {
-            return;
-        }
-        let (mut lo, mut hi) = if from <= to { (from, to) } else { (to, from) };
-        // Widen the range to swallow any block it crosses, so a delete
-        // that touches a placeholder removes the whole block.
-        if let Some((bs, be)) = self.paste_registry.block_crossed_by(lo, hi) {
-            lo = lo.min(bs);
-            hi = hi.max(be);
-        }
-        self.composer.delete_range(lo, hi);
-        self.paste_registry
-            .shift_for_edit(lo, -((hi - lo) as isize));
-    }
-
     /// Run a `f`/`F`/`t`/`T` find as a standalone Normal-mode motion,
     /// then snap off any block interior in the direction of travel.
     fn vim_find_motion(&mut self, spec: FindSpec) {
         self.composer.apply_find(spec, true);
-        self.snap_off_block(spec.forward);
-    }
-
-    /// After a cursor jump (find/`;`/`,`), snap off any paste-block
-    /// interior to the far boundary in the direction of travel.
-    fn snap_off_block(&mut self, forward: bool) {
-        if self.paste_registry.is_empty() {
-            return;
-        }
-        let landed = self
-            .paste_registry
-            .skip_cursor(self.composer.cursor(), forward);
-        self.composer.set_cursor(landed);
     }
 
     /// vim `x` — forward-delete one char into the register (charwise).
     /// The block case is handled by the caller (`paste_block_right`).
     fn vim_cut_char_forward(&mut self) {
-        let from = self.composer.cursor();
-        let Some(ch) = self.composer.text()[from..].chars().next() else {
-            return;
-        };
-        if ch == '\n' {
-            return;
+        if self.composer.cut_char_forward() {
+            self.mirror_register_to_clipboard();
         }
-        let hi = from + ch.len_utf8();
-        // Yank the char and remove it, block-aware via the registry.
-        self.composer.cut_range(from, hi, false);
-        if !self.paste_registry.is_empty() {
-            self.paste_registry
-                .shift_for_edit(from, -((hi - from) as isize));
-        }
-        self.mirror_register_to_clipboard();
     }
 
     /// vim `p` (`after = true`) / `P` (`after = false`). Pulls the OS
@@ -4108,54 +3873,10 @@ impl App {
     /// text and reconciles the paste registry for the inserted span.
     fn vim_paste(&mut self, after: bool) {
         self.sync_register_from_clipboard();
-        if self.composer.register().text.is_empty() {
-            return;
-        }
-        let before_len = self.composer.len();
-        let before_cursor = self.composer.cursor();
-        // The composer's paste lands relative to the cursor; snap the
-        // cursor off any block interior first so we never insert inside a
-        // block. (`p` inserts after the cursor cell — a block right edge
-        // is a valid landing; `P` inserts before — a block left edge is.)
-        if !self.paste_registry.is_empty() {
-            let snapped = self.paste_registry.skip_cursor(before_cursor, after);
-            self.composer.set_cursor(snapped);
-        }
-        // Record the insertion anchor: `p` inserts after the cursor cell,
-        // `P` at the cursor. We compute it the same way the composer does
-        // so the registry shift matches.
-        let cursor = self.composer.cursor();
-        let reg = self.composer.register().clone();
-        let anchor = if reg.linewise {
-            // Linewise inserts at a line boundary; compute it for the shift.
-            if after {
-                self.composer.text()[cursor..]
-                    .find('\n')
-                    .map(|i| cursor + i + 1)
-                    .unwrap_or(self.composer.len())
-            } else {
-                self.composer.text()[..cursor]
-                    .rfind('\n')
-                    .map(|i| i + 1)
-                    .unwrap_or(0)
-            }
-        } else if after {
-            self.composer.text()[cursor..]
-                .chars()
-                .next()
-                .map(|c| cursor + c.len_utf8())
-                .unwrap_or(cursor)
-        } else {
-            cursor
-        };
         if after {
             self.composer.paste_after();
         } else {
             self.composer.paste_before();
-        }
-        let inserted = self.composer.len() as isize - before_len as isize;
-        if inserted > 0 && !self.paste_registry.is_empty() {
-            self.paste_registry.shift_for_edit(anchor, inserted);
         }
     }
 
@@ -4199,7 +3920,6 @@ impl App {
             if let KeyCode::Char(ch) = key.code {
                 spec.target = ch;
                 self.composer.apply_find(spec, true);
-                self.snap_off_block(spec.forward);
             }
             return false;
         }
@@ -4261,27 +3981,37 @@ impl App {
             KeyCode::Char('T') => self.composer.set_pending_find(Some(find_spec(true, false))),
             KeyCode::Char(';') => {
                 self.composer.repeat_find(false);
-                self.snap_off_block(true);
             }
             KeyCode::Char(',') => {
                 self.composer.repeat_find(true);
-                self.snap_off_block(false);
             }
             // Motions extend the selection (move the live cursor).
-            KeyCode::Char('h') | KeyCode::Left => self.composer_move_left(),
-            KeyCode::Char('l') | KeyCode::Right => self.composer_move_right(),
+            KeyCode::Char('h') | KeyCode::Left => self.composer.move_left(),
+            KeyCode::Char('l') | KeyCode::Right => self.composer.move_right(),
             KeyCode::Char('j') | KeyCode::Down => self.composer.move_down(),
             KeyCode::Char('k') | KeyCode::Up => self.composer.move_up(),
-            KeyCode::Char('w') => self.vim_motion(|c| c.move_word_forward(false), true),
-            KeyCode::Char('W') => self.vim_motion(|c| c.move_word_forward(true), true),
-            KeyCode::Char('b') => self.vim_motion(|c| c.move_word_backward(false), false),
-            KeyCode::Char('B') => self.vim_motion(|c| c.move_word_backward(true), false),
-            KeyCode::Char('e') => self.vim_motion(|c| c.move_word_end(false), true),
-            KeyCode::Char('E') => self.vim_motion(|c| c.move_word_end(true), true),
+            KeyCode::Char('w') => self
+                .composer
+                .move_cursor(ComposerMotion::WordForward { big: false }),
+            KeyCode::Char('W') => self
+                .composer
+                .move_cursor(ComposerMotion::WordForward { big: true }),
+            KeyCode::Char('b') => self
+                .composer
+                .move_cursor(ComposerMotion::WordBackward { big: false }),
+            KeyCode::Char('B') => self
+                .composer
+                .move_cursor(ComposerMotion::WordBackward { big: true }),
+            KeyCode::Char('e') => self
+                .composer
+                .move_cursor(ComposerMotion::WordEnd { big: false }),
+            KeyCode::Char('E') => self
+                .composer
+                .move_cursor(ComposerMotion::WordEnd { big: true }),
             KeyCode::Char('0') => self.composer.move_line_start(),
             KeyCode::Char('$') => self.composer.move_line_end(),
             KeyCode::Char('G') => self.composer.move_buffer_end(),
-            KeyCode::Char('%') => self.vim_motion(|c| c.match_bracket(), true),
+            KeyCode::Char('%') => self.composer.move_cursor(ComposerMotion::MatchBracket),
             KeyCode::Char('g') => {
                 if self.composer.pending_g() {
                     self.composer.move_buffer_start();
@@ -4314,42 +4044,7 @@ impl App {
     /// visual mode (Change enters Insert; otherwise Normal). Empty /
     /// zero-width selections are a clean no-op back to Normal.
     fn visual_operate(&mut self, op: Operator) {
-        let linewise = self.composer.vim_mode() == VimMode::VisualLine;
-        let Some((lo, hi)) = self.composer.visual_range() else {
-            self.composer.end_visual();
-            return;
-        };
-        if lo >= hi {
-            self.composer.end_visual();
-            return;
-        }
-        // Widen to swallow any block the selection crosses (atomic).
-        let (mut lo, mut hi) = (lo, hi);
-        if let Some((bs, be)) = self.paste_registry.block_crossed_by(lo, hi) {
-            lo = lo.min(bs);
-            hi = hi.max(be);
-        }
-        match op {
-            Operator::Yank => {
-                self.composer.yank_range(lo, hi, linewise);
-                self.composer.set_cursor(lo);
-                self.composer.set_vim_mode(VimMode::Normal);
-            }
-            Operator::Delete | Operator::Change => {
-                self.composer.cut_range(lo, hi, linewise);
-                self.paste_registry
-                    .shift_for_edit(lo, -((hi - lo) as isize));
-                self.composer
-                    .set_vim_mode(if matches!(op, Operator::Change) {
-                        VimMode::Insert
-                    } else {
-                        VimMode::Normal
-                    });
-            }
-        }
-        // Drop the anchor (we set the mode directly above, not via
-        // end_visual, to preserve the Change→Insert transition).
-        self.composer.clear_visual_anchor();
+        self.composer.visual_operate(op);
         self.mirror_register_to_clipboard();
     }
 
@@ -4578,58 +4273,68 @@ fn cursor_on_last_line(text: &str, cursor: usize) -> bool {
     !after.contains('\n')
 }
 
-pub(super) fn validate_pasted_images_for_submit(images: &[Vec<u8>]) -> Result<(), String> {
+pub(super) fn validate_pasted_images_for_submit(
+    images: &[cockpit_client::image_upload::SubmissionImage],
+) -> Result<(), String> {
     if images.is_empty() {
         return Ok(());
     }
     validate_pasted_image_sizes(images)?;
-    for (idx, png) in images.iter().enumerate() {
+    for (idx, image) in images.iter().enumerate() {
+        let cockpit_client::image_upload::SubmissionImage::Png { bytes: png } = image else {
+            continue;
+        };
         let display_idx = idx + 1;
         let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
             .map_err(|_| format!("Pasted image #{display_idx} is not a valid PNG."))?;
-        if image.width() > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
-            || image.height() > cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+        if image.width() > cockpit_proto::MAX_IMAGE_DIMENSION_PIXELS
+            || image.height() > cockpit_proto::MAX_IMAGE_DIMENSION_PIXELS
         {
             return Err(format!(
                 "Pasted image #{display_idx} is too large: {}x{} exceeds the {} pixel dimension limit.",
                 image.width(),
                 image.height(),
-                cockpit_core::daemon::proto::MAX_IMAGE_DIMENSION_PIXELS
+                cockpit_proto::MAX_IMAGE_DIMENSION_PIXELS
             ));
         }
     }
     Ok(())
 }
 
-fn validate_pasted_image_sizes(images: &[Vec<u8>]) -> Result<(), String> {
-    if images.len() > cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE {
+fn validate_pasted_image_sizes(
+    images: &[cockpit_client::image_upload::SubmissionImage],
+) -> Result<(), String> {
+    if images.len() > cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE {
         return Err(format!(
             "Too many pasted images: {} exceeds the {} image limit.",
             images.len(),
-            cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE
+            cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE
         ));
     }
     let mut total = 0usize;
-    for (idx, png) in images.iter().enumerate() {
+    for (idx, image) in images.iter().enumerate() {
+        let cockpit_client::image_upload::SubmissionImage::Png { bytes: png } = image else {
+            continue;
+        };
         let display_idx = idx + 1;
         if png.is_empty() {
             return Err(format!("Pasted image #{display_idx} is empty."));
         }
-        if png.len() > cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES {
+        if png.len() > cockpit_proto::MAX_SINGLE_IMAGE_BYTES {
             return Err(format!(
                 "Pasted image #{display_idx} is too large: {} bytes exceeds the {} byte limit.",
                 png.len(),
-                cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES
+                cockpit_proto::MAX_SINGLE_IMAGE_BYTES
             ));
         }
         total = total
             .checked_add(png.len())
             .ok_or_else(|| "Pasted image byte count overflowed.".to_string())?;
-        if total > cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES {
+        if total > cockpit_proto::MAX_TOTAL_IMAGE_BYTES {
             return Err(format!(
                 "Pasted images are too large: {} total bytes exceeds the {} byte limit.",
                 total,
-                cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES
+                cockpit_proto::MAX_TOTAL_IMAGE_BYTES
             ));
         }
     }
@@ -4655,23 +4360,29 @@ mod image_submit_validation_tests {
 
     #[test]
     fn accepts_valid_png_under_limits() {
-        validate_pasted_images_for_submit(&[sample_png()]).unwrap();
+        validate_pasted_images_for_submit(&[cockpit_client::image_upload::SubmissionImage::png(
+            sample_png(),
+        )])
+        .unwrap();
     }
 
     #[test]
     fn rejects_too_many_images_before_dispatch() {
         let png = sample_png();
-        let images = vec![png; cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE + 1];
+        let images = vec![
+            cockpit_client::image_upload::SubmissionImage::png(png);
+            cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE + 1
+        ];
         let err = validate_pasted_images_for_submit(&images).expect_err("too many");
         assert!(err.contains("Too many pasted images"));
     }
 
     #[test]
     fn rejects_oversized_single_image_before_dispatch() {
-        let images = vec![vec![
+        let images = vec![cockpit_client::image_upload::SubmissionImage::png(vec![
             0u8;
-            cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES + 1
-        ]];
+            cockpit_proto::MAX_SINGLE_IMAGE_BYTES + 1
+        ])];
         let err = validate_pasted_images_for_submit(&images).expect_err("oversized");
         assert!(err.contains("too large"));
         assert!(err.contains("byte limit"));
@@ -4679,23 +4390,61 @@ mod image_submit_validation_tests {
 
     #[test]
     fn exact_image_count_and_byte_boundaries() {
-        let count = cockpit_core::daemon::proto::MAX_IMAGES_PER_USER_MESSAGE;
-        let single = cockpit_core::daemon::proto::MAX_SINGLE_IMAGE_BYTES;
-        let total = cockpit_core::daemon::proto::MAX_TOTAL_IMAGE_BYTES;
-        assert!(validate_pasted_image_sizes(&vec![vec![1]; count]).is_ok());
-        assert!(validate_pasted_image_sizes(&vec![vec![1]; count + 1]).is_err());
-        assert!(validate_pasted_image_sizes(&[vec![1; single]]).is_ok());
-        assert!(validate_pasted_image_sizes(&[vec![1; single + 1]]).is_err());
-        let first = single.min(total);
-        assert!(validate_pasted_image_sizes(&[vec![1; first], vec![1; total - first]]).is_ok());
+        let count = cockpit_proto::MAX_IMAGES_PER_USER_MESSAGE;
+        let single = cockpit_proto::MAX_SINGLE_IMAGE_BYTES;
+        let total = cockpit_proto::MAX_TOTAL_IMAGE_BYTES;
         assert!(
-            validate_pasted_image_sizes(&[vec![1; first], vec![1; total - first + 1]]).is_err()
+            validate_pasted_image_sizes(&vec![
+                cockpit_client::image_upload::SubmissionImage::png(
+                    vec![1]
+                );
+                count
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_pasted_image_sizes(&vec![
+                cockpit_client::image_upload::SubmissionImage::png(
+                    vec![1]
+                );
+                count + 1
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_pasted_image_sizes(&[cockpit_client::image_upload::SubmissionImage::png(
+                vec![1; single]
+            )])
+            .is_ok()
+        );
+        assert!(
+            validate_pasted_image_sizes(&[cockpit_client::image_upload::SubmissionImage::png(
+                vec![1; single + 1]
+            )])
+            .is_err()
+        );
+        let first = single.min(total);
+        assert!(
+            validate_pasted_image_sizes(&[
+                cockpit_client::image_upload::SubmissionImage::png(vec![1; first]),
+                cockpit_client::image_upload::SubmissionImage::png(vec![1; total - first]),
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_pasted_image_sizes(&[
+                cockpit_client::image_upload::SubmissionImage::png(vec![1; first]),
+                cockpit_client::image_upload::SubmissionImage::png(vec![1; total - first + 1]),
+            ])
+            .is_err()
         );
     }
 
     #[test]
     fn rejects_malformed_png_before_dispatch() {
-        let images = vec![b"not png".to_vec()];
+        let images = vec![cockpit_client::image_upload::SubmissionImage::png(
+            b"not png".to_vec(),
+        )];
         let err = validate_pasted_images_for_submit(&images).expect_err("invalid png");
         assert!(err.contains("not a valid PNG"));
     }
@@ -4779,10 +4528,12 @@ mod queued_message_edit_tests {
     };
     use crate::tui::agent_runner::{AgentRunner, AttachedRequest, TestRunnerOverrides};
     use crate::tui::app::App;
-    use cockpit_core::daemon::proto::{
+    use cockpit_core::engine::message::QueueItemStatus as EngineQueueItemStatus;
+    use cockpit_proto::{
         QueueItem, QueueItemStatus, RemoveQueuedUserMessageReason, Request, Response,
     };
-    use cockpit_core::engine::message::QueueItemStatus as EngineQueueItemStatus;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
     fn runner_with_attached_request_tx(
@@ -4794,8 +4545,8 @@ mod queued_message_edit_tests {
         })
     }
 
-    fn proto_target(id: &str) -> cockpit_core::daemon::proto::QueueTarget {
-        cockpit_core::daemon::proto::QueueTarget {
+    fn proto_target(id: &str) -> cockpit_proto::QueueTarget {
+        cockpit_proto::QueueTarget {
             id: id.to_string(),
             agent: "Build".to_string(),
             depth: 0,
@@ -4806,7 +4557,7 @@ mod queued_message_edit_tests {
     fn proto_item_with_target(
         text: &str,
         status: QueueItemStatus,
-        target: cockpit_core::daemon::proto::QueueTarget,
+        target: cockpit_proto::QueueTarget,
     ) -> QueueItem {
         QueueItem {
             id: uuid::Uuid::new_v4(),
@@ -4818,11 +4569,7 @@ mod queued_message_edit_tests {
     }
 
     fn proto_item(text: &str, status: QueueItemStatus) -> QueueItem {
-        proto_item_with_target(
-            text,
-            status,
-            cockpit_core::daemon::proto::QueueTarget::default(),
-        )
+        proto_item_with_target(text, status, cockpit_proto::QueueTarget::default())
     }
 
     #[test]
@@ -4842,14 +4589,14 @@ mod queued_message_edit_tests {
                     status: QueueItemStatus::Queued,
                     text: older.text,
                     display_text: None,
-                    target: cockpit_core::daemon::proto::QueueTarget::default(),
+                    target: cockpit_proto::QueueTarget::default(),
                 },
                 QueueItem {
                     id: newer.id,
                     status: QueueItemStatus::Queued,
                     text: newer.text,
                     display_text: Some("edit @a.rs".to_string()),
-                    target: cockpit_core::daemon::proto::QueueTarget::default(),
+                    target: cockpit_proto::QueueTarget::default(),
                 },
             ],
             queue: Vec::new(),
@@ -4914,7 +4661,7 @@ mod queued_message_edit_tests {
                 status: QueueItemStatus::Queued,
                 text: editable.text,
                 display_text: Some("editable @compact".to_string()),
-                target: cockpit_core::daemon::proto::QueueTarget::default(),
+                target: cockpit_proto::QueueTarget::default(),
             }],
             queue: Vec::new(),
         });
@@ -5191,11 +4938,11 @@ mod queued_message_edit_tests {
 mod paste_routing_tests {
     use crate::tui::agent_runner::{AgentRunner, TestRunnerOverrides};
     use crate::tui::app::{App, Overlay, PendingModelSelection};
+    use crate::tui::composer::{RegisteredComposer, TestPasteKind};
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
-    use crate::tui::paste::{PasteKind, PasteRegistry};
     use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
     use crate::tui::settings::Dialog;
-    use cockpit_core::daemon::proto::PinnedMessage;
+    use cockpit_proto::PinnedMessage;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use tokio::sync::mpsc;
 
@@ -5234,7 +4981,7 @@ mod paste_routing_tests {
                 thinking_mode: None,
                 prompt_cache_retention: None,
             },
-            trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+            trigger: cockpit_proto::ActiveModelSwitchTrigger::Picker,
             minimum_generation: app.active_model_state_generation,
             started_at: std::time::Instant::now(),
             queued_submission: None,
@@ -5309,7 +5056,7 @@ mod paste_routing_tests {
         app.handle_paste("modal paste".to_string());
 
         assert!(app.composer.is_empty());
-        assert!(app.paste_registry.is_empty());
+        assert!(app.composer.paste_is_empty());
     }
 
     #[tokio::test]
@@ -5327,19 +5074,20 @@ mod paste_routing_tests {
 
         assert_eq!(
             app.composer.text(),
-            PasteRegistry::pending_text_placeholder(1)
+            RegisteredComposer::test_pending_text_placeholder(1)
         );
-        let block = &app.paste_registry.blocks()[0];
+        let block = &app.composer.test_paste_blocks()[0];
         assert!(matches!(
             &block.kind,
-            PasteKind::Text { full, tokens: None, .. } if full == &pasted
+            TestPasteKind::Text { full, tokens: None } if full == &pasted
         ));
 
         drain_async_actions_until_idle(&mut app).await;
 
-        let expected = PasteRegistry::text_placeholder(1, cockpit_core::tokens::count(&pasted));
+        let expected =
+            RegisteredComposer::test_text_placeholder(1, cockpit_tokenizer::count(&pasted));
         assert_eq!(app.composer.text(), expected);
-        let block = &app.paste_registry.blocks()[0];
+        let block = &app.composer.test_paste_blocks()[0];
         assert_eq!((block.start, block.end), (0, expected.len()));
     }
 
@@ -5351,7 +5099,7 @@ mod paste_routing_tests {
 
         app.handle_paste(pasted.clone());
 
-        let (wire, images) = app.paste_registry.build_wire(app.composer.text(), true);
+        let (wire, images) = app.composer.wire_parts(true);
         assert!(wire.contains("<user_paste id=\""), "{wire}");
         assert!(wire.contains(&pasted), "{wire}");
         assert!(wire.contains("</user_paste id=\""), "{wire}");
@@ -5365,12 +5113,8 @@ mod paste_routing_tests {
         let (input_tx, mut input_rx) = mpsc::channel(1);
         app.agent_runner = Some(Ok(runner_with_input_tx(input_tx)));
         let pasted = long_paste("wire display");
-        let placeholder = app.paste_registry.register_text(
-            0,
-            pasted.clone(),
-            cockpit_core::tokens::count(&pasted),
-        );
-        app.composer.insert_str(&placeholder);
+        app.composer
+            .insert_registered_text(pasted.clone(), cockpit_tokenizer::count(&pasted));
 
         let keep_running = app.submit_input();
 
@@ -5424,7 +5168,7 @@ mod paste_routing_tests {
         app.handle_paste(pasted.clone());
 
         assert_eq!(app.composer.text(), pasted);
-        assert!(app.paste_registry.is_empty());
+        assert!(app.composer.paste_is_empty());
     }
 
     #[tokio::test]
@@ -5434,13 +5178,16 @@ mod paste_routing_tests {
         let pasted = long_paste("delete");
 
         app.handle_paste(pasted);
-        let block_id = app.paste_registry.blocks()[0].id;
-        let (start, end) = app.paste_block_left().expect("cursor after placeholder");
-        app.delete_paste_block(start, end);
+        let block_id = app.composer.test_paste_blocks()[0].id;
+        let (start, end) = app
+            .composer
+            .paste_block_left()
+            .expect("cursor after placeholder");
+        app.composer.delete_paste_block(start, end);
 
         assert!(!app.apply_paste_token_count(block_id, 123));
         assert!(app.composer.is_empty());
-        assert!(app.paste_registry.is_empty());
+        assert!(app.composer.paste_is_empty());
     }
 
     #[tokio::test]
@@ -5450,18 +5197,18 @@ mod paste_routing_tests {
         let pasted = long_paste("shift");
 
         app.handle_paste(pasted);
-        let block_id = app.paste_registry.blocks()[0].id;
+        let block_id = app.composer.test_paste_blocks()[0].id;
         app.composer.set_cursor(0);
-        app.composer_insert_char('>');
+        app.composer.insert_char('>');
 
-        assert_eq!(app.paste_registry.blocks()[0].start, 1);
+        assert_eq!(app.composer.test_paste_blocks()[0].start, 1);
         assert!(app.apply_paste_token_count(block_id, 123));
-        let expected = format!(">{}", PasteRegistry::text_placeholder(1, 123));
+        let expected = format!(">{}", RegisteredComposer::test_text_placeholder(1, 123));
         assert_eq!(app.composer.text(), expected);
-        let block = &app.paste_registry.blocks()[0];
+        let block = &app.composer.test_paste_blocks()[0];
         assert_eq!(
             &app.composer.text()[block.start..block.end],
-            PasteRegistry::text_placeholder(1, 123)
+            RegisteredComposer::test_text_placeholder(1, 123)
         );
     }
 
@@ -5473,26 +5220,26 @@ mod paste_routing_tests {
         let second = long_paste("second");
 
         app.handle_paste(first);
-        app.composer_insert_char(' ');
+        app.composer.insert_char(' ');
         app.handle_paste(second);
-        let first_id = app.paste_registry.blocks()[0].id;
-        let second_id = app.paste_registry.blocks()[1].id;
+        let first_id = app.composer.test_paste_blocks()[0].id;
+        let second_id = app.composer.test_paste_blocks()[1].id;
 
         assert!(app.apply_paste_token_count(second_id, 22));
         assert!(app.apply_paste_token_count(first_id, 11));
 
         let expected = format!(
             "{} {}",
-            PasteRegistry::text_placeholder(1, 11),
-            PasteRegistry::text_placeholder(2, 22)
+            RegisteredComposer::test_text_placeholder(1, 11),
+            RegisteredComposer::test_text_placeholder(2, 22)
         );
         assert_eq!(app.composer.text(), expected);
-        for block in app.paste_registry.blocks() {
+        for block in app.composer.test_paste_blocks() {
             assert_eq!(
                 &app.composer.text()[block.start..block.end],
                 match block.number {
-                    1 => PasteRegistry::text_placeholder(1, 11),
-                    2 => PasteRegistry::text_placeholder(2, 22),
+                    1 => RegisteredComposer::test_text_placeholder(1, 11),
+                    2 => RegisteredComposer::test_text_placeholder(2, 22),
                     other => panic!("unexpected block number {other}"),
                 }
             );
@@ -5507,7 +5254,7 @@ mod paste_routing_tests {
         app.handle_paste("short text".to_string());
 
         assert_eq!(app.composer.text(), "short text");
-        assert!(app.paste_registry.is_empty());
+        assert!(app.composer.paste_is_empty());
     }
 
     #[test]
@@ -5552,7 +5299,7 @@ mod paste_routing_tests {
         };
         assert_eq!(pane.editor_text_for_test(), "hi");
         assert!(app.composer.is_empty());
-        assert!(app.paste_registry.is_empty());
+        assert!(app.composer.paste_is_empty());
     }
 
     #[test]
@@ -5572,6 +5319,7 @@ mod paste_routing_tests {
                 owner_fence: None,
                 original_offset: 0,
                 deadline: std::time::Duration::from_secs(2),
+                image_admission_id: None,
                 async_action_id: None,
             },
         );
@@ -5587,7 +5335,7 @@ mod paste_routing_tests {
         assert!(!app.pending_paste_probes.contains_key(&stale_native_id));
         assert_eq!(
             app.async_actions.pending_kind_count(
-                &crate::tui::async_action::AsyncActionKind::Internal("paste.image_path_probe")
+                &crate::tui::async_action::AsyncActionKind::DaemonRpc("paste.image_path_admission",)
             ),
             0
         );
@@ -5610,6 +5358,7 @@ mod paste_routing_tests {
                 owner_fence: None,
                 original_offset: 0,
                 deadline: std::time::Duration::from_secs(2),
+                image_admission_id: None,
                 async_action_id: None,
             },
         );
@@ -5643,6 +5392,7 @@ mod paste_routing_tests {
                     owner_fence,
                     original_offset: 7,
                     deadline,
+                    image_admission_id: None,
                     async_action_id: None,
                 },
             );
@@ -5684,6 +5434,7 @@ mod paste_routing_tests {
                 owner_fence: None,
                 original_offset: 3,
                 deadline,
+                image_admission_id: None,
                 async_action_id: None,
             },
         );
@@ -5723,6 +5474,7 @@ mod paste_routing_tests {
                 owner_fence: None,
                 original_offset: 5,
                 deadline,
+                image_admission_id: None,
                 async_action_id: None,
             },
         );
@@ -5821,7 +5573,7 @@ mod paste_routing_tests {
                 .contains("hello")
         );
         assert!(app.composer.is_empty());
-        assert!(app.paste_registry.is_empty());
+        assert!(app.composer.paste_is_empty());
         app.close_pane(true);
     }
 
@@ -6096,7 +5848,7 @@ mod chat_scrollback_key_tests {
     use super::super::Selection;
     use super::*;
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
-    use cockpit_core::daemon::proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
+    use cockpit_proto::{InterruptOption, InterruptQuestion, InterruptQuestionSet};
     use crossterm::event::{KeyEventState, KeyModifiers};
     use std::time::Duration;
     use uuid::Uuid;

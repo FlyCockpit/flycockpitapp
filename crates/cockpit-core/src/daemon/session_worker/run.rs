@@ -3192,11 +3192,11 @@ pub(super) async fn persist_staged_terminal_removal(
             disposition = disposition.as_str(),
             "terminal client-submission receipt write failed; exact queued payload remains held"
         );
-        return Err(proto::ErrorPayload {
-            code: proto::ErrorCode::Internal,
-            message: "could not durably remove queued message; its exact payload remains held and will not execute; retry the same removal"
-                .to_string(),
-        });
+        return Err(user_message_database_error(
+            &error,
+            proto::ErrorCode::Internal,
+            "could not durably remove queued message; its exact payload remains held and will not execute; retry the same removal",
+        ));
     }
     let snapshot = commit_staged_removal_after_receipts(session, queue, staged, &receipts).await;
     Ok((removed, snapshot, receipts))
@@ -3352,10 +3352,11 @@ pub(super) async fn reserve_remote_send_operation_impl(
             code: proto::ErrorCode::Conflict,
             message: "remote operation capacity reached".into(),
         }),
-        Err(_) => RemoteSendDecision::Rejected(proto::ErrorPayload {
-            code: proto::ErrorCode::Internal,
-            message: "remote send could not be committed to the operation ledger".into(),
-        }),
+        Err(error) => RemoteSendDecision::Rejected(user_message_database_error(
+            &error,
+            proto::ErrorCode::Internal,
+            "remote send could not be committed to the operation ledger",
+        )),
     }
 }
 
@@ -3476,6 +3477,95 @@ fn text_artifact_terminal_error(
     }
 }
 
+/// Preserve SQLite durability categories at the user-message boundary.
+///
+/// User-message admission has specialized fallback errors, but those must not
+/// erase a storage failure whose commit outcome may be unknown. Clients retain
+/// and reconcile the exact submission only for these structured storage codes.
+fn user_message_database_error(
+    error: &anyhow::Error,
+    fallback_code: proto::ErrorCode,
+    fallback_message: impl Into<String>,
+) -> proto::ErrorPayload {
+    let code = match crate::db::classify_database_storage_failure(error.as_ref()) {
+        Some(crate::db::DatabaseStorageFailure::Capacity) => proto::ErrorCode::StorageFull,
+        Some(crate::db::DatabaseStorageFailure::Memory) => proto::ErrorCode::StorageMemory,
+        Some(crate::db::DatabaseStorageFailure::ReadOnly) => proto::ErrorCode::StorageReadOnly,
+        Some(crate::db::DatabaseStorageFailure::Io) => proto::ErrorCode::StorageIo,
+        Some(crate::db::DatabaseStorageFailure::Corrupt) => proto::ErrorCode::StorageCorrupt,
+        None => {
+            return proto::ErrorPayload {
+                code: fallback_code,
+                message: fallback_message.into(),
+            };
+        }
+    };
+    proto::ErrorPayload {
+        code,
+        message: format!("{error:#}"),
+    }
+}
+
+#[cfg(test)]
+mod user_message_database_error_tests {
+    use super::*;
+
+    #[test]
+    fn every_queue_receipt_storage_failure_keeps_its_ambiguous_reconciliation_code() {
+        for (sqlite_code, protocol_code) in [
+            (rusqlite::ErrorCode::DiskFull, proto::ErrorCode::StorageFull),
+            (
+                rusqlite::ErrorCode::OutOfMemory,
+                proto::ErrorCode::StorageMemory,
+            ),
+            (
+                rusqlite::ErrorCode::ReadOnly,
+                proto::ErrorCode::StorageReadOnly,
+            ),
+            (
+                rusqlite::ErrorCode::SystemIoFailure,
+                proto::ErrorCode::StorageIo,
+            ),
+            (
+                rusqlite::ErrorCode::DatabaseCorrupt,
+                proto::ErrorCode::StorageCorrupt,
+            ),
+        ] {
+            let sqlite = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: sqlite_code,
+                    extended_code: 0,
+                },
+                None,
+            );
+            let error = anyhow::Error::new(sqlite)
+                .context("terminal queue receipt commit outcome is ambiguous");
+            let payload = user_message_database_error(
+                &error,
+                proto::ErrorCode::UserMessageNotAccepted,
+                "fallback must not win",
+            );
+            assert_eq!(payload.code, protocol_code);
+            assert!(
+                payload
+                    .message
+                    .contains("terminal queue receipt commit outcome is ambiguous")
+            );
+        }
+    }
+
+    #[test]
+    fn non_storage_failure_retains_the_phase_specific_fallback() {
+        let payload = user_message_database_error(
+            &anyhow::anyhow!("validation failed"),
+            proto::ErrorCode::UserMessageNotAccepted,
+            "phase-specific refusal",
+        );
+        assert_eq!(payload.code, proto::ErrorCode::UserMessageNotAccepted);
+        assert_eq!(payload.message, "phase-specific refusal");
+    }
+}
+
 /// Map a fresh remote-ledger rejection to the closed FCM2 terminal domain.
 /// Once phase one owns a reservation, callers must not leave it accepted just
 /// because a later, independent in-memory/remote admission gate declined the
@@ -3534,21 +3624,22 @@ async fn reject_oversized_text_artifact_admission(
                 Err(error) => {
                     tracing::warn!(%error, %replay_session_id, operation_id = ?replay_operation_id,
                         "could not reload stale oversized admission after terminalization");
-                    proto::ErrorPayload {
-                        code: proto::ErrorCode::UserMessageNotAccepted,
-                        message: "could not finalize oversized user message admission; retry"
-                            .to_owned(),
-                    }
+                    user_message_database_error(
+                        &error,
+                        proto::ErrorCode::UserMessageNotAccepted,
+                        "could not finalize oversized user message admission; retry",
+                    )
                 }
             }
         }
         Err(error) => {
             tracing::warn!(%error, %replay_session_id, operation_id = ?replay_operation_id,
                 "failed to terminalize oversized user-message admission");
-            proto::ErrorPayload {
-                code: proto::ErrorCode::UserMessageNotAccepted,
-                message: "could not finalize oversized user message admission; retry".to_owned(),
-            }
+            user_message_database_error(
+                &error,
+                proto::ErrorCode::UserMessageNotAccepted,
+                "could not finalize oversized user message admission; retry",
+            )
         }
     }
 }
@@ -3829,9 +3920,13 @@ async fn commit_remote_queue_mutation(
             if let Some(staged) = staged.as_ref() { queue.mark_staged_removal_failed(staged).await; }
             Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation capacity reached".into() })
         }
-        Err(_) => {
+        Err(error) => {
             if let Some(staged) = staged.as_ref() { queue.mark_staged_removal_failed(staged).await; }
-            Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: "remote queue operation could not be committed".into() })
+            Err(user_message_database_error(
+                &error,
+                proto::ErrorCode::Internal,
+                "remote queue operation could not be committed",
+            ))
         }
     }
 }
@@ -3872,11 +3967,11 @@ async fn probe_user_message(
         .map_err(|error| {
             tracing::warn!(%error, %session_id, %client_submission_id,
                 "client submission probe failed; refusing ambiguous retry");
-            proto::ErrorPayload {
-                code: proto::ErrorCode::Internal,
-                message: "could not verify whether this message was already accepted; retry"
-                    .to_string(),
-            }
+            user_message_database_error(
+                &error,
+                proto::ErrorCode::Internal,
+                "could not verify whether this message was already accepted; retry",
+            )
         })?;
 
     let terminal = if durable.is_none() {
@@ -3887,11 +3982,11 @@ async fn probe_user_message(
             .map_err(|error| {
                 tracing::warn!(%error, %session_id, %client_submission_id,
                     "terminal client submission probe failed; refusing ambiguous retry");
-                proto::ErrorPayload {
-                    code: proto::ErrorCode::Internal,
-                    message: "could not verify whether this message was already terminated; retry"
-                        .to_string(),
-                }
+                user_message_database_error(
+                    &error,
+                    proto::ErrorCode::Internal,
+                    "could not verify whether this message was already terminated; retry",
+                )
             })?
     } else {
         None
@@ -7282,12 +7377,11 @@ pub(super) async fn run_worker(
                         if let Err(error) = session.persist_if_needed() {
                             tracing::error!(%error, %session_id, client_submission_id = %receipt.id,
                                 "persisting session before FCM2 artifact admission failed");
-                            let _ = respond_to.send(Err(proto::ErrorPayload {
-                                code: proto::ErrorCode::UserMessageNotAccepted,
-                                message:
-                                    "session persistence failed before oversized message admission"
-                                        .to_owned(),
-                            }));
+                            let _ = respond_to.send(Err(user_message_database_error(
+                                &error,
+                                proto::ErrorCode::UserMessageNotAccepted,
+                                "session persistence failed before oversized message admission",
+                            )));
                             continue;
                         }
                         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -7298,11 +7392,11 @@ pub(super) async fn run_worker(
                         {
                             tracing::warn!(%error, %session_id,
                                 "reconciling expired oversized reservations before admission failed");
-                            let _ = respond_to.send(Err(proto::ErrorPayload {
-                                code: proto::ErrorCode::UserMessageNotAccepted,
-                                message: "could not reconcile oversized message admission; retry"
-                                    .to_owned(),
-                            }));
+                            let _ = respond_to.send(Err(user_message_database_error(
+                                &error,
+                                proto::ErrorCode::UserMessageNotAccepted,
+                                "could not reconcile oversized message admission; retry",
+                            )));
                             continue;
                         }
                         let canonical = match validate_oversized_artifact_admission(
@@ -7451,10 +7545,11 @@ pub(super) async fn run_worker(
                             Err(error) => {
                                 tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
                                     "oversized FCM2 receipt/reservation composition failed");
-                                let _ = respond_to.send(Err(proto::ErrorPayload {
-                                    code: proto::ErrorCode::UserMessageNotAccepted,
-                                    message: "could not durably admit oversized user message; retry".to_owned(),
-                                }));
+                                let _ = respond_to.send(Err(user_message_database_error(
+                                    &error,
+                                    proto::ErrorCode::UserMessageNotAccepted,
+                                    "could not durably admit oversized user message; retry",
+                                )));
                                 continue;
                             }
                         };
@@ -7481,11 +7576,11 @@ pub(super) async fn run_worker(
                             Err(error) => {
                                 tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
                                 "terminal client submission lookup failed; refusing ambiguous enqueue");
-                                let _ = respond_to.send(Err(proto::ErrorPayload {
-                                code: proto::ErrorCode::Internal,
-                                message: "could not verify whether this message was already terminated; retry"
-                                    .to_string(),
-                            }));
+                                let _ = respond_to.send(Err(user_message_database_error(
+                                    &error,
+                                    proto::ErrorCode::Internal,
+                                    "could not verify whether this message was already terminated; retry",
+                                )));
                                 continue;
                             }
                         };
@@ -7523,23 +7618,35 @@ pub(super) async fn run_worker(
                     // check below so the full duplicate path (remote operation
                     // resolution, queue snapshot) is unchanged.
                     if artifact_admission.is_none() {
-                        if let Ok(Some(durable)) = session
+                        let durable = match session
                             .db
                             .client_submission_receipt(session_id, receipt.id)
                             .await
                         {
-                            if durable.origin_principal != receipt.origin_principal
-                                || durable.fingerprint != receipt.fingerprint
-                            {
-                                let _ = respond_to.send(Err(proto::ErrorPayload {
+                            Ok(durable) => durable,
+                            Err(error) => {
+                                tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                    "early client submission conflict lookup failed; refusing ambiguous enqueue");
+                                let _ = respond_to.send(Err(user_message_database_error(
+                                    &error,
+                                    proto::ErrorCode::Internal,
+                                    "could not verify whether this message identity was already used; retry",
+                                )));
+                                continue;
+                            }
+                        };
+                        if let Some(durable) = durable
+                            && (durable.origin_principal != receipt.origin_principal
+                                || durable.fingerprint != receipt.fingerprint)
+                        {
+                            let _ = respond_to.send(Err(proto::ErrorPayload {
                                     code: proto::ErrorCode::BadRequest,
                                     message: format!(
                                         "client_submission_id {} was already used for a different payload",
                                         receipt.id
                                     ),
                                 }));
-                                continue;
-                            }
+                            continue;
                         }
                     }
                     if artifact_admission.is_none()
@@ -7585,6 +7692,13 @@ pub(super) async fn run_worker(
                         Ok(_) => {}
                         Err(e) => {
                             let error = format!("{e:#}");
+                            let database_rejection = user_message_database_error(
+                                &e,
+                                proto::ErrorCode::UserMessageNotAccepted,
+                                format!(
+                                    "session persistence failed before accepting message {client_submission_id}: {error}"
+                                ),
+                            );
                             tracing::error!(error = %error, session_id = %session_id,
                             "persisting session on first message failed; dropping message");
                             send_current_event(
@@ -7603,12 +7717,7 @@ pub(super) async fn run_worker(
                                     crate::db::db::text_artifacts::TextArtifactRejectReason::PersistenceFailed,
                                 )
                                 .await,
-                                None => proto::ErrorPayload {
-                                    code: proto::ErrorCode::UserMessageNotAccepted,
-                                    message: format!(
-                                        "session persistence failed before accepting message {client_submission_id}: {error}"
-                                    ),
-                                },
+                                None => database_rejection,
                             };
                             let _ = respond_to.send(Err(rejection));
                             continue;
@@ -7722,11 +7831,11 @@ pub(super) async fn run_worker(
                             Err(error) => {
                                 tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
                                 "client submission dedupe lookup failed; refusing ambiguous enqueue");
-                                let _ = respond_to.send(Err(proto::ErrorPayload {
-                                code: proto::ErrorCode::Internal,
-                                message: "could not verify whether this message was already accepted; retry"
-                                    .to_string(),
-                            }));
+                                let _ = respond_to.send(Err(user_message_database_error(
+                                    &error,
+                                    proto::ErrorCode::Internal,
+                                    "could not verify whether this message was already accepted; retry",
+                                )));
                                 continue;
                             }
                         };
@@ -8097,9 +8206,13 @@ pub(super) async fn run_worker(
                                 if let Some(staged) = staged.as_ref() { driver_input_queue.mark_staged_removal_failed(staged).await; }
                                 let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation capacity reached".into() })); continue;
                             }
-                            Err(_) => {
+                            Err(error) => {
                                 if let Some(staged) = staged.as_ref() { driver_input_queue.mark_staged_removal_failed(staged).await; }
-                                let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: "remote queue operation could not be committed".into() })); continue;
+                                let _ = respond_to.send(Err(user_message_database_error(
+                                    &error,
+                                    proto::ErrorCode::Internal,
+                                    "remote queue operation could not be committed",
+                                ))); continue;
                             }
                         };
                         let _ = respond_to.send(Ok(remote_queue_mutation_response(receipt)));

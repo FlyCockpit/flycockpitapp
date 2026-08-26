@@ -183,6 +183,20 @@ pub fn hold_config_mutation_lock(
     files::ConfigMutationLock::acquire(target).map(HeldConfigMutationLock)
 }
 
+/// Try to acquire the shared config mutation lock until `deadline`.
+///
+/// This is intended for pre-socket recovery, where waiting forever on a lock
+/// left behind by another process would prevent clients from reaching the
+/// daemon's diagnostic and settlement APIs. `Ok(None)` means the lock remained
+/// busy through the deadline; callers must retain their durable pending work.
+pub fn try_hold_config_mutation_lock_until(
+    target: &std::path::Path,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Option<HeldConfigMutationLock>> {
+    files::ConfigMutationLock::acquire_until(target, deadline)
+        .map(|guard| guard.map(HeldConfigMutationLock))
+}
+
 /// Commit already-rendered configuration bytes with the same audited atomic
 /// writer used by typed config documents. Higher layers must hold
 /// [`hold_config_mutation_lock`] while checking/reloading their target.

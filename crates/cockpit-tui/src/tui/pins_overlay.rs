@@ -12,7 +12,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use cockpit_core::daemon::proto::PinnedMessage;
+use cockpit_proto::PinnedMessage;
 
 /// Grey for the `pin` half of the mouse control + muted chrome.
 pub const PIN_GREY: Color = Color::Indexed(244);

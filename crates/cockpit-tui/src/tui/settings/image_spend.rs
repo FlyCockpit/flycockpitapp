@@ -8,7 +8,7 @@ use cockpit_config::config::image_spend::{
     BudgetPolicy, ImageSpendSettings, ImageSpendSuggestions, ProjectEpochPolicy,
 };
 #[cfg(test)]
-use cockpit_core::daemon::proto::{Request, Response};
+use cockpit_proto::{Request, Response};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -138,7 +138,8 @@ impl DefaultImageSpendPersistence {
 impl ImageSpendPersistence for DefaultImageSpendPersistence {
     fn load(&self, project_key: String) -> LoadResult {
         self.block_on(async move {
-            let client = super::settings_daemon_client()
+            let lifecycle = super::test_lifecycle_client();
+            let client = super::settings_daemon_client(&lifecycle)
                 .await
                 .map_err(|error| error.to_string())?;
             match client
@@ -175,7 +176,8 @@ impl ImageSpendPersistence for DefaultImageSpendPersistence {
         // re-opens them alongside the returned authoritative version.
         let settings_json = serde_json::to_string(&settings).map_err(|error| error.to_string())?;
         self.block_on(async move {
-            let client = super::settings_daemon_client()
+            let lifecycle = super::test_lifecycle_client();
+            let client = super::settings_daemon_client(&lifecycle)
                 .await
                 .map_err(|error| error.to_string())?;
             match client

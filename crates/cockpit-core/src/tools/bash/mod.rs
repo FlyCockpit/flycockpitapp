@@ -31,8 +31,8 @@ use crate::engine::tool::{
     ToolPresentation, single_line_preview, string_field,
 };
 use crate::intel::budget::capture_text_artifact_body;
-use crate::process::{CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES};
 use crate::tools::common::{OUTPUT_BYTE_CAP, truncate_head_tail};
+use cockpit_host::process::{CHILD_PIPE_CAPTURE_HEAD_BYTES, CHILD_PIPE_CAPTURE_TAIL_BYTES};
 
 mod boundary;
 pub use boundary::{command_directory_escape, outside_session_boundary};
@@ -2642,12 +2642,12 @@ async fn run_prepared_command(
     };
     let child_pid = child.id();
 
-    let stdout_task = crate::process::spawn_bounded_pipe_drain(
+    let stdout_task = cockpit_host::process::spawn_bounded_pipe_drain(
         child.stdout.take(),
         CHILD_PIPE_CAPTURE_HEAD_BYTES,
         CHILD_PIPE_CAPTURE_TAIL_BYTES,
     );
-    let stderr_task = crate::process::spawn_bounded_pipe_drain(
+    let stderr_task = cockpit_host::process::spawn_bounded_pipe_drain(
         child.stderr.take(),
         CHILD_PIPE_CAPTURE_HEAD_BYTES,
         CHILD_PIPE_CAPTURE_TAIL_BYTES,
@@ -2694,7 +2694,8 @@ async fn run_prepared_command(
 
 /// Terminate a cancelled `bash` child.
 async fn kill_child(child: &mut tokio::process::Child, pid: Option<u32>) {
-    crate::process::terminate_group_async(child, pid, std::time::Duration::from_millis(200)).await;
+    cockpit_host::process::terminate_group_async(child, pid, std::time::Duration::from_millis(200))
+        .await;
 }
 
 fn format_combined(stdout: &str, stderr: &str, exit: i32, signaled: bool) -> String {

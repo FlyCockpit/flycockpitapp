@@ -101,6 +101,9 @@ jobs:
           test "$default_features" = "[]"
           grep -q '^remote = \[' apps/cli/Cargo.toml
           ! grep -Eq 'features[[:space:]]*=[[:space:]]*\[[^]]*remote' dist-workspace.toml
+          jq -e '.profile == "local-v0.1" and (.targets | length == 5)' apps/cli/release/local-runtime-capabilities-v1.json
+          jq -e '.profile == "local-v0.1" and (.localProtocolTagDenylist | length > 0)' apps/cli/release/local-profile-inventory-v1.json
+          scripts/check-local-release-profile.sh
 
       - name: Install dist
         shell: bash
@@ -240,6 +243,20 @@ jobs:
         run: |
           dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > target/distrib/dist-manifest.json
           echo "dist ran successfully"
+
+      - name: Verify built local executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r -d '' executable; do
+            found=$((found + 1))
+            COCKPIT_RELEASE_BIN="$executable" scripts/check-local-release-profile.sh --artifact-only
+          done < <(find target -type f \( -name cockpit -o -name cockpit.exe \) -path '*/release/*' -print0)
+          if [ "$found" -eq 0 ]; then
+            echo "::error::cargo-dist produced no Cockpit executable to verify"
+            exit 1
+          fi
 
       - id: cargo-dist
         name: Post-build

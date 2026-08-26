@@ -204,8 +204,9 @@ async fn ancestor_replaced_by_symlink_is_refused_rather_than_followed() {
         // inside the workspace, so it resolves — but it must resolve to where
         // it actually lands, not where it was named.
         let effective =
-            crate::path_containment::effective_path(&h.root().join("a/inner/x.txt")).unwrap();
-        let b_real = crate::path_containment::effective_path(&h.root().join("b")).unwrap();
+            cockpit_host::path_containment::effective_path(&h.root().join("a/inner/x.txt"))
+                .unwrap();
+        let b_real = cockpit_host::path_containment::effective_path(&h.root().join("b")).unwrap();
         assert!(
             effective.starts_with(&b_real),
             "the symlink must be resolved, not trusted: {}",

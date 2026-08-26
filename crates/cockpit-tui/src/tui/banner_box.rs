@@ -16,7 +16,8 @@ use ratatui::text::{Line, Span};
 use crate::banner;
 use crate::tui::chrome;
 use crate::tui::theme::{ACCENT_BLUE_INDEX, MUTED_COLOR_INDEX};
-use cockpit_core::welcome::{APP_NAME, LaunchInfo};
+use cockpit_core::welcome::APP_NAME;
+use cockpit_proto::LaunchInfo;
 
 const ACCENT: Color = Color::Indexed(ACCENT_BLUE_INDEX);
 const GREY: Color = Color::Indexed(MUTED_COLOR_INDEX);
@@ -185,7 +186,7 @@ mod tests {
 
     fn sample(enabled: bool, name: Option<&str>) -> LaunchInfo {
         LaunchInfo {
-            version: "9.9.9",
+            version: "9.9.9".to_string(),
             session_id: None,
             session_short_id: None,
             provider_line: "anthropic / claude".to_string(),

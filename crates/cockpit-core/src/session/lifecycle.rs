@@ -328,11 +328,11 @@ impl Session {
             }
         }
         let session_id = self.id;
-        if row.last_viewed_at.is_some()
+        if row.last_viewed_at_unix_ms.is_some()
             && let Err(e) = self.db.blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
-                    "UPDATE sessions SET last_viewed_at = ?1 WHERE session_id = ?2",
-                    params![Utc::now().timestamp(), session_id.to_string()],
+                    "UPDATE sessions SET last_viewed_at_unix_ms = ?1 WHERE session_id = ?2",
+                    params![Utc::now().timestamp_millis(), session_id.to_string()],
                 )
                 .context("marking session viewed")?;
                 Ok(())
@@ -383,7 +383,7 @@ impl Session {
                     fork_point_turn_id,
                     false,
                     Uuid::new_v4(),
-                    Utc::now().timestamp(),
+                    Utc::now().timestamp_millis(),
                 )
             })
             .context("creating fork session row")?;
@@ -433,7 +433,7 @@ impl Session {
             invalid => anyhow::bail!("invalid persisted session entry mode {invalid:?}"),
         };
         let started_at =
-            DateTime::<Utc>::from_timestamp(row.started_at, 0).unwrap_or_else(Utc::now);
+            DateTime::<Utc>::from_timestamp_millis(row.started_at_unix_ms).unwrap_or_else(Utc::now);
         let user_content_turns = count_user_turns_for_title(&db, row.session_id);
         let model_system_prompt_snapshot = Arc::new(ModelSystemPromptSnapshot::from_json_str(
             &row.model_system_prompt_snapshot_json,
@@ -669,11 +669,11 @@ impl Session {
             .context("loading persisted disk-derived redaction origins")
     }
 
-    /// Touch `last_active_at`. Called by the daemon on every
+    /// Touch `last_active_at_unix_ms`. Called by the daemon on every
     /// interaction so `cockpit -c` lands on the right session.
     pub fn touch(&self) -> Result<()> {
         if self.stage_pending_row(|row| {
-            row.last_active_at = Utc::now().timestamp();
+            row.last_active_at_unix_ms = Utc::now().timestamp_millis();
         }) {
             return Ok(());
         }
@@ -681,8 +681,8 @@ impl Session {
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
-                    "UPDATE sessions SET last_active_at = ?1 WHERE session_id = ?2",
-                    params![Utc::now().timestamp(), session_id.to_string()],
+                    "UPDATE sessions SET last_active_at_unix_ms = ?1 WHERE session_id = ?2",
+                    params![Utc::now().timestamp_millis(), session_id.to_string()],
                 )
                 .context("touching session")?;
                 Ok(())
@@ -695,7 +695,7 @@ impl Session {
     /// write through to the existing row.
     pub fn mark_viewed(&self) -> Result<()> {
         if self.stage_pending_row(|row| {
-            row.last_viewed_at = Some(Utc::now().timestamp());
+            row.last_viewed_at_unix_ms = Some(Utc::now().timestamp_millis());
         }) {
             return Ok(());
         }
@@ -703,8 +703,8 @@ impl Session {
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
-                    "UPDATE sessions SET last_viewed_at = ?1 WHERE session_id = ?2",
-                    params![Utc::now().timestamp(), session_id.to_string()],
+                    "UPDATE sessions SET last_viewed_at_unix_ms = ?1 WHERE session_id = ?2",
+                    params![Utc::now().timestamp_millis(), session_id.to_string()],
                 )
                 .context("marking session viewed")?;
                 Ok(())
@@ -712,7 +712,7 @@ impl Session {
             .context("marking session viewed")
     }
 
-    /// End the session — sets `ended_at` in the DB. Doesn't drop the
+    /// End the session — sets `ended_at_unix_ms` in the DB. Doesn't drop the
     /// row; history stays queryable via `cockpit session list`. Also
     /// removes the per-session tmp dir (sandboxing part 2): a session's
     /// scratch space doesn't outlive it.
@@ -722,8 +722,8 @@ impl Session {
         self.db
             .blocking_write_for_sync_maintenance(move |conn| {
                 conn.execute(
-                    "UPDATE sessions SET ended_at = ?1 WHERE session_id = ?2",
-                    params![Utc::now().timestamp(), session_id.to_string()],
+                    "UPDATE sessions SET ended_at_unix_ms = ?1 WHERE session_id = ?2",
+                    params![Utc::now().timestamp_millis(), session_id.to_string()],
                 )
                 .context("ending session")?;
                 Ok(())

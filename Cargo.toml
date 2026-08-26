@@ -2,9 +2,11 @@
 members = [
     "apps/cli",
     "apps/tenant-authority",
+    "crates/cockpit-client",
     "crates/cockpit-config",
     "crates/cockpit-core",
     "crates/cockpit-db",
+    "crates/cockpit-host",
     "crates/cockpit-noise",
     "crates/cockpit-proto",
     "crates/cockpit-test-support",

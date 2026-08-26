@@ -51,14 +51,14 @@ fn passive_same_generation_terminal_result_corrects_default_and_divergence() {
             .map(|effort| effort.value.clone()),
         thinking_mode: active.thinking_mode,
         prompt_cache_retention: active.prompt_cache_retention,
-        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
+        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
                 selection: active.clone(),
                 default_selection: Some(active.clone()),
                 diverged: false,
                 generation: 4,
             }),
-            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Verified {
+            default_update: cockpit_proto::DefaultModelUpdateOutcome::Verified {
                 selection: cockpit_config::providers::ActiveModelRef {
                     provider: "provider-b".into(),
                     model: "model-b".into(),
@@ -92,14 +92,14 @@ fn passive_same_generation_terminal_result_corrects_default_and_divergence() {
         reasoning_effort: None,
         thinking_mode: None,
         prompt_cache_retention: None,
-        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
+        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
                 selection: older.clone(),
                 default_selection: Some(older),
                 diverged: false,
                 generation: 3,
             }),
-            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+            default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
         },
     });
     assert_eq!(app.active_model_selection, Some(active));
@@ -171,7 +171,7 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
     ))
     .write_to(&mut png, image::ImageFormat::Png)
     .unwrap();
-    let tag = cockpit_core::daemon::proto::TagExpansionMeta {
+    let tag = cockpit_proto::TagExpansionMeta {
         tool: "read".to_string(),
         path: "src/model.rs".to_string(),
         detail: "selected lines".to_string(),
@@ -181,15 +181,17 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
         client_submission_id: uuid::Uuid::new_v4(),
         composer_text: "review @src/model.rs with image".to_string(),
         display: "review @src/model.rs with image".to_string(),
-        submission: cockpit_core::engine::message::UserSubmission {
+        submission: ClientUserSubmission {
             expected_model_state_generation: None,
             expected_model: None,
-            kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+            kind: cockpit_client::submission::UserSubmissionKind::Compact,
             origin: Default::default(),
             text: "review expanded source\n\n<image>".to_string(),
             display_text: Some("review @src/model.rs with image".to_string()),
             tag_expansions: vec![tag.clone()],
-            images: vec![png.into_inner()],
+            images: vec![cockpit_client::image_upload::SubmissionImage::png(
+                png.into_inner(),
+            )],
             forced_skill: Some("review".to_string()),
             origin_principal: Some("flycockpit:test-user".to_string()),
             job_id: Some("job-1".to_string()),
@@ -198,7 +200,7 @@ fn exact_queued_submission() -> super::QueuedModelSubmission {
             client_submissions: Vec::new(),
             pending_terminal_disposition: None,
             run_invocation_id: None,
-            queue_target: Some(cockpit_core::engine::message::QueueTarget {
+            queue_target: Some(cockpit_proto::QueueTarget {
                 id: "target-1".to_string(),
                 agent: "Build".to_string(),
                 depth: 1,
@@ -264,6 +266,7 @@ fn install_pending_model_submission(
             },
             assembled_wire_digest: None,
             slots: Vec::new(),
+            retained_drafts: Vec::new(),
             lifecycle: crate::tui::structured_paste::FenceLifecycle::Ready,
         },
     );
@@ -272,7 +275,7 @@ fn install_pending_model_submission(
         session_id: Some(session_id),
         selection_id,
         requested,
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger::Quick,
         minimum_generation,
         started_at: std::time::Instant::now(),
         queued_submission: Some(queued),
@@ -329,7 +332,7 @@ async fn model_control_is_not_sent_while_session_switch_is_pending() {
         "/quick",
         requested.clone(),
         false,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+        cockpit_proto::ActiveModelSwitchTrigger::Quick,
     ));
 
     assert!(control_rx.try_recv().is_err());
@@ -373,7 +376,7 @@ fn picker_make_default_sends_correlated_request_without_local_write() {
         .request;
     assert!(matches!(
         request,
-        cockpit_core::daemon::proto::Request::SetActiveModel {
+        cockpit_proto::Request::SetActiveModel {
             provider,
             model,
             persist_as_default: true,
@@ -420,8 +423,8 @@ fn picker_make_default_sends_correlated_request_without_local_write() {
         reasoning_effort: None,
         thinking_mode: None,
         prompt_cache_retention: None,
-        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
+        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
                 selection: verified.clone(),
                 default_selection: Some(verified.clone()),
                 diverged: false,
@@ -432,7 +435,7 @@ fn picker_make_default_sends_correlated_request_without_local_write() {
                     .unwrap_or(1)
                     .max(1),
             }),
-            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Verified {
+            default_update: cockpit_proto::DefaultModelUpdateOutcome::Verified {
                 selection: verified,
                 generation: 1,
                 scope_label: "user".into(),
@@ -527,7 +530,7 @@ fn chrome_active_model_unchanged_on_rejected_switch() {
         "/model",
         requested.clone(),
         false,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+        cockpit_proto::ActiveModelSwitchTrigger::Picker,
     ));
     let selection_id = app.pending_model_selection.as_ref().unwrap().selection_id;
     let queued = exact_queued_submission();
@@ -543,7 +546,7 @@ fn chrome_active_model_unchanged_on_rejected_switch() {
         reasoning_effort: Some("high".to_string()),
         thinking_mode: Some(cockpit_config::providers::ThinkingMode::High),
         prompt_cache_retention: Some(cockpit_config::providers::PromptCacheRetention::Extended),
-        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Rejected {
+        outcome: cockpit_proto::ModelSelectionOutcome::Rejected {
             user_message: "provider rejected the selection".to_string(),
             diagnostic_code: "model_switch_rejected".to_string(),
         },
@@ -557,7 +560,7 @@ fn chrome_active_model_unchanged_on_rejected_switch() {
     assert_eq!(retry.requested, requested);
     assert_eq!(
         retry.trigger,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker
+        cockpit_proto::ActiveModelSwitchTrigger::Picker
     );
     assert_eq!(
         queued_submission_value(
@@ -600,7 +603,7 @@ fn reopening_model_picker_expires_stale_request_and_carries_queued_submission() 
         "/model",
         selection("p", "a"),
         false,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+        cockpit_proto::ActiveModelSwitchTrigger::Picker,
     ));
     let pending = app.pending_model_selection.as_mut().unwrap();
     pending.started_at = std::time::Instant::now() - std::time::Duration::from_secs(61);
@@ -639,7 +642,7 @@ fn terminal_daemon_link_preserves_full_pending_selection_and_exact_submission() 
         "/model",
         requested.clone(),
         false,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+        cockpit_proto::ActiveModelSwitchTrigger::Picker,
     ));
     let queued = exact_queued_submission();
     let expected_queued = queued_submission_value(&queued);
@@ -675,7 +678,7 @@ fn terminal_daemon_link_preserves_full_pending_selection_and_exact_submission() 
     assert_eq!(retry.requested, requested);
     assert_eq!(
         retry.trigger,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker
+        cockpit_proto::ActiveModelSwitchTrigger::Picker
     );
     assert_eq!(
         queued_submission_value(
@@ -760,7 +763,7 @@ fn cancelling_attached_add_model_settings_immediately_reopens_picker() {
     assert!(app.refresh_reopened_model_picker_after_settings.is_none());
     let generation = app.config_snapshot.generation.saturating_add(1);
     app.apply_event(cockpit_core::engine::TurnEvent::ConfigSnapshot {
-        snapshot: Box::new(cockpit_core::daemon::proto::ConfigSnapshot {
+        snapshot: Box::new(cockpit_proto::ConfigSnapshot {
             session_id: uuid::Uuid::new_v4(),
             generation,
             extended: app.config_snapshot.extended.clone(),
@@ -817,7 +820,7 @@ fn changed_snapshot_after_settings_close_refreshes_open_picker_inventory_once() 
         });
     let generation = app.config_snapshot.generation.saturating_add(1);
     app.apply_event(cockpit_core::engine::TurnEvent::ConfigSnapshot {
-        snapshot: Box::new(cockpit_core::daemon::proto::ConfigSnapshot {
+        snapshot: Box::new(cockpit_proto::ConfigSnapshot {
             session_id: uuid::Uuid::new_v4(),
             generation,
             extended: app.config_snapshot.extended.clone(),
@@ -862,7 +865,7 @@ fn add_model_waits_through_unrelated_and_saved_snapshots_then_reopens_on_close()
     // causal marker or rebuild a hidden picker under the dialog.
     let generation = app.config_snapshot.generation.saturating_add(1);
     app.apply_event(cockpit_core::engine::TurnEvent::ConfigSnapshot {
-        snapshot: Box::new(cockpit_core::daemon::proto::ConfigSnapshot {
+        snapshot: Box::new(cockpit_proto::ConfigSnapshot {
             session_id: uuid::Uuid::new_v4(),
             generation,
             extended: app.config_snapshot.extended.clone(),
@@ -887,7 +890,7 @@ fn add_model_waits_through_unrelated_and_saved_snapshots_then_reopens_on_close()
             ..Default::default()
         });
     app.apply_event(cockpit_core::engine::TurnEvent::ConfigSnapshot {
-        snapshot: Box::new(cockpit_core::daemon::proto::ConfigSnapshot {
+        snapshot: Box::new(cockpit_proto::ConfigSnapshot {
             session_id: uuid::Uuid::new_v4(),
             generation: generation + 1,
             extended: app.config_snapshot.extended.clone(),
@@ -941,7 +944,7 @@ fn quick_model_change_waits_for_terminal_confirmation() {
         .selection_id;
     let request = control_rx.try_recv().expect("quick request");
     match request.request {
-        cockpit_core::daemon::proto::Request::SetActiveModel {
+        cockpit_proto::Request::SetActiveModel {
             selection_id: actual,
             persist_as_default,
             trigger,
@@ -961,10 +964,7 @@ fn quick_model_change_waits_for_terminal_confirmation() {
                 Some(cockpit_config::providers::PromptCacheRetention::Extended)
             );
             assert!(!persist_as_default);
-            assert_eq!(
-                trigger,
-                cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick
-            );
+            assert_eq!(trigger, cockpit_proto::ActiveModelSwitchTrigger::Quick);
         }
         other => panic!("expected SetActiveModel, got {other:?}"),
     }
@@ -992,14 +992,14 @@ fn quick_model_change_waits_for_terminal_confirmation() {
         reasoning_effort: None,
         thinking_mode: None,
         prompt_cache_retention: None,
-        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
+        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
                 selection: confirmed,
                 default_selection: None,
                 diverged: true,
                 generation: 1,
             }),
-            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+            default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
         },
     });
 
@@ -1055,7 +1055,7 @@ fn transport_send_failure_retains_complete_queued_submission() {
     app.set_current_model_selection_retry(super::ModelSelectionRetry {
         session_id: app.launch.session_id,
         requested: selection("p", "a"),
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger::Quick,
         queued_submission: Some(queued),
     });
 
@@ -1063,7 +1063,7 @@ fn transport_send_failure_retains_complete_queued_submission() {
         "/quick",
         selection("p", "a"),
         false,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+        cockpit_proto::ActiveModelSwitchTrigger::Quick,
     ));
 
     assert!(app.pending_model_selection.is_none());
@@ -1096,7 +1096,7 @@ fn picker_transport_failure_does_not_report_success_or_submit_queued_payload() {
     app.set_current_model_selection_retry(super::ModelSelectionRetry {
         session_id: app.launch.session_id,
         requested: selection("p", "a"),
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger::Picker,
         queued_submission: Some(queued),
     });
 
@@ -1136,14 +1136,14 @@ fn assert_control_failure_retains_complete_submission(
     app.set_current_model_selection_retry(super::ModelSelectionRetry {
         session_id: app.launch.session_id,
         requested: selection("p", "a"),
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger::Quick,
         queued_submission: Some(queued),
     });
     assert!(app.request_model_selection(
         "/quick",
         selection("p", "a"),
         false,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+        cockpit_proto::ActiveModelSwitchTrigger::Quick,
     ));
     control_rx
         .try_recv()
@@ -1195,7 +1195,7 @@ fn failed_cleanup_does_not_overwrite_an_already_preserved_payload() {
     app.set_current_model_selection_retry(super::ModelSelectionRetry {
         session_id: app.launch.session_id,
         requested: original_requested.clone(),
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Cycle,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger::Cycle,
         queued_submission: Some(preserved),
     });
     let mut later = exact_queued_submission();
@@ -1205,7 +1205,7 @@ fn failed_cleanup_does_not_overwrite_an_already_preserved_payload() {
         session_id: app.launch.session_id,
         selection_id: uuid::Uuid::new_v4(),
         requested: selection("p", "a"),
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger::Quick,
         minimum_generation: 0,
         started_at: std::time::Instant::now(),
         queued_submission: Some(later),
@@ -1264,7 +1264,7 @@ fn first_send_waits_for_confirmed_model_then_releases_exact_draft() {
     assert_eq!(app.composer.text(), "send this exact draft");
     assert!(matches!(
         control_rx.try_recv().expect("selection request").request,
-        cockpit_core::daemon::proto::Request::SetActiveModel {
+        cockpit_proto::Request::SetActiveModel {
             selection_id: actual,
             ..
         } if actual == selection_id
@@ -1282,14 +1282,14 @@ fn first_send_waits_for_confirmed_model_then_releases_exact_draft() {
         reasoning_effort: None,
         thinking_mode: None,
         prompt_cache_retention: None,
-        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
+        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
                 selection: confirmed,
                 default_selection: None,
                 diverged: true,
                 generation: 1,
             }),
-            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+            default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
         },
     });
 
@@ -1314,7 +1314,7 @@ fn confirmed_model_release_queue_full_retains_and_retries_exact_draft() {
     let (control_tx, _control_rx) = mpsc::channel(2);
     let (input_tx, mut input_rx) = mpsc::channel(1);
     input_tx
-        .try_send(cockpit_core::engine::message::UserSubmission::text("channel blocker").into())
+        .try_send(ClientUserSubmission::text("channel blocker").into())
         .unwrap();
     let runner = AgentRunner::stub_with_channels(control_tx, input_tx);
     let session_id = runner.session_id();
@@ -1348,14 +1348,14 @@ fn confirmed_model_release_queue_full_retains_and_retries_exact_draft() {
             .map(|effort| effort.value.clone()),
         thinking_mode: requested.thinking_mode,
         prompt_cache_retention: requested.prompt_cache_retention,
-        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
+        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
                 selection: requested.clone(),
                 default_selection: Some(requested),
                 diverged: false,
                 generation: 1,
             }),
-            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+            default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
         },
     });
 
@@ -1396,7 +1396,7 @@ fn second_submit_waiting_on_model_preserves_all_unconsumed_metadata() {
         session_id: Some(uuid::Uuid::new_v4()),
         selection_id: uuid::Uuid::new_v4(),
         requested: preference_bearing_selection("p", "a"),
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger::Picker,
         minimum_generation: 0,
         started_at: std::time::Instant::now(),
         queued_submission: Some(held),
@@ -1454,7 +1454,7 @@ fn model_picker_selection_records_summary() {
     assert!(matches!(app.overlay, Overlay::None));
     assert!(matches!(
         control_rx.try_recv().expect("selection request").request,
-        cockpit_core::daemon::proto::Request::SetActiveModel {
+        cockpit_proto::Request::SetActiveModel {
             provider,
             model,
             persist_as_default: false,
@@ -1502,7 +1502,7 @@ fn ordinary_picker_selection_is_session_only_and_promises_no_default() {
     assert!(!app.handle_key(press(KeyCode::Enter)));
     assert!(matches!(
         control_rx.try_recv().expect("selection request").request,
-        cockpit_core::daemon::proto::Request::SetActiveModel {
+        cockpit_proto::Request::SetActiveModel {
             provider,
             model,
             persist_as_default: false,
@@ -1641,7 +1641,7 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
         .lock()
         .unwrap() = new_session_id;
     let attached_selection = selection("attached-provider", "attached-model");
-    let attached_state = cockpit_core::daemon::proto::ActiveModelState {
+    let attached_state = cockpit_proto::ActiveModelState {
         selection: attached_selection.clone(),
         default_selection: Some(attached_selection.clone()),
         diverged: false,
@@ -1729,7 +1729,7 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
                 active_agent: "Build".to_string(),
                 active_agent_path: vec!["Build".to_string()],
                 last_applied_seq: None,
-                foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+                foreground_target: Some(cockpit_proto::QueueTarget::root("Build")),
                 active_model_state: Some(attached_state.clone()),
                 project_id: "project".to_string(),
                 history: Vec::new(),
@@ -1810,7 +1810,7 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
             "/quick",
             pending_requested,
             false,
-            cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+            cockpit_proto::ActiveModelSwitchTrigger::Quick,
         ));
         assert!(
             app.pending_model_selection
@@ -1832,7 +1832,7 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
             "/quick",
             requested.clone(),
             false,
-            cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+            cockpit_proto::ActiveModelSwitchTrigger::Quick,
         ));
     }
     let selection_id = app
@@ -1859,14 +1859,14 @@ fn assert_runner_epoch_reset_and_followup_completion(path: ModelEpochPath) {
             .map(|effort| effort.value.clone()),
         thinking_mode: requested.thinking_mode,
         prompt_cache_retention: requested.prompt_cache_retention,
-        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
+        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
                 selection: requested.clone(),
                 default_selection: Some(requested),
                 diverged: false,
                 generation: 1,
             }),
-            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+            default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
         },
     });
 
@@ -1981,8 +1981,8 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         active_agent: "Build".to_string(),
         active_agent_path: vec!["Build".to_string()],
         last_applied_seq: None,
-        foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
-        active_model_state: Some(cockpit_core::daemon::proto::ActiveModelState {
+        foreground_target: Some(cockpit_proto::QueueTarget::root("Build")),
+        active_model_state: Some(cockpit_proto::ActiveModelState {
             selection: attached_selection.clone(),
             default_selection: Some(attached_selection.clone()),
             diverged: false,
@@ -2026,7 +2026,7 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
         "/quick",
         requested.clone(),
         false,
-        cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Quick,
+        cockpit_proto::ActiveModelSwitchTrigger::Quick,
     ));
     control_rx
         .try_recv()
@@ -2042,14 +2042,14 @@ fn session_switch_drains_queued_old_epoch_events_before_authoritative_attach() {
             .map(|effort| effort.value.clone()),
         thinking_mode: requested.thinking_mode,
         prompt_cache_retention: requested.prompt_cache_retention,
-        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
+        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
                 selection: requested.clone(),
                 default_selection: Some(requested),
                 diverged: false,
                 generation: 1,
             }),
-            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::NotRequested,
+            default_update: cockpit_proto::DefaultModelUpdateOutcome::NotRequested,
         },
     });
     assert!(
@@ -2123,14 +2123,14 @@ fn picker_unchanged_verified_default_reports_already_set_without_claiming_a_writ
         reasoning_effort: None,
         thinking_mode: None,
         prompt_cache_retention: None,
-        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Applied {
-            active_state: Box::new(cockpit_core::daemon::proto::ModelSelectionActiveState {
+        outcome: cockpit_proto::ModelSelectionOutcome::Applied {
+            active_state: Box::new(cockpit_proto::ModelSelectionActiveState {
                 selection: verified.clone(),
                 default_selection: Some(verified.clone()),
                 diverged: false,
                 generation: minimum_generation,
             }),
-            default_update: cockpit_core::daemon::proto::DefaultModelUpdateOutcome::Verified {
+            default_update: cockpit_proto::DefaultModelUpdateOutcome::Verified {
                 selection: verified,
                 generation: 1,
                 scope_label: "user".into(),
@@ -2172,7 +2172,7 @@ fn picker_rejected_default_retains_intent_and_states_the_default_did_not_change(
         reasoning_effort: None,
         thinking_mode: None,
         prompt_cache_retention: None,
-        outcome: cockpit_core::daemon::proto::ModelSelectionOutcome::Rejected {
+        outcome: cockpit_proto::ModelSelectionOutcome::Rejected {
             user_message: "Could not make `p/a` the default for new sessions — the highest-precedence config layer (project) is not writable. The default was not changed and this session kept its model."
                 .into(),
             diagnostic_code: "effective_default_target_unwritable".into(),
@@ -2211,7 +2211,7 @@ fn standalone_default_model_result_is_correlated_and_leaves_the_session_alone() 
     // A late result for a different operation is ignored entirely.
     app.apply_event(cockpit_core::engine::TurnEvent::DefaultModelUpdateResult {
         default_update_id: uuid::Uuid::new_v4(),
-        outcome: cockpit_core::daemon::proto::DefaultModelStandaloneOutcome::Applied {
+        outcome: cockpit_proto::DefaultModelStandaloneOutcome::Applied {
             selection: Some(selection("other", "model")),
             generation: 1,
             authority_revision:
@@ -2233,7 +2233,7 @@ fn standalone_default_model_result_is_correlated_and_leaves_the_session_alone() 
 
     app.apply_event(cockpit_core::engine::TurnEvent::DefaultModelUpdateResult {
         default_update_id: mine,
-        outcome: cockpit_core::daemon::proto::DefaultModelStandaloneOutcome::Applied {
+        outcome: cockpit_proto::DefaultModelStandaloneOutcome::Applied {
             selection: Some(selection("p", "a")),
             generation: 2,
             authority_revision:
@@ -2264,7 +2264,7 @@ fn standalone_default_model_result_is_correlated_and_leaves_the_session_alone() 
     app.pending_default_model_update_id = Some(second);
     app.apply_event(cockpit_core::engine::TurnEvent::DefaultModelUpdateResult {
         default_update_id: second,
-        outcome: cockpit_core::daemon::proto::DefaultModelStandaloneOutcome::Rejected {
+        outcome: cockpit_proto::DefaultModelStandaloneOutcome::Rejected {
             user_message: "the highest-precedence config layer (project) is not writable".into(),
             diagnostic_code: "effective_default_target_unwritable".into(),
         },

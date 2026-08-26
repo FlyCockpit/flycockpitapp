@@ -83,6 +83,24 @@ pub fn recover_effective_default_journals_blocking(
     Ok(())
 }
 
+fn recover_effective_default_journals_blocking_until(
+    db: &Db,
+    cwd: &Path,
+    collected: &mut Vec<RecoveredTransaction>,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    let mut authority = DbSessionRevisionAuthority::new(db);
+    let mut sink = |transaction: &RecoveredTransaction| -> Result<()> {
+        collected.push(transaction.clone());
+        Ok(())
+    };
+    let recovery = crate::config::providers::JournalRecovery::with_sessions(&mut authority)
+        .with_sink(&mut sink)
+        .with_lock_deadline(deadline);
+    crate::config::providers::recover_all_effective_default_journals(cwd, recovery)?;
+    Ok(())
+}
+
 /// Run recovery off the async runtime under `trust_policy`, so project layers
 /// are discovered exactly as attach would read them.
 ///
@@ -109,6 +127,25 @@ pub async fn recover_effective_default_journals(
     })
     .await
     .context("joining effective-default journal recovery")?
+}
+
+/// Startup-only variant sharing the daemon's one absolute config-publication
+/// deadline. The config crate applies it to each discovered layer lock.
+pub async fn recover_effective_default_journals_before_socket(
+    db: &Db,
+    cwd: &Path,
+    publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
+) -> Result<Vec<RecoveredTransaction>> {
+    let db = db.clone();
+    let cwd = cwd.to_path_buf();
+    let deadline = publication.deadline();
+    tokio::task::spawn_blocking(move || {
+        let mut collected = Vec::new();
+        recover_effective_default_journals_blocking_until(&db, &cwd, &mut collected, deadline)?;
+        Ok(collected)
+    })
+    .await
+    .context("joining bounded pre-socket effective-default recovery")?
 }
 
 /// Hand converged transactions to the sessions that own them.

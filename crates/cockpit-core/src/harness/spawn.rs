@@ -20,7 +20,7 @@ use super::prepare::PromptDelivery;
 /// Bounded byte tail kept per stream. 256 KiB is generous for diagnostics
 /// while bounding a runaway harness's output; the structured-result path
 /// further caps what reaches the model.
-pub const HARNESS_OUTPUT_TAIL_BYTES: usize = crate::process::CHILD_PIPE_CAPTURE_BYTES;
+pub const HARNESS_OUTPUT_TAIL_BYTES: usize = cockpit_host::process::CHILD_PIPE_CAPTURE_BYTES;
 
 /// Captured output of one harness invocation.
 #[derive(Debug, Clone)]
@@ -164,10 +164,16 @@ pub async fn run_to_completion(
     };
 
     // Spawn the concurrent drainers immediately.
-    let stdout_task =
-        crate::process::spawn_bounded_pipe_drain(child.stdout.take(), 0, HARNESS_OUTPUT_TAIL_BYTES);
-    let stderr_task =
-        crate::process::spawn_bounded_pipe_drain(child.stderr.take(), 0, HARNESS_OUTPUT_TAIL_BYTES);
+    let stdout_task = cockpit_host::process::spawn_bounded_pipe_drain(
+        child.stdout.take(),
+        0,
+        HARNESS_OUTPUT_TAIL_BYTES,
+    );
+    let stderr_task = cockpit_host::process::spawn_bounded_pipe_drain(
+        child.stderr.take(),
+        0,
+        HARNESS_OUTPUT_TAIL_BYTES,
+    );
 
     tokio::select! {
         status = child.wait() => {
@@ -188,7 +194,7 @@ pub async fn run_to_completion(
         }
         _ = tokio::time::sleep(timeout) => {
             let child_pid = child.id();
-            crate::process::terminate_group_async(
+            cockpit_host::process::terminate_group_async(
                 &mut child,
                 child_pid,
                 std::time::Duration::from_millis(200),
@@ -209,11 +215,11 @@ pub async fn run_to_completion(
     }
 }
 
-/// Convert a drained [`crate::process::BoundedPipeCapture`] into its UTF-8 lossy
+/// Convert a drained [`cockpit_host::process::BoundedPipeCapture`] into its UTF-8 lossy
 /// string plus the count of bytes the drainer dropped from the FRONT. The drop
 /// count is what the child-output scrub needs to decide whether the retained
 /// tail may begin mid-secret (see [`HarnessOutput::stdout_dropped`]).
-fn lossy_capture(capture: crate::process::BoundedPipeCapture) -> (String, usize) {
+fn lossy_capture(capture: cockpit_host::process::BoundedPipeCapture) -> (String, usize) {
     (
         String::from_utf8_lossy(&capture.bytes).into_owned(),
         capture.dropped_bytes,

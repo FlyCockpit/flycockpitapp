@@ -8,6 +8,7 @@ const CATALOG: &str = include_str!("../../../crates/cockpit-core/src/external_ru
 const GENERATOR: &str = include_str!("../scripts/generate-release-assets.sh");
 const SHELL_INSTALLER_FIXTURE: &str = include_str!("fixtures/generated-installer.sh");
 const POWERSHELL_INSTALLER_FIXTURE: &str = include_str!("fixtures/generated-installer.ps1");
+const LOCAL_CAPABILITIES: &str = include_str!("../release/local-runtime-capabilities-v1.json");
 const CARGO_DIST_SHELL_TEMPLATE: &str = include_str!("fixtures/cargo-dist-0.32-installer.sh.j2");
 const CARGO_DIST_POWERSHELL_TEMPLATE: &str =
     include_str!("fixtures/cargo-dist-0.32-installer.ps1.j2");
@@ -76,6 +77,17 @@ m.patch_powershell_installer(pathlib.Path(sys.argv[3]))
 
 #[test]
 fn runtime_release_contract_tests() {
+    let capabilities: serde_json::Value = serde_json::from_str(LOCAL_CAPABILITIES).unwrap();
+    assert_eq!(capabilities["profile"], "local-v0.1");
+    assert_eq!(capabilities["targets"].as_object().unwrap().len(), 5);
+    assert!(capabilities["artifactBudgetBytes"].as_u64().unwrap() > 0);
+    assert!(
+        capabilities["forbiddenDependencies"]
+            .as_array()
+            .unwrap()
+            .len()
+            >= 5
+    );
     for target in [
         "aarch64-apple-darwin",
         "x86_64-apple-darwin",

@@ -12,18 +12,18 @@ use anyhow::{Context, Result, ensure};
 use sha2::{Digest as _, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DirectoryIdentity {
-    pub(crate) platform: &'static str,
-    pub(crate) stable_digest: String,
-    pub(crate) canonical_binding_digest: String,
+pub struct DirectoryIdentity {
+    pub platform: &'static str,
+    pub stable_digest: String,
+    pub canonical_binding_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldArtifactEvidence {
-    pub(crate) identity_digest: String,
-    pub(crate) security_digest: String,
-    pub(crate) byte_length: u64,
-    pub(crate) sha256: String,
+    pub identity_digest: String,
+    pub security_digest: String,
+    pub byte_length: u64,
+    pub sha256: String,
 }
 impl HeldArtifactEvidence {
     pub fn identity_digest(&self) -> &str {
@@ -137,7 +137,7 @@ impl HeldDirectoryRecovery {
 }
 
 #[derive(Debug)]
-pub(crate) struct HeldDirectoryAuthority {
+pub struct HeldDirectoryAuthority {
     imp: imp::HeldDirectory,
     identity: DirectoryIdentity,
 }
@@ -314,21 +314,21 @@ impl HeldWorkspaceDirectoryAuthority {
 
 impl HeldDirectoryAuthority {
     #[cfg(test)]
-    pub(crate) fn force_next_directory_sync_failure(&self) {
+    pub fn force_next_directory_sync_failure(&self) {
         FORCE_DIRECTORY_SYNC_FAILURE.set(true);
     }
-    pub(crate) fn open_existing(path: &Path) -> Result<Self> {
+    pub fn open_existing(path: &Path) -> Result<Self> {
         let imp = imp::HeldDirectory::open_existing(path)?;
         let identity = imp.identity()?;
         Ok(Self { imp, identity })
     }
 
-    pub(crate) fn identity(&self) -> &DirectoryIdentity {
+    pub fn identity(&self) -> &DirectoryIdentity {
         &self.identity
     }
 
     /// A diagnostic spelling only. It is never filesystem authority.
-    pub(crate) fn diagnostic_path(&self) -> &Path {
+    pub fn diagnostic_path(&self) -> &Path {
         self.imp.diagnostic_path()
     }
 
@@ -389,7 +389,7 @@ impl HeldDirectoryAuthority {
                 identity_digest: artifact.identity_digest.clone(),
                 security_digest: artifact.security_digest.clone(),
                 byte_length: length,
-                sha256: crate::intel::hex_lower(&hash.finalize()),
+                sha256: super::hex_lower(&hash.finalize()),
             })
         })();
         match result {
@@ -459,7 +459,7 @@ impl HeldDirectoryAuthority {
         self.imp.unlink(artifact)
     }
 
-    pub(crate) fn open_verified(
+    pub fn open_verified(
         &self,
         name: &str,
         evidence: &HeldArtifactEvidence,
@@ -499,8 +499,7 @@ fn validate_contents(file: &mut File, evidence: &HeldArtifactEvidence) -> Result
         hash.update(&buffer[..count]);
     }
     ensure!(
-        length == evidence.byte_length
-            && crate::intel::hex_lower(&hash.finalize()) == evidence.sha256,
+        length == evidence.byte_length && super::hex_lower(&hash.finalize()) == evidence.sha256,
         "held artifact length/checksum changed"
     );
     Ok(())
@@ -609,7 +608,7 @@ fn digest(parts: &[&[u8]]) -> String {
         hash.update((part.len() as u64).to_be_bytes());
         hash.update(part);
     }
-    crate::intel::hex_lower(&hash.finalize())
+    super::hex_lower(&hash.finalize())
 }
 
 #[cfg(unix)]

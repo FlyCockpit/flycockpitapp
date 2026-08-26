@@ -156,7 +156,7 @@ impl App {
             return;
         }
         if let crate::tui::links::LinkGestureOutcome::Activate(url) = link_outcome {
-            if cockpit_core::sysinfo::is_ssh() {
+            if cockpit_host::sysinfo::is_ssh() {
                 match crate::clipboard::copy_plain(&url, self.clipboard_recovery) {
                     Ok(result) => {
                         let (msg, kind) = super::copy_actions::describe_delivered(
@@ -359,11 +359,7 @@ impl App {
                 return;
             }
             Overlay::Diff(pane) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => pane.scroll_up(),
-                    MouseEventKind::ScrollDown => pane.scroll_down(),
-                    _ => {}
-                }
+                pane.handle_mouse(mouse);
                 return;
             }
             Overlay::Help(pane) => {
@@ -377,11 +373,23 @@ impl App {
             Overlay::Leaks(_) => return,
             // Handled by the modal guard above; unreachable here.
             Overlay::Sealed(_) => return,
-            Overlay::ModelPicker(_)
-            | Overlay::Multireview(_)
-            | Overlay::Usage(_)
-            | Overlay::Resources(_)
-            | Overlay::Quick(_) => return,
+            Overlay::Resources(pane) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => pane.scroll_up(),
+                    MouseEventKind::ScrollDown => pane.scroll_down(),
+                    _ => {}
+                }
+                return;
+            }
+            Overlay::Usage(pane) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => pane.scroll_up(),
+                    MouseEventKind::ScrollDown => pane.scroll_down(),
+                    _ => {}
+                }
+                return;
+            }
+            Overlay::ModelPicker(_) | Overlay::Multireview(_) | Overlay::Quick(_) => return,
             Overlay::None => {}
         }
         if self.mouse_capture && self.handle_suggestion_box_mouse(&mouse) {
@@ -445,7 +453,7 @@ impl App {
                     .get(chat_row)
                     .is_some_and(|meta| meta.diff_path.is_some());
             let items = crate::tui::context_menu::ContextMenu::build_items(
-                cockpit_core::sysinfo::is_ssh(),
+                cockpit_host::sysinfo::is_ssh(),
                 diff_editor,
             );
             self.context_menu = Some(crate::tui::context_menu::ContextMenu {
@@ -695,9 +703,13 @@ impl App {
                     pane.pointer_activate_confirm(dispatch);
                 }
             }
-            crate::tui::button::ButtonDispatch::ResourcePromote { index } => {
-                if let Overlay::Resources(pane) = &mut self.overlay {
-                    pane.pointer_promote(index);
+            crate::tui::button::ButtonDispatch::ResourcePromote { request_id } => {
+                let outcome = match &mut self.overlay {
+                    Overlay::Resources(pane) => pane.pointer_promote(request_id),
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    self.start_resources_outcome(outcome);
                 }
             }
             crate::tui::button::ButtonDispatch::NoteNew => {
@@ -821,7 +833,7 @@ impl App {
         let outcome = self.link_pointer_gesture.check_activation(pa.token, now);
         self.pending_link_activation = None;
         if let crate::tui::links::LinkGestureOutcome::Activate(url) = outcome {
-            if cockpit_core::sysinfo::is_ssh() {
+            if cockpit_host::sysinfo::is_ssh() {
                 match crate::clipboard::copy_plain(&url, self.clipboard_recovery) {
                     Ok(result) => {
                         let (msg, kind) = super::copy_actions::describe_delivered(
@@ -2736,6 +2748,358 @@ mod affordance_hover_tests {
         assert_eq!(resolve_inner_scroll_target(&bottom, 4, true), Some(target));
         assert_eq!(resolve_inner_scroll_target(&bottom, 4, false), None);
         assert_eq!(resolve_inner_scroll_target(&bottom, 8, true), None);
+    }
+}
+
+#[cfg(test)]
+mod resource_button_dispatch_tests {
+    use super::{App, Overlay};
+    use crate::tui::async_action::{AsyncActionKind, AsyncActionPayload, AsyncActionResult};
+    use crate::tui::button::ButtonDispatch;
+    use crate::tui::resources_pane::ResourcesPane;
+    use cockpit_proto::{
+        ResourceQueuedSnapshot, ResourceRequestMetadata, ResourceRequirements,
+        ResourceSchedulerSnapshot,
+    };
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+    fn resource_generation(app: &App) -> u64 {
+        match &app.overlay {
+            Overlay::Resources(pane) => pane.generation(),
+            _ => panic!("resources overlay"),
+        }
+    }
+
+    fn scheduler_snapshot(display_ids: &[&str]) -> ResourceSchedulerSnapshot {
+        ResourceSchedulerSnapshot {
+            enabled: true,
+            pools: Vec::new(),
+            running: Vec::new(),
+            queued: display_ids
+                .iter()
+                .enumerate()
+                .map(|(index, display_id)| ResourceQueuedSnapshot {
+                    id: uuid::Uuid::new_v4(),
+                    display_id: (*display_id).to_string(),
+                    resources: ResourceRequirements::new([("cpu", 1)]),
+                    metadata: ResourceRequestMetadata::default(),
+                    queued_at_ms: index as i64,
+                    wait_ms: index as u64,
+                    state: ResourceQueuedState::Queued,
+                    promoted_by: None,
+                    promoted_at_ms: None,
+                })
+                .collect(),
+            max_queued: 16,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn promote_button_enqueues_daemon_mutation_for_clicked_request() {
+        let _ = crate::tui::agent_runner::take_test_resource_promote_requests();
+        let mut pane = ResourcesPane::open();
+        let snapshot = scheduler_snapshot(&["rs-first", "rs-clicked"]);
+        let clicked_id = snapshot.queued[1].id;
+        pane.apply_snapshot_result(Ok(snapshot));
+        let mut app = App::new(None, false);
+        app.overlay = Overlay::Resources(pane);
+
+        app.dispatch_button(ButtonDispatch::ResourcePromote {
+            request_id: clicked_id,
+        });
+
+        assert_eq!(
+            app.async_actions.pending_kinds(),
+            vec![AsyncActionKind::DaemonRpc("resources.promote")]
+        );
+        assert!(matches!(
+            crate::tui::agent_runner::take_test_resource_promote_requests().as_slice(),
+            [cockpit_proto::Request::PromoteResource { request_id, .. }]
+                if request_id == &clicked_id.to_string()
+        ));
+        assert!(matches!(app.overlay, Overlay::Resources(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resources_slash_promote_preserves_display_token_contract() {
+        let _ = crate::tui::agent_runner::take_test_resource_promote_requests();
+        let mut app = App::new(None, false);
+
+        app.handle_resources_command("promote rs-0001");
+
+        assert!(matches!(
+            crate::tui::agent_runner::take_test_resource_promote_requests().as_slice(),
+            [cockpit_proto::Request::PromoteResource { request_id, .. }]
+                if request_id == "rs-0001"
+        ));
+        assert_eq!(
+            app.async_actions.pending_kinds(),
+            vec![AsyncActionKind::DaemonRpc("resources.promote")]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn earlier_fifo_success_survives_later_resource_failure() {
+        let mut pane = ResourcesPane::open();
+        let snapshot = scheduler_snapshot(&["rs-first", "rs-clicked"]);
+        let first_id = snapshot.queued[0].id;
+        let clicked_id = snapshot.queued[1].id;
+        pane.apply_snapshot_result(Ok(snapshot));
+        let mut app = App::new(None, false);
+        app.overlay = Overlay::Resources(pane);
+        let pane_generation = resource_generation(&app);
+        app.dispatch_button(ButtonDispatch::ResourcePromote {
+            request_id: first_id,
+        });
+        app.dispatch_button(ButtonDispatch::ResourcePromote {
+            request_id: clicked_id,
+        });
+        let ids = app.async_actions.pending_ids();
+        assert_eq!(
+            ids.len(),
+            2,
+            "resource mutations must remain serialized, not replaced"
+        );
+
+        app.apply_async_action_result(AsyncActionResult {
+            id: ids[0],
+            kind: AsyncActionKind::DaemonRpc("resources.promote"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::PromoteResource {
+                pane_generation: Some(pane_generation),
+                status: cockpit_proto::ResourcePromoteStatus::Promoted,
+                message: "first applied".to_string(),
+                snapshot: scheduler_snapshot(&["first-applied"]),
+            }),
+        });
+        let Overlay::Resources(pane) = &app.overlay else {
+            panic!("resources overlay")
+        };
+        assert_eq!(pane.queued_display_ids(), ["first-applied"]);
+
+        app.apply_async_action_result(AsyncActionResult {
+            id: ids[1],
+            kind: AsyncActionKind::DaemonRpc("resources.promote"),
+            presentation_stale: false,
+            payload: Err("later mutation failed".to_string()),
+        });
+        let Overlay::Resources(pane) = &app.overlay else {
+            panic!("resources overlay")
+        };
+        assert_eq!(pane.queued_display_ids(), ["first-applied"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serialized_read_success_survives_following_mutation_failure() {
+        let mut app = App::new(None, false);
+        app.overlay = Overlay::Resources(ResourcesPane::open());
+        let pane_generation = resource_generation(&app);
+        app.start_resources_snapshot_action();
+        app.dispatch_button(ButtonDispatch::ResourcePromote {
+            request_id: uuid::Uuid::new_v4(),
+        });
+        // A button for an absent stable id is rejected before RPC enqueue.
+        assert_eq!(app.async_actions.pending_ids().len(), 1);
+
+        let Overlay::Resources(pane) = &mut app.overlay else {
+            panic!("resources overlay")
+        };
+        let snapshot = scheduler_snapshot(&["rs-clicked"]);
+        let clicked_id = snapshot.queued[0].id;
+        pane.apply_snapshot_result(Ok(snapshot));
+        app.dispatch_button(ButtonDispatch::ResourcePromote {
+            request_id: clicked_id,
+        });
+        let ids = app.async_actions.pending_ids();
+        assert_eq!(ids.len(), 2, "read and mutation must share the FIFO lane");
+
+        app.apply_async_action_result(AsyncActionResult {
+            id: ids[0],
+            kind: AsyncActionKind::DaemonRpc("resources.snapshot"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::ResourceSnapshot {
+                pane_generation,
+                result: Ok(scheduler_snapshot(&["read-applied"])),
+            }),
+        });
+        app.apply_async_action_result(AsyncActionResult {
+            id: ids[1],
+            kind: AsyncActionKind::DaemonRpc("resources.promote"),
+            presentation_stale: false,
+            payload: Err("mutation failed".to_string()),
+        });
+        let Overlay::Resources(pane) = &app.overlay else {
+            panic!("resources overlay")
+        };
+        assert_eq!(pane.queued_display_ids(), ["read-applied"]);
+    }
+
+    #[test]
+    fn closed_resource_pane_completions_cannot_populate_reopened_instance() {
+        let old = ResourcesPane::open();
+        let old_generation = old.generation();
+        let old_snapshot = scheduler_snapshot(&["old-request"]);
+        let old_id = old_snapshot.queued[0].id;
+        let mut app = App::new(None, false);
+        app.overlay = Overlay::Resources(old);
+        app.overlay = Overlay::None;
+        app.overlay = Overlay::Resources(ResourcesPane::open());
+        assert_ne!(resource_generation(&app), old_generation);
+
+        app.apply_async_action_result(AsyncActionResult {
+            id: crate::tui::async_action::AsyncActionId::from_raw_for_test(91),
+            kind: AsyncActionKind::DaemonRpc("resources.snapshot"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::ResourceSnapshot {
+                pane_generation: old_generation,
+                result: Ok(old_snapshot.clone()),
+            }),
+        });
+        app.apply_async_action_result(AsyncActionResult {
+            id: crate::tui::async_action::AsyncActionId::from_raw_for_test(92),
+            kind: AsyncActionKind::DaemonRpc("resources.promote"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::PromoteResource {
+                pane_generation: Some(old_generation),
+                status: cockpit_proto::ResourcePromoteStatus::Promoted,
+                message: "old promote settled".to_string(),
+                snapshot: old_snapshot,
+            }),
+        });
+
+        let Overlay::Resources(pane) = &mut app.overlay else {
+            panic!("resources overlay")
+        };
+        assert!(pane.queued_display_ids().is_empty());
+        assert!(
+            pane.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .is_none()
+        );
+        assert!(pane.pointer_promote(old_id).is_none());
+        let mut registry = crate::tui::button::ButtonRegistry::default();
+        registry.begin_frame(true, 1);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                pane.render_with_buttons(frame, Rect::new(0, 0, 80, 12), Some(&mut registry))
+            })
+            .unwrap();
+        assert!(registry.targets().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod usage_completion_and_wheel_tests {
+    use super::{App, Overlay};
+    use crate::tui::async_action::{
+        AsyncActionId, AsyncActionKind, AsyncActionPayload, AsyncActionResult,
+    };
+    use crate::tui::usage_pane::UsagePane;
+    use cockpit_proto::{ProviderUsageAvailabilityView, ProviderUsageSnapshotView};
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+    fn rows(count: usize) -> Vec<ProviderUsageSnapshotView> {
+        (0..count)
+            .map(|index| ProviderUsageSnapshotView {
+                provider_id: format!("provider-{index}"),
+                display_name: format!("Provider {index}"),
+                fetched_at: chrono::Utc::now(),
+                availability: ProviderUsageAvailabilityView::Error {
+                    message: "offline".to_string(),
+                },
+            })
+            .collect()
+    }
+
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn stale_usage_success_and_error_cannot_reopen_or_replace_overlay() {
+        let mut app = App::new(None, false);
+        let old = UsagePane::loading();
+        let old_generation = old.generation();
+        app.overlay = Overlay::Usage(old);
+        app.overlay = Overlay::Usage(UsagePane::loading());
+
+        app.apply_async_action_result(AsyncActionResult {
+            id: AsyncActionId::from_raw_for_test(301),
+            kind: AsyncActionKind::Refresh("provider.usage"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::ProviderUsage {
+                pane_generation: old_generation,
+                result: Ok(rows(2)),
+            }),
+        });
+        assert!(
+            matches!(&app.overlay, Overlay::Usage(pane) if pane.status_text() == Some("Fetching provider usage..."))
+        );
+
+        app.apply_async_action_result(AsyncActionResult {
+            id: AsyncActionId::from_raw_for_test(302),
+            kind: AsyncActionKind::Refresh("provider.usage"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::ProviderUsage {
+                pane_generation: old_generation,
+                result: Err("old failure".to_string()),
+            }),
+        });
+        assert!(
+            matches!(&app.overlay, Overlay::Usage(pane) if pane.status_text() == Some("Fetching provider usage..."))
+        );
+
+        app.overlay = Overlay::None;
+        app.apply_async_action_result(AsyncActionResult {
+            id: AsyncActionId::from_raw_for_test(303),
+            kind: AsyncActionKind::Refresh("provider.usage"),
+            presentation_stale: false,
+            payload: Ok(AsyncActionPayload::ProviderUsage {
+                pane_generation: old_generation,
+                result: Ok(rows(1)),
+            }),
+        });
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn usage_mouse_wheel_scrolls_with_bounds_and_survives_rerender() {
+        let mut app = App::new(None, false);
+        app.overlay = Overlay::Usage(UsagePane::open(rows(20)));
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        let Overlay::Usage(pane) = &mut app.overlay else {
+            unreachable!()
+        };
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 80, 8)))
+            .unwrap();
+
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert!(matches!(&app.overlay, Overlay::Usage(pane) if pane.offset() == 1));
+        for _ in 0..100 {
+            app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        }
+        let Overlay::Usage(pane) = &mut app.overlay else {
+            unreachable!()
+        };
+        let bounded = pane.offset();
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 80, 8)))
+            .unwrap();
+        assert_eq!(pane.offset(), bounded);
+        app.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        assert!(
+            matches!(&app.overlay, Overlay::Usage(pane) if pane.offset() == bounded.saturating_sub(1))
+        );
     }
 }
 

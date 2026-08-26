@@ -1,7 +1,7 @@
 //! `session_search` — BM25 recall across past threads.
 //!
 //! Finds prior conversations whose title or message text matches a
-//! query, ranked by FTS5 BM25 with `last_active_at` recency as the
+//! query, ranked by FTS5 BM25 with `last_active_at_unix_ms` recency as the
 //! tiebreaker (migration 0013 / [`crate::db::session_search`]). Defaults
 //! to the current project, excludes archived + the live session, and
 //! returns one highlighted ~150-char snippet per thread. The companion
@@ -158,7 +158,7 @@ impl Tool for SessionSearchTool {
                 .unwrap_or_else(|| hit.session_id.to_string());
             let short = id.as_str();
             let title = hit.title.as_deref().unwrap_or("(untitled)");
-            let date = human_date(hit.last_active_at);
+            let date = human_date(hit.last_active_at_unix_ms);
             let snippet = hit.snippet.trim();
             out.push_str(&format!("{short}  {date}  {title}\n    {snippet}\n"));
         }
@@ -277,7 +277,7 @@ impl Tool for SessionLineageSearchTool {
             out.push_str(&format!(
                 "{}  {}  {}\n    {}\n",
                 id,
-                human_date(hit.last_active_at),
+                human_date(hit.last_active_at_unix_ms),
                 title,
                 hit.snippet.trim()
             ));
@@ -323,27 +323,27 @@ pub(crate) fn caller_history_trust(ctx: &ToolCtx) -> HistoryCallerTrust {
     }
 }
 
-/// `last_active_at` (epoch seconds) → `YYYY-MM-DD HH:MM UTC`, matching
+/// `last_active_at_unix_ms` → `YYYY-MM-DD HH:MM UTC`, matching
 /// the session browser's date format.
-fn human_date(epoch_secs: i64) -> String {
-    DateTime::<Utc>::from_timestamp(epoch_secs, 0)
+fn human_date(unix_ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(unix_ms)
         .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
-        .unwrap_or_else(|| epoch_secs.to_string())
+        .unwrap_or_else(|| unix_ms.to_string())
 }
 
 /// Parse the `since` bound: a full RFC3339 timestamp, or a bare
 /// `YYYY-MM-DD` date (interpreted as midnight UTC). Returns epoch
-/// seconds. A bad value is the model's fault → invalid-input.
+/// milliseconds. A bad value is the model's fault → invalid-input.
 fn parse_since(s: &str) -> Result<i64> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.timestamp());
+        return Ok(dt.timestamp_millis());
     }
     if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let dt = date
             .and_hms_opt(0, 0, 0)
             .expect("midnight is a valid time")
             .and_utc();
-        return Ok(dt.timestamp());
+        return Ok(dt.timestamp_millis());
     }
     Err(invalid_input(format!(
         "`since` `{s}` is not an RFC3339 timestamp or `YYYY-MM-DD` date"

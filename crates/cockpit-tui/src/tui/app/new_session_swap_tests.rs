@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
-use cockpit_core::engine::message::UserSubmission;
+use cockpit_client::submission::ClientUserSubmission as UserSubmission;
 
 #[test]
 fn new_session_swap_reads_no_config_from_disk() {
@@ -38,7 +38,7 @@ fn new_session_swap_makes_no_daemon_probe_or_connect() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     cockpit_core::daemon::reset_blocking_probe_call_count();
-    cockpit_core::daemon::client::reset_connect_call_count();
+    cockpit_client::reset_connect_call_count();
 
     app.pending_new_session = true;
     let serviced = app
@@ -47,7 +47,7 @@ fn new_session_swap_makes_no_daemon_probe_or_connect() {
 
     assert!(serviced);
     assert_eq!(cockpit_core::daemon::blocking_probe_call_count(), 0);
-    assert_eq!(cockpit_core::daemon::client::connect_call_count(), 0);
+    assert_eq!(cockpit_client::connect_call_count(), 0);
 }
 
 #[test]
@@ -198,17 +198,22 @@ fn complete_submission(index: usize) -> UserSubmission {
     UserSubmission {
         expected_model_state_generation: None,
         expected_model: None,
-        kind: cockpit_core::engine::message::UserSubmissionKind::Compact,
+        kind: cockpit_client::submission::UserSubmissionKind::Compact,
         origin: Default::default(),
         text: format!("wire-{index}"),
         display_text: Some(format!("display-{index}")),
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".to_string(),
             path: format!("src/{index}.rs"),
             detail: "complete".to_string(),
             ok: true,
         }],
-        images: vec![vec![index as u8, 2, 3, 4]],
+        images: vec![cockpit_client::image_upload::SubmissionImage::png(vec![
+            index as u8,
+            2,
+            3,
+            4,
+        ])],
         forced_skill: Some("review".to_string()),
         origin_principal: Some("flycockpit:test-owner".to_string()),
         job_id: Some(format!("job-{index}")),
@@ -217,12 +222,13 @@ fn complete_submission(index: usize) -> UserSubmission {
         client_submissions: Vec::new(),
         pending_terminal_disposition: None,
         run_invocation_id: None,
-        queue_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+        queue_target: Some(cockpit_proto::QueueTarget::root("Build")),
     }
 }
 
 fn side_conversation(tmp: &std::path::Path) -> SideConversation {
     SideConversation {
+        endpoint: cockpit_client::ClientEndpoint::Wire(tmp.join("daemon.sock")),
         side_session_id: uuid::Uuid::new_v4(),
         socket: tmp.join("side.sock"),
         saved_runner: None,
@@ -292,7 +298,7 @@ async fn new_session_swap_failure_preserves_old_state_and_exact_staged_submissio
     app.side_conversation = Some(side_conversation(tmp.path()));
     app.launch.session_id = Some(old_session_id);
     app.launch.session_short_id = Some("old001".to_string());
-    app.foreground_input_target = Some(cockpit_core::engine::message::QueueTarget::root("Build"));
+    app.foreground_input_target = Some(cockpit_proto::QueueTarget::root("Build"));
 
     app.pending_new_session = true;
     let cleared = Arc::new(AtomicBool::new(false));
@@ -880,7 +886,7 @@ async fn new_session_swap_discards_old_epoch_events_while_provisional() {
             },
             TurnEvent::QueueUpdated { queue: vec![] },
             TurnEvent::ConfigSnapshot {
-                snapshot: Box::new(cockpit_core::daemon::proto::ConfigSnapshot {
+                snapshot: Box::new(cockpit_proto::ConfigSnapshot {
                     session_id: uuid::Uuid::nil(),
                     generation: 1,
                     extended: config_extended.clone(),
@@ -889,7 +895,7 @@ async fn new_session_swap_discards_old_epoch_events_while_provisional() {
             },
             TurnEvent::AgentIdle {
                 turn_id: None,
-                reason: cockpit_core::engine::IdleReason::Completed,
+                reason: cockpit_proto::IdleReason::Completed,
             },
             TurnEvent::InferenceFailed {
                 agent: "Build".into(),
@@ -1114,6 +1120,7 @@ async fn new_session_swap_old_epoch_bookkeeping_settles_fence_without_presentati
             },
             assembled_wire_digest: Some([1; 32]),
             slots: Vec::new(),
+            retained_drafts: Vec::new(),
             lifecycle: crate::tui::structured_paste::FenceLifecycle::PossiblySent,
         },
     );
@@ -1336,7 +1343,7 @@ async fn new_session_switch_outcome_adopts_identity_after_immediate_reset() {
             .attachment_epoch
             .store(2, std::sync::atomic::Ordering::Release);
     }
-    let foreground = cockpit_core::engine::message::QueueTarget::root("Build");
+    let foreground = cockpit_proto::QueueTarget::root("Build");
     let selection = cockpit_config::providers::ActiveModelRef {
         provider: "openai".into(),
         model: "gpt-test".into(),
@@ -1344,7 +1351,7 @@ async fn new_session_switch_outcome_adopts_identity_after_immediate_reset() {
         thinking_mode: None,
         prompt_cache_retention: None,
     };
-    let active_model = cockpit_core::daemon::proto::ActiveModelState {
+    let active_model = cockpit_proto::ActiveModelState {
         selection: selection.clone(),
         default_selection: Some(selection.clone()),
         diverged: false,
@@ -1450,6 +1457,7 @@ async fn new_session_swap_waits_for_possibly_sent_fence_before_clear() {
             },
             assembled_wire_digest: Some([1; 32]),
             slots: Vec::new(),
+            retained_drafts: Vec::new(),
             lifecycle: FenceLifecycle::PossiblySent,
         },
     );
@@ -1523,6 +1531,7 @@ async fn new_session_swap_suppresses_outgoing_delivery_receipt_while_provisional
             },
             assembled_wire_digest: Some([9; 32]),
             slots: Vec::new(),
+            retained_drafts: Vec::new(),
             lifecycle: crate::tui::structured_paste::FenceLifecycle::Reconciling,
         },
     );
@@ -1533,12 +1542,10 @@ async fn new_session_swap_suppresses_outgoing_delivery_receipt_while_provisional
         async move {
             Ok(AsyncActionPayload::ClientSubmissionReceipt {
                 client_submission_id,
-                result: Ok(
-                    cockpit_core::daemon::proto::ClientSubmissionReceiptStatus::Terminal {
-                        disposition: "accepted".into(),
-                        wire_fingerprint: "abc".into(),
-                    },
-                ),
+                result: Ok(cockpit_proto::ClientSubmissionReceiptStatus::Terminal {
+                    disposition: "accepted".into(),
+                    wire_fingerprint: "abc".into(),
+                }),
             })
         },
     );
@@ -1690,6 +1697,7 @@ async fn new_session_swap_failed_barrier_does_not_mark_fence_possibly_sent() {
             },
             assembled_wire_digest: None,
             slots: Vec::new(),
+            retained_drafts: Vec::new(),
             lifecycle: FenceLifecycle::Ready,
         },
     );
@@ -2166,10 +2174,10 @@ async fn provisional_new_suppresses_caffeinate_presentation() {
 }
 
 fn seed_outgoing_model_and_config_chrome(app: &mut App) {
-    let mut providers = cockpit_core::daemon::proto::ProviderConfigView::default();
+    let mut providers = cockpit_proto::ProviderConfigView::default();
     providers.providers.insert(
         "outgoing".into(),
-        cockpit_core::daemon::proto::ProviderEntryView {
+        cockpit_proto::ProviderEntryView {
             entry: cockpit_config::providers::ProviderEntry {
                 name: Some("Outgoing".into()),
                 models: vec![cockpit_config::providers::ModelEntry {
@@ -2192,7 +2200,7 @@ fn seed_outgoing_model_and_config_chrome(app: &mut App) {
     });
     let mut extended = app.config_snapshot.extended.clone();
     extended.dialog.lockout_ms = 4242;
-    app.apply_config_snapshot(cockpit_core::daemon::proto::ConfigSnapshot {
+    app.apply_config_snapshot(cockpit_proto::ConfigSnapshot {
         session_id: uuid::Uuid::nil(),
         generation: 9,
         extended,
@@ -2502,7 +2510,7 @@ async fn provisional_new_suppresses_model_selection_cancel_notice() {
             thinking_mode: None,
             prompt_cache_retention: None,
         },
-        trigger: cockpit_core::daemon::proto::ActiveModelSwitchTrigger::Picker,
+        trigger: cockpit_proto::ActiveModelSwitchTrigger::Picker,
         minimum_generation: 1,
         started_at: Instant::now(),
         queued_submission: None,

@@ -1036,13 +1036,13 @@ fn resolve_write_scope(
         return Ok(None);
     };
     let requested = crate::tools::common::resolve(scope, base);
-    let effective = crate::path_containment::effective_path(&requested).map_err(|err| {
+    let effective = cockpit_host::path_containment::effective_path(&requested).map_err(|err| {
         format!(
             "`write_scope` `{}` cannot be resolved inside the workspace: {err}",
             requested.display()
         )
     })?;
-    if !crate::path_containment::contained_under(workspace, &effective) {
+    if !cockpit_host::path_containment::contained_under(workspace, &effective) {
         return Err(format!(
             "`write_scope` `{}` resolves outside the workspace `{}`",
             effective.display(),
@@ -1083,7 +1083,7 @@ fn resolve_recursive_vnext_child_cwd(
     if !resolved.is_dir() {
         return Err(format!("cwd `{raw}` does not exist or is not a directory"));
     }
-    if !crate::path_containment::contained_under(&workspace, &resolved) {
+    if !cockpit_host::path_containment::contained_under(&workspace, &resolved) {
         return Err(format!(
             "cwd `{raw}` resolves outside trusted workspace `{}`",
             workspace.display()
@@ -1119,8 +1119,8 @@ fn overlapping_write_scope_pair(
 ) -> Option<(String, std::path::PathBuf, String, std::path::PathBuf)> {
     for (idx, (left_label, left)) in scopes.iter().enumerate() {
         for (right_label, right) in scopes.iter().skip(idx + 1) {
-            if crate::path_containment::contained_under(left, right)
-                || crate::path_containment::contained_under(right, left)
+            if cockpit_host::path_containment::contained_under(left, right)
+                || cockpit_host::path_containment::contained_under(right, left)
             {
                 return Some((
                     left_label.clone(),

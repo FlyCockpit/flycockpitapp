@@ -98,6 +98,11 @@ pub enum LocalMediaMutationPayloadV1 {
         attachment_version: u64,
         availability_generation: u64,
         reference_generation: u64,
+        /// Exact daemon image-ingress admission that created this draft.
+        /// Present only for draft disposal; it prevents a generic attachment
+        /// identity from being reused as authority over another admission.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        origin_admission_id: Option<Uuid>,
         #[serde(skip_serializing_if = "Option::is_none")]
         origin_upload: Option<MediaOriginUploadV1>,
     },
@@ -145,6 +150,8 @@ pub struct DiscardUnreferencedMediaAttachmentV1 {
     pub attachment_version: u64,
     pub availability_generation: u64,
     pub reference_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_admission_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_upload: Option<MediaOriginUploadV1>,
 }
@@ -1644,6 +1651,7 @@ impl super::Db {
                 attachment_version,
                 availability_generation,
                 reference_generation,
+                origin_admission_id,
                 origin_upload,
             } => {
                 ensure!(
@@ -1661,6 +1669,12 @@ impl super::Db {
                         "invalid upload origin"
                     )
                 };
+                if let Some(admission_id) = origin_admission_id {
+                    ensure!(
+                        is_strict_uuid_v7(*admission_id),
+                        "invalid image-ingress admission origin"
+                    );
+                }
                 (*session_id, canonical_project_digest)
             }
         };
@@ -1979,6 +1993,10 @@ impl super::Db {
             "media component versions, generations, and bytes must be positive"
         );
         ensure!(
+            component.updated_at_unix_ms >= component.created_at_unix_ms,
+            "media component update time precedes creation"
+        );
+        ensure!(
             matches!(
                 component.component_kind.as_str(),
                 "quarantined_original"
@@ -2235,12 +2253,29 @@ impl super::Db {
         );
         let record = media_attachment_by_id(conn, request.attachment_id)?
             .context("media_attachment_unavailable")?;
+        if let Some(admission_id) = request.origin_admission_id {
+            let admitted_attachment: Option<String> = conn
+                .query_row(
+                    "SELECT attachment_id FROM media_ingress_admission_receipts WHERE admission_id=?1",
+                    [admission_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            ensure!(
+                admitted_attachment.as_deref() == Some(&request.attachment_id.to_string()),
+                "discard admission conflict"
+            );
+        }
         let expected_origin=conn.query_row("SELECT client_draft_id,upload_id,upload_generation FROM media_attachment_upload_origins WHERE attachment_id=?1",[request.attachment_id.to_string()],|row|Ok(MediaOriginUploadV1{client_draft_id:Uuid::parse_str(&row.get::<_,String>(0)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_id:Uuid::parse_str(&row.get::<_,String>(1)?).map_err(|_|rusqlite::Error::InvalidQuery)?,upload_generation:row.get::<_,String>(2)?.parse().map_err(|_|rusqlite::Error::InvalidQuery)?})).optional()?;
         ensure!(
             request.origin_upload == expected_origin,
             "discard origin conflict"
         );
-        let reason = if request.attachment_version != record.attachment_version {
+        let reason = if request.origin_admission_id.is_some()
+            && record.first_referenced_at_unix_ms.is_some()
+        {
+            Some(MediaDiscardReasonV1::MediaAttachmentInUse)
+        } else if request.attachment_version != record.attachment_version {
             Some(MediaDiscardReasonV1::StaleAttachmentVersion)
         } else if request.availability_generation != record.availability_generation {
             Some(MediaDiscardReasonV1::StaleAvailabilityGeneration)
@@ -2522,6 +2557,22 @@ fn validate_new_record(record: &MediaAttachmentRecord) -> Result<()> {
             || record.draft_expires_at_unix_ms.is_none(),
         "draft expiry is upload-only"
     );
+    ensure!(
+        record.updated_at_unix_ms >= record.created_at_unix_ms,
+        "media attachment update time precedes creation"
+    );
+    ensure!(
+        record
+            .draft_expires_at_unix_ms
+            .is_none_or(|value| value >= record.created_at_unix_ms),
+        "media attachment draft expiry precedes creation"
+    );
+    ensure!(
+        record
+            .first_referenced_at_unix_ms
+            .is_none_or(|value| value >= record.created_at_unix_ms),
+        "media attachment first-reference time precedes creation"
+    );
     validate_digest(&record.canonical_project_digest, "project digest")?;
     validate_digest(&record.source_identity_digest, "source identity digest")?;
     validate_digest(&record.source_sha256, "source checksum")?;
@@ -2533,6 +2584,18 @@ fn validate_new_record(record: &MediaAttachmentRecord) -> Result<()> {
         record.selected_audio_stream.is_none() || record.media_kind != MediaKind::Image,
         "audio stream is forbidden for images"
     );
+    for stream in [
+        record.selected_video_stream.as_ref(),
+        record.selected_audio_stream.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        ensure!(
+            !stream.codec.is_empty() && stream.codec.len() <= 255,
+            "selected media stream codec must contain between 1 and 255 bytes"
+        );
+    }
     Ok(())
 }
 
@@ -2818,7 +2881,7 @@ mod tests {
                 let attachment_columns=columns("media_attachments")?;let lease_columns=columns("media_attachment_component_leases")?;
                 for column in ["owner_session_id","lease_purpose","lease_expires_at_unix_ms"]{ensure!(!attachment_columns.iter().any(|value|value==column),"{column} leaked onto attachment schema");ensure!(lease_columns.iter().any(|value|value==column),"{column} missing from lease schema");}
                 ensure!(attachment_columns.iter().filter(|value|value.as_str()=="canonical_project_digest").count()==1,"attachment project digest duplicated");
-                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/project',1,1)",[session_id.to_string()])?;
+                conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/project',1,1)",[session_id.to_string()])?;
                 super::super::Db::insert_media_attachment_conn(conn,&MediaAttachmentRecord{attachment_id,session_id,canonical_project_digest:"11".repeat(32),media_kind:MediaKind::Image,source_kind:MediaSourceKind::RetainedHttps,canonical_container:"png".into(),canonical_mime:"image/png".into(),availability:MediaAvailability::Quarantined,attachment_version:1,availability_generation:1,reference_generation:1,captured_capability_generation:9,source_identity_digest:"22".repeat(32),source_byte_length:3,source_sha256:"33".repeat(32),selected_video_stream:None,selected_audio_stream:None,created_at_unix_ms:1,updated_at_unix_ms:1,draft_expires_at_unix_ms:None,first_referenced_at_unix_ms:Some(1)})?;
                 for(expected_generation,state)in[(1,MediaAvailability::Probing),(2,MediaAvailability::Decoding),(3,MediaAvailability::Normalizing),(4,MediaAvailability::Ready)]{super::super::Db::transition_media_attachment_conn(conn,attachment_id,1,expected_generation,state,i64::try_from(expected_generation)?+2)?;}
                 super::super::Db::insert_media_attachment_component_conn(conn,&MediaAttachmentComponent{component_id,attachment_id,attachment_version:1,component_kind:"image_model".into(),storage_id:Uuid::now_v7(),lifecycle_state:"ready".into(),component_generation:1,stable_identity_digest:"44".repeat(32),byte_length:3,sha256:"55".repeat(32),reservation_id:"reservation".into(),created_at_unix_ms:1,updated_at_unix_ms:1})?;
@@ -3134,7 +3197,7 @@ mod tests {
         let inserted = record.clone();
         db.transaction(move |conn| {
             conn.execute(
-                "INSERT INTO sessions (session_id,project_id,project_root,started_at,last_active_at) VALUES (?1,'project','/redacted',1,1)",
+                "INSERT INTO sessions (session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES (?1,'project','/redacted',1,1)",
                 [session_id.to_string()],
             )?;
             super::super::Db::insert_media_attachment_conn(conn, &inserted)
@@ -3169,7 +3232,7 @@ mod tests {
         let inserted_digest = project_digest.clone();
         db.transaction(move |conn| {
             conn.execute(
-                "INSERT INTO sessions (session_id,project_id,project_root,started_at,last_active_at) VALUES (?1,'project','/redacted',1,1)",
+                "INSERT INTO sessions (session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES (?1,'project','/redacted',1,1)",
                 [session_id.to_string()],
             )?;
             let record = MediaAttachmentRecord {
@@ -3242,7 +3305,7 @@ mod tests {
         let component_id = Uuid::now_v7();
         let storage_id = Uuid::now_v7();
         db.transaction(move |conn| {
-            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
+            conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms) VALUES(?1,'p','/redacted',1,1)",[session_id.to_string()])?;
             let record = MediaAttachmentRecord { attachment_id, session_id, canonical_project_digest:"11".repeat(32), media_kind:MediaKind::Image, source_kind:MediaSourceKind::RetainedHttps, canonical_container:"png".into(), canonical_mime:"image/png".into(), availability:MediaAvailability::Quarantined, attachment_version:1, availability_generation:1, reference_generation:1, captured_capability_generation:9, source_identity_digest:"22".repeat(32), source_byte_length:3, source_sha256:"33".repeat(32), selected_video_stream:None, selected_audio_stream:None, created_at_unix_ms:1, updated_at_unix_ms:1, draft_expires_at_unix_ms:None, first_referenced_at_unix_ms:None };
             super::super::Db::insert_media_attachment_conn(conn,&record)?;
             for (generation,state) in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready].into_iter().enumerate(){super::super::Db::transition_media_attachment_conn(conn,attachment_id,1,u64::try_from(generation)?+1,state,2)?;}
@@ -3414,7 +3477,7 @@ mod tests {
         let in_use = Uuid::now_v7();
         let overflow = Uuid::now_v7();
         let reference_id = Uuid::now_v7();
-        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at,last_active_at)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;for id in [applied,in_use,overflow]{super::super::Db::insert_media_attachment_conn(conn,&make(id))?;}for (generation,state) in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready].into_iter().enumerate(){super::super::Db::transition_media_attachment_conn(conn,in_use,1,u64::try_from(generation)?+1,state,2)?;}let project_digest="11".repeat(32);super::super::Db::acquire_media_reference_conn(conn,AcquireMediaReferenceInput { reference_id,attachment_id:in_use,expected_version:1,session_id:session,project_digest:&project_digest,consumer_kind:MediaReferenceConsumerKind::Message,consumer_id:"message",now_unix_ms:2 })?;conn.execute("UPDATE media_attachments SET availability_generation=?1 WHERE attachment_id=?2",params![u64::MAX.to_string(),overflow.to_string()])?;Ok(())}).await.unwrap();
+        db.transaction(move|conn|{conn.execute("INSERT INTO sessions(session_id,project_id,project_root,started_at_unix_ms,last_active_at_unix_ms)VALUES(?1,'p','/redacted',1,1)",[session.to_string()])?;for id in [applied,in_use,overflow]{super::super::Db::insert_media_attachment_conn(conn,&make(id))?;}for (generation,state) in [MediaAvailability::Probing,MediaAvailability::Decoding,MediaAvailability::Normalizing,MediaAvailability::Ready].into_iter().enumerate(){super::super::Db::transition_media_attachment_conn(conn,in_use,1,u64::try_from(generation)?+1,state,2)?;}let project_digest="11".repeat(32);super::super::Db::acquire_media_reference_conn(conn,AcquireMediaReferenceInput { reference_id,attachment_id:in_use,expected_version:1,session_id:session,project_digest:&project_digest,consumer_kind:MediaReferenceConsumerKind::Message,consumer_id:"message",now_unix_ms:2 })?;conn.execute("UPDATE media_attachments SET availability_generation=?1 WHERE attachment_id=?2",params![u64::MAX.to_string(),overflow.to_string()])?;Ok(())}).await.unwrap();
         let request = |id, availability, reference| DiscardUnreferencedMediaAttachmentV1 {
             schema_version: 1,
             kind: "discardUnreferencedMediaAttachment".into(),
@@ -3422,6 +3485,7 @@ mod tests {
             attachment_version: 1,
             availability_generation: availability,
             reference_generation: reference,
+            origin_admission_id: None,
             origin_upload: None,
         };
         let decisions = db
@@ -3473,6 +3537,7 @@ mod tests {
                         attachment_version: 1,
                         availability_generation: 5,
                         reference_generation: 3,
+                        origin_admission_id: None,
                         origin_upload: None,
                     },
                     5,

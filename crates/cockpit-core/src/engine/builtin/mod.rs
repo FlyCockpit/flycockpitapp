@@ -591,9 +591,13 @@ pub(crate) fn known_agent_tool_names() -> &'static [&'static str] {
         "transcribe_audio",
         "read_image",
         "ask_image",
+        #[cfg(feature = "extended")]
         "list_image_generation_targets",
+        #[cfg(feature = "extended")]
         "generate_image",
+        #[cfg(feature = "extended")]
         "get_image_generation_job",
+        #[cfg(feature = "extended")]
         "cancel_image_generation_job",
     ]
 }
@@ -883,24 +887,28 @@ pub fn builtin_tool_inventory() -> &'static [BuiltinToolInventoryItem] {
                 "Routes through the sidecar egress policy; requires typed session attachments.",
             ),
         },
+        #[cfg(feature = "extended")]
         BuiltinToolInventoryItem {
             family: "Image Generation",
             name: "list_image_generation_targets",
             summary: "List enabled image-generation targets with safe capability/health/cost projections.",
             condition: Some("Requires configured image-generation targets."),
         },
+        #[cfg(feature = "extended")]
         BuiltinToolInventoryItem {
             family: "Image Generation",
             name: "generate_image",
             summary: "Generate one or more images from a text prompt.",
             condition: Some("Requires configured image-generation targets."),
         },
+        #[cfg(feature = "extended")]
         BuiltinToolInventoryItem {
             family: "Image Generation",
             name: "get_image_generation_job",
             summary: "Get status and safe result metadata for an image-generation job.",
             condition: Some("Requires a session-owned job."),
         },
+        #[cfg(feature = "extended")]
         BuiltinToolInventoryItem {
             family: "Image Generation",
             name: "cancel_image_generation_job",
@@ -1002,9 +1010,13 @@ pub(crate) fn invariant_builtin_tools() -> Vec<Arc<dyn crate::engine::tool::Tool
         Arc::new(tools::transcribe_audio::TranscribeAudioTool),
         Arc::new(tools::read_image::ReadImageTool),
         Arc::new(tools::ask_image::AskImageTool),
+        #[cfg(feature = "extended")]
         Arc::new(crate::image_generation_agent_tools::ListImageGenerationTargetsTool),
+        #[cfg(feature = "extended")]
         Arc::new(crate::image_generation_agent_tools::GenerateImageTool),
+        #[cfg(feature = "extended")]
         Arc::new(crate::image_generation_agent_tools::GetImageGenerationJobTool),
+        #[cfg(feature = "extended")]
         Arc::new(crate::image_generation_agent_tools::CancelImageGenerationJobTool),
         Arc::new(tools::docs::ListPackagesTool::new(
             tools::docs::DocsResolution::new(),
@@ -1040,15 +1052,19 @@ fn materialize_tool_by_name(
         "transcribe_audio" => tb.with(Arc::new(tools::transcribe_audio::TranscribeAudioTool)),
         "read_image" => tb.with(Arc::new(tools::read_image::ReadImageTool)),
         "ask_image" => tb.with(Arc::new(tools::ask_image::AskImageTool)),
+        #[cfg(feature = "extended")]
         "list_image_generation_targets" => tb.with(Arc::new(
             crate::image_generation_agent_tools::ListImageGenerationTargetsTool,
         )),
+        #[cfg(feature = "extended")]
         "generate_image" => tb.with(Arc::new(
             crate::image_generation_agent_tools::GenerateImageTool,
         )),
+        #[cfg(feature = "extended")]
         "get_image_generation_job" => tb.with(Arc::new(
             crate::image_generation_agent_tools::GetImageGenerationJobTool,
         )),
+        #[cfg(feature = "extended")]
         "cancel_image_generation_job" => tb.with(Arc::new(
             crate::image_generation_agent_tools::CancelImageGenerationJobTool,
         )),
@@ -1524,6 +1540,7 @@ fn effective_tool_tier(
     // read_image also gets discovery: primaries/explorer direct, the
     // narrow-surface workers mcp-reachable Discoverable). It never grants
     // generation authority.
+    #[cfg(feature = "extended")]
     if tool == "list_image_generation_targets" {
         return match def.name.as_str() {
             "Build" | "Plan" | "explore" => crate::agents::ToolTier::Enabled,
@@ -1540,6 +1557,7 @@ fn effective_tool_tier(
     // Discoverable, and Disabled everywhere else (no read-only/narrow subagent
     // gets generation or job control). The whole surface stays fail-closed until
     // the daemon adapter map lands.
+    #[cfg(feature = "extended")]
     if matches!(
         tool,
         "generate_image" | "get_image_generation_job" | "cancel_image_generation_job"
@@ -1627,6 +1645,7 @@ fn with_ask_image_tools(
     Ok(tb)
 }
 
+#[cfg(feature = "extended")]
 fn with_image_generation_tools(
     mut tb: ToolBox,
     def: &crate::agents::AgentDef,
@@ -2423,7 +2442,10 @@ pub(crate) fn agent_from_def(def: &crate::agents::AgentDef, args: &SpawnArgs) ->
     tb = with_audio_video_tools(tb, def, args)?;
     tb = with_read_image_tools(tb, def, args)?;
     tb = with_ask_image_tools(tb, def, args)?;
-    tb = with_image_generation_tools(tb, def, args)?;
+    #[cfg(feature = "extended")]
+    {
+        tb = with_image_generation_tools(tb, def, args)?;
+    }
     if !is_internal_agent_def_name(&def.name) || internal_agent_def_uses_custom_tools(&def.name) {
         // Custom-bash tools (webfetch/websearch/…) are config-driven, not part
         // of the named grant — attach them like the built-in factories do.

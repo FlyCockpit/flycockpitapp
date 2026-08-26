@@ -39,8 +39,8 @@ pub struct ImportedArchiveSession {
     pub active_model: Option<ImportedArchiveActiveModel>,
     pub session_entry_mode: String,
     pub active_agent: String,
-    pub started_at: i64,
-    pub ended_at: Option<i64>,
+    pub started_at_unix_ms: i64,
+    pub ended_at_unix_ms: Option<i64>,
     pub title: Option<String>,
 }
 
@@ -329,22 +329,22 @@ fn import_session_archive_graph_conn(
                 row.model = Some(active_model.model);
                 row.model_selection_json = Some(active_model.selection_json);
             }
-            row.started_at = session.started_at;
-            row.last_active_at = session.started_at;
-            row.ended_at = session.ended_at;
+            row.started_at_unix_ms = session.started_at_unix_ms;
+            row.last_active_at_unix_ms = session.started_at_unix_ms;
+            row.ended_at_unix_ms = session.ended_at_unix_ms;
             row.title = session.title;
             Db::insert_session_row_conn(conn, &row)?;
             conn.execute(
                 "UPDATE sessions
-                    SET parent_session_id = ?1, fork_point_turn_id = ?2, ended_at = ?3,
-                        title = ?4, last_active_at = ?5
+                    SET parent_session_id = ?1, fork_point_turn_id = ?2, ended_at_unix_ms = ?3,
+                        title = ?4, last_active_at_unix_ms = ?5
                   WHERE session_id = ?6",
                 params![
                     row.parent_session_id.map(|id| id.to_string()),
                     row.fork_point_turn_id,
-                    row.ended_at,
+                    row.ended_at_unix_ms,
                     row.title,
-                    row.last_active_at,
+                    row.last_active_at_unix_ms,
                     row.session_id.to_string(),
                 ],
             )?;

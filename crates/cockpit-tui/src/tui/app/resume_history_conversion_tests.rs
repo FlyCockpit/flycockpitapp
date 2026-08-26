@@ -1,7 +1,7 @@
 use super::{App, wire_history_to_entries};
 use crate::tui::history::{HistoryEntry, ToolCallState};
-use cockpit_core::daemon::proto::HistoryEntry as Wire;
 use cockpit_core::engine::TurnEvent;
+use cockpit_proto::HistoryEntry as Wire;
 use serde_json::json;
 
 #[test]
@@ -54,7 +54,7 @@ fn replayed_user_row_renders_tag_entries() {
     let entries = wire_history_to_entries(vec![Wire::User {
         text: "expanded wire".into(),
         display_text: Some("review @src/lib.rs".into()),
-        tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+        tag_expansions: vec![cockpit_proto::TagExpansionMeta {
             tool: "read".into(),
             path: "src/lib.rs".into(),
             detail: "142 lines".into(),
@@ -98,7 +98,7 @@ fn same_session_replay_replaces_multi_id_optimistic_rows_in_place() {
         entries: vec![Wire::User {
             text: "first\n\nsecond".into(),
             display_text: Some("first + second".into()),
-            tag_expansions: vec![cockpit_core::daemon::proto::TagExpansionMeta {
+            tag_expansions: vec![cockpit_proto::TagExpansionMeta {
                 tool: "read".into(),
                 path: "combined.rs".into(),
                 detail: "2 lines".into(),
@@ -229,10 +229,10 @@ fn converts_user_assistant_tool_call_to_tui_entries() {
 #[test]
 fn converts_interrupt_decision_to_dedicated_tui_entry() {
     let entries = wire_history_to_entries(vec![Wire::InterruptDecision {
-        decision: cockpit_core::daemon::proto::InterruptDecision {
+        decision: cockpit_proto::InterruptDecision {
             permission: true,
             cancelled: false,
-            lines: vec![cockpit_core::daemon::proto::InterruptDecisionLine {
+            lines: vec![cockpit_proto::InterruptDecisionLine {
                 prompt: "Run command?".into(),
                 answer: "Allow".into(),
             }],

@@ -1,12 +1,32 @@
-//! User-message image upload helper shared by the TUI and headless run client.
+//! Typed image ingress over the local daemon protocol.
 
-use anyhow::Result;
 use base64::Engine as _;
+use cockpit_proto::{self as proto, ErrorCode, Request, Response};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::daemon::client::DaemonClient;
-use crate::daemon::proto::{self, ErrorCode, Request, Response};
+use crate::DaemonClient;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SubmissionImage {
+    Png {
+        bytes: Vec<u8>,
+    },
+    Retained {
+        image_ref: proto::ImageAttachmentRef,
+    },
+}
+
+impl SubmissionImage {
+    pub fn png(bytes: Vec<u8>) -> Self {
+        Self::Png { bytes }
+    }
+
+    pub fn retained(image_ref: proto::ImageAttachmentRef) -> Self {
+        Self::Retained { image_ref }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImageUploadError {
@@ -20,11 +40,8 @@ pub enum ImageUploadError {
 
 pub async fn upload_submission_images(
     client: &DaemonClient,
-    images: &[Vec<u8>],
+    images: &[SubmissionImage],
 ) -> Result<Vec<proto::ImageAttachmentRef>, ImageUploadError> {
-    if images.is_empty() {
-        return Ok(Vec::new());
-    }
     if images.len() > proto::MAX_IMAGES_PER_USER_MESSAGE {
         return Err(ImageUploadError::Usage(format!(
             "too many images: {} exceeds {} image limit",
@@ -32,30 +49,36 @@ pub async fn upload_submission_images(
             proto::MAX_IMAGES_PER_USER_MESSAGE
         )));
     }
-    let total: usize = images.iter().map(Vec::len).sum();
+    let total = images
+        .iter()
+        .filter_map(|image| match image {
+            SubmissionImage::Png { bytes } => Some(bytes.len()),
+            SubmissionImage::Retained { .. } => None,
+        })
+        .sum::<usize>();
     if total > proto::MAX_TOTAL_IMAGE_BYTES {
         return Err(ImageUploadError::Usage(format!(
-            "total image data is too large: {} bytes exceeds {} byte limit",
-            total,
+            "total image data is too large: {total} bytes exceeds {} byte limit",
             proto::MAX_TOTAL_IMAGE_BYTES
         )));
     }
 
     let mut refs = Vec::with_capacity(images.len());
-    for png in images {
-        refs.push(upload_one_image(client, png).await?);
+    for image in images {
+        match image {
+            SubmissionImage::Png { bytes } => refs.push(upload_one(client, bytes).await?),
+            SubmissionImage::Retained { image_ref } => refs.push(image_ref.clone()),
+        }
     }
     Ok(refs)
 }
 
-async fn upload_one_image(
+async fn upload_one(
     client: &DaemonClient,
     png: &[u8],
 ) -> Result<proto::ImageAttachmentRef, ImageUploadError> {
     if png.is_empty() {
-        return Err(ImageUploadError::Usage(
-            "image attachment is empty".to_string(),
-        ));
+        return Err(ImageUploadError::Usage("image attachment is empty".into()));
     }
     if png.len() > proto::MAX_SINGLE_IMAGE_BYTES {
         return Err(ImageUploadError::Usage(format!(
@@ -64,11 +87,14 @@ async fn upload_one_image(
             proto::MAX_SINGLE_IMAGE_BYTES
         )));
     }
-    let sha256 = crate::intel::hex_lower(&Sha256::digest(png));
-    let upload_id = match request_or_error(
+    let sha256 = Sha256::digest(png)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let upload_id = match request(
         client,
         Request::BeginAttachmentUpload {
-            mime: proto::IMAGE_ATTACHMENT_MIME_PNG.to_string(),
+            mime: proto::IMAGE_ATTACHMENT_MIME_PNG.to_owned(),
             byte_len: png.len() as u64,
             sha256,
             purpose: proto::AttachmentPurpose::UserMessageImage,
@@ -84,8 +110,7 @@ async fn upload_one_image(
         }
     };
 
-    let result = upload_one_image_chunks(client, upload_id, png).await;
-    match result {
+    match upload_chunks(client, upload_id, png).await {
         Ok(image_ref) => Ok(image_ref),
         Err(error) => {
             let _ = client
@@ -96,23 +121,22 @@ async fn upload_one_image(
     }
 }
 
-async fn upload_one_image_chunks(
+async fn upload_chunks(
     client: &DaemonClient,
     upload_id: Uuid,
     png: &[u8],
 ) -> Result<proto::ImageAttachmentRef, ImageUploadError> {
-    let max_raw = (proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES / 4) * 3;
-    let chunk_len = max_raw.max(1);
+    let chunk_len = ((proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES / 4) * 3).max(1);
     let mut offset = 0usize;
     while offset < png.len() {
         let end = (offset + chunk_len).min(png.len());
         let data_base64 = base64::engine::general_purpose::STANDARD.encode(&png[offset..end]);
         if data_base64.len() > proto::MAX_ATTACHMENT_CHUNK_BASE64_BYTES {
             return Err(ImageUploadError::Usage(
-                "encoded attachment chunk exceeded configured frame budget".to_string(),
+                "encoded attachment chunk exceeded configured frame budget".into(),
             ));
         }
-        match request_or_error(
+        match request(
             client,
             Request::UploadAttachmentChunk {
                 upload_id,
@@ -122,13 +146,13 @@ async fn upload_one_image_chunks(
         )
         .await?
         {
-            Response::AttachmentChunkAccepted { next_offset, .. } => {
-                if next_offset != end {
-                    return Err(ImageUploadError::Daemon(format!(
-                        "attachment upload ack offset mismatch: got {next_offset}, expected {end}"
-                    )));
-                }
+            Response::AttachmentChunkAccepted { next_offset, .. } if next_offset == end => {
                 offset = next_offset;
+            }
+            Response::AttachmentChunkAccepted { next_offset, .. } => {
+                return Err(ImageUploadError::Daemon(format!(
+                    "attachment upload ack offset mismatch: got {next_offset}, expected {end}"
+                )));
             }
             other => {
                 return Err(ImageUploadError::Daemon(format!(
@@ -137,7 +161,7 @@ async fn upload_one_image_chunks(
             }
         }
     }
-    match request_or_error(client, Request::FinishAttachmentUpload { upload_id }).await? {
+    match request(client, Request::FinishAttachmentUpload { upload_id }).await? {
         Response::AttachmentUploaded { image_ref } => Ok(image_ref),
         other => Err(ImageUploadError::Daemon(format!(
             "unexpected attachment finish response: {other:?}"
@@ -145,11 +169,8 @@ async fn upload_one_image_chunks(
     }
 }
 
-async fn request_or_error(
-    client: &DaemonClient,
-    request: Request,
-) -> Result<Response, ImageUploadError> {
-    match client.request(request).await {
+async fn request(client: &DaemonClient, value: Request) -> Result<Response, ImageUploadError> {
+    match client.request(value).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(error)) if error.code == ErrorCode::BadRequest => {
             Err(ImageUploadError::Usage(error.message))

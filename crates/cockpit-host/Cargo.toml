@@ -1,0 +1,29 @@
+[package]
+name = "cockpit-host"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Dependency-minimal host filesystem and process primitives for Cockpit"
+license = "Apache-2.0"
+repository = "https://github.com/FlyCockpit/flycockpitapp"
+homepage = "https://github.com/FlyCockpit/flycockpitapp"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread", "macros", "process", "io-util", "time", "sync",
+] }
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

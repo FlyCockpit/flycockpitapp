@@ -141,6 +141,15 @@ pub struct HostCapabilitySnapshot {
 }
 
 impl HostCapabilitySnapshot {
+    pub fn unpublished() -> Self {
+        Self {
+            generation: 0,
+            features: Vec::new(),
+            dependencies: Vec::new(),
+            secret_store: SecretStoreSnapshot::unconfigured_placeholder(),
+        }
+    }
+
     pub fn feature(&self, id: &str) -> Option<&FeatureCapabilityRow> {
         self.features.iter().find(|row| row.id == id)
     }

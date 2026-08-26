@@ -1,3 +1,5 @@
+//! Symlink-aware host path containment.
+
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 

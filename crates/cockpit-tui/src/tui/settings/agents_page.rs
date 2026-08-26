@@ -138,7 +138,7 @@ enum PendingAgentOperation {
         client_operation_id: String,
         mutation_intent_hash: String,
         cwd: PathBuf,
-        mutation: cockpit_core::daemon::proto::AgentMutation,
+        mutation: cockpit_proto::AgentMutation,
         expected_revision: Option<String>,
         purpose: MutationPurpose,
         querying: bool,
@@ -291,7 +291,7 @@ fn agent_external_edit_staging() -> Result<AgentExternalEditStaging, String> {
         .prefix("cockpit-agent-edit-")
         .tempdir()
         .map_err(|error| format!("failed to create private external-edit directory: {error}"))?;
-    cockpit_core::private_fs::ensure_private_dir(directory.path())
+    cockpit_host::private_fs::ensure_private_dir(directory.path())
         .map_err(|error| format!("failed to secure external-edit directory: {error:#}"))?;
     let path = directory.path().join("assistant.md");
     let directory_handle = cockpit_config::config::open_config_directory_nofollow(directory.path())
@@ -326,7 +326,7 @@ pub(crate) fn read_agent_external_edit_staging(
     let bytes = cockpit_config::config::read_config_leaf_from_retained_directory(
         directory_handle,
         leaf,
-        cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES,
+        cockpit_proto::MAX_AGENT_MARKDOWN_BYTES,
     )
     .map_err(|error| format!("failed to read retained editor staging file: {error:#}"))?;
     String::from_utf8(bytes).map_err(|_| "external editor produced non-UTF-8 content".into())
@@ -478,7 +478,7 @@ impl AgentsPage {
                         owner: format!("{}::{name}", cwd.display()),
                         revision: Some(expected_revision.clone()),
                     },
-                    cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
+                    cockpit_proto::Request::BeginAgentEditorLease {
                         client_operation_id: client_operation_id.clone(),
                         project_root: cwd.to_string_lossy().into_owned(),
                         name: name.clone(),
@@ -514,7 +514,7 @@ impl AgentsPage {
                         owner: format!("{}::{lease_id}", cwd.display()),
                         revision: Some(consumed_revision.clone()),
                     },
-                    cockpit_core::daemon::proto::Request::GetAgentEditorLeaseSettlement {
+                    cockpit_proto::Request::GetAgentEditorLeaseSettlement {
                         client_operation_id: client_operation_id.clone(),
                         project_root: cwd.to_string_lossy().into_owned(),
                         lease_id: lease_id.clone(),
@@ -545,7 +545,7 @@ impl AgentsPage {
             } => {
                 let project_root = cwd.to_string_lossy().into_owned();
                 let request = if querying {
-                    cockpit_core::daemon::proto::Request::MutateAgent {
+                    cockpit_proto::Request::MutateAgent {
                         client_operation_id: client_operation_id.clone(),
                         mutation_intent_hash: mutation_intent_hash.clone(),
                         project_root,
@@ -553,7 +553,7 @@ impl AgentsPage {
                         expected_revision: expected_revision.clone(),
                     }
                 } else {
-                    cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                    cockpit_proto::Request::GetLocalOperationSettlement {
                         client_operation_id: client_operation_id.clone(),
                     }
                 };
@@ -595,7 +595,7 @@ impl AgentsPage {
             } => {
                 let project_root = cwd.to_string_lossy().into_owned();
                 let request = if querying {
-                    cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
+                    cockpit_proto::Request::SaveAssistantDefinition {
                         client_operation_id: client_operation_id.clone(),
                         mutation_intent_hash: mutation_intent_hash.clone(),
                         project_root,
@@ -605,7 +605,7 @@ impl AgentsPage {
                         expected_config_generation,
                     }
                 } else {
-                    cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                    cockpit_proto::Request::GetLocalOperationSettlement {
                         client_operation_id: client_operation_id.clone(),
                     }
                 };
@@ -644,7 +644,7 @@ impl AgentsPage {
             } => {
                 let project_root = cwd.to_string_lossy().into_owned();
                 let request = if querying {
-                    cockpit_core::daemon::proto::Request::DeleteAssistant {
+                    cockpit_proto::Request::DeleteAssistant {
                         client_operation_id: client_operation_id.clone(),
                         mutation_intent_hash: mutation_intent_hash.clone(),
                         project_root,
@@ -653,7 +653,7 @@ impl AgentsPage {
                         expected_config_generation,
                     }
                 } else {
-                    cockpit_core::daemon::proto::Request::GetLocalOperationSettlement {
+                    cockpit_proto::Request::GetLocalOperationSettlement {
                         client_operation_id: client_operation_id.clone(),
                     }
                 };
@@ -698,7 +698,7 @@ impl AgentsPage {
                 owner: project_root.clone(),
                 revision: Some(generation.to_string()),
             },
-            cockpit_core::daemon::proto::Request::GetAgentInventory {
+            cockpit_proto::Request::GetAgentInventory {
                 project_root: project_root.clone(),
             },
         );
@@ -710,7 +710,7 @@ impl AgentsPage {
                 owner: project_root,
                 revision: Some(generation.to_string()),
             },
-            cockpit_core::daemon::proto::Request::ListAssistants,
+            cockpit_proto::Request::ListAssistants,
         );
         self.pending_daemon
             .insert(assistants, PendingAgentOperation::Assistants { generation });
@@ -1137,7 +1137,7 @@ impl AgentsPage {
         &mut self,
         cx: &mut SettingsCx,
         target: super::SettingsEffectTarget,
-        request: cockpit_core::daemon::proto::Request,
+        request: cockpit_proto::Request,
         pending: PendingAgentOperation,
     ) {
         if self.pending_daemon.values().any(|existing| {
@@ -1157,7 +1157,7 @@ impl AgentsPage {
         &mut self,
         cx: &mut SettingsCx,
         pending: PendingAgentOperation,
-        response: Result<cockpit_core::daemon::proto::Response, String>,
+        response: Result<cockpit_proto::Response, String>,
     ) {
         match pending {
             PendingAgentOperation::Snapshot {
@@ -1168,7 +1168,7 @@ impl AgentsPage {
                 purpose,
             } => {
                 let snapshot = response.and_then(|response| match response {
-                    cockpit_core::daemon::proto::Response::AgentEditSnapshot(snapshot) => {
+                    cockpit_proto::Response::AgentEditSnapshot(snapshot) => {
                         validate_agent_snapshot(&snapshot, &cwd, &name, None)?;
                         Ok(snapshot)
                     }
@@ -1192,9 +1192,8 @@ impl AgentsPage {
                 }
                 match purpose {
                     SnapshotPurpose::Edit { external } if !snapshot.editable => {
-                        let mutation = cockpit_core::daemon::proto::AgentMutation::EjectBuiltin {
-                            name: name.clone(),
-                        };
+                        let mutation =
+                            cockpit_proto::AgentMutation::EjectBuiltin { name: name.clone() };
                         let expected_revision = snapshot.revision.clone();
                         let project_root = cwd.to_string_lossy().into_owned();
                         let client_operation_id = uuid::Uuid::new_v4().to_string();
@@ -1214,7 +1213,7 @@ impl AgentsPage {
                                 ),
                                 revision: Some(expected_revision.clone()),
                             },
-                            cockpit_core::daemon::proto::Request::MutateAgent {
+                            cockpit_proto::Request::MutateAgent {
                                 client_operation_id: client_operation_id.clone(),
                                 mutation_intent_hash: mutation_intent_hash.clone(),
                                 project_root,
@@ -1237,9 +1236,8 @@ impl AgentsPage {
                     }
                     SnapshotPurpose::OpenDetail => self.open_detail_from_snapshot(snapshot),
                     SnapshotPurpose::DeleteCustom => {
-                        let mutation = cockpit_core::daemon::proto::AgentMutation::DeleteCustom {
-                            name: name.clone(),
-                        };
+                        let mutation =
+                            cockpit_proto::AgentMutation::DeleteCustom { name: name.clone() };
                         self.stage_mutation(
                             cx,
                             cwd,
@@ -1249,9 +1247,8 @@ impl AgentsPage {
                         );
                     }
                     SnapshotPurpose::ResetBuiltin => {
-                        let mutation = cockpit_core::daemon::proto::AgentMutation::ResetBuiltin {
-                            name: name.clone(),
-                        };
+                        let mutation =
+                            cockpit_proto::AgentMutation::ResetBuiltin { name: name.clone() };
                         self.stage_mutation(
                             cx,
                             cwd,
@@ -1362,9 +1359,8 @@ impl AgentsPage {
                         return;
                     }
                 };
-                if let cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded {
-                    warning,
-                } = &result.outcome
+                if let cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded { warning } =
+                    &result.outcome
                 {
                     match &purpose {
                         MutationPurpose::SaveEditor { .. } => self.editing = None,
@@ -1439,10 +1435,12 @@ impl AgentsPage {
                     MutationPurpose::ResetAll => {
                         self.expected_inventory_after_commit = result.inventory_revision.clone();
                         self.status = Some(match result.outcome {
-                            cockpit_core::daemon::proto::AgentMutationOutcome::Reconciled => {
+                            cockpit_proto::AgentMutationOutcome::Reconciled => {
                                 "reset all built-in agent overrides".into()
                             }
-                            cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded { warning } => warning,
+                            cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                                warning,
+                            } => warning,
                         });
                         self.queue_load(cx);
                     }
@@ -1509,7 +1507,7 @@ impl AgentsPage {
                 };
                 let requested_root = cwd.to_string_lossy();
                 let saved = match response {
-                    cockpit_core::daemon::proto::Response::AssistantDefinitionSaved {
+                    cockpit_proto::Response::AssistantDefinitionSaved {
                         client_operation_id: returned_operation_id,
                         mutation_intent_hash: returned_intent,
                         project_root,
@@ -1528,34 +1526,32 @@ impl AgentsPage {
                         && returned_name == name
                         && consumed_revision == expected_revision
                         && consumed_config_generation == expected_config_generation
-                        && (matches!(
-                            outcome,
-                            cockpit_core::daemon::proto::AgentMutationOutcome::Reconciled
-                        ) || result_config_generation > consumed_config_generation) =>
+                        && (matches!(outcome, cockpit_proto::AgentMutationOutcome::Reconciled)
+                            || result_config_generation > consumed_config_generation) =>
                     {
                         if let Some(assistant) = assistant {
-                                coherent_assistant_save_revision(
-                                    &assistant,
-                                    &name,
-                                    &markdown,
-                                    &consumed_revision,
-                                    &expected_revision,
-                                )
-                                .and_then(|revision| {
-                                    if revision != result_revision {
-                                        Err("assistant result revision is unbound".into())
-                                    } else {
-                                        Ok((Some(assistant), revision, outcome))
-                                    }
-                                })
-                            } else if matches!(
-                                &outcome,
-                                cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded { .. }
-                            ) {
-                                Ok((None, result_revision, outcome))
-                            } else {
-                                Err("assistant save omitted its reconciled snapshot".into())
-                            }
+                            coherent_assistant_save_revision(
+                                &assistant,
+                                &name,
+                                &markdown,
+                                &consumed_revision,
+                                &expected_revision,
+                            )
+                            .and_then(|revision| {
+                                if revision != result_revision {
+                                    Err("assistant result revision is unbound".into())
+                                } else {
+                                    Ok((Some(assistant), revision, outcome))
+                                }
+                            })
+                        } else if matches!(
+                            &outcome,
+                            cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded { .. }
+                        ) {
+                            Ok((None, result_revision, outcome))
+                        } else {
+                            Err("assistant save omitted its reconciled snapshot".into())
+                        }
                     }
                     other => Err(format!("unexpected assistant save response: {other:?}")),
                 };
@@ -1579,10 +1575,12 @@ impl AgentsPage {
                             }
                         }
                         self.status = Some(match outcome {
-                            cockpit_core::daemon::proto::AgentMutationOutcome::Reconciled => {
+                            cockpit_proto::AgentMutationOutcome::Reconciled => {
                                 format!("saved assistant `{name}`")
                             }
-                            cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded { warning } => warning,
+                            cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded {
+                                warning,
+                            } => warning,
                         });
                         self.queue_load(cx);
                     }
@@ -1659,7 +1657,7 @@ impl AgentsPage {
                     }
                 };
                 match response {
-                    cockpit_core::daemon::proto::Response::AssistantDeleted {
+                    cockpit_proto::Response::AssistantDeleted {
                         client_operation_id: returned_operation_id,
                         mutation_intent_hash: returned_intent,
                         project_root,
@@ -1678,10 +1676,8 @@ impl AgentsPage {
                         && consumed_revision == expected_registration_revision
                         && !result_revision.trim().is_empty()
                         && consumed_config_generation == expected_config_generation
-                        && (matches!(
-                            outcome,
-                            cockpit_core::daemon::proto::AgentMutationOutcome::Reconciled
-                        ) || result_config_generation > consumed_config_generation) =>
+                        && (matches!(outcome, cockpit_proto::AgentMutationOutcome::Reconciled)
+                            || result_config_generation > consumed_config_generation) =>
                     {
                         self.status = Some(format!(
                             "unregistered assistant `{name}`; its home was retained"
@@ -1751,10 +1747,7 @@ impl AgentsPage {
         // a row from an older generation.
     }
 
-    fn open_detail_from_snapshot(
-        &mut self,
-        snapshot: cockpit_core::daemon::proto::AgentEditSnapshot,
-    ) {
+    fn open_detail_from_snapshot(&mut self, snapshot: cockpit_proto::AgentEditSnapshot) {
         let name = snapshot.name.clone();
         let original_text = snapshot.markdown.clone();
         let def = match cockpit_core::agents::parse_agent(
@@ -1798,7 +1791,7 @@ impl AgentsPage {
         &mut self,
         cx: &mut SettingsCx,
         cwd: PathBuf,
-        mutation: cockpit_core::daemon::proto::AgentMutation,
+        mutation: cockpit_proto::AgentMutation,
         expected_revision: String,
         purpose: MutationPurpose,
     ) {
@@ -1816,7 +1809,7 @@ impl AgentsPage {
                 owner: format!("{}::{}", cwd.display(), agent_mutation_owner(&mutation)),
                 revision: Some(expected_revision.clone()),
             },
-            cockpit_core::daemon::proto::Request::MutateAgent {
+            cockpit_proto::Request::MutateAgent {
                 client_operation_id: client_operation_id.clone(),
                 mutation_intent_hash: mutation_intent_hash.clone(),
                 project_root,
@@ -1839,7 +1832,7 @@ impl AgentsPage {
         &mut self,
         cx: &mut SettingsCx,
         cwd: PathBuf,
-        snapshot: cockpit_core::daemon::proto::AgentEditSnapshot,
+        snapshot: cockpit_proto::AgentEditSnapshot,
         external: bool,
     ) {
         let name = snapshot.name.clone();
@@ -1865,7 +1858,7 @@ impl AgentsPage {
                     owner: format!("{}::{name}", cwd.display()),
                     revision: Some(expected_revision.clone()),
                 },
-                cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
+                cockpit_proto::Request::BeginAgentEditorLease {
                     client_operation_id: client_operation_id.clone(),
                     project_root: cwd.to_string_lossy().into_owned(),
                     name: name.clone(),
@@ -1896,10 +1889,10 @@ impl AgentsPage {
         expected_revision: String,
         authority_id: super::pointer_actions::AgentId,
         draft: AgentEditor,
-        response: Result<cockpit_core::daemon::proto::Response, String>,
+        response: Result<cockpit_proto::Response, String>,
     ) {
         let lease = match response {
-            Ok(cockpit_core::daemon::proto::Response::AgentEditorLeaseBegun(lease)) => lease,
+            Ok(cockpit_proto::Response::AgentEditorLeaseBegun(lease)) => lease,
             Ok(other) => {
                 self.uncertain_agent_operation =
                     Some(Box::new(PendingAgentOperation::BeginLease {
@@ -1955,8 +1948,7 @@ impl AgentsPage {
             validate_agent_snapshot(&lease.snapshot, &cwd, &name, None).and_then(|()| {
                 if lease.snapshot.revision != expected_revision
                     || !lease.snapshot.editable
-                    || lease.snapshot.source_layer
-                        != cockpit_core::daemon::proto::AgentSourceLayer::Workspace
+                    || lease.snapshot.source_layer != cockpit_proto::AgentSourceLayer::Workspace
                 {
                     Err("daemon editor lease did not match the requested workspace revision".into())
                 } else {
@@ -2025,7 +2017,7 @@ impl AgentsPage {
                 owner: format!("{}::{lease_id}", cwd.display()),
                 revision: Some(consumed_revision.clone()),
             },
-            cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+            cockpit_proto::Request::CompleteAgentEditorLease {
                 client_operation_id: client_operation_id.clone(),
                 project_root: cwd.to_string_lossy().into_owned(),
                 lease_id: lease_id.clone(),
@@ -2061,12 +2053,12 @@ impl AgentsPage {
         detail: Option<String>,
         outcome: super::pointer_actions::ExternalEditOutcome,
         querying: bool,
-        response: Result<cockpit_core::daemon::proto::Response, String>,
+        response: Result<cockpit_proto::Response, String>,
     ) {
         self.uncertain_agent_operation = None;
         let expected_saved = matches!(outcome, super::pointer_actions::ExternalEditOutcome::Saved);
         let receipt = match response {
-            Ok(cockpit_core::daemon::proto::Response::AgentEditorLeaseCompleted(receipt))
+            Ok(cockpit_proto::Response::AgentEditorLeaseCompleted(receipt))
                 if cockpit_proto::validate_agent_editor_completion(
                     &receipt,
                     &client_operation_id,
@@ -2105,7 +2097,7 @@ impl AgentsPage {
             }
         };
         match receipt.status {
-            cockpit_core::daemon::proto::AgentEditorSettlementStatus::NotStarted if querying => {
+            cockpit_proto::AgentEditorSettlementStatus::NotStarted if querying => {
                 self.stage(
                     cx,
                     super::SettingsEffectTarget {
@@ -2113,11 +2105,13 @@ impl AgentsPage {
                         owner: format!("{}::{lease_id}", cwd.display()),
                         revision: Some(consumed_revision.clone()),
                     },
-                    cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+                    cockpit_proto::Request::CompleteAgentEditorLease {
                         client_operation_id: client_operation_id.clone(),
                         project_root: cwd.to_string_lossy().into_owned(),
                         lease_id: lease_id.clone(),
-                        markdown: markdown.clone(),
+                        markdown: markdown
+                            .clone()
+                            .map(cockpit_proto::SensitiveWirePayload::new),
                     },
                     PendingAgentOperation::CompleteLease {
                         client_operation_id,
@@ -2134,8 +2128,8 @@ impl AgentsPage {
                 );
                 self.status = Some("retrying exact editor lease settlement…".into());
             }
-            cockpit_core::daemon::proto::AgentEditorSettlementStatus::Pending
-            | cockpit_core::daemon::proto::AgentEditorSettlementStatus::NotStarted => {
+            cockpit_proto::AgentEditorSettlementStatus::Pending
+            | cockpit_proto::AgentEditorSettlementStatus::NotStarted => {
                 self.uncertain_agent_operation =
                     Some(Box::new(PendingAgentOperation::CompleteLease {
                         client_operation_id,
@@ -2153,7 +2147,7 @@ impl AgentsPage {
                     "editor lease settlement is still pending; press Enter to query again".into(),
                 );
             }
-            cockpit_core::daemon::proto::AgentEditorSettlementStatus::Rejected { error } => {
+            cockpit_proto::AgentEditorSettlementStatus::Rejected { error } => {
                 if let Some(markdown) = markdown.as_deref()
                     && let Some(editor) = draft.as_mut()
                 {
@@ -2165,9 +2159,7 @@ impl AgentsPage {
                     error.message
                 ));
             }
-            cockpit_core::daemon::proto::AgentEditorSettlementStatus::Cancelled
-                if !expected_saved =>
-            {
+            cockpit_proto::AgentEditorSettlementStatus::Cancelled if !expected_saved => {
                 self.editing = draft.take();
                 self.status = Some(detail.unwrap_or_else(|| match outcome {
                     super::pointer_actions::ExternalEditOutcome::Cancelled => {
@@ -2176,7 +2168,7 @@ impl AgentsPage {
                     _ => "external edit failed".into(),
                 }));
             }
-            cockpit_core::daemon::proto::AgentEditorSettlementStatus::Saved {
+            cockpit_proto::AgentEditorSettlementStatus::Saved {
                 result_revision,
                 outcome: commit_outcome,
             } if expected_saved && cockpit_proto::is_opaque_authority_token(&result_revision) => {
@@ -2184,9 +2176,7 @@ impl AgentsPage {
                     (Some(detail), _) => format!("saved `{name}`; {detail}"),
                     (
                         None,
-                        cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded {
-                            warning,
-                        },
+                        cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded { warning },
                     ) => format!("saved `{name}`; {warning}"),
                     _ => format!("saved `{name}`"),
                 });
@@ -2472,11 +2462,13 @@ impl AgentsPage {
                 owner: format!("{}::{lease_id}", cwd.display()),
                 revision: Some(consumed_revision.clone()),
             },
-            cockpit_core::daemon::proto::Request::CompleteAgentEditorLease {
+            cockpit_proto::Request::CompleteAgentEditorLease {
                 client_operation_id: client_operation_id.clone(),
                 project_root: cwd.to_string_lossy().into_owned(),
                 lease_id: lease_id.clone(),
-                markdown: markdown.clone(),
+                markdown: markdown
+                    .clone()
+                    .map(cockpit_proto::SensitiveWirePayload::new),
             },
             PendingAgentOperation::CompleteLease {
                 client_operation_id,
@@ -2495,24 +2487,24 @@ impl AgentsPage {
     }
 }
 
-fn agent_mutation_owner(mutation: &cockpit_core::daemon::proto::AgentMutation) -> &str {
+fn agent_mutation_owner(mutation: &cockpit_proto::AgentMutation) -> &str {
     match mutation {
-        cockpit_core::daemon::proto::AgentMutation::EjectBuiltin { name }
-        | cockpit_core::daemon::proto::AgentMutation::SaveDefinition { name, .. }
-        | cockpit_core::daemon::proto::AgentMutation::CreateDefinition { name, .. }
-        | cockpit_core::daemon::proto::AgentMutation::DeleteCustom { name }
-        | cockpit_core::daemon::proto::AgentMutation::ResetBuiltin { name }
-        | cockpit_core::daemon::proto::AgentMutation::SaveGoalSupervision { name, .. } => name,
-        cockpit_core::daemon::proto::AgentMutation::ResetAllBuiltins => "reset-all",
+        cockpit_proto::AgentMutation::EjectBuiltin { name }
+        | cockpit_proto::AgentMutation::SaveDefinition { name, .. }
+        | cockpit_proto::AgentMutation::CreateDefinition { name, .. }
+        | cockpit_proto::AgentMutation::DeleteCustom { name }
+        | cockpit_proto::AgentMutation::ResetBuiltin { name }
+        | cockpit_proto::AgentMutation::SaveGoalSupervision { name, .. } => name,
+        cockpit_proto::AgentMutation::ResetAllBuiltins => "reset-all",
     }
 }
 
 /// Build the per-row view models for `cwd`, including the effective model.
 fn inventory_rows_from_response(
     cwd: &std::path::Path,
-    response: cockpit_core::daemon::proto::Response,
+    response: cockpit_proto::Response,
 ) -> Result<(Vec<AgentRow>, String, String, u64), String> {
-    let cockpit_core::daemon::proto::Response::AgentInventory {
+    let cockpit_proto::Response::AgentInventory {
         entries,
         inventory_revision,
         project_root,
@@ -2536,10 +2528,10 @@ fn inventory_rows_from_response(
         .map(|entry| AgentRow {
             name: entry.name,
             kind: match entry.kind {
-                cockpit_core::daemon::proto::AgentEntryKind::Builtin => AgentKind::Builtin {
+                cockpit_proto::AgentEntryKind::Builtin => AgentKind::Builtin {
                     overridden: entry.overridden,
                 },
-                cockpit_core::daemon::proto::AgentEntryKind::Custom => AgentKind::Custom,
+                cockpit_proto::AgentEntryKind::Custom => AgentKind::Custom,
             },
             detail: if entry.valid {
                 Ok(entry.description.unwrap_or_default())
@@ -2558,7 +2550,7 @@ fn inventory_rows_from_response(
 
 fn valid_agent_inventory(
     _cwd: &std::path::Path,
-    entries: &[cockpit_core::daemon::proto::AgentInventoryEntry],
+    entries: &[cockpit_proto::AgentInventoryEntry],
     revision: &str,
 ) -> bool {
     let mut names = std::collections::HashSet::new();
@@ -2566,7 +2558,7 @@ fn valid_agent_inventory(
         && entries.iter().all(|entry| {
             let builtin = cockpit_core::agents::is_builtin_agent(&entry.name);
             !entry.name.is_empty()
-                && entry.name.len() <= cockpit_core::daemon::proto::MAX_AGENT_NAME_BYTES
+                && entry.name.len() <= cockpit_proto::MAX_AGENT_NAME_BYTES
                 && names.insert(entry.name.as_str())
                 && [
                     entry.description.as_deref(),
@@ -2576,7 +2568,7 @@ fn valid_agent_inventory(
                 .into_iter()
                 .flatten()
                 .all(|value| value.len() <= cockpit_proto::MAX_AGENT_METADATA_BYTES)
-                && (entry.kind == cockpit_core::daemon::proto::AgentEntryKind::Builtin) == builtin
+                && (entry.kind == cockpit_proto::AgentEntryKind::Builtin) == builtin
                 && (!entry.overridden || builtin)
                 && cockpit_proto::is_opaque_authority_token(&entry.source_identity)
                 && cockpit_proto::is_opaque_authority_token(&entry.revision)
@@ -2595,9 +2587,9 @@ fn valid_agent_inventory(
 }
 
 fn assistant_rows_from_response(
-    response: cockpit_core::daemon::proto::Response,
+    response: cockpit_proto::Response,
 ) -> Result<(Vec<AgentRow>, u64), String> {
-    let cockpit_core::daemon::proto::Response::Assistants {
+    let cockpit_proto::Response::Assistants {
         assistants,
         config_generation,
     } = response
@@ -2672,7 +2664,7 @@ fn assistant_rows_from_response(
 }
 
 fn coherent_assistant_save_revision(
-    assistant: &cockpit_core::daemon::proto::AssistantSummary,
+    assistant: &cockpit_proto::AssistantSummary,
     expected_name: &str,
     expected_markdown: &str,
     consumed_revision: &str,
@@ -2697,7 +2689,7 @@ fn coherent_assistant_save_revision(
 }
 
 pub(crate) fn validate_agent_snapshot(
-    snapshot: &cockpit_core::daemon::proto::AgentEditSnapshot,
+    snapshot: &cockpit_proto::AgentEditSnapshot,
     cwd: &std::path::Path,
     expected_name: &str,
     expected_markdown: Option<&str>,
@@ -2706,23 +2698,22 @@ pub(crate) fn validate_agent_snapshot(
         .map_err(str::to_string)?;
     if snapshot.name != expected_name
         || snapshot.name.is_empty()
-        || snapshot.name.len() > cockpit_core::daemon::proto::MAX_AGENT_NAME_BYTES
+        || snapshot.name.len() > cockpit_proto::MAX_AGENT_NAME_BYTES
         || snapshot.revision.is_empty()
         || snapshot.source_identity.is_empty()
-        || snapshot.markdown.len() > cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES
-        || snapshot.canonical_preview.len() > cockpit_core::daemon::proto::MAX_AGENT_MARKDOWN_BYTES
+        || snapshot.markdown.len() > cockpit_proto::MAX_AGENT_MARKDOWN_BYTES
+        || snapshot.canonical_preview.len() > cockpit_proto::MAX_AGENT_MARKDOWN_BYTES
     {
         return Err("daemon returned a misrouted or revisionless agent snapshot".into());
     }
     if expected_markdown.is_some_and(|markdown| snapshot.markdown != markdown) {
         return Err("daemon returned an agent snapshot with unexpected content".into());
     }
-    let workspace =
-        snapshot.source_layer == cockpit_core::daemon::proto::AgentSourceLayer::Workspace;
-    let embedded = snapshot.source_layer == cockpit_core::daemon::proto::AgentSourceLayer::Embedded;
+    let workspace = snapshot.source_layer == cockpit_proto::AgentSourceLayer::Workspace;
+    let embedded = snapshot.source_layer == cockpit_proto::AgentSourceLayer::Embedded;
     if snapshot.editable != workspace
         || snapshot.overridden != !embedded
-        || (snapshot.kind == cockpit_core::daemon::proto::AgentEntryKind::Custom && embedded)
+        || (snapshot.kind == cockpit_proto::AgentEntryKind::Custom && embedded)
     {
         return Err("daemon returned incoherent agent source metadata".into());
     }
@@ -2734,31 +2725,31 @@ pub(crate) fn validate_agent_snapshot(
 }
 
 pub(crate) fn validate_agent_mutation_result(
-    result: &cockpit_core::daemon::proto::AgentMutationResult,
+    result: &cockpit_proto::AgentMutationResult,
     client_operation_id: &str,
     mutation_intent_hash: &str,
     cwd: &std::path::Path,
-    mutation: &cockpit_core::daemon::proto::AgentMutation,
+    mutation: &cockpit_proto::AgentMutation,
     prior_revision: Option<&str>,
     completed_lease_id: Option<&str>,
 ) -> Result<(), String> {
-    use cockpit_core::daemon::proto::{
-        AgentEntryKind as K, AgentMutation as M, AgentSourceLayer as L,
-    };
+    use cockpit_proto::{AgentEntryKind as K, AgentMutation as M, AgentSourceLayer as L};
     cockpit_proto::validate_agent_mutation_envelope(
         result,
-        client_operation_id,
-        mutation_intent_hash,
-        cwd.to_string_lossy().as_ref(),
-        cockpit_proto::agent_mutation_name(mutation),
-        prior_revision,
-        completed_lease_id,
-        matches!(mutation, M::ResetAllBuiltins),
+        &cockpit_proto::AgentMutationExpectations {
+            client_operation_id,
+            mutation_intent_hash,
+            project_root: cwd.to_string_lossy().as_ref(),
+            agent_name: cockpit_proto::agent_mutation_name(mutation),
+            consumed_revision: prior_revision,
+            completed_lease_id,
+            inventory_wide: matches!(mutation, M::ResetAllBuiltins),
+        },
     )
     .map_err(str::to_string)?;
     if matches!(
         result.outcome,
-        cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded { .. }
+        cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded { .. }
     ) {
         if let Some(snapshot) = &result.snapshot {
             let name = cockpit_proto::agent_mutation_name(mutation)
@@ -2844,9 +2835,8 @@ pub(crate) fn validate_agent_mutation_result(
             {
                 return Err("daemon omitted the reset-all inventory revision".into());
             }
-            if let cockpit_core::daemon::proto::AgentMutationOutcome::CommittedRefreshNeeded {
-                warning,
-            } = &result.outcome
+            if let cockpit_proto::AgentMutationOutcome::CommittedRefreshNeeded { warning } =
+                &result.outcome
                 && warning.trim().is_empty()
             {
                 return Err("daemon omitted the committed reset refresh warning".into());
@@ -2911,24 +2901,24 @@ pub(crate) fn validate_agent_mutation_result(
 }
 
 pub(crate) enum AgentMutationSettlement {
-    Committed(cockpit_core::daemon::proto::AgentMutationResult),
+    Committed(cockpit_proto::AgentMutationResult),
     Pending,
     Rejected(String),
 }
 
 enum AssistantMutationSettlement {
-    Committed(cockpit_core::daemon::proto::Response),
+    Committed(cockpit_proto::Response),
     Pending,
     Rejected(String),
 }
 
 fn bind_assistant_mutation_settlement(
-    response: cockpit_core::daemon::proto::Response,
+    response: cockpit_proto::Response,
     client_operation_id: &str,
     mutation_intent_hash: &str,
     operation_kind: &str,
 ) -> Result<AssistantMutationSettlement, String> {
-    use cockpit_core::daemon::proto::Response;
+    use cockpit_proto::Response;
     let receipt_matches = |response: &Response| match (operation_kind, response) {
         (
             "save_assistant_definition",
@@ -3006,11 +2996,11 @@ fn bind_assistant_mutation_settlement(
 /// mutation. A transport error is handled by the caller by querying the local
 /// operation ledger with the same operation id.
 pub(crate) fn bind_agent_mutation_settlement(
-    response: cockpit_core::daemon::proto::Response,
+    response: cockpit_proto::Response,
     client_operation_id: &str,
     mutation_intent_hash: &str,
 ) -> Result<AgentMutationSettlement, String> {
-    use cockpit_core::daemon::proto::Response;
+    use cockpit_proto::Response;
     match response {
         Response::AgentMutated(result) => {
             if result.client_operation_id != client_operation_id
@@ -3197,7 +3187,7 @@ impl SettingsCx {
                                     owner: name.clone(),
                                     revision: Some(revision.clone()),
                                 },
-                                cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
+                                cockpit_proto::Request::SaveAssistantDefinition {
                                     client_operation_id: client_operation_id.clone(),
                                     mutation_intent_hash: mutation_intent_hash.clone(),
                                     project_root,
@@ -3222,11 +3212,10 @@ impl SettingsCx {
                         }
                         Some(revision) => {
                             let cwd = self.agents_cwd();
-                            let mutation =
-                                cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
-                                    name,
-                                    markdown: text.clone(),
-                                };
+                            let mutation = cockpit_proto::AgentMutation::SaveDefinition {
+                                name,
+                                markdown: text.clone(),
+                            };
                             p.stage_mutation(
                                 self,
                                 cwd,
@@ -3289,7 +3278,7 @@ impl SettingsCx {
                         p.stage_mutation(
                             self,
                             cwd,
-                            cockpit_core::daemon::proto::AgentMutation::ResetAllBuiltins,
+                            cockpit_proto::AgentMutation::ResetAllBuiltins,
                             revision,
                             MutationPurpose::ResetAll,
                         );
@@ -3380,7 +3369,7 @@ impl SettingsCx {
                 owner: format!("{}::{name}", cwd.display()),
                 revision: Some(revision.clone()),
             },
-            cockpit_core::daemon::proto::Request::BeginAgentEditorLease {
+            cockpit_proto::Request::BeginAgentEditorLease {
                 client_operation_id: client_operation_id.clone(),
                 project_root: cwd.to_string_lossy().into_owned(),
                 name: name.clone(),
@@ -3492,7 +3481,7 @@ impl SettingsCx {
                         owner: format!("{}::{name}", cwd.display()),
                         revision: Some(revision.clone()),
                     },
-                    cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+                    cockpit_proto::Request::GetAgentEditSnapshot {
                         project_root: cwd.to_string_lossy().into_owned(),
                         name: name.clone(),
                     },
@@ -3618,7 +3607,7 @@ impl SettingsCx {
                     owner: name.clone(),
                     revision: Some(expected_revision.clone()),
                 },
-                cockpit_core::daemon::proto::Request::SaveAssistantDefinition {
+                cockpit_proto::Request::SaveAssistantDefinition {
                     client_operation_id: client_operation_id.clone(),
                     mutation_intent_hash: mutation_intent_hash.clone(),
                     project_root,
@@ -3642,7 +3631,7 @@ impl SettingsCx {
             );
         } else if let Some(revision) = expected_revision {
             let cwd = self.agents_cwd();
-            let mutation = cockpit_core::daemon::proto::AgentMutation::SaveDefinition {
+            let mutation = cockpit_proto::AgentMutation::SaveDefinition {
                 name,
                 markdown: markdown.clone(),
             };
@@ -3715,7 +3704,7 @@ impl SettingsCx {
                 owner: format!("{}::{name}", cwd.display()),
                 revision: Some(revision.clone()),
             },
-            cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+            cockpit_proto::Request::GetAgentEditSnapshot {
                 project_root: cwd.to_string_lossy().into_owned(),
                 name: name.clone(),
             },
@@ -3778,7 +3767,7 @@ impl SettingsCx {
                 owner: format!("{}::{name}", cwd.display()),
                 revision: Some(revision.clone()),
             },
-            cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+            cockpit_proto::Request::GetAgentEditSnapshot {
                 project_root: cwd.to_string_lossy().into_owned(),
                 name: name.clone(),
             },
@@ -3860,7 +3849,7 @@ impl SettingsCx {
                         owner: name.clone(),
                         revision: Some(registration_revision.clone()),
                     },
-                    cockpit_core::daemon::proto::Request::DeleteAssistant {
+                    cockpit_proto::Request::DeleteAssistant {
                         client_operation_id: client_operation_id.clone(),
                         mutation_intent_hash: mutation_intent_hash.clone(),
                         project_root,
@@ -3890,7 +3879,7 @@ impl SettingsCx {
                         owner: format!("{}::{name}", cwd.display()),
                         revision: Some(revision.clone()),
                     },
-                    cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+                    cockpit_proto::Request::GetAgentEditSnapshot {
                         project_root: cwd.to_string_lossy().into_owned(),
                         name: name.clone(),
                     },
@@ -3940,7 +3929,7 @@ impl SettingsCx {
                 owner: format!("{}::{name}", cwd.display()),
                 revision: Some(revision.clone()),
             },
-            cockpit_core::daemon::proto::Request::GetAgentEditSnapshot {
+            cockpit_proto::Request::GetAgentEditSnapshot {
                 project_root: cwd.to_string_lossy().into_owned(),
                 name: name.clone(),
             },

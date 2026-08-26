@@ -228,6 +228,55 @@ pub enum ExternalJournalState {
     Failed,
 }
 
+pub const EXTERNAL_JOURNAL_STATES: &[&str] = &[
+    "prepared",
+    "dispatching",
+    "accepted",
+    "rejected",
+    "submission_unknown",
+    "reconciling",
+    "cancellation_requested",
+    "cancelled",
+    "expired",
+    "completed_after_cancel",
+    "succeeded",
+    "failed",
+];
+pub const EXTERNAL_JOURNAL_TERMINAL_STATES: &[&str] = &[
+    "rejected",
+    "cancelled",
+    "expired",
+    "completed_after_cancel",
+    "succeeded",
+    "failed",
+];
+pub const EXTERNAL_JOURNAL_LEGAL_EDGES: &[(&str, &str)] = &[
+    ("prepared", "dispatching"),
+    ("prepared", "cancelled"),
+    ("prepared", "expired"),
+    ("dispatching", "accepted"),
+    ("dispatching", "rejected"),
+    ("dispatching", "submission_unknown"),
+    ("dispatching", "cancellation_requested"),
+    ("accepted", "succeeded"),
+    ("accepted", "completed_after_cancel"),
+    ("accepted", "failed"),
+    ("accepted", "cancellation_requested"),
+    ("submission_unknown", "reconciling"),
+    ("submission_unknown", "cancellation_requested"),
+    ("reconciling", "accepted"),
+    ("reconciling", "rejected"),
+    ("reconciling", "submission_unknown"),
+    ("reconciling", "failed"),
+    ("reconciling", "cancellation_requested"),
+    ("cancellation_requested", "cancelled"),
+    ("cancellation_requested", "accepted"),
+    ("cancellation_requested", "completed_after_cancel"),
+    ("cancellation_requested", "failed"),
+    ("cancellation_requested", "submission_unknown"),
+    ("cancellation_requested", "reconciling"),
+];
+
 impl ExternalJournalState {
     /// Every state, in graph order.
     pub const ALL: [Self; 12] = [
@@ -283,15 +332,7 @@ impl ExternalJournalState {
 
     /// Terminal states accept no further transition.
     pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Cancelled
-                | Self::Expired
-                | Self::CompletedAfterCancel
-                | Self::Succeeded
-                | Self::Failed
-                | Self::Rejected
-        )
+        EXTERNAL_JOURNAL_TERMINAL_STATES.contains(&self.as_str())
     }
 
     /// Work that has left `prepared` but has not reached a terminal state and
@@ -315,49 +356,7 @@ impl ExternalJournalState {
 
     /// The exact edge set. Everything absent here is rejected.
     pub fn allows_transition_to(self, next: Self) -> bool {
-        match self {
-            Self::Prepared => matches!(next, Self::Dispatching | Self::Cancelled | Self::Expired),
-            Self::Dispatching => matches!(
-                next,
-                Self::Accepted
-                    | Self::Rejected
-                    | Self::SubmissionUnknown
-                    | Self::CancellationRequested
-            ),
-            Self::Accepted => matches!(
-                next,
-                Self::Succeeded
-                    | Self::CompletedAfterCancel
-                    | Self::Failed
-                    | Self::CancellationRequested
-            ),
-            Self::SubmissionUnknown => {
-                matches!(next, Self::Reconciling | Self::CancellationRequested)
-            }
-            Self::Reconciling => matches!(
-                next,
-                Self::Accepted
-                    | Self::Rejected
-                    | Self::SubmissionUnknown
-                    | Self::Failed
-                    | Self::CancellationRequested
-            ),
-            Self::CancellationRequested => matches!(
-                next,
-                Self::Cancelled
-                    | Self::Accepted
-                    | Self::CompletedAfterCancel
-                    | Self::Failed
-                    | Self::SubmissionUnknown
-                    | Self::Reconciling
-            ),
-            Self::Cancelled
-            | Self::Expired
-            | Self::CompletedAfterCancel
-            | Self::Succeeded
-            | Self::Failed
-            | Self::Rejected => false,
-        }
+        EXTERNAL_JOURNAL_LEGAL_EDGES.contains(&(self.as_str(), next.as_str()))
     }
 }
 
@@ -3720,7 +3719,7 @@ mod tests {
         for id in [old_root.session_id, old_child.session_id] {
             db.write(move |conn| {
                 conn.execute(
-                    "UPDATE sessions SET ended_at = 1, last_active_at = 1
+                    "UPDATE sessions SET ended_at_unix_ms = 1, last_active_at_unix_ms = 1
                       WHERE session_id = ?1",
                     params![id.to_string()],
                 )?;

@@ -407,6 +407,7 @@ pub struct ImageControlReadResponseV1 {
 }
 
 impl ImageControlReadResponseV1 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         daemon_instance_id: String,
         requested_project_root: String,
@@ -553,6 +554,7 @@ pub struct ImageControlEventV1 {
 }
 
 impl ImageControlEventV1 {
+    #[allow(clippy::too_many_arguments)]
     pub fn config_changed(
         daemon_instance_id: String,
         requested_project_root: String,
@@ -604,6 +606,7 @@ pub struct ImageControlMutationResponseV1 {
 }
 
 impl ImageControlMutationResponseV1 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client_operation_id: String,
         mutation_intent_hash: String,

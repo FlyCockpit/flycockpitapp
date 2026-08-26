@@ -1135,17 +1135,17 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.blocking_write_for_sync_maintenance(|conn| {
             conn.execute(
-                "INSERT INTO sessions (session_id, project_id, project_root, started_at, last_active_at)
-                 VALUES ('s', 'p', '/p', 1, 1)",
+                "INSERT INTO sessions (session_id, project_id, project_root, started_at_unix_ms, last_active_at_unix_ms)
+                 VALUES ('00000000-0000-4000-8000-000000000001', 'p', '/p', 1, 1)",
                 [],
             )?;
             conn.execute(
                 "INSERT INTO sealed_values (session_id, value_id, value, reason, origin, created_at)
-                 VALUES ('s', 'v', NULL, 'r', 'user', 1)",
+                 VALUES ('00000000-0000-4000-8000-000000000001', 'v', NULL, 'r', 'user', 1)",
                 [],
             )?;
             let stored: Option<String> = conn.query_row(
-                "SELECT value FROM sealed_values WHERE session_id = 's' AND value_id = 'v'",
+                "SELECT value FROM sealed_values WHERE session_id = '00000000-0000-4000-8000-000000000001' AND value_id = 'v'",
                 [],
                 |row| row.get(0),
             )?;

@@ -48,6 +48,9 @@ const DELETED_PUBLIC_METHODS: &[&str] = &["read_blocking", "write_blocking"];
 ///
 /// - `blocking_for_sync_cli`: permanent guarded boundary for synchronous CLI one-shots.
 /// - four `blocking_*_for_sync_*` wrappers: temporary; owned by `db-sync-wrapper-migration`.
+/// - three typed agent-publication journal methods: permanent, narrow bridges
+///   used only while a caller owns the cross-process filesystem publication
+///   lock; none accepts an arbitrary closure.
 const ALLOWLIST: &[AllowlistEntry] = &[
     AllowlistEntry {
         name: "blocking_for_sync_cli",
@@ -79,12 +82,31 @@ const ALLOWLIST: &[AllowlistEntry] = &[
         owner: "db-sync-wrapper-migration",
         rationale: "temporary sync maintenance write boundary pending db-sync-wrapper-migration",
     },
+    AllowlistEntry {
+        name: "insert_agent_mutation_journal_under_publication_lock",
+        kind: AllowlistKind::PermanentPublicationJournal,
+        owner: "agent-mutation-journal",
+        rationale: "typed recovery fence must be ordered inside the cross-process agent publication lock",
+    },
+    AllowlistEntry {
+        name: "prepare_agent_editor_publication_under_publication_lock",
+        kind: AllowlistKind::PermanentPublicationJournal,
+        owner: "agent-editor-mutation-journal",
+        rationale: "typed editor intent must precede filesystem replacement under one publication lock",
+    },
+    AllowlistEntry {
+        name: "record_agent_editor_publication_under_publication_lock",
+        kind: AllowlistKind::PermanentPublicationJournal,
+        owner: "agent-editor-mutation-journal",
+        rationale: "typed editor publication evidence must follow replacement under one publication lock",
+    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AllowlistKind {
     PermanentCli,
     TemporarySyncWrapper,
+    PermanentPublicationJournal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1242,6 +1264,10 @@ fn evaluate_against_allowlist(analysis: &mut Analysis) {
             AllowlistKind::TemporarySyncWrapper => {
                 assert_eq!(entry.owner, "db-sync-wrapper-migration");
             }
+            AllowlistKind::PermanentPublicationJournal => {
+                assert!(entry.name.ends_with("under_publication_lock"));
+                assert!(entry.rationale.contains("publication lock"));
+            }
         }
     }
 }
@@ -1383,17 +1409,165 @@ fn db_blocking_boundary_gate_allowlist_is_exact_and_documented() {
             "blocking_write_for_sync_ui",
             "blocking_write_for_sync_event",
             "blocking_write_for_sync_maintenance",
+            "insert_agent_mutation_journal_under_publication_lock",
+            "prepare_agent_editor_publication_under_publication_lock",
+            "record_agent_editor_publication_under_publication_lock",
         ]
     );
     assert_eq!(ALLOWLIST[0].kind, AllowlistKind::PermanentCli);
     assert!(ALLOWLIST[0].rationale.contains("synchronous CLI"));
-    for entry in &ALLOWLIST[1..] {
+    for entry in &ALLOWLIST[1..5] {
         assert_eq!(entry.kind, AllowlistKind::TemporarySyncWrapper);
         assert_eq!(entry.owner, "db-sync-wrapper-migration");
+    }
+    for entry in &ALLOWLIST[5..] {
+        assert_eq!(entry.kind, AllowlistKind::PermanentPublicationJournal);
+        assert!(entry.rationale.contains("publication lock"));
     }
     for entry in ALLOWLIST {
         assert!(!entry.name.contains('*'));
     }
+}
+
+#[test]
+fn permanent_publication_bridges_have_closed_typed_signatures() {
+    fn type_shape(ty: &syn::Type) -> String {
+        match ty {
+            syn::Type::Path(path) => path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+                .unwrap_or_default(),
+            syn::Type::Array(array) => {
+                let syn::Expr::Lit(length) = &array.len else {
+                    panic!("publication array length must be a literal")
+                };
+                let syn::Lit::Int(length) = &length.lit else {
+                    panic!("publication array length must be an integer")
+                };
+                format!("[{};{}]", type_shape(&array.elem), length.base10_digits())
+            }
+            syn::Type::Reference(reference) => format!("&{}", type_shape(&reference.elem)),
+            other => panic!(
+                "unsupported permanent publication parameter type at {:?}",
+                other.span()
+            ),
+        }
+    }
+    struct CallableTypeVisitor {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for CallableTypeVisitor {
+        fn visit_type_bare_fn(&mut self, node: &'ast syn::TypeBareFn) {
+            self.found = true;
+            visit::visit_type_bare_fn(self, node);
+        }
+
+        fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
+            if node.path.segments.iter().any(|segment| {
+                matches!(
+                    segment.ident.to_string().as_str(),
+                    "Fn" | "FnMut" | "FnOnce"
+                )
+            }) {
+                self.found = true;
+            }
+            visit::visit_type_path(self, node);
+        }
+    }
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let sources = [
+        manifest.join("src/db/agent_mutation_journals.rs"),
+        manifest.join("src/db/agent_editor_leases.rs"),
+    ];
+    let expected_arity = BTreeMap::from([
+        (
+            "insert_agent_mutation_journal_under_publication_lock",
+            2_usize,
+        ),
+        ("prepare_agent_editor_publication_under_publication_lock", 2),
+        ("record_agent_editor_publication_under_publication_lock", 5),
+    ]);
+    let expected_types = BTreeMap::from([
+        (
+            "insert_agent_mutation_journal_under_publication_lock",
+            vec!["AgentMutationJournalFence"],
+        ),
+        (
+            "prepare_agent_editor_publication_under_publication_lock",
+            vec!["AgentEditorPublicationIntent"],
+        ),
+        (
+            "record_agent_editor_publication_under_publication_lock",
+            vec!["String", "[u8;32]", "String", "String"],
+        ),
+    ]);
+    let mut seen = BTreeSet::new();
+    for path in sources {
+        let source = fs::read_to_string(&path).expect("publication bridge source");
+        let file = syn::parse_file(&source).expect("publication bridge source parses");
+        for item in file.items {
+            let Item::Impl(item_impl) = item else {
+                continue;
+            };
+            if !is_db_self_ty(&item_impl.self_ty) || item_impl.trait_.is_some() {
+                continue;
+            }
+            for item in item_impl.items {
+                let ImplItem::Fn(method) = item else { continue };
+                let name = method.sig.ident.to_string();
+                let Some(expected) = expected_arity.get(name.as_str()) else {
+                    continue;
+                };
+                assert!(
+                    method.sig.generics.params.is_empty(),
+                    "permanent publication bridge Db::{name} must not be generic"
+                );
+                assert_eq!(
+                    method.sig.inputs.len(),
+                    *expected,
+                    "permanent publication bridge Db::{name} changed its reviewed typed signature"
+                );
+                let actual_types = method
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|input| match input {
+                        FnArg::Receiver(_) => None,
+                        FnArg::Typed(argument) => Some(type_shape(&argument.ty)),
+                    })
+                    .collect::<Vec<_>>();
+                let actual_types = actual_types.iter().map(String::as_str).collect::<Vec<_>>();
+                assert_eq!(
+                    actual_types,
+                    expected_types[name.as_str()],
+                    "permanent publication bridge Db::{name} changed parameter types"
+                );
+                let mut callable = CallableTypeVisitor { found: false };
+                callable.visit_signature(&method.sig);
+                assert!(
+                    !callable.found,
+                    "permanent publication bridge Db::{name} must not accept a closure or callable type"
+                );
+                assert!(
+                    matches!(method.sig.output, syn::ReturnType::Type(_, ref ty)
+                        if matches!(ty.as_ref(), syn::Type::Path(path)
+                            if path.path.segments.last().is_some_and(|segment| segment.ident == "Result"))),
+                    "permanent publication bridge Db::{name} must return typed Result"
+                );
+                seen.insert(name);
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        expected_arity
+            .keys()
+            .map(|name| (*name).to_owned())
+            .collect()
+    );
 }
 
 #[test]

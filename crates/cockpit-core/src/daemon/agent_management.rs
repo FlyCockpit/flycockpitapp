@@ -44,6 +44,23 @@ struct SealedEditorCompletion {
     markdown: Option<String>,
 }
 
+/// Borrowed encoding view used so sealing a submitted document does not
+/// allocate ordinary `String` copies of any payload field.
+#[derive(serde::Serialize)]
+struct SealedEditorCompletionRef<'a> {
+    owner_digest: &'a str,
+    client_operation_id: &'a str,
+    project_root: &'a str,
+    lease_id: &'a str,
+    markdown: Option<&'a str>,
+}
+
+enum EditorPublicationAttempt {
+    Published(Response),
+    Rejected(ErrorPayload),
+    Pending(ErrorPayload),
+}
+
 impl zeroize::Zeroize for SealedEditorCompletion {
     fn zeroize(&mut self) {
         zeroize::Zeroize::zeroize(&mut self.owner_digest);
@@ -65,8 +82,8 @@ fn editor_completion_handle(completion_identity: [u8; 32]) -> String {
     )
 }
 
-fn load_editor_completion(
-    ctx: &DaemonContext,
+fn load_editor_completion_sync(
+    vault: &crate::secure_key::SecretVault,
     row: &crate::db::agent_editor_leases::AgentEditorLeaseRow,
 ) -> Result<zeroize::Zeroizing<SealedEditorCompletion>, ErrorPayload> {
     let operation_id = row
@@ -84,8 +101,7 @@ fn load_editor_completion(
     if handle != expected_handle {
         return Err(internal("editor completion payload handle is corrupt"));
     }
-    let plaintext = ctx
-        .secret_vault
+    let plaintext = vault
         .get_item(
             cockpit_db::secret_vault::SecretVaultKind::SealedState,
             handle,
@@ -115,7 +131,7 @@ fn load_editor_completion(
         ))
         .map_err(internal)?,
     );
-    let identity = ctx.secret_vault.keyed_identity(
+    let identity = vault.keyed_identity(
         b"flycockpit.agent-editor.completion.v2",
         identity_plaintext.as_slice(),
     );
@@ -127,8 +143,19 @@ fn load_editor_completion(
     Ok(payload)
 }
 
-fn load_editor_replay(
+async fn load_editor_completion(
     ctx: &DaemonContext,
+    row: &crate::db::agent_editor_leases::AgentEditorLeaseRow,
+) -> Result<zeroize::Zeroizing<SealedEditorCompletion>, ErrorPayload> {
+    let vault = ctx.secret_vault.clone();
+    let row = row.clone();
+    tokio::task::spawn_blocking(move || load_editor_completion_sync(&vault, &row))
+        .await
+        .map_err(join_error)?
+}
+
+fn load_editor_replay_sync(
+    vault: &crate::secure_key::SecretVault,
     row: &crate::db::agent_editor_leases::AgentEditorLeaseRow,
 ) -> Result<AgentEditSnapshot, ErrorPayload> {
     let expected_handle = editor_replay_handle(&row.lease_id);
@@ -139,16 +166,14 @@ fn load_editor_replay(
     if handle != expected_handle {
         return Err(internal("editor lease replay handle is corrupt"));
     }
-    let plaintext = ctx
-        .secret_vault
+    let plaintext = vault
         .get_item(
             cockpit_db::secret_vault::SecretVaultKind::SealedState,
             handle,
         )
         .map_err(internal)?;
-    let identity = ctx
-        .secret_vault
-        .keyed_identity(b"flycockpit.agent-editor.snapshot.v1", plaintext.as_slice());
+    let identity =
+        vault.keyed_identity(b"flycockpit.agent-editor.snapshot.v1", plaintext.as_slice());
     if identity != row.snapshot_identity {
         return Err(internal("editor lease sealed replay identity mismatch"));
     }
@@ -159,6 +184,17 @@ fn load_editor_replay(
         return Err(internal("editor lease sealed replay owner mismatch"));
     }
     Ok(replay.snapshot.clone())
+}
+
+async fn load_editor_replay(
+    ctx: &DaemonContext,
+    row: &crate::db::agent_editor_leases::AgentEditorLeaseRow,
+) -> Result<AgentEditSnapshot, ErrorPayload> {
+    let vault = ctx.secret_vault.clone();
+    let row = row.clone();
+    tokio::task::spawn_blocking(move || load_editor_replay_sync(&vault, &row))
+        .await
+        .map_err(join_error)?
 }
 
 async fn delete_editor_replay_and_row(
@@ -180,17 +216,106 @@ async fn delete_editor_replay_and_row(
                 return Ok(());
             }
             vault
-                .mutate_item_on_conn(
+                .delete_item_on_conn(
                     conn,
                     cockpit_db::secret_vault::SecretVaultKind::SealedState,
                     &handle,
-                    None,
                 )
                 .map_err(|error| anyhow::anyhow!(error))?;
             Ok(())
         })
         .await
         .map_err(internal)
+}
+
+/// Finish a completion for which the filesystem publication revision is
+/// already durable.  Recovery must not depend on the short-lived sealed
+/// markdown after this point: the journal row itself is sufficient evidence
+/// for an exact, target-bound Saved receipt.
+async fn settle_published_editor_completion(
+    ctx: &DaemonContext,
+    row: &crate::db::agent_editor_leases::AgentEditorLeaseRow,
+) -> Result<Response, ErrorPayload> {
+    if row.owner_digest.trim().is_empty() {
+        return Err(internal("published editor completion omitted its owner"));
+    }
+    let completion_identity = row
+        .completion_identity
+        .ok_or_else(|| internal("published editor completion omitted its identity"))?;
+    let completion_handle = row
+        .completion_handle
+        .clone()
+        .ok_or_else(|| internal("published editor completion omitted its sealed payload handle"))?;
+    if completion_handle != editor_completion_handle(completion_identity) {
+        return Err(internal(
+            "published editor completion payload handle is corrupt",
+        ));
+    }
+    let operation_id = row
+        .completion_operation_id
+        .as_deref()
+        .ok_or_else(|| internal("published editor completion omitted its operation id"))?;
+    let result_revision = row
+        .publication_result_revision
+        .clone()
+        .ok_or_else(|| internal("published editor completion omitted its result revision"))?;
+    if row.publication_phase != "published" {
+        return Err(internal(
+            "editor completion revision exists without published phase",
+        ));
+    }
+
+    let consumed_config_generation = row
+        .consumed_config_generation
+        .ok_or_else(|| internal("published editor completion omitted its consumed generation"))?;
+    let result_config_generation = row
+        .result_config_generation
+        .ok_or_else(|| internal("published editor completion omitted its result generation"))?;
+    // The journal allocates the exact generation before publication. Recovery
+    // only raises the process-local floor to that durable value; it never
+    // allocates a second generation for the same filesystem commit.
+    crate::daemon::server::inventory::publish_committed_config_generation_at_least(
+        result_config_generation,
+    );
+    let receipt = editor_completion(
+        row,
+        operation_id,
+        &row.project_root,
+        AgentEditorSettlementStatus::Saved {
+            result_revision,
+            outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
+        },
+    );
+    let json = serde_json::to_string(&receipt).map_err(internal)?;
+    let vault = ctx.secret_vault.clone();
+    let lease_id = row.lease_id.clone();
+    let operation_id = operation_id.to_owned();
+    ctx.db
+        .transaction(move |conn| {
+            // Terminal metadata and secret cleanup share the same writer
+            // transaction. Deletion is idempotent and deliberately does not
+            // decrypt the payload, so corrupt ciphertext cannot orphan a
+            // forever-live completion handle.
+            vault
+                .delete_item_on_conn(
+                    conn,
+                    cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                    &completion_handle,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?;
+            crate::db::agent_editor_leases::finish_agent_editor_completion_conn(
+                conn,
+                &lease_id,
+                completion_identity,
+                &operation_id,
+                &json,
+                consumed_config_generation,
+                result_config_generation,
+            )
+        })
+        .await
+        .map_err(internal)?;
+    Ok(Response::AgentEditorLeaseCompleted(receipt))
 }
 
 /// Boot/periodic maintenance for abandoned editor authority. Expired open
@@ -215,14 +340,42 @@ pub(crate) async fn maintain_editor_leases(ctx: &DaemonContext) -> Result<(), Er
         .await
         .map_err(internal)?;
     for row in completing {
-        let payload = load_editor_completion(ctx, &row)?;
+        if row.publication_result_revision.is_some() {
+            if let Err(error) = settle_published_editor_completion(ctx, &row).await {
+                tracing::warn!(
+                    error = %error.message,
+                    lease_id = row.lease_id,
+                    "published editor completion metadata could not be terminalized"
+                );
+            }
+            continue;
+        }
+        let mut payload = match load_editor_completion(ctx, &row).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                // A single damaged or unavailable sealed completion remains
+                // inspectable; it must not permanently suppress the daemon
+                // socket needed to diagnose and settle other work.
+                tracing::warn!(
+                    error = %error.message,
+                    lease_id = row.lease_id,
+                    "editor completion recovery evidence is unavailable"
+                );
+                continue;
+            }
+        };
+        let client_operation_id = std::mem::take(&mut payload.client_operation_id);
+        let project_root = std::mem::take(&mut payload.project_root);
+        let lease_id = std::mem::take(&mut payload.lease_id);
+        let markdown = std::mem::take(&mut payload.markdown);
+        let owner_digest = std::mem::take(&mut payload.owner_digest);
         if let Err(error) = complete_editor_lease(
             ctx,
-            payload.client_operation_id.clone(),
-            payload.project_root.clone(),
-            payload.lease_id.clone(),
-            payload.markdown.clone(),
-            payload.owner_digest.clone(),
+            client_operation_id,
+            project_root,
+            lease_id,
+            markdown.map(cockpit_proto::SensitiveWirePayload::new),
+            owner_digest,
         )
         .await
         {
@@ -240,31 +393,63 @@ pub(crate) async fn maintain_editor_leases(ctx: &DaemonContext) -> Result<(), Er
 /// pre-socket boot: no live predecessor can still own the in-memory claim.
 pub(crate) async fn recover_editor_leases_before_publish(
     ctx: &DaemonContext,
+    publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
 ) -> Result<(), ErrorPayload> {
+    let config_lock_deadline = publication.deadline();
     let completing = ctx
         .db
         .recoverable_agent_editor_completions(chrono::Utc::now().timestamp_millis())
         .await
         .map_err(internal)?;
     for row in completing {
-        let payload = load_editor_completion(ctx, &row)?;
-        let response = complete_editor_lease_inner(
+        if row.publication_result_revision.is_some() {
+            if let Err(error) = settle_published_editor_completion(ctx, &row).await {
+                tracing::warn!(
+                    error = %error.message,
+                    lease_id = row.lease_id,
+                    "published editor completion metadata could not be terminalized before socket publication"
+                );
+            }
+            continue;
+        }
+        let mut payload = match load_editor_completion(ctx, &row).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error.message,
+                    lease_id = row.lease_id,
+                    "editor completion recovery evidence is unavailable before socket publication"
+                );
+                continue;
+            }
+        };
+        let client_operation_id = std::mem::take(&mut payload.client_operation_id);
+        let project_root = std::mem::take(&mut payload.project_root);
+        let lease_id = std::mem::take(&mut payload.lease_id);
+        let markdown = std::mem::take(&mut payload.markdown);
+        let owner_digest = std::mem::take(&mut payload.owner_digest);
+        let response = match complete_editor_lease_inner(
             ctx,
-            payload.client_operation_id.clone(),
-            payload.project_root.clone(),
-            payload.lease_id.clone(),
-            payload.markdown.clone(),
-            payload.owner_digest.clone(),
+            client_operation_id,
+            project_root,
+            lease_id,
+            markdown.map(zeroize::Zeroizing::new),
+            owner_digest,
             true,
+            Some(config_lock_deadline),
         )
         .await
-        .map_err(|error| ErrorPayload {
-            code: ErrorCode::Shutdown,
-            message: format!(
-                "editor completion {} could not be reconciled safely before publication: {}",
-                row.lease_id, error.message
-            ),
-        })?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error.message,
+                    lease_id = row.lease_id,
+                    "editor completion could not be reconciled before socket publication"
+                );
+                continue;
+            }
+        };
         if matches!(
             response,
             Response::AgentEditorLeaseCompleted(AgentEditorCompletion {
@@ -411,6 +596,7 @@ pub async fn mutate(
             authority_mutation,
             authority_revision,
             &guard,
+            None,
         );
         let committed_match = result
             .as_ref()
@@ -456,23 +642,24 @@ pub async fn mutate(
             let projection_root = root.clone();
             let projection_name = plan.agent_name.clone();
             let result_is_absent = plan.result_is_absent;
-            let (snapshot, inventory_revision) = tokio::task::spawn_blocking(move || {
-                let snapshot = match projection_name.as_deref() {
-                    Some(name) if !result_is_absent => snapshot_sync(&projection_root, name).ok(),
-                    _ => None,
-                };
-                let inventory = if projection_name.is_none() {
-                    current_inventory_revision(&projection_root).ok()
-                } else {
-                    None
-                };
-                (snapshot, inventory)
-            })
-            .await
-            .map_err(join_error)?;
-            let result_revision = snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.revision.clone())
+            let (definition_revision, inventory_revision) =
+                tokio::task::spawn_blocking(move || {
+                    let revision = match projection_name.as_deref() {
+                        Some(name) if !result_is_absent => {
+                            current_definition_revision_sync(&projection_root, name).ok()
+                        }
+                        _ => None,
+                    };
+                    let inventory = if projection_name.is_none() {
+                        current_inventory_revision(&projection_root).ok()
+                    } else {
+                        None
+                    };
+                    (revision, inventory)
+                })
+                .await
+                .map_err(join_error)?;
+            let result_revision = definition_revision
                 .or_else(|| inventory_revision.clone())
                 .unwrap_or_else(|| {
                     mutation_tombstone_revision(
@@ -495,7 +682,7 @@ pub async fn mutate(
                 agent_name: plan.agent_name.clone(),
                 changed: plan.changed_hint,
                 affected: plan.affected_hint,
-                snapshot,
+                snapshot: None,
                 config_generation: result_config_generation,
                 consumed_config_generation: plan.consumed_config_generation,
                 result_config_generation,
@@ -519,7 +706,14 @@ pub async fn mutate(
             &mutation,
         );
     }
-    settle_agent_mutation_journal(
+    // The live caller may receive a render snapshot, but the durable receipt
+    // is metadata-only. Move (never clone) the snapshot out while encoding the
+    // receipt, then restore it for the immediate response.
+    let detached_snapshot = match &mut response {
+        Response::AgentMutated(result) => result.snapshot.take(),
+        _ => None,
+    };
+    let settlement = settle_agent_mutation_journal(
         ctx,
         owner_digest,
         client_operation_id,
@@ -527,7 +721,11 @@ pub async fn mutate(
         fencing_generation,
         &response,
     )
-    .await?;
+    .await;
+    if let Response::AgentMutated(result) = &mut response {
+        result.snapshot = detached_snapshot;
+    }
+    settlement?;
     Ok(response)
 }
 
@@ -949,7 +1147,10 @@ async fn settle_agent_mutation_journal(
 /// visible. A matching intended projection proves that atomic publication
 /// crossed its durability boundary; a divergent projection remains pending
 /// for explicit repair rather than fabricating either success or rejection.
-pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64, ErrorPayload> {
+pub async fn recover_agent_mutation_journals(
+    ctx: &DaemonContext,
+    publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
+) -> Result<u64, ErrorPayload> {
     let _publication = crate::daemon::server::inventory::write_authority_publication().await;
     type Row = (
         String,
@@ -1066,20 +1267,49 @@ pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64,
         let check_root = root.clone();
         let check_plan = plan.clone();
         let check_vault = ctx.secret_vault.clone();
-        let matches = tokio::task::spawn_blocking(move || {
-            projection_matches_plan(&check_root, &check_plan, &check_vault)
-        })
-        .await
-        .map_err(join_error)??;
-        if !matches {
-            let consumed_root = root.clone();
-            let consumed_plan = plan.clone();
-            let consumed_vault = ctx.secret_vault.clone();
-            let still_consumed = tokio::task::spawn_blocking(move || {
-                projection_matches_consumed(&consumed_root, &consumed_plan, &consumed_vault)
+        let lock_target = root.join(".cockpit/config.json");
+        let projection_name = agent_name.clone();
+        let result_is_absent = plan.result_is_absent;
+        let (matches, still_consumed, definition_revision, inventory_revision) = publication
+            .with_target(&lock_target, move |_| {
+                let matches = projection_matches_plan(&check_root, &check_plan, &check_vault)
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                let still_consumed = if matches {
+                    false
+                } else {
+                    projection_matches_consumed(&check_root, &check_plan, &check_vault)
+                        .map_err(|error| anyhow::anyhow!(error.message))?
+                };
+                let definition_revision = if matches {
+                    match projection_name.as_deref() {
+                        Some(name) if !result_is_absent => {
+                            current_definition_revision_sync(&check_root, name).ok()
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let inventory_revision = if matches && projection_name.is_none() {
+                    current_inventory_revision(&check_root).ok()
+                } else {
+                    None
+                };
+                Ok((
+                    matches,
+                    still_consumed,
+                    definition_revision,
+                    inventory_revision,
+                ))
             })
             .await
-            .map_err(join_error)??;
+            .map_err(|error| ErrorPayload {
+                code: ErrorCode::Shutdown,
+                message: format!(
+                    "bounded agent recovery could not acquire publication authority: {error:#}"
+                ),
+            })?;
+        if !matches {
             if still_consumed {
                 cancel_agent_mutation_journal(
                     ctx,
@@ -1107,26 +1337,7 @@ pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64,
             recovered = recovered.saturating_add(1);
             continue;
         }
-        let projection_root = root.clone();
-        let projection_name = agent_name.clone();
-        let result_is_absent = plan.result_is_absent;
-        let (snapshot, inventory_revision) = tokio::task::spawn_blocking(move || {
-            let snapshot = match projection_name.as_deref() {
-                Some(name) if !result_is_absent => snapshot_sync(&projection_root, name).ok(),
-                _ => None,
-            };
-            let inventory = if projection_name.is_none() {
-                current_inventory_revision(&projection_root).ok()
-            } else {
-                None
-            };
-            (snapshot, inventory)
-        })
-        .await
-        .map_err(join_error)?;
-        let result_revision = snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.revision.clone())
+        let result_revision = definition_revision
             .or_else(|| inventory_revision.clone())
             .unwrap_or_else(|| {
                 mutation_tombstone_revision(
@@ -1154,7 +1365,7 @@ pub async fn recover_agent_mutation_journals(ctx: &DaemonContext) -> Result<u64,
             agent_name,
             changed: changed_hint,
             affected: affected_hint,
-            snapshot,
+            snapshot: None,
             config_generation: result_config_generation,
             consumed_config_generation,
             result_config_generation,
@@ -1294,20 +1505,23 @@ pub async fn begin_editor_lease(
                 "agent editor client operation was reused for a different request",
             ));
         }
-        if existing.expires_at_unix_ms < chrono::Utc::now().timestamp_millis()
-            && existing.state != "terminal"
-        {
-            delete_editor_replay_and_row(ctx, existing).await?;
-            return Err(conflict(
-                "agent editor lease acquisition expired before it was acknowledged; start a new editor handoff",
-            ));
-        }
         if existing.state == "terminal" {
             return Err(conflict(
                 "agent editor lease acquisition was already settled; start a new editor handoff",
             ));
         }
-        let snapshot = load_editor_replay(ctx, &existing)?;
+        if existing.state == "completing" {
+            return Err(conflict(
+                "agent editor lease completion is already in progress; query the exact completion operation with get_agent_editor_lease_settlement",
+            ));
+        }
+        if existing.expires_at_unix_ms < chrono::Utc::now().timestamp_millis() {
+            delete_editor_replay_and_row(ctx, existing).await?;
+            return Err(conflict(
+                "agent editor lease acquisition expired before it was acknowledged; start a new editor handoff",
+            ));
+        }
+        let snapshot = load_editor_replay(ctx, &existing).await?;
         return Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
             client_operation_id: existing.client_operation_id,
             lease_id: existing.lease_id,
@@ -1369,7 +1583,12 @@ pub async fn begin_editor_lease(
         completion_identity: None,
         completion_handle: None,
         completion_operation_id: None,
+        publication_phase: "none".into(),
+        consumed_projection_identity: None,
+        intended_projection_identity: None,
         publication_result_revision: None,
+        consumed_config_generation: None,
+        result_config_generation: None,
         terminal_result_json: None,
         terminal_error_json: None,
         expires_at_unix_ms,
@@ -1405,20 +1624,23 @@ pub async fn begin_editor_lease(
             && existing.agent_name == replay_name
             && existing.consumed_revision == replay_revision
         {
-            if existing.expires_at_unix_ms < chrono::Utc::now().timestamp_millis()
-                && existing.state != "terminal"
-            {
-                delete_editor_replay_and_row(ctx, existing).await?;
-                return Err(conflict(
-                    "agent editor lease acquisition expired before it was acknowledged; start a new editor handoff",
-                ));
-            }
             if existing.state == "terminal" {
                 return Err(conflict(
                     "agent editor lease acquisition was already settled; start a new editor handoff",
                 ));
             }
-            let snapshot = load_editor_replay(ctx, &existing)?;
+            if existing.state == "completing" {
+                return Err(conflict(
+                    "agent editor lease completion is already in progress; query the exact completion operation with get_agent_editor_lease_settlement",
+                ));
+            }
+            if existing.expires_at_unix_ms < chrono::Utc::now().timestamp_millis() {
+                delete_editor_replay_and_row(ctx, existing).await?;
+                return Err(conflict(
+                    "agent editor lease acquisition expired before it was acknowledged; start a new editor handoff",
+                ));
+            }
+            let snapshot = load_editor_replay(ctx, &existing).await?;
             return Ok(Response::AgentEditorLeaseBegun(AgentEditorLease {
                 client_operation_id: existing.client_operation_id,
                 lease_id: existing.lease_id,
@@ -1441,7 +1663,7 @@ pub async fn complete_editor_lease(
     client_operation_id: String,
     project_root: String,
     lease_id: String,
-    markdown: Option<String>,
+    markdown: Option<cockpit_proto::SensitiveWirePayload>,
     principal_digest: String,
 ) -> Result<Response, ErrorPayload> {
     complete_editor_lease_inner(
@@ -1449,9 +1671,10 @@ pub async fn complete_editor_lease(
         client_operation_id,
         project_root,
         lease_id,
-        markdown,
+        markdown.map(cockpit_proto::SensitiveWirePayload::into_zeroizing),
         principal_digest,
         false,
+        None,
     )
     .await
 }
@@ -1461,11 +1684,13 @@ async fn complete_editor_lease_inner(
     client_operation_id: String,
     project_root: String,
     lease_id: String,
-    markdown: Option<String>,
+    markdown: Option<zeroize::Zeroizing<String>>,
     principal_digest: String,
     force_reclaim: bool,
+    pre_socket_lock_deadline: Option<std::time::Instant>,
 ) -> Result<Response, ErrorPayload> {
     Uuid::parse_str(&lease_id).map_err(|_| bad_request("invalid editor lease"))?;
+    let _publication = crate::daemon::server::inventory::write_authority_publication().await;
     let known_lease = ctx
         .db
         .agent_editor_lease_by_id(lease_id.clone())
@@ -1482,14 +1707,10 @@ async fn complete_editor_lease_inner(
     // lease state. A typo, stale workspace selection, or malformed persisted
     // snapshot must not poison an otherwise reusable lease by reserving its
     // one completion slot.
-    let request_root_text = if known_lease.project_root == project_root {
-        project_root.clone()
-    } else {
-        crate::daemon::fs_api::canonical_project_root(&project_root)?
-            .to_string_lossy()
-            .into_owned()
-    };
-    if known_lease.project_root != request_root_text {
+    // Completion is an exact capability replay. Do not touch the filesystem
+    // merely to normalize a caller-supplied spelling: the canonical root was
+    // fixed when Begin issued the lease and is part of the immutable binding.
+    if !editor_root_matches(&known_lease.project_root, &project_root)? {
         return Err(bad_request("editor lease belongs to another workspace"));
     }
     let root_text = known_lease.project_root.clone();
@@ -1499,7 +1720,7 @@ async fn complete_editor_lease_inner(
             &client_operation_id,
             &root_text,
             &lease_id,
-            markdown.as_deref(),
+            markdown.as_ref().map(|value| value.as_str()),
         ))
         .map_err(internal)?,
     );
@@ -1508,7 +1729,7 @@ async fn complete_editor_lease_inner(
         completion_plaintext.as_slice(),
     );
     if known_lease.state == "open" {
-        load_editor_replay(ctx, &known_lease)?;
+        load_editor_replay(ctx, &known_lease).await?;
     }
     if known_lease.state == "terminal" {
         if known_lease.completion_identity != Some(completion_identity) {
@@ -1530,21 +1751,18 @@ async fn complete_editor_lease_inner(
         validate_editor_completion_receipt(&known_lease, &result)?;
         return Ok(Response::AgentEditorLeaseCompleted(result));
     }
-    // Durable terminal replay and identity conflicts above do not depend on
-    // mutable trust. A new or resumed filesystem mutation still does.
-    let root = trusted_canonical_root(ctx, PathBuf::from(&root_text)).await?;
     // Expiry prevents an unacknowledged Begin from being replayed as apparent
     // success forever; it must not make an already-issued capability
     // impossible to settle. Completion remains exact-hash and owner bound, so
     // a client can reconcile a commit whose response was lost after the TTL.
     let completion_handle = editor_completion_handle(completion_identity);
     let sealed_completion = zeroize::Zeroizing::new(
-        serde_json::to_vec(&SealedEditorCompletion {
-            owner_digest: principal_digest.clone(),
-            client_operation_id: client_operation_id.clone(),
-            project_root: root_text.clone(),
-            lease_id: lease_id.clone(),
-            markdown: markdown.clone(),
+        serde_json::to_vec(&SealedEditorCompletionRef {
+            owner_digest: &principal_digest,
+            client_operation_id: &client_operation_id,
+            project_root: &root_text,
+            lease_id: &lease_id,
+            markdown: markdown.as_ref().map(|value| value.as_str()),
         })
         .map_err(internal)?,
     );
@@ -1585,11 +1803,10 @@ async fn complete_editor_lease_inner(
                     )
                     .map_err(|error| anyhow::anyhow!(error))?;
                 vault
-                    .mutate_item_on_conn(
+                    .delete_item_on_conn(
                         conn,
                         cockpit_db::secret_vault::SecretVaultKind::SealedState,
                         &snapshot_handle,
-                        None,
                     )
                     .map_err(|error| anyhow::anyhow!(error))?;
             }
@@ -1597,7 +1814,7 @@ async fn complete_editor_lease_inner(
         })
         .await
         .map_err(|error| conflict(error.to_string()))?;
-    let lease = match lease {
+    let mut lease = match lease {
         crate::db::agent_editor_leases::AgentEditorCompletionClaim::Execute(lease) => lease,
         crate::db::agent_editor_leases::AgentEditorCompletionClaim::Pending => {
             return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
@@ -1610,50 +1827,33 @@ async fn complete_editor_lease_inner(
         crate::db::agent_editor_leases::AgentEditorCompletionClaim::Terminal(lease) => lease,
     };
     if let Some(json) = lease.terminal_result_json.as_deref() {
-        let result: AgentEditorCompletion = serde_json::from_str(&json).map_err(internal)?;
+        let result: AgentEditorCompletion = serde_json::from_str(json).map_err(internal)?;
         return Ok(Response::AgentEditorLeaseCompleted(result));
     }
     if let Some(json) = lease.terminal_error_json.as_deref() {
-        let result: AgentEditorCompletion = serde_json::from_str(&json).map_err(internal)?;
+        let result: AgentEditorCompletion = serde_json::from_str(json).map_err(internal)?;
         return Ok(Response::AgentEditorLeaseCompleted(result));
     }
     let completed_lease_id = lease_id.clone();
     let consumed_lease_revision = lease.consumed_revision.clone();
     let is_save = markdown.is_some();
     let result = match markdown {
-        Some(markdown) => {
-            // A prior daemon may have committed the file and crashed before
-            // recording its terminal receipt. Reconcile exact content before
-            // attempting the CAS again.
-            let current = match tokio::task::spawn_blocking({
-                let root = root.clone();
-                let name = lease.agent_name.clone();
-                move || snapshot_sync(&root, &name)
-            })
-            .await
-            .map_err(join_error)
-            .and_then(|result| result)
-            {
-                Ok(current) => current,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error.message,
-                        lease_id,
-                        "editor completion projection is unreadable; retaining settlement evidence"
-                    );
-                    return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
-                        &lease,
-                        &client_operation_id,
-                        &root_text,
-                        AgentEditorSettlementStatus::Pending,
-                    )));
-                }
-            };
+        Some(mut markdown) => {
             if let Some(result_revision) = lease.publication_result_revision.clone() {
                 // This claim durably recorded the revision it published. A
                 // later writer may advance the live projection, but cannot
                 // make the original commit ambiguous again.
-                let generation = crate::daemon::server::inventory::current_config_generation();
+                let consumed_generation = lease.consumed_config_generation.ok_or_else(|| {
+                    internal("published editor completion omitted its consumed generation")
+                })?;
+                let changed =
+                    lease.consumed_projection_identity != lease.intended_projection_identity;
+                let result_generation = lease.result_config_generation.ok_or_else(|| {
+                    internal("published editor completion omitted its result generation")
+                })?;
+                crate::daemon::server::inventory::publish_committed_config_generation_at_least(
+                    result_generation,
+                );
                 Response::AgentMutated(AgentMutationResult {
                     client_operation_id: client_operation_id.clone(),
                     mutation_intent_hash: crate::daemon::authority_token::mint(
@@ -1664,139 +1864,365 @@ async fn complete_editor_lease_inner(
                     requested_project_root: root_text.clone(),
                     owner_scope: format!("project:{root_text}"),
                     agent_name: Some(lease.agent_name.clone()),
-                    changed: true,
-                    affected: 1,
+                    changed,
+                    affected: u32::from(changed),
                     snapshot: None,
-                    config_generation: generation,
-                    consumed_config_generation: generation,
-                    result_config_generation: generation,
+                    config_generation: result_generation,
+                    consumed_config_generation: consumed_generation,
+                    result_config_generation: result_generation,
                     inventory_revision: None,
                     consumed_revision: Some(consumed_lease_revision.clone()),
                     result_revision,
                     completed_lease_id: None,
                     outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
                 })
-            } else if current.markdown == markdown && current.revision == consumed_lease_revision {
-                let result_revision = current.revision.clone();
-                let generation = crate::daemon::server::inventory::current_config_generation();
-                Response::AgentMutated(AgentMutationResult {
-                    client_operation_id: client_operation_id.clone(),
-                    mutation_intent_hash: crate::daemon::authority_token::mint(
-                        b"agent-editor-mutation-intent/v1",
-                        &[lease.lease_id.as_bytes(), lease.agent_name.as_bytes()],
-                    ),
-                    project_root: root_text.clone(),
-                    requested_project_root: root_text.clone(),
-                    owner_scope: format!("project:{root_text}"),
-                    agent_name: Some(lease.agent_name.clone()),
-                    changed: false,
-                    affected: 0,
-                    snapshot: Some(current),
-                    config_generation: generation,
-                    consumed_config_generation: generation,
-                    result_config_generation: generation,
-                    inventory_revision: None,
-                    consumed_revision: Some(consumed_lease_revision.clone()),
-                    result_revision,
-                    completed_lease_id: None,
-                    outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
-                })
-            } else if current.markdown == markdown {
-                return Ok(Response::AgentEditorLeaseCompleted(editor_completion(
-                    &lease,
-                    &client_operation_id,
-                    &root_text,
-                    AgentEditorSettlementStatus::Pending,
-                )));
             } else {
+                // New publication authority is trust-gated. An existing
+                // durable intent is instead classified under its immutable
+                // canonical-root capability; revoked trust only prevents a
+                // retry when the consumed bytes are still authoritative.
+                let root = PathBuf::from(&root_text);
+                let retry_is_trusted = if lease.publication_phase == "none" {
+                    trusted_canonical_root(ctx, root.clone()).await?;
+                    true
+                } else {
+                    workspace_is_trusted(ctx, &root).await.unwrap_or(false)
+                };
+                // Planning, durable intent, authoritative classification,
+                // atomic replacement, and publication evidence all occur
+                // under the same cross-process lock. A crash can therefore be
+                // classified as exact-intended, exact-consumed, or genuinely
+                // third-party without attributing another writer's bytes.
                 let agent_name = lease.agent_name.clone();
                 let consumed_revision = lease.consumed_revision.clone();
+                let publication_phase = lease.publication_phase.clone();
+                let recorded_consumed_identity = lease.consumed_projection_identity.clone();
+                let recorded_intended_identity = lease.intended_projection_identity.clone();
+                let recorded_consumed_generation = lease.consumed_config_generation;
+                let recorded_result_generation = lease.result_config_generation;
+                let publication_db = ctx.db.clone();
+                let publication_vault = ctx.secret_vault.clone();
+                let publication_lease_id = lease_id.clone();
+                let publication_operation_id = client_operation_id.clone();
                 match tokio::task::spawn_blocking(move || {
-                    mutate_sync(
+                    let lock_target = root.join(".cockpit/config.json");
+                    let guard = if let Some(deadline) = pre_socket_lock_deadline {
+                        let Some(guard) =
+                            cockpit_config::config::try_hold_config_mutation_lock_until(
+                                &lock_target,
+                                deadline,
+                            )
+                            .map_err(internal)?
+                        else {
+                            return Ok(EditorPublicationAttempt::Pending(ErrorPayload {
+                                code: ErrorCode::Shutdown,
+                                message: "editor completion remains pending because the config mutation lock was busy during bounded boot recovery".into(),
+                            }));
+                        };
+                        guard
+                    } else {
+                        cockpit_config::config::hold_config_mutation_lock(&lock_target)
+                            .map_err(internal)?
+                    };
+                    let mutation = AgentMutation::SaveDefinition {
+                        name: agent_name.clone(),
+                        markdown: std::mem::take(&mut *markdown),
+                    };
+                    let (consumed_identity, intended_identity, consumed_generation, result_generation) =
+                        if publication_phase == "none" {
+                            recover_reset_all_locked(&root, &guard)?;
+                            let plan = prepare_mutation_plan_sync(
+                                &root,
+                                &mutation,
+                                Some(&consumed_revision),
+                                &publication_vault,
+                            )?;
+                            let consumed_generation = plan.consumed_config_generation;
+                            let result_generation = if plan.changed_hint {
+                                consumed_generation.checked_add(1).ok_or_else(|| {
+                                    internal("agent editor config generation overflow")
+                                })?
+                            } else {
+                                consumed_generation
+                            };
+                            publication_db.prepare_agent_editor_publication_under_publication_lock(
+                                crate::db::agent_editor_leases::AgentEditorPublicationIntent {
+                                    lease_id: publication_lease_id.clone(),
+                                    completion_identity,
+                                    completion_operation_id: publication_operation_id.clone(),
+                                    consumed_projection_identity: plan.consumed_projection_identity.clone(),
+                                    intended_projection_identity: plan.intended_projection_identity.clone(),
+                                    consumed_config_generation: consumed_generation,
+                                    result_config_generation: result_generation,
+                                },
+                            )
+                            .map_err(internal)?;
+                            (
+                                plan.consumed_projection_identity,
+                                plan.intended_projection_identity,
+                                consumed_generation,
+                                result_generation,
+                            )
+                        } else {
+                            (
+                                recorded_consumed_identity.ok_or_else(|| {
+                                    internal("editor publication intent omitted consumed identity")
+                                })?,
+                                recorded_intended_identity.ok_or_else(|| {
+                                    internal("editor publication intent omitted intended identity")
+                                })?,
+                                recorded_consumed_generation.ok_or_else(|| {
+                                    internal("editor publication intent omitted consumed generation")
+                                })?,
+                                recorded_result_generation.ok_or_else(|| {
+                                    internal("editor publication intent omitted result generation")
+                                })?,
+                            )
+                        };
+                    let authoritative_identity =
+                        target_projection_identity(&root, &agent_name, &publication_vault)?;
+                    if authoritative_identity == intended_identity {
+                        let result_revision =
+                            current_definition_revision_sync(&root, &agent_name)?;
+                        let changed = consumed_identity != intended_identity;
+                        if publication_phase != "published" {
+                            publication_db.record_agent_editor_publication_under_publication_lock(
+                                publication_lease_id.clone(),
+                                completion_identity,
+                                publication_operation_id.clone(),
+                                result_revision.clone(),
+                            )
+                            .map_err(internal)?;
+                        }
+                        crate::daemon::server::inventory::publish_committed_config_generation_at_least(result_generation);
+                        return Ok(EditorPublicationAttempt::Published(Response::AgentMutated(AgentMutationResult {
+                            client_operation_id: publication_operation_id,
+                            mutation_intent_hash: crate::daemon::authority_token::mint(
+                                b"agent-editor-mutation-intent/v1",
+                                &[publication_lease_id.as_bytes(), agent_name.as_bytes()],
+                            ),
+                            project_root: root.to_string_lossy().into_owned(),
+                            requested_project_root: root.to_string_lossy().into_owned(),
+                            owner_scope: format!("project:{}", root.to_string_lossy()),
+                            agent_name: Some(agent_name),
+                            changed,
+                            affected: u32::from(changed),
+                            result_revision,
+                            snapshot: None,
+                            config_generation: result_generation,
+                            consumed_config_generation: consumed_generation,
+                            result_config_generation: result_generation,
+                            inventory_revision: None,
+                            consumed_revision: Some(consumed_revision),
+                            completed_lease_id: None,
+                            outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
+                        })));
+                    }
+                    if authoritative_identity != consumed_identity {
+                        return Ok(EditorPublicationAttempt::Pending(ErrorPayload {
+                            code: ErrorCode::Shutdown,
+                            message: "editor publication settlement is unknown because the authoritative file matches neither the consumed nor intended projection".into(),
+                        }));
+                    }
+                    if !retry_is_trusted {
+                        return Ok(EditorPublicationAttempt::Pending(ErrorPayload {
+                            code: ErrorCode::WorkspaceTrust,
+                            message: "editor publication intent remains pending because workspace trust was revoked before the consumed projection could be retried".into(),
+                        }));
+                    }
+                    // Recovery journals may themselves publish agent bytes.
+                    // Run them only after trust is confirmed, then classify
+                    // the editor target again before attempting this write.
+                    recover_reset_all_locked(&root, &guard)?;
+                    let after_recovery_identity =
+                        target_projection_identity(&root, &agent_name, &publication_vault)?;
+                    if after_recovery_identity == intended_identity {
+                        let result_revision =
+                            current_definition_revision_sync(&root, &agent_name)?;
+                        publication_db.record_agent_editor_publication_under_publication_lock(
+                            publication_lease_id.clone(),
+                            completion_identity,
+                            publication_operation_id.clone(),
+                            result_revision.clone(),
+                        )
+                        .map_err(internal)?;
+                        crate::daemon::server::inventory::publish_committed_config_generation_at_least(result_generation);
+                        let changed = consumed_identity != intended_identity;
+                        return Ok(EditorPublicationAttempt::Published(Response::AgentMutated(
+                            AgentMutationResult {
+                                client_operation_id: publication_operation_id,
+                                mutation_intent_hash: crate::daemon::authority_token::mint(
+                                    b"agent-editor-mutation-intent/v1",
+                                    &[publication_lease_id.as_bytes(), agent_name.as_bytes()],
+                                ),
+                                project_root: root.to_string_lossy().into_owned(),
+                                requested_project_root: root.to_string_lossy().into_owned(),
+                                owner_scope: format!("project:{}", root.to_string_lossy()),
+                                agent_name: Some(agent_name),
+                                changed,
+                                affected: u32::from(changed),
+                                result_revision,
+                                snapshot: None,
+                                config_generation: result_generation,
+                                consumed_config_generation: consumed_generation,
+                                result_config_generation: result_generation,
+                                inventory_revision: None,
+                                consumed_revision: Some(consumed_revision),
+                                completed_lease_id: None,
+                                outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
+                            },
+                        )));
+                    }
+                    if after_recovery_identity != consumed_identity {
+                        return Ok(EditorPublicationAttempt::Pending(ErrorPayload {
+                            code: ErrorCode::Shutdown,
+                            message: "editor publication settlement changed while trusted recovery was running; the authoritative projection matches neither the consumed nor intended bytes".into(),
+                        }));
+                    }
+                    let response = match mutate_sync_locked(
                         &root,
-                        AgentMutation::SaveDefinition {
-                            name: agent_name,
-                            markdown,
-                        },
-                        Some(consumed_revision),
-                    )
+                        mutation,
+                        Some(consumed_revision.clone()),
+                        &guard,
+                        Some((consumed_generation, result_generation)),
+                    ) {
+                        Ok(response) => response,
+                        Err(mutation_error) => {
+                            // Error codes cannot prove whether atomic replace
+                            // crossed its durability boundary. Re-read the
+                            // exact target while still holding the publication
+                            // lock and classify only from keyed identities.
+                            let authoritative_identity = match target_projection_identity(
+                                &root,
+                                &agent_name,
+                                &publication_vault,
+                            ) {
+                                Ok(identity) => identity,
+                                Err(classification_error) => {
+                                    return Ok(EditorPublicationAttempt::Pending(
+                                        classification_error,
+                                    ));
+                                }
+                            };
+                            if authoritative_identity == intended_identity {
+                                let result_revision = match current_definition_revision_sync(
+                                    &root,
+                                    &agent_name,
+                                ) {
+                                    Ok(revision) => revision,
+                                    Err(classification_error) => {
+                                        return Ok(EditorPublicationAttempt::Pending(
+                                            classification_error,
+                                        ));
+                                    }
+                                };
+                                publication_db
+                                    .record_agent_editor_publication_under_publication_lock(
+                                        publication_lease_id.clone(),
+                                        completion_identity,
+                                        publication_operation_id.clone(),
+                                        result_revision.clone(),
+                                    )
+                                    .map_err(internal)?;
+                                let changed = consumed_identity != intended_identity;
+                                crate::daemon::server::inventory::publish_committed_config_generation_at_least(result_generation);
+                                return Ok(EditorPublicationAttempt::Published(
+                                    Response::AgentMutated(AgentMutationResult {
+                                        client_operation_id: publication_operation_id,
+                                        mutation_intent_hash:
+                                            crate::daemon::authority_token::mint(
+                                                b"agent-editor-mutation-intent/v1",
+                                                &[
+                                                    publication_lease_id.as_bytes(),
+                                                    agent_name.as_bytes(),
+                                                ],
+                                            ),
+                                        project_root: root.to_string_lossy().into_owned(),
+                                        requested_project_root: root
+                                            .to_string_lossy()
+                                            .into_owned(),
+                                        owner_scope: format!(
+                                            "project:{}",
+                                            root.to_string_lossy()
+                                        ),
+                                        agent_name: Some(agent_name),
+                                        changed,
+                                        affected: u32::from(changed),
+                                        result_revision,
+                                        snapshot: None,
+                                        config_generation: result_generation,
+                                        consumed_config_generation: consumed_generation,
+                                        result_config_generation: result_generation,
+                                        inventory_revision: None,
+                                        consumed_revision: Some(consumed_revision),
+                                        completed_lease_id: None,
+                                        outcome: cockpit_proto::AgentMutationOutcome::Reconciled,
+                                    }),
+                                ));
+                            }
+                            if authoritative_identity == consumed_identity {
+                                return Ok(EditorPublicationAttempt::Rejected(mutation_error));
+                            }
+                            return Ok(EditorPublicationAttempt::Pending(mutation_error));
+                        }
+                    };
+                    if let Response::AgentMutated(mutation) = &response {
+                        publication_db.record_agent_editor_publication_under_publication_lock(
+                            publication_lease_id,
+                            completion_identity,
+                            publication_operation_id,
+                            mutation.result_revision.clone(),
+                        )
+                        .map_err(internal)?;
+                    }
+                    Ok(EditorPublicationAttempt::Published(response))
                 })
                 .await
                 .map_err(join_error)
                 .and_then(|result| result)
                 {
-                    Ok(result) => {
-                        if let Response::AgentMutated(mutation) = &result
-                            && mutation.changed
-                        {
-                            let publication_revision = mutation.result_revision.clone();
-                            let lease_id = lease_id.clone();
-                            let operation_id = client_operation_id.clone();
-                            ctx.db
-                                .write(move |conn| {
-                                    crate::db::agent_editor_leases::record_agent_editor_publication_conn(
-                                        conn,
-                                        &lease_id,
-                                        completion_identity,
-                                        &operation_id,
-                                        &publication_revision,
-                                    )
-                                })
-                                .await
-                                .map_err(internal)?;
-                        }
-                        result
-                    }
-                    Err(error) => {
-                        if matches!(
-                            error.code,
-                            ErrorCode::BadRequest
-                                | ErrorCode::Conflict
-                                | ErrorCode::HashMismatch
-                                | ErrorCode::LockConflict
-                                | ErrorCode::InvalidConfig
-                                | ErrorCode::WorkspaceTrust
-                        ) {
-                            let receipt = editor_completion(
-                                &lease,
-                                &client_operation_id,
-                                &root_text,
-                                AgentEditorSettlementStatus::Rejected {
-                                    error: ErrorPayload {
-                                        code: error.code,
-                                        message:
-                                            "the editor completion was rejected before publication"
-                                                .into(),
-                                    },
+                    Ok(EditorPublicationAttempt::Published(result)) => result,
+                    Ok(EditorPublicationAttempt::Rejected(error)) => {
+                        let receipt = editor_completion(
+                            &lease,
+                            &client_operation_id,
+                            &root_text,
+                            AgentEditorSettlementStatus::Rejected {
+                                error: ErrorPayload {
+                                    code: error.code,
+                                    message:
+                                        "the editor completion was rejected before publication"
+                                            .into(),
                                 },
-                            );
-                            let json = serde_json::to_string(&receipt).map_err(internal)?;
-                            let vault = ctx.secret_vault.clone();
-                            let handle = completion_handle.clone();
-                            let rejected_lease_id = lease_id.clone();
-                            let operation_id = client_operation_id.clone();
-                            ctx.db
-                                .transaction(move |conn| {
-                                    vault
-                                        .mutate_item_on_conn(
-                                            conn,
-                                            cockpit_db::secret_vault::SecretVaultKind::SealedState,
-                                            &handle,
-                                            None,
-                                        )
-                                        .map_err(|error| anyhow::anyhow!(error))?;
-                                    crate::db::agent_editor_leases::fail_agent_editor_completion_conn(
+                            },
+                        );
+                        let json = serde_json::to_string(&receipt).map_err(internal)?;
+                        let vault = ctx.secret_vault.clone();
+                        let handle = completion_handle.clone();
+                        let rejected_lease_id = lease_id.clone();
+                        let operation_id = client_operation_id.clone();
+                        ctx.db
+                            .transaction(move |conn| {
+                                vault
+                                    .delete_item_on_conn(
                                         conn,
-                                        &rejected_lease_id,
-                                        completion_identity,
-                                        &operation_id,
-                                        &json,
+                                        cockpit_db::secret_vault::SecretVaultKind::SealedState,
+                                        &handle,
                                     )
-                                })
-                                .await
-                                .map_err(internal)?;
-                            return Ok(Response::AgentEditorLeaseCompleted(receipt));
-                        }
+                                    .map_err(|error| anyhow::anyhow!(error))?;
+                                crate::db::agent_editor_leases::fail_agent_editor_completion_conn(
+                                    conn,
+                                    &rejected_lease_id,
+                                    completion_identity,
+                                    &operation_id,
+                                    &json,
+                                )
+                            })
+                            .await
+                            .map_err(internal)?;
+                        return Ok(Response::AgentEditorLeaseCompleted(receipt));
+                    }
+                    Ok(EditorPublicationAttempt::Pending(error)) | Err(error) => {
                         tracing::warn!(
                             error = %error.message,
                             lease_id,
@@ -1841,6 +2267,11 @@ async fn complete_editor_lease_inner(
     let Response::AgentMutated(mut result) = result else {
         unreachable!("agent mutation always returns AgentMutated")
     };
+    if let Some(mut discarded_snapshot) = result.snapshot.take() {
+        zeroize_agent_edit_snapshot(&mut discarded_snapshot);
+    }
+    lease.consumed_config_generation = Some(result.consumed_config_generation);
+    lease.result_config_generation = Some(result.result_config_generation);
     result.completed_lease_id = Some(completed_lease_id);
     let status = if is_save {
         let result_revision = result.result_revision.clone();
@@ -1873,11 +2304,10 @@ async fn complete_editor_lease_inner(
         .db
         .transaction(move |conn| {
             vault
-                .mutate_item_on_conn(
+                .delete_item_on_conn(
                     conn,
                     cockpit_db::secret_vault::SecretVaultKind::SealedState,
                     &terminal_completion_handle,
-                    None,
                 )
                 .map_err(|error| anyhow::anyhow!(error))?;
             crate::db::agent_editor_leases::finish_agent_editor_completion_conn(
@@ -1886,6 +2316,8 @@ async fn complete_editor_lease_inner(
                 completion_identity,
                 &settlement_operation_id,
                 &result_json,
+                result.consumed_config_generation,
+                result.result_config_generation,
             )
         })
         .await
@@ -1924,34 +2356,29 @@ pub async fn editor_lease_settlement(
             message: "agent editor lease belongs to another client principal".into(),
         });
     }
-    let request_root_text = if row.project_root == project_root {
-        project_root
-    } else {
-        crate::daemon::fs_api::canonical_project_root(&project_root)?
-            .to_string_lossy()
-            .into_owned()
-    };
-    if row.project_root != request_root_text {
+    // Settlement is metadata-only and exact-root-bound. It must remain
+    // queryable after the workspace disappears or trust is revoked.
+    if !editor_root_matches(&row.project_root, &project_root)? {
         return Err(bad_request("editor lease belongs to another workspace"));
     }
     let root_text = row.project_root.clone();
-    let status = match row.completion_operation_id.as_deref() {
-        None => AgentEditorSettlementStatus::NotStarted,
-        Some(operation) if operation != client_operation_id => {
+    let status = match (row.state.as_str(), row.completion_operation_id.as_deref()) {
+        ("open", None) => AgentEditorSettlementStatus::NotStarted,
+        (_, None) => {
+            return Err(internal(
+                "reserved editor lease omitted its completion operation",
+            ));
+        }
+        (_, Some(operation)) if operation != client_operation_id => {
             return Err(conflict(
                 "agent editor lease was settled by a different client operation",
             ));
         }
-        Some(_)
-            if row.state == "completing"
-                && row.updated_at_unix_ms.saturating_add(
-                    crate::db::agent_editor_leases::AGENT_EDITOR_COMPLETION_CLAIM_MS,
-                ) <= chrono::Utc::now().timestamp_millis() =>
-        {
-            AgentEditorSettlementStatus::NotStarted
-        }
-        Some(_) if row.state == "completing" => AgentEditorSettlementStatus::Pending,
-        Some(_) => {
+        // Age only controls which daemon recovery worker may reclaim the
+        // executor claim. Once reserved, publication may already be durable,
+        // so the client must never be told that this operation was not started.
+        ("completing", Some(_)) => AgentEditorSettlementStatus::Pending,
+        ("terminal", Some(_)) => {
             let json = row
                 .terminal_result_json
                 .as_deref()
@@ -1960,6 +2387,11 @@ pub async fn editor_lease_settlement(
             let receipt: AgentEditorCompletion = serde_json::from_str(json).map_err(internal)?;
             validate_editor_completion_receipt(&row, &receipt)?;
             return Ok(Response::AgentEditorLeaseCompleted(receipt));
+        }
+        (state, Some(_)) => {
+            return Err(internal(format!(
+                "editor lease has unsupported settlement state {state}"
+            )));
         }
     };
     Ok(Response::AgentEditorLeaseCompleted(editor_completion(
@@ -1976,14 +2408,35 @@ fn editor_completion(
     project_root: &str,
     status: AgentEditorSettlementStatus,
 ) -> AgentEditorCompletion {
+    let (consumed_config_generation, result_config_generation) = match &status {
+        AgentEditorSettlementStatus::Saved { .. } | AgentEditorSettlementStatus::Cancelled => {
+            (row.consumed_config_generation, row.result_config_generation)
+        }
+        AgentEditorSettlementStatus::NotStarted
+        | AgentEditorSettlementStatus::Pending
+        | AgentEditorSettlementStatus::Rejected { .. } => (None, None),
+    };
     AgentEditorCompletion {
         client_operation_id: client_operation_id.to_owned(),
         project_root: project_root.to_owned(),
+        owner_scope: format!("project:{project_root}"),
         agent_name: row.agent_name.clone(),
         lease_id: row.lease_id.clone(),
         consumed_revision: row.consumed_revision.clone(),
+        consumed_config_generation,
+        result_config_generation,
         status,
     }
+}
+
+fn zeroize_agent_edit_snapshot(snapshot: &mut AgentEditSnapshot) {
+    zeroize::Zeroize::zeroize(&mut snapshot.name);
+    zeroize::Zeroize::zeroize(&mut snapshot.markdown);
+    zeroize::Zeroize::zeroize(&mut snapshot.canonical_preview);
+    zeroize::Zeroize::zeroize(&mut snapshot.source_identity);
+    zeroize::Zeroize::zeroize(&mut snapshot.revision);
+    zeroize::Zeroize::zeroize(&mut snapshot.goal_supervision_json);
+    zeroize::Zeroize::zeroize(&mut snapshot.projection_digest);
 }
 
 fn validate_editor_completion_receipt(
@@ -1992,13 +2445,41 @@ fn validate_editor_completion_receipt(
 ) -> Result<(), ErrorPayload> {
     if receipt.client_operation_id != row.completion_operation_id.as_deref().unwrap_or_default()
         || receipt.project_root != row.project_root
+        || receipt.owner_scope != format!("project:{}", row.project_root)
         || receipt.agent_name != row.agent_name
         || receipt.lease_id != row.lease_id
         || receipt.consumed_revision != row.consumed_revision
     {
         return Err(internal("editor completion receipt binding mismatch"));
     }
+    if matches!(
+        &receipt.status,
+        AgentEditorSettlementStatus::Saved { .. } | AgentEditorSettlementStatus::Cancelled
+    ) && (receipt.consumed_config_generation != row.consumed_config_generation
+        || receipt.result_config_generation != row.result_config_generation)
+    {
+        return Err(internal("editor completion generation binding mismatch"));
+    }
+    cockpit_proto::validate_agent_editor_completion(
+        receipt,
+        receipt.client_operation_id.as_str(),
+        &row.project_root,
+        &row.agent_name,
+        &row.lease_id,
+        &row.consumed_revision,
+    )
+    .map_err(internal)?;
     Ok(())
+}
+
+fn editor_root_matches(canonical_root: &str, requested_root: &str) -> Result<bool, ErrorPayload> {
+    // Exact replay remains possible after the workspace has disappeared.
+    // Otherwise normalize relative/symlink spellings without consulting the
+    // mutable trust database; the lease itself is the durable capability.
+    if canonical_root == requested_root {
+        return Ok(true);
+    }
+    Ok(crate::daemon::fs_api::canonical_project_root(requested_root)? == Path::new(canonical_root))
 }
 
 async fn trusted_root(ctx: &DaemonContext, root: &str) -> Result<PathBuf, ErrorPayload> {
@@ -2023,6 +2504,13 @@ async fn trusted_canonical_root(
         });
     }
     Ok(root)
+}
+
+async fn workspace_is_trusted(ctx: &DaemonContext, root: &Path) -> Result<bool, ErrorPayload> {
+    let policy = crate::config::trust::resolve_workspace_trust_policy_from_db(&ctx.db, root)
+        .await
+        .map_err(internal)?;
+    Ok(policy.mode == crate::db::workspace_trust::WorkspaceTrustMode::Trust)
 }
 
 fn inventory_sync(
@@ -2186,6 +2674,23 @@ fn snapshot_sync(root: &Path, name: &str) -> Result<AgentEditSnapshot, ErrorPayl
     })
 }
 
+/// Compute the authoritative definition revision without constructing an
+/// `AgentEditSnapshot`. Recovery needs only this metadata and must not create
+/// extra ordinary copies of editor markdown that will immediately be dropped.
+fn current_definition_revision_sync(root: &Path, name: &str) -> Result<String, ErrorPayload> {
+    validate_name(name)?;
+    let (source_layer, source_identity, markdown, target_exists) =
+        source_snapshot_parts(root, name)?;
+    let markdown = zeroize::Zeroizing::new(markdown);
+    Ok(definition_revision(
+        name,
+        source_layer,
+        &source_identity,
+        &crate::assistants::markdown_content_hash(markdown.as_str()),
+        target_exists,
+    ))
+}
+
 fn source_snapshot_parts(
     root: &Path,
     name: &str,
@@ -2241,28 +2746,20 @@ fn source_snapshot_parts(
     }
 }
 
-fn mutate_sync(
-    root: &Path,
-    mutation: AgentMutation,
-    expected_revision: Option<String>,
-) -> Result<Response, ErrorPayload> {
-    let lock_target = root.join(".cockpit/config.json");
-    let guard =
-        cockpit_config::config::hold_config_mutation_lock(&lock_target).map_err(internal)?;
-    mutate_sync_locked(root, mutation, expected_revision, &guard)
-}
-
 fn mutate_sync_locked(
     root: &Path,
     mutation: AgentMutation,
     expected_revision: Option<String>,
     guard: &cockpit_config::config::HeldConfigMutationLock,
+    durable_generation_pair: Option<(u64, u64)>,
 ) -> Result<Response, ErrorPayload> {
     let mutation_name = cockpit_proto::agent_mutation_name(&mutation).map(str::to_owned);
     let project_root = root.to_string_lossy().into_owned();
     let consumed_revision = expected_revision.clone();
     recover_reset_all_locked(root, guard)?;
-    let generation_before = crate::daemon::server::inventory::current_config_generation();
+    let generation_before = durable_generation_pair
+        .map(|(consumed, _)| consumed)
+        .unwrap_or_else(crate::daemon::server::inventory::current_config_generation);
     let resets_inventory = matches!(&mutation, AgentMutation::ResetAllBuiltins);
     let (changed, affected, snapshot) = match mutation {
         AgentMutation::EjectBuiltin { name } => {
@@ -2288,6 +2785,7 @@ fn mutate_sync_locked(
             }
         }
         AgentMutation::SaveDefinition { name, markdown } => {
+            let markdown = zeroize::Zeroizing::new(markdown);
             validate_name(&name)?;
             let current = snapshot_sync(root, &name)?;
             ensure_revision(&current.revision, expected_revision.as_deref())?;
@@ -2389,7 +2887,7 @@ fn mutate_sync_locked(
         AgentMutation::ResetAllBuiltins => {
             let current_inventory_revision = current_inventory_revision(root)?;
             ensure_revision(&current_inventory_revision, expected_revision.as_deref())?;
-            let affected = reset_all_builtins_atomic_locked(root, &guard)?;
+            let affected = reset_all_builtins_atomic_locked(root, guard)?;
             (affected != 0, affected, None)
         }
         AgentMutation::SaveGoalSupervision { name, patch } => {
@@ -2439,10 +2937,21 @@ fn mutate_sync_locked(
             }
         }
     };
-    let generation = if changed {
-        crate::daemon::server::inventory::publish_committed_config_generation()
-    } else {
-        generation_before
+    let generation = match durable_generation_pair {
+        Some((consumed, result)) => {
+            if consumed != generation_before
+                || (changed && result <= consumed)
+                || (!changed && result != consumed)
+            {
+                return Err(internal(
+                    "agent editor durable generation pair is inconsistent",
+                ));
+            }
+            crate::daemon::server::inventory::publish_committed_config_generation_at_least(result);
+            result
+        }
+        None if changed => crate::daemon::server::inventory::publish_committed_config_generation(),
+        None => generation_before,
     };
     let (result_inventory_revision, outcome) = if resets_inventory {
         match current_inventory_revision(root) {
@@ -2827,7 +3336,10 @@ fn recover_reset_all_locked(
     Ok(())
 }
 
-pub async fn recover_known_workspace_resets(ctx: &DaemonContext) -> Result<(), ErrorPayload> {
+pub async fn recover_known_workspace_resets(
+    ctx: &DaemonContext,
+    publication: crate::daemon::config_publication_recovery::PreSocketConfigPublication,
+) -> Result<(), ErrorPayload> {
     let sessions = ctx
         .db
         .list_sessions(false, 100_000)
@@ -2877,17 +3389,22 @@ pub async fn recover_known_workspace_resets(ctx: &DaemonContext) -> Result<(), E
         }
         trusted_roots.push(root);
     }
-    tokio::task::spawn_blocking(move || {
-        for root in trusted_roots {
-            let lock_target = root.join(".cockpit/config.json");
-            let guard = cockpit_config::config::hold_config_mutation_lock(&lock_target)
-                .map_err(internal)?;
-            recover_reset_all_locked(&root, &guard)?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(join_error)?
+    for root in trusted_roots {
+        let lock_target = root.join(".cockpit/config.json");
+        publication
+            .with_target(&lock_target, move |guard| {
+                recover_reset_all_locked(&root, guard)
+                    .map_err(|error| anyhow::anyhow!(error.message))
+            })
+            .await
+            .map_err(|error| ErrorPayload {
+                code: ErrorCode::Shutdown,
+                message: format!(
+                    "bounded agent-reset recovery could not acquire publication authority: {error:#}"
+                ),
+            })?;
+    }
+    Ok(())
 }
 
 fn reset_all_builtins_atomic_locked(
@@ -2910,13 +3427,14 @@ fn reset_all_builtins_atomic_locked(
         return Ok(0);
     }
     let trash_root = trash.parent().expect("trash has parent");
-    crate::private_fs::ensure_private_dir(trash_root).map_err(internal)?;
+    cockpit_host::private_fs::ensure_private_dir(trash_root).map_err(internal)?;
     #[cfg(unix)]
     let _trash_root_handle =
-        crate::private_fs::open_private_dir_handle(trash_root).map_err(internal)?;
-    crate::private_fs::ensure_private_dir(&trash).map_err(internal)?;
+        cockpit_host::private_fs::open_private_dir_handle(trash_root).map_err(internal)?;
+    cockpit_host::private_fs::ensure_private_dir(&trash).map_err(internal)?;
     #[cfg(unix)]
-    let _trash_handle = crate::private_fs::open_private_dir_handle(&trash).map_err(internal)?;
+    let _trash_handle =
+        cockpit_host::private_fs::open_private_dir_handle(&trash).map_err(internal)?;
     // The prepared journal may refer to this staging directory immediately
     // after publication, so persist both the directory itself and its parent
     // first. Recovery must never observe a durable journal naming a directory

@@ -328,6 +328,80 @@ fn modal_state_ctrl_d_uses_guarded_quit_path() {
 }
 
 #[test]
+fn durable_control_receipt_fences_every_guarded_exit() {
+    use super::{App, ControlApplied, PendingControlRequest};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(Some(tmp.path()), false);
+    app.daemon_prompt = None;
+    app.dialog = crate::tui::settings::Dialog::None;
+    let request_id = cockpit_core::engine::ControlRequestId(41);
+    app.pending_control_requests.insert(
+        request_id,
+        PendingControlRequest {
+            label: "durable mutation".to_string(),
+            applied: ControlApplied::None,
+        },
+    );
+
+    assert!(app.has_unsettled_local_authority());
+    assert!(!app.request_guarded_exit(), "/exit must remain fenced");
+    assert!(!app.handle_key(ctrl('d')), "Ctrl+D must remain fenced");
+    app.ctrl_c_armed_at = Some(Instant::now());
+    assert!(!app.handle_ctrl_c(), "double Ctrl+C must remain fenced");
+    assert!(
+        app.toast
+            .as_ref()
+            .is_some_and(|toast| toast.text.contains("verified terminal state")),
+        "all exit paths use the same authority-settlement status"
+    );
+
+    app.pending_control_requests.remove(&request_id);
+    assert!(!app.has_unsettled_local_authority());
+    assert!(app.request_guarded_exit());
+}
+
+#[test]
+fn exit_routes_share_the_app_wide_authority_gate() {
+    let terminal_controls = include_str!("terminal_controls.rs");
+    let input = include_str!("input.rs");
+    let slash = include_str!("slash.rs");
+
+    assert!(
+        terminal_controls
+            .contains("CtrlCAction::Exit => {\n                self.request_guarded_exit()")
+    );
+    assert!(input.contains(
+        "self.ctrl_d_can_exit_immediately() {\n                self.request_guarded_exit()"
+    ));
+    assert!(input.contains(
+        "DaemonChoice::Exit) | None => {\n                    return self.request_guarded_exit();"
+    ));
+    assert!(
+        slash.contains(
+            "fn run_exit(app: &mut App, _: &str) -> bool {\n    app.request_guarded_exit()"
+        )
+    );
+}
+
+#[test]
+fn async_authority_inventory_is_central_and_programmatic_exit_is_fenced() {
+    let terminal_controls = include_str!("terminal_controls.rs");
+    let app = include_str!("mod.rs");
+    let async_action = include_str!("../async_action.rs");
+
+    assert!(terminal_controls.contains("self.async_actions.has_unsettled_local_authority()"));
+    assert!(
+        !terminal_controls.contains("AsyncActionKind::"),
+        "App exit code must not maintain a second action-label inventory"
+    );
+    assert!(async_action.contains("pub fn authority(&self)"));
+    assert!(async_action.contains("_ => Unclassified"));
+    assert!(async_action.contains("!matches!(self, Self::ReadOnly)"));
+    assert!(app.contains("if self.exit_requested && !self.has_unsettled_local_authority()"));
+}
+
+#[test]
 fn bare_note_shows_usage_only() {
     use super::{App, HistoryEntry, Overlay};
     let tmp = tempfile::tempdir().unwrap();

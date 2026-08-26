@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "profile": "local-v0.1",
+  "commands": [
+    "ask",
+    "run",
+    "agent",
+    "provider",
+    "setup",
+    "models",
+    "daemon",
+    "doctor",
+    "session",
+    "trust",
+    "export",
+    "config",
+    "init"
+  ]
+}

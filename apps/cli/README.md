@@ -140,7 +140,9 @@ After the provider wizard finishes, the model wizard opens so you can choose the
 cockpit models openai
 ```
 
-`cockpit provider` manages model-provider credentials and model catalogs. `cockpit account` signs you in to Flycockpit account services for sync and relay features.
+`cockpit provider` manages model-provider credentials and model catalogs. The
+public v0.1 binary is local-only and does not require or expose a FlyCockpit
+account, organization sync, or relay connection.
 
 ### First Message
 
@@ -222,7 +224,7 @@ cockpit packages prune --dry-run
 | `cockpit agent install OWNER/REPO[@REV]:PATH --scope global\|workspace-private\|workspace` | Ask the daemon to install a versioned agent definition. |
 | `cockpit agent list [--json]` | List daemon-owned agent provenance for a scope. |
 | `cockpit agent inspect INSTALLATION_ID [--json]` | Inspect source revision and digest without exposing local binding routes. |
-| `cockpit assistants list` | List persistent assistants. |
+| `cockpit assistant list` | List persistent assistants. |
 | `cockpit account login --no-remote` | Sign in to Flycockpit account services without enabling remote access. |
 | `cockpit provider list` | List built-in provider templates. |
 | `cockpit setup [wizard]` | Run an interactive setup wizard in the terminal. |
@@ -248,15 +250,11 @@ cockpit packages prune --dry-run
 | `cockpit debug context` | Print bounded, redacted assembled diagnostic context. |
 | `cockpit config export-policy` | Export portable non-secret provider/model policy JSON. |
 | `cockpit mcp list` | List configured MCP servers. |
-| `cockpit sync status` | Show session-log sync and remote-audit upload state. |
-| `cockpit connect status` | Show outbound relay connector status. |
 | `cockpit packages add <id> --git <url>` | Register dependency package source for the docs agent. |
 | `cockpit kcl import` | Import packages from a local `kcl` registry. |
 | `cockpit init` | Explore the project and write an instructions file. |
 | `cockpit bash-hints list` | List built-in shell post-result hint rules. |
 | `cockpit completion <shell>` | Generate shell completions. |
-| `cockpit account whoami` | Show the active Flycockpit account and instance. |
-| `cockpit account logout` | Sign out of Flycockpit on this machine. |
 | `cockpit provider add [template]` | Add a model provider using the terminal wizard. |
 | `cockpit provider usage` | Show vendor plan limits and quota where supported. |
 | `cockpit packages prune [--days <n>] [--dry-run]` | Delete stale Cockpit-owned package clone directories. |
@@ -265,6 +263,14 @@ cockpit packages prune --dry-run
 | `cockpit trust set [path] --mode trust` | Store a workspace trust decision. |
 | `cockpit mcp add ...` | Add an MCP server to layered `.cockpit/mcp.json`. |
 | Man pages | Release artifacts include generated `cockpit.1` and subcommand man pages. Homebrew installs them to `man1`; the shell installer best-effort copies them under `$XDG_DATA_HOME/man/man1` or `~/.local/share/man/man1`. |
+
+### Internal remote profile
+
+Account, organization-sync, and relay-control commands are compiled only for
+internal builds using the opt-in Cargo `remote` feature. They are not part of
+the public v0.1 command or compatibility surface. Remote-profile operators use
+`cockpit account`, `cockpit sync`, and `cockpit connect`; public local installs
+must not depend on those commands or FlyCockpit service reachability.
 
 ## Configuration
 
@@ -724,7 +730,7 @@ At a high level:
 - `crates/cockpit-config/` resolves layered configuration, provider entries, workspace trust, and Cockpit-specific settings.
 - `crates/cockpit-db/` provides SQLite persistence and the squashed migration set.
 - `crates/cockpit-proto/` defines the daemon wire protocol.
-- `crates/relay-protocol/` defines the relay wire protocol.
+- `crates/relay-protocol/` defines the internal remote profile's relay wire protocol; it is excluded from the public local build.
 
 Model-callable tools include `bash`, `read`, `write`, `edit`, `task`, `mcp`, `schedule`, `todo`, and code-intelligence tools.
 
@@ -795,16 +801,17 @@ current CLI behavior, not a future privacy policy.
 | [TinyFish](https://tinyfish.ai/) (`api.search.tinyfish.ai`, `api.fetch.tinyfish.ai`) | A web-search query or URL and its configured API credential | You select TinyFish and configure `TINYFISH_API_KEY` | Opt-in; without its key Cockpit falls back to Firecrawl keyless tier |
 | crates.io, npm, and PyPI | A package name | The docs/package workflow resolves a package official source repository | Default-on when that model-triggered workflow runs |
 | A registry-declared git host | A `git clone` request for a package repository | The package workflow has resolved the repository from crates.io, npm, or PyPI | Approval-gated |
-| `app.flycockpit.dev` account login | OAuth device-login and instance-registration data, including hostname, OS, architecture, and CLI version | You run `cockpit account login` | Opt-in |
-| `app.flycockpit.dev` enterprise session-log sync | Post-redaction session-log data, including recorded model-request payloads when selected by policy | After account login, an organization policy has both session-log sync `enabled` and `mandatory` | Account opt-in; sync is policy-controlled |
-| `app.flycockpit.dev` remote audit | Connector audit rows | A signed-in account has remote connector access enabled | Opt-in |
-| A configured relay | The daemon RPC surface, including the project-root path | You log in and enable/connect the relay | Opt-in |
 | Configured MCP servers | The requests and data required by that server | You configure and invoke an MCP server | Opt-in; none are configured by default |
 | OAuth and provider endpoints | OAuth device-login data, model catalog requests, or embedding/project-text requests | You explicitly add or use that provider or command; embeddings are separately gated | Opt-in |
 
+The internal `remote` profile adds FlyCockpit account login, enterprise
+session-log sync, remote connector audit, and configured relay destinations.
+Those destinations and commands are absent from the public local build.
+
 Cockpit has no telemetry, analytics, crash-reporting service, or self-update
 client. The User-Agent identifies Cockpit version, operating system, and
-architecture. A FlyCockpit account login always includes the machine hostname in the instance-registration payload, along with OS, architecture, and CLI version. The optional display name defaults to the hostname when none is supplied. Hostname is not included in the model system prompt.
+architecture. Internal remote-profile account registration also includes the
+machine hostname. Hostname is not included in the model system prompt.
 
 ### Local storage and retention
 

@@ -192,7 +192,7 @@ fn external_editor_tempfile_is_owner_only() {
 
 #[test]
 fn parse_sandbox_arg_maps_to_modes_and_network() {
-    use cockpit_core::tools::sandbox_mode::SandboxMode;
+    use cockpit_proto::SandboxMode;
 
     assert_eq!(parse_sandbox_arg(""), Ok(SandboxCommand::Cycle));
     assert_eq!(parse_sandbox_arg("  "), Ok(SandboxCommand::Cycle));
@@ -250,8 +250,8 @@ fn parse_sandbox_escalation_arg_maps_to_actions() {
 #[test]
 fn next_sandbox_mode_skips_unavailable_container_modes() {
     use super::next_sandbox_mode;
-    use cockpit_core::tools::sandbox_mode::SandboxMode;
     use cockpit_proto::FeatureCapabilityState;
+    use cockpit_proto::SandboxMode;
 
     let host_down = crate::tui::capability_gate::snapshot_with_sandbox(
         FeatureCapabilityState::Missing,
@@ -297,8 +297,8 @@ fn next_sandbox_mode_skips_unavailable_container_modes() {
 #[test]
 fn slash_sandbox_on_recheck_then_reject_when_host_missing() {
     use super::decide_sandbox_set;
-    use cockpit_core::tools::sandbox_mode::SandboxMode;
     use cockpit_proto::FeatureCapabilityState;
+    use cockpit_proto::SandboxMode;
 
     let missing = crate::tui::capability_gate::snapshot_with_sandbox_reasons(
         FeatureCapabilityState::Missing,
@@ -438,7 +438,7 @@ fn cap_tokens_truncates_large_input() {
     let big = "word ".repeat(5000);
     let capped = cap_tokens(&big, 100);
     assert!(capped.contains("truncated"));
-    assert!(cockpit_core::tokens::count(&capped) <= 200);
+    assert!(cockpit_tokenizer::count(&capped) <= 200);
 }
 
 #[test]

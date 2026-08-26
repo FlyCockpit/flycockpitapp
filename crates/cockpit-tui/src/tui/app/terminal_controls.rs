@@ -1,6 +1,41 @@
 use super::*;
 
 impl App {
+    /// One process-wide authority fence for every user-requested exit path.
+    /// Read-only projection loads are intentionally absent. Operations that
+    /// can have changed durable or host-published state remain represented by
+    /// their exact owner/correlation until a terminal receipt is applied.
+    pub(super) fn has_unsettled_local_authority(&self) -> bool {
+        self.pending_workspace_trust.is_some()
+            || self.dialog.has_unsettled_local_authority()
+            || self.overlay.has_unsettled_local_authority()
+            || self.pending_mcp_local.is_some()
+            || self.pending_leak_reveal.is_some()
+            || self.pending_runner_attach.is_some()
+            || self.pending_model_selection.is_some()
+            || self.pending_default_model_update_id.is_some()
+            || !self.pending_control_requests.is_empty()
+            || !self.pending_usage.is_empty()
+            || !self.settings_blocking_actions.is_empty()
+            || self.async_actions.has_unsettled_local_authority()
+            || !self.image_ingress_draft_discards.is_empty()
+    }
+
+    /// Return true only when shutdown may surrender all local authority.
+    /// A blocked exit leaves every owner ID and lease in place for its normal
+    /// completion/reconciliation path.
+    pub(super) fn request_guarded_exit(&mut self) -> bool {
+        if self.has_unsettled_local_authority() {
+            self.show_toast(
+                "Exit is waiting for a local operation to reach a verified terminal state",
+                ToastKind::Info,
+            );
+            false
+        } else {
+            true
+        }
+    }
+
     /// Handle a ctrl+c press (GOALS §3a). Single press interrupts a
     /// running agent (never quits); a second press within
     /// [`CTRL_C_EXIT_WINDOW`] of the previous exits. Returns `true` to
@@ -17,17 +52,7 @@ impl App {
         );
         self.ctrl_c_armed_at = new_armed;
         match action {
-            CtrlCAction::Exit => {
-                if self.pending_mcp_local.is_some() {
-                    self.push_plain(
-                        "/mcp: exit is fenced until the pending mutation reaches a verified terminal state."
-                            .to_string(),
-                    );
-                    false
-                } else {
-                    true
-                }
-            }
+            CtrlCAction::Exit => self.request_guarded_exit(),
             CtrlCAction::ArmAndInterrupt => {
                 self.interrupt_agent();
                 self.end_working_span();
@@ -55,7 +80,7 @@ impl App {
     pub(super) fn interrupt_agent(&mut self) {
         self.send_daemon_request(
             "interrupt",
-            cockpit_core::daemon::proto::Request::CancelTurn,
+            cockpit_proto::Request::CancelTurn,
             ControlApplied::None,
         );
     }

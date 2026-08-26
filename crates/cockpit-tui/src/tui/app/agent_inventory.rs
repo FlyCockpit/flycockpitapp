@@ -1,5 +1,5 @@
 use super::*;
-use cockpit_core::daemon::proto::{AgentSummary, ModelSummary, SkillSummary};
+use cockpit_proto::{AgentSummary, ModelSummary, SkillSummary};
 use uuid::Uuid;
 
 impl App {
@@ -93,7 +93,7 @@ impl App {
             ),
             async move {
                 let response = attached
-                    .request(cockpit_core::daemon::proto::Request::GetInventoryBundle {
+                    .request(cockpit_proto::Request::GetInventoryBundle {
                         project_root: cwd.to_string_lossy().into_owned(),
                         session_id: attached.session_id(),
                         selected_agent: agent_name,
@@ -127,9 +127,9 @@ impl App {
     /// Late results without a matching in-flight ticket are inert.
     pub(super) fn apply_inventory_bundle_response(
         &mut self,
-        response: cockpit_core::daemon::proto::Response,
+        response: cockpit_proto::Response,
     ) -> bool {
-        let cockpit_core::daemon::proto::Response::InventoryBundle {
+        let cockpit_proto::Response::InventoryBundle {
             selected_agent,
             agents,
             models,

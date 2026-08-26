@@ -1019,8 +1019,8 @@ fn parse_session(value: &Value) -> Result<ImportedSession> {
         },
         session_entry_mode,
         active_agent: required_string(object, "active_agent", "import manifest session")?,
-        started_at: required_i64(object, "started_at", "import manifest session")?,
-        ended_at: optional_i64(object.get("ended_at"), "ended_at")?,
+        started_at_unix_ms: required_i64(object, "started_at_unix_ms", "import manifest session")?,
+        ended_at_unix_ms: optional_i64(object.get("ended_at_unix_ms"), "ended_at_unix_ms")?,
         title: optional_string(object.get("title"), "title")?,
     })
 }
@@ -1212,8 +1212,8 @@ mod tests {
                 active_model: None,
                 session_entry_mode: "code".into(),
                 active_agent: "Build".into(),
-                started_at: 1,
-                ended_at: None,
+                started_at_unix_ms: 1,
+                ended_at_unix_ms: None,
                 title: Some("Imported".into()),
             }],
             events: Vec::new(),
@@ -1279,8 +1279,8 @@ mod tests {
             },
             "session_entry_mode": "code",
             "active_agent": "Build",
-            "started_at": 100,
-            "ended_at": null,
+            "started_at_unix_ms": 100,
+            "ended_at_unix_ms": null,
             "title": "Imported session",
         })
     }
@@ -1612,7 +1612,7 @@ mod tests {
         let child = Uuid::new_v4();
         let mut child_manifest = session(child, Some(root));
         child_manifest["fork_point_turn_id"] = json!("42");
-        child_manifest["ended_at"] = json!(777);
+        child_manifest["ended_at_unix_ms"] = json!(777);
         child_manifest["title"] = json!("Restored title");
         child_manifest["short_id"] = json!("child1");
         let archive = read_archive_bytes(&archive_bytes(
@@ -1630,7 +1630,7 @@ mod tests {
         let restored = db.get_session(child_destination_id).await.unwrap().unwrap();
         assert_eq!(restored.parent_session_id, Some(root_destination_id));
         assert_eq!(restored.fork_point_turn_id.as_deref(), Some("42"));
-        assert_eq!(restored.ended_at, Some(777));
+        assert_eq!(restored.ended_at_unix_ms, Some(777));
         assert_eq!(restored.title.as_deref(), Some("Restored title"));
         assert_eq!(restored.short_id.as_deref(), Some("child1"));
         assert_eq!(restored.provider.as_deref(), Some("test-provider"));

@@ -24,7 +24,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use zeroize::Zeroizing;
 
-use cockpit_core::daemon::proto::{
+use cockpit_proto::{
     LeakReportMetadata, LeakRotationDisposition, LeakRotationState, Request, Response,
 };
 
@@ -256,9 +256,12 @@ pub struct LeaksRpcResult {
 }
 
 impl LeaksRpcAction {
-    pub fn run_blocking_rpc(self) -> Result<LeaksRpcResult, String> {
-        let socket = self.daemon_socket;
-        let send = |request| crate::tui::agent_runner::daemon_request_at_blocking(&socket, request);
+    pub fn run_blocking_rpc(
+        self,
+        endpoint: cockpit_client::ClientEndpoint,
+    ) -> Result<LeaksRpcResult, String> {
+        let send =
+            |request| crate::tui::agent_runner::daemon_request_at_blocking(&endpoint, request);
         match self.kind {
             LeaksRpcKind::List {
                 cursor,
@@ -293,14 +296,14 @@ impl LeaksRpcAction {
                     rotation,
                 })?;
                 // Re-list from the top after a mutation.
-                relist(&socket, None).map(|mut r| {
+                relist(&endpoint, None).map(|mut r| {
                     r.status = Some("rotation updated".to_string());
                     r
                 })
             }
             LeaksRpcKind::Delete { report_id } => {
                 send(Request::DeleteLeakReport { report_id })?;
-                relist(&socket, None).map(|mut r| {
+                relist(&endpoint, None).map(|mut r| {
                     r.status = Some("protected value deleted".to_string());
                     r
                 })
@@ -310,11 +313,11 @@ impl LeaksRpcAction {
 }
 
 fn relist(
-    socket: &std::path::Path,
+    endpoint: &cockpit_client::ClientEndpoint,
     rotation: Option<LeakRotationState>,
 ) -> Result<LeaksRpcResult, String> {
     match crate::tui::agent_runner::daemon_request_at_blocking(
-        socket,
+        endpoint,
         Request::ListLeakReports {
             cursor: None,
             limit: None,

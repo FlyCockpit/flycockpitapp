@@ -261,7 +261,7 @@ pub(super) fn btw_info_to_proto(info: crate::db::sessions::BtwForkInfo) -> proto
         parent_session_id: info.parent_session_id,
         short_id: info.short_id,
         tangent: info.tangent,
-        created_at: info.created_at,
+        created_at: info.created_at_unix_ms,
         message_count: info.message_count,
     }
 }
@@ -438,7 +438,8 @@ pub(super) async fn delete_session(
     // regardless of the active state. The negotiated protocol version
     // gates this so a v9 envelope carrying the unchanged DeleteSession
     // tag does not get the new rejection behavior.
-    if negotiated_protocol_version >= proto::PROTOCOL_VERSION && session.ended_at.is_none() {
+    if negotiated_protocol_version >= proto::PROTOCOL_VERSION && session.ended_at_unix_ms.is_none()
+    {
         return Err(ErrorPayload {
             code: ErrorCode::Conflict,
             message: format!("session {session_id} is active; end it before deleting"),
@@ -695,8 +696,8 @@ mod sessions_activity_tests {
             short_id: None,
             project_root: "/proj".into(),
             project_id: "pid".into(),
-            started_at: 1,
-            last_active_at: 1,
+            started_at_unix_ms: 1,
+            last_active_at_unix_ms: 1,
             turns: 0,
             active_agent: "Build".into(),
             title: None,
@@ -705,11 +706,11 @@ mod sessions_activity_tests {
             shared_with_collaborators: false,
             fork_count: 0,
             descendant_count: 0,
-            last_viewed_at: None,
-            latest_activity_at: None,
+            last_viewed_at_unix_ms: None,
+            latest_activity_at_unix_ms: None,
             open_interrupts: 0,
             activity_state,
-            archived_at: None,
+            archived_at_unix_ms: None,
             pin_count: 0,
         }
     }

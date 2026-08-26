@@ -498,10 +498,10 @@ impl KnowledgeIndex {
 
 fn open_sidecar_connection(sidecar: &Path) -> Result<Connection> {
     if !sidecar.exists() {
-        match crate::private_fs::write_private_file_exclusive(sidecar, b"") {
+        match cockpit_host::private_fs::write_private_file_exclusive(sidecar, b"") {
             Ok(()) => {}
             Err(error) if sidecar.exists() => {
-                crate::private_fs::repair_private_file(sidecar, "knowledge sidecar")
+                cockpit_host::private_fs::repair_private_file(sidecar, "knowledge sidecar")
                     .map_err(anyhow::Error::from)
                     .context("securing concurrently-created knowledge sidecar")?;
                 tracing::debug!(%error, "knowledge sidecar was created concurrently");
@@ -509,7 +509,7 @@ fn open_sidecar_connection(sidecar: &Path) -> Result<Connection> {
             Err(error) => return Err(error).context("creating private knowledge sidecar"),
         }
     } else {
-        crate::private_fs::repair_private_file(sidecar, "knowledge sidecar")
+        cockpit_host::private_fs::repair_private_file(sidecar, "knowledge sidecar")
             .map_err(anyhow::Error::from)?;
     }
     let conn = Connection::open(sidecar)
@@ -1179,7 +1179,7 @@ pub(crate) async fn attached_bundles(
                 }
                 let cache_root =
                     crate::config::resolve::cockpit_data_dir()?.join("knowledge-indexes");
-                crate::private_fs::ensure_private_dir(&cache_root)?;
+                cockpit_host::private_fs::ensure_private_dir(&cache_root)?;
                 bundles.push(AttachedBundle {
                     scope: BundleScope::Assistant,
                     root,

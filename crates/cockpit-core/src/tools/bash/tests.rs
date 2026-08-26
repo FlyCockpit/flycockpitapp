@@ -103,7 +103,7 @@ async fn bash_large_output_is_bounded_at_pipe() {
     let stdout = sidecar.payload["stdout"]
         .as_str()
         .expect("sidecar stdout is a string");
-    assert!(stdout.len() <= crate::process::CHILD_PIPE_CAPTURE_BYTES);
+    assert!(stdout.len() <= cockpit_host::process::CHILD_PIPE_CAPTURE_BYTES);
     assert!(stdout.starts_with("0123456789"));
     assert!(!stdout.is_empty());
 }

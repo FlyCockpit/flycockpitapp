@@ -559,6 +559,25 @@ fn execute_image_publication_slot_transition_conn(
     Ok(next)
 }
 
+fn execute_image_dispatch_preparation_transitions_conn(
+    conn: &Connection,
+    input: &PrepareImageGenerationDispatch<'_>,
+    operation: &ExternalJournalRecord,
+) -> Result<()> {
+    ensure!(
+        attempt_transition_allowed(
+            ImageGenerationAttemptState::Planned,
+            ImageGenerationAttemptState::Preparing
+        ) && attempt_transition_allowed(
+            ImageGenerationAttemptState::Preparing,
+            ImageGenerationAttemptState::Prepared
+        ),
+        "dispatch preparation attempt transitions are not canonical"
+    );
+    execute_image_dispatch_preparation_transitions_conn(conn, input, &operation)?;
+    Ok(())
+}
+
 pub const fn slot_is_job_settled(state: ImageGenerationSlotState) -> bool {
     use ImageGenerationSlotState as S;
     matches!(

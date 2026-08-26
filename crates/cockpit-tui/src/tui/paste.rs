@@ -142,7 +142,9 @@ pub struct PasteRegistry {
     blocks: Vec<PasteBlock>,
     next_block_id: u64,
     next_text_number: u32,
-    next_image_number: u32,
+    /// Stored one wider than the public placeholder number so observing
+    /// `#u32::MAX` can represent an exhausted sequence without wrapping.
+    next_image_number: u64,
 }
 
 #[derive(Debug)]
@@ -156,7 +158,7 @@ pub struct EditorPasteSnapshot {
     images: BTreeMap<u32, RetainedImage>,
     text_numbers_by_nonce: BTreeMap<String, u32>,
     next_text_number: u32,
-    next_image_number: u32,
+    next_image_number: u64,
 }
 
 impl Default for PasteRegistry {
@@ -246,7 +248,7 @@ impl PasteRegistry {
     /// prior occurrence of the same image reuses its number (and the new
     /// block becomes a `reference`); otherwise it's the next distinct
     /// image index. Returns `(number, is_duplicate)`.
-    fn image_number_for(&mut self, hash: u64) -> (u32, bool) {
+    fn image_number_for(&mut self, hash: u64) -> Option<(u32, bool)> {
         if let Some(existing) = self.blocks.iter().find_map(|b| match &b.kind {
             PasteKind::Image { hash: h, .. } | PasteKind::ImageHandle { hash: h, .. }
                 if *h == hash =>
@@ -255,14 +257,11 @@ impl PasteRegistry {
             }
             _ => None,
         }) {
-            return (existing, true);
+            return Some((existing, true));
         }
-        let number = self.next_image_number;
-        self.next_image_number = self
-            .next_image_number
-            .checked_add(1)
-            .expect("paste image numbering exhausted");
-        (number, false)
+        let number = u32::try_from(self.next_image_number).ok()?;
+        self.next_image_number += 1;
+        Some((number, false))
     }
 
     fn next_block_id(&mut self) -> u64 {
@@ -360,15 +359,17 @@ impl PasteRegistry {
     /// Insert a block record for a pasted image at byte `at`. Dedups by
     /// content hash: a repeat paste reuses the original's `#N` and is
     /// flagged a `reference` (sent as text at send time). Returns the
-    /// placeholder string the caller must insert into the buffer.
-    pub fn register_image(&mut self, at: usize, png: Vec<u8>) -> String {
-        self.register_image_with_id(at, png).1
+    /// placeholder string the caller must insert into the buffer, or `None`
+    /// when every representable stable image number has been consumed.
+    pub fn register_image(&mut self, at: usize, png: Vec<u8>) -> Option<String> {
+        self.register_image_with_id(at, png)
+            .map(|(_, placeholder)| placeholder)
     }
 
-    pub fn register_image_with_id(&mut self, at: usize, png: Vec<u8>) -> (u64, String) {
+    pub fn register_image_with_id(&mut self, at: usize, png: Vec<u8>) -> Option<(u64, String)> {
         let hash = hash_bytes(&png);
-        let (number, reference) = self.image_number_for(hash);
-        self.insert_image_with_number(at, png, hash, number, reference)
+        let (number, reference) = self.image_number_for(hash)?;
+        Some(self.insert_image_with_number(at, png, hash, number, reference))
     }
 
     fn register_image_with_number(&mut self, at: usize, png: Vec<u8>, number: u32) -> String {
@@ -379,11 +380,7 @@ impl PasteRegistry {
             }
             PasteKind::Text { .. } => false,
         });
-        self.next_image_number = self.next_image_number.max(
-            number
-                .checked_add(1)
-                .expect("paste image numbering exhausted"),
-        );
+        self.next_image_number = self.next_image_number.max(u64::from(number) + 1);
         self.insert_image_with_number(at, png, hash, number, reference)
             .1
     }
@@ -420,9 +417,9 @@ impl PasteRegistry {
         image_ref: cockpit_proto::ImageAttachmentRef,
         normalized_byte_length: u64,
         sha256: String,
-    ) -> String {
+    ) -> Option<String> {
         self.register_image_handle_with_id(at, draft, image_ref, normalized_byte_length, sha256)
-            .1
+            .map(|(_, placeholder)| placeholder)
     }
 
     pub fn register_image_handle_with_id(
@@ -432,10 +429,10 @@ impl PasteRegistry {
         image_ref: cockpit_proto::ImageAttachmentRef,
         normalized_byte_length: u64,
         sha256: String,
-    ) -> (u64, String) {
+    ) -> Option<(u64, String)> {
         let hash = hash_bytes(sha256.as_bytes());
-        let (number, reference) = self.image_number_for(hash);
-        self.insert_image_handle_with_number(
+        let (number, reference) = self.image_number_for(hash)?;
+        Some(self.insert_image_handle_with_number(
             at,
             draft,
             image_ref,
@@ -444,7 +441,7 @@ impl PasteRegistry {
             hash,
             number,
             reference,
-        )
+        ))
     }
 
     fn register_image_handle_with_number(
@@ -463,11 +460,7 @@ impl PasteRegistry {
             }
             PasteKind::Text { .. } => false,
         });
-        self.next_image_number = self.next_image_number.max(
-            number
-                .checked_add(1)
-                .expect("paste image numbering exhausted"),
-        );
+        self.next_image_number = self.next_image_number.max(u64::from(number) + 1);
         self.insert_image_handle_with_number(
             at,
             draft,
@@ -1033,9 +1026,7 @@ impl PasteRegistry {
                 .keys()
                 .copied()
                 .max()
-                .unwrap_or(0)
-                .checked_add(1)
-                .expect("external-editor image numbering exhausted"),
+                .map_or(1, |number| u64::from(number) + 1),
         };
         Self::rebuild_from_editor_snapshot(editor_text, &snapshot, count_text)
     }
@@ -1055,9 +1046,8 @@ impl PasteRegistry {
             .max();
         registry.next_text_number = snapshot.next_text_number;
         registry.next_image_number = unknown_image_max
-            .and_then(|number| number.checked_add(1))
-            .map_or(snapshot.next_image_number, |floor| {
-                snapshot.next_image_number.max(floor)
+            .map_or(snapshot.next_image_number, |number| {
+                snapshot.next_image_number.max(u64::from(number) + 1)
             });
         let mut retained_text_numbers = snapshot.text_numbers_by_nonce.clone();
         let mut pos = 0usize;
@@ -1193,11 +1183,11 @@ mod tests {
         );
 
         let mut registry = PasteRegistry::new();
-        let first_image = registry.register_image(0, vec![1]);
-        let second_image = registry.register_image(first_image.len(), vec![2]);
+        let first_image = registry.register_image(0, vec![1]).unwrap();
+        let second_image = registry.register_image(first_image.len(), vec![2]).unwrap();
         registry.remove_range(first_image.len(), first_image.len() + second_image.len());
         assert_eq!(
-            registry.register_image(first_image.len(), vec![3]),
+            registry.register_image(first_image.len(), vec![3]).unwrap(),
             "[Pasted image #3]"
         );
     }
@@ -1246,12 +1236,12 @@ mod tests {
         let mut r = PasteRegistry::new();
         let a = vec![1u8, 2, 3, 4];
         let b = vec![9u8, 8, 7];
-        let p1 = r.register_image(0, a.clone());
+        let p1 = r.register_image(0, a.clone()).unwrap();
         assert_eq!(p1, "[Pasted image #1]");
-        let p2 = r.register_image(p1.len(), b.clone());
+        let p2 = r.register_image(p1.len(), b.clone()).unwrap();
         assert_eq!(p2, "[Pasted image #2]");
         // Duplicate of the first image reuses #1 and is a reference.
-        let p3 = r.register_image(p1.len() + p2.len(), a.clone());
+        let p3 = r.register_image(p1.len() + p2.len(), a.clone()).unwrap();
         assert_eq!(p3, "[Pasted image #1]");
         let dup = r.blocks().last().unwrap();
         assert!(matches!(
@@ -1435,7 +1425,7 @@ mod tests {
         let text = r.register_text(buffer.len(), "VERY LONG TEXT".into(), 4);
         buffer.push_str(&text);
         buffer.push(' ');
-        let image = r.register_image(buffer.len(), vec![1, 2, 3]);
+        let image = r.register_image(buffer.len(), vec![1, 2, 3]).unwrap();
         buffer.push_str(&image);
 
         let display = r.expand_display(&buffer);
@@ -1473,7 +1463,9 @@ VERY LONG TEXT
         let mut buffer = String::from("before ");
         let text = registry.register_text(buffer.len(), "payload".into(), 1);
         buffer.push_str(&text);
-        let image = registry.register_image(buffer.len(), vec![1, 2, 3]);
+        let image = registry
+            .register_image(buffer.len(), vec![1, 2, 3])
+            .unwrap();
         buffer.push_str(&image);
         assert!(registry.expand_plain_payload(&buffer).is_none());
     }
@@ -1483,10 +1475,10 @@ VERY LONG TEXT
         let mut r = PasteRegistry::new();
         let png = vec![1u8, 2, 3];
         let mut buffer = String::new();
-        let p1 = r.register_image(0, png.clone());
+        let p1 = r.register_image(0, png.clone()).unwrap();
         buffer.push_str(&p1);
         buffer.push(' ');
-        let p2 = r.register_image(buffer.len(), png.clone()); // duplicate
+        let p2 = r.register_image(buffer.len(), png.clone()).unwrap(); // duplicate
         buffer.push_str(&p2);
         let (wire, images) = r.build_wire(&buffer, true);
         // First image → one real part (sentinel); duplicate → text ref.
@@ -1500,7 +1492,7 @@ VERY LONG TEXT
     fn build_wire_non_vision_converts_images_to_text_note() {
         let mut r = PasteRegistry::new();
         let png = vec![1u8, 2, 3];
-        let p = r.register_image(0, png);
+        let p = r.register_image(0, png).unwrap();
         let (wire, images) = r.build_wire(&p, false);
         assert!(images.is_empty());
         assert_eq!(
@@ -1541,7 +1533,7 @@ VERY LONG TEXT
     fn insert_image_block(c: &mut Composer, r: &mut PasteRegistry, png: Vec<u8>) -> String {
         let at = r.resolve_insertion(c.cursor());
         c.set_cursor(at);
-        let (block_id, placeholder) = r.register_image_with_id(at, png);
+        let (block_id, placeholder) = r.register_image_with_id(at, png).unwrap();
         c.insert_str(&placeholder);
         r.shift_other_blocks_after_insert(block_id, at, placeholder.len());
         placeholder
@@ -1700,7 +1692,7 @@ text"
         registry.next_text_number = 10;
         let text = registry.register_text(0, "sparse text".into(), 2);
         registry.next_image_number = 10;
-        let image = registry.register_image(text.len() + 1, vec![10]);
+        let image = registry.register_image(text.len() + 1, vec![10]).unwrap();
         registry.next_text_number = 40;
         registry.next_image_number = 50;
 
@@ -1726,7 +1718,8 @@ text"
         assert_eq!(
             rebuilt
                 .registry
-                .register_image(rebuilt.buffer.len(), vec![61]),
+                .register_image(rebuilt.buffer.len(), vec![61])
+                .unwrap(),
             "[Pasted image #61]"
         );
     }
@@ -1841,7 +1834,8 @@ gamma",
         assert_eq!(
             rebuilt
                 .registry
-                .register_image(rebuilt.buffer.len(), vec![4]),
+                .register_image(rebuilt.buffer.len(), vec![4])
+                .unwrap(),
             "[Pasted image #3]"
         );
     }
@@ -1860,9 +1854,35 @@ gamma",
 
         assert_eq!(rebuilt.buffer, raw);
         assert!(rebuilt.registry.is_empty());
+        assert_eq!(rebuilt.registry.next_image_number, u64::from(u32::MAX) + 1);
+        assert!(
+            rebuilt
+                .registry
+                .register_image(raw.len(), vec![1])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retained_max_image_exhausts_future_distinct_numbers_without_panicking() {
+        let retained = BTreeMap::from([(u32::MAX, RetainedImage::Bytes(vec![9]))]);
+        let raw = "[Pasted image #4294967295]";
+        let mut rebuilt = PasteRegistry::rebuild_from_editor(raw, &retained, |_| 0);
+
+        assert_eq!(rebuilt.buffer, raw);
+        assert_eq!(rebuilt.registry.blocks()[0].number, u32::MAX);
+        assert!(
+            rebuilt
+                .registry
+                .register_image(raw.len(), vec![1])
+                .is_none()
+        );
         assert_eq!(
-            rebuilt.registry.register_image(raw.len(), vec![1]),
-            "[Pasted image #7]"
+            rebuilt
+                .registry
+                .register_image(raw.len(), vec![9])
+                .as_deref(),
+            Some("[Pasted image #4294967295]")
         );
     }
 
@@ -1965,7 +1985,7 @@ gamma",
         // not. No re-paste required — the bytes are retained either way.
         let mut r = PasteRegistry::new();
         let png = vec![7u8, 7, 7];
-        let p = r.register_image(0, png.clone());
+        let p = r.register_image(0, png.clone()).unwrap();
         let buffer = p;
         let (non_vision, no_imgs) = r.build_wire(&buffer, false);
         assert!(no_imgs.is_empty());
@@ -1993,7 +2013,7 @@ gamma",
 
         let mut composer = Composer::new(false);
         let mut registry = PasteRegistry::new();
-        let placeholder = registry.register_image(0, vec![1, 2, 3]);
+        let placeholder = registry.register_image(0, vec![1, 2, 3]).unwrap();
         composer.insert_str(&placeholder);
         composer.set_cursor(0);
         composer.insert_str("\u{200d}");

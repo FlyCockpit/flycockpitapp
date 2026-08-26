@@ -1923,7 +1923,7 @@ pub struct App {
     /// value and never reconstruct session state from the config default.
     pub(super) active_model_selection: Option<cockpit_config::providers::ActiveModelRef>,
 
-    pub(super) composer: RegisteredComposer,
+    composer: RegisteredComposer,
     /// Ownership epoch for asynchronous paste results. Edits keep the same
     /// epoch; detaching a submitted draft advances it.
     pub(super) draft_generation: u64,

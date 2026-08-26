@@ -567,7 +567,10 @@ impl RegisteredComposer {
             .paste_registry
             .resolve_insertion(self.composer.cursor());
         self.composer.set_cursor(at);
-        let (block_id, placeholder) = self.paste_registry.register_image_with_id(at, png);
+        let Some((block_id, placeholder)) = self.paste_registry.register_image_with_id(at, png)
+        else {
+            return false;
+        };
         self.composer.insert_str(&placeholder);
         self.paste_registry
             .shift_other_blocks_after_insert(block_id, at, placeholder.len());
@@ -589,13 +592,15 @@ impl RegisteredComposer {
             .paste_registry
             .resolve_insertion(self.composer.cursor());
         self.composer.set_cursor(at);
-        let (block_id, placeholder) = self.paste_registry.register_image_handle_with_id(
+        let Some((block_id, placeholder)) = self.paste_registry.register_image_handle_with_id(
             at,
             draft,
             image_ref,
             normalized_byte_length,
             sha256,
-        );
+        ) else {
+            return false;
+        };
         self.composer.insert_str(&placeholder);
         self.paste_registry
             .shift_other_blocks_after_insert(block_id, at, placeholder.len());
@@ -619,19 +624,21 @@ impl RegisteredComposer {
         if from == to {
             return false;
         }
+        let semantic_end = |at: usize| {
+            self.composer
+                .text()
+                .get(at..)
+                .and_then(|text| {
+                    crate::tui::markdown::semantic_graphemes(text)
+                        .into_iter()
+                        .next()
+                })
+                .map_or(at, |grapheme| at + grapheme.len())
+        };
         let (lo, hi) = if from <= to {
-            let hi = if inclusive {
-                self.composer
-                    .text()
-                    .get(to..)
-                    .and_then(|text| text.chars().next())
-                    .map_or(to, |ch| to + ch.len_utf8())
-            } else {
-                to
-            };
-            (from, hi)
+            (from, if inclusive { semantic_end(to) } else { to })
         } else {
-            (to, from)
+            (to, if inclusive { semantic_end(from) } else { from })
         };
         self.apply_operator_range(operator, lo, hi);
         true
@@ -693,13 +700,17 @@ impl RegisteredComposer {
 
     pub(crate) fn cut_char_forward(&mut self) -> bool {
         let from = self.composer.cursor();
-        let Some(ch) = self.composer.text()[from..].chars().next() else {
+        let Some(grapheme) =
+            crate::tui::markdown::semantic_graphemes(&self.composer.text()[from..])
+                .into_iter()
+                .next()
+        else {
             return false;
         };
-        if ch == '\n' {
+        if grapheme == "\n" {
             return false;
         }
-        self.cut_range(from, from + ch.len_utf8(), false).is_some()
+        self.cut_range(from, from + grapheme.len(), false).is_some()
     }
 
     #[cfg(test)]
@@ -810,7 +821,8 @@ impl RegisteredComposer {
 
 #[cfg(test)]
 mod tests {
-    use super::RegisteredComposer;
+    use super::{ComposerMotion, RegisteredComposer};
+    use crate::tui::composer::Operator;
     use crate::tui::paste::PasteRegistry;
 
     #[test]
@@ -849,6 +861,38 @@ mod tests {
                 })
                 .any(|boundary| boundary == owner.cursor())
         );
+    }
+
+    #[test]
+    fn cut_char_forward_cuts_one_semantic_grapheme_into_register() {
+        for cluster in ["👩\u{200d}💻", "क्\u{200d}ष"] {
+            let mut owner = RegisteredComposer::new(true);
+            owner.insert_str(&format!("{cluster}tail"));
+            owner.set_cursor(0);
+
+            assert!(owner.cut_char_forward());
+            assert_eq!(owner.register().text, cluster);
+            assert_eq!(owner.cursor(), 0);
+            assert_eq!(owner.text(), "tail");
+        }
+    }
+
+    #[test]
+    fn inclusive_operator_endpoint_consumes_the_full_semantic_grapheme() {
+        for cluster in ["👩\u{200d}💻", "क्\u{200d}ष"] {
+            let mut owner = RegisteredComposer::new(true);
+            owner.insert_str(&format!("a{cluster}tail"));
+            owner.set_cursor(0);
+
+            assert!(owner.apply_operator_motion(
+                Operator::Delete,
+                ComposerMotion::Absolute(1),
+                true,
+            ));
+            assert_eq!(owner.register().text, format!("a{cluster}"));
+            assert_eq!(owner.cursor(), 0);
+            assert_eq!(owner.text(), "tail");
+        }
     }
 
     #[test]

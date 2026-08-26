@@ -19,7 +19,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context as _;
 use cockpit_host::daemon_lifecycle::{
@@ -42,6 +41,44 @@ struct ProcessReap {
     cleanup: ProcessCleanup,
     completed: Option<std::sync::mpsc::Sender<anyhow::Result<()>>>,
     attempts: u8,
+}
+
+#[derive(Debug)]
+enum CleanupPhase {
+    Pending,
+    Running,
+    Complete(Result<(), Arc<str>>),
+}
+
+#[derive(Debug)]
+struct CleanupState {
+    phase: std::sync::Mutex<CleanupPhase>,
+    completed: std::sync::Condvar,
+}
+
+impl CleanupState {
+    fn new() -> Self {
+        Self {
+            phase: std::sync::Mutex::new(CleanupPhase::Pending),
+            completed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn disarm(&self) {
+        let mut phase = self.phase.lock().unwrap_or_else(|error| error.into_inner());
+        if matches!(*phase, CleanupPhase::Pending) {
+            *phase = CleanupPhase::Complete(Ok(()));
+            self.completed.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn is_pending(&self) -> bool {
+        matches!(
+            *self.phase.lock().unwrap_or_else(|error| error.into_inner()),
+            CleanupPhase::Pending
+        )
+    }
 }
 
 static PROCESS_REAPER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<ProcessReap>>> =
@@ -337,7 +374,7 @@ fn owner_exit_timeout() -> std::time::Duration {
     if let Some(milliseconds) = INJECT_OWNER_EXIT_TIMEOUT_MS.with(|value| value.replace(None)) {
         return std::time::Duration::from_millis(milliseconds);
     }
-    std::time::Duration::from_secs(5)
+    crate::daemon::restart_release_timeout(None)
 }
 
 fn request_owned_graceful_stop(
@@ -363,25 +400,47 @@ fn request_owned_graceful_stop(
             .enable_all()
             .build()
             .context("building owner graceful-stop runtime")?;
-        runtime.block_on(async {
-            let client = cockpit_client::DaemonClient::connect(&cleanup.paths.socket)
-                .await
-                .context("connecting exact owned daemon")?;
-            match client
-                .request_ok(Request::StopDaemon { grace_secs: None })
-                .await
-                .context("requesting exact owned daemon shutdown")?
-            {
-                crate::daemon::proto::Response::Ack => Ok(()),
-                response => anyhow::bail!("unexpected owner shutdown response: {response:?}"),
-            }
-        })
+        runtime.block_on(request_owned_graceful_stop_async(cleanup, expected, || {}))
     }
     #[cfg(not(unix))]
     {
         let _ = (cleanup, expected);
         anyhow::bail!("owner graceful-stop transport is unavailable on this platform")
     }
+}
+
+#[cfg(unix)]
+async fn request_owned_graceful_stop_async(
+    cleanup: &ProcessCleanup,
+    expected: &DaemonPidReceipt,
+    after_connect: impl FnOnce(),
+) -> anyhow::Result<()> {
+    let client = cockpit_client::DaemonClient::connect(&cleanup.paths.socket)
+        .await
+        .context("connecting exact owned daemon")?;
+    after_connect();
+    if read_daemon_pid_record(&cleanup.paths.pid_file)
+        != Some(DaemonPidRecord::Receipt(expected.clone()))
+    {
+        anyhow::bail!(
+            "daemon receipt changed during owner graceful-stop handshake; shutdown request was not sent"
+        );
+    }
+    let response = client
+        .request_ok(Request::StopDaemon { grace_secs: None })
+        .await
+        .context("requesting exact owned daemon shutdown")?;
+    if !matches!(response, crate::daemon::proto::Response::Ack) {
+        anyhow::bail!("unexpected owner shutdown response: {response:?}");
+    }
+    if read_daemon_pid_record(&cleanup.paths.pid_file)
+        != Some(DaemonPidRecord::Receipt(expected.clone()))
+    {
+        anyhow::bail!(
+            "daemon receipt changed after owner graceful-stop acknowledgement; replacement metadata was preserved"
+        );
+    }
+    Ok(())
 }
 
 fn receipt_matches_owned_launch(
@@ -441,17 +500,15 @@ fn retire_late_exact_metadata(
 /// to a pre-existing persistent daemon (`owns_daemon = false`) builds no
 /// guard, so it never shuts anything down.
 ///
-/// The drop performs a best-effort *synchronous* `StopDaemon` so it works
-/// from inside `Drop` without juggling the async runtime: it connects to
-/// the daemon's Unix socket with the std (blocking) `UnixStream` and writes
-/// one NDJSON `StopDaemon` request. The daemon routes it through its single
-/// graceful drain (see `server::handle_request` / `server::request_shutdown`).
+/// Drop joins the same process-reaper completion used by explicit and
+/// signal-driven shutdown. Socket-only test guards retain the small blocking
+/// fallback used outside an async runtime.
 pub struct EphemeralDaemonGuard {
     socket: PathBuf,
     process: Option<ProcessCleanup>,
-    /// Cleared once shutdown has been requested (happy path) so the drop
-    /// doesn't fire a redundant second request.
-    armed: Arc<AtomicBool>,
+    /// One joinable teardown result shared by explicit shutdown, signal
+    /// handling, and `Drop`. Claiming cleanup is distinct from completing it.
+    cleanup_state: Arc<CleanupState>,
 }
 
 impl EphemeralDaemonGuard {
@@ -470,7 +527,7 @@ impl EphemeralDaemonGuard {
                 launch_start: Some(launch_start),
                 launch_executable: Some(launch_executable),
             }),
-            armed: Arc::new(AtomicBool::new(true)),
+            cleanup_state: Arc::new(CleanupState::new()),
         }
     }
 
@@ -479,36 +536,15 @@ impl EphemeralDaemonGuard {
         Self {
             socket,
             process: None,
-            armed: Arc::new(AtomicBool::new(true)),
+            cleanup_state: Arc::new(CleanupState::new()),
         }
     }
 
-    /// Disarm and synchronously request shutdown. Idempotent: the first
-    /// caller wins, later calls (including the drop) are no-ops.
+    /// Request shutdown and synchronously join its shared result. Idempotent:
+    /// the first caller performs teardown and every concurrent/later caller
+    /// observes the same completion.
     pub fn shutdown(&self) -> anyhow::Result<()> {
-        if self.armed.swap(false, Ordering::SeqCst) {
-            if let Some(cleanup) = self.process.clone() {
-                let (completed, completion) = std::sync::mpsc::channel();
-                let reap = ProcessReap {
-                    cleanup,
-                    completed: Some(completed),
-                    attempts: 0,
-                };
-                if let Err(error) = process_reaper()?.send(reap) {
-                    // Explicit shutdown runs on the lifecycle-owned OS thread.
-                    // If the process-lifetime reaper unexpectedly retired,
-                    // retain exact ownership and perform the same bounded
-                    // cleanup synchronously while surfacing its result.
-                    return run_cleanup_fallback_until_released(&error.0.cleanup);
-                }
-                completion
-                    .recv()
-                    .context("ephemeral process reaper dropped completion")??;
-            } else {
-                stop_daemon_blocking(&self.socket);
-            }
-        }
-        Ok(())
+        shutdown_shared(&self.cleanup_state, &self.socket, self.process.clone())
     }
 
     pub fn bind_published_receipt(&self) -> anyhow::Result<()> {
@@ -545,8 +581,84 @@ impl EphemeralDaemonGuard {
     /// Until an explicit handoff, dropping a provisional owner remains
     /// fail-safe and reaps the daemon it spawned.
     pub fn disarm(&self) {
-        self.armed.store(false, Ordering::SeqCst);
+        self.cleanup_state.disarm();
     }
+}
+
+fn shutdown_shared(
+    state: &CleanupState,
+    socket: &Path,
+    process: Option<ProcessCleanup>,
+) -> anyhow::Result<()> {
+    let mut phase = state
+        .phase
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    loop {
+        match &*phase {
+            CleanupPhase::Pending => {
+                *phase = CleanupPhase::Running;
+                break;
+            }
+            CleanupPhase::Running => {
+                phase = state
+                    .completed
+                    .wait(phase)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+            CleanupPhase::Complete(result) => {
+                return result
+                    .as_ref()
+                    .map(|()| ())
+                    .map_err(|error| anyhow::anyhow!(error.to_string()));
+            }
+        }
+    }
+    drop(phase);
+
+    let result = if let Some(cleanup) = process {
+        let (completed, completion) = std::sync::mpsc::channel();
+        let reap = ProcessReap {
+            cleanup: cleanup.clone(),
+            completed: Some(completed),
+            attempts: 0,
+        };
+        match process_reaper() {
+            Ok(reaper) => match reaper.send(reap) {
+                Ok(()) => completion
+                    .recv()
+                    .context("ephemeral process reaper dropped completion")
+                    .and_then(|result| result),
+                Err(error) => run_cleanup_fallback_until_released(&error.0.cleanup),
+            },
+            Err(error) => {
+                let fallback = run_cleanup_fallback_until_released(&cleanup);
+                match fallback {
+                    Ok(()) => Err(error),
+                    Err(fallback) => Err(anyhow::anyhow!(
+                        "{error}; synchronous exact-child cleanup also failed: {fallback}"
+                    )),
+                }
+            }
+        }
+    } else {
+        stop_daemon_blocking(socket);
+        Ok(())
+    };
+    publish_cleanup_result(state, result)
+}
+
+fn publish_cleanup_result(state: &CleanupState, result: anyhow::Result<()>) -> anyhow::Result<()> {
+    let stored = result
+        .as_ref()
+        .map(|()| ())
+        .map_err(|error| Arc::<str>::from(format!("{error:#}")));
+    *state
+        .phase
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = CleanupPhase::Complete(stored);
+    state.completed.notify_all();
+    result
 }
 
 /// Owns a newly spawned child before its OS start identity can be captured.
@@ -641,34 +753,9 @@ pub fn aggregate_shutdown_result<T>(
 
 impl Drop for EphemeralDaemonGuard {
     fn drop(&mut self) {
-        if !self.armed.swap(false, Ordering::SeqCst) {
-            return;
-        }
-        if let Some(cleanup) = self.process.clone() {
-            let reap = ProcessReap {
-                cleanup,
-                completed: None,
-                attempts: 0,
-            };
-            match process_reaper() {
-                Ok(reaper) => {
-                    if let Err(error) = reaper.send(reap) {
-                        if let Err(cleanup_error) =
-                            run_cleanup_fallback_until_released(&error.0.cleanup)
-                        {
-                            tracing::error!(%cleanup_error, "emergency ephemeral cleanup failed");
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(%error, "ephemeral process reaper unavailable during drop");
-                    if let Err(cleanup_error) = run_cleanup_fallback_until_released(&reap.cleanup) {
-                        tracing::error!(%cleanup_error, "emergency ephemeral cleanup failed");
-                    }
-                }
-            }
-        } else {
-            stop_daemon_blocking(&self.socket);
+        if let Err(error) = shutdown_shared(&self.cleanup_state, &self.socket, self.process.clone())
+        {
+            tracing::error!(%error, "emergency ephemeral cleanup failed");
         }
     }
 }
@@ -726,7 +813,7 @@ pub fn spawn_signal_shutdown(
     exit_on_signal: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let guard = guard?;
-    let armed = guard.armed.clone();
+    let cleanup_state = guard.cleanup_state.clone();
     let socket = guard.socket.clone();
     let process = guard.process.clone();
     Some(tokio::spawn(async move {
@@ -734,68 +821,12 @@ pub fn spawn_signal_shutdown(
             tracing::error!(%error, "foreground signal watcher stopped without a signal");
             return;
         }
-        if armed.swap(false, Ordering::SeqCst) {
-            if let Some(cleanup) = process {
-                let (completed, completion) = std::sync::mpsc::channel();
-                let reap = ProcessReap {
-                    cleanup,
-                    completed: Some(completed),
-                    attempts: 0,
-                };
-                match process_reaper() {
-                    Ok(reaper) => match reaper.send(reap) {
-                        Ok(()) => {
-                            match tokio::task::spawn_blocking(move || completion.recv()).await {
-                                Ok(Ok(Ok(()))) => {}
-                                Ok(Ok(Err(error))) => {
-                                    tracing::error!(%error, "signal-triggered ephemeral cleanup failed");
-                                }
-                                Ok(Err(error)) => {
-                                    tracing::error!(%error, "signal-triggered cleanup completion channel closed");
-                                }
-                                Err(error) => {
-                                    tracing::error!(%error, "signal-triggered cleanup waiter failed");
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            let cleanup = error.0.cleanup;
-                            match tokio::task::spawn_blocking(move || {
-                                run_cleanup_fallback_until_released(&cleanup)
-                            })
-                            .await
-                            {
-                                Ok(Ok(())) => {}
-                                Ok(Err(error)) => {
-                                    tracing::error!(%error, "signal-triggered emergency cleanup failed");
-                                }
-                                Err(error) => {
-                                    tracing::error!(%error, "signal-triggered emergency cleanup worker failed");
-                                }
-                            }
-                        }
-                    },
-                    Err(error) => {
-                        tracing::error!(%error, "signal-triggered daemon reaper unavailable");
-                        let cleanup = reap.cleanup;
-                        match tokio::task::spawn_blocking(move || {
-                            run_cleanup_fallback_until_released(&cleanup)
-                        })
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                tracing::error!(%error, "signal-triggered emergency cleanup failed");
-                            }
-                            Err(error) => {
-                                tracing::error!(%error, "signal-triggered emergency cleanup worker failed");
-                            }
-                        }
-                    }
-                }
-            } else {
-                stop_daemon_blocking(&socket);
-            }
+        let cleanup =
+            tokio::task::spawn_blocking(move || shutdown_shared(&cleanup_state, &socket, process));
+        match cleanup.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(%error, "signal-triggered ephemeral cleanup failed"),
+            Err(error) => tracing::error!(%error, "signal-triggered cleanup waiter failed"),
         }
         if exit_on_signal {
             // After reaping, exit the foreground promptly — the user asked
@@ -849,7 +880,7 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
 #[cfg(unix)]
 mod tests {
     use super::*;
-    use crate::daemon::proto::Body;
+    use crate::daemon::proto::{Body, ProtoStream, RecvFrame, Response};
     use tokio::io::AsyncBufReadExt;
     use tokio::net::UnixListener;
 
@@ -878,6 +909,65 @@ mod tests {
             },
         );
         (guard, paths, pid)
+    }
+
+    fn publish_owned_receipt(
+        guard: &EphemeralDaemonGuard,
+        paths: &crate::daemon::DaemonPaths,
+        pid: u32,
+    ) -> DaemonPidReceipt {
+        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        let receipt =
+            cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable)
+                .unwrap();
+        *guard.process.as_ref().unwrap().receipt.lock().unwrap() = Some(receipt.clone());
+        receipt
+    }
+
+    fn hello_response(protocol_version: u32) -> Response {
+        Response::DaemonStatus {
+            pid: std::process::id(),
+            uptime_secs: 0,
+            active_sessions: 0,
+            socket_path: "fixture.sock".to_string(),
+            daemon_version: crate::daemon::proto::DAEMON_VERSION.to_string(),
+            protocol_version,
+            paused_sessions: 0,
+            database_path: "fixture.db".to_string(),
+            schema_version: 1,
+        }
+    }
+
+    async fn send_hello(stream: &mut ProtoStream<tokio::net::UnixStream>, version: u32) {
+        stream
+            .send(&Envelope::response(
+                uuid::Uuid::nil(),
+                hello_response(version),
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn receive_stop(stream: &mut ProtoStream<tokio::net::UnixStream>) -> uuid::Uuid {
+        match stream.recv().await.unwrap().unwrap() {
+            RecvFrame::Envelope(Envelope {
+                body: Body::Request { id, request },
+                ..
+            }) => {
+                assert!(matches!(request, Request::StopDaemon { grace_secs: None }));
+                id
+            }
+            frame => panic!("expected StopDaemon request, got {frame:?}"),
+        }
+    }
+
+    fn reap_fixture_child(guard: &EphemeralDaemonGuard) {
+        let cleanup = guard.process.as_ref().unwrap();
+        let mut child = cleanup.child.lock().unwrap();
+        if let Some(child) = child.as_mut() {
+            kill_and_wait_exact_child(child).unwrap();
+        }
+        *child = None;
     }
 
     /// Accept one connection on `socket`, read the first NDJSON line, and
@@ -944,10 +1034,10 @@ mod tests {
         let socket_for_guard = socket.clone();
         tokio::task::spawn_blocking(move || {
             let guard = EphemeralDaemonGuard::new_for_socket(socket_for_guard);
-            assert!(guard.armed.load(Ordering::SeqCst));
+            assert!(guard.cleanup_state.is_pending());
             guard.shutdown().unwrap();
             // Disarmed: the second call and the drop must both be no-ops.
-            assert!(!guard.armed.load(Ordering::SeqCst));
+            assert!(!guard.cleanup_state.is_pending());
             guard.shutdown().unwrap();
             drop(guard);
         })
@@ -1056,7 +1146,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (guard, _paths, _pid) = child_guard(root.path(), "cleanup-panic");
         let cleanup = guard.process.as_ref().unwrap().clone();
-        guard.armed.store(false, Ordering::SeqCst);
+        guard.disarm();
         INJECT_PROCESS_CLEANUP_PANIC.with(|inject| inject.set(true));
         assert!(run_process_cleanup_recovering(&cleanup).is_err());
         assert!(cleanup.child.lock().unwrap().is_none());
@@ -1067,7 +1157,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (guard, _paths, _pid) = child_guard(root.path(), "poisoned-child");
         let cleanup = guard.process.as_ref().unwrap().clone();
-        guard.armed.store(false, Ordering::SeqCst);
+        guard.disarm();
         let child = cleanup.child.clone();
         let _ = std::thread::spawn(move || {
             let _locked = child.lock().unwrap();
@@ -1089,7 +1179,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (guard, paths, _pid) = child_guard(root.path(), "kill-failure");
         let cleanup = guard.process.as_ref().unwrap().clone();
-        guard.armed.store(false, Ordering::SeqCst);
+        guard.disarm();
         std::fs::write(&paths.socket, b"owned artifact").unwrap();
         INJECT_CHILD_KILL_FAILURE.with(|inject| inject.set(true));
         assert!(emergency_kill_wait_and_retire(&cleanup).is_err());
@@ -1104,7 +1194,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (guard, _paths, _pid) = child_guard(root.path(), "wait-failure");
         let cleanup = guard.process.as_ref().unwrap().clone();
-        guard.armed.store(false, Ordering::SeqCst);
+        guard.disarm();
         INJECT_CHILD_WAIT_FAILURE.with(|inject| inject.set(true));
         assert!(emergency_kill_wait_and_retire(&cleanup).is_err());
         assert!(process_child_retained(&cleanup));
@@ -1120,7 +1210,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (guard, paths, pid) = child_guard(root.path(), "already-exited");
         let cleanup = guard.process.as_ref().unwrap().clone();
-        guard.armed.store(false, Ordering::SeqCst);
+        guard.disarm();
         let executable = std::fs::canonicalize("/bin/sleep").unwrap();
         cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable).unwrap();
         std::fs::write(&paths.socket, b"stale socket").unwrap();
@@ -1184,12 +1274,237 @@ mod tests {
         assert!(paths.socket.exists());
     }
 
+    #[tokio::test]
+    async fn owner_protocol_hello_stop_ack_and_child_exit_is_valid() {
+        initialize_process_reaper().expect("process reaper");
+        let root = tempfile::tempdir().unwrap();
+        let (guard, paths, pid) = child_guard(root.path(), "protocol-valid");
+        let expected = publish_owned_receipt(&guard, &paths, pid);
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = ProtoStream::new(socket);
+            send_hello(&mut stream, crate::daemon::proto::PROTOCOL_VERSION).await;
+            let id = receive_stop(&mut stream).await;
+            stream
+                .send(&Envelope::response(id, Response::Ack))
+                .await
+                .unwrap();
+            // Model the real daemon exiting after its acknowledged drain.
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+        });
+
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        tokio::task::spawn_blocking(move || cleanup_exact_process(&cleanup))
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        guard.disarm();
+        assert_eq!(
+            read_daemon_pid_record(&paths.pid_file),
+            None,
+            "exact metadata is retired after the child exits"
+        );
+        assert_ne!(expected.publication_nonce, [0; 32]);
+    }
+
+    #[tokio::test]
+    async fn owner_protocol_rejects_malformed_and_incompatible_hello() {
+        use tokio::io::AsyncWriteExt as _;
+
+        for (name, malformed) in [("malformed", true), ("incompatible", false)] {
+            let root = tempfile::tempdir().unwrap();
+            let (guard, paths, pid) = child_guard(root.path(), name);
+            let expected = publish_owned_receipt(&guard, &paths, pid);
+            let cleanup = guard.process.as_ref().unwrap().clone();
+            let listener = UnixListener::bind(&paths.socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                if malformed {
+                    let mut socket = socket;
+                    socket.write_all(b"not-json\n").await.unwrap();
+                } else {
+                    let mut stream = ProtoStream::new(socket);
+                    send_hello(
+                        &mut stream,
+                        crate::daemon::proto::PROTOCOL_VERSION.saturating_add(1),
+                    )
+                    .await;
+                }
+            });
+
+            assert!(
+                request_owned_graceful_stop_async(&cleanup, &expected, || {})
+                    .await
+                    .is_err()
+            );
+            server.await.unwrap();
+            guard.disarm();
+            reap_fixture_child(&guard);
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_protocol_rejects_unexpected_shutdown_response() {
+        let root = tempfile::tempdir().unwrap();
+        let (guard, paths, pid) = child_guard(root.path(), "protocol-unexpected");
+        let expected = publish_owned_receipt(&guard, &paths, pid);
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = ProtoStream::new(socket);
+            send_hello(&mut stream, crate::daemon::proto::PROTOCOL_VERSION).await;
+            let id = receive_stop(&mut stream).await;
+            stream
+                .send(&Envelope::response(id, Response::Unknown))
+                .await
+                .unwrap();
+        });
+
+        assert!(
+            request_owned_graceful_stop_async(&cleanup, &expected, || {})
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected owner shutdown response")
+        );
+        server.await.unwrap();
+        guard.disarm();
+        reap_fixture_child(&guard);
+    }
+
+    #[tokio::test]
+    async fn replacement_during_hello_never_receives_stop_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let (guard, paths, pid) = child_guard(root.path(), "protocol-replacement");
+        let expected = publish_owned_receipt(&guard, &paths, pid);
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let (observed, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = ProtoStream::new(socket);
+            send_hello(&mut stream, crate::daemon::proto::PROTOCOL_VERSION).await;
+            let request =
+                tokio::time::timeout(std::time::Duration::from_millis(100), stream.recv()).await;
+            let received_stop = matches!(
+                request,
+                Ok(Ok(Some(RecvFrame::Envelope(Envelope {
+                    body: Body::Request {
+                        request: Request::StopDaemon { .. },
+                        ..
+                    },
+                    ..
+                }))))
+            );
+            observed.send(received_stop).unwrap();
+        });
+        let replacement_path = paths.pid_file.clone();
+        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        let result = request_owned_graceful_stop_async(&cleanup, &expected, move || {
+            std::fs::remove_file(&replacement_path).unwrap();
+            cockpit_host::daemon_lifecycle::write_pid_file(&replacement_path, pid, &executable)
+                .unwrap();
+        })
+        .await;
+
+        assert!(result.unwrap_err().to_string().contains("receipt changed"));
+        assert!(!received.await.unwrap(), "replacement received StopDaemon");
+        server.await.unwrap();
+        guard.disarm();
+        reap_fixture_child(&guard);
+    }
+
+    #[tokio::test]
+    async fn replacement_after_stop_ack_is_reported_and_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let (guard, paths, pid) = child_guard(root.path(), "protocol-post-ack-replacement");
+        let expected = publish_owned_receipt(&guard, &paths, pid);
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let replacement_path = paths.pid_file.clone();
+        let executable = std::fs::canonicalize("/bin/sleep").unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = ProtoStream::new(socket);
+            send_hello(&mut stream, crate::daemon::proto::PROTOCOL_VERSION).await;
+            let id = receive_stop(&mut stream).await;
+            std::fs::remove_file(&replacement_path).unwrap();
+            let replacement =
+                cockpit_host::daemon_lifecycle::write_pid_file(&replacement_path, pid, &executable)
+                    .unwrap();
+            stream
+                .send(&Envelope::response(id, Response::Ack))
+                .await
+                .unwrap();
+            replacement
+        });
+
+        let error = request_owned_graceful_stop_async(&cleanup, &expected, || {})
+            .await
+            .unwrap_err();
+        let replacement = server.await.unwrap();
+        assert!(error.to_string().contains("after owner graceful-stop"));
+        assert_eq!(
+            read_daemon_pid_record(&paths.pid_file),
+            Some(DaemonPidRecord::Receipt(replacement))
+        );
+        guard.disarm();
+        reap_fixture_child(&guard);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_stop_that_exceeds_drain_bound_forces_exact_child() {
+        let root = tempfile::tempdir().unwrap();
+        let (guard, paths, pid) = child_guard(root.path(), "protocol-timeout-force");
+        publish_owned_receipt(&guard, &paths, pid);
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = ProtoStream::new(socket);
+            send_hello(&mut stream, crate::daemon::proto::PROTOCOL_VERSION).await;
+            let id = receive_stop(&mut stream).await;
+            stream
+                .send(&Envelope::response(id, Response::Ack))
+                .await
+                .unwrap();
+        });
+
+        let cleanup_result = tokio::task::spawn_blocking(move || {
+            INJECT_OWNER_EXIT_TIMEOUT_MS.with(|value| value.set(Some(1)));
+            cleanup_exact_process(&cleanup)
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert!(cleanup_result.is_err());
+        assert!(!process_child_retained(guard.process.as_ref().unwrap()));
+        guard.disarm();
+    }
+
+    #[test]
+    fn competing_shutdown_waiters_join_the_same_completion_result() {
+        let state = Arc::new(CleanupState::new());
+        *state.phase.lock().unwrap() = CleanupPhase::Running;
+        let waiter_state = state.clone();
+        let waiter =
+            std::thread::spawn(move || shutdown_shared(&waiter_state, Path::new("unused"), None));
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let published = anyhow::anyhow!("deterministic teardown failure");
+        assert!(publish_cleanup_result(&state, Err(published)).is_err());
+        let joined = waiter.join().unwrap().unwrap_err().to_string();
+        assert_eq!(joined, "deterministic teardown failure");
+    }
+
     #[test]
     fn owned_graceful_ack_and_exit_is_clean() {
         let root = tempfile::tempdir().unwrap();
         let (guard, paths, pid) = child_guard(root.path(), "owner-graceful");
         let cleanup = guard.process.as_ref().unwrap().clone();
-        guard.armed.store(false, Ordering::SeqCst);
+        guard.disarm();
         let executable = std::fs::canonicalize("/bin/sleep").unwrap();
         let receipt =
             cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable)
@@ -1211,7 +1526,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (guard, paths, pid) = child_guard(root.path(), "owner-timeout");
         let cleanup = guard.process.as_ref().unwrap().clone();
-        guard.armed.store(false, Ordering::SeqCst);
+        guard.disarm();
         let executable = std::fs::canonicalize("/bin/sleep").unwrap();
         let receipt =
             cockpit_host::daemon_lifecycle::write_pid_file(&paths.pid_file, pid, &executable)

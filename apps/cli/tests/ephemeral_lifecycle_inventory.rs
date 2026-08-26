@@ -28,7 +28,7 @@ impl<'ast> Visit<'ast> for RawAuthority {
             .to_string()
             .split(|character: char| !character.is_alphanumeric() && character != '_')
         {
-            if RAW_AUTHORITY.contains(&token) {
+            if RAW_AUTHORITY.contains(&token) || token == "OwnedDaemonSession" {
                 self.0.push(token.into());
             }
         }
@@ -68,10 +68,49 @@ fn inspect_items(items: &[syn::Item], violations: &mut Vec<String>) {
                 let mut paths = Vec::new();
                 flatten_use(&item.tree, &mut Vec::new(), &mut paths);
                 for path in paths {
-                    if path == "cockpit_core::daemon" || path.ends_with("daemon::client::*") {
+                    let public = !matches!(item.vis, syn::Visibility::Inherited);
+                    if path == "cockpit_core::daemon"
+                        || path.ends_with("daemon::client::*")
+                        || (public && path.ends_with("daemon::client::OwnedDaemonSession"))
+                    {
                         violations.push(path);
                     }
                 }
+                fn reject_renames(
+                    tree: &syn::UseTree,
+                    prefix: &mut Vec<String>,
+                    violations: &mut Vec<String>,
+                ) {
+                    match tree {
+                        syn::UseTree::Rename(rename)
+                            if rename.ident == "OwnedDaemonSession"
+                                || (rename.ident == "client"
+                                    && prefix
+                                        .iter()
+                                        .map(String::as_str)
+                                        .eq(["crate", "daemon"])) =>
+                        {
+                            violations.push(format!("renamed lifecycle facade: {}", rename.ident));
+                        }
+                        syn::UseTree::Path(path) => {
+                            prefix.push(path.ident.to_string());
+                            reject_renames(&path.tree, prefix, violations);
+                            prefix.pop();
+                        }
+                        syn::UseTree::Group(group) => {
+                            for tree in &group.items {
+                                reject_renames(tree, prefix, violations);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                reject_renames(&item.tree, &mut Vec::new(), violations);
+            }
+            syn::Item::Type(alias) => {
+                let mut facade = OwnedFacade::default();
+                facade.visit_type(&alias.ty);
+                violations.extend(facade.0);
             }
             syn::Item::Mod(module) => {
                 if let Some((_, items)) = &module.content {
@@ -79,6 +118,17 @@ fn inspect_items(items: &[syn::Item], violations: &mut Vec<String>) {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+#[derive(Default)]
+struct OwnedFacade(Vec<String>);
+
+impl<'ast> Visit<'ast> for OwnedFacade {
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        if ident == "OwnedDaemonSession" {
+            self.0.push(ident.to_string());
         }
     }
 }
@@ -189,6 +239,12 @@ impl<'ast> Visit<'ast> for OwnedFlow {
         self.closure_depth -= 1;
     }
 
+    fn visit_expr_async(&mut self, expression: &'ast syn::ExprAsync) {
+        self.closure_depth += 1;
+        visit::visit_expr_async(self, expression);
+        self.closure_depth -= 1;
+    }
+
     fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
         self.branch_depth += 1;
         visit::visit_expr_if(self, expression);
@@ -198,6 +254,24 @@ impl<'ast> Visit<'ast> for OwnedFlow {
     fn visit_expr_match(&mut self, expression: &'ast syn::ExprMatch) {
         self.branch_depth += 1;
         visit::visit_expr_match(self, expression);
+        self.branch_depth -= 1;
+    }
+
+    fn visit_expr_loop(&mut self, expression: &'ast syn::ExprLoop) {
+        self.branch_depth += 1;
+        visit::visit_expr_loop(self, expression);
+        self.branch_depth -= 1;
+    }
+
+    fn visit_expr_while(&mut self, expression: &'ast syn::ExprWhile) {
+        self.branch_depth += 1;
+        visit::visit_expr_while(self, expression);
+        self.branch_depth -= 1;
+    }
+
+    fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
+        self.branch_depth += 1;
+        visit::visit_expr_for_loop(self, expression);
         self.branch_depth -= 1;
     }
 
@@ -266,7 +340,13 @@ impl<'ast> Visit<'ast> for OwnedFlow {
         {
             let name = ident.to_string();
             if let Some(id) = self.resolve(&name) {
-                self.finishes.push((id, self.position));
+                if self.closure_depth > 0 || self.branch_depth > 0 {
+                    self.violations.push(
+                        "owned session finished in deferred or conditional control flow".into(),
+                    );
+                } else {
+                    self.finishes.push((id, self.position));
+                }
             } else {
                 self.unresolved_finishes.push((name, self.position));
             }
@@ -416,6 +496,11 @@ fn adversarial_raw_alias_reexport_glob_and_helper_are_rejected() {
         "macro_rules! hidden { () => { ConnectedDaemon } }",
         "use crate::daemon::ephemeral_guard::EphemeralDaemonGuard as Guard; fn leak(value: Guard) { Guard::shutdown(&value); }",
         "pub fn leak() -> crate::daemon::client::ConnectedDaemon { unreachable!() }",
+        "use crate::daemon::client::OwnedDaemonSession as Session;",
+        "use crate::daemon::client as lifecycle;",
+        "pub use crate::daemon::client::OwnedDaemonSession;",
+        "type Session = crate::daemon::client::OwnedDaemonSession;",
+        "macro_rules! extra_owned { () => { OwnedDaemonSession::connect(mode).await } }",
     ] {
         assert!(!source_violations(source).is_empty(), "accepted: {source}");
     }
@@ -443,10 +528,25 @@ fn adversarial_shadow_move_deferred_and_finish_order_are_rejected() {
         "async fn run() { if condition { let daemon = OwnedDaemonSession::connect(mode).await?; daemon.finish(result).await; } }",
         "async fn run() { daemon.finish(result).await; let daemon = OwnedDaemonSession::connect(mode).await?; }",
         "async fn run() { let (daemon,) = (OwnedDaemonSession::connect(mode).await?,); daemon.finish(result).await; }",
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; if false { daemon.finish(result).await; } }",
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; let deferred = || async { daemon.finish(result).await; }; }",
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; async { daemon.finish(result).await; }; }",
+        "async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; while false { daemon.finish(result).await; } }",
     ] {
         let mut flow = OwnedFlow::default();
         flow.visit_file(&syn::parse_file(source).unwrap());
         assert!(!flow.validate().is_empty(), "accepted: {source}");
+    }
+}
+
+#[test]
+fn adversarial_hidden_additional_acquisitions_are_rejected() {
+    for source in [
+        "use crate::daemon::client::OwnedDaemonSession as Session; async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; daemon.finish(result).await; let extra = Session::connect(mode).await?; }",
+        "type Session = OwnedDaemonSession; async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; daemon.finish(result).await; let extra = Session::connect(mode).await?; }",
+        "macro_rules! extra_owned { () => { OwnedDaemonSession::connect(mode).await } } async fn run() { let daemon = OwnedDaemonSession::connect(mode).await?; daemon.finish(result).await; let extra = extra_owned!()?; }",
+    ] {
+        assert!(!source_violations(source).is_empty(), "accepted: {source}");
     }
 }
 

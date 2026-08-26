@@ -128,7 +128,7 @@ impl OwnedDaemonGuard {
 }
 
 impl ConnectedDaemon {
-    pub fn take_owned_daemon_guard(
+    pub(crate) fn take_owned_daemon_guard(
         &mut self,
     ) -> Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard> {
         self.owned_daemon_guard.take()
@@ -143,6 +143,57 @@ impl ConnectedDaemon {
                     .take()
                     .map(OwnedDaemonGuard::InProcess)
             })
+    }
+}
+
+/// Foreground CLI connection whose ephemeral process ownership cannot be
+/// separated from its client. Construction arms signal cleanup before the
+/// value is published; [`finish`](Self::finish) joins that cleanup and
+/// combines it with the command result.
+pub struct OwnedDaemonSession {
+    client: DaemonClient,
+    guard: Option<crate::daemon::ephemeral_guard::EphemeralDaemonGuard>,
+    signal_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OwnedDaemonSession {
+    pub async fn connect(mode: LifecycleMode) -> Result<Self> {
+        let mut connected = probe_or_spawn(mode).await?;
+        let guard = connected.take_owned_daemon_guard();
+        let signal_task =
+            match crate::daemon::ephemeral_guard::spawn_signal_shutdown(guard.as_ref(), true) {
+                Ok(task) => task,
+                Err(error) => {
+                    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
+                    drop(guard);
+                    return crate::daemon::ephemeral_guard::aggregate_shutdown_result(
+                        Err::<Self, _>(error.context("arming owned-daemon signal cleanup")),
+                        shutdown,
+                    );
+                }
+            };
+        Ok(Self {
+            client: connected.client,
+            guard,
+            signal_task,
+        })
+    }
+
+    pub fn client(&self) -> &DaemonClient {
+        &self.client
+    }
+
+    pub async fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+        let signal_task = self.signal_task.take();
+        if let Some(task) = &signal_task {
+            task.abort();
+        }
+        let shutdown = self.guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
+        self.guard.take();
+        if let Some(task) = signal_task {
+            let _ = task.await;
+        }
+        crate::daemon::ephemeral_guard::aggregate_shutdown_result(result, shutdown)
     }
 }
 

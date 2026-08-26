@@ -4,8 +4,7 @@ use anyhow::{Context, Result};
 use uuid::Uuid;
 
 use crate::cli::{InvocationCancelArgs, InvocationCommand, InvocationStatusArgs, OutputFormat};
-use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::{aggregate_shutdown_result, spawn_signal_shutdown};
+use crate::daemon::client::{LifecycleMode, OwnedDaemonSession};
 use crate::daemon::proto::{self, Request, Response};
 
 pub async fn run(cmd: InvocationCommand) -> Result<()> {
@@ -19,86 +18,54 @@ async fn status(args: InvocationStatusArgs) -> Result<()> {
     let id = parse_canonical_uuid(&args.client_submission_id).map_err(|e| {
         exit_usage(2, &e);
     })?;
-    let mut daemon = connect()
+    let daemon = connect()
         .await
         .map_err(|e| exit_transport(4, &format!("{e:#}")))?;
-    let client = daemon.client.clone();
-    let guard = daemon.take_owned_daemon_guard();
-    let (signal_task, signal_registration_error) = match spawn_signal_shutdown(guard.as_ref(), true)
+    let result = match daemon
+        .client()
+        .request(Request::GetRunInvocationStatus {
+            client_submission_id: id,
+        })
+        .await
     {
-        Ok(task) => (task, None),
-        Err(error) => (None, Some(error)),
-    };
-    let result = if let Some(error) = signal_registration_error {
-        Err(error.context("arming owned-daemon signal cleanup"))
-    } else {
-        match client
-            .request(Request::GetRunInvocationStatus {
-                client_submission_id: id,
-            })
-            .await
-        {
-            Ok(Ok(Response::RunInvocationStatus { status })) => print_status(args.format, &status),
-            Ok(Ok(other)) => Err(InvocationCommandError::transport(format!(
-                "unexpected response: {other:?}"
-            ))
-            .into()),
-            Ok(Err(error)) => Err(map_daemon_error(&error).into()),
-            Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
+        Ok(Ok(Response::RunInvocationStatus { status })) => print_status(args.format, &status),
+        Ok(Ok(other)) => {
+            Err(InvocationCommandError::transport(format!("unexpected response: {other:?}")).into())
         }
+        Ok(Err(error)) => Err(map_daemon_error(&error).into()),
+        Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
     };
-    if let Some(task) = signal_task {
-        task.abort();
-    }
-    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
-    drop(guard);
-    finish_invocation_result(aggregate_shutdown_result(result, shutdown))
+    finish_invocation_result(daemon.finish(result).await)
 }
 
 async fn cancel(args: InvocationCancelArgs) -> Result<()> {
     let id = parse_canonical_uuid(&args.client_submission_id).map_err(|e| {
         exit_usage(2, &e);
     })?;
-    let mut daemon = connect()
+    let daemon = connect()
         .await
         .map_err(|e| exit_transport(4, &format!("{e:#}")))?;
-    let client = daemon.client.clone();
-    let guard = daemon.take_owned_daemon_guard();
-    let (signal_task, signal_registration_error) = match spawn_signal_shutdown(guard.as_ref(), true)
+    let result = match daemon
+        .client()
+        .request(Request::CancelRunInvocation {
+            client_submission_id: id,
+        })
+        .await
     {
-        Ok(task) => (task, None),
-        Err(error) => (None, Some(error)),
-    };
-    let result = if let Some(error) = signal_registration_error {
-        Err(error.context("arming owned-daemon signal cleanup"))
-    } else {
-        match client
-            .request(Request::CancelRunInvocation {
-                client_submission_id: id,
-            })
-            .await
-        {
-            Ok(Ok(Response::RunInvocationCancelResult { result })) => {
-                print_cancel(args.format, &result)
-            }
-            Ok(Ok(other)) => Err(InvocationCommandError::transport(format!(
-                "unexpected response: {other:?}"
-            ))
-            .into()),
-            Ok(Err(error)) => Err(map_daemon_error(&error).into()),
-            Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
+        Ok(Ok(Response::RunInvocationCancelResult { result })) => {
+            print_cancel(args.format, &result)
         }
+        Ok(Ok(other)) => {
+            Err(InvocationCommandError::transport(format!("unexpected response: {other:?}")).into())
+        }
+        Ok(Err(error)) => Err(map_daemon_error(&error).into()),
+        Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
     };
-    if let Some(task) = signal_task {
-        task.abort();
-    }
-    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
-    drop(guard);
-    finish_invocation_result(aggregate_shutdown_result(result, shutdown))
+    finish_invocation_result(daemon.finish(result).await)
 }
 
-async fn connect() -> Result<crate::daemon::client::ConnectedDaemon> {
-    probe_or_spawn(LifecycleMode::AttachOrEphemeral)
+async fn connect() -> Result<OwnedDaemonSession> {
+    OwnedDaemonSession::connect(LifecycleMode::AttachOrEphemeral)
         .await
         .context("connecting to daemon")
 }

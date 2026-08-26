@@ -8,8 +8,7 @@
 use anyhow::{Context, Result};
 
 use crate::cli::LearnArgs;
-use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::{aggregate_shutdown_result, spawn_signal_shutdown};
+use crate::daemon::client::{LifecycleMode, OwnedDaemonSession};
 pub use crate::skills::{build_learn_prompt, subject_from_parts};
 
 pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
@@ -20,36 +19,17 @@ pub async fn run(args: LearnArgs, no_sandbox: bool) -> Result<()> {
     } else {
         LifecycleMode::AttachOrEphemeral
     };
-    let mut daemon = probe_or_spawn(mode).await?;
-    let client = daemon.client.clone();
-    let guard = daemon.take_owned_daemon_guard();
-    let (signal_task, signal_registration_error) = match spawn_signal_shutdown(guard.as_ref(), true)
-    {
-        Ok(task) => (task, None),
-        Err(error) => (None, Some(error)),
-    };
-
-    let result = if let Some(error) = signal_registration_error {
-        Err(error.context("arming owned-daemon signal cleanup"))
-    } else {
-        eprintln!("Authoring a reusable skill from the supplied sources…");
-        crate::commands::run::attach_send_pump(
-            &client,
-            prompt,
-            no_sandbox,
-            crate::cli::OutputFormat::Default,
-            crate::commands::run::RunPumpOptions::default(),
-        )
-        .await
-    };
-
-    if let Some(task) = signal_task {
-        task.abort();
-    }
-    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
-    drop(guard);
-
-    let exit_code = aggregate_shutdown_result(result.context("running learn turn"), shutdown)?;
+    let daemon = OwnedDaemonSession::connect(mode).await?;
+    eprintln!("Authoring a reusable skill from the supplied sources…");
+    let result = crate::commands::run::attach_send_pump(
+        daemon.client(),
+        prompt,
+        no_sandbox,
+        crate::cli::OutputFormat::Default,
+        crate::commands::run::RunPumpOptions::default(),
+    )
+    .await;
+    let exit_code = daemon.finish(result.context("running learn turn")).await?;
     if exit_code != 0 {
         anyhow::bail!("`cockpit assistant learn` ran but the agent reported an error");
     }

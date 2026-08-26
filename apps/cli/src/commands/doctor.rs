@@ -26,8 +26,7 @@ pub struct DoctorChecksFailed;
 pub struct DoctorCouldNotRun(#[source] pub anyhow::Error);
 
 use crate::cli::DoctorArgs;
-use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::spawn_signal_shutdown;
+use crate::daemon::client::{LifecycleMode, OwnedDaemonSession};
 use crate::daemon::proto::{Request, Response};
 
 const DIAGNOSTIC_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -49,7 +48,7 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
         return dependencies_json(&args, no_sandbox).await;
     }
 
-    // `probe_or_spawn` attaches to a persistent daemon when one is available,
+    // The owned session attaches to a persistent daemon when one is available,
     // otherwise it starts an isolated ephemeral daemon. Only the latter can
     // need the one-shot worker: never replace a failure to contact a live
     // daemon with an unrelated local diagnostic.
@@ -74,53 +73,27 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
             })?;
         return finish_snapshot(worker.rendered, worker.has_failures);
     }
-    let mut daemon = match probe_or_spawn(LifecycleMode::AttachOrEphemeral).await {
+    let daemon = match OwnedDaemonSession::connect(LifecycleMode::AttachOrEphemeral).await {
         Ok(daemon) => daemon,
         Err(daemon_error) if ephemeral_boot_attempted => {
             return recover_ephemeral_database_boot_failure(&args, no_sandbox, daemon_error).await;
         }
         Err(daemon_error) => return Err(DoctorCouldNotRun(daemon_error).into()),
     };
-    // A diagnostic-only invocation must never auto-promote a persistent
-    // daemon. The guard owns only a daemon this command spawned, and reaps it
-    // on every return path after the socket RPC has been attempted.
-    let guard = daemon.take_owned_daemon_guard();
-    let (signal_task, signal_registration_error) = match spawn_signal_shutdown(guard.as_ref(), true)
-    {
-        Ok(task) => (task, None),
-        Err(error) => (None, Some(error)),
-    };
-    let response = if let Some(error) = signal_registration_error {
-        Err(DoctorCouldNotRun(
-            error.context("arming diagnostic-daemon signal cleanup"),
-        ))
-    } else {
-        daemon
-            .client
-            .request(build_doctor_request(&args, no_sandbox))
-            .await
-            .map_err(DoctorCouldNotRun)
-            .and_then(|response| {
-                response.map_err(|error| {
-                    DoctorCouldNotRun(anyhow::anyhow!("daemon rejected doctor snapshot: {error}"))
-                })
+    let response = daemon
+        .client()
+        .request(build_doctor_request(&args, no_sandbox))
+        .await
+        .map_err(DoctorCouldNotRun)
+        .and_then(|response| {
+            response.map_err(|error| {
+                DoctorCouldNotRun(anyhow::anyhow!("daemon rejected doctor snapshot: {error}"))
             })
-    };
-    if let Some(task) = signal_task {
-        task.abort();
-    }
-    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
-    drop(guard);
-    let response = match (response, shutdown) {
-        (Ok(response), Ok(())) => Ok(response),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(shutdown)) => Err(DoctorCouldNotRun(
-            shutdown.context("shutting down diagnostic daemon"),
-        )),
-        (Err(command), Err(shutdown)) => Err(DoctorCouldNotRun(anyhow::anyhow!(
-            "{command:#}; diagnostic daemon shutdown also failed: {shutdown:#}"
-        ))),
-    };
+        });
+    let response = daemon
+        .finish(response.map_err(|error| anyhow::anyhow!("{error:#}")))
+        .await
+        .map_err(DoctorCouldNotRun);
     let Response::DoctorSnapshot {
         rendered,
         has_failures,

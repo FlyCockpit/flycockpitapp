@@ -13,12 +13,12 @@
 //!
 //! 1. Resolve project root (cwd or `--project`).
 //! 2. Build the prompt (argv + stdin).
-//! 3. probe_or_spawn the daemon, attach a new session.
+//! 3. acquire an owned daemon session, attach a new session.
 //! 4. Send the prompt and pump events until `TurnComplete`.
 //! 5. In `default` format we stream assistant text to stdout; in
 //!    `json` format we emit one envelope per line.
 //! 6. If we own the daemon (ephemeral path), shut it down. An
-//!    [`EphemeralDaemonGuard`] (Layer A) guarantees this fires on every
+//!    The owned-session RAII fallback (Layer A) guarantees this fires on every
 //!    exit — happy path, early `?` error, panic/unwind, or
 //!    SIGINT/SIGTERM — never on a run that attached to a pre-existing
 //!    persistent daemon.
@@ -32,8 +32,8 @@ use uuid::Uuid;
 
 use crate::approval::store::GrantKind;
 use crate::cli::{OutputFormat, RunArgs};
-use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::{aggregate_shutdown_result, spawn_signal_shutdown};
+use crate::daemon::client::{LifecycleMode, OwnedDaemonSession};
+use crate::daemon::ephemeral_guard::aggregate_shutdown_result;
 use crate::daemon::proto::{self, Request, Response};
 
 #[derive(Debug, thiserror::Error)]
@@ -238,67 +238,39 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
         LifecycleMode::AttachOrEphemeral
     };
 
-    let mut daemon = match probe_or_spawn(mode).await {
+    let daemon = match OwnedDaemonSession::connect(mode).await {
         Ok(daemon) => daemon,
         Err(error) => exit_run_error(format, 4, "daemon_connection", &format!("{error:#}")),
     };
-    let client = daemon.client.clone();
-
-    // Ownership and signal cleanup must be armed before the first daemon RPC
-    // or fallible preflight after spawn. From this point to the single
-    // teardown boundary below, no path may call `process::exit`.
-    let guard = daemon.take_owned_daemon_guard();
-    let (signal_task, signal_registration_error) = match spawn_signal_shutdown(guard.as_ref(), true)
-    {
-        Ok(task) => (task, None),
-        Err(error) => (None, Some(error)),
-    };
-
-    let result = if let Some(error) = signal_registration_error {
-        Err(error.context("arming owned-daemon signal cleanup"))
-    } else {
-        async {
-            // Preflight via daemon RPCs — the CLI never opens SQLite.
-            emit_org_logging_indicator_via_daemon(&client, &cwd).await;
-            enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd)
-                .await
-                .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
-            let requested_session = resolve_requested_session_via_daemon(&args, &client, &cwd)
-                .await
-                .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
-            let image_files = resolve_attachment_paths(&cwd, &args.file)
-                .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
-            let image_data = load_and_validate_images(&image_files).map_err(|error| {
-                RunPreflightFailure::new(2, "invalid_attachment", format!("{error:#}"))
-            })?;
-
-            run_turn(
-                &client,
-                &args,
-                prompt,
-                no_sandbox,
-                &cwd,
-                requested_session,
-                &image_data,
-            )
+    let client = daemon.client().clone();
+    let result = async {
+        // Preflight via daemon RPCs — the CLI never opens SQLite.
+        emit_org_logging_indicator_via_daemon(&client, &cwd).await;
+        enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd)
             .await
-        }
-        .await
-    };
+            .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
+        let requested_session = resolve_requested_session_via_daemon(&args, &client, &cwd)
+            .await
+            .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+        let image_files = resolve_attachment_paths(&cwd, &args.file)
+            .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+        let image_data = load_and_validate_images(&image_files).map_err(|error| {
+            RunPreflightFailure::new(2, "invalid_attachment", format!("{error:#}"))
+        })?;
 
-    // Stop the signal watcher and run the (now happy-path) shutdown
-    // before deciding the exit code, so the daemon is gone whether the
-    // turn succeeded or errored.
-    if let Some(task) = signal_task {
-        task.abort();
+        run_turn(
+            &client,
+            &args,
+            prompt,
+            no_sandbox,
+            &cwd,
+            requested_session,
+            &image_data,
+        )
+        .await
     }
-    let result = finish_owned_run(result, || {
-        guard.as_ref().map_or(Ok(()), |guard| guard.shutdown())
-    });
-    // Drop the guard before rendering or selecting an exit path. A signal
-    // task already inside blocking cleanup is not cancelled by abort; this
-    // explicit shutdown joins the same shared completion.
-    drop(guard);
+    .await;
+    let result = daemon.finish(result).await;
 
     let exit_code = match result {
         Ok(code) => code,

@@ -7,8 +7,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::cli::{OutputFormat, SessionAnswerArgs, SessionCommand, SessionListArgs};
-use crate::daemon::client::{LifecycleMode, ensure_persistent_daemon, probe_or_spawn};
-use crate::daemon::ephemeral_guard::{aggregate_shutdown_result, spawn_signal_shutdown};
+use crate::daemon::client::{LifecycleMode, OwnedDaemonSession, ensure_persistent_daemon};
 use crate::daemon::proto::{Request, ResolveResponse, Response};
 
 pub async fn run(cmd: SessionCommand) -> Result<()> {
@@ -284,85 +283,71 @@ async fn answer_inner(args: &SessionAnswerArgs) -> Result<()> {
     let interrupt_id = Uuid::parse_str(&args.interrupt).context("parsing --interrupt")?;
     let response = response_from_args(args)?;
 
-    let mut daemon = probe_or_spawn(LifecycleMode::AttachOrEphemeral).await?;
-    let client = daemon.client.clone();
-    let guard = daemon.take_owned_daemon_guard();
-    let (signal_task, signal_registration_error) = match spawn_signal_shutdown(guard.as_ref(), true)
-    {
-        Ok(task) => (task, None),
-        Err(error) => (None, Some(error)),
-    };
-    let result = if let Some(error) = signal_registration_error {
-        Err(error.context("arming owned-daemon signal cleanup"))
-    } else {
-        async {
-            let env_snapshot = crate::env_snapshot::EnvSnapshot::from_process(
-                crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
-            );
-            let attached = client
-                .request_ok(Request::Attach {
-                    session_id: Some(session_id),
-                    since_seq: None,
-                    project_root: Some(std::env::current_dir()?.to_string_lossy().into_owned()),
-                    initial_model: None,
-                    no_sandbox: false,
-                    interactive: false,
-                    model_override: None,
-                    client_protocol_version: client.negotiated().version,
-                    env_snapshot: Some(env_snapshot.to_wire()),
-                    env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
-                })
-                .await?;
-            match attached {
-                Response::Attached { session_id: id, .. } if id == session_id => {}
-                other => bail!("unexpected attach response: {other:?}"),
-            }
-            client
-                .request_ok(Request::ResolveInterrupt {
-                    interrupt_id,
-                    response,
-                })
-                .await
-                .context("resolving interrupt")?;
-
-            if args.json {
-                emit_json(&json!({
-                    "event": "interrupt_resolved",
-                    "session_id": session_id,
-                    "interrupt_id": interrupt_id,
-                    "status": "resolved"
-                }))?;
-            } else {
-                println!("interrupt {interrupt_id} resolved");
-            }
-
-            if args.follow {
-                let format = if args.json {
-                    OutputFormat::Json
-                } else {
-                    OutputFormat::Default
-                };
-                crate::commands::run::pump_events(
-                    &client,
-                    session_id,
-                    format,
-                    args.json,
-                    &[],
-                    false,
-                    None,
-                )
-                .await?;
-            }
-            Ok(())
+    let daemon = OwnedDaemonSession::connect(LifecycleMode::AttachOrEphemeral).await?;
+    let result = async {
+        let env_snapshot = crate::env_snapshot::EnvSnapshot::from_process(
+            crate::env_snapshot::EnvSnapshotSource::ExplicitCli,
+        );
+        let attached = daemon
+            .client()
+            .request_ok(Request::Attach {
+                session_id: Some(session_id),
+                since_seq: None,
+                project_root: Some(std::env::current_dir()?.to_string_lossy().into_owned()),
+                initial_model: None,
+                no_sandbox: false,
+                interactive: false,
+                model_override: None,
+                client_protocol_version: daemon.client().negotiated().version,
+                env_snapshot: Some(env_snapshot.to_wire()),
+                env_policy: crate::env_snapshot::EnvDriftPolicy::Daemon,
+            })
+            .await?;
+        match attached {
+            Response::Attached { session_id: id, .. } if id == session_id => {}
+            other => bail!("unexpected attach response: {other:?}"),
         }
-        .await
-    };
-    if let Some(task) = signal_task {
-        task.abort();
+        daemon
+            .client()
+            .request_ok(Request::ResolveInterrupt {
+                interrupt_id,
+                response,
+            })
+            .await
+            .context("resolving interrupt")?;
+
+        if args.json {
+            emit_json(&json!({
+                "event": "interrupt_resolved",
+                "session_id": session_id,
+                "interrupt_id": interrupt_id,
+                "status": "resolved"
+            }))?;
+        } else {
+            println!("interrupt {interrupt_id} resolved");
+        }
+
+        if args.follow {
+            let format = if args.json {
+                OutputFormat::Json
+            } else {
+                OutputFormat::Default
+            };
+            crate::commands::run::pump_events(
+                daemon.client(),
+                session_id,
+                format,
+                args.json,
+                &[],
+                false,
+                None,
+            )
+            .await?;
+        }
+        Ok(())
     }
-    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
-    drop(guard);
-    aggregate_shutdown_result(result, shutdown)
+    .await;
+    daemon.finish(result).await
 }
 
 #[cfg(test)]

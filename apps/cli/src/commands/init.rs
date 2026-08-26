@@ -18,8 +18,7 @@ use anyhow::{Context, Result};
 use cockpit_core::init::{InitMode, build_init_prompt, display_target, resolve_target};
 
 use crate::cli::InitArgs;
-use crate::daemon::client::{LifecycleMode, probe_or_spawn};
-use crate::daemon::ephemeral_guard::{aggregate_shutdown_result, spawn_signal_shutdown};
+use crate::daemon::client::{LifecycleMode, OwnedDaemonSession};
 
 /// `cockpit init [path]` — headless. Resolves the target, refuses to
 /// clobber an existing file unless `--force` (no interactive prompt in
@@ -58,37 +57,17 @@ pub async fn run(args: InitArgs, no_sandbox: bool) -> Result<()> {
     } else {
         LifecycleMode::AttachOrEphemeral
     };
-    let mut daemon = probe_or_spawn(mode_lc).await?;
-    let client = daemon.client.clone();
-
-    let guard = daemon.take_owned_daemon_guard();
-    let (signal_task, signal_registration_error) = match spawn_signal_shutdown(guard.as_ref(), true)
-    {
-        Ok(task) => (task, None),
-        Err(error) => (None, Some(error)),
-    };
-
-    let result = if let Some(error) = signal_registration_error {
-        Err(error.context("arming owned-daemon signal cleanup"))
-    } else {
-        eprintln!("Exploring the project and writing `{shown}`…");
-        crate::commands::run::attach_send_pump(
-            &client,
-            prompt,
-            no_sandbox,
-            crate::cli::OutputFormat::Default,
-            crate::commands::run::RunPumpOptions::default(),
-        )
-        .await
-    };
-
-    if let Some(task) = signal_task {
-        task.abort();
-    }
-    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
-    drop(guard);
-
-    let exit_code = aggregate_shutdown_result(result, shutdown)?;
+    let daemon = OwnedDaemonSession::connect(mode_lc).await?;
+    eprintln!("Exploring the project and writing `{shown}`…");
+    let result = crate::commands::run::attach_send_pump(
+        daemon.client(),
+        prompt,
+        no_sandbox,
+        crate::cli::OutputFormat::Default,
+        crate::commands::run::RunPumpOptions::default(),
+    )
+    .await;
+    let exit_code = daemon.finish(result).await?;
     if exit_code != 0 {
         anyhow::bail!("`cockpit init` ran but the agent reported an error");
     }

@@ -44,7 +44,7 @@ pub async fn run(args: ConnectArgs) -> Result<()> {
 
     match args.command.unwrap_or(ConnectCommand::Status) {
         ConnectCommand::On => {
-            set_connector_enabled(&daemon, true).await?;
+            set_connector_enabled(&daemon.client, true).await?;
             println!(
                 "Remote access enabled for instance {} on {}.",
                 account.instance_id, account.server_url
@@ -52,14 +52,14 @@ pub async fn run(args: ConnectArgs) -> Result<()> {
             println!("The daemon will connect outbound to the relay while it is running.");
         }
         ConnectCommand::Off => {
-            set_connector_enabled(&daemon, false).await?;
+            set_connector_enabled(&daemon.client, false).await?;
             println!(
                 "Remote access disabled for instance {} on {}.",
                 account.instance_id, account.server_url
             );
         }
         ConnectCommand::Status => {
-            let state = connector_state(&daemon).await?;
+            let state = connector_state(&daemon.client).await?;
             print!(
                 "{}",
                 format_status(&account.server_url, &account.instance_id, state.as_ref())
@@ -69,12 +69,8 @@ pub async fn run(args: ConnectArgs) -> Result<()> {
     Ok(())
 }
 
-async fn set_connector_enabled(
-    daemon: &crate::daemon::client::ConnectedDaemon,
-    enabled: bool,
-) -> Result<()> {
-    match daemon
-        .client
+async fn set_connector_enabled(client: &cockpit_client::DaemonClient, enabled: bool) -> Result<()> {
+    match client
         .request(Request::SetFlycockpitConnectorEnabled { enabled })
         .await
         .context("requesting FlyCockpit connector update from daemon")?
@@ -88,10 +84,9 @@ async fn set_connector_enabled(
 }
 
 async fn connector_state(
-    daemon: &crate::daemon::client::ConnectedDaemon,
+    client: &cockpit_client::DaemonClient,
 ) -> Result<Option<ConnectorStateView>> {
-    let Response::ConnectorState { connector_json } = daemon
-        .client
+    let Response::ConnectorState { connector_json } = client
         .request(Request::GetConnectorState)
         .await
         .context("requesting FlyCockpit connector state from daemon")?

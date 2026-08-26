@@ -505,6 +505,19 @@ fn trusted_test_policy(root: &std::path::Path) -> crate::config::trust::Workspac
     }
 }
 
+/// Every real worker carries the attach-time directory capability that owns
+/// configuration refreshes. Keep direct worker tests on that same construction
+/// path instead of letting a test omit the authority that production requires.
+fn test_workspace_root_authority(
+    root: &std::path::Path,
+    policy: &crate::config::trust::WorkspaceTrustPolicy,
+) -> Arc<crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority> {
+    Arc::new(
+        crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority::capture(root, policy)
+            .expect("capture test worker workspace authority"),
+    )
+}
+
 #[derive(Clone)]
 struct CaptureWriter(Arc<StdMutex<Vec<u8>>>);
 
@@ -783,6 +796,7 @@ fn live_worker_persistent_terminal_failure_holds_fifo_and_shuts_down() {
             None,
             None,
             tmp.path().to_path_buf(),
+            test_workspace_root_authority(tmp.path(), &trusted_test_policy(tmp.path())),
             false,
             false,
             &extended,
@@ -1111,6 +1125,7 @@ fn send_user_message_remote_path_commits_ledger_and_rejects_phase_one_fcm2_confl
             None,
             None,
             tmp.path().to_path_buf(),
+            test_workspace_root_authority(tmp.path(), &trusted_test_policy(tmp.path())),
             false,
             false,
             &extended,
@@ -1414,6 +1429,7 @@ fn oversized_remote_ledger_rejection_terminalizes_its_exact_bound_run() {
             None,
             None,
             tmp.path().to_path_buf(),
+            test_workspace_root_authority(tmp.path(), &trusted_test_policy(tmp.path())),
             false,
             false,
             &extended,
@@ -2348,6 +2364,7 @@ async fn absent_scheduler_is_not_an_error() {
         None,
         None,
         tmp.path().to_path_buf(),
+        test_workspace_root_authority(tmp.path(), &trust_policy),
         false,
         false,
         &extended,
@@ -2445,6 +2462,7 @@ async fn worker_driver_respects_attached_ignore_config_policy() {
         None,
         None,
         project.clone(),
+        test_workspace_root_authority(&project, &attached_policy),
         false,
         false,
         &extended,
@@ -2616,6 +2634,7 @@ async fn resumed_worker_rederives_disk_redaction_markers_and_warns_when_source_d
             None,
             None,
             tmp.path().to_path_buf(),
+            test_workspace_root_authority(tmp.path(), &trust_policy),
             false,
             false,
             &extended,
@@ -4316,6 +4335,47 @@ async fn replace_config_snapshot_changed_values_bump_generation() {
     );
     assert!(result.changed);
     assert_eq!(result.generation, 1);
+}
+
+#[tokio::test]
+async fn stale_config_refresh_cannot_publish_over_newer_mutation_snapshot() {
+    let snapshot = Arc::new(RwLock::new(snapshot_for_tests()));
+    // This models a direct mutation publishing N while a watcher still owns
+    // the parsed snapshot it captured at generation zero.
+    let mutation = replace_config_snapshot(
+        &snapshot,
+        SessionConfigSnapshot::new(
+            0,
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        ),
+    );
+    assert_eq!(mutation.generation, 1);
+    let old_capture = snapshot_for_tests();
+    let stale = replace_config_snapshot_if_current(&snapshot, old_capture, Some(0), None);
+    assert!(stale.stale);
+    assert!(!stale.changed);
+    assert_eq!(stale.generation, 1);
+    assert_eq!(snapshot.read().unwrap().generation, 1);
+}
+
+#[tokio::test]
+async fn trust_transition_tag_rejects_an_older_generation_matched_refresh() {
+    let snapshot = Arc::new(RwLock::new(snapshot_for_tests().with_trust_revision(7)));
+    let stale = replace_config_snapshot_if_current(
+        &snapshot,
+        SessionConfigSnapshot::new(
+            0,
+            crate::config::providers::ProvidersConfig::default(),
+            crate::config::extended::ExtendedConfig::default(),
+        )
+        .with_trust_revision(7),
+        Some(0),
+        Some(6),
+    );
+    assert!(stale.stale);
+    assert!(!stale.changed);
+    assert_eq!(snapshot.read().unwrap().trust_revision, 7);
 }
 
 #[tokio::test]

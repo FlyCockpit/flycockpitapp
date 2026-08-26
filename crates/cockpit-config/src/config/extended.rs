@@ -1877,6 +1877,85 @@ pub struct DaemonExtendedConfigLoad {
     pub participating_layers: Vec<PathBuf>,
 }
 
+/// Resolve trusted ambient layers plus an already-captured workspace layer.
+/// The caller must run this under an `IgnoreConfig` workspace trust policy so
+/// `cwd` discovery contributes only ambient/home/machine layers; the supplied
+/// snapshot is then the sole project-layer input.  This separation prevents a
+/// parser from reopening the mutable workspace pathname after attachment.
+pub fn load_for_cwd_for_daemon_contract_with_workspace_layer(
+    cwd: &Path,
+    workspace: &crate::config::WorkspaceConfigLayerSnapshotChain,
+) -> Result<DaemonExtendedConfigLoad> {
+    LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
+    // A complete retained chain (the explicit override is the one-layer
+    // case) is already the entire effective config. Its acquisition is
+    // capability-bound in the daemon, so ambient path discovery must not add
+    // home/machine layers beside it. An empty (ignore-config) chain keeps the
+    // historical ambient explicit behavior.
+    let paths = if workspace.exclusive {
+        Vec::new()
+    } else {
+        config_file_paths_for_load(cwd)
+    };
+    let (ambient_providers, captured) =
+        crate::config::providers::ConfigDoc::try_load_effective_with_layer_snapshot(&paths)?;
+    let mut merged_providers = serde_json::to_value(ambient_providers)
+        .context("serializing ambient provider configuration")?;
+    for layer in &workspace.layers {
+        let workspace_providers =
+            crate::config::providers::ConfigDoc::providers_from_workspace_layer_snapshot(layer)?;
+        let workspace_provider_value = serde_json::to_value(workspace_providers)
+            .context("serializing retained workspace provider configuration")?;
+        deep_merge_value(&mut merged_providers, &workspace_provider_value);
+    }
+    let providers = serde_json::from_value(merged_providers)
+        .context("projecting retained workspace provider configuration")?;
+
+    let mut docs: Vec<_> = captured
+        .into_iter()
+        .map(|(path, raw)| ExtendedConfigDoc {
+            path,
+            raw,
+            origin: ConfigLayerOrigin::LocalTrusted,
+        })
+        .collect();
+    for layer in &workspace.layers {
+        docs.push(extended_doc_from_workspace_snapshot(layer)?);
+    }
+    let mut validation = Ok(());
+    for doc in &docs {
+        if let Some(value) = doc.raw_field("response_metrics_tokenizer")
+            && let Err(source) = serde_json::from_value::<TiktokenEncoding>(value.clone())
+            && validation.is_ok()
+        {
+            validation = Err(InvalidResponseMetricsTokenizer {
+                path: doc.path.clone(),
+                source,
+            });
+        }
+    }
+    let participating_layers = docs.iter().map(|doc| doc.path.clone()).collect();
+    Ok(DaemonExtendedConfigLoad {
+        providers,
+        config: resolve_loaded_docs(&docs),
+        response_metrics_tokenizer_validation: validation,
+        participating_layers,
+    })
+}
+
+fn extended_doc_from_workspace_snapshot(
+    workspace: &crate::config::WorkspaceConfigLayerSnapshot,
+) -> Result<ExtendedConfigDoc> {
+    let raw = parse_config_root_object(workspace.config_json.as_deref().unwrap_or(b"{}"))?;
+    Ok(ExtendedConfigDoc {
+        // Never expose the attachment path in diagnostics or wire data. The
+        // source label identifies provenance without becoming filesystem data.
+        path: PathBuf::from("<attached workspace config>"),
+        raw,
+        origin: ConfigLayerOrigin::LocalTrusted,
+    })
+}
+
 pub fn load_for_cwd_for_daemon_contract(cwd: &Path) -> Result<DaemonExtendedConfigLoad> {
     LOAD_FOR_CWD_CALLS.with(|calls| calls.set(calls.get() + 1));
     let paths = config_file_paths_for_load(cwd);

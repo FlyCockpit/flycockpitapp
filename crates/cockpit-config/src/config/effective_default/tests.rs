@@ -26,6 +26,29 @@ fn selection(provider: &str, model: &str) -> ActiveModelRef {
     }
 }
 
+fn test_default_update_authority(generation: u64) -> DefaultUpdateAuthorityBinding {
+    DefaultUpdateAuthorityBinding::new(
+        "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
+            .to_string(),
+        generation,
+    )
+    .unwrap()
+}
+
+fn test_retained_receipt_proof(
+    default_update_id: Uuid,
+    session_id: Uuid,
+    generation: u64,
+) -> RetainedDefaultReceiptProof {
+    RetainedDefaultReceiptProof::new(
+        default_update_id,
+        session_id,
+        test_default_update_authority(generation),
+        r#"{"type":"applied"}"#,
+    )
+    .unwrap()
+}
+
 /// A fully specified reference: the verified default must match every field,
 /// including reasoning effort and thinking mode.
 fn rich_selection(provider: &str, model: &str) -> ActiveModelRef {
@@ -166,6 +189,61 @@ fn fresh_session_resolution(cwd: &Path) -> Option<ActiveModelRef> {
 
 fn journal_and_backup_are_gone(config_path: &Path) -> bool {
     !journal_path_for_config(config_path).exists() && !backup_path_for_config(config_path).exists()
+}
+
+/// A deliberately small filesystem spy for recovery-boundary tests. The
+/// retained path is allowed to have created its own journal/backup/lock before
+/// ambient recovery starts; the ambient classifier must not add or remove any
+/// sibling artifact after seeing the retained correlation.
+fn sidecar_entries(dir: &Path) -> Vec<std::ffi::OsString> {
+    let mut entries = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
+/// Build one capability-bound config-only target with a concrete old and new
+/// default. Tests that mutate journal metadata use this rather than a
+/// pathname-based recovery helper so they exercise the same retained backend
+/// as the daemon.
+fn retained_config_only_target(
+    tmp: &TempDir,
+) -> (
+    RetainedEffectiveDefaultTarget,
+    PathBuf,
+    ActiveModelRef,
+    ActiveModelRef,
+) {
+    let config_dir = tmp.path().join("retained-config");
+    let project_root = tmp.path().join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let prior = selection("old", "a");
+    let requested = selection("new", "b");
+    write_layer(
+        &config_dir,
+        Some(&prior),
+        &[("old", "a"), ("new", "b")],
+    );
+    let config_path = config_dir.join("config.json");
+    let target = RetainedEffectiveDefaultTarget::new(
+        std::fs::File::open(&config_dir).unwrap(),
+        std::ffi::OsString::from("config.json"),
+        journal_path_for_config(&config_path)
+            .file_name()
+            .unwrap()
+            .to_os_string(),
+        backup_path_for_config(&config_path)
+            .file_name()
+            .unwrap()
+            .to_os_string(),
+        config_path.canonicalize().unwrap(),
+        project_root.canonicalize().unwrap(),
+        EffectiveDefaultScope::Project,
+    )
+    .unwrap();
+    (target, config_path, prior, requested)
 }
 
 // ---- AC2: layer matrix + fresh-session resolution --------------------------
@@ -708,6 +786,822 @@ const ALL_CRASH_POINTS: &[EffectiveDefaultCrashPoint] = &[
     EffectiveDefaultCrashPoint::AfterJournalCleanup,
     EffectiveDefaultCrashPoint::AfterCompensatingMarker,
 ];
+
+/// The retained-directory backend has the same durable recovery contract as
+/// the ambient writer, but must recover through its held directory instead of
+/// finding a newly selected `COCKPIT_CONFIG` path. Exercise both sides of the
+/// commit boundary with a correlated receipt: prepared restores the old
+/// value, while committed completes the new one, and neither journal can be
+/// deleted before the sink accepts that receipt.
+#[test]
+fn retained_config_only_recovery_matches_prepared_and_committed_journal_contract() {
+    for (point, expect_target) in [
+        (EffectiveDefaultCrashPoint::AfterJournalPrepared, false),
+        (EffectiveDefaultCrashPoint::AfterCommittedMarker, true),
+        (
+            EffectiveDefaultCrashPoint::AfterRetainedCommitBeforeRefresh,
+            true,
+        ),
+        (
+            EffectiveDefaultCrashPoint::AfterRetainedRefreshBeforeReceipt,
+            true,
+        ),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("retained-config");
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let prior = selection("old", "a");
+        let target_selection = selection("new", "b");
+        write_layer(
+            &config_dir,
+            Some(&prior),
+            &[("old", "a"), ("new", "b")],
+        );
+        let config_path = config_dir.join("config.json");
+        let target = RetainedEffectiveDefaultTarget::new(
+            std::fs::File::open(&config_dir).unwrap(),
+            std::ffi::OsString::from("config.json"),
+            journal_path_for_config(&config_path)
+                .file_name()
+                .unwrap()
+                .to_os_string(),
+            backup_path_for_config(&config_path)
+                .file_name()
+                .unwrap()
+                .to_os_string(),
+            config_path.canonicalize().unwrap(),
+            project_root.canonicalize().unwrap(),
+            EffectiveDefaultScope::Project,
+        )
+        .unwrap();
+        let update_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+
+        set_crash_inject(Some(point));
+        let result = mutate_effective_default_retained(
+            &target,
+            Some(&target_selection),
+            Some(target_selection.clone()),
+            TransactionCorrelation::RetainedDefaultUpdate {
+                default_update_id: update_id,
+                session_id,
+                authority: None,
+            },
+        );
+        if point == EffectiveDefaultCrashPoint::AfterRetainedRefreshBeforeReceipt {
+            result.expect("the config commit reaches the refresh handoff");
+            assert!(
+                retained_default_after_refresh_before_terminal_receipt("project").is_err(),
+                "{point:?} simulates an abrupt stop after refresh but before the durable receipt"
+            );
+        } else {
+            assert!(result.is_err(), "{point:?} simulates an abrupt stop");
+        }
+        set_crash_inject(None);
+
+        let recovery = recover_retained_effective_default_journal(&target)
+            .expect("retained recovery converges the journal");
+        let (recovered, mut finalization, receipt_validation) = recovery.into_parts();
+        assert!(receipt_validation.is_none());
+        assert_eq!(recovered.len(), 1);
+        match (&recovered[0].outcome, expect_target) {
+            (RecoveredOutcome::Applied { selection, .. }, true) => {
+                assert_eq!(selection.as_ref(), Some(&target_selection));
+            }
+            (RecoveredOutcome::Restored { restored, .. }, false) => {
+                assert_eq!(restored.as_ref(), Some(&prior));
+            }
+            (outcome, _) => panic!("unexpected retained recovery outcome: {outcome:?}"),
+        }
+        assert_eq!(
+            ConfigDoc::providers_from_paths(&[config_path.clone()]).active_model,
+            if expect_target {
+                Some(target_selection)
+            } else {
+                Some(prior)
+            },
+        );
+        let mut finalization = finalization
+            .expect("correlated recovery retains a terminal finalizer");
+        finalization
+            .bind_default_update_authority(test_default_update_authority(1))
+            .expect("recovery seals its authority before terminal receipt");
+        finalization
+            .finalize_after_terminal_receipt(&test_retained_receipt_proof(
+                update_id, session_id, 1,
+            ))
+            .expect("receipt finalization removes retained artifacts");
+        assert!(journal_and_backup_are_gone(&config_path));
+        assert!(
+            recover_retained_effective_default_journal(&target)
+                .expect("retained recovery is idempotent")
+                .into_parts()
+                .0
+                .is_empty()
+        );
+    }
+}
+
+/// A retained correlation is an explicit capability boundary, not merely a
+/// conventional config journal. Startup/path recovery may see the same leaf
+/// through a replacement `COCKPIT_CONFIG` spelling; it must leave the journal
+/// and its terminal delivery untouched until an attached worker presents the
+/// exact retained target.
+#[test]
+fn ambient_recovery_never_converges_or_delivers_a_retained_default_journal() {
+    let tmp = TempDir::new().unwrap();
+    let (target, config_path, _prior, requested) = retained_config_only_target(&tmp);
+    let update_id = Uuid::new_v4();
+    set_crash_inject(Some(EffectiveDefaultCrashPoint::AfterCommittedMarker));
+    assert!(
+        mutate_effective_default_retained(
+            &target,
+            Some(&requested),
+            Some(requested),
+            TransactionCorrelation::RetainedDefaultUpdate {
+                default_update_id: update_id,
+                session_id: Uuid::new_v4(),
+                authority: None,
+            },
+        )
+        .is_err(),
+        "crash leaves the durable retained handoff pending"
+    );
+    set_crash_inject(None);
+
+    let sidecars_before = sidecar_entries(config_path.parent().unwrap());
+
+    reset_ambient_recovery_operation_counts_for_tests();
+    let mut delivered = Vec::new();
+    let mut sink = |transaction: &RecoveredTransaction| {
+        delivered.push(transaction.clone());
+        Ok(())
+    };
+    let ambient = recover_effective_default_journal(
+        &config_path,
+        JournalRecovery::with_sink(&mut sink),
+    )
+    .expect("ambient recovery declines retained work rather than failing startup");
+    assert!(ambient.is_empty());
+    assert!(delivered.is_empty(), "ambient recovery must not emit a receipt");
+    assert!(
+        journal_path_for_config(&config_path).exists(),
+        "only retained worker recovery may retire the private journal"
+    );
+    assert_eq!(
+        sidecar_entries(config_path.parent().unwrap()),
+        sidecars_before,
+        "ambient retained classification must not create a lock/temporary sidecar or touch the retained backup"
+    );
+    assert_eq!(
+        ambient_recovery_operation_counts_for_tests(),
+        AmbientRecoveryOperationCounts::default(),
+        "a preexisting retained journal must return before target canonicalization or ambient lock acquisition"
+    );
+
+    // Both public entry points and the orphan-sweep helper share the same
+    // fence. Exercise all three even though the deterministic retained write
+    // already created the lock leaf before this probe begins.
+    reset_ambient_recovery_operation_counts_for_tests();
+    recover_layer_journals(
+        std::slice::from_ref(&config_path),
+        JournalRecovery::read_only(),
+    )
+    .expect("public layer recovery also declines retained work");
+    assert_eq!(
+        ambient_recovery_operation_counts_for_tests(),
+        AmbientRecoveryOperationCounts::default(),
+        "public layer recovery must not derive the retained target lock"
+    );
+    reset_ambient_recovery_operation_counts_for_tests();
+    sweep_orphans(&config_path);
+    assert_eq!(
+        ambient_recovery_operation_counts_for_tests(),
+        AmbientRecoveryOperationCounts::default(),
+        "orphan sweeping must not acquire a path lock beside a retained journal"
+    );
+
+    let recovered = recover_retained_effective_default_journal(&target)
+        .expect("the held target can recover the same journal");
+    assert_eq!(recovered.into_parts().0.len(), 1);
+}
+
+/// Ambient recovery first observes an ordinary journal, then the containing
+/// directory is replaced with a retained one before it can derive/open the
+/// ambient lock. The captured-handle bounded reread recognizes the new
+/// correlation *before* lock acquisition and leaves its private artifacts
+/// intact; it must never recover or lock B using facts read from A.
+#[test]
+fn ambient_recovery_reclassifies_a_replaced_journal_before_touching_retained_sidecars() {
+    let tmp = TempDir::new().unwrap();
+    let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    crate::config::trust::clear_runtime_policy_for_tests();
+    reset_recovery_backoff_for_tests();
+
+    let live_dir = tmp.path().join("live");
+    let live_config = live_dir.join("config.json");
+    let prior = selection("old", "a");
+    let replacement = selection("new", "b");
+    write_layer(&live_dir, Some(&prior), &[("old", "a"), ("new", "b")]);
+    env.set_cockpit_config(&live_config);
+    let cwd = tmp.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // A is a normal path-owned transaction, deliberately stopped after its
+    // config replacement so the first classifier has a non-retained record.
+    set_crash_inject(Some(EffectiveDefaultCrashPoint::AfterConfigReplaced));
+    assert!(
+        mutate_effective_default(
+            &cwd,
+            Some(&replacement),
+            ActiveModelWriteMode::Replace,
+            None,
+            None,
+            None,
+        )
+        .is_err()
+    );
+    set_crash_inject(None);
+    assert!(journal_path_for_config(&live_config).exists());
+
+    // Construct B through a retained handle, while naming its transaction
+    // artifacts for the final `live/config.json` spelling. Its handle remains
+    // B's capability even after the pathname swap below.
+    let replacement_dir = tmp.path().join("replacement");
+    let replacement_root = tmp.path().join("replacement-project");
+    std::fs::create_dir_all(&replacement_root).unwrap();
+    write_layer(
+        &replacement_dir,
+        Some(&prior),
+        &[("old", "a"), ("new", "b")],
+    );
+    let retained_target = RetainedEffectiveDefaultTarget::new(
+        std::fs::File::open(&replacement_dir).unwrap(),
+        std::ffi::OsString::from("config.json"),
+        journal_path_for_config(&live_config)
+            .file_name()
+            .unwrap()
+            .to_os_string(),
+        backup_path_for_config(&live_config)
+            .file_name()
+            .unwrap()
+            .to_os_string(),
+        live_config.clone(),
+        replacement_root.canonicalize().unwrap(),
+        EffectiveDefaultScope::ExplicitOverride,
+    )
+    .unwrap();
+    set_crash_inject(Some(EffectiveDefaultCrashPoint::AfterCommittedMarker));
+    assert!(
+        mutate_effective_default_retained(
+            &retained_target,
+            Some(&replacement),
+            Some(replacement.clone()),
+            TransactionCorrelation::RetainedDefaultUpdate {
+                default_update_id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                authority: None,
+            },
+        )
+        .is_err()
+    );
+    set_crash_inject(None);
+    let retained_journal = journal_path_for_config(&live_config);
+    let retained_backup = backup_path_for_config(&live_config);
+    assert!(replacement_dir.join(retained_journal.file_name().unwrap()).exists());
+
+    let moved_a = tmp.path().join("moved-a");
+    let replacement_for_hook = replacement_dir.clone();
+    let live_for_hook = live_dir.clone();
+    let moved_a_for_hook = moved_a.clone();
+    set_ambient_recovery_classification_hook_for_tests(Some(Arc::new(move || {
+        std::fs::rename(&live_for_hook, &moved_a_for_hook).unwrap();
+        std::fs::rename(&replacement_for_hook, &live_for_hook).unwrap();
+    })));
+
+    // The journal is not at `live` until the hook runs; save B's bytes by its
+    // current retained directory before invoking ambient recovery.
+    let journal_before = std::fs::read(replacement_dir.join(retained_journal.file_name().unwrap()))
+        .unwrap();
+    let backup_before = std::fs::read(replacement_dir.join(retained_backup.file_name().unwrap()))
+        .unwrap();
+    let config_before = std::fs::read(replacement_dir.join("config.json")).unwrap();
+
+    reset_ambient_recovery_operation_counts_for_tests();
+    let recovered = recover_effective_default_journal(&live_config, JournalRecovery::read_only())
+        .expect("the retained replacement is declined, not path-recovered");
+    set_ambient_recovery_classification_hook_for_tests(None);
+    assert!(recovered.is_empty());
+    assert_eq!(
+        std::fs::read(live_dir.join(retained_journal.file_name().unwrap())).unwrap(),
+        journal_before,
+        "ambient recovery must not rewrite or remove B's retained journal"
+    );
+    assert_eq!(
+        std::fs::read(live_dir.join(retained_backup.file_name().unwrap())).unwrap(),
+        backup_before,
+        "ambient recovery must not reopen, compensate, or remove B's backup"
+    );
+    assert_eq!(
+        std::fs::read(live_dir.join("config.json")).unwrap(),
+        config_before,
+        "the captured retained reclassification must not mutate B's config"
+    );
+    let operations = ambient_recovery_operation_counts_for_tests();
+    assert_eq!(operations.target_canonicalizations, 1);
+    assert_eq!(
+        operations.lock_acquisitions, 0,
+        "a newly captured retained B is rejected before ambient recovery opens its lock leaf"
+    );
+}
+
+/// Once a default mutation has captured A, a pathname replacement with a
+/// retained B may not redirect its probe, lock, recovery, or commit. The
+/// operation continues through its held A directory; B remains byte-for-byte
+/// untouched for the retained worker that owns it.
+#[test]
+fn ambient_mutation_keeps_probe_and_lock_on_captured_a_after_path_becomes_b() {
+    let tmp = TempDir::new().unwrap();
+    let env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    crate::config::trust::clear_runtime_policy_for_tests();
+    reset_recovery_backoff_for_tests();
+
+    let live_dir = tmp.path().join("live");
+    let live_config = live_dir.join("config.json");
+    let prior = selection("old", "a");
+    let replacement = selection("new", "b");
+    write_layer(&live_dir, Some(&prior), &[("old", "a"), ("new", "b")]);
+    env.set_cockpit_config(&live_config);
+    let cwd = tmp.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // Build B's correlated retained transaction while it is not reachable
+    // through the ambient spelling. Its artifact names intentionally match
+    // the final live target spelling.
+    let replacement_dir = tmp.path().join("replacement");
+    let replacement_root = tmp.path().join("replacement-project");
+    std::fs::create_dir_all(&replacement_root).unwrap();
+    write_layer(
+        &replacement_dir,
+        Some(&prior),
+        &[("old", "a"), ("new", "b")],
+    );
+    let retained_target = RetainedEffectiveDefaultTarget::new(
+        std::fs::File::open(&replacement_dir).unwrap(),
+        std::ffi::OsString::from("config.json"),
+        journal_path_for_config(&live_config)
+            .file_name()
+            .unwrap()
+            .to_os_string(),
+        backup_path_for_config(&live_config)
+            .file_name()
+            .unwrap()
+            .to_os_string(),
+        live_config.clone(),
+        replacement_root.canonicalize().unwrap(),
+        EffectiveDefaultScope::ExplicitOverride,
+    )
+    .unwrap();
+    set_crash_inject(Some(EffectiveDefaultCrashPoint::AfterCommittedMarker));
+    assert!(
+        mutate_effective_default_retained(
+            &retained_target,
+            Some(&replacement),
+            Some(replacement.clone()),
+            TransactionCorrelation::RetainedDefaultUpdate {
+                default_update_id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                authority: None,
+            },
+        )
+        .is_err()
+    );
+    set_crash_inject(None);
+
+    fn directory_snapshot(dir: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+        let mut entries = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    let before = directory_snapshot(&replacement_dir);
+    let moved_a = tmp.path().join("moved-a");
+    let replacement_for_hook = replacement_dir.clone();
+    let live_for_hook = live_dir.clone();
+    let moved_a_for_hook = moved_a.clone();
+    set_ambient_mutation_classification_hook_for_tests(Some(Arc::new(move || {
+        std::fs::rename(&live_for_hook, &moved_a_for_hook).unwrap();
+        std::fs::rename(&replacement_for_hook, &live_for_hook).unwrap();
+    })));
+
+    reset_ambient_recovery_operation_counts_for_tests();
+    let result = mutate_effective_default(
+        &cwd,
+        Some(&replacement),
+        ActiveModelWriteMode::Replace,
+        None,
+        None,
+        None,
+    )
+    .expect("captured A remains the mutation authority after the replacement");
+    set_ambient_mutation_classification_hook_for_tests(None);
+    assert_eq!(result.selection.as_ref(), Some(&replacement));
+    assert_eq!(directory_snapshot(&live_dir), before);
+    let operations = ambient_recovery_operation_counts_for_tests();
+    assert_eq!(operations.mutation_writable_probes, 1);
+    assert_eq!(operations.mutation_lock_acquisitions, 1);
+    assert!(
+        std::fs::read_dir(&moved_a)
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("effective-default-lock")),
+        "the capability-local lock belongs to held A, not the replacement path",
+    );
+    assert!(
+        std::fs::read_dir(&live_dir)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("effective-default-lock")),
+        "B must not receive an ambient lock sidecar",
+    );
+    assert_eq!(
+        active_model_from_config_bytes(&std::fs::read(moved_a.join("config.json")).unwrap()),
+        Some(replacement),
+        "the held A target, not B's replacement spelling, receives the update",
+    );
+}
+
+/// The probe is not merely a retained no-op assertion: a normal path-owned
+/// journal must still derive its target identity and acquire the ambient lock
+/// before recovery converges it.
+#[test]
+fn ambient_recovery_nonretained_control_uses_the_canonical_lock_path() {
+    let tmp = TempDir::new().unwrap();
+    let _env = cockpit_test_support::TestEnvGuard::isolate_cockpit_home_at(tmp.path());
+    crate::config::trust::clear_runtime_policy_for_tests();
+    reset_recovery_backoff_for_tests();
+    let user = user_dir(tmp.path());
+    let prior = selection("old", "a");
+    let replacement = selection("new", "b");
+    write_layer(&user, Some(&prior), &[("old", "a"), ("new", "b")]);
+    let cwd = tmp.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let config_path = user.join("config.json");
+
+    set_crash_inject(Some(EffectiveDefaultCrashPoint::AfterConfigReplaced));
+    assert!(
+        mutate_effective_default(
+            &cwd,
+            Some(&replacement),
+            ActiveModelWriteMode::Replace,
+            None,
+            None,
+            None,
+        )
+        .is_err()
+    );
+    set_crash_inject(None);
+
+    reset_ambient_recovery_operation_counts_for_tests();
+    recover_effective_default_journal(&config_path, JournalRecovery::read_only())
+        .expect("ordinary config-only recovery converges under its path lock");
+    let operations = ambient_recovery_operation_counts_for_tests();
+    assert!(operations.target_canonicalizations >= 1);
+    assert!(operations.lock_acquisitions >= 1);
+}
+
+/// A retained write cannot retire the correlation merely because its config
+/// bytes reached disk. The worker refresh/terminal handoff owns cleanup.
+#[test]
+fn retained_commit_keeps_journal_until_terminal_finalization() {
+    let tmp = TempDir::new().unwrap();
+    let config_dir = tmp.path().join("retained-config");
+    let project_root = tmp.path().join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let prior = selection("old", "a");
+    let target_selection = selection("new", "b");
+    write_layer(
+        &config_dir,
+        Some(&prior),
+        &[("old", "a"), ("new", "b")],
+    );
+    let config_path = config_dir.join("config.json");
+    let target = RetainedEffectiveDefaultTarget::new(
+        std::fs::File::open(&config_dir).unwrap(),
+        std::ffi::OsString::from("config.json"),
+        journal_path_for_config(&config_path)
+            .file_name()
+            .unwrap()
+            .to_os_string(),
+        backup_path_for_config(&config_path)
+            .file_name()
+            .unwrap()
+            .to_os_string(),
+        config_path.canonicalize().unwrap(),
+        project_root.canonicalize().unwrap(),
+        EffectiveDefaultScope::Project,
+    )
+    .unwrap();
+    let update_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+
+    let mut pending = mutate_effective_default_retained(
+        &target,
+        Some(&target_selection),
+        Some(target_selection.clone()),
+        TransactionCorrelation::RetainedDefaultUpdate {
+            default_update_id: update_id,
+            session_id,
+            authority: None,
+        },
+    )
+    .expect("retained commit succeeds before receipt handoff");
+    assert!(pending.result().wrote);
+    assert!(
+        !journal_and_backup_are_gone(&config_path),
+        "a committed correlation must survive until its terminal handoff"
+    );
+    assert_eq!(
+        ConfigDoc::providers_from_paths(&[config_path.clone()]).active_model,
+        Some(target_selection),
+    );
+
+    pending
+        .bind_default_update_authority(test_default_update_authority(1))
+        .expect("terminal handoff seals its authority first");
+    // A retry with the same fence is harmless, but a later worker must never
+    // reinterpret this committed A transaction as its own B receipt.
+    pending
+        .bind_default_update_authority(test_default_update_authority(1))
+        .expect("same authority binding is idempotent");
+    assert!(
+        pending
+            .bind_default_update_authority(test_default_update_authority(2))
+            .is_err(),
+        "a sealed retained authority is write-once"
+    );
+    pending
+        .finalize_after_terminal_receipt(&test_retained_receipt_proof(
+            update_id, session_id, 1,
+        ))
+        .expect("terminal handoff finalizes retained artifacts");
+    assert!(journal_and_backup_are_gone(&config_path));
+}
+
+/// A process death after receipt emission leaves a durable marker. Recovery is
+/// cleanup-only, so the same correlation is never re-emitted after that point.
+#[test]
+fn retained_receipt_marker_makes_post_receipt_recovery_cleanup_only() {
+    let tmp = TempDir::new().unwrap();
+    let config_dir = tmp.path().join("retained-config");
+    let project_root = tmp.path().join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let prior = selection("old", "a");
+    let target_selection = selection("new", "b");
+    write_layer(
+        &config_dir,
+        Some(&prior),
+        &[("old", "a"), ("new", "b")],
+    );
+    let config_path = config_dir.join("config.json");
+    let target = RetainedEffectiveDefaultTarget::new(
+        std::fs::File::open(&config_dir).unwrap(),
+        std::ffi::OsString::from("config.json"),
+        journal_path_for_config(&config_path)
+            .file_name()
+            .unwrap()
+            .to_os_string(),
+        backup_path_for_config(&config_path)
+            .file_name()
+            .unwrap()
+            .to_os_string(),
+        config_path.canonicalize().unwrap(),
+        project_root.canonicalize().unwrap(),
+        EffectiveDefaultScope::Project,
+    )
+    .unwrap();
+    let default_update_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let mut pending = mutate_effective_default_retained(
+        &target,
+        Some(&target_selection),
+        Some(target_selection),
+        TransactionCorrelation::RetainedDefaultUpdate {
+            default_update_id,
+            session_id,
+            authority: None,
+        },
+    )
+    .unwrap();
+
+    pending
+        .bind_default_update_authority(test_default_update_authority(1))
+        .expect("terminal handoff seals its authority first");
+    set_crash_inject(Some(
+        EffectiveDefaultCrashPoint::AfterRetainedReceiptBeforeCleanup,
+    ));
+    let proof = test_retained_receipt_proof(default_update_id, session_id, 1);
+    assert!(pending.finalize_after_terminal_receipt(&proof).is_err());
+    set_crash_inject(None);
+    assert!(!journal_and_backup_are_gone(&config_path));
+
+    let recovery = recover_retained_effective_default_journal(&target).unwrap();
+    let (recovered, finalization, receipt_validation) = recovery.into_parts();
+    assert!(
+        recovered.is_empty(),
+        "receipt-marked recovery never re-emits a terminal correlation"
+    );
+    assert!(finalization.is_none());
+    let receipt_validation = receipt_validation.expect("receipt marker needs daemon-ledger validation");
+    assert_eq!(receipt_validation.proof(), &proof);
+    assert!(
+        !journal_and_backup_are_gone(&config_path),
+        "the low-level recovery must retain unvalidated artifacts"
+    );
+    receipt_validation
+        .into_finalization()
+        .finalize_after_terminal_receipt(&proof)
+        .expect("a daemon-validated receipt may clean retained artifacts");
+    assert!(journal_and_backup_are_gone(&config_path));
+}
+
+/// A workspace-controlled journal cannot manufacture the ReceiptEmitted
+/// cleanup state. Both a missing proof and a syntactically valid proof for a
+/// different operation remain pending for attached-daemon ledger validation.
+#[test]
+fn retained_receipt_marker_missing_or_mismatched_proof_fails_closed() {
+    let tmp = TempDir::new().unwrap();
+    let (target, config_path, _prior, requested) = retained_config_only_target(&tmp);
+    let default_update_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let mut pending = mutate_effective_default_retained(
+        &target,
+        Some(&requested),
+        Some(requested),
+        TransactionCorrelation::RetainedDefaultUpdate {
+            default_update_id,
+            session_id,
+            authority: None,
+        },
+    )
+    .unwrap();
+    pending
+        .bind_default_update_authority(test_default_update_authority(3))
+        .unwrap();
+
+    let mut record = target.load_journal().unwrap().unwrap();
+    record.phase = JournalPhase::ReceiptEmitted;
+    record.receipt_proof = None;
+    target.write_journal(&record).unwrap();
+    assert!(
+        recover_retained_effective_default_journal(&target).is_err(),
+        "a receipt-emitted retained journal without a proof remains pending"
+    );
+    assert!(!journal_and_backup_are_gone(&config_path));
+
+    let mut record = target.load_journal().unwrap().unwrap();
+    record.receipt_proof = Some(test_retained_receipt_proof(
+        Uuid::new_v4(),
+        session_id,
+        3,
+    ));
+    target.write_journal(&record).unwrap();
+    assert!(
+        recover_retained_effective_default_journal(&target).is_err(),
+        "a valid-shaped proof for another update remains pending"
+    );
+    assert!(!journal_and_backup_are_gone(&config_path));
+}
+
+/// A syntactically parseable but invalid authority proof is not equivalent to
+/// an unsealed journal. Recovery must leave its exact retained artifacts in
+/// place for repair; otherwise a damaged proof could silently become a new
+/// receipt authority.
+#[test]
+fn retained_corrupt_authority_seal_fails_closed_without_rewriting_journal() {
+    let tmp = TempDir::new().unwrap();
+    let (target, config_path, _prior, requested) = retained_config_only_target(&tmp);
+    let mut pending = mutate_effective_default_retained(
+        &target,
+        Some(&requested),
+        Some(requested.clone()),
+        TransactionCorrelation::RetainedDefaultUpdate {
+            default_update_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            authority: None,
+        },
+    )
+    .expect("retained commit succeeds before the terminal handoff");
+    pending
+        .bind_default_update_authority(test_default_update_authority(1))
+        .expect("write a normally sealed journal first");
+
+    let mut record = target
+        .load_journal()
+        .unwrap()
+        .expect("committed retained journal");
+    let Some(TransactionCorrelation::RetainedDefaultUpdate { authority, .. }) = record.correlation.as_mut()
+    else {
+        panic!("expected config-only default-update correlation");
+    };
+    *authority = Some(DefaultUpdateAuthorityBinding {
+        authority_revision: "not-a-valid-authority-digest".to_string(),
+        config_generation: 1,
+    });
+    target.write_journal(&record).unwrap();
+    let journal_path = journal_path_for_config(&config_path);
+    let before = std::fs::read(&journal_path).unwrap();
+
+    let error = recover_retained_effective_default_journal(&target)
+        .expect_err("a corrupt authority seal must not be interpreted as unbound");
+    assert!(
+        format!("{error:#}").contains("authority revision"),
+        "{error:#}"
+    );
+    assert_eq!(
+        std::fs::read(&journal_path).unwrap(),
+        before,
+        "failed recovery never rewrites the corrupt journal"
+    );
+    assert!(
+        !journal_and_backup_are_gone(&config_path),
+        "failed recovery never cleans correlated artifacts"
+    );
+    assert_eq!(
+        ConfigDoc::providers_from_paths(&[config_path]).active_model,
+        Some(requested),
+        "failed recovery preserves the already committed A bytes"
+    );
+}
+
+/// A committed journal is intentionally allowed to be unbound until the
+/// worker refresh completes, but no terminal cleanup phase may run before
+/// that one-way seal exists.
+#[test]
+fn retained_terminal_phases_require_a_sealed_authority_and_stay_pending_without_one() {
+    let tmp = TempDir::new().unwrap();
+    let (target, config_path, _prior, requested) = retained_config_only_target(&tmp);
+    let pending = mutate_effective_default_retained(
+        &target,
+        Some(&requested),
+        Some(requested.clone()),
+        TransactionCorrelation::RetainedDefaultUpdate {
+            default_update_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            authority: None,
+        },
+    )
+    .expect("retained commit succeeds before authority sealing");
+    let journal_path = journal_path_for_config(&config_path);
+    let before_finalize = std::fs::read(&journal_path).unwrap();
+    let error = pending
+        .finalize_after_terminal_receipt(&test_retained_receipt_proof(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            1,
+        ))
+        .expect_err("unsealed journal cannot be terminally finalized");
+    assert!(
+        format!("{error:#}").contains("no sealed authority"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&journal_path).unwrap(), before_finalize);
+    assert!(!journal_and_backup_are_gone(&config_path));
+
+    let mut record = target
+        .load_journal()
+        .unwrap()
+        .expect("the unsealed journal remains pending");
+    record.phase = JournalPhase::ReceiptEmitted;
+    target.write_journal(&record).unwrap();
+    let before_recovery = std::fs::read(&journal_path).unwrap();
+    let error = recover_retained_effective_default_journal(&target)
+        .expect_err("receipt-emitted cleanup cannot proceed without the seal");
+    assert!(
+        format!("{error:#}").contains("no sealed authority"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&journal_path).unwrap(), before_recovery);
+    assert!(!journal_and_backup_are_gone(&config_path));
+    assert_eq!(
+        ConfigDoc::providers_from_paths(&[config_path]).active_model,
+        Some(requested),
+        "the malformed terminal phase never compensates or rewrites committed bytes"
+    );
+}
 
 /// Config-only (`SetDefaultModel`) crash coverage: no session phase runs, and
 /// a "restarted" process converges the config to prior or target.
@@ -1759,6 +2653,7 @@ fn a_plain_reader_never_converges_a_correlated_journal_and_the_daemon_pass_deliv
     let correlation = TransactionCorrelation::DefaultUpdate {
         default_update_id,
         session_id,
+        authority: None,
     };
     // A config-only (no session) but correlated transaction that crashed after
     // its `committed` marker was fsynced — the phase recovery converges
@@ -1861,6 +2756,7 @@ fn forward_recovery_reports_divergence_instead_of_wedging_on_a_higher_layer_chan
         Some(TransactionCorrelation::DefaultUpdate {
             default_update_id: Uuid::from_u128(21),
             session_id: Uuid::from_u128(22),
+            authority: None,
         }),
     );
     set_crash_inject(None);
@@ -2142,6 +3038,7 @@ fn one_config_file_has_one_journal_key_across_path_spellings() {
         Some(TransactionCorrelation::DefaultUpdate {
             default_update_id: Uuid::from_u128(41),
             session_id: Uuid::from_u128(42),
+            authority: None,
         }),
     );
     set_crash_inject(None);
@@ -2211,6 +3108,7 @@ fn a_second_mutation_never_swallows_a_pending_correlated_transaction() {
     let waiting = TransactionCorrelation::DefaultUpdate {
         default_update_id: Uuid::from_u128(51),
         session_id: Uuid::from_u128(52),
+        authority: None,
     };
     set_crash_inject(Some(EffectiveDefaultCrashPoint::AfterConfigReplaced));
     let _ = mutate_effective_default(
@@ -2234,6 +3132,7 @@ fn a_second_mutation_never_swallows_a_pending_correlated_transaction() {
         Some(TransactionCorrelation::DefaultUpdate {
             default_update_id: Uuid::from_u128(53),
             session_id: Uuid::from_u128(52),
+            authority: None,
         }),
     )
     .expect_err("a pending correlated transaction blocks a new mutation");
@@ -2387,6 +3286,142 @@ fn an_errored_cas_that_actually_committed_is_still_compensated() {
     );
     assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
     assert!(journal_and_backup_are_gone(&config_path));
+}
+
+#[test]
+fn modes_session_setup_retained_selected_leaf_projects_exact_effective_default_journal_states() {
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.json");
+    let canonical = canonical_config_path(&config_path);
+    let project_root = tmp.path().to_string_lossy().to_string();
+    let prior = b"{\"active_model\":{\"provider\":\"old\",\"model\":\"a\"}}\n".to_vec();
+    let requested = selection("new", "b");
+    let committed = replacement_bytes(&prior, Some(&requested)).unwrap();
+
+    let record_for = |phase: JournalPhase, session: JournalSession| JournalRecord {
+        transaction_id: Uuid::new_v4(),
+        project_root: project_root.clone(),
+        trust_mode: Some(WorkspaceTrustMode::Trust.as_str().to_string()),
+        scope: EffectiveDefaultScope::Project,
+        target_path_digest: path_digest(&canonical),
+        old_config_digest: bytes_digest(&prior),
+        new_config_digest: bytes_digest(&committed),
+        requested: Some(requested.clone()),
+        expected_effective: Some(requested.clone()),
+        session,
+        correlation: None,
+        receipt_proof: None,
+        phase,
+    };
+
+    let serialize = |record: &JournalRecord| serde_json::to_vec(record).unwrap();
+
+    // A config-only prepared transaction exposes the recoverable prior view,
+    // even if the replacement had reached the config file before a crash.
+    let prepared = serialize(&record_for(JournalPhase::Prepared, JournalSession::None));
+    assert_eq!(
+        project_retained_effective_default_bytes(
+            &canonical,
+            Some(committed.clone()),
+            Some(&prepared),
+            Some(&prior),
+        )
+        .unwrap(),
+        Some(prior.clone())
+    );
+
+    // The capability projection preserves every config-only recovery branch:
+    // an already-prior layer needs no backup, whereas a replacement in flight
+    // needs the validated backup to project the compensating view.
+    for phase in [JournalPhase::Prepared, JournalPhase::Compensating] {
+        let record = serialize(&record_for(phase, JournalSession::None));
+        assert_eq!(
+            project_retained_effective_default_bytes(
+                &canonical,
+                Some(prior.clone()),
+                Some(&record),
+                None,
+            )
+            .unwrap(),
+            Some(prior.clone()),
+            "{phase:?} with prior bytes is already safely recovered"
+        );
+        assert!(
+            project_retained_effective_default_bytes(
+                &canonical,
+                Some(committed.clone()),
+                Some(&record),
+                None,
+            )
+            .is_err(),
+            "{phase:?} with replacement bytes requires its rollback snapshot"
+        );
+    }
+
+    // A committed config-only record deterministically exposes the forward
+    // bytes even before the normal recovery pass writes/removes artifacts.
+    let committed_record = serialize(&record_for(JournalPhase::Committed, JournalSession::None));
+    assert_eq!(
+        project_retained_effective_default_bytes(
+            &canonical,
+            Some(prior.clone()),
+            Some(&committed_record),
+            Some(&prior),
+        )
+        .unwrap(),
+        Some(committed.clone())
+    );
+    assert_eq!(
+        project_retained_effective_default_bytes(
+            &canonical,
+            Some(committed.clone()),
+            Some(&committed_record),
+            None,
+        )
+        .unwrap(),
+        Some(committed.clone()),
+        "a durably committed layer needs no backup to project forward"
+    );
+
+    // A session-bound transaction is always masked back to the validated
+    // prior snapshot until a daemon session-authority recovery owns it.
+    let session_record = serialize(&record_for(
+        JournalPhase::SessionCommitted,
+        JournalSession::Session {
+            session_id: Uuid::new_v4(),
+            prior: selection("old", "a"),
+            target: requested.clone(),
+            expected_revision: 7,
+        },
+    ));
+    assert_eq!(
+        project_retained_effective_default_bytes(
+            &canonical,
+            Some(committed.clone()),
+            Some(&session_record),
+            Some(&prior),
+        )
+        .unwrap(),
+        Some(prior.clone())
+    );
+
+    // A stale record for a different selected leaf is not this layer's
+    // transaction and cannot block it merely by sharing a directory.
+    let foreign_path = tmp.path().join("other.json");
+    let foreign_canonical = canonical_config_path(&foreign_path);
+    let mut foreign: JournalRecord = serde_json::from_slice(&prepared).unwrap();
+    foreign.target_path_digest = path_digest(&foreign_canonical);
+    let foreign = serialize(&foreign);
+    assert_eq!(
+        project_retained_effective_default_bytes(
+            &canonical,
+            Some(committed.clone()),
+            Some(&foreign),
+            Some(&prior),
+        )
+        .unwrap(),
+        Some(committed)
+    );
 }
 
 /// The uncounted masked read used by pre-attach bootstrap and export obeys the

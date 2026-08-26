@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{Context, Result, bail};
 
@@ -78,6 +78,16 @@ pub struct WorkspaceTrustPolicy {
     pub mode: WorkspaceTrustMode,
 }
 
+/// A DB-resolved policy plus the durable per-root revision that selected it.
+/// The revision is intentionally kept separate from [`WorkspaceTrustPolicy`]:
+/// task/thread policy propagation describes authority, whereas this value is a
+/// short-lived daemon publication fence and must never be inherited ambiently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWorkspaceTrustPolicy {
+    pub policy: WorkspaceTrustPolicy,
+    pub revision: i64,
+}
+
 /// A fail-closed workspace-trust decision refusal. Keeping this distinct from
 /// path-resolution and database failures lets daemon clients branch on trust
 /// without mislabeling storage faults as user decisions.
@@ -108,9 +118,16 @@ impl std::fmt::Display for WorkspaceTrustError {
 
 impl std::error::Error for WorkspaceTrustError {}
 
+/// A daemon worker keeps this cell for its lifetime.  A workspace-trust
+/// update replaces the value only after the daemon has published the matching
+/// retained config snapshot.  Keeping the cell rather than a copied policy in
+/// a task-local is important: a long-lived driver must not retain `Trust`
+/// after the durable decision becomes `IgnoreConfig`.
+pub type SharedWorkspaceTrustPolicy = Arc<RwLock<WorkspaceTrustPolicy>>;
+
 static RUNTIME_POLICY: OnceLock<Mutex<Option<WorkspaceTrustPolicy>>> = OnceLock::new();
 tokio::task_local! {
-    static TASK_POLICY: WorkspaceTrustPolicy;
+    static TASK_POLICY: SharedWorkspaceTrustPolicy;
 }
 thread_local! {
     static THREAD_POLICY: std::cell::RefCell<Option<WorkspaceTrustPolicy>> = const { std::cell::RefCell::new(None) };
@@ -145,7 +162,7 @@ pub fn clear_runtime_policy_for_tests() {
 }
 
 pub fn runtime_policy() -> Option<WorkspaceTrustPolicy> {
-    if let Ok(policy) = TASK_POLICY.try_with(Clone::clone) {
+    if let Ok(policy) = TASK_POLICY.try_with(read_shared_workspace_trust_policy) {
         return Some(policy);
     }
     if let Some(policy) = THREAD_POLICY.with(|cell| cell.borrow().clone()) {
@@ -192,7 +209,47 @@ pub fn with_workspace_trust_policy<T>(policy: WorkspaceTrustPolicy, f: impl FnOn
     f()
 }
 
+pub fn shared_workspace_trust_policy(
+    policy: WorkspaceTrustPolicy,
+) -> SharedWorkspaceTrustPolicy {
+    Arc::new(RwLock::new(policy))
+}
+
+pub fn read_shared_workspace_trust_policy(
+    policy: &SharedWorkspaceTrustPolicy,
+) -> WorkspaceTrustPolicy {
+    policy
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Replace the policy observed by an already-running daemon worker.  This is
+/// deliberately a narrow operation: callers must first publish a matching
+/// capability-projected snapshot under the daemon's publication coordinator.
+pub fn replace_shared_workspace_trust_policy(
+    policy: &SharedWorkspaceTrustPolicy,
+    replacement: WorkspaceTrustPolicy,
+) {
+    *policy
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = replacement;
+}
+
 pub async fn scope_workspace_trust_policy<F, T>(policy: WorkspaceTrustPolicy, f: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    scope_shared_workspace_trust_policy(shared_workspace_trust_policy(policy), f).await
+}
+
+/// Scope async work to a mutable daemon-owned policy cell.  Normal callers
+/// should use [`scope_workspace_trust_policy`]; this exists for long-lived
+/// session workers whose durable trust decision can change while they run.
+pub async fn scope_shared_workspace_trust_policy<F, T>(
+    policy: SharedWorkspaceTrustPolicy,
+    f: F,
+) -> T
 where
     F: std::future::Future<Output = T>,
 {
@@ -232,6 +289,19 @@ pub async fn resolve_workspace_trust_policy_from_db(
     db: &crate::db::Db,
     path: &Path,
 ) -> Result<WorkspaceTrustPolicy> {
+    Ok(resolve_workspace_trust_policy_with_revision_from_db(db, path)
+        .await?
+        .policy)
+}
+
+/// Resolve the policy and its durable generation in one database observation.
+/// Callers that perform asynchronous preflight before publishing a worker or a
+/// replacement snapshot must retain `revision` and re-read it at the final
+/// publication fence.
+pub async fn resolve_workspace_trust_policy_with_revision_from_db(
+    db: &crate::db::Db,
+    path: &Path,
+) -> Result<ResolvedWorkspaceTrustPolicy> {
     let root = resolve_trust_root(path)?;
     let Some(decision) = db.workspace_trust_by_root(&root.root).await? else {
         return Err(WorkspaceTrustError::Unset {
@@ -244,7 +314,10 @@ pub async fn resolve_workspace_trust_policy_from_db(
             root: root.root.clone(),
         }
         .into()),
-        mode => Ok(WorkspaceTrustPolicy { root, mode }),
+        mode => Ok(ResolvedWorkspaceTrustPolicy {
+            policy: WorkspaceTrustPolicy { root, mode },
+            revision: decision.revision,
+        }),
     }
 }
 
@@ -472,6 +545,34 @@ mod tests {
             "ambient COCKPIT_TRUST_* env vars must not forge runtime trust"
         );
         clear_runtime_policy_for_tests();
+    }
+
+    #[tokio::test]
+    async fn shared_task_policy_observes_live_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = resolve_trust_root(tmp.path()).unwrap();
+        let shared = shared_workspace_trust_policy(WorkspaceTrustPolicy {
+            root: root.clone(),
+            mode: WorkspaceTrustMode::Trust,
+        });
+        let replacement = WorkspaceTrustPolicy {
+            root,
+            mode: WorkspaceTrustMode::IgnoreConfig,
+        };
+        let shared_for_scope = shared.clone();
+
+        scope_shared_workspace_trust_policy(shared_for_scope, async {
+            assert_eq!(
+                current_workspace_trust_policy().map(|policy| policy.mode),
+                Some(WorkspaceTrustMode::Trust)
+            );
+            replace_shared_workspace_trust_policy(&shared, replacement);
+            assert_eq!(
+                current_workspace_trust_policy().map(|policy| policy.mode),
+                Some(WorkspaceTrustMode::IgnoreConfig)
+            );
+        })
+        .await;
     }
 
     #[test]

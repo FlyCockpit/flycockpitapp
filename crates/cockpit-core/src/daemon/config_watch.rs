@@ -1,4 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::time::Duration;
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
@@ -149,12 +151,11 @@ fn event_kind_may_change_config(kind: EventKind) -> bool {
 }
 
 pub(crate) fn spawn_config_watcher(
-    project_root: PathBuf,
     db: Db,
     config_source: ConfigSource,
     handle: SessionWorkerHandle,
+    watch_paths: ConfigWatchPaths,
 ) -> Option<JoinHandle<()>> {
-    let watch_paths = config_source.watch_paths(&project_root);
     let watch_dirs = watch_paths.watched_dirs();
     if watch_dirs.is_empty() {
         return None;
@@ -228,16 +229,24 @@ async fn run_config_watcher_task(
                         debouncer.signal(Instant::now());
                     }
                     _ = tokio::time::sleep_until(deadline) => {
-                        if debouncer.fire_if_due(Instant::now()).is_some()
-                            && let Err(error) = refresh_session_config(
+                        if debouncer.fire_if_due(Instant::now()).is_some() {
+                            // Do not hold CONFIG_PUBLICATION while awaiting a
+                            // worker: a queued driver default-model mutation
+                            // may need that coordinator before it can process
+                            // this replacement. Generation + trust-revision
+                            // CAS fences make this unlocked watcher safe; a
+                            // losing capture is retried from its retained
+                            // authority instead of published out of order.
+                            if let Err(error) = refresh_session_config(
                                 &db,
                                 &config_source,
                                 &handle,
                                 Some(&mut failure_deduper),
                             )
                             .await
-                        {
-                            tracing::warn!(error = %error, "config file watcher refresh failed");
+                            {
+                                tracing::warn!(error = %error, "config file watcher refresh failed");
+                            }
                         }
                     }
                 }

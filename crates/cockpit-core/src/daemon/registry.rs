@@ -27,9 +27,11 @@ use uuid::Uuid;
 use crate::config::extended::ExtendedConfig;
 use crate::config::providers::{ActiveModelRef, ProvidersConfig};
 use crate::config::trust::{
-    WorkspaceTrustError, WorkspaceTrustPolicy, resolve_workspace_trust_policy_from_db,
+    WorkspaceTrustError, WorkspaceTrustPolicy,
+    resolve_workspace_trust_policy_with_revision_from_db,
 };
 use crate::daemon::EventSender;
+use crate::daemon::server::dispatch::CONFIG_PUBLICATION_RPC_LOCK;
 use crate::daemon::session_worker::{self, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownSignal;
 use crate::db::Db;
@@ -216,6 +218,11 @@ struct Inner {
     /// tests inject fixed configs so no attach/resume/worker path consults
     /// the machine's live layered config.
     config_source: crate::daemon::config_source::ConfigSource,
+    /// Test-only seam for proving that the start boundary cannot replace the
+    /// authority/configuration preflight selected. Production has no callback
+    /// between those two phases.
+    #[cfg(test)]
+    pre_start_worker_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Shared host-capability snapshot. Late-installed after
     /// [`crate::daemon::server::DaemonContext`] owns the store.
     host_capabilities: Mutex<Option<crate::host_capabilities::HostCapabilitySnapshotStore>>,
@@ -619,6 +626,8 @@ impl SessionRegistry {
                 shutdown,
                 global_bus: Mutex::new(None),
                 config_source,
+                #[cfg(test)]
+                pre_start_worker_hook: Mutex::new(None),
                 host_capabilities: Mutex::new(None),
                 host_capability_probes: Mutex::new(None),
             }),
@@ -632,6 +641,19 @@ impl SessionRegistry {
     ) {
         *crate::sync::lock_or_recover(&self.inner.host_capabilities) = Some(store);
         *crate::sync::lock_or_recover(&self.inner.host_capability_probes) = Some(probes);
+    }
+
+    #[cfg(test)]
+    fn set_pre_start_worker_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *crate::sync::lock_or_recover(&self.inner.pre_start_worker_hook) = hook;
+    }
+
+    #[cfg(test)]
+    fn run_pre_start_worker_hook(&self) {
+        if let Some(hook) = crate::sync::lock_or_recover(&self.inner.pre_start_worker_hook).clone()
+        {
+            hook();
+        }
     }
 
     fn current_host_capabilities(&self) -> cockpit_proto::HostCapabilitySnapshot {
@@ -1147,15 +1169,44 @@ impl SessionRegistry {
         env_snapshot: EnvSnapshot,
         session_entry_mode: crate::daemon::proto::SessionEntryMode,
     ) -> Result<SessionWorkerHandle> {
+        // Linearize the full preflight/start handoff with trust decisions and
+        // config publication. Command-secret preparation below awaits; without
+        // this coordinator an IgnoreConfig decision could win during that
+        // await and a project-derived snapshot would still be spawned.
+        let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
         let Some(project_root) = project_root else {
             bail!("attach requires either session_id or project_root");
         };
-        let trust_policy =
-            resolve_workspace_trust_policy_from_db(&self.inner.db, &project_root).await?;
-        let (providers_cfg, extended_cfg) = self
+        let resolved_trust =
+            resolve_workspace_trust_policy_with_revision_from_db(&self.inner.db, &project_root)
+                .await?;
+        let mut trust_policy = resolved_trust.policy;
+        let mut trust_revision = resolved_trust.revision;
+        self.inner
+            .config_source
+            .prepare_global_layers_before_retained_capture(&project_root, &trust_policy)?;
+        let workspace_root_authority = Arc::new(
+            crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority::capture(
+                &project_root,
+                &trust_policy,
+            )?,
+        );
+        // Use the complete attach-time source chain. In addition to avoiding
+        // a later ambient `COCKPIT_CONFIG` redirect, this preserves exact
+        // provenance for global provider/model choices so an attached
+        // SetModelFavorite can mutate only its observed retained source.
+        let mut workspace_layer = workspace_root_authority
+            .capture_retained_config_source_chain(&trust_policy)?;
+        let (mut providers_cfg, mut extended_cfg) = self
             .inner
             .config_source
-            .load_effective_for_daemon(&project_root, &trust_policy)?;
+            .load_effective_for_daemon_with_retained_workspace_layer(
+                &project_root,
+                &trust_policy,
+                &workspace_layer,
+        )?;
+        let mut hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
+        let config_watch_paths = workspace_root_authority.config_watch_paths();
         if let (Some(initial), Some(pinned)) = (&initial_model, model_override) {
             anyhow::ensure!(
                 initial == pinned,
@@ -1196,6 +1247,44 @@ impl SessionRegistry {
         // model, so both observe the cache and never trigger a sync exec.
         self.preresolve_session_command_secrets(&session, &providers_cfg)
             .await;
+        // Test-only interleaving seam. Keep it before the final durable trust
+        // observation so a direct DB transition exercises the same reproject
+        // path as a real concurrent writer; production has no hook here.
+        #[cfg(test)]
+        self.run_pre_start_worker_hook();
+        // The coordinator prevents normal trust RPCs from changing policy in
+        // this window, but retain a durable revision fence for DB writers and
+        // future entry paths that do not share this task. Reproject only from
+        // the authority captured above; never rediscover workspace paths.
+        let current_trust = resolve_workspace_trust_policy_with_revision_from_db(
+            &self.inner.db,
+            &session.project_root,
+        )
+        .await?;
+        if current_trust.revision != trust_revision || current_trust.policy != trust_policy {
+            trust_policy = current_trust.policy;
+            trust_revision = current_trust.revision;
+            workspace_layer = workspace_root_authority
+                .capture_retained_config_source_chain(&trust_policy)?;
+            (providers_cfg, extended_cfg) = self
+                .inner
+                .config_source
+                .load_effective_for_daemon_with_retained_workspace_layer(
+                    &session.project_root,
+                    &trust_policy,
+                    &workspace_layer,
+                )?;
+            hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
+            if initial_model.is_none() && model_override.is_none() {
+                session.set_active_model_ref(
+                    providers_cfg
+                        .active_model
+                        .clone()
+                        .context("no model selected after workspace trust changed")?,
+                )?;
+            }
+        }
+        debug_assert!(trust_revision > 0);
         self.start_worker(
             session,
             &providers_cfg,
@@ -1204,6 +1293,11 @@ impl SessionRegistry {
             model_override,
             None,
             trust_policy,
+            trust_revision,
+            workspace_root_authority,
+            workspace_layer,
+            hooks,
+            config_watch_paths,
             env_snapshot,
             generation,
         )
@@ -1220,17 +1314,38 @@ impl SessionRegistry {
         client_no_sandbox: bool,
         env_snapshot: EnvSnapshot,
     ) -> Result<SessionWorkerHandle> {
+        let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
         crate::assistants::validate_assistant_name(assistant_name)?;
         crate::assistants::load_verified(&self.inner.db, assistant_name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("assistant `{assistant_name}` not found"))?;
 
-        let trust_policy =
-            resolve_workspace_trust_policy_from_db(&self.inner.db, &project_root).await?;
-        let (providers_cfg, extended_cfg) = self
+        let resolved_trust =
+            resolve_workspace_trust_policy_with_revision_from_db(&self.inner.db, &project_root)
+                .await?;
+        let mut trust_policy = resolved_trust.policy;
+        let mut trust_revision = resolved_trust.revision;
+        self.inner
+            .config_source
+            .prepare_global_layers_before_retained_capture(&project_root, &trust_policy)?;
+        let workspace_root_authority = Arc::new(
+            crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority::capture(
+                &project_root,
+                &trust_policy,
+            )?,
+        );
+        let mut workspace_layer = workspace_root_authority
+            .capture_retained_config_source_chain(&trust_policy)?;
+        let (mut providers_cfg, mut extended_cfg) = self
             .inner
             .config_source
-            .load_effective_for_daemon(&project_root, &trust_policy)?;
+            .load_effective_for_daemon_with_retained_workspace_layer(
+                &project_root,
+                &trust_policy,
+                &workspace_layer,
+        )?;
+        let mut hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
+        let config_watch_paths = workspace_root_authority.config_watch_paths();
         let active = initial_model
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new assistant session")?;
@@ -1255,6 +1370,37 @@ impl SessionRegistry {
         // `start_worker` (see `attach_create_session`).
         self.preresolve_session_command_secrets(&session, &providers_cfg)
             .await;
+        #[cfg(test)]
+        self.run_pre_start_worker_hook();
+        let current_trust = resolve_workspace_trust_policy_with_revision_from_db(
+            &self.inner.db,
+            &session.project_root,
+        )
+        .await?;
+        if current_trust.revision != trust_revision || current_trust.policy != trust_policy {
+            trust_policy = current_trust.policy;
+            trust_revision = current_trust.revision;
+            workspace_layer = workspace_root_authority
+                .capture_retained_config_source_chain(&trust_policy)?;
+            (providers_cfg, extended_cfg) = self
+                .inner
+                .config_source
+                .load_effective_for_daemon_with_retained_workspace_layer(
+                    &session.project_root,
+                    &trust_policy,
+                    &workspace_layer,
+                )?;
+            hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
+            if initial_model.is_none() {
+                session.set_active_model_ref(
+                    providers_cfg
+                        .active_model
+                        .clone()
+                        .context("no model selected after workspace trust changed")?,
+                )?;
+            }
+        }
+        debug_assert!(trust_revision > 0);
         self.start_worker(
             session,
             &providers_cfg,
@@ -1263,6 +1409,11 @@ impl SessionRegistry {
             None,
             None,
             trust_policy,
+            trust_revision,
+            workspace_root_authority,
+            workspace_layer,
+            hooks,
+            config_watch_paths,
             env_snapshot,
             generation,
         )
@@ -1277,7 +1428,8 @@ impl SessionRegistry {
         env_snapshot: EnvSnapshot,
         generation: WorkerGeneration,
     ) -> Result<SessionWorkerHandle> {
-        let session = Session::resume(
+        let _config_publication_guard = CONFIG_PUBLICATION_RPC_LOCK.lock().await;
+        let mut session = Session::resume(
             self.inner.db.clone(),
             id,
             self.redaction_key_resolver()?,
@@ -1285,16 +1437,61 @@ impl SessionRegistry {
         )
         .context("resuming session")?
         .ok_or_else(|| anyhow::anyhow!("unknown session {id}"))?;
-        let trust_policy =
-            resolve_workspace_trust_policy_from_db(&self.inner.db, &session.project_root).await?;
-        let (providers_cfg, extended_cfg) = self
+        let resolved_trust = resolve_workspace_trust_policy_with_revision_from_db(
+            &self.inner.db,
+            &session.project_root,
+        )
+        .await?;
+        let mut trust_policy = resolved_trust.policy;
+        let mut trust_revision = resolved_trust.revision;
+        self.inner
+            .config_source
+            .prepare_global_layers_before_retained_capture(&session.project_root, &trust_policy)?;
+        let workspace_root_authority = Arc::new(
+            crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority::capture(
+                &session.project_root,
+                &trust_policy,
+            )?,
+        );
+        let mut workspace_layer = workspace_root_authority
+            .capture_retained_config_source_chain(&trust_policy)?;
+        let (mut providers_cfg, mut extended_cfg) = self
             .inner
             .config_source
-            .load_effective_for_daemon(&session.project_root, &trust_policy)?;
+            .load_effective_for_daemon_with_retained_workspace_layer(
+                &session.project_root,
+                &trust_policy,
+                &workspace_layer,
+        )?;
+        let mut hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
+        let config_watch_paths = workspace_root_authority.config_watch_paths();
         // Async pre-resolve referenced command-backed secrets before the sync
         // `start_worker` (see `attach_create_session`).
         self.preresolve_session_command_secrets(&session, &providers_cfg)
             .await;
+        #[cfg(test)]
+        self.run_pre_start_worker_hook();
+        let current_trust = resolve_workspace_trust_policy_with_revision_from_db(
+            &self.inner.db,
+            &session.project_root,
+        )
+        .await?;
+        if current_trust.revision != trust_revision || current_trust.policy != trust_policy {
+            trust_policy = current_trust.policy;
+            trust_revision = current_trust.revision;
+            workspace_layer = workspace_root_authority
+                .capture_retained_config_source_chain(&trust_policy)?;
+            (providers_cfg, extended_cfg) = self
+                .inner
+                .config_source
+                .load_effective_for_daemon_with_retained_workspace_layer(
+                    &session.project_root,
+                    &trust_policy,
+                    &workspace_layer,
+                )?;
+            hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
+        }
+        debug_assert!(trust_revision > 0);
         self.start_worker(
             session,
             &providers_cfg,
@@ -1303,6 +1500,11 @@ impl SessionRegistry {
             None,
             initial_model,
             trust_policy,
+            trust_revision,
+            workspace_root_authority,
+            workspace_layer,
+            hooks,
+            config_watch_paths,
             env_snapshot,
             generation,
         )
@@ -1438,6 +1640,13 @@ impl SessionRegistry {
         model_override: Option<&ActiveModelRef>,
         recovery_model: Option<ActiveModelRef>,
         trust_policy: WorkspaceTrustPolicy,
+        trust_revision: i64,
+        workspace_root_authority: Arc<
+            crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority,
+        >,
+        workspace_layer: cockpit_config::config::WorkspaceConfigLayerSnapshotChain,
+        hooks: crate::config::extended::hooks::HookRegistry,
+        config_watch_paths: crate::daemon::config_source::ConfigWatchPaths,
         env_snapshot: EnvSnapshot,
         generation: WorkerGeneration,
     ) -> Result<SessionWorkerHandle> {
@@ -1446,6 +1655,17 @@ impl SessionRegistry {
         }
         let session_id = session.id;
         let project_root = session.project_root.clone();
+        // Preflight captured this exact authority and policy projection before
+        // choosing the model. Reusing both here prevents a mutable
+        // `COCKPIT_CONFIG` environment or path discovery from splitting model
+        // selection from the worker/endpoint snapshot. A source hidden by the
+        // current IgnoreConfig policy is intentionally not revalidated: it
+        // remains retained only for a later Trust refresh.
+        workspace_root_authority
+            .verify_retained_config_source_chain_for_policy(&trust_policy)
+            .context("validating preflight worker config authority")?;
+        let providers_cfg = providers_cfg.clone();
+        let extended_cfg = extended_cfg.clone();
 
         // Recovery of a pre-selection session is a two-phase operation. The
         // full selection is visible in memory while the worker is validated,
@@ -1493,22 +1713,16 @@ impl SessionRegistry {
         // the daemon's shared shutdown gate so this worker's inference
         // dispatch refuses new provider requests once a drain begins
         // (`daemon-graceful-drain-shutdown.md`).
-        // Config file path for the session's project, used to self-heal the
-        // wire-API endpoint (implementation note):
-        // write to the most-specific layer that defines the active provider,
-        // matching the runtime config write-target rule. `None` when nothing
-        // is discoverable (the fallback still works, it just isn't persisted).
-        let session_active = resolve_session_active_model(providers_cfg, &session)?;
-        let config_path = {
-            crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-                self.inner
-                    .config_source
-                    .config_write_target_for_provider(&project_root, &session_active.provider)
-            })
-        };
+        // The endpoint-repair persistence target is selected from this same
+        // preflight snapshot, never from a mutable `COCKPIT_CONFIG` or fresh
+        // workspace discovery. Ambient-only providers deliberately have no
+        // worker-local persistence target.
+        let session_active = resolve_session_active_model(&providers_cfg, &session)?;
+        let config_path = workspace_root_authority
+            .provider_write_target(&workspace_layer, &session_active.provider);
         let model = resolve_session_worker_model(
-            providers_cfg,
-            extended_cfg,
+            &providers_cfg,
+            &extended_cfg,
             &session,
             redact.clone(),
             &env_snapshot,
@@ -1568,32 +1782,31 @@ impl SessionRegistry {
             thinking_params,
             endpoint_recovery_thinking_params,
             project_root.clone(),
+            workspace_root_authority,
             client_no_sandbox,
             daemon_no_sandbox,
-            extended_cfg,
+            &extended_cfg,
             self.inner.lsp.clone(),
             self.inner.resource_scheduler.clone(),
             self.scheduler_source(),
             self.write_scope_source(),
             crate::sync::lock_or_recover(&self.inner.global_bus).clone(),
             trust_policy.clone(),
+            trust_revision,
             Some(cleanup),
             terminal_lock_cleanup_gate.clone(),
             terminal_closing.clone(),
             terminal_cleanup_complete.clone(),
             env_snapshot,
             {
-                // Resolve hooks under the same workspace-trust scope and
-                // generation as providers/extended config.
-                let hooks = crate::config::trust::with_workspace_trust_policy(trust_policy, || {
-                    crate::config::extended::hooks::resolve_hooks_for_cwd(&project_root)
-                });
                 let snapshot = session_worker::SessionConfigSnapshot::with_hooks(
                     0,
                     providers_cfg.clone(),
                     extended_cfg.clone(),
                     hooks,
                 )
+                .with_trust_revision(trust_revision)
+                .with_retained_provider_model_sources(&workspace_layer)?
                 .with_host_capabilities(self.current_host_capabilities());
                 match self.host_capability_refresh_runtime() {
                     Some(runtime) => snapshot.with_host_capability_refresh_runtime(runtime),
@@ -1616,10 +1829,10 @@ impl SessionRegistry {
                 },
             );
         let config_watcher = crate::daemon::config_watch::spawn_config_watcher(
-            project_root,
             self.inner.db.clone(),
             self.inner.config_source.clone(),
             handle.clone(),
+            config_watch_paths,
         );
         crate::sync::lock_or_recover(&self.inner.worker_joins).insert(
             session_id,
@@ -1954,6 +2167,30 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// Snapshot live handles belonging to the supplied durable trust root.
+    ///
+    /// The comparison intentionally uses the worker's already-captured policy
+    /// root rather than re-resolving `handle.project_root`: after attachment,
+    /// a mutable `.git`/worktree layout must not redirect which live worker a
+    /// trust transition controls. The caller performs a policy-projected
+    /// refresh under the daemon-wide publication coordinator; this method
+    /// deliberately never starts/resumes sessions or reopens paths.
+    pub fn live_handles_for_trust_root(
+        &self,
+        trust_root: &std::path::Path,
+    ) -> Vec<SessionWorkerHandle> {
+        let handles = crate::sync::lock_or_recover(&self.inner.workers)
+            .live
+            .values()
+            .filter(|entry| !entry.handle.is_closed())
+            .map(|entry| entry.handle.clone())
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .filter(|handle| handle.current_trust_policy().root.root.as_path() == trust_root)
+            .collect()
+    }
+
     /// The single daemon-wide lock manager. Exposed so the daemon's
     /// periodic lock sweeper (`read-wait-and-lock-expiry.md`) can call
     /// [`crate::locks::LockManager::sweep_expired`] — there is one authority,
@@ -2219,7 +2456,7 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn test_registry() -> SessionRegistry {
         test_registry_with_config_source(crate::daemon::config_source::ConfigSource::fixed(
@@ -2482,6 +2719,181 @@ mod tests {
 
         assert!(reg.lookup(handle.session_id).is_some());
         reg.forget(handle.session_id);
+    }
+
+    #[tokio::test]
+    async fn modes_session_setup_preflight_authority_survives_config_override_change_for_every_start_path()
+    {
+        fn write_explicit_model_config(path: &std::path::Path, model: &str) {
+            let providers = path.parent().expect("config parent").join("providers");
+            std::fs::create_dir_all(&providers).expect("create explicit provider directory");
+            std::fs::write(
+                path,
+                format!(
+                    r#"{{"active_model":{{"provider":"lmstudio","model":"{model}"}},"maxPrimaryRounds":17,"hooks":{{"preToolUse":[{{"command":["hook-{model}"]}}]}}}}"#
+                ),
+            )
+            .expect("write explicit config");
+            std::fs::write(
+                providers.join("lmstudio.json"),
+                format!(
+                    r#"{{"url":"http://127.0.0.1:9/v1","models":[{{"id":"{model}"}}]}}"#
+                ),
+            )
+            .expect("write explicit provider");
+        }
+
+        fn assert_preflight_model(handle: &SessionWorkerHandle, model: &str) {
+            assert_eq!(
+                handle
+                    .active_model_selection()
+                    .as_ref()
+                    .map(|selection| selection.model.as_str()),
+                Some(model),
+                "durable/session model must come from the preflight config"
+            );
+            assert_eq!(
+                handle
+                    .config_snapshot()
+                    .providers
+                    .active_model
+                    .as_ref()
+                    .map(|selection| selection.model.as_str()),
+                Some(model),
+                "worker snapshot must be the same preflight config"
+            );
+            assert!(
+                handle
+                    .config_snapshot()
+                    .hooks
+                    .hooks
+                    .iter()
+                    .any(|hook| hook.command.first().is_some_and(|command| {
+                        command == &format!("hook-{model}")
+                    })),
+                "worker hooks must be the same preflight config"
+            );
+        }
+
+        let state = tempfile::tempdir().expect("isolated state");
+        let env = crate::test_env::TestEnvGuard::isolate_cockpit_home_at_async(state.path()).await;
+        let workspace = state.path().join("workspace");
+        let config_a = state.path().join("override-a/config.json");
+        let config_b = state.path().join("override-b/config.json");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        write_explicit_model_config(&config_a, "model-a");
+        write_explicit_model_config(&config_b, "model-b");
+
+        let reg = test_registry_with_config_source(
+            crate::daemon::config_source::ConfigSource::production(),
+        );
+        reg.inner
+            .db
+            .set_workspace_trust(
+                &workspace,
+                crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+            )
+            .await
+            .expect("trust workspace");
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls_for_start = Arc::clone(&hook_calls);
+        let config_b_for_start = config_b.clone();
+        reg.set_pre_start_worker_hook(Some(Arc::new(move || {
+            hook_calls_for_start.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: `TestEnvGuard` holds the process-global environment
+            // mutation lock for this whole test. This hook runs synchronously
+            // on its owner test task between preflight and worker construction.
+            unsafe {
+                std::env::set_var(crate::config::dirs::COCKPIT_CONFIG_ENV, &config_b_for_start);
+            }
+        })));
+
+        let daemon_env = || {
+            EnvSnapshot::new(
+                crate::env_snapshot::EnvSnapshotSource::DaemonStart,
+                Default::default(),
+            )
+        };
+
+        env.set_cockpit_config(&config_a);
+        let created = reg
+            .attach(
+                None,
+                Some(workspace.clone()),
+                None,
+                false,
+                None,
+                daemon_env(),
+                proto::SessionEntryMode::Code,
+            )
+            .await
+            .expect("create through preflight A");
+        assert_preflight_model(&created, "model-a");
+        assert!(
+            reg.interrupt_and_stop(created.session_id)
+                .await
+                .expect("stop created worker")
+        );
+
+        let assistant_name = "preflight-authority";
+        let assistant_home = crate::assistants::default_home_dir(assistant_name)
+            .expect("canonical assistant home");
+        crate::assistants::create_assistant(
+            &reg.inner.db,
+            crate::assistants::CreateAssistantSpec {
+                name: assistant_name.to_string(),
+                description: "preflight authority fixture".to_string(),
+                prompt: "Keep the attached configuration authority.".to_string(),
+                home_dir: assistant_home,
+            },
+        )
+        .await
+        .expect("create verified assistant");
+        env.set_cockpit_config(&config_a);
+        let assistant = reg
+            .create_assistant_session(
+                assistant_name,
+                workspace.clone(),
+                None,
+                false,
+                daemon_env(),
+            )
+            .await
+            .expect("assistant creation through preflight A");
+        assert_preflight_model(&assistant, "model-a");
+        assert!(
+            reg.interrupt_and_stop(assistant.session_id)
+                .await
+                .expect("stop assistant worker")
+        );
+
+        let persisted = reg
+            .inner
+            .db
+            .create_session("provider", workspace.to_str().expect("workspace UTF-8"), "Build")
+            .await
+            .expect("durable session for resume");
+        env.set_cockpit_config(&config_a);
+        let resumed = reg
+            .attach(
+                Some(persisted.session_id),
+                None,
+                None,
+                false,
+                None,
+                daemon_env(),
+                proto::SessionEntryMode::Code,
+            )
+            .await
+            .expect("resume through preflight A");
+        assert_preflight_model(&resumed, "model-a");
+        assert!(
+            reg.interrupt_and_stop(resumed.session_id)
+                .await
+                .expect("stop resumed worker")
+        );
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -3321,6 +3733,13 @@ mod tests {
             },
             mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
         };
+        let workspace_root_authority = Arc::new(
+            crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority::capture(
+                &session.project_root,
+                &policy,
+            )
+            .expect("capture test workspace authority"),
+        );
         let err = match reg.start_worker(
             Arc::try_unwrap(session)
                 .ok()
@@ -3331,6 +3750,11 @@ mod tests {
             None,
             None,
             policy,
+            1,
+            workspace_root_authority,
+            cockpit_config::config::workspace_config_layer_snapshot_chain(Vec::new()),
+            crate::config::extended::hooks::HookRegistry::default(),
+            crate::daemon::config_source::ConfigWatchPaths::default(),
             env,
             1,
         ) {

@@ -54,6 +54,10 @@ pub enum DefaultModelStandaloneOutcome {
     Applied {
         selection: Option<cockpit_config::config::providers::ActiveModelRef>,
         generation: u64,
+        /// Opaque digest of the retained attach authority and the exact worker
+        /// config generation at the durable receipt fence.  It is safe to
+        /// expose: it contains no path, credential, or configuration value.
+        authority_revision: String,
         scope_label: String,
         #[serde(default)]
         unchanged: bool,

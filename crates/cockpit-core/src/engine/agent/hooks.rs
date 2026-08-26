@@ -27,13 +27,17 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::config::extended::hooks::{HookEvent, HookRegistry, ResolvedHook};
+use crate::config::extended::hooks::{
+    HookEvent, HookExecutionLaunch, HookRegistry, HookWorkingDirectory, ResolvedHook,
+};
 use crate::db::session_log::{HookRunAudit, HookRunStatus};
 use crate::process_containment::{
     ContainmentError, ContainmentGuarantee, ContainmentLease, EmptyOutcome,
@@ -697,9 +701,11 @@ pub(crate) fn windows_clean_env_additions(
 
 /// Resolve the hook command's executable to an absolute path.
 ///
-/// The config foundation already resolved source-relative paths to absolute or
-/// bare names. A bare name is resolved here before `env_clear` using the
-/// process-environment seam.
+/// This is only the ambient path: the config foundation resolved global and
+/// absolute handlers to absolute or bare names. Captured workspace-relative
+/// handlers bypass this helper entirely through `RetainedHookExecutionAuthority`.
+/// A bare name is resolved here before `env_clear` using the process-environment
+/// seam.
 pub(crate) fn resolve_hook_executable(
     hook: &ResolvedHook,
     process_env: &dyn ProcessEnv,
@@ -711,6 +717,71 @@ pub(crate) fn resolve_hook_executable(
     }
     // Bare executable: resolve via parent-process lookup.
     process_env.resolve_executable(exe)
+}
+
+/// A handler launch after its configuration provenance has been applied.
+///
+/// Ambient hooks retain the historical executable lookup policy.  A relative
+/// project/explicit hook is instead bound to an immutable daemon bundle and a
+/// capability-backed cwd.  Keeping the variants here makes it impossible for
+/// a dispatch path to accidentally unwrap the retained bundle back into a
+/// mutable workspace pathname.
+enum ResolvedHookLaunch {
+    Ambient(PathBuf),
+    Retained(HookExecutionLaunch),
+}
+
+fn resolve_hook_launch(
+    hook: &ResolvedHook,
+    process_env: &dyn ProcessEnv,
+) -> Option<ResolvedHookLaunch> {
+    match hook.retained_execution_launch() {
+        Ok(Some(launch)) => Some(ResolvedHookLaunch::Retained(launch)),
+        Ok(None) => resolve_hook_executable(hook, process_env).map(ResolvedHookLaunch::Ambient),
+        // An unbound/capability-invalid retained launch must fail open.  In
+        // particular, never use `hook.command[0]` as a fallback pathname.
+        Err(_) => None,
+    }
+}
+
+async fn run_hook_launch(
+    runner: &dyn CommandRunner,
+    launch: &ResolvedHookLaunch,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    ambient_workspace_root: &Path,
+    stdin: &str,
+    timeout: Duration,
+    session_id: Uuid,
+) -> HookRawOutput {
+    match launch {
+        ResolvedHookLaunch::Ambient(executable) => {
+            runner
+                .run(
+                    executable,
+                    args,
+                    env,
+                    ambient_workspace_root,
+                    stdin,
+                    timeout,
+                    session_id,
+                )
+                .await
+        }
+        ResolvedHookLaunch::Retained(launch) => {
+            runner
+                .run_retained(
+                    launch,
+                    args,
+                    env,
+                    ambient_workspace_root,
+                    stdin,
+                    timeout,
+                    session_id,
+                )
+                .await
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -784,6 +855,48 @@ pub trait CommandRunner: Send + Sync {
         timeout: Duration,
         session_id: Uuid,
     ) -> HookRawOutput;
+
+    /// Run a source-relative workspace hook whose program and working
+    /// directory were both captured through a daemon-held authority.  Test
+    /// doubles deliberately use their existing `run` seam; the only
+    /// production implementation overrides this to honour the retained cwd.
+    async fn run_retained(
+        &self,
+        launch: &HookExecutionLaunch,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        ambient_workspace_root: &Path,
+        stdin: &str,
+        timeout: Duration,
+        session_id: Uuid,
+    ) -> HookRawOutput {
+        let cwd = match launch.working_directory() {
+            HookWorkingDirectory::Path(path) => path,
+            #[cfg(unix)]
+            // Test runners cannot execute a real child and have no safe
+            // interpretation of the private fd. Keep their stable recorded
+            // cwd contract; TokioCommandRunner below performs `fchdir`.
+            HookWorkingDirectory::RetainedUnixDirectory(_) => ambient_workspace_root,
+            #[cfg(windows)]
+            // Test runners never create a child, so use the lease's diagnostic
+            // spelling only to retain their existing captured-cwd assertion.
+            // The production runner below revalidates the lease immediately
+            // before `CreateProcess`.
+            HookWorkingDirectory::RetainedWindowsDirectory(directory) => {
+                directory.canonical_path()
+            }
+        };
+        self.run(
+            launch.executable(),
+            args,
+            env,
+            cwd,
+            stdin,
+            timeout,
+            session_id,
+        )
+        .await
+    }
 }
 
 /// Terminate the lease and await the same-generation empty oracle, bounded so a
@@ -967,13 +1080,57 @@ async fn spawn_real_hook_child(
     executable: &Path,
     args: &[String],
     env: &BTreeMap<String, String>,
-    cwd: &Path,
+    working_directory: &HookWorkingDirectory,
     stdin: &str,
     timeout: Duration,
 ) -> ChildRunOutcome {
+    // Keep the existing `Command::new(executable)` dispatch on Windows. Rust's
+    // Windows implementation recognizes `.cmd` / `.bat`, resolves the system
+    // command interpreter itself, and uses its batch-specific argument
+    // escaping. In particular, do not hand-roll `cmd.exe /c` here: that would
+    // change the historical runner semantics and can regress its quoting
+    // protections. The retained path is a private immutable bundle, so this
+    // preserves the dispatch without reopening the mutable source executable.
     let mut cmd = tokio::process::Command::new(executable);
     cmd.args(args);
-    cmd.current_dir(cwd);
+    #[cfg(windows)]
+    // Keep an owned clone through the whole child wait. A Windows cwd is a
+    // pathname API, so this no-delete lease is what prevents that pathname
+    // from being renamed/reused after its final FileId check and while the
+    // child is executing.
+    let retained_windows_cwd = match working_directory {
+        HookWorkingDirectory::RetainedWindowsDirectory(directory) => Some(Arc::clone(directory)),
+        _ => None,
+    };
+    match working_directory {
+        HookWorkingDirectory::Path(path) => {
+            cmd.current_dir(path);
+        }
+        #[cfg(unix)]
+        HookWorkingDirectory::RetainedUnixDirectory(directory) => {
+            use std::os::fd::AsRawFd as _;
+            let directory_fd = directory.as_raw_fd();
+            // This runs in the child immediately before exec.  The open fd is
+            // rooted in the attach-time workspace directory, so a later
+            // replacement of the config parent or workspace pathname cannot
+            // redirect project-relative file accesses by the immutable hook
+            // snapshot.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::fchdir(directory_fd) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
+        #[cfg(windows)]
+        HookWorkingDirectory::RetainedWindowsDirectory(_) => {
+            // Set after the final FileId/path revalidation below, immediately
+            // before `CreateProcess` consumes it.
+        }
+    }
     cmd.env_clear();
     for (key, value) in env {
         cmd.env(key, value);
@@ -984,6 +1141,21 @@ async fn spawn_real_hook_child(
     // Drop-safety for the local child handle, IN ADDITION TO the lease
     // terminate + empty barrier (never the sole authority).
     cmd.kill_on_drop(true);
+
+    #[cfg(windows)]
+    if let Some(directory) = &retained_windows_cwd {
+        if directory.revalidate_before_spawn().is_err() {
+            return ChildRunOutcome {
+                stdout: String::new(),
+                exit_code: None,
+                spawn_failed: true,
+                timed_out: false,
+            };
+        }
+        // This call sits immediately before `spawn`/CreateProcess. The lease
+        // remains owned by `retained_windows_cwd` until the child is reaped.
+        cmd.current_dir(directory.canonical_path());
+    }
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -1107,6 +1279,32 @@ async fn spawn_real_hook_child(
     }
 }
 
+/// Narrow real-process seam for authority tests in sibling daemon modules.
+/// Production always reaches [`spawn_real_hook_child`] through containment;
+/// this test-only wrapper proves the retained cwd capability itself selects
+/// the project directory after path replacement (an fd on Unix, a verified
+/// no-delete handle chain on Windows).
+#[cfg(test)]
+pub(crate) async fn spawn_real_hook_child_for_test(
+    executable: &Path,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    working_directory: &HookWorkingDirectory,
+    stdin: &str,
+    timeout: Duration,
+) -> (String, bool, bool) {
+    let output = spawn_real_hook_child(
+        executable,
+        args,
+        env,
+        working_directory,
+        stdin,
+        timeout,
+    )
+    .await;
+    (output.stdout, output.spawn_failed, output.timed_out)
+}
+
 /// Production command runner using tokio::process under a containment lease.
 #[derive(Clone)]
 pub struct TokioCommandRunner {
@@ -1167,7 +1365,7 @@ impl CommandRunner for TokioCommandRunner {
         // the orchestration's owned copies).
         let program = executable.to_path_buf();
         let args_owned = args.to_vec();
-        let cwd_owned = cwd.to_path_buf();
+        let working_directory = HookWorkingDirectory::Path(cwd.to_path_buf());
         let env_owned = env.clone();
         let stdin_owned = stdin.to_string();
         run_hook_child_contained(
@@ -1175,14 +1373,62 @@ impl CommandRunner for TokioCommandRunner {
             session_id,
             program.clone(),
             args_owned.clone(),
-            cwd_owned.clone(),
+            cwd.to_path_buf(),
             start,
             move |_lease| async move {
                 spawn_real_hook_child(
                     &program,
                     &args_owned,
                     &env_owned,
-                    &cwd_owned,
+                    &working_directory,
+                    &stdin_owned,
+                    timeout,
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    async fn run_retained(
+        &self,
+        launch: &HookExecutionLaunch,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        ambient_workspace_root: &Path,
+        stdin: &str,
+        timeout: Duration,
+        session_id: Uuid,
+    ) -> HookRawOutput {
+        let start = Instant::now();
+        let Some(handle) = self.containment.clone() else {
+            return HookRawOutput::containment_failure(
+                REASON_DESCENDANT_CONTAINMENT_UNSUPPORTED,
+                start,
+            );
+        };
+        let program = launch.executable().to_path_buf();
+        let working_directory = launch.working_directory().clone();
+        let args_owned = args.to_vec();
+        let env_owned = env.clone();
+        let stdin_owned = stdin.to_string();
+        // The containment service receives the ambient root only as an audit
+        // label / grouping input. It never determines the child's cwd: the
+        // spawn closure below performs capability-backed fchdir on Unix.
+        let containment_cwd = ambient_workspace_root.to_path_buf();
+        run_hook_child_contained(
+            &handle,
+            session_id,
+            program.clone(),
+            args_owned.clone(),
+            containment_cwd,
+            start,
+            move |_lease| async move {
+                spawn_real_hook_child(
+                    &program,
+                    &args_owned,
+                    &env_owned,
+                    &working_directory,
                     &stdin_owned,
                     timeout,
                 )
@@ -1367,8 +1613,8 @@ pub(crate) async fn run_pre_tool_hooks(
     let stdin = envelope.to_json_string();
 
     for hook in hooks {
-        let executable = match resolve_hook_executable(hook, process_env) {
-            Some(path) => path,
+        let launch = match resolve_hook_launch(hook, process_env) {
+            Some(launch) => launch,
             None => {
                 // Spawn failure: fail-open, record failed run.
                 record_hook_run(
@@ -1419,17 +1665,17 @@ pub(crate) async fn run_pre_tool_hooks(
         };
         let timeout = Duration::from_secs(hook.timeout_secs as u64);
         let args = &hook.command[1..];
-        let raw = runner
-            .run(
-                &executable,
-                args,
-                &child_env,
-                workspace_root,
-                &stdin,
-                timeout,
-                session_id,
-            )
-            .await;
+        let raw = run_hook_launch(
+            runner,
+            &launch,
+            args,
+            &child_env,
+            workspace_root,
+            &stdin,
+            timeout,
+            session_id,
+        )
+        .await;
 
         let decision = if let Some(reason) = raw.failure_reason {
             HookDecision::Failed {
@@ -1518,8 +1764,8 @@ pub(crate) async fn run_post_tool_hooks(
     let stdin = envelope.to_json_string();
 
     for hook in hooks {
-        let executable = match resolve_hook_executable(hook, process_env) {
-            Some(path) => path,
+        let launch = match resolve_hook_launch(hook, process_env) {
+            Some(launch) => launch,
             None => {
                 record_hook_run(
                     db,
@@ -1569,17 +1815,17 @@ pub(crate) async fn run_post_tool_hooks(
         };
         let timeout = Duration::from_secs(hook.timeout_secs as u64);
         let args = &hook.command[1..];
-        let raw = runner
-            .run(
-                &executable,
-                args,
-                &child_env,
-                workspace_root,
-                &stdin,
-                timeout,
-                session_id,
-            )
-            .await;
+        let raw = run_hook_launch(
+            runner,
+            &launch,
+            args,
+            &child_env,
+            workspace_root,
+            &stdin,
+            timeout,
+            session_id,
+        )
+        .await;
 
         let decision = if let Some(reason) = raw.failure_reason {
             HookDecision::Failed {
@@ -1843,8 +2089,8 @@ pub(crate) async fn run_stop_hooks(
     let mut feedback = StopGateFeedback::default();
 
     for hook in hooks {
-        let executable = match resolve_hook_executable(hook, process_env) {
-            Some(path) => path,
+        let launch = match resolve_hook_launch(hook, process_env) {
+            Some(launch) => launch,
             None => {
                 record_hook_run(
                     db,
@@ -1894,17 +2140,17 @@ pub(crate) async fn run_stop_hooks(
         };
         let timeout = Duration::from_secs(hook.timeout_secs as u64);
         let args = &hook.command[1..];
-        let raw = runner
-            .run(
-                &executable,
-                args,
-                &child_env,
-                workspace_root,
-                &stdin,
-                timeout,
-                session_id,
-            )
-            .await;
+        let raw = run_hook_launch(
+            runner,
+            &launch,
+            args,
+            &child_env,
+            workspace_root,
+            &stdin,
+            timeout,
+            session_id,
+        )
+        .await;
 
         let decision = if let Some(reason) = raw.failure_reason {
             HookDecision::Failed {
@@ -2074,8 +2320,8 @@ pub(crate) async fn run_observe_hooks(
     let stdin = envelope.to_json_string();
 
     for hook in hooks {
-        let executable = match resolve_hook_executable(hook, process_env) {
-            Some(path) => path,
+        let launch = match resolve_hook_launch(hook, process_env) {
+            Some(launch) => launch,
             None => {
                 record_hook_run(
                     db,
@@ -2125,17 +2371,17 @@ pub(crate) async fn run_observe_hooks(
         };
         let timeout = Duration::from_secs(hook.timeout_secs as u64);
         let args = &hook.command[1..];
-        let raw = runner
-            .run(
-                &executable,
-                args,
-                &child_env,
-                workspace_root,
-                &stdin,
-                timeout,
-                session_id,
-            )
-            .await;
+        let raw = run_hook_launch(
+            runner,
+            &launch,
+            args,
+            &child_env,
+            workspace_root,
+            &stdin,
+            timeout,
+            session_id,
+        )
+        .await;
 
         let decision = if let Some(reason) = raw.failure_reason {
             HookDecision::Failed {

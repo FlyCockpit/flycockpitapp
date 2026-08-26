@@ -2657,6 +2657,40 @@ CREATE TABLE client_submission_terminal_receipts (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 );
 
+-- Authoritative terminal receipts for config-only SetDefaultModel requests.
+-- The request returns Ack and the result travels on the event stream, so the
+-- durable receipt is the recovery/idempotency source of truth.  It is written
+-- before an event is attempted and before the private config transaction
+-- journal is retired; reusing an id can therefore replay only this exact safe
+-- terminal outcome, never perform a second configuration mutation.
+CREATE TABLE default_model_update_receipts (
+    session_id          TEXT NOT NULL,
+    default_update_id   TEXT NOT NULL,
+    outcome_json        TEXT NOT NULL CHECK (
+        typeof(outcome_json) = 'text'
+        AND length(CAST(outcome_json AS BLOB)) BETWEEN 2 AND 65536
+        AND json_valid(outcome_json)
+    ),
+    -- Opaque retained-attachment receipt fence.  Both values are present for
+    -- a retained authority-bound terminal result (Applied or a recovered
+    -- Restored rejection) and absent for a pre-mutation rejection; raw
+    -- paths/configuration never enter this ledger.
+    authority_revision  TEXT CHECK (
+        authority_revision IS NULL
+        OR (
+            length(authority_revision) = 64
+            AND authority_revision NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    config_generation   INTEGER CHECK (
+        config_generation IS NULL OR config_generation >= 0
+    ),
+    created_at_ms       INTEGER NOT NULL,
+    CHECK ((authority_revision IS NULL) = (config_generation IS NULL)),
+    PRIMARY KEY (session_id, default_update_id),
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+
 -- Authoritative exactly-once ledger for typed user-message submissions. UUID
 -- identities that cross the canonical binary boundary are RFC-byte BLOBs;
 -- actor identity is deliberately absent for the local-owner tuple.
@@ -4020,6 +4054,9 @@ CREATE INDEX idx_text_artifact_reservations_expiry
 CREATE TABLE workspace_trust (
     root_path TEXT PRIMARY KEY,
     mode TEXT NOT NULL CHECK (mode IN ('trust', 'ignore-config', 'untrusted')),
+    -- Monotonic per-root policy fence.  Timestamps are observability only and
+    -- cannot safely linearize two decisions made in the same clock tick.
+    revision INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );

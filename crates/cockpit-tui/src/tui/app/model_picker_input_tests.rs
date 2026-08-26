@@ -2214,6 +2214,9 @@ fn standalone_default_model_result_is_correlated_and_leaves_the_session_alone() 
         outcome: cockpit_core::daemon::proto::DefaultModelStandaloneOutcome::Applied {
             selection: Some(selection("other", "model")),
             generation: 1,
+            authority_revision:
+                "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
+                    .into(),
             scope_label: "user".into(),
             unchanged: false,
         },
@@ -2233,6 +2236,9 @@ fn standalone_default_model_result_is_correlated_and_leaves_the_session_alone() 
         outcome: cockpit_core::daemon::proto::DefaultModelStandaloneOutcome::Applied {
             selection: Some(selection("p", "a")),
             generation: 2,
+            authority_revision:
+                "4d8d4cd5bbf18d6ae07e52adf7f0b6a9e5e8f91a9e72d8cb69c6a129e84e400c"
+                    .into(),
             scope_label: "project".into(),
             unchanged: false,
         },

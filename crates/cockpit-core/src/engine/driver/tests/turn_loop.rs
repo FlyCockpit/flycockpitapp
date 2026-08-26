@@ -1754,6 +1754,7 @@ fn stop_and_stop_failure_registry() -> crate::config::extended::hooks::HookRegis
         origin: HookOrigin::for_test("project:abcdef0123456789:0"),
         source_config_path: std::path::PathBuf::from("/tmp/test/config.json"),
         source_directory: std::path::PathBuf::from("/tmp/test"),
+        execution: crate::config::extended::hooks::HookExecutionProvenance::Ambient,
     };
     HookRegistry {
         hooks: vec![

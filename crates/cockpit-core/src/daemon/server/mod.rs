@@ -459,6 +459,35 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 scrub_model_summary(model, redact);
             }
         }
+        proto::Response::SessionSetupSnapshot { snapshot } => {
+            for candidate in &mut snapshot.candidates {
+                scrub_string(&mut candidate.installation.source_agent_id, redact);
+                scrub_string(&mut candidate.installation.source_identity, redact);
+                if let Some(revision) = &mut candidate.installation.source_revision {
+                    scrub_string(revision, redact);
+                }
+                for slot in &mut candidate.slots {
+                    for choice in &mut slot.choices {
+                        scrub_string(&mut choice.provider_id, redact);
+                        scrub_string(&mut choice.model_id, redact);
+                        if let Some(label) = &mut choice.author_label {
+                            scrub_string(label, redact);
+                        }
+                        if let Some(rationale) = &mut choice.rationale {
+                            scrub_string(rationale, redact);
+                        }
+                    }
+                    for recommendation in &mut slot.unmatched_recommendations {
+                        if let Some(label) = &mut recommendation.author_label {
+                            scrub_string(label, redact);
+                        }
+                        if let Some(rationale) = &mut recommendation.rationale {
+                            scrub_string(rationale, redact);
+                        }
+                    }
+                }
+            }
+        }
         proto::Response::ResourceSnapshot { snapshot } => {
             scrub_resource_scheduler_snapshot(snapshot, redact);
         }
@@ -2762,20 +2791,75 @@ impl DaemonContext {
     pub(crate) fn agent_installation_service(
         &self,
     ) -> Result<Arc<crate::daemon::agent_installation::AgentInstallationService>> {
+        self.agent_installation_service_for_authorized_workspace(None)
+    }
+
+    /// Construct the installation boundary with the already-attached
+    /// session's workspace proof in the local-owner authorization contract.
+    /// The caller receives that immutable proof only from a daemon-owned
+    /// attachment, never from request data or a later path lookup.
+    pub(crate) fn agent_installation_service_for_authorized_workspace(
+        &self,
+        attached_workspace_root: Option<
+            &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+        >,
+    ) -> Result<Arc<crate::daemon::agent_installation::AgentInstallationService>> {
+        self.agent_installation_service_for_authorized_workspace_with_providers(
+            attached_workspace_root,
+            None,
+        )
+    }
+
+    /// Same installation boundary, but lets a read-only projection reuse the
+    /// attached worker's already-authoritative provider snapshot. This avoids
+    /// reopening `canonical_cwd` while a setup request holds an attach-time
+    /// workspace capability.
+    pub(crate) fn agent_installation_service_for_authorized_workspace_with_providers(
+        &self,
+        attached_workspace_root: Option<
+            &crate::daemon::agent_installation::AuthorizedWorkspaceRoot,
+        >,
+        providers: Option<crate::config::providers::ProvidersConfig>,
+    ) -> Result<Arc<crate::daemon::agent_installation::AgentInstallationService>> {
         #[cfg(debug_assertions)]
         if let Some(service) = &self.agent_installation_fixture {
             return Ok(service.clone());
         }
+        let authorized_roots = match attached_workspace_root {
+            // If the session was attached at the daemon cwd, do not capture
+            // that spelling again: a replacement directory would otherwise
+            // be accidentally admitted alongside the attach-time proof.
+            Some(root) if root.canonical_path() == self.canonical_cwd => {
+                vec![root.clone()]
+            }
+            Some(root) => {
+                vec![
+                    crate::daemon::agent_installation::AuthorizedWorkspaceRoot::capture(
+                        &self.canonical_cwd,
+                    )?,
+                    root.clone(),
+                ]
+            }
+            None => vec![
+                crate::daemon::agent_installation::AuthorizedWorkspaceRoot::capture(
+                    &self.canonical_cwd,
+                )?,
+            ],
+        };
         Ok(Arc::new(
-            crate::daemon::agent_installation::default_daemon_service(
+            crate::daemon::agent_installation::default_daemon_service_with_captured_workspace_roots(
                 self.db.clone(),
                 &self.paths,
                 self.secret_vault.clone(),
-                self.config_source()
-                    .load(&self.canonical_cwd)
-                    .context("loading daemon provider configuration")?
-                    .0,
-                vec![self.canonical_cwd.clone()],
+                match providers {
+                    Some(providers) => providers,
+                    None => self
+                        .config_source()
+                        .load(&self.canonical_cwd)
+                        .context("loading daemon provider configuration")?
+                        .0,
+                },
+                authorized_roots,
             )?,
         ))
     }
@@ -3998,7 +4082,9 @@ pub async fn recover_before_socket_publish(ctx: &Arc<DaemonContext>) -> Result<(
     )
     .await
     .context("startup effective-default journal recovery failed")?;
-    crate::daemon::effective_default_recovery::deliver_recovered_terminals(ctx, recovered).await;
+    crate::daemon::effective_default_recovery::deliver_recovered_terminals(ctx, recovered)
+        .await
+        .context("startup recovered effective-default receipt delivery failed")?;
     Ok(())
 }
 
@@ -4231,6 +4317,7 @@ pub(super) struct SharedClientState {
 pub(super) struct SharedAttachedSession {
     session_id: Uuid,
     project_root: PathBuf,
+    workspace_identity: Option<crate::daemon::agent_installation::AuthorizedWorkspaceRoot>,
     /// A concurrent request still has to enter the one attached session worker
     /// for durable decision ownership. Keeping this immutable handle in the
     /// per-request snapshot lets a long-lived operation wait outside the
@@ -4355,6 +4442,7 @@ impl MutableClientState {
             attached: self.attached.as_ref().map(|att| SharedAttachedSession {
                 session_id: att.handle.session_id,
                 project_root: att.handle.project_root.clone(),
+                workspace_identity: att.workspace_identity.clone(),
                 handle: att.handle.clone(),
                 redaction_table: att.handle.redaction_table(),
                 active_tool_names: att.handle.active_tool_names(),
@@ -4500,6 +4588,10 @@ struct ReadyAttachment {
 
 struct AttachedSession {
     handle: SessionWorkerHandle,
+    /// Captured at attach before this connection can issue setup reads. The
+    /// setup projection verifies this stable directory identity rather than
+    /// authorizing a later object that happens to reuse the same pathname.
+    workspace_identity: Option<crate::daemon::agent_installation::AuthorizedWorkspaceRoot>,
     /// Held for the lifetime of the attachment when this client is
     /// interactive (can answer interrupts). Dropping it on detach /
     /// re-attach / disconnect decrements the worker's interactive-client

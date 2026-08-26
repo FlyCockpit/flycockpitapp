@@ -215,7 +215,13 @@ pub use fetch_status::{
     ProviderModelFetchDisplayState, format_model_fetch_age, model_fetch_reason_display,
     provider_model_fetch_display_state, provider_model_fetch_reason_display,
 };
-pub use io::{ActiveModelWriteMode, ConfigDoc, is_xai_grok_provider};
+pub use io::{
+    ActiveModelWriteMode, ConfigDoc, RetainedProviderModelFavoriteTarget,
+    RetainedProviderModelFavoriteLock, RetainedProviderModelFavoriteWriteError,
+    RetainedProviderModelFavoritePostWriteVerifier, RetainedProviderModelFavoritePreWriteVerifier,
+    RetainedProviderModelFavoriteWriteReceipt, RetainedProviderModelSource, is_xai_grok_provider,
+    retained_provider_model_source_from_workspace_layer_snapshots,
+};
 
 pub(crate) use io::next_load_effective_generation;
 pub use io::{load_effective_call_count, load_provider_raw_file, reset_load_effective_call_count};
@@ -223,7 +229,7 @@ pub use io::{load_effective_call_count, load_provider_raw_file, reset_load_effec
 /// The one authoritative effective-default mutation API. Nothing else in the
 /// workspace may write `active_model`.
 pub use crate::config::effective_default::{
-    EffectiveDefaultError, EffectiveDefaultMutationResult, EffectiveDefaultScope,
+    DefaultUpdateAuthorityBinding, EffectiveDefaultError, EffectiveDefaultMutationResult, EffectiveDefaultScope,
     JournalDiagnostic, JournalRecovery, RecoveredOutcome, RecoveredSink, RecoveredTransaction,
     ResolvedTarget, SessionCompensation, SessionDefaultParticipant, SessionRevisionAuthority,
     TransactionCorrelation, journal_diagnostics, journal_path_for_layer, mutate_effective_default,

@@ -1406,6 +1406,7 @@ fn observe_boundary_registry(
             origin: HookOrigin::for_test("project:abcdef0123456789:0"),
             source_config_path: std::path::PathBuf::from("/tmp/test/config.json"),
             source_directory: std::path::PathBuf::from("/tmp/test"),
+            execution: crate::config::extended::hooks::HookExecutionProvenance::Ambient,
         }],
         warnings: Vec::new(),
     }

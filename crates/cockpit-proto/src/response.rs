@@ -687,6 +687,12 @@ pub enum Response {
         inventory_generation: u64,
     },
 
+    /// Answer to [`Request::GetSessionSetupSnapshot`]. All selection and
+    /// availability facts are daemon-owned, credential-free snapshot data.
+    SessionSetupSnapshot {
+        snapshot: crate::SessionSetupSnapshotV1,
+    },
+
     /// Answer to [`Request::ResourceSnapshot`].
     ResourceSnapshot {
         snapshot: ResourceSchedulerSnapshot,
@@ -1403,6 +1409,7 @@ macro_rules! response_variants {
             (Response::Forked { .. }, "forked");
             (Response::BtwFork { .. }, "btw_fork");
             (Response::InventoryBundle { .. }, "inventory_bundle");
+            (Response::SessionSetupSnapshot { .. }, "session_setup_snapshot");
             (Response::ResourceSnapshot { .. }, "resource_snapshot");
             (Response::PromoteResourceResult { .. }, "promote_resource_result");
             (Response::ScheduledJob { .. }, "scheduled_job");

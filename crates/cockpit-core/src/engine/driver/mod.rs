@@ -328,6 +328,11 @@ pub enum DriverControl {
     /// counter, and a client's terminal gate compares against it.
     EmitRecoveredDefaultTerminals {
         transactions: Vec<crate::config::providers::RecoveredTransaction>,
+        /// The retained-config dispatcher must not retire its private journal
+        /// until this driver has durably recorded the exact terminal receipt.
+        /// `None` is retained for direct driver tests that only inspect turn
+        /// events.
+        respond_to: Option<tokio::sync::oneshot::Sender<std::result::Result<(), String>>>,
     },
     /// Set the session's model-comparison tandem (shadow) set
     /// (`/model-comparison`, implementation note).
@@ -5216,9 +5221,14 @@ impl Driver {
                     )
                     .await;
             }
-            DriverControl::EmitRecoveredDefaultTerminals { transactions } => {
-                self.emit_recovered_default_terminals(transactions, tx)
-                    .await;
+            DriverControl::EmitRecoveredDefaultTerminals {
+                transactions,
+                respond_to,
+            } => {
+                let result = self.emit_recovered_default_terminals(transactions, tx).await;
+                if let Some(respond_to) = respond_to {
+                    let _ = respond_to.send(result);
+                }
             }
             DriverControl::SetActiveModelWithDeadline {
                 selection_id,

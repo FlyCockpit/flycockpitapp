@@ -50,6 +50,55 @@ fn hooks_config_parses_and_preserves_source() {
 }
 
 #[test]
+fn modes_session_setup_captured_project_hook_bytes_never_reopen_swapped_source_path() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("workspace/.cockpit/config.json");
+    let retained_bytes = br#"{"hooks":{"sessionStart":[{"command":["retained-hook"]}]}}"#;
+    write_config(
+        &path,
+        r#"{"hooks":{"sessionStart":[{"command":["attacker-hook"]}]}}"#,
+    );
+
+    // The source label is intentionally the mutable pathname that now names
+    // an attacker replacement. The parser must consume the bytes acquired by
+    // the retained workspace capability, not reopen that pathname.
+    let registry = resolve_hooks_from_captured_sources(&[(
+        source(path, ConfigDirKind::Project),
+        Ok(Some(retained_bytes.to_vec())),
+    )]);
+
+    assert!(registry.warnings.is_empty());
+    assert_eq!(registry.hooks.len(), 1);
+    assert_eq!(registry.hooks[0].command, ["retained-hook"]);
+    assert_ne!(registry.hooks[0].command, ["attacker-hook"]);
+}
+
+#[test]
+fn modes_session_setup_captured_relative_project_hook_requires_retained_authority() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("workspace/.cockpit/config.json");
+    let registry = resolve_hooks_from_captured_sources(&[(
+        source(path, ConfigDirKind::Project),
+        Ok(Some(
+            br#"{"hooks":{"sessionStart":[{"command":["./hooks/check"]}]}}"#.to_vec(),
+        )),
+    )]);
+
+    assert!(registry.warnings.is_empty());
+    assert_eq!(registry.hooks.len(), 1);
+    let hook = &registry.hooks[0];
+    assert_eq!(hook.command, ["hooks/check"]);
+    assert!(matches!(
+        &hook.execution,
+        HookExecutionProvenance::RetainedRelative { .. }
+    ));
+    assert!(
+        hook.retained_execution_launch().is_err(),
+        "the parser must not silently reopen the source-relative pathname"
+    );
+}
+
+#[test]
 fn hooks_config_event_table_and_defaults() {
     assert_eq!(
         HookEvent::ALL.map(HookEvent::key),

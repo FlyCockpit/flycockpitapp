@@ -79,6 +79,16 @@ describe("cockpit-proto daemon wire schemas", () => {
     ).toBe(true);
   });
 
+  it("modes_session_setup_nonempty snapshot sentinel stays schema-valid and redacted", () => {
+    const frame = responsesFixture.session_setup_snapshot;
+    expect(responseEnvelopeSchema.safeParse(frame).success).toBe(true);
+    expect(frame.data.snapshot.candidates.length).toBeGreaterThan(0);
+    expect(frame.data.snapshot.selected_installation_id).toBe(
+      frame.data.snapshot.candidates[0]?.installation.installation_id,
+    );
+    expect(JSON.stringify(frame)).not.toContain("credential-profile");
+  });
+
   it("accepts only opaque 64KiB-through-8MiB bulk user-message references", () => {
     const envelope = (total_length: string, mime_class = "opaque") => ({
       v: PROTOCOL_VERSION,
@@ -559,8 +569,8 @@ describe("cockpit-proto daemon wire schemas", () => {
     );
   });
 
-  it("config_refreshed_typescript_mirror_is_v19", () => {
-    expect(PROTOCOL_VERSION).toBe(19);
+  it("config_refreshed_typescript_mirror_is_v20", () => {
+    expect(PROTOCOL_VERSION).toBe(20);
     expect(responseEnvelopeSchema.parse(responsesFixture.config_refreshed)).toEqual(
       responsesFixture.config_refreshed,
     );

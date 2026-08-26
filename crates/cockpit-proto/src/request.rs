@@ -1228,6 +1228,13 @@ pub enum Request {
         selected_agent: String,
     },
 
+    /// Return daemon-owned installed-agent/model setup choices for the
+    /// attached session. The daemon derives both workspace and selected
+    /// installation; callers cannot select another session's inventory.
+    GetSessionSetupSnapshot {
+        session_id: Uuid,
+    },
+
     /// Snapshot the daemon-wide resource scheduler for `/resources`.
     ResourceSnapshot,
 
@@ -3713,6 +3720,7 @@ macro_rules! request_variants {
             (Request::RecordSessionNote { .. }, "record_session_note");
             (Request::DeleteSession { .. }, "delete_session");
             (Request::GetInventoryBundle { .. }, "get_inventory_bundle");
+            (Request::GetSessionSetupSnapshot { .. }, "get_session_setup_snapshot");
             (Request::ResourceSnapshot, "resource_snapshot");
             (Request::PromoteResource { .. }, "promote_resource");
             (Request::CreateScheduledJob { .. }, "create_scheduled_job");
@@ -4003,6 +4011,7 @@ macro_rules! command {
             (Request::RecordSessionNote { session_id, text }, "record_session_note", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid|text:String", [session_id: Uuid => session, text: String => param]);
             (Request::DeleteSession { session_id }, "delete_session", session_row_writer(session_id), field(session_id), true, transactional_mutation, sql_transaction, serialized, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::GetInventoryBundle { project_root, session_id, selected_agent }, "get_inventory_bundle", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, path(project_root), "project_root:String|session_id:Uuid|selected_agent:String", [project_root: String => project_root, session_id: Uuid => session, selected_agent: String => param]);
+            (Request::GetSessionSetupSnapshot { session_id }, "get_session_setup_snapshot", session_row_reader(session_id), field(session_id), false, read_only, none, concurrent, none, "session_id:Uuid", [session_id: Uuid => session]);
             (Request::ResourceSnapshot, "resource_snapshot", owner_only, none, false, local_only, none, concurrent, none, "-", []);
             (Request::PromoteResource { request_id, session_id }, "promote_resource", owner_only, option_field(session_id), true, local_only, none, serialized, none, "request_id:String|session_id:Option<Uuid>", [request_id: String => param, session_id: Option<Uuid> => session]);
             (Request::CreateScheduledJob { job }, "create_scheduled_job", owner_only, none, true, local_only, none, serialized, none, "job:ScheduledJobCreate", [job: ScheduledJobCreate => scheduled]);

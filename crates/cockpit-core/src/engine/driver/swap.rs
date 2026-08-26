@@ -777,21 +777,64 @@ impl Driver {
         &mut self,
         transactions: Vec<crate::config::providers::RecoveredTransaction>,
         tx: &mpsc::Sender<TurnEvent>,
-    ) {
+    ) -> std::result::Result<(), String> {
         use crate::config::providers::{RecoveredOutcome, TransactionCorrelation};
 
         for transaction in transactions {
             if transaction.correlation.session_id() != self.session.id {
                 continue;
             }
-            let Some(generation) =
-                next_active_model_state_generation(self.active_model_state_generation)
-            else {
-                tracing::error!(
+            // A default-update journal carries its receipt authority only after
+            // the sealing fence; `None` is a pending handoff that must never be
+            // delivered as a terminal (see `TransactionCorrelation` docs). Skip
+            // it and leave it for a later sealing pass — an unsealed entry (e.g.
+            // a legacy ambient `DefaultUpdate` journal after upgrade) must not
+            // abort delivery of the sibling `ModelSelection` terminals queued
+            // behind it in the same batch.
+            if matches!(
+                &transaction.correlation,
+                TransactionCorrelation::DefaultUpdate { authority: None, .. }
+                    | TransactionCorrelation::RetainedDefaultUpdate { authority: None, .. }
+            ) {
+                tracing::warn!(
                     session_id = %self.session.id,
-                    "cannot reconcile a recovered model transaction: active model state generation space is exhausted"
+                    "skipping terminal delivery for an unsealed (pending) recovered default-update journal"
                 );
-                break;
+                continue;
+            }
+            // A retained `SetDefaultModel` is config-only. Its terminal
+            // generation is the exact config snapshot generation sealed in
+            // the durable authority binding, not this driver's unrelated
+            // active-model-state sequence. Advancing that sequence here used
+            // to make recovered receipts disagree with their DB authority
+            // columns and with the direct (non-recovery) result.
+            let retained_default = matches!(
+                &transaction.correlation,
+                TransactionCorrelation::RetainedDefaultUpdate { .. }
+            );
+            let generation = if retained_default {
+                transaction
+                    .correlation
+                    .default_update_authority()
+                    .ok_or_else(|| {
+                        "recovered retained default has no sealed authority receipt binding"
+                            .to_string()
+                    })?
+                    .config_generation
+            } else {
+                let Some(generation) =
+                    next_active_model_state_generation(self.active_model_state_generation)
+                else {
+                    tracing::error!(
+                        session_id = %self.session.id,
+                        "cannot reconcile a recovered model transaction: active model state generation space is exhausted"
+                    );
+                    return Err(
+                        "active model state generation space is exhausted while recording a recovered default receipt"
+                            .to_string(),
+                    );
+                };
+                generation
             };
             // A recovered `Applied` for a *session+default* transaction says
             // the durable authorities hold the target while this driver
@@ -812,7 +855,9 @@ impl Driver {
                 },
                 _ => Ok(()),
             };
-            self.active_model_state_generation = generation;
+            if !retained_default {
+                self.active_model_state_generation = generation;
+            }
             if let Err(error) = swapped {
                 // Never claim a model the running agent is not using.
                 let message = format!(
@@ -821,19 +866,59 @@ impl Driver {
                 );
                 match transaction.correlation {
                     TransactionCorrelation::DefaultUpdate {
-                        default_update_id, ..
+                        default_update_id,
+                        authority,
+                        ..
+                    }
+                    | TransactionCorrelation::RetainedDefaultUpdate {
+                        default_update_id,
+                        authority,
+                        ..
                     } => {
-                        let _ = tx
-                            .send(TurnEvent::DefaultModelUpdateResult {
+                        let authority = authority.ok_or_else(|| {
+                            "recovered retained default has no sealed authority receipt binding"
+                                .to_string()
+                        })?;
+                        let outcome =
+                            crate::daemon::proto::DefaultModelStandaloneOutcome::Rejected {
+                                user_message: message,
+                                diagnostic_code: "model_selection_recovered_rebuild_failed"
+                                    .to_string(),
+                            };
+                        let encoded = serde_json::to_string(&outcome).map_err(|error| {
+                            format!("encoding recovered default-model terminal receipt: {error}")
+                        })?;
+                        let receipt = self
+                            .session
+                            .db
+                            .record_default_model_update_receipt(
+                                self.session.id,
                                 default_update_id,
-                                outcome:
-                                    crate::daemon::proto::DefaultModelStandaloneOutcome::Rejected {
-                                        user_message: message,
-                                        diagnostic_code: "model_selection_recovered_rebuild_failed"
-                                            .to_string(),
-                                    },
-                            })
-                            .await;
+                                crate::db::session_log::DefaultModelUpdateReceipt {
+                                    outcome_json: encoded,
+                                    authority_revision: Some(
+                                        authority.authority_revision.clone(),
+                                    ),
+                                    config_generation: Some(authority.config_generation),
+                                },
+                            )
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "persisting recovered default-model terminal receipt: {error:#}"
+                                )
+                            })?;
+                        if matches!(
+                            receipt,
+                            crate::db::session_log::DefaultModelUpdateReceiptWrite::Recorded
+                        ) {
+                            let _ = tx
+                                .send(TurnEvent::DefaultModelUpdateResult {
+                                    default_update_id,
+                                    outcome,
+                                })
+                                .await;
+                        }
                     }
                     TransactionCorrelation::ModelSelection { selection_id, .. } => {
                         let Some(requested) = transaction.requested.clone() else {
@@ -863,13 +948,25 @@ impl Driver {
             }
             match transaction.correlation {
                 TransactionCorrelation::DefaultUpdate {
-                    default_update_id, ..
+                    default_update_id,
+                    authority,
+                    ..
+                }
+                | TransactionCorrelation::RetainedDefaultUpdate {
+                    default_update_id,
+                    authority,
+                    ..
                 } => {
+                    let authority = authority.ok_or_else(|| {
+                        "recovered retained default has no sealed authority receipt binding"
+                            .to_string()
+                    })?;
                     let outcome = match &transaction.outcome {
                         RecoveredOutcome::Applied { selection, .. } => {
                             crate::daemon::proto::DefaultModelStandaloneOutcome::Applied {
                                 selection: selection.clone(),
                                 generation,
+                                authority_revision: authority.authority_revision.clone(),
                                 scope_label: transaction.scope_label.clone(),
                                 unchanged: false,
                             }
@@ -886,12 +983,61 @@ impl Driver {
                             }
                         }
                     };
-                    let _ = tx
-                        .send(TurnEvent::DefaultModelUpdateResult {
+                    let encoded = serde_json::to_string(&outcome).map_err(|error| {
+                        format!("encoding recovered default-model terminal receipt: {error}")
+                    })?;
+                    let (authority_revision, config_generation) = match &outcome {
+                        crate::daemon::proto::DefaultModelStandaloneOutcome::Applied {
+                            authority_revision,
+                            ..
+                        } => {
+                            if authority_revision != &authority.authority_revision {
+                                return Err(
+                                    "recovered retained default receipt revision disagrees with its journal binding"
+                                        .to_string(),
+                                );
+                            }
+                            (
+                                Some(authority.authority_revision.clone()),
+                                Some(authority.config_generation),
+                            )
+                        }
+                        crate::daemon::proto::DefaultModelStandaloneOutcome::Rejected { .. } => {
+                            (
+                                Some(authority.authority_revision.clone()),
+                                Some(authority.config_generation),
+                            )
+                        }
+                    };
+                    let receipt = self
+                        .session
+                        .db
+                        .record_default_model_update_receipt(
+                            self.session.id,
                             default_update_id,
-                            outcome,
-                        })
-                        .await;
+                            crate::db::session_log::DefaultModelUpdateReceipt {
+                                outcome_json: encoded,
+                                authority_revision,
+                                config_generation,
+                            },
+                        )
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "persisting recovered default-model terminal receipt: {error:#}"
+                            )
+                        })?;
+                    if matches!(
+                        receipt,
+                        crate::db::session_log::DefaultModelUpdateReceiptWrite::Recorded
+                    ) {
+                        let _ = tx
+                            .send(TurnEvent::DefaultModelUpdateResult {
+                                default_update_id,
+                                outcome,
+                            })
+                            .await;
+                    }
                 }
                 TransactionCorrelation::ModelSelection { selection_id, .. } => {
                     let Some(requested) = transaction.requested.clone() else {
@@ -946,6 +1092,7 @@ impl Driver {
                 }
             }
         }
+        Ok(())
     }
 
     /// Bring the live root agent onto a model that recovery already committed
@@ -1297,6 +1444,19 @@ impl Driver {
                 "default_model_write_failed",
             ));
         }
+
+        // This legacy Ctrl+Enter path still owns an ambient effective-default
+        // transaction (unlike the retained daemon RPC). It must therefore
+        // participate in the same publication order as SetWorkspaceTrust:
+        // either it completes under the policy observed before the durable
+        // transition, or it begins only after the worker's shared policy cell
+        // and retained snapshot have been projected. Without this gate a
+        // driver could capture Trust, then write a project layer after an
+        // IgnoreConfig decision committed.
+        let _config_publication_guard =
+            crate::daemon::server::dispatch::CONFIG_PUBLICATION_RPC_LOCK
+                .lock()
+                .await;
 
         let prior_session = self
             .session

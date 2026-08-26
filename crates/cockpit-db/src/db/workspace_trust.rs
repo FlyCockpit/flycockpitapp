@@ -50,6 +50,9 @@ impl FromStr for WorkspaceTrustMode {
 pub struct WorkspaceTrustDecision {
     pub root_path: String,
     pub mode: WorkspaceTrustMode,
+    /// Monotonic durable version for one root. Consumers use this as a
+    /// publication fence; `updated_at` is not sufficiently precise.
+    pub revision: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -73,10 +76,11 @@ impl Db {
         now: i64,
     ) -> Result<WorkspaceTrustDecision> {
         conn.execute(
-            "INSERT INTO workspace_trust (root_path, mode, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)
+            "INSERT INTO workspace_trust (root_path, mode, revision, created_at, updated_at)
+             VALUES (?1, ?2, 1, ?3, ?3)
              ON CONFLICT(root_path) DO UPDATE SET
                 mode = excluded.mode,
+                revision = workspace_trust.revision + 1,
                 updated_at = excluded.updated_at",
             params![normalized_root, mode.as_str(), now],
         )
@@ -126,7 +130,7 @@ fn canonical_dir_path(path: &Path) -> Result<PathBuf> {
 
 fn query_decision_by_root(conn: &Connection, root: &str) -> Result<Option<WorkspaceTrustDecision>> {
     conn.query_row(
-        "SELECT root_path, mode, created_at, updated_at
+        "SELECT root_path, mode, revision, created_at, updated_at
            FROM workspace_trust
           WHERE root_path = ?1",
         [root],
@@ -147,6 +151,7 @@ fn decode_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceTrustDe
                 Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
             )
         })?,
+        revision: row.get("revision")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -178,6 +183,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.mode, WorkspaceTrustMode::Trust);
         assert_eq!(first.root_path, canonical_root);
+        assert_eq!(first.revision, 1);
         assert_eq!(first.created_at, first.updated_at);
 
         let second = db
@@ -186,6 +192,7 @@ mod tests {
             .unwrap();
         assert_eq!(second.mode, WorkspaceTrustMode::IgnoreConfig);
         assert_eq!(second.root_path, first.root_path);
+        assert_eq!(second.revision, first.revision + 1);
         assert_eq!(second.created_at, first.created_at);
         assert!(second.updated_at >= first.updated_at);
 

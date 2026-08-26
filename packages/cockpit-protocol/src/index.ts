@@ -15,7 +15,7 @@ export * from "./remote-websocket-fallback";
 export * from "./remote-wire-magic-registry";
 export * from "./send-user-message-v2";
 
-export const PROTOCOL_VERSION = 19 as const;
+export const PROTOCOL_VERSION = 20 as const;
 
 /** Immutable daemon-owned session setup metadata; never an authority grant. */
 export const sessionEntryModeSchema = z.enum(["code", "assistant", "computer"]);
@@ -699,6 +699,7 @@ const requestParamSchemas = {
       selected_agent: z.string().min(1),
     })
     .strict(),
+  get_session_setup_snapshot: z.object({ session_id: uuidSchema }).strict(),
   list_sessions: z
     .object({
       project_id: z.string().nullable().optional(),
@@ -1001,6 +1002,7 @@ const clientRequestVariants = [
   requestVariant("git_diff_file", requestParamSchemas.git_diff_file),
   requestVariant("git_status", requestParamSchemas.git_status),
   requestVariant("get_inventory_bundle", requestParamSchemas.get_inventory_bundle),
+  requestVariant("get_session_setup_snapshot", requestParamSchemas.get_session_setup_snapshot),
   requestVariant("list_sessions", requestParamSchemas.list_sessions),
   requestVariant("read_history_page", requestParamSchemas.read_history_page),
   requestVariant("read_agent_tree", requestParamSchemas.read_agent_tree),
@@ -1142,6 +1144,7 @@ export const responseNameSchema = z.enum([
   "agent_decision_steered",
   "history_page",
   "inventory_bundle",
+  "session_setup_snapshot",
   "models",
   "restart_decision",
   "run_invocation_status",
@@ -1693,6 +1696,100 @@ export const responseEnvelopeSchema = z.discriminatedUnion("response", [
       })
       .passthrough(),
   ),
+  responseVariant(
+    "session_setup_snapshot",
+    z
+      .object({
+        snapshot: z
+          .object({
+            dto_version: z.literal(1),
+            session_id: uuidSchema,
+            config_generation: safeU64NumberSchema,
+            revision: safeU64NumberSchema,
+            selected_installation_id: uuidSchema.optional(),
+            candidates: z.array(
+              z
+                .object({
+                  installation: z
+                    .object({
+                      installation_id: uuidSchema,
+                      scope: z.enum(["global", "workspace_private", "workspace_shared"]),
+                      source_agent_id: z.string().min(1),
+                      source_identity: z.string().min(1),
+                      source_revision: z.string().optional(),
+                      source_digest: z.string().length(64),
+                      installation_revision: safeU64NumberSchema,
+                      bindings: z
+                        .array(
+                          z
+                            .object({
+                              slot_id: z.string().min(1),
+                              state: z.enum([
+                                "bound",
+                                "primary_unusable",
+                                "optional_unbound",
+                                "rebind_required",
+                              ]),
+                              model_id: z.string(),
+                            })
+                            .strict(),
+                        )
+                        .optional(),
+                    })
+                    .strict(),
+                  selected: z.boolean(),
+                  slots: z
+                    .array(
+                      z
+                        .object({
+                          slot_id: z.string().min(1),
+                          choices: z
+                            .array(
+                              z
+                                .object({
+                                  choice_id: z.string().min(1),
+                                  slot_id: z.string().min(1),
+                                  offering_id: z.string().min(1),
+                                  provider_id: z.string().min(1),
+                                  model_id: z.string().min(1),
+                                  recommendation_id: z.string().min(1).optional(),
+                                  canonical_upstream_identity: z.string().min(1).optional(),
+                                  author_label: z.string().min(1).optional(),
+                                  rationale: z.string().min(1).optional(),
+                                  author_suggested: z.boolean(),
+                                  exact_alias_match: z.boolean(),
+                                })
+                                .strict(),
+                            )
+                            .optional(),
+                          unmatched_recommendations: z
+                            .array(
+                              z
+                                .object({
+                                  recommendation_id: z.string().min(1),
+                                  canonical_upstream_identity: z.string().min(1),
+                                  author_label: z.string().min(1).optional(),
+                                  rationale: z.string().min(1).optional(),
+                                })
+                                .strict(),
+                            )
+                            .optional(),
+                          unavailable_reason: z
+                            .enum(["no_hard_compatible_local_model", "rebind_required"])
+                            .optional(),
+                        })
+                        .strict(),
+                    )
+                    .optional(),
+                  locked_reason: z.enum(["definition_unavailable", "rebind_required"]).optional(),
+                })
+                .strict(),
+            ),
+          })
+          .strict(),
+      })
+      .strict(),
+  ),
   responseVariant("stats_rollup", z.object({ rollup: statsRollupWireSchema }).passthrough()),
   responseVariant(
     "restart_decision",
@@ -2030,6 +2127,7 @@ export const defaultModelStandaloneOutcomeSchema = z.discriminatedUnion("status"
       // Null when the default was cleared and nothing is inherited.
       selection: activeModelRefSchema.nullable().optional(),
       generation: safeU64NumberSchema,
+      authority_revision: z.string().regex(/^[a-f0-9]{64}$/),
       scope_label: z.string(),
       unchanged: z.boolean().optional(),
     })

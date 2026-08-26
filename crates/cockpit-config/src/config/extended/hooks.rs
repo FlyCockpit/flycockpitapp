@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -264,7 +265,159 @@ impl HookOrigin {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+/// Execution context for an already-resolved hook command.
+///
+/// This is deliberately runtime-only. It is neither serializable nor included
+/// in diagnostics: a daemon may attach a capability-backed implementation for
+/// a workspace-relative hook, and that capability must never cross a protocol,
+/// log, audit record, or configuration export.
+#[derive(Clone)]
+pub struct HookExecutionLaunch {
+    executable: PathBuf,
+    working_directory: HookWorkingDirectory,
+    /// Holds any daemon-private execution bundle alive until the child has
+    /// inherited its program and working-directory state.
+    _lease: Option<Arc<dyn HookExecutionLease>>,
+}
+
+impl HookExecutionLaunch {
+    pub fn ambient(executable: PathBuf, working_directory: PathBuf) -> Self {
+        Self {
+            executable,
+            working_directory: HookWorkingDirectory::Path(working_directory),
+            _lease: None,
+        }
+    }
+
+    pub fn retained(
+        executable: PathBuf,
+        working_directory: HookWorkingDirectory,
+        lease: Arc<dyn HookExecutionLease>,
+    ) -> Self {
+        Self {
+            executable,
+            working_directory,
+            _lease: Some(lease),
+        }
+    }
+
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub fn working_directory(&self) -> &HookWorkingDirectory {
+        &self.working_directory
+    }
+}
+
+impl fmt::Debug for HookExecutionLaunch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HookExecutionLaunch")
+            .field("execution", &"runtime-private")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Object retained solely to keep a capability-backed hook launch valid.
+/// Implementations must not expose their path/handle through `Debug` or any
+/// serialization boundary.
+pub trait HookExecutionLease: Send + Sync {}
+
+/// Windows-specific working-directory lease.  `CreateProcess` accepts a
+/// pathname rather than a directory handle, so the daemon implementation keeps
+/// a no-delete handle chain alive and re-proves the canonical spelling still
+/// names that exact chain immediately before spawning the child.  This narrow
+/// trait keeps the handle and its private proof out of config, protocol, and
+/// diagnostics while allowing the core runner to use the verified spelling.
+#[cfg(windows)]
+pub trait RetainedWindowsHookWorkingDirectory: HookExecutionLease {
+    fn canonical_path(&self) -> &Path;
+    fn revalidate_before_spawn(&self) -> Result<(), String>;
+}
+
+/// A working directory selected by the hook authority.  The retained Unix
+/// variant keeps an already-open directory alive so `pre_exec(fchdir)` can use
+/// the original directory even after its pathname is renamed or replaced. The
+/// Windows variant carries a typed no-delete lease because `CreateProcess`
+/// requires a path for `lpCurrentDirectory`.
+#[derive(Clone)]
+pub enum HookWorkingDirectory {
+    Path(PathBuf),
+    #[cfg(unix)]
+    RetainedUnixDirectory(Arc<std::fs::File>),
+    #[cfg(windows)]
+    RetainedWindowsDirectory(Arc<dyn RetainedWindowsHookWorkingDirectory>),
+}
+
+impl fmt::Debug for HookWorkingDirectory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Path(_) => formatter.write_str("HookWorkingDirectory::Path(..)"),
+            #[cfg(unix)]
+            Self::RetainedUnixDirectory(_) => {
+                formatter.write_str("HookWorkingDirectory::RetainedUnixDirectory(..)")
+            }
+            #[cfg(windows)]
+            Self::RetainedWindowsDirectory(_) => {
+                formatter.write_str("HookWorkingDirectory::RetainedWindowsDirectory(..)")
+            }
+        }
+    }
+}
+
+/// Daemon-only authority for one source-relative hook executable.  The config
+/// crate owns the typed hand-off while the daemon supplies the platform file
+/// capability and private execution bundle below it.
+pub trait RetainedHookExecutionAuthority: Send + Sync {
+    fn launch(&self, relative_components: &[String]) -> Result<HookExecutionLaunch, String>;
+}
+
+/// How `command[0]` was resolved.  Relative project/explicit commands are not
+/// lexicalized into a mutable source pathname: they require a daemon-retained
+/// authority to produce a launch context at execution time.
+#[derive(Clone)]
+pub enum HookExecutionProvenance {
+    Ambient,
+    RetainedRelative {
+        components: Vec<String>,
+        authority: Option<Arc<dyn RetainedHookExecutionAuthority>>,
+    },
+}
+
+impl fmt::Debug for HookExecutionProvenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ambient => formatter.write_str("HookExecutionProvenance::Ambient"),
+            Self::RetainedRelative { components, authority } => formatter
+                .debug_struct("HookExecutionProvenance::RetainedRelative")
+                .field("component_count", &components.len())
+                .field("authority_bound", &authority.is_some())
+                .finish(),
+        }
+    }
+}
+
+impl PartialEq for HookExecutionProvenance {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ambient, Self::Ambient) => true,
+            (
+                Self::RetainedRelative {
+                    components: left, ..
+                },
+                Self::RetainedRelative {
+                    components: right, ..
+                },
+            ) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for HookExecutionProvenance {}
+
+#[derive(Clone)]
 pub struct ResolvedHook {
     pub event: HookEvent,
     pub matcher: Option<BTreeSet<String>>,
@@ -274,7 +427,60 @@ pub struct ResolvedHook {
     pub origin: HookOrigin,
     pub source_config_path: PathBuf,
     pub source_directory: PathBuf,
+    pub execution: HookExecutionProvenance,
 }
+
+impl ResolvedHook {
+    /// Bind the non-serializable daemon capability for a captured
+    /// source-relative executable. Calling this for an ambient command is a
+    /// construction invariant violation, so it is intentionally a typed error
+    /// rather than silently widening execution to a pathname.
+    pub fn bind_retained_execution_authority(
+        &mut self,
+        authority: Arc<dyn RetainedHookExecutionAuthority>,
+    ) -> Result<(), &'static str> {
+        match &mut self.execution {
+            HookExecutionProvenance::RetainedRelative {
+                authority: bound, ..
+            } => {
+                *bound = Some(authority);
+                Ok(())
+            }
+            HookExecutionProvenance::Ambient => {
+                Err("ambient hook executable must not receive retained execution authority")
+            }
+        }
+    }
+
+    pub fn retained_execution_launch(&self) -> Result<Option<HookExecutionLaunch>, String> {
+        match &self.execution {
+            HookExecutionProvenance::Ambient => Ok(None),
+            HookExecutionProvenance::RetainedRelative {
+                components,
+                authority: Some(authority),
+            } => authority.launch(components).map(Some),
+            HookExecutionProvenance::RetainedRelative {
+                authority: None, ..
+            } => Err("retained relative hook executable has no daemon execution authority".into()),
+        }
+    }
+}
+
+impl PartialEq for ResolvedHook {
+    fn eq(&self, other: &Self) -> bool {
+        self.event == other.event
+            && self.matcher == other.matcher
+            && self.command == other.command
+            && self.timeout_secs == other.timeout_secs
+            && self.env == other.env
+            && self.origin == other.origin
+            && self.source_config_path == other.source_config_path
+            && self.source_directory == other.source_directory
+            && self.execution == other.execution
+    }
+}
+
+impl Eq for ResolvedHook {}
 
 impl fmt::Debug for ResolvedHook {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -287,6 +493,7 @@ impl fmt::Debug for ResolvedHook {
             .field("timeout_secs", &self.timeout_secs)
             .field("env_keys", &self.env.keys().collect::<Vec<_>>())
             .field("origin", &self.origin)
+            .field("execution", &self.execution)
             .finish_non_exhaustive()
     }
 }
@@ -306,12 +513,21 @@ pub struct HookRegistry {
 
 pub fn resolve_hooks_for_cwd(cwd: &Path) -> HookRegistry {
     let paths = config_file_paths_for_load(cwd);
-    let sources = sources_for_cwd(cwd, paths);
+    let explicit = std::env::var_os(COCKPIT_CONFIG_ENV).is_some_and(|value| !value.is_empty());
+    let sources = hook_sources_for_config_paths(cwd, paths, explicit);
     resolve_hooks_from_sources(&sources)
 }
 
-fn sources_for_cwd(cwd: &Path, paths: Vec<PathBuf>) -> Vec<HookConfigSource> {
-    if std::env::var_os(COCKPIT_CONFIG_ENV).is_some_and(|value| !value.is_empty()) {
+/// Classify a caller-captured sequence of effective config paths for hook
+/// resolution without re-reading `COCKPIT_CONFIG`. Daemon workers retain this
+/// source selection at attach time so later process-environment mutation
+/// cannot redirect a running session's hook configuration.
+pub fn hook_sources_for_config_paths(
+    cwd: &Path,
+    paths: Vec<PathBuf>,
+    explicit_config_override: bool,
+) -> Vec<HookConfigSource> {
+    if explicit_config_override {
         return paths
             .into_iter()
             .map(|path| HookConfigSource {
@@ -339,6 +555,42 @@ pub fn resolve_hooks_from_sources(sources: &[HookConfigSource]) -> HookRegistry 
     let mut seen = HashSet::new();
     for source in sources {
         resolve_source(source, &mut registry, &mut seen);
+    }
+    registry
+}
+
+/// Resolve hooks from bytes acquired by the caller's filesystem authority.
+///
+/// The parser deliberately retains the original source metadata for warning,
+/// precedence, origin, and relative-command behavior, but does not reopen the
+/// path represented by a captured entry.  Daemon workers use this for
+/// workspace/explicit layers held at attach; ordinary global callers can keep
+/// using [`resolve_hooks_from_sources`].
+pub fn resolve_hooks_from_captured_sources(
+    sources: &[(HookConfigSource, Result<Option<Vec<u8>>, String>)],
+) -> HookRegistry {
+    let mut registry = HookRegistry::default();
+    let mut seen = HashSet::new();
+    for (source, captured) in sources {
+        match captured {
+            Ok(bytes) => resolve_source_bytes(
+                source,
+                bytes.as_deref(),
+                &source_digest(&source.path),
+                matches!(
+                    source.kind,
+                    HookSourceKind::Layer(ConfigDirKind::Project) | HookSourceKind::Explicit
+                ),
+                &mut registry,
+                &mut seen,
+            ),
+            Err(error) => warn(
+                &mut registry,
+                source,
+                None,
+                format!("could not read config: {error}"),
+            ),
+        }
     }
     registry
 }
@@ -404,11 +656,14 @@ fn resolve_source(
     registry: &mut HookRegistry,
     seen: &mut HashSet<DedupKey>,
 ) {
-    if !source.path.exists() {
-        return;
-    }
+    // Ordinary global/non-daemon resolution retains the previous canonical
+    // origin behavior. Daemon-held sources use the captured-byte entry point
+    // above, which intentionally never canonicalizes/reopens their path.
+    let source_identity_path =
+        std::fs::canonicalize(&source.path).unwrap_or_else(|_| source.path.clone());
     let bytes = match std::fs::read(&source.path) {
-        Ok(bytes) => bytes,
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             warn(
                 registry,
@@ -418,6 +673,27 @@ fn resolve_source(
             );
             return;
         }
+    };
+    resolve_source_bytes(
+        source,
+        bytes.as_deref(),
+        &source_digest(&source_identity_path),
+        false,
+        registry,
+        seen,
+    );
+}
+
+fn resolve_source_bytes(
+    source: &HookConfigSource,
+    bytes: Option<&[u8]>,
+    digest: &str,
+    retain_relative_executable: bool,
+    registry: &mut HookRegistry,
+    seen: &mut HashSet<DedupKey>,
+) {
+    let Some(bytes) = bytes else {
+        return;
     };
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return;
@@ -442,7 +718,6 @@ fn resolve_source(
         .parent()
         .unwrap_or_else(|| Path::new(""))
         .to_path_buf();
-    let digest = source_digest(&source.path);
     let kind = origin_kind(&source.kind);
     let mut index = 0_usize;
     for (event_key, value) in hooks.0 {
@@ -488,8 +763,9 @@ fn resolve_source(
                 &source.path,
                 &source_directory,
                 kind,
-                &digest,
+                digest,
                 handler_index,
+                retain_relative_executable,
             ) {
                 Ok(resolved) => resolved,
                 Err(error) => {
@@ -525,6 +801,7 @@ fn validate_handler(
     kind: &str,
     digest: &str,
     index: usize,
+    retain_relative_executable: bool,
 ) -> Result<ResolvedHook, &'static str> {
     if raw.command.is_empty() || raw.command.iter().any(String::is_empty) {
         return Err("command must be a non-empty argv array with no empty items");
@@ -543,8 +820,25 @@ fn validate_handler(
     }
     let matcher = validate_matcher(event.policy().matcher, raw.matcher)?;
     let mut command = raw.command;
-    command[0] = resolve_executable(&command[0], source_directory)
-        .ok_or("resolved executable path is not valid UTF-8")?;
+    let execution = if retain_relative_executable
+        && !Path::new(&command[0]).is_absolute()
+        && !is_bare_executable(Path::new(&command[0]))
+    {
+        let components = retained_relative_components(&command[0])?;
+        // Keep the source-relative spelling deterministic for deduplication and
+        // diagnostics, but never turn it into a source-directory pathname.
+        // The daemon binds a retained execution authority before this registry
+        // can reach a running worker.
+        command[0] = components.join("/");
+        HookExecutionProvenance::RetainedRelative {
+            components,
+            authority: None,
+        }
+    } else {
+        command[0] = resolve_executable(&command[0], source_directory)
+            .ok_or("resolved executable path is not valid UTF-8")?;
+        HookExecutionProvenance::Ambient
+    };
     Ok(ResolvedHook {
         event,
         matcher,
@@ -554,7 +848,42 @@ fn validate_handler(
         origin: HookOrigin(format!("{kind}:{digest}:{index}")),
         source_config_path: source_path.to_path_buf(),
         source_directory: source_directory.to_path_buf(),
+        execution,
     })
+}
+
+/// Convert an attached workspace hook's relative executable into a bounded
+/// no-parent-traversal component list.  The retained authority will open each
+/// component without following links; accepting `..` here would escape that
+/// capability and reintroduce the very mutable-path authority this type
+/// protects against.
+fn retained_relative_components(executable: &str) -> Result<Vec<String>, &'static str> {
+    let path = Path::new(executable);
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(component) => {
+                let component = component
+                    .to_str()
+                    .ok_or("relative executable path is not valid UTF-8")?;
+                if component.is_empty() {
+                    return Err("relative executable path has an empty component");
+                }
+                components.push(component.to_owned());
+            }
+            Component::ParentDir => {
+                return Err("relative executable path must not traverse parent directories");
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("relative executable path is not relative");
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err("relative executable path must name a file");
+    }
+    Ok(components)
 }
 
 fn validate_matcher(
@@ -631,8 +960,10 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 fn source_digest(path: &Path) -> String {
     use std::fmt::Write as _;
 
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    // Captured daemon source paths are immutable attach-time descriptors, so
+    // hashing their spelling is sufficient for a stable origin and cannot
+    // reopen a possibly replaced path merely to decorate metadata.
+    let digest = Sha256::digest(path.to_string_lossy().as_bytes());
     let mut output = String::with_capacity(16);
     for byte in digest.iter().take(8) {
         write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");

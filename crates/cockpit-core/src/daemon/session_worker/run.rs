@@ -3965,7 +3965,7 @@ pub(super) async fn run_worker(
         crate::engine::model::EndpointRecoveryAdditionalParams,
     >,
     project_root: PathBuf,
-    trust_policy: crate::config::trust::WorkspaceTrustPolicy,
+    trust_policy: crate::config::trust::SharedWorkspaceTrustPolicy,
     mut work_rx: mpsc::Receiver<SessionWork>,
     event_tx: EventSender,
     turn_completions: Arc<Mutex<TurnCompletions>>,
@@ -5816,7 +5816,7 @@ pub(super) async fn run_worker(
     let driver_queue_for_loop = driver_input_queue.clone();
     let resolver_registry_for_driver = tree_resolver_registry.clone();
     let mut driver_handle = tokio::spawn(async move {
-        crate::config::trust::scope_workspace_trust_policy(trust_policy, async move {
+        crate::config::trust::scope_shared_workspace_trust_policy(trust_policy, async move {
             let driver_loop = Box::pin(driver.run_main_loop(
                 driver_queue_for_loop,
                 driver_control_rx,
@@ -7944,14 +7944,20 @@ pub(super) async fn run_worker(
                     );
                     let _ = respond_to.send(Ok((item, queue)));
                 }
-                SessionWork::EmitRecoveredDefaultTerminals { transactions } => {
-                    // Best effort: if the driver is gone there is no terminal
-                    // gate left to satisfy, and the converged durable state is
-                    // already what the next attach will serve.
+                SessionWork::EmitRecoveredDefaultTerminals {
+                    transactions,
+                    respond_to,
+                } => {
+                    // The retained config journal is not cleanup-safe until
+                    // the driver's durable receipt ledger has accepted the
+                    // terminal result. A closed driver drops `respond_to`,
+                    // which the dispatcher treats as a retained retry rather
+                    // than a false terminal acknowledgement.
                     let _ = send_driver_control_or_fail(
                         &driver_control_tx,
                         crate::engine::driver::DriverControl::EmitRecoveredDefaultTerminals {
                             transactions,
+                            respond_to: Some(respond_to),
                         },
                         &event_tx,
                         &turn_completions,
@@ -9329,9 +9335,16 @@ pub(super) async fn run_worker(
                 }
                 SessionWork::ReplaceConfigSnapshot {
                     snapshot,
+                    expected_generation,
+                    expected_trust_revision,
                     respond_to,
                 } => {
-                    let result = replace_config_snapshot(&config_snapshot, *snapshot);
+                    let result = replace_config_snapshot_if_current(
+                        &config_snapshot,
+                        *snapshot,
+                        expected_generation,
+                        expected_trust_revision,
+                    );
                     let changed = result.changed;
                     send_config_snapshot_event_if_changed(
                         &event_tx,

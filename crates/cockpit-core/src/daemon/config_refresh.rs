@@ -16,12 +16,18 @@ pub(crate) struct ConfigRefreshFailureDeduper {
 pub(crate) struct ConfigRefreshResult {
     pub applied_generation: u64,
     pub changed: bool,
+    /// Internal worker-CAS signal. Public refresh callers always consume this
+    /// by retrying; it never crosses the daemon protocol boundary.
+    stale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExplicitConfigRefreshError {
     InvalidResponseMetricsTokenizer,
     InvalidConfig(String),
+    /// A newer publication won while this resolution was in flight. This is
+    /// private control flow; callers retry from the retained authority.
+    Stale,
     Internal,
 }
 
@@ -30,15 +36,92 @@ pub(crate) async fn refresh_session_config_explicit(
     config_source: &ConfigSource,
     handle: &SessionWorkerHandle,
 ) -> std::result::Result<ConfigRefreshResult, ExplicitConfigRefreshError> {
-    let trust_policy =
-        crate::config::trust::resolve_workspace_trust_policy_from_db(db, &handle.project_root)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "failed to resolve trust for explicit config refresh");
-                ExplicitConfigRefreshError::Internal
-            })?;
+    refresh_session_config_explicit_with_retry(db, config_source, handle).await
+}
+
+/// Publish the retained projection for one already-committed trust decision.
+/// Unlike the watcher path this never adopts a newer DB value on retry: a
+/// superseding transition owns its own convergence pass, and this call must
+/// fail stale rather than publish the wrong authority under its caller.
+pub(crate) async fn refresh_session_config_for_trust_transition(
+    db: &Db,
+    config_source: &ConfigSource,
+    handle: &SessionWorkerHandle,
+    resolved_trust: &crate::config::trust::ResolvedWorkspaceTrustPolicy,
+) -> std::result::Result<ConfigRefreshResult, ExplicitConfigRefreshError> {
+    refresh_session_config_explicit_once(db, config_source, handle, Some(resolved_trust)).await
+}
+
+/// The synchronous reload paired with a retained `SetDefaultModel` write.
+/// Unlike ordinary watcher refresh, this must replay the complete layer chain
+/// captured at attach so neither an ambient environment change nor a renewed
+/// path discovery can make an acknowledged mutation describe another config.
+pub(crate) async fn refresh_session_config_after_retained_default_mutation(
+    db: &Db,
+    config_source: &ConfigSource,
+    handle: &SessionWorkerHandle,
+) -> std::result::Result<ConfigRefreshResult, ExplicitConfigRefreshError> {
+    refresh_session_config_explicit_with_retry(db, config_source, handle).await
+}
+
+/// A direct refresh is serialized by the daemon publication coordinator, but
+/// its parse/load work necessarily happens outside the worker's short-lived
+/// snapshot lock. A concurrent retained mutation can therefore win after the
+/// capture. Retry from the same retained authority instead of accepting an
+/// older resolved view.
+async fn refresh_session_config_explicit_with_retry(
+    db: &Db,
+    config_source: &ConfigSource,
+    handle: &SessionWorkerHandle,
+) -> std::result::Result<ConfigRefreshResult, ExplicitConfigRefreshError> {
+    for _ in 0..3 {
+        match refresh_session_config_explicit_once(db, config_source, handle, None).await {
+            Err(ExplicitConfigRefreshError::Stale) => continue,
+            result => return result,
+        }
+    }
+    Err(ExplicitConfigRefreshError::Internal)
+}
+
+async fn refresh_session_config_explicit_once(
+    db: &Db,
+    config_source: &ConfigSource,
+    handle: &SessionWorkerHandle,
+    expected_trust: Option<&crate::config::trust::ResolvedWorkspaceTrustPolicy>,
+) -> std::result::Result<ConfigRefreshResult, ExplicitConfigRefreshError> {
+    // Capture before any await or path/config read. The worker performs the
+    // matching CAS immediately before it publishes the replacement.
+    let expected_generation = handle.config_snapshot().generation;
+    let resolved_trust = match expected_trust {
+        Some(expected) => expected.clone(),
+        None => crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+            db,
+            &handle.project_root,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to resolve trust for explicit config refresh");
+            ExplicitConfigRefreshError::Internal
+        })?,
+    };
+    let trust_policy = resolved_trust.policy.clone();
+    let trust_revision = resolved_trust.revision;
+    if !handle.trust_transition_matches(&resolved_trust) {
+        return Err(ExplicitConfigRefreshError::Stale);
+    }
+    let workspace_layer = handle
+        .workspace_root_authority
+        .capture_retained_config_source_chain(&trust_policy)
+        .map_err(|error| {
+            tracing::warn!(%error, "explicit config refresh workspace authority rejected");
+            ExplicitConfigRefreshError::Internal
+        })?;
     let (providers, extended) = config_source
-        .load_effective_for_daemon(&handle.project_root, &trust_policy)
+        .load_effective_for_daemon_with_retained_workspace_layer(
+            &handle.project_root,
+            &trust_policy,
+            &workspace_layer,
+        )
         .map_err(|error| {
             if let Some(invalid) = error
                 .downcast_ref::<crate::config::extended::InvalidResponseMetricsTokenizer>()
@@ -50,24 +133,60 @@ pub(crate) async fn refresh_session_config_explicit(
                 ExplicitConfigRefreshError::InvalidConfig(format!("{error:#}"))
             }
         })?;
-    // Resolve hooks under the same workspace-trust scope and generation as
-    // providers/extended config so the hook registry is turn-stable with the
-    // rest of the snapshot.
-    let hooks = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-        crate::config::extended::hooks::resolve_hooks_for_cwd(&handle.project_root)
-    });
+    handle
+        .workspace_root_authority
+        .verify_retained_config_source_chain_for_policy(&trust_policy)
+        .map_err(|error| {
+            tracing::warn!(%error, "explicit config refresh authority changed before publication");
+            ExplicitConfigRefreshError::Internal
+        })?;
+    // Resolve hooks from the immutable attach-time source selection so a
+    // mutable process override cannot redirect this worker during refresh.
+    let hooks = handle
+        .workspace_root_authority
+        .resolve_hooks_for_policy(&trust_policy)
+        .map_err(|error| {
+            tracing::warn!(%error, "explicit config refresh hook authority rejected");
+            ExplicitConfigRefreshError::Internal
+        })?;
     apply_global_goal_supervision_kill_switch(db, &extended)
         .await
         .map_err(|error| {
             tracing::warn!(%error, "failed to apply global goal-supervision kill switch");
             ExplicitConfigRefreshError::Internal
         })?;
+    handle
+        .workspace_root_authority
+        .verify_retained_config_source_chain_for_policy(&trust_policy)
+        .map_err(|error| {
+            tracing::warn!(%error, "explicit config refresh authority changed at publication");
+            ExplicitConfigRefreshError::Internal
+        })?;
+    let latest_trust = crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+        db,
+        &handle.project_root,
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "failed to re-read trust at explicit config publication");
+        ExplicitConfigRefreshError::Internal
+    })?;
+    if latest_trust != resolved_trust || !handle.trust_transition_matches(&resolved_trust) {
+        return Err(ExplicitConfigRefreshError::Stale);
+    }
+    let snapshot = SessionConfigSnapshot::with_hooks(0, providers, extended, hooks)
+        .with_trust_revision(trust_revision)
+        .with_retained_provider_model_sources(&workspace_layer)
+        .map_err(|error| {
+            tracing::warn!(%error, "explicit config refresh provider provenance rejected");
+            ExplicitConfigRefreshError::Internal
+        })?;
     let (respond_to, response_rx) = oneshot::channel();
     handle
         .send_work(SessionWork::ReplaceConfigSnapshot {
-            snapshot: Box::new(SessionConfigSnapshot::with_hooks(
-                0, providers, extended, hooks,
-            )),
+            snapshot: Box::new(snapshot),
+            expected_generation: Some(expected_generation),
+            expected_trust_revision: Some(trust_revision),
             respond_to,
         })
         .await
@@ -79,10 +198,14 @@ pub(crate) async fn refresh_session_config_explicit(
         tracing::warn!(%error, "explicit config refresh worker response dropped");
         ExplicitConfigRefreshError::Internal
     })?;
+    if replacement.stale {
+        return Err(ExplicitConfigRefreshError::Stale);
+    }
     crate::daemon::server::inventory::bump_inventory_generation();
     Ok(ConfigRefreshResult {
         applied_generation: replacement.generation,
         changed: replacement.changed,
+        stale: false,
     })
 }
 
@@ -106,11 +229,66 @@ pub(crate) async fn refresh_session_config(
     handle: &SessionWorkerHandle,
     mut failure_deduper: Option<&mut ConfigRefreshFailureDeduper>,
 ) -> Result<Option<ConfigRefreshResult>> {
-    let trust_policy =
-        crate::config::trust::resolve_workspace_trust_policy_from_db(db, &handle.project_root)
+    for _ in 0..3 {
+        match refresh_session_config_once(
+            db,
+            config_source,
+            handle,
+            failure_deduper.as_deref_mut(),
+        )
+        .await?
+        {
+            Some(result) if result.stale => continue,
+            Some(result) => return Ok(Some(result)),
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+async fn refresh_session_config_once(
+    db: &Db,
+    config_source: &ConfigSource,
+    handle: &SessionWorkerHandle,
+    mut failure_deduper: Option<&mut ConfigRefreshFailureDeduper>,
+) -> Result<Option<ConfigRefreshResult>> {
+    let expected_generation = handle.config_snapshot().generation;
+    let resolved_trust =
+        crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(db, &handle.project_root)
             .await?;
+    let trust_policy = resolved_trust.policy.clone();
+    let trust_revision = resolved_trust.revision;
+    if !handle.trust_transition_matches(&resolved_trust) {
+        return Ok(Some(ConfigRefreshResult {
+            applied_generation: handle.config_snapshot().generation,
+            changed: false,
+            stale: true,
+        }));
+    }
+    let workspace_layer = match handle
+        .workspace_root_authority
+        .capture_retained_config_source_chain(&trust_policy)
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let notice = format!("{CONFIG_REFRESH_FAILURE_PREFIX}: workspace authority changed");
+            tracing::warn!(%error, "background config refresh workspace authority rejected");
+            if failure_deduper
+                .as_deref_mut()
+                .map(|deduper| deduper.should_emit(&notice))
+                .unwrap_or(true)
+            {
+                handle.broadcast_notice(notice);
+            }
+            return Ok(None);
+        }
+    };
     let (providers, extended) = match config_source
-        .load_effective_for_daemon(&handle.project_root, &trust_policy)
+        .load_effective_for_daemon_with_retained_workspace_layer(
+            &handle.project_root,
+            &trust_policy,
+            &workspace_layer,
+        )
     {
         Ok(configs) => configs,
         Err(error) => {
@@ -134,24 +312,112 @@ pub(crate) async fn refresh_session_config(
         }
     };
 
+    if let Err(error) = handle
+        .workspace_root_authority
+        .verify_retained_config_source_chain_for_policy(&trust_policy)
+    {
+        let notice = format!("{CONFIG_REFRESH_FAILURE_PREFIX}: workspace authority changed");
+        tracing::warn!(%error, "background config refresh authority changed before publication");
+        if failure_deduper
+            .as_deref_mut()
+            .map(|deduper| deduper.should_emit(&notice))
+            .unwrap_or(true)
+        {
+            handle.broadcast_notice(notice);
+        }
+        return Ok(None);
+    }
+
     apply_global_goal_supervision_kill_switch(db, &extended).await?;
 
-    // Resolve hooks under the same workspace-trust scope and generation as
-    // providers/extended config.
-    let hooks = crate::config::trust::with_workspace_trust_policy(trust_policy.clone(), || {
-        crate::config::extended::hooks::resolve_hooks_for_cwd(&handle.project_root)
-    });
+    // Resolve hooks from the immutable attach-time source selection so a
+    // mutable process override cannot redirect this worker during refresh.
+    let hooks = match handle
+        .workspace_root_authority
+        .resolve_hooks_for_policy(&trust_policy)
+    {
+        Ok(hooks) => hooks,
+        Err(error) => {
+            let notice = format!("{CONFIG_REFRESH_FAILURE_PREFIX}: workspace authority changed");
+            tracing::warn!(%error, "background config refresh hook authority rejected");
+            if failure_deduper
+                .as_deref_mut()
+                .map(|deduper| deduper.should_emit(&notice))
+                .unwrap_or(true)
+            {
+                handle.broadcast_notice(notice);
+            }
+            return Ok(None);
+        }
+    };
 
+    if let Err(error) = handle
+        .workspace_root_authority
+        .verify_retained_config_source_chain_for_policy(&trust_policy)
+    {
+        let notice = format!("{CONFIG_REFRESH_FAILURE_PREFIX}: workspace authority changed");
+        tracing::warn!(%error, "background config refresh authority changed at publication");
+        if failure_deduper
+            .as_deref_mut()
+            .map(|deduper| deduper.should_emit(&notice))
+            .unwrap_or(true)
+        {
+            handle.broadcast_notice(notice);
+        }
+        return Ok(None);
+    }
+
+    let latest_trust = crate::config::trust::resolve_workspace_trust_policy_with_revision_from_db(
+        db,
+        &handle.project_root,
+    )
+    .await?;
+    if latest_trust != resolved_trust || !handle.trust_transition_matches(&resolved_trust) {
+        return Ok(Some(ConfigRefreshResult {
+            applied_generation: handle.config_snapshot().generation,
+            changed: false,
+            stale: true,
+        }));
+    }
+
+    let snapshot = match SessionConfigSnapshot::with_hooks(0, providers, extended, hooks)
+        .with_trust_revision(trust_revision)
+        .with_retained_provider_model_sources(&workspace_layer)
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let notice = format!("{CONFIG_REFRESH_FAILURE_PREFIX}: provider source provenance is invalid");
+            tracing::warn!(%error, "background config refresh provider provenance rejected");
+            if failure_deduper
+                .as_deref_mut()
+                .map(|deduper| deduper.should_emit(&notice))
+                .unwrap_or(true)
+            {
+                handle.broadcast_notice(notice);
+            }
+            return Ok(None);
+        }
+    };
     let (respond_to, response_rx) = oneshot::channel();
     handle
         .send_work(SessionWork::ReplaceConfigSnapshot {
-            snapshot: Box::new(SessionConfigSnapshot::with_hooks(
-                0, providers, extended, hooks,
-            )),
+            snapshot: Box::new(snapshot),
+            expected_generation: Some(expected_generation),
+            expected_trust_revision: Some(trust_revision),
             respond_to,
         })
         .await?;
     let replacement = response_rx.await?;
+    if replacement.stale {
+        // The watcher has already consumed the edge that triggered this
+        // refresh. Surface an internal stale signal so the bounded outer loop
+        // re-resolves rather than waiting for a second filesystem event.
+        return Ok(Some(ConfigRefreshResult {
+            applied_generation: replacement.generation,
+            changed: false,
+            stale: true,
+        }));
+    }
     crate::daemon::server::inventory::bump_inventory_generation();
     if let Some(deduper) = failure_deduper {
         deduper.record_success();
@@ -159,6 +425,7 @@ pub(crate) async fn refresh_session_config(
     Ok(Some(ConfigRefreshResult {
         applied_generation: replacement.generation,
         changed: replacement.changed,
+        stale: false,
     }))
 }
 
@@ -227,6 +494,7 @@ mod tests {
                 .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
                     generation: 7,
                     changed: true,
+                    stale: false,
                 })
                 .unwrap();
         });
@@ -284,6 +552,7 @@ mod tests {
                 .send(crate::daemon::session_worker::ReplaceConfigSnapshotResult {
                     generation: 1,
                     changed: true,
+                    stale: false,
                 })
                 .unwrap();
         });

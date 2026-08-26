@@ -1,6 +1,10 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use sha2::{Digest as _, Sha256};
+
+use crate::config::MAX_WORKSPACE_CONFIG_FILE_BYTES;
 
 #[cfg(unix)]
 fn ensure_dir_exists_private_if_created(path: &Path) -> Result<()> {
@@ -397,12 +401,18 @@ fn is_cockpit_owned_config_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Stable cross-process lock shared by every `config.json` mutation.
+/// Stable cross-process lock for one `config.json` mutation target.
 ///
 /// Config files are replaced atomically, so locking the destination inode
-/// would not serialize the next writer. A separate state-directory lock keeps
-/// the read/merge/replace sequence coherent across provider and extended
-/// configuration writers, including explicit `COCKPIT_CONFIG` targets.
+/// would not serialize the next writer. Instead every target has a
+/// deterministic private sibling lock leaf. Path-based callers open that leaf
+/// through the target's no-follow parent directory; retained callers open the
+/// exact same leaf through their held directory descriptor. This makes locks
+/// for different config directories independent while preserving serialization
+/// between ambient and retained writers of the same logical config file.
+/// The lock file is deliberately retained after release: OS advisory locks are
+/// released automatically when the owning descriptor/process dies, so deleting
+/// a "stale" leaf would only add a replacement race.
 /// A held cross-process config mutation lock.
 ///
 /// Deliberately `!Send`: the re-entrancy depth that lets journal recovery run
@@ -412,39 +422,55 @@ fn is_cockpit_owned_config_dir(path: &Path) -> bool {
 /// underflowing on drop. Keeping the guard pinned to its acquiring thread
 /// makes that class of corruption unrepresentable.
 pub(crate) struct ConfigMutationLock {
-    _file: std::fs::File,
+    /// `None` is a same-thread re-entrant guard for this exact lock identity.
+    /// The outer guard owns the OS lock; a different target never shares this
+    /// shortcut and therefore cannot slip past the lock.
+    _file: Option<std::fs::File>,
+    identity: String,
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
 thread_local! {
-    /// Re-entrancy depth for the cross-process mutation lock on this thread.
+    /// Re-entrancy depths for mutation locks on this thread, keyed by their
+    /// immutable target identity. A scalar global depth would incorrectly
+    /// treat a lock on config A as authority to mutate config B.
     ///
     /// The OS lock is per open file description, so a second `acquire` on the
     /// same thread would deadlock against the guard this thread already holds.
     /// Journal recovery runs both standalone and inside an in-flight mutation,
     /// so it consults this depth instead of blindly re-locking.
-    static MUTATION_LOCK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static MUTATION_LOCK_DEPTHS: std::cell::RefCell<HashMap<String, u32>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 impl ConfigMutationLock {
-    pub(crate) fn acquire(_target: &Path) -> Result<Self> {
-        let lock_path = mutation_lock_path()?;
-        ensure_parent_dir_private(&lock_path)?;
-
-        let file = open_private_lock_file(&lock_path)?;
+    pub(crate) fn acquire(target: &Path) -> Result<Self> {
+        let target_identity = mutation_lock_identity(target);
+        let (parent, lock_leaf, display_path) = open_mutation_lock_parent(target)?;
+        let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
+        if Self::is_held_identity(&identity) {
+            return Ok(Self::enter(None, identity));
+        }
+        let file = open_private_lock_file_at(&parent, &lock_leaf, &display_path)?;
         file.lock()
-            .with_context(|| format!("locking config mutation at {}", lock_path.display()))?;
-        Ok(Self::enter(file))
+            .with_context(|| format!("locking config mutation at {}", display_path.display()))?;
+        Ok(Self::enter(Some(file), identity))
     }
 
     pub(crate) fn acquire_cancellable(
-        _target: &Path,
+        target: &Path,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<Self> {
-        let lock_path = mutation_lock_path()?;
-        ensure_parent_dir_private(&lock_path)?;
-
-        let file = open_private_lock_file(&lock_path)?;
+        let target_identity = mutation_lock_identity(target);
+        let (parent, lock_leaf, display_path) = open_mutation_lock_parent(target)?;
+        let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
+        if Self::is_held_identity(&identity) {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                anyhow::bail!("active-model config mutation was cancelled");
+            }
+            return Ok(Self::enter(None, identity));
+        }
+        let file = open_private_lock_file_at(&parent, &lock_leaf, &display_path)?;
         loop {
             if cancelled.load(std::sync::atomic::Ordering::Acquire) {
                 anyhow::bail!("active-model config mutation was cancelled");
@@ -454,44 +480,215 @@ impl ConfigMutationLock {
                     if cancelled.load(std::sync::atomic::Ordering::Acquire) {
                         anyhow::bail!("active-model config mutation was cancelled");
                     }
-                    return Ok(Self::enter(file));
+                    return Ok(Self::enter(Some(file), identity));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 Err(std::fs::TryLockError::Error(error)) => {
                     return Err(error).with_context(|| {
-                        format!("locking config mutation at {}", lock_path.display())
+                        format!("locking config mutation at {}", display_path.display())
                     });
                 }
             }
         }
     }
 
-    fn enter(file: std::fs::File) -> Self {
-        MUTATION_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    /// Acquire the target's deterministic lock leaf relative to an already
+    /// verified directory capability. The caller must pass the canonical
+    /// target identity that the ambient backend uses for the same config file.
+    pub(crate) fn acquire_retained(
+        directory: &std::fs::File,
+        canonical_target: &Path,
+        display_parent: &Path,
+    ) -> Result<Self> {
+        // `canonical_target` was captured with the retained directory. Do not
+        // canonicalize/open its parent again here: that would turn lock
+        // selection itself into a post-attach pathname authority read.
+        let target_identity = mutation_lock_identity_from_canonical(canonical_target);
+        let identity = mutation_lock_runtime_identity(directory, &target_identity)?;
+        if Self::is_held_identity(&identity) {
+            return Ok(Self::enter(None, identity));
+        }
+        let lock_leaf = mutation_lock_leaf_for_identity(&target_identity);
+        let display_path = display_parent.join(&lock_leaf);
+        let file = open_private_lock_file_at(directory, &lock_leaf, &display_path)?;
+        file.lock()
+            .with_context(|| format!("locking retained config mutation at {}", display_path.display()))?;
+        Ok(Self::enter(Some(file), identity))
+    }
+
+    /// Cancellable counterpart of [`Self::acquire_retained`]. The lock leaf
+    /// is still opened through the held directory, so cancellation never
+    /// falls back to a current pathname lookup.
+    pub(crate) fn acquire_retained_cancellable(
+        directory: &std::fs::File,
+        canonical_target: &Path,
+        display_parent: &Path,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self> {
+        let target_identity = mutation_lock_identity_from_canonical(canonical_target);
+        let identity = mutation_lock_runtime_identity(directory, &target_identity)?;
+        if Self::is_held_identity(&identity) {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                anyhow::bail!("active-model config mutation was cancelled");
+            }
+            return Ok(Self::enter(None, identity));
+        }
+        let lock_leaf = mutation_lock_leaf_for_identity(&target_identity);
+        let display_path = display_parent.join(&lock_leaf);
+        let file = open_private_lock_file_at(directory, &lock_leaf, &display_path)?;
+        loop {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                anyhow::bail!("active-model config mutation was cancelled");
+            }
+            match file.try_lock() {
+                Ok(()) => {
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        anyhow::bail!("active-model config mutation was cancelled");
+                    }
+                    return Ok(Self::enter(Some(file), identity));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| {
+                        format!("locking retained config mutation at {}", display_path.display())
+                    });
+                }
+            }
+        }
+    }
+
+    fn enter(file: Option<std::fs::File>, identity: String) -> Self {
+        MUTATION_LOCK_DEPTHS.with(|depths| {
+            let mut depths = depths.borrow_mut();
+            *depths.entry(identity.clone()).or_default() += 1;
+        });
         Self {
             _file: file,
+            identity,
             _not_send: std::marker::PhantomData,
         }
     }
 
-    /// True while this thread already owns the cross-process mutation lock.
-    pub(crate) fn is_held_by_current_thread() -> bool {
-        MUTATION_LOCK_DEPTH.with(std::cell::Cell::get) > 0
+    /// True while this thread already owns the exact target's mutation lock.
+    pub(crate) fn is_held_by_current_thread(target: &Path) -> Result<bool> {
+        let target_identity = mutation_lock_identity(target);
+        let (parent, _, _) = open_mutation_lock_parent(target)?;
+        let identity = mutation_lock_runtime_identity(&parent, &target_identity)?;
+        Ok(Self::is_held_identity(&identity))
+    }
+
+    fn is_held_identity(identity: &str) -> bool {
+        MUTATION_LOCK_DEPTHS.with(|depths| depths.borrow().get(identity).copied().unwrap_or(0) > 0)
     }
 }
 
 impl Drop for ConfigMutationLock {
     fn drop(&mut self) {
-        MUTATION_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        MUTATION_LOCK_DEPTHS.with(|depths| {
+            let mut depths = depths.borrow_mut();
+            let Some(depth) = depths.get_mut(&self.identity) else {
+                debug_assert!(false, "config mutation lock depth missing on drop");
+                return;
+            };
+            *depth = depth.saturating_sub(1);
+            if *depth == 0 {
+                depths.remove(&self.identity);
+            }
+        });
     }
 }
 
-fn mutation_lock_path() -> Result<PathBuf> {
-    Ok(crate::config::resolve::cockpit_state_dir()?
-        .join("config-locks")
-        .join("effective-config.lock"))
+fn mutation_lock_identity(target: &Path) -> String {
+    let absolute = std::path::absolute(target).unwrap_or_else(|_| target.to_path_buf());
+    let canonical = match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .unwrap_or(absolute),
+        _ => absolute,
+    };
+    mutation_lock_identity_from_canonical(&canonical)
+}
+
+fn mutation_lock_identity_from_canonical(canonical_target: &Path) -> String {
+    canonical_target.to_string_lossy().into_owned()
+}
+
+/// Pair the canonical config-leaf identity with the actual directory object
+/// that contains its lock leaf. A pathname can be swapped and later reused;
+/// that replacement is intentionally a different re-entrancy identity even
+/// though it has the same spelling and deterministic lock-file name.
+fn mutation_lock_runtime_identity(directory: &std::fs::File, target_identity: &str) -> Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = directory.metadata()?;
+        return Ok(format!("unix:{}:{}:{target_identity}", metadata.dev(), metadata.ino()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(directory.as_raw_handle(), &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let file = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        return Ok(format!("windows:{}:{file}:{target_identity}", info.dwVolumeSerialNumber));
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let metadata = directory.metadata()?;
+        return Ok(format!("portable:{}:{}:{target_identity}", metadata.len(), metadata.modified()?.elapsed().unwrap_or_default().as_nanos()));
+    }
+}
+
+fn mutation_lock_leaf_for_identity(identity: &str) -> std::ffi::OsString {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cockpit-effective-default-lock-v1\0");
+    hasher.update(identity.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    std::ffi::OsString::from(format!(".cockpit-effective-default-lock-{digest}.lock"))
+}
+
+fn mutation_lock_leaf(target: &Path) -> std::ffi::OsString {
+    mutation_lock_leaf_for_identity(&mutation_lock_identity(target))
+}
+
+#[cfg(unix)]
+fn open_mutation_lock_parent(
+    target: &Path,
+) -> Result<(std::fs::File, std::ffi::OsString, PathBuf)> {
+    let (parent, _) = open_parent_directory_nofollow(target)?;
+    let leaf = mutation_lock_leaf(target);
+    let display = target.parent().unwrap_or_else(|| Path::new(".")).join(&leaf);
+    Ok((parent, leaf, display))
+}
+
+#[cfg(windows)]
+fn open_mutation_lock_parent(
+    target: &Path,
+) -> Result<(std::fs::File, std::ffi::OsString, PathBuf)> {
+    let (parent, _) = open_windows_parent_directory_nofollow(target, false)?;
+    let leaf = mutation_lock_leaf(target);
+    let display = target.parent().unwrap_or_else(|| Path::new(".")).join(&leaf);
+    Ok((parent, leaf, display))
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn open_mutation_lock_parent(
+    target: &Path,
+) -> Result<(std::fs::File, std::ffi::OsString, PathBuf)> {
+    let parent_path = target.parent().unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::File::open(parent_path)?;
+    let leaf = mutation_lock_leaf(target);
+    let display = parent_path.join(&leaf);
+    Ok((parent, leaf, display))
 }
 
 /// Read a file without ever traversing a symlink or reparse point in its final
@@ -553,6 +750,95 @@ pub(crate) fn read_file_nofollow(path: &Path) -> Result<Option<Vec<u8>>> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
         }
+    }
+}
+
+/// Read a final-component-no-follow file while bounding the allocation made
+/// for its contents.  This is deliberately separate from [`read_file_nofollow`]:
+/// callers which need to classify an untrusted durable control record before
+/// deciding whether any other pathname operation is permitted must not first
+/// allocate an attacker-sized journal.
+pub(crate) fn read_file_nofollow_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    #[cfg(unix)]
+    {
+        let (parent, file_name) = match open_parent_directory_nofollow(path) {
+            Ok(parts) => parts,
+            Err(error) if root_cause_is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let file = match open_file_at_nofollow(
+            &parent,
+            &file_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        ) {
+            Ok(file) => file,
+            Err(error) if root_cause_is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        read_all_bounded(file, path, max_bytes).map(Some)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, SYNCHRONIZE,
+        };
+
+        let (parent, name) = match open_windows_parent_directory_nofollow(path, false) {
+            Ok(parts) => parts,
+            Err(error) if root_cause_is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let file = match open_windows_relative_nofollow(
+            &parent,
+            &name,
+            false,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("opening {}", path.display()));
+            }
+        };
+        reject_windows_reparse_handle(&file, path)?;
+        read_all_bounded(file, path, max_bytes).map(Some)
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        use std::io::Read as _;
+
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", path.display()));
+            }
+        };
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("inspecting {}", path.display()))?;
+        anyhow::ensure!(metadata.is_file(), "{} is not a regular file", path.display());
+        anyhow::ensure!(
+            metadata.len() <= max_bytes as u64,
+            "{} exceeds the byte limit",
+            path.display()
+        );
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(max_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("reading {}", path.display()))?;
+        anyhow::ensure!(
+            bytes.len() <= max_bytes,
+            "{} exceeds the byte limit",
+            path.display()
+        );
+        Ok(Some(bytes))
     }
 }
 
@@ -682,6 +968,60 @@ pub(crate) fn open_directory_handle_nofollow(path: &Path) -> Result<std::fs::Fil
     }
 }
 
+/// Prove that an already-open directory capability still denotes the
+/// directory currently named by `path`. This is used only while constructing a
+/// descriptor: once construction succeeds, callers must retain and use the
+/// handle rather than repeating a pathname lookup.
+pub(crate) fn directory_handle_matches_path(directory: &std::fs::File, path: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let named = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let held = directory.metadata()?;
+        return Ok(
+            named.is_dir()
+                && held.is_dir()
+                && named.dev() == held.dev()
+                && named.ino() == held.ino(),
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let named = match open_windows_directory_nofollow(path, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let mut held_info = BY_HANDLE_FILE_INFORMATION::default();
+        let mut named_info = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(directory.as_raw_handle(), &mut held_info) } == 0
+            || unsafe { GetFileInformationByHandle(named.as_raw_handle(), &mut named_info) } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        return Ok(
+            held_info.dwVolumeSerialNumber == named_info.dwVolumeSerialNumber
+                && held_info.nFileIndexHigh == named_info.nFileIndexHigh
+                && held_info.nFileIndexLow == named_info.nFileIndexLow,
+        );
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let named = std::fs::canonicalize(path)?;
+        let held = directory.metadata()?;
+        let current = std::fs::metadata(named)?;
+        return Ok(held.is_dir() && current.is_dir());
+    }
+}
+
 pub(crate) fn read_leaf_from_directory_handle(
     directory: &std::fs::File,
     leaf: &std::ffi::OsStr,
@@ -727,6 +1067,8 @@ pub(crate) fn read_leaf_from_directory_handle(
     #[cfg(any(unix, windows))]
     {
         use std::io::Read as _;
+        #[cfg(windows)]
+        reject_windows_reparse_handle(&file, Path::new(leaf))?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() > max_bytes as u64 {
             anyhow::bail!("retained-directory leaf is not a bounded regular file");
@@ -738,6 +1080,432 @@ pub(crate) fn read_leaf_from_directory_handle(
         }
         Ok(bytes)
     }
+}
+
+/// Read one optional, bounded regular leaf beneath an already-open directory.
+///
+/// This is the capability-relative counterpart of [`read_file_nofollow`].
+/// The directory handle, not `display_path`, is the filesystem authority;
+/// the latter is deliberately diagnostic-only.  Keeping the optional/not-found
+/// distinction here prevents callers that hold an attach-time directory from
+/// accidentally reopening a mutable absolute path just to check whether a
+/// transaction artifact exists.
+pub(crate) fn read_optional_leaf_from_directory_handle(
+    directory: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    match read_leaf_from_directory_handle(directory, leaf, max_bytes) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+const WORKSPACE_CONFIG_MAX_PROVIDER_FILES: usize = 256;
+
+/// Capture the project-local Cockpit layer from an already-retained workspace
+/// directory.  The path is intentionally fixed: the daemon never accepts a
+/// caller-supplied config path at this authority boundary.
+pub(crate) fn snapshot_workspace_config_layer_from_retained_directory(
+    directory: &std::fs::File,
+) -> Result<crate::config::WorkspaceConfigLayerSnapshot> {
+    // A retained directory protects identity, not concurrent mutations within
+    // that directory.  Capture twice and publish only an identical complete
+    // view; bounded churn is a typed failure rather than an A/B mixture.
+    const STABLE_CAPTURE_ATTEMPTS: usize = 3;
+    for _ in 0..STABLE_CAPTURE_ATTEMPTS {
+        let first = snapshot_workspace_config_layer_once(directory)?;
+        let second = snapshot_workspace_config_layer_once(directory)?;
+        if first.digest == second.digest {
+            return Ok(second);
+        }
+    }
+    anyhow::bail!("workspace configuration changed during retained snapshot capture")
+}
+
+pub(crate) fn snapshot_workspace_config_layer_from_retained_config_directory(
+    directory: &std::fs::File,
+    config_leaf: &std::ffi::OsStr,
+    canonical_config_path: &Path,
+    journal_leaf: Option<&std::ffi::OsStr>,
+    backup_leaf: Option<&std::ffi::OsStr>,
+) -> Result<crate::config::WorkspaceConfigLayerSnapshot> {
+    validate_single_leaf(config_leaf)?;
+    if let Some(journal_leaf) = journal_leaf {
+        validate_single_leaf(journal_leaf)?;
+    }
+    if let Some(backup_leaf) = backup_leaf {
+        validate_single_leaf(backup_leaf)?;
+    }
+    anyhow::ensure!(
+        journal_leaf.is_some() == backup_leaf.is_some(),
+        "retained effective-default journal and backup descriptors must be paired"
+    );
+    const STABLE_CAPTURE_ATTEMPTS: usize = 3;
+    for _ in 0..STABLE_CAPTURE_ATTEMPTS {
+        let first = snapshot_workspace_config_directory_once(
+            directory,
+            config_leaf,
+            canonical_config_path,
+            journal_leaf,
+            backup_leaf,
+        )?;
+        let second = snapshot_workspace_config_directory_once(
+            directory,
+            config_leaf,
+            canonical_config_path,
+            journal_leaf,
+            backup_leaf,
+        )?;
+        if first.digest == second.digest {
+            return Ok(second);
+        }
+    }
+    anyhow::bail!("workspace configuration changed during retained snapshot capture")
+}
+
+fn snapshot_workspace_config_layer_once(
+    directory: &std::fs::File,
+) -> Result<crate::config::WorkspaceConfigLayerSnapshot> {
+    let Some(cockpit) = open_retained_child_directory_optional(
+        directory,
+        std::ffi::OsStr::new(".cockpit"),
+    )?
+    else {
+        return Ok(workspace_snapshot(None, Vec::new(), None));
+    };
+    snapshot_workspace_config_directory_once(
+        &cockpit,
+        std::ffi::OsStr::new("config.json"),
+        &Path::new(".cockpit").join("config.json"),
+        None,
+        None,
+    )
+}
+
+fn validate_single_leaf(leaf: &std::ffi::OsStr) -> Result<()> {
+    let mut components = Path::new(leaf).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => anyhow::bail!("retained workspace config leaf must be one normal path component"),
+    }
+}
+
+fn snapshot_workspace_config_directory_once(
+    cockpit: &std::fs::File,
+    config_leaf: &std::ffi::OsStr,
+    canonical_config_path: &Path,
+    journal_leaf: Option<&std::ffi::OsStr>,
+    backup_leaf: Option<&std::ffi::OsStr>,
+) -> Result<crate::config::WorkspaceConfigLayerSnapshot> {
+    let config_json = read_retained_leaf_optional(
+        cockpit,
+        config_leaf,
+        MAX_WORKSPACE_CONFIG_FILE_BYTES,
+    )?;
+    let (config_json, effective_default_artifact_digest) = match (journal_leaf, backup_leaf) {
+        (Some(journal_leaf), Some(backup_leaf)) => {
+            let journal = read_retained_leaf_optional(
+                cockpit,
+                journal_leaf,
+                MAX_WORKSPACE_CONFIG_FILE_BYTES,
+            )?;
+            let backup = read_retained_leaf_optional(
+                cockpit,
+                backup_leaf,
+                MAX_WORKSPACE_CONFIG_FILE_BYTES,
+            )?;
+            (
+                crate::config::effective_default::project_retained_effective_default_bytes(
+                    canonical_config_path,
+                    config_json,
+                    journal.as_deref(),
+                    backup.as_deref(),
+                )?,
+                effective_default_artifact_digest(journal.as_deref(), backup.as_deref()),
+            )
+        }
+        (None, None) => (config_json, None),
+        _ => unreachable!("paired retained journal descriptors were validated above"),
+    };
+    let Some(providers) = open_retained_child_directory_optional(
+        cockpit,
+        std::ffi::OsStr::new("providers"),
+    )? else {
+        return Ok(workspace_snapshot(
+            config_json,
+            Vec::new(),
+            effective_default_artifact_digest,
+        ));
+    };
+
+    let mut provider_files = Vec::new();
+    for name in retained_directory_names(&providers)? {
+        if provider_files.len() >= WORKSPACE_CONFIG_MAX_PROVIDER_FILES {
+            anyhow::bail!("workspace provider layer exceeds its file limit");
+        }
+        let path = Path::new(&name);
+        let Some(id) = crate::config::providers::provider_id_from_file_name(path) else {
+            // Non-provider files are not part of this layer; never follow or
+            // inspect them merely to decide that fact.
+            continue;
+        };
+        let bytes = read_leaf_from_directory_handle(
+            &providers,
+            &name,
+            MAX_WORKSPACE_CONFIG_FILE_BYTES,
+        )?;
+        provider_files.push((id, bytes));
+    }
+    provider_files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(workspace_snapshot(
+        config_json,
+        provider_files,
+        effective_default_artifact_digest,
+    ))
+}
+
+fn workspace_snapshot(
+    config_json: Option<Vec<u8>>,
+    provider_files: Vec<(String, Vec<u8>)>,
+    effective_default_artifact_digest: Option<String>,
+) -> crate::config::WorkspaceConfigLayerSnapshot {
+    use sha2::{Digest as _, Sha256};
+
+    // Domain/type/length framing makes this digest suitable as an immutable
+    // input to daemon snapshot publication; distinct boundaries cannot alias.
+    let mut hasher = Sha256::new();
+    hasher.update(b"cockpit-workspace-config-layer-v1");
+    match &config_json {
+        Some(bytes) => {
+            hasher.update([1]);
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+        None => hasher.update([0]),
+    }
+    match &effective_default_artifact_digest {
+        Some(digest) => {
+            hasher.update([1]);
+            hasher.update((digest.len() as u64).to_be_bytes());
+            hasher.update(digest.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update((provider_files.len() as u64).to_be_bytes());
+    for (id, bytes) in &provider_files {
+        hasher.update((id.len() as u64).to_be_bytes());
+        hasher.update(id.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    crate::config::WorkspaceConfigLayerSnapshot {
+        config_json,
+        provider_files,
+        effective_default_artifact_digest,
+        digest: format!("{:x}", hasher.finalize()),
+    }
+}
+
+pub(crate) fn empty_workspace_config_layer_snapshot() -> crate::config::WorkspaceConfigLayerSnapshot {
+    workspace_snapshot(None, Vec::new(), None)
+}
+
+/// Replace only the captured `config.json` bytes while preserving the exact
+/// retained provider-file inventory. Used by a capability-bound default-write
+/// preview to ask what an active-model clear would expose without reopening a
+/// layer by pathname.
+pub(crate) fn workspace_config_layer_snapshot_with_config_json(
+    snapshot: &crate::config::WorkspaceConfigLayerSnapshot,
+    config_json: Option<Vec<u8>>,
+) -> crate::config::WorkspaceConfigLayerSnapshot {
+    workspace_snapshot(
+        config_json,
+        snapshot.provider_files.clone(),
+        snapshot.effective_default_artifact_digest.clone(),
+    )
+}
+
+fn effective_default_artifact_digest(
+    journal: Option<&[u8]>,
+    backup: Option<&[u8]>,
+) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+
+    if journal.is_none() && backup.is_none() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"cockpit-retained-effective-default-artifacts-v1");
+    for artifact in [journal, backup] {
+        match artifact {
+            Some(bytes) => {
+                hasher.update([1]);
+                hasher.update((bytes.len() as u64).to_be_bytes());
+                hasher.update(bytes);
+            }
+            None => hasher.update([0]),
+        }
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn read_retained_leaf_optional(
+    directory: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    read_optional_leaf_from_directory_handle(directory, leaf, max_bytes)
+}
+
+#[cfg(unix)]
+pub(crate) fn open_retained_child_directory_optional(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> Result<Option<std::fs::File>> {
+    match open_file_at_nofollow(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    ) {
+        Ok(file) => {
+            if !file.metadata()?.is_dir() {
+                anyhow::bail!("retained workspace config component is not a directory");
+            }
+            Ok(Some(file))
+        }
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn retained_directory_names(directory: &std::fs::File) -> Result<Vec<std::ffi::OsString>> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error()).context("duplicating retained provider directory");
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(std::io::Error::last_os_error()).context("enumerating retained provider directory");
+    }
+    let mut names = Vec::new();
+    loop {
+        #[cfg(target_os = "macos")]
+        unsafe { *libc::__error() = 0; }
+        #[cfg(not(target_os = "macos"))]
+        unsafe { *libc::__errno_location() = 0; }
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            #[cfg(target_os = "macos")]
+            let errno_code = unsafe { *libc::__error() };
+            #[cfg(not(target_os = "macos"))]
+            let errno_code = unsafe { *libc::__errno_location() };
+            unsafe { libc::closedir(stream) };
+            if errno_code != 0 {
+                return Err(std::io::Error::from_raw_os_error(errno_code))
+                    .context("reading retained provider directory");
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(OsStr::from_bytes(name).to_os_string());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_retained_child_directory_optional(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> Result<Option<std::fs::File>> {
+    use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE};
+    match open_windows_relative_nofollow(
+        parent,
+        name,
+        true,
+        FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_OPEN,
+    ) {
+        Ok(file) => {
+            reject_windows_reparse_handle(&file, Path::new(name))?;
+            if !file.metadata()?.is_dir() {
+                anyhow::bail!("retained workspace config component is not a directory");
+            }
+            Ok(Some(file))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(windows)]
+fn retained_directory_names(directory: &std::fs::File) -> Result<Vec<std::ffi::OsString>> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_BOTH_DIR_INFO, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
+        GetFileInformationByHandleEx,
+    };
+    let mut names = Vec::new();
+    let mut restart = true;
+    loop {
+        let mut buffer = vec![0u8; 64 * 1024];
+        let class = if restart { FileIdBothDirectoryRestartInfo } else { FileIdBothDirectoryInfo };
+        let ok = unsafe {
+            GetFileInformationByHandleEx(directory.as_raw_handle(), class, buffer.as_mut_ptr().cast(), buffer.len() as u32)
+        };
+        restart = false;
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) { break; }
+            return Err(error).context("enumerating retained provider directory");
+        }
+        let mut offset = 0usize;
+        loop {
+            let info = unsafe { &*(buffer.as_ptr().add(offset).cast::<FILE_ID_BOTH_DIR_INFO>()) };
+            let length = info.FileNameLength as usize / 2;
+            let name = std::ffi::OsString::from_wide(unsafe {
+                std::slice::from_raw_parts(info.FileName.as_ptr(), length)
+            });
+            if name != "." && name != ".." { names.push(name); }
+            if info.NextEntryOffset == 0 { break; }
+            offset = offset.checked_add(info.NextEntryOffset as usize)
+                .filter(|offset| *offset < buffer.len())
+                .ok_or_else(|| anyhow::anyhow!("invalid Windows retained provider enumeration offset"))?;
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+pub(crate) fn open_retained_child_directory_optional(_: &std::fs::File, _: &std::ffi::OsStr) -> Result<Option<std::fs::File>> {
+    anyhow::bail!("retained workspace config snapshots are unsupported on this platform")
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn retained_directory_names(_: &std::fs::File) -> Result<Vec<std::ffi::OsString>> {
+    anyhow::bail!("retained workspace config snapshots are unsupported on this platform")
 }
 
 pub(crate) fn snapshot_markdown_tree_nofollow(
@@ -1230,6 +1998,33 @@ fn read_all(mut file: impl std::io::Read, path: &Path) -> Result<Vec<u8>> {
 }
 
 #[cfg(any(unix, windows))]
+fn read_all_bounded(
+    mut file: std::fs::File,
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting {}", path.display()))?;
+    anyhow::ensure!(metadata.is_file(), "{} is not a regular file", path.display());
+    anyhow::ensure!(
+        metadata.len() <= max_bytes as u64,
+        "{} exceeds the byte limit",
+        path.display()
+    );
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(64 * 1024));
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if bytes.len() > max_bytes {
+        anyhow::bail!("{} exceeds the byte limit", path.display());
+    }
+    Ok(bytes)
+}
+
+#[cfg(any(unix, windows))]
 fn root_cause_is_not_found(error: &anyhow::Error) -> bool {
     error
         .root_cause()
@@ -1325,41 +2120,54 @@ pub(crate) fn fsync_dir(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
-    let (parent, file_name) = open_parent_directory_nofollow(path)?;
+fn open_private_lock_file_at(
+    parent: &std::fs::File,
+    file_name: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<std::fs::File> {
     let file = open_file_at_nofollow(
-        &parent,
-        &file_name,
+        parent,
+        file_name,
         libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0o600,
     )
-    .with_context(|| format!("opening config mutation lock {}", path.display()))?;
-    chmod_file_private(&file).with_context(|| format!("chmod 0600 {}", path.display()))?;
+    .with_context(|| format!("opening config mutation lock {}", display_path.display()))?;
+    chmod_file_private(&file).with_context(|| format!("chmod 0600 {}", display_path.display()))?;
     Ok(file)
 }
 
 #[cfg(windows)]
-fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
+fn open_private_lock_file_at(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<std::fs::File> {
     use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN_IF;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, SYNCHRONIZE,
     };
 
-    let (parent, name) = open_windows_parent_directory_nofollow(path, false)?;
     let file = open_windows_relative_nofollow(
-        &parent,
-        &name,
+        parent,
+        name,
         false,
         FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         FILE_OPEN_IF,
     )
-    .with_context(|| format!("opening config mutation lock {}", path.display()))?;
-    reject_windows_reparse_handle(&file, path)?;
+    .with_context(|| format!("opening config mutation lock {}", display_path.display()))?;
+    reject_windows_reparse_handle(&file, display_path)?;
     Ok(file)
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn open_private_lock_file(path: &Path) -> Result<std::fs::File> {
+fn open_private_lock_file_at(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<std::fs::File> {
+    let path = display_path;
+    let _ = parent;
+    let _ = name;
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -2270,6 +3078,23 @@ fn prepare_atomic_write_in_existing_parent(
     path: &Path,
     contents: &[u8],
 ) -> Result<PreparedAtomicWrite> {
+    #[cfg(any(unix, windows))]
+    {
+        #[cfg(unix)]
+        let (parent_dir, destination_name) = open_parent_directory_nofollow(path)?;
+        #[cfg(windows)]
+        let (parent_dir, destination_name) =
+            open_windows_parent_directory_for_rename_nofollow(path, false)?;
+        return prepare_atomic_write_from_retained_directory(
+            parent_dir,
+            &destination_name,
+            path,
+            contents,
+        );
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -2279,15 +3104,43 @@ fn prepare_atomic_write_in_existing_parent(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    #[cfg(unix)]
-    let (parent_dir, destination_name) = open_parent_directory_nofollow(path)?;
-    #[cfg(windows)]
-    let (parent_dir, destination_name) =
-        open_windows_parent_directory_for_rename_nofollow(path, false)?;
-    #[cfg(any(unix, windows))]
     let tmp_name =
         std::ffi::OsString::from(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
-    #[cfg(all(not(unix), not(windows)))]
+    let tmp_path = parent.join(&tmp_name);
+    let mut tmp = open_private_atomic_temp(&tmp_path)?;
+    std::io::Write::write_all(&mut tmp, contents)
+        .with_context(|| format!("writing temporary file {}", tmp_path.display()))?;
+    tmp.sync_all()
+        .with_context(|| format!("syncing temporary file {}", tmp_path.display()))?;
+    drop(tmp);
+    Ok(PreparedAtomicWrite {
+        tmp_path: Some(tmp_path),
+        path: path.to_path_buf(),
+        parent: parent.to_path_buf(),
+    })
+    }
+}
+
+/// Prepare an atomic replacement directly under an already-open directory.
+///
+/// The returned writer retains that directory handle through publication, so
+/// a rename/reparse-point replacement of the directory's original pathname
+/// cannot redirect the write. `display_path` is used only in diagnostics and
+/// must never be reopened by this helper.
+#[cfg(any(unix, windows))]
+pub(crate) fn prepare_atomic_write_from_retained_directory(
+    parent_dir: std::fs::File,
+    destination_name: &std::ffi::OsStr,
+    display_path: &Path,
+    contents: &[u8],
+) -> Result<PreparedAtomicWrite> {
+    validate_single_leaf(destination_name)?;
+    let parent = display_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = destination_name.to_str().unwrap_or("config.json");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
     let tmp_name =
         std::ffi::OsString::from(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
     let tmp_path = parent.join(&tmp_name);
@@ -2295,8 +3148,6 @@ fn prepare_atomic_write_in_existing_parent(
     let mut tmp = open_private_atomic_temp_at(&parent_dir, &tmp_name, &tmp_path)?;
     #[cfg(windows)]
     let mut tmp = open_windows_private_atomic_temp(&parent_dir, &tmp_name, &tmp_path)?;
-    #[cfg(all(not(unix), not(windows)))]
-    let mut tmp = open_private_atomic_temp(&tmp_path)?;
     std::io::Write::write_all(&mut tmp, contents)
         .with_context(|| format!("writing temporary file {}", tmp_path.display()))?;
     tmp.sync_all()
@@ -2304,20 +3155,241 @@ fn prepare_atomic_write_in_existing_parent(
     #[cfg(not(windows))]
     drop(tmp);
     Ok(PreparedAtomicWrite {
-        #[cfg(all(not(unix), not(windows)))]
-        tmp_path: Some(tmp_path),
-        #[cfg(all(not(unix), not(windows)))]
-        path: path.to_path_buf(),
         parent: parent.to_path_buf(),
-        #[cfg(any(unix, windows))]
         parent_dir,
         #[cfg(unix)]
         tmp_name: Some(tmp_name),
         #[cfg(windows)]
         tmp_file: Some(tmp),
-        #[cfg(any(unix, windows))]
-        destination_name,
+        destination_name: destination_name.to_os_string(),
     })
+}
+
+/// Atomically replace one leaf under a retained directory.  This is the
+/// capability-relative mutation primitive used by attached-session config
+/// transactions; it never resolves the original directory path again.
+#[cfg(any(unix, windows))]
+pub(crate) fn atomic_write_leaf_from_retained_directory(
+    directory: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    display_path: &Path,
+    contents: &[u8],
+) -> Result<()> {
+    prepare_atomic_write_from_retained_directory(
+        directory.try_clone()?,
+        leaf,
+        display_path,
+        contents,
+    )?
+    .commit()
+}
+
+/// Prove a retained directory accepts a private create/remove cycle without
+/// reopening its pathname. The probe leaf is opened with exclusive creation,
+/// so it can never replace an attacker-controlled existing file merely to
+/// answer a writability question.
+#[cfg(any(unix, windows))]
+pub(crate) fn probe_directory_writable_from_retained_directory(
+    directory: &std::fs::File,
+    display_parent: &Path,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    for attempt in 0..3u8 {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let leaf = std::ffi::OsString::from(format!(
+            ".cockpit-write-probe-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
+        let display = display_parent.join(&leaf);
+        #[cfg(unix)]
+        let created = open_private_atomic_temp_at(directory, &leaf, &display);
+        #[cfg(windows)]
+        let created = open_windows_private_atomic_temp(directory, &leaf, &display);
+        let mut probe = match created {
+            Ok(file) => file,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|source| source.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error).with_context(|| format!("creating {display:?}")),
+        };
+        probe.write_all(b"probe")?;
+        probe.sync_all()?;
+        drop(probe);
+        remove_leaf_from_retained_directory(directory, &leaf, &display)?;
+        return Ok(());
+    }
+    anyhow::bail!("could not allocate a private retained-directory writability probe")
+}
+
+/// Remove one optional regular leaf relative to a retained directory.
+///
+/// As with [`atomic_write_leaf_from_retained_directory`], the directory
+/// capability is retained across the namespace operation.  A missing leaf is
+/// already absent, while every other failure remains observable to the
+/// journal caller.
+#[cfg(any(unix, windows))]
+pub(crate) fn remove_leaf_from_retained_directory(
+    directory: &std::fs::File,
+    leaf: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<()> {
+    validate_single_leaf(leaf)?;
+    #[cfg(unix)]
+    {
+        match unlink_file_at(directory, leaf) {
+            Ok(()) => directory
+                .sync_all()
+                .with_context(|| format!("fsync config directory after removing {}", display_path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("removing {}", display_path.display())),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_READ_ATTRIBUTES, SYNCHRONIZE,
+        };
+        let file = match open_windows_relative_nofollow(
+            directory,
+            leaf,
+            false,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).with_context(|| format!("opening {} for removal", display_path.display())),
+        };
+        reject_windows_reparse_handle(&file, display_path)?;
+        remove_open_file_on_windows(&file)
+            .with_context(|| format!("removing {}", display_path.display()))?;
+        // Windows has no directory fsync primitive; this mirrors the audited
+        // pathname writer's post-rename best-effort sync.
+        let _ = directory.sync_all();
+        Ok(())
+    }
+}
+
+/// List stale private atomic-write temporaries through an already-open
+/// directory.  Cleanup is deliberately capability-relative for the same
+/// reason as journal removal: after a config parent has been captured, a
+/// pathname replacement must not redirect crash-debris deletion elsewhere.
+///
+/// Both supported platforms enumerate from the retained directory handle;
+/// Windows uses its existing `GetFileInformationByHandleEx` implementation
+/// rather than reopening the original directory spelling.
+#[cfg(unix)]
+pub(crate) fn stale_private_temp_leaves_from_retained_directory(
+    directory: &std::fs::File,
+    stale_after: std::time::Duration,
+) -> Result<Vec<std::ffi::OsString>> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut leaves = Vec::new();
+    for leaf in retained_directory_names(directory)? {
+        let bytes = leaf.as_bytes();
+        if bytes == b"." || bytes == b".." || !bytes.starts_with(b".") || !bytes.ends_with(b".tmp") {
+            continue;
+        }
+        let name = path_component_cstring(&leaf)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the retained directory fd, name, and output storage remain
+        // live; AT_SYMLINK_NOFOLLOW rejects a planted symlink.
+        let stated = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stated != 0 {
+            continue;
+        }
+        // SAFETY: fstatat initialized `stat` on success.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || stat.st_mode & 0o777 != 0o600
+            || stat.st_mtime < 0
+            || now.saturating_sub(stat.st_mtime as u64) < stale_after.as_secs()
+        {
+            continue;
+        }
+        leaves.push(leaf);
+    }
+    Ok(leaves)
+}
+
+#[cfg(windows)]
+pub(crate) fn stale_private_temp_leaves_from_retained_directory(
+    directory: &std::fs::File,
+    stale_after: std::time::Duration,
+) -> Result<Vec<std::ffi::OsString>> {
+    use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_READ_ATTRIBUTES, SYNCHRONIZE,
+    };
+
+    let mut leaves = Vec::new();
+    for leaf in retained_directory_names(directory)? {
+        let display = Path::new(&leaf);
+        let display_name = display.to_string_lossy();
+        if !display_name.starts_with('.') || !display_name.ends_with(".tmp") {
+            continue;
+        }
+        let file = match open_windows_relative_nofollow(
+            directory,
+            &leaf,
+            false,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("opening retained temporary for cleanup"),
+        };
+        if reject_windows_reparse_handle(&file, display).is_err()
+            || verify_windows_protected_dacl(&file).is_err()
+        {
+            continue;
+        }
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        if !metadata.is_file()
+            || !metadata
+                .modified()
+                .ok()
+                .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|age| age >= stale_after)
+        {
+            continue;
+        }
+        leaves.push(leaf);
+    }
+    Ok(leaves)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+pub(crate) fn stale_private_temp_leaves_from_retained_directory(
+    _directory: &std::fs::File,
+    _stale_after: std::time::Duration,
+) -> Result<Vec<std::ffi::OsString>> {
+    Ok(Vec::new())
 }
 
 #[cfg(windows)]
@@ -2426,6 +3498,34 @@ fn open_private_atomic_temp(path: &Path) -> Result<std::fs::File> {
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn modes_session_setup_retained_workspace_snapshot_ignores_unrelated_effective_default_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let cockpit = temp.path().join(".cockpit");
+        std::fs::create_dir(&cockpit).unwrap();
+        let config = cockpit.join("config.json");
+        std::fs::write(&config, "{}\n").unwrap();
+        std::fs::write(
+            cockpit.join(".cockpit-active-model-journal-interrupted.json"),
+            "{\"phase\":\"prepared\"}",
+        )
+        .unwrap();
+
+        let canonical_config = std::fs::canonicalize(&config).unwrap();
+        let journal = crate::config::effective_default::journal_path_for_layer(&canonical_config);
+        let backup = crate::config::effective_default::backup_path_for_layer(&canonical_config);
+        let retained = std::fs::File::open(&cockpit).unwrap();
+        let snapshot = super::snapshot_workspace_config_layer_from_retained_config_directory(
+            &retained,
+            std::ffi::OsStr::new("config.json"),
+            &canonical_config,
+            journal.file_name(),
+            backup.file_name(),
+        )
+        .expect("an unrelated transaction artifact does not alter selected-leaf capture");
+        assert_eq!(snapshot.config_json.as_deref(), Some(&b"{}\n"[..]));
+    }
 
     #[test]
     fn relative_explicit_config_in_current_directory_needs_no_parent_creation() {
@@ -2693,6 +3793,68 @@ mod windows_tests {
             std::fs::read(attacker.join("provider.json")).unwrap(),
             b"outside",
             "handle-bound deletion must not follow the swapped parent path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mutation_lock_tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn target_local_locks_do_not_serialize_independent_config_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let a_dir = temp.path().join("a");
+        let b_dir = temp.path().join("b");
+        std::fs::create_dir_all(&a_dir).unwrap();
+        std::fs::create_dir_all(&b_dir).unwrap();
+        let a = a_dir.join("config.json");
+        let b = b_dir.join("config.json");
+        let _a_guard = super::ConfigMutationLock::acquire(&a).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _b_guard = super::ConfigMutationLock::acquire(&b).unwrap();
+            ready_tx.send(()).unwrap();
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a lock for config A must not block independent config B");
+    }
+
+    #[test]
+    fn retained_and_ambient_writers_serialize_on_the_same_target_lock_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let target = config_dir.join("config.json");
+        let canonical = std::fs::canonicalize(&config_dir)
+            .unwrap()
+            .join("config.json");
+        let guard = super::ConfigMutationLock::acquire(&canonical).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let retained_dir = config_dir.clone();
+        std::thread::spawn(move || {
+            let directory = std::fs::File::open(&retained_dir).unwrap();
+            let _retained_guard = super::ConfigMutationLock::acquire_retained(
+                &directory,
+                &canonical,
+                &retained_dir,
+            )
+            .unwrap();
+            ready_tx.send(()).unwrap();
+        });
+        assert!(
+            ready_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the retained writer must wait for the ambient target lock"
+        );
+        drop(guard);
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the retained writer acquires once the shared target lock releases");
+        assert!(
+            !target.exists(),
+            "locking must not create or replace the config leaf itself"
         );
     }
 }

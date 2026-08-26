@@ -10,7 +10,18 @@ pub struct SessionWorkerHandle {
     pub session_id: Uuid,
     pub project_root: PathBuf,
     pub active_agent_name: String,
-    pub trust_policy: crate::config::trust::WorkspaceTrustPolicy,
+    /// Current daemon-authoritative workspace policy.  This is shared with
+    /// the long-lived worker/driver task so a durable trust transition cannot
+    /// leave a live session running under an attach-time copy of `Trust`.
+    trust_policy: crate::config::trust::SharedWorkspaceTrustPolicy,
+    /// Durable revision of `trust_policy`. This daemon-private tag lets a
+    /// worker reject a refresh that was resolved before a later trust
+    /// transition, without putting a database detail in task-local authority.
+    trust_revision: Arc<std::sync::atomic::AtomicI64>,
+    /// Attach-time directory authority for every workspace-local config
+    /// refresh.  This is deliberately not a path-derived capability.
+    pub(crate) workspace_root_authority:
+        Arc<crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority>,
     work_tx: mpsc::Sender<SessionWork>,
     event_tx: EventSender,
     turn_completions: Arc<Mutex<TurnCompletions>>,
@@ -354,7 +365,17 @@ impl std::fmt::Debug for HostCapabilityRefreshRuntime {
 #[derive(Debug, Clone)]
 pub struct SessionConfigSnapshot {
     pub generation: u64,
+    /// Durable workspace-trust revision that produced this projection. It is
+    /// only a worker-side CAS fence and is never exposed in the protocol.
+    pub(crate) trust_revision: i64,
     pub providers: crate::config::providers::ProvidersConfig,
+    /// Daemon-private source proofs for provider/model choices visible in
+    /// this generation. They are derived from capability-captured layer bytes
+    /// and deliberately never cross the protocol or diagnostic boundary.
+    pub(crate) provider_model_sources: HashMap<
+        (String, String),
+        cockpit_config::config::providers::RetainedProviderModelSource,
+    >,
     pub extended: crate::config::extended::ExtendedConfig,
     /// Turn-pinned hook registry resolved under the same workspace-trust scope
     /// and generation as providers/extended config. A config reload affects
@@ -380,7 +401,9 @@ impl SessionConfigSnapshot {
     ) -> Self {
         Self {
             generation,
+            trust_revision: 0,
             providers,
+            provider_model_sources: HashMap::new(),
             extended,
             hooks: crate::config::extended::hooks::HookRegistry::default(),
             host_capabilities: super::unpublished_host_capability_snapshot(),
@@ -397,7 +420,9 @@ impl SessionConfigSnapshot {
     ) -> Self {
         Self {
             generation,
+            trust_revision: 0,
             providers,
+            provider_model_sources: HashMap::new(),
             extended,
             hooks,
             host_capabilities: super::unpublished_host_capability_snapshot(),
@@ -419,6 +444,46 @@ impl SessionConfigSnapshot {
     ) -> Self {
         self.host_capability_refresh_runtime = Some(runtime);
         self
+    }
+
+    /// Bind a resolved projection to its exact durable trust decision.
+    pub(crate) fn with_trust_revision(mut self, trust_revision: i64) -> Self {
+        self.trust_revision = trust_revision;
+        self
+    }
+
+    /// Bind the visible provider/model catalog to the exact retained source
+    /// bytes that supplied each choice. The supplied chain is the complete
+    /// attach-time source selection (global, project, or explicit); its
+    /// opaque proofs authorize only capability-relative writes to that exact
+    /// source, never workspace access through a global layer.
+    pub(crate) fn with_retained_provider_model_sources(
+        mut self,
+        workspace: &cockpit_config::config::WorkspaceConfigLayerSnapshotChain,
+    ) -> anyhow::Result<Self> {
+        let mut sources = HashMap::new();
+        for (provider_id, provider) in &self.providers.providers {
+            for model in &provider.models {
+                if let Some(source) = cockpit_config::config::providers::retained_provider_model_source_from_workspace_layer_snapshots(
+                    &workspace.layers,
+                    provider_id,
+                    &model.id,
+                )? {
+                    sources.insert((provider_id.clone(), model.id.clone()), source);
+                }
+            }
+        }
+        self.provider_model_sources = sources;
+        Ok(self)
+    }
+
+    pub(crate) fn retained_provider_model_source(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Option<&cockpit_config::config::providers::RetainedProviderModelSource> {
+        self.provider_model_sources
+            .get(&(provider_id.to_string(), model_id.to_string()))
     }
 
     /// The turn-pinned hook registry.
@@ -622,28 +687,64 @@ pub(super) fn redacted_provider_view(
 pub struct ReplaceConfigSnapshotResult {
     pub generation: u64,
     pub changed: bool,
+    /// A refresh snapshot was resolved against an older worker generation.
+    /// It was deliberately not published: callers must re-resolve from the
+    /// retained authority rather than overwrite a newer mutation.
+    pub stale: bool,
 }
 
 pub(super) fn replace_config_snapshot(
     config_snapshot: &Arc<RwLock<SessionConfigSnapshot>>,
     replacement: SessionConfigSnapshot,
 ) -> ReplaceConfigSnapshotResult {
+    replace_config_snapshot_if_current(config_snapshot, replacement, None, None)
+}
+
+/// Replace a resolved snapshot only if the worker is still at the generation
+/// observed before resolution began.  The worker lock is the final freshness
+/// fence: a watcher may finish parsing an older file after a direct mutation
+/// has already published generation N, but it can never publish its stale
+/// view over N.
+pub(super) fn replace_config_snapshot_if_current(
+    config_snapshot: &Arc<RwLock<SessionConfigSnapshot>>,
+    replacement: SessionConfigSnapshot,
+    expected_generation: Option<u64>,
+    expected_trust_revision: Option<i64>,
+) -> ReplaceConfigSnapshotResult {
     let mut snapshot = config_snapshot
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if expected_generation.is_some_and(|expected| expected != snapshot.generation) {
+        return ReplaceConfigSnapshotResult {
+            generation: snapshot.generation,
+            changed: false,
+            stale: true,
+        };
+    }
+    if expected_trust_revision.is_some_and(|expected| expected != snapshot.trust_revision) {
+        return ReplaceConfigSnapshotResult {
+            generation: snapshot.generation,
+            changed: false,
+            stale: true,
+        };
+    }
     if config_snapshots_equal(&snapshot, &replacement) {
         return ReplaceConfigSnapshotResult {
             generation: snapshot.generation,
             changed: false,
+            stale: false,
         };
     }
     snapshot.generation = snapshot.generation.saturating_add(1);
     snapshot.providers = replacement.providers;
+    snapshot.provider_model_sources = replacement.provider_model_sources;
     snapshot.extended = replacement.extended;
     snapshot.hooks = replacement.hooks;
+    snapshot.trust_revision = replacement.trust_revision;
     ReplaceConfigSnapshotResult {
         generation: snapshot.generation,
         changed: true,
+        stale: false,
     }
 }
 
@@ -676,8 +777,10 @@ fn config_snapshots_equal(
     replacement: &SessionConfigSnapshot,
 ) -> bool {
     serialize_equal(&current.providers, &replacement.providers)
+        && current.provider_model_sources == replacement.provider_model_sources
         && serialize_equal(&current.extended, &replacement.extended)
         && current.hooks == replacement.hooks
+        && current.trust_revision == replacement.trust_revision
 }
 
 fn serialize_equal<T: serde::Serialize>(left: &T, right: &T) -> bool {
@@ -833,7 +936,8 @@ impl SessionWorkerHandle {
             session_id: session.id,
             project_root: session.project_root.clone(),
             active_agent_name: "Build".to_string(),
-            trust_policy: crate::config::trust::WorkspaceTrustPolicy {
+            trust_policy: crate::config::trust::shared_workspace_trust_policy(
+                crate::config::trust::WorkspaceTrustPolicy {
                 root: crate::config::trust::resolve_trust_root(&session.project_root)
                     .unwrap_or_else(|_| crate::config::trust::TrustRoot {
                         opened_path: session.project_root.clone(),
@@ -841,7 +945,20 @@ impl SessionWorkerHandle {
                         kind: crate::config::trust::TrustRootKind::Directory,
                     }),
                 mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
-            },
+                },
+            ),
+            trust_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            workspace_root_authority: Arc::new(
+                crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority::capture(
+                    &session.project_root,
+                    &crate::config::trust::WorkspaceTrustPolicy {
+                        root: crate::config::trust::resolve_trust_root(&session.project_root)
+                            .expect("test trust root"),
+                        mode: crate::db::workspace_trust::WorkspaceTrustMode::Trust,
+                    },
+                )
+                .expect("test workspace authority"),
+            ),
             work_tx,
             event_tx,
             turn_completions: Arc::new(Mutex::new(TurnCompletions::default())),
@@ -875,11 +992,34 @@ impl SessionWorkerHandle {
         providers: crate::config::providers::ProvidersConfig,
         extended: crate::config::extended::ExtendedConfig,
     ) {
+        self.set_config_snapshot_for_tests_at_generation(0, providers, extended);
+    }
+
+    /// Test receiver counterpart of the worker's atomic snapshot publication.
+    /// Callers that model a real `ReplaceConfigSnapshot` acknowledgement must
+    /// keep this generation equal to the acknowledgement they send, otherwise
+    /// authority-bound receipt replay would be tested against an artificial
+    /// stale handle.
+    #[cfg(test)]
+    pub(crate) fn set_config_snapshot_for_tests_at_generation(
+        &self,
+        generation: u64,
+        providers: crate::config::providers::ProvidersConfig,
+        extended: crate::config::extended::ExtendedConfig,
+    ) {
         *self
             .config_snapshot
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            SessionConfigSnapshot::new(0, providers, extended);
+            SessionConfigSnapshot::new(generation, providers, extended);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_full_config_snapshot_for_tests(&self, snapshot: SessionConfigSnapshot) {
+        *self
+            .config_snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot;
     }
 
     pub fn set_created_by_principal(&self, principal: Option<String>) -> anyhow::Result<()> {
@@ -1142,6 +1282,60 @@ impl Drop for InteractiveClientGuard {
 }
 
 impl SessionWorkerHandle {
+    /// Snapshot the policy currently governing this live worker.  Do not use
+    /// attach-time state for daemon decisions: trust can change while a
+    /// session remains attached.
+    pub(crate) fn current_trust_policy(&self) -> crate::config::trust::WorkspaceTrustPolicy {
+        crate::config::trust::read_shared_workspace_trust_policy(&self.trust_policy)
+    }
+
+    pub(crate) fn current_trust_revision(&self) -> i64 {
+        self.trust_revision.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn trust_transition_matches(
+        &self,
+        expected: &crate::config::trust::ResolvedWorkspaceTrustPolicy,
+    ) -> bool {
+        let revision = self.current_trust_revision();
+        // Bare test handles have no async DB preflight, hence no durable
+        // revision to seed. Production workers are constructed only after a
+        // positive revision is resolved by the registry.
+        (revision == expected.revision || (cfg!(test) && revision == 0))
+            && self.current_trust_policy() == expected.policy
+    }
+
+    /// Advance the live policy cell and tag the existing projection before an
+    /// unlocked replacement is sent to the worker.  Tagging the snapshot
+    /// first invalidates any already-resolved older refresh at the worker CAS;
+    /// publishing the policy immediately afterwards makes the durable DB
+    /// decision authoritative even if the replacement later fails.
+    pub(crate) fn begin_trust_transition(
+        &self,
+        resolved: &crate::config::trust::ResolvedWorkspaceTrustPolicy,
+    ) {
+        self.config_snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .trust_revision = resolved.revision;
+        crate::config::trust::replace_shared_workspace_trust_policy(
+            &self.trust_policy,
+            resolved.policy.clone(),
+        );
+        self.trust_revision
+            .store(resolved.revision, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Install a new policy only after the caller has published the matching
+    /// retained config snapshot.  The shared task-local used by the driver
+    /// observes this same cell on its next policy read.
+    pub(crate) fn replace_trust_policy(
+        &self,
+        policy: crate::config::trust::WorkspaceTrustPolicy,
+    ) {
+        crate::config::trust::replace_shared_workspace_trust_policy(&self.trust_policy, policy);
+    }
+
     pub async fn send_work(&self, work: SessionWork) -> Result<()> {
         self.work_tx
             .send(work)
@@ -1622,6 +1816,9 @@ pub enum SessionWork {
     /// carries the driver's own active-model-state generation.
     EmitRecoveredDefaultTerminals {
         transactions: Vec<crate::config::providers::RecoveredTransaction>,
+        /// Resolves only after the driver's durable default-update receipt
+        /// write. The retained config journal remains until that point.
+        respond_to: oneshot::Sender<std::result::Result<(), String>>,
     },
     SteerDelegation {
         task_call_id: String,
@@ -1683,6 +1880,14 @@ pub enum SessionWork {
     },
     ReplaceConfigSnapshot {
         snapshot: Box<SessionConfigSnapshot>,
+        /// Worker generation captured before the daemon began resolving this
+        /// replacement. `None` is retained only for in-process test seams;
+        /// production refreshes always provide a fence.
+        expected_generation: Option<u64>,
+        /// Durable trust revision captured with the same retained source
+        /// chain. Production refreshes provide it so a worker cannot publish
+        /// a projection from before a later trust transition.
+        expected_trust_revision: Option<i64>,
         respond_to: oneshot::Sender<ReplaceConfigSnapshotResult>,
     },
     SetActiveModel {
@@ -1799,6 +2004,7 @@ pub fn spawn(
         crate::engine::model::EndpointRecoveryAdditionalParams,
     >,
     project_root: PathBuf,
+    workspace_root_authority: Arc<crate::daemon::agent_installation::WorkerWorkspaceConfigAuthority>,
     client_no_sandbox: bool,
     daemon_no_sandbox: bool,
     extended_cfg: &crate::config::extended::ExtendedConfig,
@@ -1808,6 +2014,7 @@ pub fn spawn(
     write_scope: crate::write_scope::WriteScopeSource,
     global_bus: Option<EventSender>,
     trust_policy: crate::config::trust::WorkspaceTrustPolicy,
+    trust_revision: i64,
     cleanup: Option<Box<dyn FnOnce() + Send + 'static>>,
     terminal_lock_cleanup_gate: Arc<tokio::sync::Mutex<()>>,
     terminal_closing: Arc<std::sync::atomic::AtomicBool>,
@@ -1924,11 +2131,14 @@ pub fn spawn(
     let park_commit = crate::engine::interrupt::ParkCommit::new();
     let config_snapshot = Arc::new(RwLock::new(config_snapshot));
 
+    let trust_policy = crate::config::trust::shared_workspace_trust_policy(trust_policy);
     let handle = SessionWorkerHandle {
         session_id,
         project_root: project_root.clone(),
         active_agent_name: initial_agent,
         trust_policy: trust_policy.clone(),
+        trust_revision: Arc::new(std::sync::atomic::AtomicI64::new(trust_revision)),
+        workspace_root_authority,
         work_tx,
         event_tx: event_tx.clone(),
         turn_completions: turn_completions.clone(),
@@ -1989,7 +2199,7 @@ pub fn spawn(
             terminal_closing,
             terminal_cleanup_complete,
         ));
-        crate::config::trust::scope_workspace_trust_policy(trust_policy, worker).await;
+        crate::config::trust::scope_shared_workspace_trust_policy(trust_policy, worker).await;
     });
 
     (handle, join)

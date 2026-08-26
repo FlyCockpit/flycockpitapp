@@ -551,6 +551,22 @@ pub struct AgentProfileSnapshotRow {
     pub created_at_unix_ms: i64,
 }
 
+/// One coherent, read-only input record for daemon session-setup projection.
+/// It is assembled on one SQLite connection so a caller never combines an
+/// installation row from one revision with bindings or selection from another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSetupInstallationSnapshotRow {
+    pub installation: AgentInstallationRow,
+    pub observation: Option<AgentObservationRow>,
+    pub bindings: Vec<AgentBindingRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSetupDbSnapshot {
+    pub selected_installation_id: Option<Uuid>,
+    pub installations: Vec<SessionSetupInstallationSnapshotRow>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrepareAgentSessionOutcome {
     Prepared(AgentProfileSnapshotRow),
@@ -880,6 +896,78 @@ impl Db {
         let key = scope_key(scope, canonical_workspace_id.as_deref())?;
         self.read(move |conn| installations_by_scope(conn, scope, &key))
             .await
+    }
+
+    /// Read the selected immutable profile reference, all visible installation
+    /// rows, observations, and matching current bindings through one SQLite
+    /// read snapshot.  Definition files and provider config are intentionally
+    /// outside this DB boundary and must be revalidated by the daemon before
+    /// publishing a composite response.
+    pub async fn session_setup_snapshot(
+        &self,
+        session_id: Uuid,
+        canonical_workspace_id: String,
+    ) -> Result<SessionSetupDbSnapshot> {
+        self.read(move |conn| {
+            // A pooled SQLite connection does not by itself make consecutive
+            // SELECTs one snapshot under WAL. Hold an explicit read
+            // transaction so the selected profile, candidates, observations,
+            // and bindings are one durable authority view.
+            conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+            let projection = (|| {
+                let selected_installation_id = snapshot_for_session(conn, session_id)?
+                    .map(|snapshot| snapshot.installation_id);
+                let mut installations =
+                    installations_by_scope(conn, AgentInstallationScope::Global, "")?;
+                installations.extend(installations_by_scope(
+                    conn,
+                    AgentInstallationScope::WorkspacePrivate,
+                    &canonical_workspace_id,
+                )?);
+                installations.extend(installations_by_scope(
+                    conn,
+                    AgentInstallationScope::WorkspaceShared,
+                    &canonical_workspace_id,
+                )?);
+                let mut rows = Vec::with_capacity(installations.len());
+                for installation in installations {
+                    let observation = observation_by_id(conn, installation.installation_id)?;
+                    let bindings = current_bindings_for_digest(
+                        conn,
+                        installation.installation_id,
+                        &installation.source_digest,
+                    )?;
+                    rows.push(SessionSetupInstallationSnapshotRow {
+                        installation,
+                        observation,
+                        bindings,
+                    });
+                }
+                if let Some(selected_installation_id) = selected_installation_id {
+                    ensure!(
+                        rows.iter().any(|row| {
+                            row.installation.installation_id == selected_installation_id
+                        }),
+                        "session profile references an installation outside its authorized workspace snapshot"
+                    );
+                }
+                Ok(SessionSetupDbSnapshot {
+                    selected_installation_id,
+                    installations: rows,
+                })
+            })();
+            match projection {
+                Ok(snapshot) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(snapshot)
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        })
+        .await
     }
 }
 

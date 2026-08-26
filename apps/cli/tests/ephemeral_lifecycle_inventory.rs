@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use quote::ToTokens;
 use syn::visit::{self, Visit};
 
 const RAW_AUTHORITY: &[&str] = &[
@@ -377,7 +378,9 @@ fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
         return false;
     };
     if return_segment.ident != "Result"
+        || return_arguments.args.len() != 2
         || !matches!(return_arguments.args.first(), Some(syn::GenericArgument::Type(syn::Type::Path(value))) if value.path.is_ident("T"))
+        || !matches!(return_arguments.args.iter().nth(1), Some(syn::GenericArgument::Type(syn::Type::Path(value))) if path_ends(&value.path, "OwnedDaemonRunError"))
     {
         return false;
     }
@@ -456,6 +459,9 @@ fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
     else {
         return false;
     };
+    if pin_segment.ident != "Pin" || pin_arguments.args.len() != 1 {
+        return false;
+    }
     let Some(box_segment) = boxed.path.segments.last() else {
         return false;
     };
@@ -467,6 +473,9 @@ fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
     else {
         return false;
     };
+    if box_segment.ident != "Box" || box_arguments.args.len() != 1 {
+        return false;
+    }
     let has_client_lifetime = future.bounds.iter().any(
         |bound| matches!(bound, syn::TypeParamBound::Lifetime(value) if value.ident == "client"),
     );
@@ -487,7 +496,8 @@ fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
                     if result.path.segments.last().is_some_and(|segment| {
                         segment.ident == "Result"
                             && matches!(&segment.arguments, syn::PathArguments::AngleBracketed(arguments)
-                                if matches!(arguments.args.first(), Some(syn::GenericArgument::Type(syn::Type::Path(value))) if value.path.is_ident("T")))
+                                if arguments.args.len() == 1
+                                    && matches!(arguments.args.first(), Some(syn::GenericArgument::Type(syn::Type::Path(value))) if value.path.is_ident("T")))
                     }))
             }
             _ => false,
@@ -498,11 +508,10 @@ fn runner_hrtb_is_exact(runner: &syn::ItemFn) -> bool {
 
 fn core_contract_violations(source: &str) -> Vec<String> {
     #[derive(Default)]
-    struct RawReturn(bool);
-    impl<'ast> Visit<'ast> for RawReturn {
+    struct RawDaemonSurface(bool);
+    impl<'ast> Visit<'ast> for RawDaemonSurface {
         fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
-            if path_ends(&path.path, "DaemonClient") || path_ends(&path.path, "ScopedDaemonClient")
-            {
+            if path_ends(&path.path, "DaemonClient") {
                 self.0 = true;
             }
             visit::visit_type_path(self, path);
@@ -555,19 +564,23 @@ fn core_contract_violations(source: &str) -> Vec<String> {
         }
     }
 
-    let implementation = file.items.iter().find_map(|item| match item {
-        syn::Item::Impl(item)
-            if item.trait_.is_none()
-                && matches!(&*item.self_ty, syn::Type::Path(path) if path_ends(&path.path, "ScopedDaemonClient")) => Some(item),
-        _ => None,
-    });
-    let Some(implementation) = implementation else {
-        violations.push("ScopedDaemonClient inherent impl missing".into());
-        return violations;
-    };
-    let method_items = implementation
+    let implementations = file
         .items
         .iter()
+        .filter_map(|item| match item {
+            syn::Item::Impl(item)
+                if matches!(&*item.self_ty, syn::Type::Path(path) if path_ends(&path.path, "ScopedDaemonClient")) => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if implementations.is_empty() {
+        violations.push("ScopedDaemonClient inherent impl missing".into());
+        return violations;
+    }
+    let method_items = implementations
+        .iter()
+        .filter(|implementation| implementation.trait_.is_none())
+        .flat_map(|implementation| &implementation.items)
         .filter_map(|item| match item {
             syn::ImplItem::Fn(method) => Some(method),
             _ => None,
@@ -584,54 +597,21 @@ fn core_contract_violations(source: &str) -> Vec<String> {
         if !matches!(method.vis, syn::Visibility::Public(_)) {
             violations.push(format!("{} is not public", method.sig.ident));
         }
-        let mut raw = RawReturn::default();
-        raw.visit_return_type(&method.sig.output);
+        let mut raw = RawDaemonSurface::default();
+        raw.visit_signature(&method.sig);
         if raw.0 {
             violations.push(format!(
-                "{} returns raw daemon client authority",
+                "{} exposes raw daemon client authority in its signature",
                 method.sig.ident
             ));
         }
     }
-    for item in &file.items {
-        let syn::Item::Impl(item) = item else {
-            continue;
-        };
-        if !matches!(&*item.self_ty, syn::Type::Path(path) if path_ends(&path.path, "ScopedDaemonClient"))
-        {
-            continue;
-        }
-        if let Some((_, path, _)) = &item.trait_
-            && [
-                "Clone",
-                "Copy",
-                "Deref",
-                "DerefMut",
-                "AsRef",
-                "AsMut",
-                "Borrow",
-                "BorrowMut",
-            ]
-            .iter()
-            .any(|name| path_ends(path, name))
-        {
+    for implementation in implementations {
+        if let Some((_, path, _)) = &implementation.trait_ {
             violations.push(format!(
-                "ScopedDaemonClient escape trait: {}",
+                "ScopedDaemonClient may not implement trait {}",
                 path.segments.last().unwrap().ident
             ));
-        }
-        for implementation_item in &item.items {
-            let syn::ImplItem::Fn(method) = implementation_item else {
-                continue;
-            };
-            let mut authority = RawReturn::default();
-            authority.visit_return_type(&method.sig.output);
-            if authority.0 {
-                violations.push(format!(
-                    "trait method {} returns daemon client authority",
-                    method.sig.ident
-                ));
-            }
         }
     }
     let runner = file.items.iter().find_map(|item| match item {
@@ -679,7 +659,7 @@ fn raw_owner_acquisitions(source: &str) -> Vec<String> {
         fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
             if self.test_depth == 0
                 && matches!(&*call.func, syn::Expr::Path(path)
-                    if path.path.segments.iter().rev().take(2).map(|segment| segment.ident.to_string()).eq(["connect", "OwnedDaemonSession"]))
+                    if path.path.segments.iter().map(|segment| segment.ident.to_string()).eq(["OwnedDaemonSession", "connect"]))
             {
                 self.acquisitions
                     .push(self.function.clone().unwrap_or_else(|| "<none>".into()));
@@ -696,6 +676,75 @@ fn raw_owner_acquisitions(source: &str) -> Vec<String> {
     };
     visitor.visit_file(&file);
     visitor.acquisitions
+}
+
+fn raw_owner_aliases(source: &str) -> Vec<String> {
+    struct AliasVisitor {
+        test_depth: usize,
+        aliases: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for AliasVisitor {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            let test = usize::from(is_test_only(&item.attrs));
+            self.test_depth += test;
+            visit::visit_item_mod(self, item);
+            self.test_depth -= test;
+        }
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if self.test_depth == 0 && compact_tokens(&item.ty).contains("OwnedDaemonSession") {
+                self.aliases.push(item.ident.to_string());
+            }
+            visit::visit_item_type(self, item);
+        }
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            if self.test_depth == 0 {
+                let mut inspection = UseInspection::default();
+                inspect_use(&item.tree, &mut inspection);
+                if inspection.renamed
+                    && inspection
+                        .names
+                        .iter()
+                        .any(|name| matches!(name.as_str(), "OwnedDaemonSession" | "connect"))
+                {
+                    self.aliases.push("use".into());
+                }
+            }
+            visit::visit_item_use(self, item);
+        }
+    }
+    let file = syn::parse_file(source).unwrap();
+    let mut visitor = AliasVisitor {
+        test_depth: 0,
+        aliases: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.aliases
+}
+
+fn raw_owner_connect_path_count(source: &str) -> usize {
+    struct ConnectPaths(usize);
+    impl<'ast> Visit<'ast> for ConnectPaths {
+        fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+            if path
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .eq(["OwnedDaemonSession", "connect"])
+            {
+                self.0 += 1;
+            }
+            visit::visit_expr_path(self, path);
+        }
+    }
+    let file = syn::parse_file(source).unwrap();
+    let mut visitor = ConnectPaths(0);
+    visitor.visit_file(&file);
+    visitor.0
+}
+
+fn compact_tokens(tokens: impl quote::ToTokens) -> String {
+    tokens.to_token_stream().to_string().replace(' ', "")
 }
 
 fn raw_owner_struct_literals(source: &str) -> Vec<String> {
@@ -738,7 +787,7 @@ fn raw_owner_struct_literals(source: &str) -> Vec<String> {
         }
         fn visit_expr_struct(&mut self, value: &'ast syn::ExprStruct) {
             if self.test_depth == 0
-                && (path_ends(&value.path, "OwnedDaemonSession")
+                && (value.path.is_ident("OwnedDaemonSession")
                     || (self.owned_impl_depth > 0 && value.path.is_ident("Self")))
             {
                 self.owners
@@ -794,7 +843,9 @@ fn core_runner_is_the_only_raw_owner() {
         core_contract_violations(&source).join("\n")
     );
     assert_eq!(raw_owner_acquisitions(&source), ["run_owned_daemon"]);
+    assert_eq!(raw_owner_connect_path_count(&source), 1);
     assert_eq!(raw_owner_struct_literals(&source), ["connect"]);
+    assert!(raw_owner_aliases(&source).is_empty());
     let session = file
         .items
         .iter()
@@ -864,12 +915,43 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
         ),
         ("for<'client> FnOnce(", "FnOnce("),
         ("+ 'client>", "+ 'static>"),
+        ("std::pin::Pin<", "crate::EvilPin<"),
+        (
+            "Box<dyn std::future::Future",
+            "EvilBox<dyn std::future::Future",
+        ),
+        (
+            "std::result::Result<T, OwnedDaemonRunError>",
+            "std::result::Result<T, OwnedDaemonRunError, anyhow::Error>",
+        ),
     ] {
         let adversarial = source.replacen(before, after, 1);
         assert_ne!(adversarial, source, "fixture seam exists: {before}");
         assert!(
             !core_contract_violations(&adversarial).is_empty(),
             "accepted weakened scoped capability contract: {after}"
+        );
+    }
+
+    for addition in [
+        r#"
+            impl ScopedDaemonClient<'_> {
+                pub fn with_raw<R>(&self, callback: impl FnOnce(&DaemonClient) -> R) -> R {
+                    callback(self.client)
+                }
+            }
+        "#,
+        r#"
+            trait CustomEscape { fn expose(&self, callback: &mut dyn FnMut(&DaemonClient)); }
+            impl CustomEscape for ScopedDaemonClient<'_> {
+                fn expose(&self, callback: &mut dyn FnMut(&DaemonClient)) { callback(self.client); }
+            }
+        "#,
+    ] {
+        let adversarial = format!("{source}\n{addition}");
+        assert!(
+            !core_contract_violations(&adversarial).is_empty(),
+            "accepted extra capability surface: {addition}"
         );
     }
 
@@ -888,6 +970,19 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
         raw_owner_struct_literals(&literal),
         ["connect", "run_owned_daemon"]
     );
+    let alias = source.replacen(
+        "impl OwnedDaemonSession {",
+        "type Session = OwnedDaemonSession;\nimpl OwnedDaemonSession {",
+        1,
+    );
+    assert_eq!(raw_owner_aliases(&alias), ["Session"]);
+    let function_item = source.replacen(
+        "let session = OwnedDaemonSession::connect(mode)",
+        "let constructor = OwnedDaemonSession::connect;\n    let session = constructor(mode)",
+        1,
+    );
+    assert_eq!(raw_owner_acquisitions(&function_item), []);
+    assert_eq!(raw_owner_connect_path_count(&function_item), 1);
 }
 
 #[test]

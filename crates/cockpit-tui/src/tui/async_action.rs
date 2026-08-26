@@ -317,6 +317,12 @@ pub enum AsyncActionPayload {
     },
     Skills(crate::tui::skills_pane::SkillsPaneFetchResult),
     InventoryBundle(cockpit_proto::Response),
+    SessionSetupSnapshot(cockpit_proto::Response),
+    AgentTreeSnapshot {
+        tree: Box<cockpit_proto::Response>,
+        attention: Box<cockpit_proto::Response>,
+    },
+    AgentTreeResolved,
     NotesRpc(crate::tui::notes_pane::NotesRpcResult),
     LeaksRpc(crate::tui::leaks_pane::LeaksRpcResult),
     PasteTokenCount {

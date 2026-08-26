@@ -1090,6 +1090,30 @@ impl App {
                 }
                 _ => {}
             },
+            AsyncActionKind::DaemonRpc("session_setup.snapshot") => match result.payload {
+                Ok(AsyncActionPayload::SessionSetupSnapshot(response)) => {
+                    self.apply_session_setup_snapshot_response(response);
+                }
+                Err(error) => {
+                    self.apply_session_setup_snapshot_error(error);
+                }
+                _ => {}
+            },
+            AsyncActionKind::DaemonRpc("agent_tree.snapshot") => match result.payload {
+                Ok(AsyncActionPayload::AgentTreeSnapshot { tree, attention }) => {
+                    self.apply_agent_tree_snapshot(*tree, *attention);
+                }
+                Err(error) => {
+                    self.apply_agent_tree_error(error);
+                }
+                _ => {}
+            },
+            AsyncActionKind::DaemonRpc("agent_tree.resolve") => match result.payload {
+                Ok(AsyncActionPayload::AgentTreeResolved) => {
+                    self.request_agent_tree_refresh();
+                }
+                _ => {}
+            },
             AsyncActionKind::DaemonRpc("guidance.estimate") => {
                 if let Ok(AsyncActionPayload::GuidanceEstimate(estimate)) = result.payload {
                     self.guidance_estimate = Some(estimate);

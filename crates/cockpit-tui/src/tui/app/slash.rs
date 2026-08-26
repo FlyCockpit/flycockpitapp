@@ -727,6 +727,22 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         describe: describe_static,
     },
     SlashCommand {
+        name: "setup",
+        description: "Daemon-owned session setup: installed agents, model slots, and bindings (read-only)",
+        takes_args: false,
+        run: run_session_setup,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
+        name: "tree",
+        description: "Agent tree: breadcrumbs, child focus, and the ordered attention list",
+        takes_args: false,
+        run: run_agent_tree,
+        available: available_always,
+        describe: describe_static,
+    },
+    SlashCommand {
         name: "usage",
         description: "Show vendor plan limits and quota per provider (arg: provider-id; bare = all)",
         takes_args: true,
@@ -1095,6 +1111,16 @@ fn run_stats(app: &mut App, _: &str) -> bool {
     if let Some(key) = fetch {
         app.start_stats_rollup_action(key);
     }
+    false
+}
+
+fn run_session_setup(app: &mut App, _: &str) -> bool {
+    app.open_session_setup();
+    false
+}
+
+fn run_agent_tree(app: &mut App, _: &str) -> bool {
+    app.open_agent_tree();
     false
 }
 

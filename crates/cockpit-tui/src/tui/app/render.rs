@@ -379,6 +379,7 @@ fn tool_call_state_id(state: ToolCallState) -> u8 {
         ToolCallState::Success => 1,
         ToolCallState::Failed => 2,
         ToolCallState::BadCall => 3,
+        ToolCallState::Verifying => 4,
     }
 }
 
@@ -1433,6 +1434,14 @@ impl App {
                 Overlay::Diff(mut pane) => {
                     pane.render(frame, rects.body);
                     self.overlay = Overlay::Diff(pane);
+                }
+                Overlay::SessionSetup(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::SessionSetup(pane);
+                }
+                Overlay::AgentTree(mut pane) => {
+                    pane.render(frame, rects.body);
+                    self.overlay = Overlay::AgentTree(pane);
                 }
                 Overlay::Help(mut pane) => {
                     pane.render(frame, rects.body);

@@ -472,11 +472,16 @@ fn production_uses_cockpit_proto_directly() {
                     path.display()
                 ));
             }
-            if compact.contains("cockpit_core::engine::IdleReason") {
-                findings.push(format!(
-                    "{}: IdleReason is a cockpit-proto wire type",
-                    path.display()
-                ));
+            for migrated_wire_type in [
+                "cockpit_core::engine::IdleReason",
+                "cockpit_core::engine::tool::ToolFailKind",
+            ] {
+                if compact.contains(migrated_wire_type) {
+                    findings.push(format!(
+                        "{}: {migrated_wire_type} is a cockpit-proto wire type",
+                        path.display()
+                    ));
+                }
             }
             if compact.contains("externcratecockpit_core") {
                 findings.push(format!(
@@ -495,6 +500,7 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::daemon::proto"
                     || imported.starts_with("cockpit_core::daemon::proto::")
                     || imported == "cockpit_core::engine::IdleReason"
+                    || imported == "cockpit_core::engine::tool::ToolFailKind"
                 {
                     findings.push(format!(
                         "{}: protocol import must use cockpit_proto directly: {imported}",

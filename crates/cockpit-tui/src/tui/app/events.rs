@@ -1618,8 +1618,8 @@ impl App {
                 // Bold red when the model built the call badly; plain red
                 // when the tool failed for another reason.
                 let state = match kind {
-                    cockpit_core::engine::tool::ToolFailKind::Invocation => ToolCallState::BadCall,
-                    cockpit_core::engine::tool::ToolFailKind::Execution => ToolCallState::Failed,
+                    cockpit_proto::ToolFailKind::Invocation => ToolCallState::BadCall,
+                    cockpit_proto::ToolFailKind::Execution => ToolCallState::Failed,
                 };
                 if !self.update_tool_state(&call_id, state, Some((error.clone(), false)), None) {
                     // No pending call to update (e.g. an edit/write tool

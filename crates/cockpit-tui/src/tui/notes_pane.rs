@@ -552,7 +552,9 @@ impl NotesPane {
         }
         self.pending_generations
             .retain(|pending| *pending != generation);
-        self.status = Some(error);
+        if generation == self.operation_generation {
+            self.status = Some(error);
+        }
         None
     }
 
@@ -1989,6 +1991,10 @@ mod tests {
         );
         assert_eq!(pane.editor.text(), queued_draft);
         assert!(matches!(pane.mode, Mode::Editing { id: editing } if editing == id));
+        assert_eq!(
+            pane.status, None,
+            "the older failure must not replace newer state"
+        );
 
         assert!(
             pane.apply_transport_error(41, first.generation, "duplicate".into())

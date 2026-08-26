@@ -481,7 +481,7 @@ pub fn registration_revision(row: &AssistantRow) -> String {
     crate::daemon::authority_token::mint(
         b"assistant-registration-revision/v1",
         &[
-            &row.created_at.to_le_bytes(),
+            &row.created_at_unix_ms.to_le_bytes(),
             row.name.as_bytes(),
             row.home_dir.as_bytes(),
             row.config_json.as_bytes(),
@@ -564,7 +564,7 @@ fn recover_creation_journal_locked(db: &Db, home: &Path) -> Result<()> {
     let target = assistant_definition_path(home);
     let row_for_validation = AssistantRow {
         name: journal.name.clone(),
-        created_at: 0,
+        created_at_unix_ms: 0,
         home_dir: journal.home_dir.clone(),
         config_json: journal.config_json.clone(),
         content_hash: journal.content_hash.clone(),
@@ -999,7 +999,7 @@ struct UnregisterJournal {
     operation_id: String,
     phase: UnregisterPhase,
     name: String,
-    created_at: i64,
+    created_at_unix_ms: i64,
     home_dir: String,
     config_json: String,
     content_hash: String,
@@ -1008,7 +1008,7 @@ struct UnregisterJournal {
 
 fn row_matches_unregister_journal(row: &AssistantRow, journal: &UnregisterJournal) -> bool {
     row.name == journal.name
-        && row.created_at == journal.created_at
+        && row.created_at_unix_ms == journal.created_at_unix_ms
         && row.home_dir == journal.home_dir
         && row.config_json == journal.config_json
         && row.content_hash == journal.content_hash
@@ -1097,7 +1097,7 @@ fn build_unregister_journal(
         operation_id,
         phase: UnregisterPhase::Prepared,
         name: row.name.clone(),
-        created_at: row.created_at,
+        created_at_unix_ms: row.created_at_unix_ms,
         home_dir: row.home_dir.clone(),
         config_json: row.config_json.clone(),
         content_hash: row.content_hash.clone(),
@@ -1181,8 +1181,8 @@ fn delete_registered_row_cas(db: &Db, journal: &UnregisterJournal) -> Result<boo
     let journal = journal.clone();
     db.write_blocking(move |conn| {
         let changed = conn.execute(
-            "DELETE FROM assistants WHERE name=?1 AND created_at=?2 AND home_dir=?3 AND config_json=?4 AND content_hash=?5",
-            rusqlite::params![journal.name, journal.created_at, journal.home_dir, journal.config_json, journal.content_hash],
+            "DELETE FROM assistants WHERE name=?1 AND created_at_unix_ms=?2 AND home_dir=?3 AND config_json=?4 AND content_hash=?5",
+            rusqlite::params![journal.name, journal.created_at_unix_ms, journal.home_dir, journal.config_json, journal.content_hash],
         )?;
         Ok(changed == 1)
     })

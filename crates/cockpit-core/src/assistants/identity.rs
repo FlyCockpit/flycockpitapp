@@ -187,11 +187,11 @@ fn update_identity_hashes_cas_blocking(
     db.write_blocking(move |conn| {
         let changed = conn.execute(
             "UPDATE assistants SET config_json = ?6
-             WHERE name = ?1 AND created_at = ?2 AND home_dir = ?3
+             WHERE name = ?1 AND created_at_unix_ms = ?2 AND home_dir = ?3
                AND config_json = ?4 AND content_hash = ?5",
             rusqlite::params![
                 expected.name,
-                expected.created_at,
+                expected.created_at_unix_ms,
                 expected.home_dir,
                 expected.config_json,
                 expected.content_hash,

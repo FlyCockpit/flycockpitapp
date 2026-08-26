@@ -16,9 +16,10 @@
 -- ---- assistants ------------------------------------------------------------
 
 CREATE TABLE assistants (
-    name         TEXT    PRIMARY KEY,
-    created_at   INTEGER NOT NULL,
-    home_dir     TEXT    NOT NULL,
+    name         TEXT    PRIMARY KEY CHECK (length(name) BETWEEN 1 AND 255),
+    -- Daemon-observed wall-clock time, signed Unix milliseconds.
+    created_at_unix_ms INTEGER NOT NULL,
+    home_dir     TEXT    NOT NULL CHECK (length(home_dir) BETWEEN 1 AND 32768),
     config_json  TEXT    NOT NULL DEFAULT '{}' CHECK (
         json_valid(config_json) AND json_type(config_json) = 'object'
         AND length(CAST(config_json AS BLOB)) <= 1048576

@@ -2564,13 +2564,9 @@ mod tests {
         let assistant_home = crate::assistants::default_home_dir("helper").unwrap();
         std::fs::create_dir_all(&assistant_home).unwrap();
         let assistant_md = "---\nagentId: local/00000000-0000-0000-0000-000000000001\ndescription: Test helper\nexecutionKind: assistant\nmodelSlots:\n  primary:\n    allowDefaultFallback: true\n    locality: any\n    minContextTokens: 1\n    purpose: Primary model\n    requiredCapabilities: [text_generation]\nschemaVersion: 2\n---\n\nHelp with tests.\n";
-        std::fs::write(assistant_home.join("assistant.md"), assistant_md)
-            .unwrap();
-        let content_hash = crate::assistants::markdown_content_identity(
-            &reg.inner.db,
-            assistant_md,
-        )
-        .unwrap();
+        std::fs::write(assistant_home.join("assistant.md"), assistant_md).unwrap();
+        let content_hash =
+            crate::assistants::markdown_content_identity(&reg.inner.db, assistant_md).unwrap();
         reg.inner
             .db
             .upsert_assistant(

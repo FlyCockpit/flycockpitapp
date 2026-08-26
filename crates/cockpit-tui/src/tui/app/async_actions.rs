@@ -105,11 +105,13 @@ async fn begin_provider_oauth(
     .await;
     let response = match response {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) | Err(_) => Ok(match oauth_settlement(&client, client_operation_id.clone()).await {
-            Ok(response @ Ok(_)) => response,
-            Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
-            Err(error) => return Ok(oauth_settlement_unknown(error)),
-        }),
+        Ok(Err(_)) | Err(_) => Ok(
+            match oauth_settlement(&client, client_operation_id.clone()).await {
+                Ok(response @ Ok(_)) => response,
+                Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
+                Err(error) => return Ok(oauth_settlement_unknown(error)),
+            },
+        ),
     };
     match response.map_err(|e: anyhow::Error| e.to_string())? {
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {
@@ -208,16 +210,19 @@ async fn complete_provider_oauth(
     let request = cockpit_core::daemon::proto::Request::CompleteProviderOAuth {
         client_operation_id: client_operation_id.clone(),
         flow_id: flow_id.clone(),
-        input: input.map(|mut value| cockpit_proto::SensitiveWirePayload::new(std::mem::take(&mut *value))),
+        input: input
+            .map(|mut value| cockpit_proto::SensitiveWirePayload::new(std::mem::take(&mut *value))),
     };
     let response = tokio::time::timeout(OAUTH_COMPLETE_TIMEOUT, client.request(request)).await;
     let response = match response {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) | Err(_) => Ok(match oauth_settlement(&client, client_operation_id.clone()).await {
-            Ok(response @ Ok(_)) => response,
-            Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
-            Err(error) => return Ok(oauth_settlement_unknown(error)),
-        }),
+        Ok(Err(_)) | Err(_) => Ok(
+            match oauth_settlement(&client, client_operation_id.clone()).await {
+                Ok(response @ Ok(_)) => response,
+                Ok(Err(error)) => return Ok(oauth_settlement_unknown(error)),
+                Err(error) => return Ok(oauth_settlement_unknown(error)),
+            },
+        ),
     };
     match response.map_err(|e: anyhow::Error| e.to_string())? {
         Ok(cockpit_core::daemon::proto::Response::LocalOperationSettlement {

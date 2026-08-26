@@ -160,20 +160,26 @@ impl SkillsPane {
         let body = layout[0];
         let help_area = layout[1];
 
-        let lines = self.body_lines();
-        self.last_content_rows = lines.len();
         self.last_body_height = body.height as usize;
-        // Clamp scroll to the valid range now that we know the heights.
-        let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
-        *self.list.offset_mut() = self.list.offset().min(max_scroll);
-
-        let overflow = self.last_content_rows > self.last_body_height;
+        let full_width = body.width.max(1) as usize;
+        let full_lines = self.body_lines(full_width);
+        let overflow = full_lines.len() > self.last_body_height;
         let (list_area, scrollbar_area) = if overflow && body.width >= 2 {
             let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(1)]).split(body);
             (cols[0], Some(cols[1]))
         } else {
             (body, None)
         };
+        let lines = if list_area.width as usize == full_width {
+            full_lines
+        } else {
+            self.body_lines(list_area.width.max(1) as usize)
+        };
+        self.last_content_rows = lines.len();
+        // Clamp scroll to the valid range now that we know the heights.
+        let max_scroll = self.last_content_rows.saturating_sub(self.last_body_height);
+        *self.list.offset_mut() = self.list.offset().min(max_scroll);
+
         let items = lines.into_iter().map(ListItem::new).collect::<Vec<_>>();
         frame.render_stateful_widget(List::new(items), list_area, &mut self.list);
         if let Some(scrollbar_area) = scrollbar_area {
@@ -202,23 +208,33 @@ impl SkillsPane {
     /// Assemble every body row as owned [`Line`]s. Pure aside from
     /// reading `self`, so the empty-state / listing logic is unit-testable
     /// without an `App`/terminal.
-    fn body_lines(&self) -> Vec<Line<'static>> {
+    fn body_lines(&self, width: usize) -> Vec<Line<'static>> {
         match &self.state {
-            SkillsPaneState::Loading => vec![Line::from(Span::styled(
-                "Loading skills...".to_string(),
-                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-            ))],
-            SkillsPaneState::Error(e) => vec![Line::from(Span::styled(
-                format!("skills unavailable: {e}"),
-                Style::default().fg(Color::Red),
-            ))],
-            SkillsPaneState::Ready { skills, source } => ready_lines(skills, *source),
+            SkillsPaneState::Loading => wrap_line(
+                Line::from(Span::styled(
+                    "Loading skills...".to_string(),
+                    Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+                )),
+                width,
+                "",
+                "",
+            ),
+            SkillsPaneState::Error(e) => wrap_line(
+                Line::from(Span::styled(
+                    format!("skills unavailable: {e}"),
+                    Style::default().fg(Color::Red),
+                )),
+                width,
+                "",
+                "",
+            ),
+            SkillsPaneState::Ready { skills, source } => ready_lines(skills, *source, width),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn body_text_for_test(&self) -> String {
-        self.body_lines()
+        self.body_lines(120)
             .iter()
             .map(|l| {
                 l.spans
@@ -248,22 +264,36 @@ impl Pane for SkillsPane {
     }
 }
 
-fn ready_lines(skills: &[SkillSummary], source: SkillsPaneSource) -> Vec<Line<'static>> {
+fn ready_lines(
+    skills: &[SkillSummary],
+    source: SkillsPaneSource,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if source == SkillsPaneSource::Local {
-        lines.push(Line::from(Span::styled(
-            "local view - session-specific activation unavailable".to_string(),
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-        )));
+        lines.extend(wrap_line(
+            Line::from(Span::styled(
+                "local view - session-specific activation unavailable".to_string(),
+                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            )),
+            width,
+            "",
+            "  ",
+        ));
         lines.push(Line::default());
     }
     if skills.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No skills found in the configured scan directories.".to_string(),
-            Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
-        )));
+        lines.extend(wrap_line(
+            Line::from(Span::styled(
+                "No skills found in the configured scan directories.".to_string(),
+                Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX)),
+            )),
+            width,
+            "",
+            "  ",
+        ));
     } else {
-        lines.extend(skill_lines(skills));
+        lines.extend(skill_lines(skills, width));
     }
     lines
 }
@@ -271,29 +301,74 @@ fn ready_lines(skills: &[SkillSummary], source: SkillsPaneSource) -> Vec<Line<'s
 /// Render the non-empty skill list: a name + source header line per skill
 /// (source muted), then the indented description underneath, with a blank
 /// separator between entries.
-fn skill_lines(skills: &[SkillSummary]) -> Vec<Line<'static>> {
+fn skill_lines(skills: &[SkillSummary], width: usize) -> Vec<Line<'static>> {
     let muted = Style::default().fg(Color::Indexed(MUTED_COLOR_INDEX));
     let mut out: Vec<Line<'static>> = Vec::new();
     for (i, s) in skills.iter().enumerate() {
         if i > 0 {
             out.push(Line::default());
         }
-        out.push(Line::from(vec![
-            Span::styled(
-                s.name.clone(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(s.source.clone(), muted),
-        ]));
-        out.push(Line::from(Span::styled(
-            format!("  {}", s.description),
-            Style::default().fg(Color::White),
-        )));
+        out.extend(wrap_line(
+            Line::from(vec![
+                Span::styled(
+                    s.name.clone(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(s.source.clone(), muted),
+            ]),
+            width,
+            "",
+            "  ",
+        ));
+        out.extend(wrap_line(
+            Line::from(Span::styled(
+                s.description.clone(),
+                Style::default().fg(Color::White),
+            )),
+            width,
+            "  ",
+            "  ",
+        ));
     }
     out
+}
+
+fn wrap_line(
+    line: Line<'static>,
+    width: usize,
+    first_prefix: &'static str,
+    continuation_prefix: &'static str,
+) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut remaining = Some(line.spans);
+    let mut rows = Vec::new();
+    let mut first = true;
+    while let Some(spans) = remaining.take() {
+        let requested_prefix = if first {
+            first_prefix
+        } else {
+            continuation_prefix
+        };
+        let prefix = if requested_prefix.len() < width {
+            requested_prefix
+        } else {
+            ""
+        };
+        let available = width.saturating_sub(prefix.len()).max(1);
+        let (head, tail) = crate::tui::message_block::slice_spans_at_width(spans, available);
+        let mut row = Vec::new();
+        if !prefix.is_empty() {
+            row.push(Span::raw(prefix));
+        }
+        row.extend(head);
+        rows.push(Line::from(row));
+        remaining = tail;
+        first = false;
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -301,6 +376,7 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend};
+    use unicode_width::UnicodeWidthStr;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -504,5 +580,47 @@ mod tests {
             (1..5).any(|row| !buffer[(38, row)].symbol().trim().is_empty()),
             "reserved rightmost body column contains the scrollbar"
         );
+    }
+
+    #[test]
+    fn visual_rows_are_grapheme_safe_reflow_and_reach_the_tail() {
+        let long_token = "token".repeat(24);
+        let skills = (0..8)
+            .map(|index| {
+                summary(
+                    &format!("Cafe\u{301}-界-🚀-{index}"),
+                    &format!("{long_token} combining e\u{301} CJK 世界 emoji 👩‍🚀 TAIL-{index}"),
+                    &format!("/very/long/source/path/{long_token}/{index}/SKILL.md"),
+                )
+            })
+            .collect();
+        let mut pane = pane_with(Ok(skills));
+
+        let narrow_rows = pane.body_lines(17);
+        assert!(
+            narrow_rows
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) <= 17)
+        );
+        let narrow_text = narrow_rows
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(narrow_text.contains("e\u{301}"));
+        assert!(narrow_text.contains("👩‍🚀"));
+        assert!(narrow_text.contains("世界"));
+
+        let top = rendered_buffer(&mut pane, 22, 7);
+        let narrow_count = pane.last_content_rows;
+        pane.handle_key(press(KeyCode::Char('G')));
+        let tail = rendered_buffer(&mut pane, 22, 7);
+        assert_ne!(top, tail);
+        assert!(tail.contains("TAIL-7"));
+
+        let wide = rendered_buffer(&mut pane, 100, 14);
+        assert!(pane.last_content_rows < narrow_count);
+        assert!(pane.list.offset() <= pane.last_content_rows.saturating_sub(pane.last_body_height));
+        assert!(wide.contains("q quit"));
     }
 }

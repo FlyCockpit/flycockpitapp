@@ -44,7 +44,7 @@ pub enum Mode {
     /// the main pane.
     Browsing,
     /// Editing the selected note's raw markdown source in the main pane.
-    Editing,
+    Editing { id: Uuid },
     /// A single-line name prompt is up. `for_note` is `Some(id)` for a rename
     /// and `None` for a create. `buffer` holds the typed name.
     Naming {
@@ -52,7 +52,7 @@ pub enum Mode {
         buffer: String,
     },
     /// Delete confirmation for the selected note.
-    ConfirmingDelete,
+    ConfirmingDelete { id: Uuid },
 }
 
 /// The notes dialog state. Opened over the chat body; routed input/render by
@@ -71,6 +71,7 @@ pub struct NotesPane {
     sidebar: ListState,
     selection: SidebarSelection,
     operation_generation: u64,
+    pending_save: Option<PendingSave>,
     mode: Mode,
     /// The reused composer editing engine for the raw-markdown editor. Holds
     /// the note source while [`Mode::Editing`]; honors vim when enabled.
@@ -92,6 +93,13 @@ pub struct NotesPane {
     /// A transient error/status line shown under the sidebar (e.g. a failed
     /// DB write). Cleared on the next successful action.
     status: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingSave {
+    id: Uuid,
+    generation: u64,
+    draft: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +348,7 @@ impl NotesPane {
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::Uninitialized,
             operation_generation: 0,
+            pending_save: None,
             mode: Mode::Browsing,
             editor: Composer::new(vim_enabled),
             vim_enabled,
@@ -400,8 +409,26 @@ impl NotesPane {
                 let is_current = result.generation == self.operation_generation;
                 if let Some(error) = result.error {
                     if is_current {
+                        if let Some(save) = self
+                            .pending_save
+                            .as_ref()
+                            .filter(|save| save.generation == result.generation)
+                        {
+                            debug_assert!(
+                                matches!(self.mode, Mode::Editing { id } if id == save.id)
+                            );
+                            debug_assert_eq!(self.editor.text(), save.draft);
+                        }
                         self.status = Some(error);
                     }
+                    return;
+                }
+                if !is_current
+                    && matches!(
+                        self.mode,
+                        Mode::Naming { .. } | Mode::Editing { .. } | Mode::ConfirmingDelete { .. }
+                    )
+                {
                     return;
                 }
                 let old_index = self.selected_index();
@@ -454,6 +481,13 @@ impl NotesPane {
                 self.sidebar.select(Some(self.selected_index()));
                 if is_current {
                     self.mode = Mode::Browsing;
+                    if self
+                        .pending_save
+                        .as_ref()
+                        .is_some_and(|save| save.generation == result.generation)
+                    {
+                        self.pending_save = None;
+                    }
                     self.status = None;
                     if result.enter_edit {
                         self.enter_edit();
@@ -480,10 +514,16 @@ impl NotesPane {
         self.operation_generation = self.operation_generation.wrapping_add(1);
     }
 
+    fn invalidate_pending_save(&mut self) {
+        if self.pending_save.take().is_some() {
+            self.invalidate_pending_operations();
+        }
+    }
+
     /// Begin editing the selected note: load its source into the reused
     /// composer and switch the pane to the raw editor. No-op with no note.
     fn enter_edit(&mut self) {
-        let Some(content) = self.current().map(|n| n.content.clone()) else {
+        let Some((id, content)) = self.current().map(|n| (n.id, n.content.clone())) else {
             return;
         };
         self.editor = Composer::new(self.vim_enabled);
@@ -493,24 +533,25 @@ impl NotesPane {
         self.edit_scroll = 0;
         self.edit_scroll_manual = false;
         self.invalidate_pending_operations();
-        self.mode = Mode::Editing;
+        self.pending_save = None;
+        self.mode = Mode::Editing { id };
     }
 
     /// Persist the editor buffer back to the selected note and return to the
     /// rendered view.
     fn leave_edit(&mut self) -> NotesOutcome {
-        if let Some(note) = self.current() {
-            let id = note.id;
+        if let Mode::Editing { id } = self.mode {
             let content = self.editor.text().to_string();
-            self.mode = Mode::Browsing;
-            self.view_scroll = 0;
             if let Some(action) = self.action(NotesRpcActionKind::Save { id, content }) {
+                self.pending_save = Some(PendingSave {
+                    id,
+                    generation: action.generation,
+                    draft: self.editor.text().to_string(),
+                });
                 return NotesOutcome::Rpc(action);
             }
             self.status = Some("Unavailable — reconnect to the daemon, then Retry".to_string());
         }
-        self.mode = Mode::Browsing;
-        self.view_scroll = 0;
         NotesOutcome::Stay
     }
 
@@ -523,20 +564,22 @@ impl NotesPane {
     pub fn handle_key(&mut self, key: KeyEvent) -> NotesOutcome {
         match &self.mode {
             Mode::Naming { .. } => self.handle_naming_key(key),
-            Mode::ConfirmingDelete => self.handle_confirm_delete_key(key),
-            Mode::Editing => self.handle_editing_key(key),
+            Mode::ConfirmingDelete { .. } => self.handle_confirm_delete_key(key),
+            Mode::Editing { .. } => self.handle_editing_key(key),
             Mode::Browsing => self.handle_browsing_key(key),
         }
     }
 
     pub fn paste(&mut self, text: &str) {
         match &mut self.mode {
-            Mode::Editing => {
+            Mode::Editing { .. } => {
                 if text.is_empty() {
                     return;
                 }
                 let normalized = text.replace("\r\n", "\n").replace('\r', "");
                 self.editor.insert_str(&normalized);
+                self.edit_scroll_manual = false;
+                self.invalidate_pending_save();
             }
             Mode::Naming { buffer, .. } => {
                 let Some(first_line) = text.split('\n').next() else {
@@ -547,7 +590,7 @@ impl NotesPane {
                 }
                 buffer.push_str(&first_line.replace('\r', ""));
             }
-            Mode::Browsing | Mode::ConfirmingDelete => {}
+            Mode::Browsing | Mode::ConfirmingDelete { .. } => {}
         }
     }
 
@@ -587,7 +630,9 @@ impl NotesPane {
                 }
             }
             KeyCode::Char('d') if self.current().is_some() => {
-                self.mode = Mode::ConfirmingDelete;
+                let id = self.current().expect("guarded selected note").id;
+                self.invalidate_pending_operations();
+                self.mode = Mode::ConfirmingDelete { id };
             }
             KeyCode::PageDown => {
                 self.scroll_view_down_page();
@@ -655,10 +700,13 @@ impl NotesPane {
     fn handle_confirm_delete_key(&mut self, key: KeyEvent) -> NotesOutcome {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(note) = self.current() {
-                    let id = note.id;
+                if let Mode::ConfirmingDelete { id } = self.mode {
                     self.mode = Mode::Browsing;
-                    let fallback_index = self.selected_index();
+                    let fallback_index = self
+                        .notes
+                        .iter()
+                        .position(|note| note.id == id)
+                        .unwrap_or_else(|| self.selected_index());
                     if let Some(action) =
                         self.action(NotesRpcActionKind::Delete { id, fallback_index })
                     {
@@ -697,7 +745,11 @@ impl NotesPane {
         // Everything else is editing — driven through the reused composer vim
         // engine (or plain insert when vim is off).
         self.edit_scroll_manual = false;
+        let before = self.editor.text().to_string();
         self.editor.handle_vim_key(key);
+        if self.editor.text() != before {
+            self.invalidate_pending_save();
+        }
         NotesOutcome::Stay
     }
 
@@ -709,18 +761,18 @@ impl NotesPane {
     /// Mouse-wheel scroll for the viewed note.
     pub fn scroll_up(&mut self) {
         match self.mode {
-            Mode::Editing => {
+            Mode::Editing { .. } => {
                 self.edit_scroll = self.edit_scroll.saturating_sub(1);
                 self.edit_scroll_manual = true;
             }
             Mode::Browsing => self.view_scroll = self.view_scroll.saturating_sub(1),
-            Mode::Naming { .. } | Mode::ConfirmingDelete => {}
+            Mode::Naming { .. } | Mode::ConfirmingDelete { .. } => {}
         }
     }
 
     pub fn scroll_down(&mut self) {
         match self.mode {
-            Mode::Editing => {
+            Mode::Editing { .. } => {
                 let max_scroll = self.last_edit_rows.saturating_sub(self.last_view_height);
                 self.edit_scroll = (self.edit_scroll + 1).min(max_scroll);
                 self.edit_scroll_manual = true;
@@ -729,7 +781,7 @@ impl NotesPane {
                 let max_scroll = self.last_view_rows.saturating_sub(self.last_view_height);
                 self.view_scroll = (self.view_scroll + 1).min(max_scroll);
             }
-            Mode::Naming { .. } | Mode::ConfirmingDelete => {}
+            Mode::Naming { .. } | Mode::ConfirmingDelete { .. } => {}
         }
     }
 
@@ -742,7 +794,8 @@ impl NotesPane {
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::New,
             operation_generation: 0,
-            mode: Mode::Editing,
+            pending_save: None,
+            mode: Mode::Editing { id: Uuid::nil() },
             editor: Composer::new(vim_enabled),
             vim_enabled,
             view_scroll: 0,
@@ -812,7 +865,7 @@ impl NotesPane {
 
         let highlight = if matches!(
             self.mode,
-            Mode::Browsing | Mode::Editing | Mode::ConfirmingDelete
+            Mode::Browsing | Mode::Editing { .. } | Mode::ConfirmingDelete { .. }
         ) {
             crate::tui::theme::row_selection_style()
         } else {
@@ -853,9 +906,9 @@ impl NotesPane {
 
         let help = match self.mode {
             Mode::Browsing => "↑/↓ select  ↵ edit/new  n new  r rename  d delete  q close",
-            Mode::Editing => "Ctrl+S save  Esc done",
+            Mode::Editing { .. } => "Ctrl+S save  Esc done",
             Mode::Naming { .. } => "type a name  ↵ confirm  Esc cancel",
-            Mode::ConfirmingDelete => "y delete  any other key cancel",
+            Mode::ConfirmingDelete { .. } => "y delete  any other key cancel",
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(help.to_string(), muted))),
@@ -885,15 +938,20 @@ impl NotesPane {
                 ]);
                 frame.render_widget(Paragraph::new(line), inner);
             }
-            Mode::ConfirmingDelete => {
-                let name = self.current().map(|n| n.name.clone()).unwrap_or_default();
+            Mode::ConfirmingDelete { id } => {
+                let name = self
+                    .notes
+                    .iter()
+                    .find(|note| note.id == *id)
+                    .map(|note| note.name.clone())
+                    .unwrap_or_else(|| "missing note".to_string());
                 let line = Line::from(Span::styled(
                     format!("Delete note `{name}`? [y/N]"),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ));
                 frame.render_widget(Paragraph::new(line), area);
             }
-            Mode::Editing => {
+            Mode::Editing { .. } => {
                 // Raw editable markdown source (never rendered while editing).
                 let height = area.height.max(1) as usize;
                 let text = self.editor.text().to_string();
@@ -1051,6 +1109,7 @@ mod tests {
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::Note(id),
             operation_generation: 0,
+            pending_save: None,
             mode: Mode::Browsing,
             editor: Composer::new(false),
             vim_enabled: false,
@@ -1337,6 +1396,106 @@ mod tests {
         pointer.pointer_new_note();
         assert_eq!(pointer.selection, SidebarSelection::New);
         assert!(matches!(pointer.mode, Mode::Naming { .. }));
+    }
+
+    #[test]
+    fn edit_and_delete_remain_bound_to_captured_note_identity() {
+        let edited = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let mut pane = pane(true);
+        pane.notes = vec![
+            note(edited, "edited", "draft"),
+            note(other, "other", "other"),
+        ];
+        pane.select_sidebar(0);
+        pane.enter_edit();
+        assert!(matches!(pane.mode, Mode::Editing { id } if id == edited));
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(other, "other", "changed")],
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert_eq!(
+            pane.notes.len(),
+            2,
+            "stale inventory is ignored during edit"
+        );
+        let NotesOutcome::Rpc(save) = pane.leave_edit() else {
+            panic!("save action");
+        };
+        assert!(matches!(save.kind, NotesRpcActionKind::Save { id, .. } if id == edited));
+
+        let mut pane = pane(true);
+        pane.notes = vec![
+            note(edited, "edited", "draft"),
+            note(other, "other", "other"),
+        ];
+        pane.select_sidebar(0);
+        pane.handle_key(press(KeyCode::Char('d')));
+        assert!(matches!(pane.mode, Mode::ConfirmingDelete { id } if id == edited));
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(other, "other", "changed")],
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert_eq!(
+            pane.notes.len(),
+            2,
+            "stale inventory is ignored during confirmation"
+        );
+        let NotesOutcome::Rpc(delete) = pane.handle_key(press(KeyCode::Char('y'))) else {
+            panic!("delete action");
+        };
+        assert!(matches!(delete.kind, NotesRpcActionKind::Delete { id, .. } if id == edited));
+    }
+
+    #[test]
+    fn failed_save_keeps_exact_draft_and_new_edits_supersede_pending_completion() {
+        let id = pane(true).notes[0].id;
+        let mut pane = pane(true);
+        pane.notes[0].id = id;
+        pane.selection = SidebarSelection::Note(id);
+        pane.enter_edit();
+        pane.editor.set("exact unsaved draft".to_string());
+        let NotesOutcome::Rpc(save) = pane.leave_edit() else {
+            panic!("save action");
+        };
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: save.generation,
+            error: Some("disk full".into()),
+            project_root: "/proj".into(),
+            notes: Vec::new(),
+            selection: SelectionAfterRpc::Keep(id),
+            enter_edit: false,
+        }));
+        assert!(matches!(pane.mode, Mode::Editing { id: editing } if editing == id));
+        assert_eq!(pane.editor.text(), "exact unsaved draft");
+        assert_eq!(pane.status.as_deref(), Some("disk full"));
+
+        let NotesOutcome::Rpc(second_save) = pane.leave_edit() else {
+            panic!("second save action");
+        };
+        pane.edit_scroll_manual = true;
+        pane.paste("!");
+        assert!(pane.editor.text().contains('!'));
+        assert!(pane.pending_save.is_none());
+        assert!(!pane.edit_scroll_manual);
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: second_save.generation,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(id, "ideas", "exact unsaved draft")],
+            selection: SelectionAfterRpc::Keep(id),
+            enter_edit: false,
+        }));
+        assert!(matches!(pane.mode, Mode::Editing { id: editing } if editing == id));
+        assert!(pane.editor.text().contains('!'));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 members = [
     "apps/cli",
     "apps/tenant-authority",
+    "crates/cockpit-client",
     "crates/cockpit-config",
     "crates/cockpit-core",
     "crates/cockpit-db",

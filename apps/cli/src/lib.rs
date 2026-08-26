@@ -41,8 +41,8 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::cli::{Cli, Command};
 pub use crate::cli::public_v0_1_command;
+use crate::cli::{Cli, Command};
 
 pub mod manpages {
     use std::fs;
@@ -110,7 +110,7 @@ pub mod integration {
     /// Typed socket client for the integration harness.
     #[derive(Clone)]
     pub struct DaemonClient {
-        inner: crate::daemon::client::DaemonClient,
+        inner: cockpit_client::DaemonClient,
     }
 
     /// Stable subset of the daemon status response needed by harness tests.
@@ -197,7 +197,7 @@ pub mod integration {
     impl DaemonClient {
         pub async fn connect(socket: &Path) -> Result<Self> {
             Ok(Self {
-                inner: crate::daemon::client::DaemonClient::connect(socket).await?,
+                inner: cockpit_client::DaemonClient::connect(socket).await?,
             })
         }
 
@@ -725,10 +725,9 @@ fn error_stderr_line(err: &anyhow::Error) -> String {
 
 async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
     use clap::FromArgMatches as _;
-    let cli = crate::cli::PublicCli::from_arg_matches(
-        &crate::cli::public_v0_1_command().get_matches(),
-    )?
-    .into();
+    let cli =
+        crate::cli::PublicCli::from_arg_matches(&crate::cli::public_v0_1_command().get_matches())?
+            .into();
 
     init_tracing(cli.log_level.as_deref(), cli.print_logs);
 

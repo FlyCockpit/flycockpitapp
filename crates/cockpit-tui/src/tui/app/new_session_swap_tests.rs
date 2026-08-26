@@ -38,7 +38,7 @@ fn new_session_swap_makes_no_daemon_probe_or_connect() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(Some(tmp.path()), false);
     cockpit_core::daemon::reset_blocking_probe_call_count();
-    cockpit_core::daemon::client::reset_connect_call_count();
+    cockpit_client::reset_connect_call_count();
 
     app.pending_new_session = true;
     let serviced = app
@@ -47,7 +47,7 @@ fn new_session_swap_makes_no_daemon_probe_or_connect() {
 
     assert!(serviced);
     assert_eq!(cockpit_core::daemon::blocking_probe_call_count(), 0);
-    assert_eq!(cockpit_core::daemon::client::connect_call_count(), 0);
+    assert_eq!(cockpit_client::connect_call_count(), 0);
 }
 
 #[test]

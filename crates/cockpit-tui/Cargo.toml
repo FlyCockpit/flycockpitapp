@@ -14,9 +14,10 @@ workspace = true
 
 [features]
 default = []
-remote = ["cockpit-core/remote", "cockpit-proto/remote"]
+remote = ["cockpit-client/remote", "cockpit-core/remote", "cockpit-proto/remote"]
 
 [dependencies]
+cockpit-client = { path = "../cockpit-client" }
 cockpit-config = { path = "../cockpit-config" }
 cockpit-core = { path = "../cockpit-core" }
 cockpit-host = { path = "../cockpit-host" }

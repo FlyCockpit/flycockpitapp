@@ -4293,7 +4293,7 @@ fn table_for(secret: &str) -> Arc<RedactionTable> {
 #[tokio::test]
 async fn detached_client_cannot_remove_editable_queued_messages() {
     let ctx = test_ctx();
-    let client = crate::daemon::client::DaemonClient::from_in_process(ctx);
+    let client = cockpit_client::DaemonClient::from_in_process(spawn_in_process_client(ctx));
 
     let err = client
         .request(Request::RemoveEditableQueuedUserMessages { target_id: None })
@@ -29453,7 +29453,8 @@ async fn in_process_broadcast_lag_emits_typed_event() {
         host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore::new(),
         host_capability_probes: base.host_capability_probes.clone(),
     });
-    let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
+    let client =
+        cockpit_client::DaemonClient::from_in_process(spawn_in_process_client(ctx.clone()));
 
     assert!(matches!(
         tokio::time::timeout(std::time::Duration::from_secs(1), client.next_event())
@@ -29667,7 +29668,8 @@ async fn in_process_full_event_queue_emits_lag_marker() {
         host_capabilities: crate::host_capabilities::HostCapabilitySnapshotStore::new(),
         host_capability_probes: base.host_capability_probes.clone(),
     });
-    let client = crate::daemon::client::DaemonClient::from_in_process(ctx.clone());
+    let client =
+        cockpit_client::DaemonClient::from_in_process(spawn_in_process_client(ctx.clone()));
 
     assert!(matches!(
         client

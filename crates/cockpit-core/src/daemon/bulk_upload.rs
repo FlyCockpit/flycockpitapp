@@ -7,12 +7,12 @@ use base64::Engine as _;
 use rand::RngExt as _;
 use sha2::{Digest as _, Sha256};
 
-use crate::daemon::client::DaemonClient;
 use crate::daemon::proto::{ErrorCode, Request, Response};
 use crate::proto_crate::bulk_transfer::{
     BulkMimeClass as RemoteBulkMimeClass, BulkTransferRef as RemoteBulkTransferRef,
     transfer_id_from_bytes,
 };
+use cockpit_client::DaemonClient;
 
 /// Text above this boundary must use the FCM2 source-artifact path rather than
 /// an inline user-message request.  It is intentionally shared by the native
@@ -168,10 +168,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bulk_user_message_staging_uses_bounded_write_requests_and_exact_digest() {
-        use crate::daemon::client::DaemonClient;
         use crate::daemon::proto::{Body, Envelope, ProtoStream, RecvFrame, Request, Response};
         use crate::proto_crate::bulk_transfer::BulkMimeClass as RemoteBulkMimeClass;
         use base64::Engine as _;
+        use cockpit_client::DaemonClient;
         use sha2::{Digest as _, Sha256};
         use tokio::net::UnixListener;
         use uuid::Uuid;

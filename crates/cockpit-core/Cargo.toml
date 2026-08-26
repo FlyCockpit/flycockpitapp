@@ -14,6 +14,7 @@ test-support = ["dep:cockpit-test-support"]
 # Starts FlyCockpit-owned account/sync/relay background work. The public v0.1
 # CLI leaves this off; provider network access remains available independently.
 remote = [
+    "cockpit-client/remote",
     "cockpit-db/remote",
     "cockpit-proto/remote",
     "dep:flycockpit-relay-protocol",
@@ -66,6 +67,7 @@ reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 rig = { workspace = true }
 httpdate = "1"
 tokio-tungstenite = { workspace = true, optional = true }
+cockpit-client = { path = "../cockpit-client" }
 cockpit-config = { path = "../cockpit-config" }
 cockpit-db = { path = "../cockpit-db" }
 cockpit-host = { path = "../cockpit-host" }

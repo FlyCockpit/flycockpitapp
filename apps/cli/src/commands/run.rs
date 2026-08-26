@@ -48,10 +48,7 @@ struct RunUsageError(String);
 #[error("{0}")]
 struct RunTurnFailure(String);
 
-async fn emit_org_logging_indicator_via_daemon(
-    client: &crate::daemon::client::DaemonClient,
-    cwd: &Path,
-) {
+async fn emit_org_logging_indicator_via_daemon(client: &cockpit_client::DaemonClient, cwd: &Path) {
     let project_root = cwd.display().to_string();
     let response = client
         .request(crate::daemon::proto::Request::GetStartupDisclosures { project_root })
@@ -70,7 +67,7 @@ async fn emit_org_logging_indicator_via_daemon(
 }
 
 async fn enforce_noninteractive_workspace_trust_via_daemon(
-    client: &crate::daemon::client::DaemonClient,
+    client: &cockpit_client::DaemonClient,
     cwd: &Path,
 ) -> Result<()> {
     let trust_root = crate::config::trust::resolve_trust_root(cwd)?;
@@ -109,7 +106,7 @@ async fn enforce_noninteractive_workspace_trust_via_daemon(
 
 async fn resolve_requested_session_via_daemon(
     args: &RunArgs,
-    client: &crate::daemon::client::DaemonClient,
+    client: &cockpit_client::DaemonClient,
     root: &Path,
 ) -> Result<Option<Uuid>> {
     if let Some(session) = &args.session {
@@ -348,7 +345,7 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
 /// Attach, send the prompt, pump events. Split out so the `?` operators
 /// unwind through [`run`]'s guard rather than skipping it.
 async fn run_turn(
-    client: &crate::daemon::client::DaemonClient,
+    client: &cockpit_client::DaemonClient,
     args: &RunArgs,
     prompt: String,
     no_sandbox: bool,
@@ -382,7 +379,7 @@ async fn run_turn(
 /// the daemon. The caller owns the daemon lifecycle (probe/spawn +
 /// ephemeral guard).
 pub(crate) async fn attach_send_pump(
-    client: &crate::daemon::client::DaemonClient,
+    client: &cockpit_client::DaemonClient,
     prompt: String,
     no_sandbox: bool,
     format: OutputFormat,
@@ -726,7 +723,7 @@ fn load_and_validate_images(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
 }
 
 async fn load_and_upload_images(
-    client: &crate::daemon::client::DaemonClient,
+    client: &cockpit_client::DaemonClient,
     images: &[Vec<u8>],
 ) -> Result<Vec<proto::ImageAttachmentRef>> {
     let typed = images
@@ -848,7 +845,7 @@ fn validate_ephemeral_continuation(args: &RunArgs) -> Result<()> {
 }
 
 pub(crate) async fn pump_events(
-    client: &crate::daemon::client::DaemonClient,
+    client: &cockpit_client::DaemonClient,
     session_id: Uuid,
     format: OutputFormat,
     verbose_json: bool,
@@ -1027,7 +1024,7 @@ fn disconnect_status_guidance(id: Uuid) -> String {
 
 /// First-SIGINT reconciliation: cancel then status on the same identity.
 async fn reconcile_after_interrupt(
-    client: &crate::daemon::client::DaemonClient,
+    client: &cockpit_client::DaemonClient,
     id: Uuid,
     format: OutputFormat,
     stderr: &mut impl Write,
@@ -1417,10 +1414,7 @@ fn sanitize_terminal_text(input: &str) -> String {
     out
 }
 
-async fn is_processing(
-    client: &crate::daemon::client::DaemonClient,
-    session_id: Uuid,
-) -> Result<bool> {
+async fn is_processing(client: &cockpit_client::DaemonClient, session_id: Uuid) -> Result<bool> {
     match client
         .request_ok(Request::SessionLiveStatus {
             session_ids: vec![session_id],

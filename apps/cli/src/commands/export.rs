@@ -23,7 +23,9 @@ use cockpit_core::daemon::proto::{ExportSessionKind, Request, Response, SessionS
 
 use crate::cli::ExportArgs;
 use crate::commands::CommandUsageError;
-use crate::daemon::client::{DaemonClient, ensure_persistent_daemon};
+use cockpit_client::DaemonClient;
+
+use crate::daemon::client::ensure_persistent_daemon;
 
 pub async fn run(args: ExportArgs) -> Result<()> {
     let daemon = ensure_persistent_daemon()

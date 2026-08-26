@@ -10,7 +10,7 @@
 //! this crate and plug in through explicit boundary traits.
 //!
 //! Crate direction is one-way:
-//! `cockpit-cli -> cockpit-core -> cockpit-config/cockpit-db/cockpit-proto`;
+//! `cockpit-cli -> cockpit-core -> cockpit-client/cockpit-proto/cockpit-config/cockpit-db`;
 //! the lower crates do not depend on `cockpit-core` or `cockpit-cli`.
 
 pub mod agents;

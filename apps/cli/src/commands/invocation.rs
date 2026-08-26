@@ -60,7 +60,7 @@ async fn cancel(args: InvocationCancelArgs) -> Result<()> {
     }
 }
 
-async fn connect() -> Result<crate::daemon::client::DaemonClient> {
+async fn connect() -> Result<cockpit_client::DaemonClient> {
     let daemon = probe_or_spawn(LifecycleMode::AttachOrEphemeral)
         .await
         .context("connecting to daemon")?;

@@ -2,7 +2,7 @@
 //!
 //! Phase 4 of the daemon migration: the TUI no longer owns the
 //! engine. Instead [`try_spawn`] probes (or auto-promotes) the daemon
-//! via [`cockpit_core::daemon::client`], attaches a session at the cwd, and
+//! via [`cockpit_client`], attaches a session at the cwd, and
 //! pipes the per-tick event stream from the daemon's broadcast back
 //! to the TUI in the same `Arc<Mutex<Vec<TurnEvent>>>` shape the rest
 //! of `app.rs` already consumes. The wire-shape of events is
@@ -20,11 +20,12 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock, mpsc, on
 use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
 
+use cockpit_client::DaemonClient;
 use cockpit_core::daemon::bulk_upload::{
     BulkUserMessageUploadError, INLINE_USER_MESSAGE_TEXT_BYTES, stage_opaque_user_text,
     user_message_needs_bulk,
 };
-use cockpit_core::daemon::client::{DaemonClient, LifecycleMode, probe_or_spawn};
+use cockpit_core::daemon::client::{LifecycleMode, probe_or_spawn};
 use cockpit_core::daemon::image_upload::{ImageUploadError, upload_submission_images};
 use cockpit_core::engine::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
@@ -2929,9 +2930,7 @@ async fn daemon_guidance_estimate_at_socket(
     model: Option<String>,
     socket: &Path,
 ) -> Option<GuidanceEstimate> {
-    let client = cockpit_core::daemon::client::DaemonClient::connect(socket)
-        .await
-        .ok()?;
+    let client = cockpit_client::DaemonClient::connect(socket).await.ok()?;
     let resp = client
         .request_ok(Request::GuidanceEstimate {
             project_root: cwd.to_string_lossy().into_owned(),
@@ -3024,10 +3023,9 @@ pub(crate) fn daemon_request_blocking(req: Request) -> Result<Response, String> 
                 if !matches!(probe.status, DaemonStatus::Running) {
                     return Err("daemon not running".to_string());
                 }
-                let client =
-                    cockpit_core::daemon::client::DaemonClient::connect(&probe.paths.socket)
-                        .await
-                        .map_err(|e| format!("daemon connect: {e}"))?;
+                let client = cockpit_client::DaemonClient::connect(&probe.paths.socket)
+                    .await
+                    .map_err(|e| format!("daemon connect: {e}"))?;
                 client
                     .request_ok(req)
                     .await
@@ -3069,7 +3067,7 @@ pub(crate) fn daemon_request_blocking_classified(
                     "daemon not running".to_string(),
                 ));
             }
-            let client = cockpit_core::daemon::client::DaemonClient::connect(&probe.paths.socket)
+            let client = cockpit_client::DaemonClient::connect(&probe.paths.socket)
                 .await
                 .map_err(|error| {
                     BlockingDaemonRequestError::Other(format!("daemon connect: {error}"))
@@ -3102,7 +3100,7 @@ pub(crate) fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<
     let socket = socket.to_path_buf();
     tokio::task::block_in_place(|| {
         runtime.block_on(async {
-            let client = cockpit_core::daemon::client::DaemonClient::connect(&socket)
+            let client = cockpit_client::DaemonClient::connect(&socket)
                 .await
                 .map_err(|e| format!("daemon connect: {e}"))?;
             client
@@ -3149,7 +3147,7 @@ fn request_on_socket(socket: &Path, req: Request) -> Result<Response, String> {
     let socket = socket.to_path_buf();
     tokio::task::block_in_place(|| {
         runtime.block_on(async {
-            let client = cockpit_core::daemon::client::DaemonClient::connect(&socket)
+            let client = cockpit_client::DaemonClient::connect(&socket)
                 .await
                 .map_err(|e| format!("daemon connect: {e}"))?;
             client

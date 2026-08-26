@@ -3289,6 +3289,12 @@ pub(crate) fn register_in_process_context(ctx: Arc<DaemonContext>) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     contexts.insert(ctx.paths.socket.clone(), Arc::downgrade(&ctx));
+    let endpoint = ctx.paths.socket.clone();
+    let weak = Arc::downgrade(&ctx);
+    cockpit_client::register_in_process_connector(
+        endpoint,
+        Arc::new(move || weak.upgrade().map(spawn_in_process_client)),
+    );
 }
 
 pub(crate) fn in_process_context(socket: &Path) -> Option<Arc<DaemonContext>> {
@@ -4341,23 +4347,21 @@ pub(super) struct ClientRequestEffects {
     shutdown_after_response: bool,
 }
 
-pub(crate) struct InProcessRequest {
-    pub request: Request,
-    pub reply: oneshot::Sender<std::result::Result<Response, ErrorPayload>>,
-}
-
 pub(crate) fn spawn_in_process_client(
     ctx: Arc<DaemonContext>,
-) -> (mpsc::Sender<InProcessRequest>, mpsc::Receiver<proto::Event>) {
+) -> cockpit_client::InProcessConnection {
     let (request_tx, request_rx) = mpsc::channel(IN_PROCESS_REQUEST_QUEUE);
     let (event_tx, event_rx) = mpsc::channel(IN_PROCESS_EVENT_QUEUE);
     tokio::spawn(run_in_process_client(ctx, request_rx, event_tx));
-    (request_tx, event_rx)
+    cockpit_client::InProcessConnection {
+        requests: request_tx,
+        events: event_rx,
+    }
 }
 
 async fn run_in_process_client(
     ctx: Arc<DaemonContext>,
-    mut request_rx: mpsc::Receiver<InProcessRequest>,
+    mut request_rx: mpsc::Receiver<cockpit_client::InProcessRequest>,
     event_tx: mpsc::Sender<proto::Event>,
 ) {
     let _client_guard = ctx.track_client();
@@ -4464,7 +4468,7 @@ async fn run_in_process_client(
                     }
                 }
                 cmd = request_rx.recv() => {
-                    let Some(InProcessRequest { request, reply }) = cmd else {
+                    let Some(cockpit_client::InProcessRequest { request, reply }) = cmd else {
                         break 'client;
                     };
                     if principal::request_ordering(&request) == principal::RequestOrdering::Concurrent {

@@ -388,7 +388,7 @@ fn submit(run: &mut WizardRun, answer: WizardAnswer, io: &mut dyn TerminalIo) ->
 }
 
 async fn request_durable_local_mutation(
-    client: &crate::daemon::client::DaemonClient,
+    client: &cockpit_client::DaemonClient,
     client_operation_id: &str,
     operation_kind: &str,
     request: Request,

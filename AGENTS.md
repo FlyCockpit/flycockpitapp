@@ -11,30 +11,31 @@ Flycockpit is a pnpm/Turborepo monorepo with a React web app, Hono API server, B
 
 Apps under `apps/`: `apps/cli` (Rust Cockpit CLI), `apps/docs` (documentation site), `apps/native` (Expo app), `apps/relay` (temporary TypeScript standalone relay bridge still deployed until WebSocket ownership moves into `apps/server`), `apps/server` (Hono API; destination owner of public WebSocket signaling/gateway work), `apps/tenant-authority` (Rust tenant-authority reference service), `apps/web` (React app), and `apps/worker` (BullMQ worker). There is no Rust WebSocket relay app: the former `apps/relay-rs` experiment was deleted.
 
-Rust code lives in the Cargo workspace rooted at this repo's `Cargo.toml`. Current members are `apps/cli` (Cockpit CLI binary, commands, and terminal host), `apps/tenant-authority` (customer-operated tenant-authority reference service), `crates/cockpit-tui` (ratatui terminal interface), `crates/cockpit-core` (UI-free Cockpit application layer), `crates/cockpit-host` (dependency-minimal private filesystem, path, process, PID, and lifecycle-guard primitives), `crates/cockpit-config` (config types/loading), `crates/cockpit-tokenizer` (strict shared tiktoken contract), `crates/cockpit-db` (SQLite layer and migrations), `crates/cockpit-proto` (daemon wire protocol), `crates/cockpit-noise` (Noise protocol bindings), `crates/cockpit-test-support` (shared test-only helpers; not a production API), and `crates/relay-protocol` (legacy relay wire types still used by the daemon client). pnpm/turbo commands do not build or test Rust. Run cargo checks serially from the primary repo root with its singular target: `CARGO_TARGET_DIR=target cargo fmt --check`, `CARGO_TARGET_DIR=target cargo nextest run --locked --workspace`, and `CARGO_TARGET_DIR=target cargo clippy --locked --tests -- -D warnings` (test targets are lint-clean and must stay that way). `cargo nextest run --locked --workspace --profile quick` may be used only while fixing a failure in the final serialized validation loop — it skips only apps/cli's e2e integration binary — and the full default-profile run is required after the last change. Worker worktrees never build or test, and build artifacts or dependency caches never go under `/tmp`. CLI CI is `.github/workflows/cli-ci.yml` and releases go through `.github/workflows/release.yml` (cargo-dist + Homebrew tap).
+Rust code lives in the Cargo workspace rooted at this repo's `Cargo.toml`. Current members are `apps/cli` (Cockpit CLI binary, commands, and terminal host), `apps/tenant-authority` (customer-operated tenant-authority reference service), `crates/cockpit-tui` (ratatui terminal interface), `crates/cockpit-core` (UI-free Cockpit application layer), `crates/cockpit-client` (dependency-minimal local daemon client transport), `crates/cockpit-host` (dependency-minimal private filesystem, path, process, PID, and lifecycle-guard primitives), `crates/cockpit-config` (config types/loading), `crates/cockpit-tokenizer` (strict shared tiktoken contract), `crates/cockpit-db` (SQLite layer and migrations), `crates/cockpit-proto` (daemon wire protocol), `crates/cockpit-noise` (Noise protocol bindings), `crates/cockpit-test-support` (shared test-only helpers; not a production API), and `crates/relay-protocol` (legacy relay wire types still used by the daemon client). pnpm/turbo commands do not build or test Rust. Run cargo checks serially from the primary repo root with its singular target: `CARGO_TARGET_DIR=target cargo fmt --check`, `CARGO_TARGET_DIR=target cargo nextest run --locked --workspace`, and `CARGO_TARGET_DIR=target cargo clippy --locked --tests -- -D warnings` (test targets are lint-clean and must stay that way). `cargo nextest run --locked --workspace --profile quick` may be used only while fixing a failure in the final serialized validation loop — it skips only apps/cli's e2e integration binary — and the full default-profile run is required after the last change. Worker worktrees never build or test, and build artifacts or dependency caches never go under `/tmp`. CLI CI is `.github/workflows/cli-ci.yml` and releases go through `.github/workflows/release.yml` (cargo-dist + Homebrew tap).
 
 ### Rust crate graph
 
 Dependencies run strictly downward; there are no upward or circular edges. This graph is authoritative — do not duplicate it elsewhere.
 
 ```
-apps/cli                 -> cockpit-tui, cockpit-core, cockpit-host, cockpit-proto,
+apps/cli                 -> cockpit-tui, cockpit-core, cockpit-client, cockpit-host, cockpit-proto,
                             cockpit-config, cockpit-db, relay-protocol
 apps/tenant-authority    -> cockpit-proto
-crates/cockpit-tui       -> cockpit-core, cockpit-host, cockpit-proto, cockpit-config
-crates/cockpit-core      -> cockpit-host, cockpit-proto, cockpit-config,
+crates/cockpit-tui       -> cockpit-core, cockpit-client, cockpit-host, cockpit-proto, cockpit-config
+crates/cockpit-core      -> cockpit-client, cockpit-host, cockpit-proto, cockpit-config,
                             cockpit-tokenizer, cockpit-db, relay-protocol
 crates/cockpit-proto     -> cockpit-config, cockpit-db
 crates/cockpit-config    -> cockpit-tokenizer, cockpit-db
 crates/cockpit-tokenizer -> (none)
 crates/cockpit-db        -> (none)
+crates/cockpit-client    -> cockpit-proto
 crates/cockpit-host      -> (none)
 crates/cockpit-noise     -> (none)
 crates/cockpit-test-support -> (none)
 crates/relay-protocol    -> (none)
 ```
 
-Layered, the application chain is `apps/cli -> cockpit-tui -> cockpit-core -> cockpit-proto -> cockpit-config -> cockpit-db`, with upper crates also depending directly on lower ones. `cockpit-host` is an independent production leaf shared by CLI, TUI, and core; it must not depend on application, protocol, config, or storage crates. `apps/tenant-authority` sits beside `apps/cli` and depends only on `cockpit-proto`. `cockpit-noise` is a leaf. `cockpit-test-support` is a test-only leaf: upper crates may take it as a dev-dependency or via an explicit `test-support` feature; that is not a production edge and must not become one.
+Layered, the application chain is `apps/cli -> cockpit-tui -> cockpit-core -> cockpit-client -> cockpit-proto -> cockpit-config -> cockpit-db`, with upper crates also depending directly on lower ones. `cockpit-client` is the authority-free local daemon transport shared by core, CLI, and TUI. `cockpit-host` is an independent production leaf shared by CLI, TUI, and core; it must not depend on application, protocol, config, or storage crates. `apps/tenant-authority` sits beside `apps/cli` and depends only on `cockpit-proto`. `cockpit-noise` is a leaf. `cockpit-test-support` is a test-only leaf: upper crates may take it as a dev-dependency or via an explicit `test-support` feature; that is not a production edge and must not become one.
 
 Rules that follow from the graph:
 
@@ -42,6 +43,7 @@ Rules that follow from the graph:
 - `crates/cockpit-core` and everything below it must stay free of ratatui, crossterm, and any terminal-UI dependency.
 - `crates/cockpit-db` is the base of the chain and depends on no other production workspace crate (`cockpit-test-support` may appear only as a dev-dependency).
 - `crates/cockpit-host` owns shared private-filesystem, symlink-aware path, child-process/PID, and lifecycle metadata guards. It is a dependency-minimal leaf and must not depend on any other Cockpit workspace crate. Do not re-export its modules from `cockpit-core`; upper crates use it directly.
+- `crates/cockpit-client` owns local daemon request/response framing, exact hello negotiation, event delivery, timeouts, and the authority-free in-process channel transport. It must not depend on `cockpit-core`, storage, or any UI crate. Do not re-export it through `cockpit-core`; upper crates use it directly.
 - `crates/cockpit-core` must not re-export `cockpit_db` (`pub use cockpit_db as db` or equivalent). The storage crate is an implementation detail of the core layer. CLI production paths and daemon-connected TUI paths talk to the ledger only through daemon RPCs. The documented daemonless TUI fallback is the narrow exception; do not use it to add a new production database bypass. Fix a bypass by moving the call onto an RPC, not by widening the re-export.
 - `crates/cockpit-test-support` and `cockpit_core::test_env` (behind the `test-support` feature) are test instrumentation only. They must not grow into a general-purpose database API for upper crates.
 - There is no Rust public WebSocket server or relay binary in this workspace. Server-side/public WebSockets are TypeScript-owned (`apps/relay` as a temporary deployed bridge; destination is TypeScript `apps/server`). The Rust daemon remains an outbound WebSocket client only.

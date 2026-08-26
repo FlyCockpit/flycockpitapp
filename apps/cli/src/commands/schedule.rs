@@ -19,7 +19,7 @@ pub async fn run(cmd: ScheduleCommand) -> Result<()> {
     }
 }
 
-async fn client() -> Result<crate::daemon::client::DaemonClient> {
+async fn client() -> Result<cockpit_client::DaemonClient> {
     Ok(probe_or_spawn(LifecycleMode::AttachOrAutoPromote)
         .await?
         .client)

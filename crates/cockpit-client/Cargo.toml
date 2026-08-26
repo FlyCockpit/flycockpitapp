@@ -1,0 +1,29 @@
+[package]
+name = "cockpit-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Dependency-minimal local daemon client transport for Cockpit"
+license = "Apache-2.0"
+repository = "https://github.com/FlyCockpit/flycockpitapp"
+homepage = "https://github.com/FlyCockpit/flycockpitapp"
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+remote = ["cockpit-proto/remote"]
+
+[dependencies]
+anyhow = { workspace = true }
+cockpit-proto = { path = "../cockpit-proto" }
+tokio = { workspace = true, features = ["net", "sync", "time", "rt"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

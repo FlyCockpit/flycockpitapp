@@ -1239,6 +1239,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cockpit-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cockpit-proto",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cockpit-config"
 version = "0.1.0"
 dependencies = [
@@ -1277,6 +1290,7 @@ dependencies = [
  "bytes",
  "chacha20poly1305",
  "chrono",
+ "cockpit-client",
  "cockpit-config",
  "cockpit-db",
  "cockpit-host",
@@ -1442,6 +1456,7 @@ dependencies = [
  "anyhow",
  "base64",
  "chrono",
+ "cockpit-client",
  "cockpit-config",
  "cockpit-db",
  "futures",
@@ -1490,6 +1505,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "cockpit-client",
  "cockpit-config",
  "cockpit-core",
  "cockpit-host",

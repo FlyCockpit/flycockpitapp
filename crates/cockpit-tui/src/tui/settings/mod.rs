@@ -96,8 +96,7 @@ use providers::initial_list_cursor;
 /// daemon.  Keeping this tiny helper here makes accidental local vault opens
 /// in settings code both unnecessary and easy for the boundary ratchet to
 /// reject.
-pub(crate) async fn settings_daemon_client()
--> anyhow::Result<cockpit_core::daemon::client::DaemonClient> {
+pub(crate) async fn settings_daemon_client() -> anyhow::Result<cockpit_client::DaemonClient> {
     Ok(cockpit_core::daemon::client::ensure_persistent_daemon()
         .await?
         .client)
@@ -2307,7 +2306,7 @@ fn same_denylist_occurrences(
 /// keyset-paginated; callers must not treat the first page as the whole
 /// answer, and a concurrent mutation requires restarting the traversal.
 pub(crate) async fn secret_inventory_contains(
-    client: &cockpit_core::daemon::client::DaemonClient,
+    client: &cockpit_client::DaemonClient,
     name: &str,
     kind: Option<cockpit_proto::SecretInventoryKind>,
 ) -> Result<bool, String> {

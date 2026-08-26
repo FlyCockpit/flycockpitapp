@@ -5,8 +5,8 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::daemon::client::DaemonClient;
 use crate::daemon::proto::{self, ErrorCode, Request, Response};
+use cockpit_client::DaemonClient;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImageUploadError {

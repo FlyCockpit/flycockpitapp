@@ -11,3 +11,4 @@ pub mod jitter;
 pub mod path_containment;
 pub mod private_fs;
 pub mod process;
+pub mod text;

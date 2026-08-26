@@ -4998,7 +4998,7 @@ fn render_field_row(
     ];
     if active {
         let text = field.text();
-        let cursor = cockpit_core::text::floor_char_boundary(text, field.cursor());
+        let cursor = cockpit_host::text::floor_char_boundary(text, field.cursor());
         let (before, after) = text.split_at(cursor);
         spans.push(Span::styled(before.to_string(), value_style));
         spans.push(super::shell::cursor_marker_span());

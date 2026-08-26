@@ -1553,7 +1553,7 @@ impl App {
                     self.history.push(HistoryEntry::ToolLine {
                         call_id,
                         tool,
-                        summary: cockpit_core::text::first_line(&output, 200),
+                        summary: cockpit_host::text::first_line(&output, 200),
                         state: ToolCallState::Success,
                     });
                 }
@@ -1626,7 +1626,7 @@ impl App {
                     self.history.push(HistoryEntry::ToolLine {
                         call_id,
                         tool,
-                        summary: cockpit_core::text::first_line(&error, 200),
+                        summary: cockpit_host::text::first_line(&error, 200),
                         state,
                     });
                 }
@@ -2780,7 +2780,7 @@ fn inference_failure_reason(
             "stream stalled past the idle timeout".to_string()
         }
         other if detail.is_empty() => other.to_string(),
-        other => format!("{other}: {}", cockpit_core::text::first_line(detail, 200)),
+        other => format!("{other}: {}", cockpit_host::text::first_line(detail, 200)),
     }
 }
 
@@ -2866,9 +2866,9 @@ fn mcp_child_expanded_by_default(meta: Option<&crate::tui::history::McpChildMeta
 
 #[cfg(test)]
 fn readable_arg_value(value: &serde_json::Value, limit: usize, multiline: bool) -> String {
-    cockpit_core::text::format_arg_value(
+    cockpit_host::text::format_arg_value(
         value,
-        cockpit_core::text::ArgFormatOptions::history(limit, multiline),
+        cockpit_host::text::ArgFormatOptions::history(limit, multiline),
     )
 }
 

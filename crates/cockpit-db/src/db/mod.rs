@@ -114,6 +114,7 @@ pub mod workspace_trust;
 pub mod write_scope_leases;
 
 use std::any::Any;
+use std::io::Seek as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1349,24 +1350,153 @@ fn create_migration_backup_with_limit(
 }
 
 fn existing_quarantine_matches(path: &Path, expected_digest: &str) -> Result<bool> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    existing_quarantine_matches_after_open(path, expected_digest, || {})
+}
+
+fn existing_quarantine_matches_after_open(
+    path: &Path,
+    expected_digest: &str,
+    after_open: impl FnOnce(),
+) -> Result<bool> {
+    let mut file = match open_quarantine_nofollow(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(false),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("inspecting quarantine artifact {}", path.display()));
         }
     };
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting quarantine handle {}", path.display()))?;
+    if !quarantine_handle_is_regular(&metadata) {
         return Ok(false);
     }
-    files::repair_private_file(path, "quarantined database backup artifact")?;
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("rechecking quarantine artifact {}", path.display()))?;
+    if !quarantine_metadata_is_owned(&metadata) {
+        return Ok(false);
+    }
+    repair_private_quarantine_handle(&file, &metadata, path)?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("rechecking quarantine handle {}", path.display()))?;
     if !quarantine_metadata_is_private_and_owned(&metadata) {
         return Ok(false);
     }
-    Ok(file_sha256(path)? == expected_digest)
+    after_open();
+    file.rewind()
+        .with_context(|| format!("rewinding quarantine artifact {}", path.display()))?;
+    let digest_matches = reader_sha256(&mut file)? == expected_digest;
+    Ok(digest_matches && path_still_names_open_quarantine(path, &metadata)?)
+}
+
+#[cfg(unix)]
+fn quarantine_metadata_is_owned(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    // SAFETY: `geteuid` has no preconditions and reads process identity only.
+    metadata.uid() == unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn quarantine_metadata_is_owned(_metadata: &std::fs::Metadata) -> bool {
+    // The standard library cannot prove a private-owner ACL for this handle.
+    false
+}
+
+#[cfg(unix)]
+fn path_still_names_open_quarantine(path: &Path, opened: &std::fs::Metadata) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let current = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("rechecking quarantine pathname identity"),
+    };
+    Ok(current.file_type().is_file()
+        && !current.file_type().is_symlink()
+        && current.dev() == opened.dev()
+        && current.ino() == opened.ino())
+}
+
+#[cfg(not(unix))]
+fn path_still_names_open_quarantine(_path: &Path, _opened: &std::fs::Metadata) -> Result<bool> {
+    // Windows deduplication already fails closed because the standard library
+    // cannot prove a private-owner ACL for the opened handle.
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn open_quarantine_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_quarantine_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_quarantine_nofollow(_path: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no-follow quarantine validation is unavailable on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn quarantine_handle_is_regular(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+#[cfg(not(windows))]
+fn quarantine_handle_is_regular(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
+#[cfg(unix)]
+fn repair_private_quarantine_handle(
+    file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+    path: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "repairing quarantined database backup handle permissions {}",
+                    path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn repair_private_quarantine_handle(
+    _file: &std::fs::File,
+    _metadata: &std::fs::Metadata,
+    _path: &Path,
+) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1378,7 +1508,15 @@ fn quarantine_metadata_is_private_and_owned(metadata: &std::fs::Metadata) -> boo
     metadata.permissions().mode() & 0o777 == 0o600 && metadata.uid() == effective_uid
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn quarantine_metadata_is_private_and_owned(_metadata: &std::fs::Metadata) -> bool {
+    // The standard library exposes the opened handle's reparse attributes but
+    // not a sufficiently strong private-owner ACL proof. Keep deduplication
+    // fail-closed rather than treating a regular file as privately owned.
+    false
+}
+
+#[cfg(not(any(unix, windows)))]
 fn quarantine_metadata_is_private_and_owned(metadata: &std::fs::Metadata) -> bool {
     metadata.is_file()
 }
@@ -1491,15 +1629,16 @@ fn sqlite_allocated_bytes(conn: &Connection) -> Result<u64> {
 }
 
 fn file_sha256(path: &Path) -> Result<String> {
-    use std::io::Read as _;
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("opening backup candidate {} for hashing", path.display()))?;
+    reader_sha256(&mut file).with_context(|| format!("hashing backup candidate {}", path.display()))
+}
+
+fn reader_sha256(reader: &mut impl std::io::Read) -> Result<String> {
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
     loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("hashing backup candidate {}", path.display()))?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -1905,9 +2044,13 @@ fn prune_untrusted_migration_backups_with_limits(
         if !owned {
             continue;
         }
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("reading quarantined backup type {}", candidate.display()))?;
+        let metadata = std::fs::symlink_metadata(&candidate).with_context(|| {
+            format!(
+                "reading quarantined backup metadata without following links {}",
+                candidate.display()
+            )
+        })?;
+        let file_type = metadata.file_type();
         if file_type.is_symlink() {
             std::fs::remove_file(&candidate).with_context(|| {
                 format!(
@@ -1922,12 +2065,6 @@ fn prune_untrusted_migration_backups_with_limits(
             "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: quarantine path {} is a directory or special file; remove that exact path manually and retry",
             candidate.display()
         );
-        let metadata = entry.metadata().with_context(|| {
-            format!(
-                "reading quarantined backup metadata {}",
-                candidate.display()
-            )
-        })?;
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
         backups.push((modified, metadata.len(), candidate));
     }
@@ -2906,6 +3043,62 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"matching target bytes");
         std::fs::write(&quarantine, b"later regular admission").unwrap();
         assert!(quarantine.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_validation_hashes_opened_handle_after_path_is_swapped() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp
+            .path()
+            .join("cockpit.v1.backup-untrusted-race.sqlite.quarantine");
+        let opened_bytes = b"opened quarantine bytes";
+        std::fs::write(&quarantine, opened_bytes).unwrap();
+        let source = temp.path().join("source.sqlite");
+        std::fs::write(&source, opened_bytes).unwrap();
+        let digest = file_sha256(&source).unwrap();
+
+        let target = temp.path().join("target.sqlite");
+        std::fs::write(&target, b"must not be read or modified").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let displaced = temp.path().join("displaced.sqlite");
+        assert!(
+            !existing_quarantine_matches_after_open(&quarantine, &digest, || {
+                std::fs::rename(&quarantine, &displaced).unwrap();
+                symlink(&target, &quarantine).unwrap();
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"must not be read or modified"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read(displaced).unwrap(), opened_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_pruning_unlinks_symlink_without_accounting_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let target = temp.path().join("large-target.sqlite");
+        std::fs::write(&target, vec![7_u8; 4096]).unwrap();
+        let quarantine = temp
+            .path()
+            .join("cockpit.v1.backup-untrusted-swap.sqlite.quarantine");
+        symlink(&target, &quarantine).unwrap();
+
+        prune_untrusted_migration_backups_with_limits(&database, 0, 0).unwrap();
+        assert!(!std::fs::symlink_metadata(&quarantine).is_ok());
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 4096);
     }
 
     #[test]

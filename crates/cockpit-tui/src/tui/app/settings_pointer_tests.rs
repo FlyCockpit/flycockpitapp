@@ -324,11 +324,7 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
         ),
         (
             OverlaySurface::Notes,
-            Overlay::Notes(crate::tui::notes_pane::NotesPane::open(
-                tmp.path(),
-                false,
-                None,
-            )),
+            Overlay::Notes(crate::tui::notes_pane::NotesPane::open(tmp.path(), false)),
         ),
         (
             OverlaySurface::Diff,

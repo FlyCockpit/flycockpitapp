@@ -70,10 +70,6 @@ pub struct NotesPane {
     instance_id: u64,
     /// Project-root scoping key (git/worktree root, or launch cwd).
     project_root: String,
-    /// Owned DB handle for note CRUD. `None` when the global DB couldn't be
-    /// opened — the dialog still renders (with an inline error) but every
-    /// mutating action is a no-op until it's reachable.
-    daemon_socket: Option<std::path::PathBuf>,
     /// Loaded notes for this project, in sidebar order.
     notes: Vec<ProjectNote>,
     /// Durable sidebar selection and viewport. The final selectable row is
@@ -136,7 +132,6 @@ pub enum NotesOutcome {
 
 pub struct NotesRpcAction {
     instance_id: u64,
-    daemon_socket: std::path::PathBuf,
     project_root: String,
     kind: NotesRpcActionKind,
     generation: u64,
@@ -357,24 +352,14 @@ impl NotesPane {
     /// root, falling back to `cwd`). Loading happens through
     /// [`Self::initial_load_action`] so the TUI does not block the async
     /// runtime while opening the pane.
-    pub fn open(
-        cwd: &std::path::Path,
-        vim_enabled: bool,
-        daemon_socket: Option<std::path::PathBuf>,
-    ) -> Self {
+    pub fn open(cwd: &std::path::Path, vim_enabled: bool) -> Self {
         let project_root = cockpit_core::git::find_worktree_root(cwd)
             .unwrap_or_else(|| cwd.to_path_buf())
             .to_string_lossy()
             .into_owned();
-        let status = if daemon_socket.is_some() {
-            Some("loading notes".to_string())
-        } else {
-            Some("Unavailable — reconnect to the daemon, then Retry".to_string())
-        };
         Self {
             instance_id: next_notes_pane_instance(),
             project_root,
-            daemon_socket,
             notes: Vec::new(),
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::Uninitialized,
@@ -393,20 +378,19 @@ impl NotesPane {
             last_view_height: 0,
             last_view_rows: 0,
             last_edit_rows: 0,
-            status,
+            status: Some("loading notes".to_string()),
         }
     }
 
-    pub fn initial_load_action(&mut self) -> Option<NotesRpcAction> {
+    pub fn initial_load_action(&mut self) -> NotesRpcAction {
         let action = NotesRpcAction {
             instance_id: self.instance_id,
-            daemon_socket: self.daemon_socket.clone()?,
             project_root: self.project_root.clone(),
             kind: NotesRpcActionKind::Load { keep: None },
             generation: self.operation_generation,
         };
         self.pending_generations.push_back(action.generation);
-        Some(action)
+        action
     }
 
     /// Currently-selected note, if any.
@@ -568,7 +552,6 @@ impl NotesPane {
     }
 
     fn schedule_action(&mut self, kind: NotesRpcActionKind) -> Option<(u64, NotesRpcAction)> {
-        let daemon_socket = self.daemon_socket.clone()?;
         self.operation_generation = self.operation_generation.wrapping_add(1);
         let generation = self.operation_generation;
         self.pending_generations.push_back(generation);
@@ -576,7 +559,6 @@ impl NotesPane {
             generation,
             NotesRpcAction {
                 instance_id: self.instance_id,
-                daemon_socket,
                 project_root: self.project_root.clone(),
                 kind,
                 generation,
@@ -748,12 +730,6 @@ impl NotesPane {
                     self.status = Some("name must not be empty".to_string());
                     return NotesOutcome::Stay;
                 }
-                if self.daemon_socket.is_none() {
-                    self.status =
-                        Some("Unavailable — reconnect to the daemon, then Retry".to_string());
-                    self.mode = Mode::Browsing;
-                    return NotesOutcome::Stay;
-                };
                 let kind = match for_note {
                     Some(id) => NotesRpcActionKind::Rename { id, name },
                     None => NotesRpcActionKind::Create { name },
@@ -867,7 +843,6 @@ impl NotesPane {
         let mut pane = Self {
             instance_id: 0,
             project_root: "/proj".to_string(),
-            daemon_socket: Some(std::path::PathBuf::from("/test-daemon.sock")),
             notes: Vec::new(),
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::New,
@@ -1176,12 +1151,11 @@ mod tests {
         }
     }
 
-    fn pane(connected: bool) -> NotesPane {
+    fn pane(_connected: bool) -> NotesPane {
         let id = Uuid::new_v4();
         let mut pane = NotesPane {
             instance_id: 0,
             project_root: "/proj".to_string(),
-            daemon_socket: connected.then(|| std::path::PathBuf::from("/test-daemon.sock")),
             notes: vec![ProjectNote {
                 id,
                 project_root: "/proj".into(),
@@ -1243,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_notes_are_unavailable_without_mutation() {
+    fn endpoint_state_does_not_suppress_confirmed_intent() {
         let mut pane = pane(false);
         pane.start_create();
         if let Mode::Naming { buffer, .. } = &mut pane.mode {
@@ -1251,10 +1225,10 @@ mod tests {
         }
         assert!(matches!(
             pane.handle_key(press(KeyCode::Enter)),
-            NotesOutcome::Stay
+            NotesOutcome::Rpc(_)
         ));
         assert_eq!(pane.notes.len(), 1);
-        assert!(pane.status.as_deref().unwrap().contains("Unavailable"));
+        assert!(pane.pending_generations.front().is_some());
     }
 
     #[test]

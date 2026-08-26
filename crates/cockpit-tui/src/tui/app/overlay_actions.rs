@@ -1,5 +1,15 @@
 use super::*;
 
+async fn resolve_notes_endpoint(
+    lifecycle: cockpit_client::LifecycleClient,
+) -> Result<cockpit_client::ClientEndpoint, String> {
+    lifecycle
+        .resolve(cockpit_client::LifecycleIntent::EnsurePersistent)
+        .await
+        .map(|resolution| resolution.endpoint)
+        .map_err(|error| format!("notes daemon lifecycle failed: {error}"))
+}
+
 pub(super) struct PendingLeakReveal {
     pub(super) operation_id: uuid::Uuid,
     pub(super) pane_instance_id: uuid::Uuid,
@@ -48,31 +58,25 @@ impl App {
     /// slash command and the Ctrl+N keyboard shortcut. The editor mirrors the
     /// composer's vim setting so vim users get vim editing in their scratchpad.
     pub(super) fn open_scratchpad_pane(&mut self) {
-        let mut pane = crate::tui::notes_pane::NotesPane::open(
-            &self.launch.cwd,
-            self.composer.vim_enabled(),
-            self.startup_background.daemon_socket.clone(),
-        );
+        let mut pane =
+            crate::tui::notes_pane::NotesPane::open(&self.launch.cwd, self.composer.vim_enabled());
         let action = pane.initial_load_action();
         self.overlay = Overlay::Notes(pane);
-        if let Some(action) = action {
-            self.start_notes_rpc_action(action);
-        }
+        self.start_notes_rpc_action(action);
     }
 
     pub(super) fn start_notes_rpc_action(
         &mut self,
         action: crate::tui::notes_pane::NotesRpcAction,
     ) {
-        let Some(endpoint) = self.attached_daemon_endpoint() else {
-            return;
-        };
+        let lifecycle = self.lifecycle.clone();
         let kind = crate::tui::async_action::AsyncActionKind::NotesProjection {
             instance_id: action.instance_id(),
             generation: action.generation(),
         };
         let key = crate::tui::async_action::AsyncActionKey::new(action.serialization_key());
         self.async_actions.start_serialized(kind, key, async move {
+            let endpoint = resolve_notes_endpoint(lifecycle).await?;
             let result = tokio::task::spawn_blocking(move || action.run_blocking_rpc(endpoint))
                 .await
                 .map_err(|error| format!("notes rpc worker failed: {error}"))?;
@@ -331,6 +335,61 @@ impl App {
                 self.keyboard_enhancement_active,
             ),
         );
+    }
+}
+
+#[cfg(test)]
+mod notes_lifecycle_tests {
+    use super::resolve_notes_endpoint;
+
+    #[tokio::test]
+    async fn endpoint_resolution_requests_persistent_attach_exactly_once() {
+        let (client, mut requests) = cockpit_client::LifecycleClient::channel(2);
+        let resolve = tokio::spawn(resolve_notes_endpoint(client));
+        let request = requests.recv().await.expect("one lifecycle request");
+        assert_eq!(
+            request.intent,
+            cockpit_client::LifecycleIntent::EnsurePersistent
+        );
+        let (connections, _connection_requests) = tokio::sync::mpsc::channel(1);
+        let (sensitive, _sensitive_requests) = tokio::sync::mpsc::channel(1);
+        assert!(
+            request
+                .reply
+                .send(Ok(cockpit_client::LifecycleResolution {
+                    endpoint: cockpit_client::ClientEndpoint::InProcess(
+                        cockpit_client::InProcessEndpoint::new(connections, sensitive),
+                    ),
+                    owns_daemon: false,
+                    socket: std::path::PathBuf::from("in-process"),
+                    startup_notice: None,
+                }))
+                .is_ok()
+        );
+        let endpoint = resolve.await.expect("resolver task").expect("endpoint");
+        assert!(matches!(
+            endpoint,
+            cockpit_client::ClientEndpoint::InProcess(_)
+        ));
+        request.accepted.await.expect("endpoint acceptance");
+        assert!(
+            requests.try_recv().is_err(),
+            "later attachment must not duplicate a settled intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_failure_is_a_correlated_worker_error() {
+        let (client, mut requests) = cockpit_client::LifecycleClient::channel(1);
+        let resolve = tokio::spawn(resolve_notes_endpoint(client));
+        let request = requests.recv().await.expect("lifecycle request");
+        assert!(request.reply.send(Err("attach unavailable".into())).is_ok());
+        let result = resolve.await.expect("resolver task");
+        let Err(error) = result else {
+            panic!("resolution must fail");
+        };
+        assert!(error.contains("attach unavailable"));
+        assert!(requests.try_recv().is_err());
     }
 }
 

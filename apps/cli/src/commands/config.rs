@@ -2,7 +2,7 @@
 use anyhow::bail;
 use anyhow::{Context, Result};
 
-#[cfg(feature = "remote")]
+#[cfg(feature = "extended")]
 use crate::cli::ImageSpendArgs;
 use crate::cli::{ConfigCommand, ConfigExportPolicyArgs, ConfigImportPolicyArgs};
 

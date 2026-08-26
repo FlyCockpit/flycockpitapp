@@ -249,11 +249,11 @@ fn assert_static_table_ownership(
     );
     let classified_extended = ownership
         .iter()
-        .filter_map(|(name, owner)| (owner.launch_profile == "deferred").then_some(name.clone()))
+        .filter_map(|(name, owner)| (owner.launch_profile == "extended").then_some(name.clone()))
         .collect::<BTreeSet<_>>();
     assert_eq!(
         classified_extended, extended,
-        "extended-local SQL tables must be exactly the deferred classifications"
+        "extended-local SQL tables must be exactly the extended-local classifications"
     );
     let classified_remote = ownership
         .iter()
@@ -470,6 +470,34 @@ fn required_text<'a>(name: &str, entry: &'a toml::value::Table, field: &str) -> 
 fn ownership() -> BTreeMap<String, Ownership> {
     let parsed: toml::Value = toml::from_str(include_str!("../schema-ownership.toml"))
         .expect("schema-ownership.toml must be valid TOML");
+    let families = parsed
+        .get("state_machine_family")
+        .and_then(toml::Value::as_table)
+        .expect("schema-ownership.toml must contain state-machine families");
+    assert!(
+        !families.is_empty(),
+        "state-machine families cannot be vacuous"
+    );
+    for (name, value) in families {
+        let family = value
+            .as_table()
+            .unwrap_or_else(|| panic!("state-machine family {name} must be a rich record"));
+        for field in [
+            "rust_owner",
+            "recovery_entrypoint",
+            "terminal_states",
+            "retention_rule",
+            "authoritative_invariant",
+        ] {
+            required_text(name, family, field);
+        }
+        assert!(
+            required_text(name, family, "terminal_states")
+                .split(',')
+                .all(|state| !state.trim().is_empty()),
+            "state-machine family {name} has an empty terminal state"
+        );
+    }
     let table = parsed
         .get("table")
         .and_then(toml::Value::as_table)
@@ -477,6 +505,19 @@ fn ownership() -> BTreeMap<String, Ownership> {
     assert!(
         !table.is_empty(),
         "ownership classification cannot be vacuous"
+    );
+    let referenced_families = table
+        .iter()
+        .filter_map(|(name, value)| {
+            let entry = value.as_table()?;
+            (entry.get("state_machine")?.as_str()? == "rust-and-sql")
+                .then(|| required_text(name, entry, "state_machine_family").to_owned())
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        referenced_families,
+        families.keys().cloned().collect::<BTreeSet<_>>(),
+        "every state-machine family must be referenced and every reference must resolve"
     );
     table
         .iter()
@@ -499,6 +540,46 @@ fn ownership() -> BTreeMap<String, Ownership> {
                 required_text(name, entry, field);
             }
             let status = required_text(name, entry, "status");
+            let rust_owner = required_text(name, entry, "rust_owner");
+            let recovery = required_text(name, entry, "recovery_entrypoint");
+            assert_ne!(
+                rust_owner, "cockpit-db::db",
+                "table {name} has a generic Rust owner"
+            );
+            for placeholder in [
+                "cockpit-db remote domain module",
+                "cockpit-db::db:: methods",
+                "daemon-owned domain retention policy",
+            ] {
+                assert!(
+                    !entry
+                        .values()
+                        .filter_map(toml::Value::as_str)
+                        .any(|value| value.contains(placeholder)),
+                    "table {name} contains generic placeholder {placeholder}"
+                );
+            }
+            assert!(
+                !recovery.contains("daemon boot recovery and cockpit doctor inspection"),
+                "table {name} has a generic recovery placeholder"
+            );
+            let state_machine = required_text(name, entry, "state_machine");
+            assert!(
+                matches!(state_machine, "rust" | "rust-and-sql" | "none"),
+                "table {name} has unsupported state-machine ownership {state_machine}"
+            );
+            if state_machine == "rust-and-sql" {
+                let family = required_text(name, entry, "state_machine_family");
+                assert!(
+                    families.contains_key(family),
+                    "table {name} references unknown state-machine family {family}"
+                );
+                assert_eq!(
+                    recovery,
+                    format!("state-machine-family:{family}"),
+                    "table {name} must delegate recovery to its declared family"
+                );
+            }
             let semantic_class = required_text(name, entry, "semantic_class");
             assert!(
                 matches!(
@@ -514,8 +595,13 @@ fn ownership() -> BTreeMap<String, Ownership> {
             );
             let launch_profile = required_text(name, entry, "launch_profile");
             assert!(
-                matches!(launch_profile, "local" | "deferred" | "remote"),
+                matches!(launch_profile, "local" | "extended" | "remote"),
                 "table {name} has unsupported launch profile {launch_profile}"
+            );
+            assert_eq!(
+                status == "launch-required",
+                launch_profile == "local",
+                "table {name} launch status/profile disagree"
             );
             assert!(
                 matches!(
@@ -535,8 +621,65 @@ fn ownership() -> BTreeMap<String, Ownership> {
         .collect()
 }
 
+fn applied_profile_inventory(
+    extended: bool,
+    remote: bool,
+    ownership: &BTreeMap<String, Ownership>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))
+        .expect("local base schema must apply first");
+    if extended {
+        conn.execute_batch(include_str!(
+            "../src/db/migrations/0001_extended_profile.sql"
+        ))
+        .expect("extended-local schema must apply after local base");
+    }
+    if remote {
+        conn.execute_batch(include_str!("../src/db/migrations/0001_remote_profile.sql"))
+            .expect("remote schema must apply after local base");
+    }
+    let inventory = schema_inventory(&conn);
+    let tables = inventory.get("table").cloned().unwrap_or_default();
+    let mut statement = conn
+        .prepare(
+            "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_schema \
+             WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .unwrap();
+    for row in statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+    {
+        let (kind, name, owning_table, sql) = row.unwrap();
+        if matches!(kind.as_str(), "index" | "trigger") {
+            assert!(
+                tables.contains(&owning_table) || is_runtime_managed_table(&owning_table),
+                "profile object {kind} {name} has absent owning table {owning_table}"
+            );
+        }
+        for classified_table in ownership.keys() {
+            let referenced = sql
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .any(|token| token == classified_table);
+            assert!(
+                !referenced || tables.contains(classified_table),
+                "profile object {kind} {name} references absent table {classified_table}"
+            );
+        }
+    }
+    inventory
+}
+
 #[test]
-fn local_base_and_remote_extension_have_exact_physical_ownership() {
+fn all_four_schema_profiles_have_exact_physical_ownership() {
     let local_sql = include_str!("../src/db/migrations/0001_initial.sql");
     let extended_sql = include_str!("../src/db/migrations/0001_extended_profile.sql");
     let remote_sql = include_str!("../src/db/migrations/0001_remote_profile.sql");
@@ -573,22 +716,46 @@ fn local_base_and_remote_extension_have_exact_physical_ownership() {
         .execute_batch(local_sql)
         .expect("0001_initial.sql must execute as SQLite");
     assert_session_fts_runtime_contract(&local, local_sql);
-    let local_inventory = schema_inventory(&local);
+    let local_inventory = applied_profile_inventory(false, false, &ownership);
     let local_tables = local_inventory.get("table").cloned().unwrap_or_default();
-    let full = Connection::open_in_memory().unwrap();
-    full.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))
-        .expect("local base must execute before the remote extension");
-    full.execute_batch(extended_sql)
-        .expect("extended-local profile must execute after the local base");
-    full.execute_batch(remote_sql)
-        .expect("remote profile extension must execute after the local and extended profiles");
-    let full_inventory = schema_inventory(&full);
+    let extended_inventory = applied_profile_inventory(true, false, &ownership);
+    let remote_inventory = applied_profile_inventory(false, true, &ownership);
+    let full_inventory = applied_profile_inventory(true, true, &ownership);
     let full_tables = full_inventory.get("table").cloned().unwrap_or_default();
     assert_eq!(
         ownership.keys().cloned().collect::<BTreeSet<_>>(),
         full_tables,
         "ownership manifest must classify every executed table exactly once"
     );
+
+    for (label, inventory, included_profiles) in [
+        ("local", &local_inventory, &["local"][..]),
+        (
+            "local+extended",
+            &extended_inventory,
+            &["local", "extended"][..],
+        ),
+        ("local+remote", &remote_inventory, &["local", "remote"][..]),
+        (
+            "local+extended+remote",
+            &full_inventory,
+            &["local", "extended", "remote"][..],
+        ),
+    ] {
+        let expected = ownership
+            .iter()
+            .filter_map(|(name, owner)| {
+                included_profiles
+                    .contains(&owner.launch_profile.as_str())
+                    .then_some(name.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            inventory.get("table").cloned().unwrap_or_default(),
+            expected,
+            "{label} profile table inventory disagrees with ownership manifest"
+        );
+    }
 
     let remote_tables = ownership
         .iter()
@@ -679,4 +846,42 @@ fn local_base_and_remote_extension_have_exact_physical_ownership() {
             );
         }
     }
+}
+
+#[test]
+fn extended_local_and_remote_feature_gates_remain_independent() {
+    let cli_config = include_str!("../../../apps/cli/src/commands/config.rs");
+    assert!(
+        !cli_config.contains("feature = \"remote\""),
+        "image-spend CLI code must be gated only by extended"
+    );
+    assert_eq!(
+        cli_config.matches("feature = \"extended\"").count(),
+        4,
+        "ImageSpendArgs import, bail import, dispatch arm, and handler must share one gate"
+    );
+
+    let cli_manifest = include_str!("../../../apps/cli/Cargo.toml");
+    let core_manifest = include_str!("../../cockpit-core/Cargo.toml");
+    let db_manifest = include_str!("../Cargo.toml");
+    for manifest in [cli_manifest, core_manifest, db_manifest] {
+        assert!(
+            manifest.contains("extended = ["),
+            "extended feature is missing"
+        );
+        let remote = manifest
+            .split("remote = [")
+            .nth(1)
+            .and_then(|tail| tail.split_once(']').map(|(body, _)| body))
+            .expect("remote feature declaration must remain explicit");
+        assert!(
+            !remote.contains("extended"),
+            "remote must not implicitly enable future local product domains"
+        );
+    }
+
+    let migration_runner = include_str!("../src/db/mod.rs");
+    assert!(migration_runner.contains("#[cfg(feature = \"extended\")]\n    deferred_sql:"));
+    assert!(migration_runner.contains("#[cfg(feature = \"remote\")]\n    extension_sql:"));
+    assert!(migration_runner.contains("remote-extended-v0.1"));
 }

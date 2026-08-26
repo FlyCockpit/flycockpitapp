@@ -125,6 +125,15 @@ pub async fn serve_lifecycle_requests(
     }
 }
 
+/// Test-support composition owned below frontends. TUI tests receive only the
+/// client capability and never construct or drive core lifecycle requests.
+#[cfg(feature = "test-support")]
+pub fn test_lifecycle_client() -> cockpit_client::LifecycleClient {
+    let (client, requests) = cockpit_client::LifecycleClient::channel(8);
+    tokio::spawn(serve_lifecycle_requests(requests));
+    client
+}
+
 /// Find the daemon socket, optionally spawn the daemon, return a
 /// connected client. Honors [`LifecycleMode`].
 pub async fn probe_or_spawn(mode: LifecycleMode) -> Result<ConnectedDaemon> {

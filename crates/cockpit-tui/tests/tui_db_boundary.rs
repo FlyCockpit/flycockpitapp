@@ -1921,6 +1921,10 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
     assert!(run_with_session.contains("lifecycle_composition()"));
     assert!(app.contains("LifecycleClient::channel"));
     assert!(app.contains("serve_lifecycle_requests"));
+    let settings = read("crates/cockpit-tui/src/tui/settings/mod.rs");
+    assert!(!settings.contains("serve_lifecycle_requests"));
+    assert!(!settings.contains("LifecycleClient::channel"));
+    assert!(settings.contains("cockpit_core::daemon::client::test_lifecycle_client()"));
     let tui = tui_production_sources();
     for required in [
         "LifecycleIntent::AlwaysEphemeral",

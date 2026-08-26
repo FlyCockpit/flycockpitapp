@@ -108,11 +108,7 @@ pub(crate) async fn settings_daemon_client(
 
 #[cfg(test)]
 pub(crate) fn test_lifecycle_client() -> cockpit_client::LifecycleClient {
-    let (client, requests) = cockpit_client::LifecycleClient::channel(8);
-    tokio::spawn(cockpit_core::daemon::client::serve_lifecycle_requests(
-        requests,
-    ));
-    client
+    cockpit_core::daemon::client::test_lifecycle_client()
 }
 
 /// A transport captured on the reducer thread and then owned by an async

@@ -29,13 +29,13 @@ fn canonical_leak_capability(value: &str) -> bool {
 }
 
 fn cancel_leak_capability_blocking(
-    socket: &std::path::Path,
+    endpoint: &cockpit_client::ClientEndpoint,
     capability: cockpit_proto::LeakRevealToken,
     expected_report_id: &str,
 ) -> bool {
     matches!(
         crate::tui::agent_runner::daemon_request_at_blocking(
-            socket,
+            endpoint,
             cockpit_proto::Request::CancelLeakReveal { capability },
         ),
         Ok(cockpit_proto::Response::LeakRevealCancelled { report_id })
@@ -64,12 +64,15 @@ impl App {
         &mut self,
         action: crate::tui::notes_pane::NotesRpcAction,
     ) {
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
+            return;
+        };
         self.async_actions.start_blocking(
             crate::tui::async_action::AsyncActionKind::Internal("notes.rpc"),
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
             move || {
                 action
-                    .run_blocking_rpc()
+                    .run_blocking_rpc(endpoint)
                     .map(crate::tui::async_action::AsyncActionPayload::NotesRpc)
                     .map_err(|e| e.to_string())
             },
@@ -93,12 +96,15 @@ impl App {
         &mut self,
         action: crate::tui::leaks_pane::LeaksRpcAction,
     ) {
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
+            return;
+        };
         self.async_actions.start_blocking(
             crate::tui::async_action::AsyncActionKind::Internal("leaks.rpc"),
             crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
             move || {
                 action
-                    .run_blocking_rpc()
+                    .run_blocking_rpc(endpoint)
                     .map(crate::tui::async_action::AsyncActionPayload::LeaksRpc)
             },
         );
@@ -127,6 +133,9 @@ impl App {
             }
             return;
         };
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
+            return;
+        };
         let operation_id = uuid::Uuid::new_v4();
         let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let worker_active = std::sync::Arc::clone(&active);
@@ -135,7 +144,7 @@ impl App {
         let _ = tokio::task::spawn_blocking(move || {
             let result = (|| {
                 let capability = match crate::tui::agent_runner::daemon_request_at_blocking(
-                    &socket,
+                    &endpoint,
                     cockpit_proto::Request::BeginLeakReveal {
                         report_id: worker_report_id.clone(),
                     },
@@ -156,7 +165,7 @@ impl App {
                             .saturating_add(cockpit_core::leaks::LEAK_REVEAL_CAPABILITY_TTL_MS);
                 if !binding_valid || !worker_active.load(std::sync::atomic::Ordering::Acquire) {
                     let settled = cancel_leak_capability_blocking(
-                        &socket,
+                        &endpoint,
                         capability.capability,
                         &capability.report_id,
                     );
@@ -172,7 +181,7 @@ impl App {
                     // `RateLimited` and unavailable-channel paths do not consume
                     // the slot. An authorization failure may already have spent
                     // it; exact cancel then harmlessly fails closed.
-                    let _ = cancel_leak_capability_blocking(&socket, token, &worker_report_id);
+                    let _ = cancel_leak_capability_blocking(&endpoint, token, &worker_report_id);
                 }
                 reveal
             })();

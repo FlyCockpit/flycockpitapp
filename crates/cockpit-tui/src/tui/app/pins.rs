@@ -14,15 +14,18 @@ use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
 use super::{App, ToastKind, render};
 
 fn pin_rpc(
-    socket: &std::path::Path,
+    endpoint: &cockpit_client::ClientEndpoint,
     request: cockpit_proto::Request,
 ) -> Result<cockpit_proto::Response, String> {
-    crate::tui::agent_runner::daemon_request_at_blocking(socket, request)
+    crate::tui::agent_runner::daemon_request_at_blocking(endpoint, request)
 }
 
-fn load_pin_state(socket: &std::path::Path, sid: uuid::Uuid) -> Result<(usize, Vec<i64>), String> {
+fn load_pin_state(
+    endpoint: &cockpit_client::ClientEndpoint,
+    sid: uuid::Uuid,
+) -> Result<(usize, Vec<i64>), String> {
     match pin_rpc(
-        socket,
+        endpoint,
         cockpit_proto::Request::PinnedMessageState { session_id: sid },
     )? {
         cockpit_proto::Response::PinState { state } => {
@@ -62,9 +65,9 @@ impl App {
     /// Open the global DB for a pin operation. `None` (with a transcript
     /// note) when the DB can't be opened — pins degrade gracefully rather
     /// than crash the TUI.
-    fn pins_socket(&mut self) -> Option<std::path::PathBuf> {
+    fn pins_socket(&mut self) -> Option<cockpit_client::ClientEndpoint> {
         if self.daemon_connected {
-            self.startup_background.daemon_socket.clone()
+            self.attached_daemon_endpoint()
         } else {
             self.push_plain("pins: Unavailable — reconnect to the daemon, then Retry".to_string());
             None
@@ -451,8 +454,12 @@ impl App {
             Some(HistoryEntry::User { text, .. }) => Some(text.clone()),
             _ => None,
         };
-        let (parent_session_id, socket) = match self.agent_runner.as_ref() {
-            Some(Ok(runner)) => (runner.session_id(), runner.socket.clone()),
+        let (parent_session_id, endpoint, socket) = match self.agent_runner.as_ref() {
+            Some(Ok(runner)) => (
+                runner.session_id(),
+                runner.endpoint.clone(),
+                runner.socket.clone(),
+            ),
             _ => {
                 self.history.push(HistoryEntry::CommandError {
                     line: "/fork: no active session to fork from".to_string(),
@@ -467,13 +474,14 @@ impl App {
             move || {
                 let fork_point_turn_id = Some(seq.to_string());
                 let (session_id, short_id) = super::agent_runner::fork_session_blocking(
-                    &socket,
+                    &endpoint,
                     parent_session_id,
                     fork_point_turn_id,
                     false,
                 )?;
                 Ok(super::AsyncActionPayload::ForkCreated {
                     parent_session_id,
+                    endpoint,
                     socket,
                     session_id,
                     short_id,

@@ -1468,7 +1468,7 @@ impl App {
                 }
                 Err(error) => {
                     if let Some(side) = self.side_conversation.take() {
-                        let discard_socket = side.socket.clone();
+                        let discard_endpoint = side.endpoint.clone();
                         let discard_session_id = side.side_session_id;
                         self.restore_side_snapshot(side);
                         self.async_actions.start_blocking(
@@ -1476,7 +1476,7 @@ impl App {
                             AsyncActionPolicy::AllowConcurrent,
                             move || {
                                 agent_runner::discard_session_blocking(
-                                    &discard_socket,
+                                    &discard_endpoint,
                                     discard_session_id,
                                 )
                                 .map(|_| AsyncActionPayload::Unit)
@@ -1951,6 +1951,7 @@ impl App {
             AsyncActionKind::DaemonRpc("fork.create") => match result.payload {
                 Ok(AsyncActionPayload::ForkCreated {
                     parent_session_id,
+                    endpoint,
                     socket,
                     session_id,
                     short_id,
@@ -1960,6 +1961,7 @@ impl App {
                 }) => {
                     self.apply_fork_created(
                         parent_session_id,
+                        endpoint,
                         socket,
                         session_id,
                         short_id,
@@ -1977,12 +1979,19 @@ impl App {
             AsyncActionKind::DaemonRpc("side.start") => match result.payload {
                 Ok(AsyncActionPayload::ForkCreated {
                     parent_session_id,
+                    endpoint,
                     socket,
                     session_id,
                     short_id,
                     ..
                 }) => {
-                    self.apply_side_created(parent_session_id, socket, session_id, short_id);
+                    self.apply_side_created(
+                        parent_session_id,
+                        endpoint,
+                        socket,
+                        session_id,
+                        short_id,
+                    );
                 }
                 Ok(_) => self.history.push(HistoryEntry::CommandError {
                     line: "/side: unexpected daemon response".to_string(),
@@ -2044,6 +2053,7 @@ impl App {
                 ),
                 Err(e) => self.show_toast(format!("copy file: {e}"), ToastKind::Error),
             },
+            #[cfg(test)]
             AsyncActionKind::Refresh("display.daemon.probe") => match result.payload {
                 Ok(AsyncActionPayload::DaemonProbe { cwd, status }) => {
                     self.apply_display_daemon_probe_result(cwd, status);
@@ -2895,12 +2905,13 @@ impl App {
     }
 
     pub(super) fn start_resources_snapshot_action(&mut self) {
+        let lifecycle = self.lifecycle.clone();
         let start = self.async_actions.start_serialized(
             AsyncActionKind::DaemonRpc("resources.snapshot"),
             AsyncActionKey::new("resources.projection"),
             async {
-                tokio::task::spawn_blocking(|| {
-                    match crate::tui::agent_runner::resource_snapshot_blocking()? {
+                tokio::task::spawn_blocking(move || {
+                    match crate::tui::agent_runner::resource_snapshot_blocking(lifecycle)? {
                         cockpit_proto::Response::ResourceSnapshot { snapshot } => {
                             Ok(AsyncActionPayload::ResourceSnapshot(snapshot))
                         }
@@ -2916,13 +2927,14 @@ impl App {
 
     pub(super) fn start_resource_promote_action(&mut self, request_id: String) {
         let session_id = self.current_session_id();
+        let lifecycle = self.lifecycle.clone();
         let start = self.async_actions.start_serialized(
             AsyncActionKind::DaemonRpc("resources.promote"),
             AsyncActionKey::new("resources.projection"),
             async move {
                 tokio::task::spawn_blocking(move || {
                     match crate::tui::agent_runner::promote_resource_blocking(
-                        request_id, session_id,
+                        lifecycle, request_id, session_id,
                     )? {
                         cockpit_proto::Response::PromoteResourceResult {
                             status,
@@ -2965,34 +2977,38 @@ impl App {
             .or(self.startup_background.daemon_socket.as_deref())
     }
 
+    pub(super) fn sessions_daemon_endpoint(&self) -> Option<cockpit_client::ClientEndpoint> {
+        self.attached_daemon_endpoint()
+    }
+
     pub(super) fn start_sessions_list_action(&mut self) {
         let Overlay::Sessions(pane) = &self.overlay else {
             return;
         };
         let (project_id, parent) = pane.root_request();
-        let socket = self.sessions_daemon_socket().map(Path::to_path_buf);
+        let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.list"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.list")),
             move || {
-                let socket = socket
-                    .ok_or_else(|| "daemon socket unavailable for sessions.list".to_string())?;
-                crate::tui::agent_runner::list_sessions_blocking(&socket, project_id, parent)
+                let endpoint = endpoint
+                    .ok_or_else(|| "daemon endpoint unavailable for sessions.list".to_string())?;
+                crate::tui::agent_runner::list_sessions_blocking(&endpoint, project_id, parent)
                     .map(AsyncActionPayload::Sessions)
             },
         );
     }
 
     pub(super) fn start_sessions_live_status_action(&mut self, ids: Vec<uuid::Uuid>) {
-        let socket = self.sessions_daemon_socket().map(Path::to_path_buf);
+        let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.live"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.live")),
             move || {
-                let socket = socket
-                    .ok_or_else(|| "daemon socket unavailable for sessions.live".to_string())?;
+                let endpoint = endpoint
+                    .ok_or_else(|| "daemon endpoint unavailable for sessions.live".to_string())?;
                 Ok(AsyncActionPayload::SessionLiveStatus(
-                    crate::tui::agent_runner::session_live_status_blocking(&socket, ids),
+                    crate::tui::agent_runner::session_live_status_blocking(&endpoint, ids),
                 ))
             },
         );
@@ -3003,16 +3019,17 @@ impl App {
         session_id: uuid::Uuid,
         before_seq: Option<i64>,
     ) {
-        let socket = self.sessions_daemon_socket().map(Path::to_path_buf);
+        let endpoint = self.sessions_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("sessions.preview"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("sessions.preview")),
             move || {
-                let socket = socket
-                    .ok_or_else(|| "daemon socket unavailable for sessions.preview".to_string())?;
+                let endpoint = endpoint.ok_or_else(|| {
+                    "daemon endpoint unavailable for sessions.preview".to_string()
+                })?;
                 let (messages, has_more) =
                     crate::tui::agent_runner::read_session_messages_blocking(
-                        &socket, session_id, before_seq, 50,
+                        &endpoint, session_id, before_seq, 50,
                     )?;
                 Ok(AsyncActionPayload::SessionMessages {
                     session_id,
@@ -3065,13 +3082,13 @@ impl App {
         &mut self,
         key: crate::tui::stats_pane::StatsPaneFetchKey,
     ) {
-        let socket = self.startup_background.daemon_socket.clone();
+        let endpoint = self.attached_daemon_endpoint();
         self.async_actions.start_blocking(
             AsyncActionKind::Refresh("stats.rollup"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("stats.rollup")),
             move || {
                 Ok(AsyncActionPayload::StatsRollup(
-                    crate::tui::stats_pane::fetch_stats_rollup(socket.as_deref(), key),
+                    crate::tui::stats_pane::fetch_stats_rollup(endpoint.as_ref(), key),
                 ))
             },
         );

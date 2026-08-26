@@ -32,7 +32,7 @@ use cockpit_proto::{Body, Envelope, ProtoStream, RecvFrame};
 /// A cloneable, capability-bearing endpoint for opening fresh in-process
 /// client connections. Unlike the former pathname registry, possession of
 /// this value is the authority to connect.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct InProcessEndpoint {
     connections: mpsc::Sender<oneshot::Sender<Option<InProcessConnection>>>,
 }
@@ -56,7 +56,7 @@ impl InProcessEndpoint {
 }
 
 /// Transport capability returned by lifecycle composition.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ClientEndpoint {
     Wire(PathBuf),
     InProcess(InProcessEndpoint),

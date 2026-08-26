@@ -361,8 +361,12 @@ impl App {
                     });
                     return;
                 };
-                let (parent_session_id, socket) = match self.agent_runner.as_ref() {
-                    Some(Ok(runner)) => (runner.session_id(), runner.socket.clone()),
+                let (parent_session_id, endpoint, socket) = match self.agent_runner.as_ref() {
+                    Some(Ok(runner)) => (
+                        runner.session_id(),
+                        runner.endpoint.clone(),
+                        runner.socket.clone(),
+                    ),
                     _ => {
                         self.history.push(HistoryEntry::CommandError {
                             line: "/resume: no active session to fork from".to_string(),
@@ -376,13 +380,14 @@ impl App {
                     move || {
                         let fork_point_turn_id = Some(seq.to_string());
                         let (session_id, short_id) = agent_runner::fork_session_blocking(
-                            &socket,
+                            &endpoint,
                             parent_session_id,
                             fork_point_turn_id,
                             false,
                         )?;
                         Ok(AsyncActionPayload::ForkCreated {
                             parent_session_id,
+                            endpoint,
                             socket,
                             session_id,
                             short_id,

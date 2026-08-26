@@ -82,7 +82,7 @@ impl App {
             self.older_history_marker = OlderHistoryMarker::Failed;
             return;
         };
-        let Some(socket) = self.startup_background.daemon_socket.clone() else {
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
             self.older_history_marker = OlderHistoryMarker::Failed;
             return;
         };
@@ -104,7 +104,7 @@ impl App {
                     AsyncActionKind::DaemonRpc("history.page"),
                     AsyncActionPolicy::Dedupe(AsyncActionKey::new("history.page")),
                     move || match crate::tui::agent_runner::read_history_page_blocking(
-                        &socket,
+                        &endpoint,
                         session_id,
                         Some(before_seq),
                         HISTORY_PAGE_ENTRIES as u32,
@@ -137,7 +137,7 @@ impl App {
                     AsyncActionKind::DaemonRpc("subagent.history.page"),
                     AsyncActionPolicy::Dedupe(AsyncActionKey::new("subagent.history.page")),
                     move || match crate::tui::agent_runner::read_subagent_history_page_blocking(
-                        &socket,
+                        &endpoint,
                         session_id,
                         task_call_id.clone(),
                         label.clone(),

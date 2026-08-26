@@ -84,6 +84,7 @@ fn session_summary(session_id: Uuid, project_root: String) -> SessionSummary {
 
 fn fake_side_conversation(tmp: &std::path::Path) -> SideConversation {
     SideConversation {
+        endpoint: cockpit_client::ClientEndpoint::Wire(tmp.join("daemon.sock")),
         side_session_id: Uuid::new_v4(),
         socket: tmp.join("missing-daemon.sock"),
         saved_runner: None,

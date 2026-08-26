@@ -532,7 +532,7 @@ fn init_expanded(rollup: &StatsPaneState) -> Vec<bool> {
 }
 
 pub(crate) fn fetch_stats_rollup(
-    socket: Option<&std::path::Path>,
+    endpoint: Option<&cockpit_client::ClientEndpoint>,
     key: StatsPaneFetchKey,
 ) -> StatsPaneFetchResult {
     let request = cockpit_proto::Request::StatsRollup {
@@ -543,8 +543,8 @@ pub(crate) fn fetch_stats_rollup(
         range: key.range(),
         by_role: false,
     };
-    let result = match socket {
-        Some(socket) => crate::tui::agent_runner::daemon_request_at_blocking(socket, request),
+    let result = match endpoint {
+        Some(endpoint) => crate::tui::agent_runner::daemon_request_at_blocking(endpoint, request),
         None => Err("Unavailable — reconnect to the daemon, then Retry".to_string()),
     }
     .and_then(|response| match response {

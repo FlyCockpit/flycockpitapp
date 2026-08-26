@@ -39,6 +39,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn start_display_daemon_probe_action<F>(&mut self, work: F)
     where
         F: FnOnce() -> cockpit_core::daemon::DaemonStatus + Send + 'static,
@@ -56,6 +57,7 @@ impl App {
         );
     }
 
+    #[cfg(test)]
     pub(super) fn apply_display_daemon_probe_result(
         &mut self,
         cwd: PathBuf,
@@ -340,6 +342,8 @@ impl App {
             self.project_id = Some(r.project_id.clone());
             self.foreground_input_target = r.foreground_target.clone();
             self.maybe_show_daemon_version_chip(&r.daemon_version, r.daemon_compatible);
+            self.startup_background.daemon_socket = Some(r.socket.clone());
+            self.startup_background.daemon_endpoint = Some(r.endpoint.clone());
             // Flush records buffered before the runner existed,
             // backfilling tag project ids now that we know the project.
             let pid = self.project_id.clone();
@@ -366,7 +370,7 @@ impl App {
             // runner's own socket so it reaches an owned pid+nonce ephemeral
             // daemon (daemonless / auto-spawn), not just the canonical one —
             // reuses the just-established daemon, no new spawn, one request.
-            self.refresh_guidance_estimate_from_daemon(&r.socket);
+            self.refresh_guidance_estimate_from_daemon(r.endpoint.clone());
             if let Some(info) = live_btw_fork {
                 self.open_btw_pane_from_info(info, true);
             }
@@ -611,19 +615,21 @@ impl App {
     /// transient miss never blanks a correct local estimate. Touches only the
     /// indicator — never the cached system prompt — so the prompt cache is
     /// undisturbed.
-    pub(super) fn refresh_guidance_estimate_from_daemon(&mut self, socket: &Path) {
+    pub(super) fn refresh_guidance_estimate_from_daemon(
+        &mut self,
+        endpoint: cockpit_client::ClientEndpoint,
+    ) {
         let (provider, model) = match &self.launch.active_model {
             Some((p, m)) => (Some(p.clone()), Some(m.clone())),
             None => (None, None),
         };
-        let socket = socket.to_path_buf();
         let project_root = self.launch.cwd.to_string_lossy().into_owned();
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("guidance.estimate"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("guidance.estimate")),
             move || {
                 let resp = agent_runner::daemon_request_at_blocking(
-                    &socket,
+                    &endpoint,
                     cockpit_proto::Request::GuidanceEstimate {
                         project_root,
                         provider,

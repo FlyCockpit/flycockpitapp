@@ -616,6 +616,13 @@ pub(crate) fn seed_ready_model_for_tests(app: &mut App) {
 }
 
 impl App {
+    pub(super) fn attached_daemon_endpoint(&self) -> Option<cockpit_client::ClientEndpoint> {
+        self.agent_runner
+            .as_ref()
+            .and_then(|runner| runner.as_ref().ok().map(|runner| runner.endpoint.clone()))
+            .or_else(|| self.startup_background.daemon_endpoint.clone())
+    }
+
     /// The required startup modal that is both rendered and allowed to
     /// consume keys. Keep this as the single ordering source; duplicating it
     /// in render and input caused trust choices to be recorded invisibly.
@@ -1429,6 +1436,7 @@ pub(super) struct SideConversation {
     /// The daemon socket the side fork lives on (the same one the parent
     /// runner is attached to), so the discard RPC reaches the right daemon.
     pub(super) socket: std::path::PathBuf,
+    pub(super) endpoint: cockpit_client::ClientEndpoint,
     /// Saved main-session view, restored on exit.
     saved_runner: Option<Result<AgentRunner, String>>,
     saved_history: HistoryWindow,
@@ -1797,6 +1805,7 @@ pub(super) enum PaneSide {
 #[derive(Debug, Clone)]
 struct StartupBackground {
     daemon_socket: Option<PathBuf>,
+    daemon_endpoint: Option<cockpit_client::ClientEndpoint>,
     started: bool,
 }
 
@@ -3657,6 +3666,7 @@ impl App {
             skills_pane_generation: 0,
             startup_background: StartupBackground {
                 daemon_socket: daemon_state.socket,
+                daemon_endpoint: None,
                 started: false,
             },
             startup_daemon_notice: daemon_state.notice,

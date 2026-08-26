@@ -1512,7 +1512,7 @@ impl App {
     }
 
     pub(super) fn handle_curator_command(&mut self, args: &str) {
-        let Some(socket) = self.startup_background.daemon_socket.clone() else {
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
             self.push_plain(
                 "/curator: Unavailable — reconnect to the daemon, then Retry".to_string(),
             );
@@ -1570,7 +1570,7 @@ impl App {
             operation,
             AsyncActionPolicy::Dedupe(curator_key),
             move || {
-                let response = agent_runner::daemon_request_at_blocking(&socket, request)?;
+                let response = agent_runner::daemon_request_at_blocking(&endpoint, request)?;
                 Ok(AsyncActionPayload::Text(format!("/curator: {response:?}")))
             },
         );
@@ -1853,7 +1853,7 @@ impl App {
             self.push_plain(format!("/assistant: {error}"));
             return;
         }
-        let Some(socket) = self.startup_background.daemon_socket.clone() else {
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
             self.push_plain(
                 "/assistant: Unavailable — reconnect to the daemon, then Retry".to_string(),
             );
@@ -1868,7 +1868,7 @@ impl App {
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("assistant.resolve"),
             AsyncActionPolicy::AllowConcurrent,
-            move || match agent_runner::daemon_request_at_blocking(&socket, request)? {
+            move || match agent_runner::daemon_request_at_blocking(&endpoint, request)? {
                 cockpit_proto::Response::AssistantSessionResolved { session, .. } => {
                     Ok(AsyncActionPayload::AssistantSessionResolved {
                         session_id: session.session_id,
@@ -2328,12 +2328,16 @@ impl App {
             return;
         };
         if title.is_empty() {
+            let Some(endpoint) = self.attached_daemon_endpoint() else {
+                self.push_plain("/rename: daemon is not attached".to_string());
+                return;
+            };
             self.push_plain("/rename: generating".to_string());
             let request = cockpit_proto::Request::AutoTitle { session_id };
             self.async_actions.start_blocking(
                 AsyncActionKind::Internal("rename.auto"),
                 AsyncActionPolicy::AllowConcurrent,
-                move || match agent_runner::daemon_request_from_blocking_worker(request)? {
+                move || match agent_runner::daemon_request_at_blocking(&endpoint, request)? {
                     cockpit_proto::Response::AutoTitle { title, .. } => {
                         Ok(AsyncActionPayload::Text(title))
                     }
@@ -2347,12 +2351,16 @@ impl App {
             title: title.to_string(),
         };
         let title = title.to_string();
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
+            self.push_plain("/rename: daemon is not attached".to_string());
+            return;
+        };
         self.push_plain("/rename: pending".to_string());
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("rename"),
             AsyncActionPolicy::AllowConcurrent,
             move || {
-                agent_runner::daemon_request_from_blocking_worker(req)
+                agent_runner::daemon_request_at_blocking(&endpoint, req)
                     .map(|_| AsyncActionPayload::Text(title))
             },
         );
@@ -2427,11 +2435,15 @@ impl App {
             text: text.to_string(),
         };
         let text = text.to_string();
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
+            self.push_plain("/note: daemon is not attached".to_string());
+            return;
+        };
         self.push_plain("/note: pending".to_string());
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("note"),
             AsyncActionPolicy::AllowConcurrent,
-            move || match agent_runner::daemon_request_from_blocking_worker(req) {
+            move || match agent_runner::daemon_request_at_blocking(&endpoint, req) {
                 Ok(cockpit_proto::Response::NoteRecorded { .. }) => {
                     Ok(AsyncActionPayload::NoteRecorded { text })
                 }
@@ -2463,12 +2475,17 @@ impl App {
             cockpit_proto::Request::DeleteLeakReport { .. } => "leaks-delete",
             _ => "leaks",
         };
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
+            self.push_plain("/leaks: daemon is not attached".to_string());
+            return;
+        };
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc(label),
             AsyncActionPolicy::AllowConcurrent,
             move || {
-                let text =
-                    leak_response_text(agent_runner::daemon_request_from_blocking_worker(request));
+                let text = leak_response_text(agent_runner::daemon_request_at_blocking(
+                    &endpoint, request,
+                ));
                 Ok(AsyncActionPayload::Text(text))
             },
         );

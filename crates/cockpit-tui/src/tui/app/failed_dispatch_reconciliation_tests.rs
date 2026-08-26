@@ -151,6 +151,7 @@ fn seed_session_live_state(app: &mut App) {
 
 fn fake_side_conversation(tmp: &std::path::Path) -> SideConversation {
     SideConversation {
+        endpoint: cockpit_client::ClientEndpoint::Wire(tmp.join("daemon.sock")),
         side_session_id: uuid::Uuid::new_v4(),
         socket: tmp.join("missing-daemon.sock"),
         saved_runner: None,
@@ -854,6 +855,7 @@ async fn pending_resume_rejects_created_side_without_mutating_main_view() {
 
     app.apply_side_created(
         parent_session_id,
+        cockpit_client::ClientEndpoint::Wire(tmp.path().join("missing-daemon.sock")),
         tmp.path().join("missing-daemon.sock"),
         uuid::Uuid::new_v4(),
         "side123".to_string(),
@@ -901,6 +903,7 @@ async fn pending_resume_discards_created_fork_instead_of_reusing_existing_action
 
     app.apply_fork_created(
         parent_session_id,
+        cockpit_client::ClientEndpoint::Wire(tmp.path().join("missing-daemon.sock")),
         tmp.path().join("missing-daemon.sock"),
         uuid::Uuid::new_v4(),
         "fork123".to_string(),

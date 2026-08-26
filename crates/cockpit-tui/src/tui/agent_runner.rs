@@ -354,7 +354,7 @@ pub struct AgentRunner {
     pub owns_daemon: bool,
     /// Capability used for every fresh connection to this exact daemon,
     /// including session switches and reconnects.
-    endpoint: ClientEndpoint,
+    pub(crate) endpoint: ClientEndpoint,
     /// The socket of the daemon this runner is attached to. Carried so an
     /// owned ephemeral daemon can be reaped on exit via the guard.
     pub socket: PathBuf,
@@ -2911,16 +2911,17 @@ pub struct GuidanceEstimate {
 /// a local raw-cl100k computation via [`cockpit_core::engine::builtin`]. The two
 /// modes may differ by the calibration factor; each is the best available
 /// for its mode. Best-effort and non-blocking for launch.
-pub async fn fetch_guidance_estimate_with_socket(
+pub async fn fetch_guidance_estimate_with_endpoint(
     cwd: &Path,
     providers: cockpit_config::providers::ProvidersConfig,
     provider: Option<String>,
     model: Option<String>,
-    socket: Option<std::path::PathBuf>,
+    endpoint: Option<ClientEndpoint>,
 ) -> GuidanceEstimate {
-    if let Some(socket) = socket
+    if let Some(endpoint) = endpoint
         && let Some(est) =
-            daemon_guidance_estimate_at_socket(cwd, provider.clone(), model.clone(), &socket).await
+            daemon_guidance_estimate_at_endpoint(cwd, provider.clone(), model.clone(), &endpoint)
+                .await
     {
         return est;
     }
@@ -2930,13 +2931,15 @@ pub async fn fetch_guidance_estimate_with_socket(
 /// Ask an already-running daemon for the calibrated estimate. Returns
 /// `None` on any failure (no daemon, transport error, or a malformed
 /// response) so the caller can fall back to the local computation.
-async fn daemon_guidance_estimate_at_socket(
+async fn daemon_guidance_estimate_at_endpoint(
     cwd: &Path,
     provider: Option<String>,
     model: Option<String>,
-    socket: &Path,
+    endpoint: &ClientEndpoint,
 ) -> Option<GuidanceEstimate> {
-    let client = cockpit_client::DaemonClient::connect(socket).await.ok()?;
+    let client = cockpit_client::DaemonClient::connect_endpoint(endpoint)
+        .await
+        .ok()?;
     let resp = client
         .request_ok(Request::GuidanceEstimate {
             project_root: cwd.to_string_lossy().into_owned(),
@@ -3013,23 +3016,26 @@ fn local_guidance_estimate(
 /// `AsyncActionRunner::start_blocking`/`spawn_blocking` worker; reducers and
 /// event handlers use typed async effects. `Err(String)` for any
 /// transport/typed failure.
-pub(crate) fn daemon_request_blocking(req: Request) -> Result<Response, String> {
+pub(crate) fn daemon_request_blocking(
+    lifecycle: cockpit_client::LifecycleClient,
+    req: Request,
+) -> Result<Response, String> {
     #[cfg(test)]
     {
+        let _ = lifecycle;
         return crate::tui::settings::test_daemon_request(req);
     }
     #[cfg(not(test))]
     {
-        use cockpit_core::daemon::{DaemonStatus, discover};
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
         tokio::task::block_in_place(|| {
             runtime.block_on(async {
-                let probe = discover().await;
-                if !matches!(probe.status, DaemonStatus::Running) {
-                    return Err("daemon not running".to_string());
-                }
-                let client = cockpit_client::DaemonClient::connect(&probe.paths.socket)
+                let resolved = lifecycle
+                    .resolve(LifecycleIntent::EnsurePersistent)
+                    .await
+                    .map_err(|error| format!("daemon lifecycle: {error}"))?;
+                let client = cockpit_client::DaemonClient::connect_endpoint(&resolved.endpoint)
                     .await
                     .map_err(|e| format!("daemon connect: {e}"))?;
                 client
@@ -3046,10 +3052,6 @@ pub(crate) fn daemon_request_blocking(req: Request) -> Result<Response, String> 
 /// accidental use from reducers and the async event-loop thread.
 ///
 /// [`AsyncActionRunner::start_blocking`]: crate::tui::async_action::AsyncActionRunner::start_blocking
-pub(crate) fn daemon_request_from_blocking_worker(req: Request) -> Result<Response, String> {
-    daemon_request_blocking(req)
-}
-
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum BlockingDaemonRequestError {
@@ -3100,13 +3102,16 @@ pub(crate) fn daemon_request_blocking_classified(
 /// auto-spawn paths) whose socket env is set only in the daemon child, not
 /// in this client process. Connects only — never spawns. `Err(String)` on
 /// any transport/typed failure.
-pub(crate) fn daemon_request_at_blocking(socket: &Path, req: Request) -> Result<Response, String> {
+pub(crate) fn daemon_request_at_blocking(
+    endpoint: &ClientEndpoint,
+    req: Request,
+) -> Result<Response, String> {
     let runtime =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
-    let socket = socket.to_path_buf();
+    let endpoint = endpoint.clone();
     tokio::task::block_in_place(|| {
         runtime.block_on(async {
-            let client = cockpit_client::DaemonClient::connect(&socket)
+            let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                 .await
                 .map_err(|e| format!("daemon connect: {e}"))?;
             client
@@ -3147,13 +3152,13 @@ pub(crate) fn daemon_reveal_leak_blocking(
 /// this targets a specific socket — the one the live runner is attached to.
 /// That matters in daemonless mode, where the runner owns a pid+nonce
 /// ephemeral daemon the canonical paths don't point at.
-fn request_on_socket(socket: &Path, req: Request) -> Result<Response, String> {
+fn request_on_endpoint(endpoint: &ClientEndpoint, req: Request) -> Result<Response, String> {
     let runtime =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime".to_string())?;
-    let socket = socket.to_path_buf();
+    let endpoint = endpoint.clone();
     tokio::task::block_in_place(|| {
         runtime.block_on(async {
-            let client = cockpit_client::DaemonClient::connect(&socket)
+            let client = cockpit_client::DaemonClient::connect_endpoint(&endpoint)
                 .await
                 .map_err(|e| format!("daemon connect: {e}"))?;
             client
@@ -3169,13 +3174,13 @@ fn request_on_socket(socket: &Path, req: Request) -> Result<Response, String> {
 /// throwaway `/side` side-conversation fork (excluded from lists, never
 /// auto-titled, discarded on end/exit).
 pub fn fork_session_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     parent_session_id: uuid::Uuid,
     fork_point_turn_id: Option<String>,
     ephemeral: bool,
 ) -> Result<(uuid::Uuid, String), String> {
-    match request_on_socket(
-        socket,
+    match request_on_endpoint(
+        endpoint,
         Request::ForkSession {
             parent_session_id,
             fork_point_turn_id,
@@ -3194,8 +3199,11 @@ pub fn fork_session_blocking(
 /// Discard an ephemeral side-conversation (`/side`) on the daemon at
 /// `socket`: stops its worker and deletes its row + descendant forks. A
 /// non-ephemeral session is left untouched (daemon-side guard).
-pub fn discard_session_blocking(socket: &Path, session_id: uuid::Uuid) -> Result<(), String> {
-    match request_on_socket(socket, Request::DiscardSession { session_id })? {
+pub fn discard_session_blocking(
+    endpoint: &ClientEndpoint,
+    session_id: uuid::Uuid,
+) -> Result<(), String> {
+    match request_on_endpoint(endpoint, Request::DiscardSession { session_id })? {
         Response::Ack => Ok(()),
         other => Err(format!("unexpected discard response: {other:?}")),
     }
@@ -3205,12 +3213,12 @@ pub fn discard_session_blocking(socket: &Path, session_id: uuid::Uuid) -> Result
 /// `parent = None` → root sessions in `p`; `parent = Some(s)` → direct
 /// forks of `s`; both `None` → every open session (all-projects scope).
 pub fn list_sessions_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     project_id: Option<String>,
     parent_session_id: Option<uuid::Uuid>,
 ) -> Result<Vec<proto::SessionSummary>, String> {
     match daemon_request_at_blocking(
-        socket,
+        endpoint,
         Request::ListSessions {
             project_id,
             parent_session_id,
@@ -3223,13 +3231,13 @@ pub fn list_sessions_blocking(
 }
 
 pub fn read_session_messages_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     session_id: uuid::Uuid,
     before_seq: Option<i64>,
     limit: u32,
 ) -> Result<(Vec<proto::SessionMessage>, bool), String> {
     match daemon_request_at_blocking(
-        socket,
+        endpoint,
         Request::ReadSessionMessages {
             session_id,
             before_seq,
@@ -3248,12 +3256,12 @@ pub fn read_session_messages_blocking(
 }
 
 pub fn read_client_submission_receipt_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     session_id: uuid::Uuid,
     client_submission_id: uuid::Uuid,
 ) -> Result<proto::ClientSubmissionReceiptStatus, String> {
     match daemon_request_at_blocking(
-        socket,
+        endpoint,
         Request::ReadClientSubmissionReceipt {
             session_id,
             client_submission_id,
@@ -3271,13 +3279,13 @@ pub fn read_client_submission_receipt_blocking(
 }
 
 pub fn read_history_page_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     session_id: uuid::Uuid,
     before_seq: Option<i64>,
     limit: u32,
 ) -> Result<(Vec<proto::HistoryEntry>, bool, Option<i64>), String> {
     match daemon_request_at_blocking(
-        socket,
+        endpoint,
         Request::ReadHistoryPage {
             session_id,
             before_seq,
@@ -3295,7 +3303,7 @@ pub fn read_history_page_blocking(
 }
 
 pub fn read_subagent_history_page_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     session_id: uuid::Uuid,
     task_call_id: String,
     label: String,
@@ -3303,7 +3311,7 @@ pub fn read_subagent_history_page_blocking(
     limit: u32,
 ) -> Result<(Vec<proto::HistoryEntry>, bool, Option<i64>), String> {
     match daemon_request_at_blocking(
-        socket,
+        endpoint,
         Request::ReadSubagentHistoryPage {
             session_id,
             task_call_id: task_call_id.clone(),
@@ -3328,21 +3336,27 @@ pub fn read_subagent_history_page_blocking(
     }
 }
 
-pub(crate) fn resource_snapshot_blocking() -> Result<proto::Response, String> {
-    match daemon_request_blocking(Request::ResourceSnapshot)? {
+pub(crate) fn resource_snapshot_blocking(
+    lifecycle: cockpit_client::LifecycleClient,
+) -> Result<proto::Response, String> {
+    match daemon_request_blocking(lifecycle, Request::ResourceSnapshot)? {
         response @ Response::ResourceSnapshot { .. } => Ok(response),
         other => Err(format!("unexpected resource_snapshot response: {other:?}")),
     }
 }
 
 pub fn promote_resource_blocking(
+    lifecycle: cockpit_client::LifecycleClient,
     request_id: String,
     session_id: Option<uuid::Uuid>,
 ) -> Result<proto::Response, String> {
-    match daemon_request_blocking(Request::PromoteResource {
-        request_id,
-        session_id,
-    })? {
+    match daemon_request_blocking(
+        lifecycle,
+        Request::PromoteResource {
+            request_id,
+            session_id,
+        },
+    )? {
         response @ Response::PromoteResourceResult { .. } => Ok(response),
         other => Err(format!("unexpected promote_resource response: {other:?}")),
     }
@@ -3352,10 +3366,10 @@ pub fn promote_resource_blocking(
 /// session ids. Daemon down / no live worker → empty map; callers treat
 /// absent ids as not-processing / no-jobs.
 pub fn session_live_status_blocking(
-    socket: &Path,
+    endpoint: &ClientEndpoint,
     session_ids: Vec<uuid::Uuid>,
 ) -> std::collections::HashMap<uuid::Uuid, (bool, bool)> {
-    match daemon_request_at_blocking(socket, Request::SessionLiveStatus { session_ids }) {
+    match daemon_request_at_blocking(endpoint, Request::SessionLiveStatus { session_ids }) {
         Ok(Response::SessionLiveStatus { statuses }) => statuses
             .into_iter()
             .map(|s| (s.session_id, (s.has_active_schedules, s.processing)))
@@ -4687,7 +4701,8 @@ mod tests {
                 .unwrap();
         });
 
-        let err = read_history_page_blocking(&socket, session_id, None, 20)
+        let endpoint = ClientEndpoint::Wire(socket);
+        let err = read_history_page_blocking(&endpoint, session_id, None, 20)
             .expect_err("mismatched response variant is rejected");
 
         assert!(err.contains("unexpected read_history_page response"));

@@ -120,7 +120,7 @@ impl App {
 
         let cwd = self.launch.cwd.clone();
         let active_model = self.launch.active_model.clone();
-        let socket = self.startup_background.daemon_socket.clone();
+        let endpoint = self.attached_daemon_endpoint();
         let providers = self.config_snapshot.providers.clone();
         self.async_actions.start(
             AsyncActionKind::Internal("startup.guidance.estimate"),
@@ -130,8 +130,8 @@ impl App {
                     Some((p, m)) => (Some(p.clone()), Some(m.clone())),
                     None => (None, None),
                 };
-                let estimate = agent_runner::fetch_guidance_estimate_with_socket(
-                    &cwd, providers, provider, model, socket,
+                let estimate = agent_runner::fetch_guidance_estimate_with_endpoint(
+                    &cwd, providers, provider, model, endpoint,
                 )
                 .await;
                 Ok(AsyncActionPayload::StartupGuidanceEstimate {
@@ -181,7 +181,7 @@ impl App {
         self.startup_disclosures_generation = self.startup_disclosures_generation.wrapping_add(1);
         let request_generation = self.startup_disclosures_generation;
         let disclosure_root = self.launch.cwd.to_string_lossy().into_owned();
-        let disclosure_socket = self.startup_background.daemon_socket.clone();
+        let disclosure_endpoint = self.attached_daemon_endpoint();
         let launch_session_id = self.launch.session_id;
         let (session_id, attachment_epoch) = self
             .agent_runner
@@ -190,7 +190,7 @@ impl App {
             .filter(|runner| runner.has_attached_client())
             .map(|runner| (Some(runner.session_id()), Some(runner.attachment_epoch())))
             .unwrap_or((None, None));
-        let request_socket = disclosure_socket.clone();
+        let request_socket = self.startup_background.daemon_socket.clone();
         self.async_actions.start_blocking(
             AsyncActionKind::Internal("startup.remote_disclosures"),
             AsyncActionPolicy::Replace(AsyncActionKey::new("startup.remote_disclosures")),
@@ -198,10 +198,10 @@ impl App {
                 let request = cockpit_proto::Request::GetStartupDisclosures {
                     project_root: disclosure_root.clone(),
                 };
-                let response = match disclosure_socket.as_deref() {
-                    Some(socket) => agent_runner::daemon_request_at_blocking(socket, request),
-                    None => agent_runner::daemon_request_from_blocking_worker(request),
-                }?;
+                let endpoint = disclosure_endpoint.ok_or_else(|| {
+                    "daemon endpoint unavailable for startup disclosures".to_string()
+                })?;
+                let response = agent_runner::daemon_request_at_blocking(&endpoint, request)?;
                 match response {
                     cockpit_proto::Response::StartupDisclosures {
                         org_sync,

@@ -217,6 +217,7 @@ pub enum AsyncActionPayload {
     },
     ForkCreated {
         parent_session_id: uuid::Uuid,
+        endpoint: cockpit_client::ClientEndpoint,
         socket: std::path::PathBuf,
         session_id: uuid::Uuid,
         short_id: String,
@@ -359,6 +360,7 @@ pub enum AsyncActionPayload {
         failed: bool,
         git_args: Option<String>,
     },
+    #[cfg(test)]
     DaemonProbe {
         cwd: std::path::PathBuf,
         status: cockpit_core::daemon::DaemonStatus,

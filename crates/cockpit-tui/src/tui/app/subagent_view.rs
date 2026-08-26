@@ -135,7 +135,7 @@ impl App {
         task_call_id: String,
         label: String,
     ) {
-        let Some(socket) = self.startup_background.daemon_socket.clone() else {
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
             self.push_plain(
                 "Subagent history unavailable — reconnect to the daemon, then Retry".to_string(),
             );
@@ -154,7 +154,7 @@ impl App {
                     limit: HISTORY_WINDOW_TARGET_ENTRIES as u32,
                 };
                 let response =
-                    crate::tui::agent_runner::daemon_request_at_blocking(&socket, request)?;
+                    crate::tui::agent_runner::daemon_request_at_blocking(&endpoint, request)?;
                 let cockpit_proto::Response::SubagentHistoryPage {
                     entries,
                     has_more,
@@ -373,10 +373,14 @@ impl App {
             label: view.label,
             message,
         };
+        let Some(endpoint) = self.attached_daemon_endpoint() else {
+            self.push_plain("Subagent steering unavailable — daemon is not attached".to_string());
+            return true;
+        };
         self.async_actions.start_blocking(
             AsyncActionKind::DaemonRpc("subagent.steer"),
             AsyncActionPolicy::AllowConcurrent,
-            move || match agent_runner::daemon_request_from_blocking_worker(req)? {
+            move || match agent_runner::daemon_request_at_blocking(&endpoint, req)? {
                 cockpit_proto::Response::DelegationSteer { result } => {
                     Ok(AsyncActionPayload::DelegationSteer(result))
                 }

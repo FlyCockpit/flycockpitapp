@@ -117,12 +117,14 @@ pub struct NotesRpcResult {
 }
 
 impl NotesRpcAction {
-    pub fn run_blocking_rpc(self) -> anyhow::Result<NotesRpcResult> {
-        let socket = self.daemon_socket;
+    pub fn run_blocking_rpc(
+        self,
+        endpoint: cockpit_client::ClientEndpoint,
+    ) -> anyhow::Result<NotesRpcResult> {
         let project_root = self.project_root;
         let response_project_root = project_root.clone();
         let send = |request| {
-            crate::tui::agent_runner::daemon_request_at_blocking(&socket, request)
+            crate::tui::agent_runner::daemon_request_at_blocking(&endpoint, request)
                 .map_err(anyhow::Error::msg)
         };
         match self.kind {

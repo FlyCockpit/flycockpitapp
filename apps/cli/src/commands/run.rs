@@ -48,6 +48,24 @@ struct RunUsageError(String);
 #[error("{0}")]
 struct RunTurnFailure(String);
 
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct RunPreflightFailure {
+    exit_code: i32,
+    code: &'static str,
+    message: String,
+}
+
+impl RunPreflightFailure {
+    fn new(exit_code: i32, code: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            exit_code,
+            code,
+            message: error.to_string(),
+        }
+    }
+}
+
 async fn emit_org_logging_indicator_via_daemon(client: &cockpit_client::DaemonClient, cwd: &Path) {
     let project_root = cwd.display().to_string();
     let response = client
@@ -226,43 +244,38 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     };
     let client = daemon.client.clone();
 
-    // Preflight via daemon RPCs — the CLI never opens SQLite.
-    emit_org_logging_indicator_via_daemon(&client, &cwd).await;
-    if let Err(error) = enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd).await {
-        exit_run_error(format, 3, "workspace_trust", &error.to_string());
-    }
-
-    let requested_session = match resolve_requested_session_via_daemon(&args, &client, &cwd).await {
-        Ok(session) => session,
-        Err(error) => exit_run_error(format, 2, "invalid_arguments", &error.to_string()),
-    };
-    let image_files = match resolve_attachment_paths(&cwd, &args.file) {
-        Ok(paths) => paths,
-        Err(error) => exit_run_error(format, 2, "invalid_arguments", &error.to_string()),
-    };
-    let image_data = match load_and_validate_images(&image_files) {
-        Ok(images) => images,
-        Err(error) => exit_run_error(format, 2, "invalid_attachment", &format!("{error:#}")),
-    };
-
-    // Layer A: arm the shutdown backstop *only* when we own the daemon.
-    // Held across every `?` below so an error return still reaps it.
+    // Ownership and signal cleanup must be armed before the first daemon RPC
+    // or fallible preflight after spawn. From this point to the single
+    // teardown boundary below, no path may call `process::exit`.
     let guard = daemon.take_owned_daemon_guard();
-
-    // A signal handler so Ctrl-C / SIGTERM during the run reaps the
-    // daemon instead of orphaning it. Shares the guard's armed flag and
-    // socket so it drives the identical synchronous shutdown.
     let signal_task = spawn_signal_shutdown(guard.as_ref(), true);
 
-    let result = run_turn(
-        &client,
-        &args,
-        prompt,
-        no_sandbox,
-        &cwd,
-        requested_session,
-        &image_data,
-    )
+    let result = async {
+        // Preflight via daemon RPCs — the CLI never opens SQLite.
+        emit_org_logging_indicator_via_daemon(&client, &cwd).await;
+        enforce_noninteractive_workspace_trust_via_daemon(&client, &cwd)
+            .await
+            .map_err(|error| RunPreflightFailure::new(3, "workspace_trust", error))?;
+        let requested_session = resolve_requested_session_via_daemon(&args, &client, &cwd)
+            .await
+            .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+        let image_files = resolve_attachment_paths(&cwd, &args.file)
+            .map_err(|error| RunPreflightFailure::new(2, "invalid_arguments", error))?;
+        let image_data = load_and_validate_images(&image_files).map_err(|error| {
+            RunPreflightFailure::new(2, "invalid_attachment", format!("{error:#}"))
+        })?;
+
+        run_turn(
+            &client,
+            &args,
+            prompt,
+            no_sandbox,
+            &cwd,
+            requested_session,
+            &image_data,
+        )
+        .await
+    }
     .await;
 
     // Stop the signal watcher and run the (now happy-path) shutdown
@@ -271,14 +284,32 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
     if let Some(task) = signal_task {
         task.abort();
     }
-    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
-    // Drop the guard explicitly here so its (now-disarmed) drop is a
-    // no-op and we don't carry it past `process::exit`.
+    let result = finish_owned_run(result, || {
+        guard.as_ref().map_or(Ok(()), |guard| guard.shutdown())
+    });
+    // Drop the guard before rendering or selecting an exit path. A signal
+    // task already inside blocking cleanup is not cancelled by abort; this
+    // explicit shutdown joins the same shared completion.
     drop(guard);
 
-    let result = aggregate_shutdown_result(result, shutdown);
     let exit_code = match result {
         Ok(code) => code,
+        Err(error) if error.downcast_ref::<RunPreflightFailure>().is_some() => {
+            let failure = error
+                .downcast_ref::<RunPreflightFailure>()
+                .expect("preflight failure checked above");
+            if json_mode {
+                emit_json(&json!({
+                    "event": "error",
+                    "code": failure.code,
+                    "message": failure.message
+                }))?;
+                emit_run_complete(false, failure.exit_code)?;
+            } else {
+                eprintln!("{}", failure.message);
+            }
+            failure.exit_code
+        }
         Err(error) if error.downcast_ref::<RunWorkspaceTrustError>().is_some() => {
             let message = error.to_string();
             if json_mode {
@@ -339,6 +370,13 @@ pub async fn run(args: RunArgs, no_sandbox: bool, project_alias: Option<&Path>) 
         std::process::exit(exit_code);
     }
     Ok(())
+}
+
+fn finish_owned_run<T>(
+    command: anyhow::Result<T>,
+    shutdown: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    aggregate_shutdown_result(command, shutdown())
 }
 
 /// Attach, send the prompt, pump events. Split out so the `?` operators
@@ -1847,6 +1885,40 @@ fn event_session(event: &proto::Event) -> Option<uuid::Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_failure_still_finishes_owned_shutdown_before_render_or_exit() {
+        let shutdown_called = std::cell::Cell::new(false);
+        let result: anyhow::Result<()> = finish_owned_run(
+            Err(RunPreflightFailure::new(3, "workspace_trust", "denied").into()),
+            || {
+                shutdown_called.set(true);
+                Ok(())
+            },
+        );
+        assert!(shutdown_called.get());
+        assert!(result.unwrap_err().is::<RunPreflightFailure>());
+    }
+
+    #[test]
+    fn owner_and_signal_cleanup_are_armed_before_run_preflight() {
+        let source = include_str!("run.rs");
+        let start = source.find("pub async fn run(").unwrap();
+        let end = source[start..].find("async fn run_turn(").unwrap() + start;
+        let run = &source[start..end];
+        let guard = run.find("take_owned_daemon_guard()").unwrap();
+        let signal = run
+            .find("spawn_signal_shutdown(guard.as_ref(), true)")
+            .unwrap();
+        let preflight = run
+            .find("emit_org_logging_indicator_via_daemon(&client, &cwd).await")
+            .unwrap();
+        let drop_guard = run.find("drop(guard)").unwrap();
+        let exit = run.find("std::process::exit(exit_code)").unwrap();
+        assert!(guard < signal && signal < preflight);
+        assert!(preflight < drop_guard && drop_guard < exit);
+        assert_eq!(run.matches("std::process::exit(").count(), 1);
+    }
 
     #[test]
     fn image_control_config_changed_is_filtered_as_daemon_global() {

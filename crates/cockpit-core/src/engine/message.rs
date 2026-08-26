@@ -16,7 +16,7 @@ use base64::Engine as _;
 use tokio::sync::{Mutex, Notify, watch};
 use uuid::Uuid;
 
-pub use crate::daemon::proto::{QueueItemStatus, QueueTarget};
+pub use crate::daemon::proto::{QueueItem as QueuedUserMessage, QueueItemStatus, QueueTarget};
 pub use cockpit_client::image_upload::SubmissionImage;
 pub use cockpit_client::submission::{
     ClientSubmissionReceipt, ClientUserSubmission as UserSubmission,
@@ -28,15 +28,6 @@ pub use cockpit_client::submission::{
 /// position. We split on it here to interleave text and image content
 /// parts in order when assembling the outbound user [`Message`].
 pub use crate::daemon::proto::IMAGE_PART_SENTINEL;
-
-#[derive(Debug, Clone)]
-pub struct QueuedUserMessage {
-    pub id: Uuid,
-    pub status: QueueItemStatus,
-    pub text: String,
-    pub display_text: Option<String>,
-    pub target: QueueTarget,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoveQueuedMessageResult {

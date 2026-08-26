@@ -4489,10 +4489,8 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
     })
 }
 
-fn queue_item_from_proto(
-    item: proto::QueueItem,
-) -> cockpit_core::engine::message::QueuedUserMessage {
-    cockpit_core::engine::message::QueuedUserMessage {
+fn queue_item_from_proto(item: proto::QueueItem) -> cockpit_proto::QueueItem {
+    cockpit_proto::QueueItem {
         id: item.id,
         status: match item.status {
             proto::QueueItemStatus::Queued => proto::QueueItemStatus::Queued,

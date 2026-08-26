@@ -489,6 +489,7 @@ fn production_uses_cockpit_proto_directly() {
                 "cockpit_core::engine::model::InferenceErrorClass",
                 "cockpit_core::engine::message::QueueItemStatus",
                 "cockpit_core::engine::message::QueueTarget",
+                "cockpit_core::engine::message::QueuedUserMessage",
                 "cockpit_core::engine::message::SubmissionImage",
                 "cockpit_core::engine::message::SubmissionOrigin",
                 "cockpit_core::engine::message::UserSubmission",
@@ -576,6 +577,7 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::engine::model::InferenceErrorClass"
                     || imported == "cockpit_core::engine::message::QueueItemStatus"
                     || imported == "cockpit_core::engine::message::QueueTarget"
+                    || imported == "cockpit_core::engine::message::QueuedUserMessage"
                     || imported == "cockpit_core::engine::message::SubmissionImage"
                     || imported == "cockpit_core::engine::message::SubmissionOrigin"
                     || imported == "cockpit_core::engine::message::UserSubmission"

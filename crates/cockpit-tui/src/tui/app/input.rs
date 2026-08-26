@@ -18,7 +18,7 @@ use super::{
 use crate::tui::agent_runner;
 use crate::tui::async_action::{AsyncActionKey, AsyncActionPayload, AsyncActionPolicy};
 use crate::tui::settings::Dialog;
-use cockpit_core::engine::message::QueuedUserMessage;
+use cockpit_proto::QueueItem as QueuedUserMessage;
 use cockpit_proto::QueueItemStatus;
 use cockpit_proto::{self, Request, Response};
 
@@ -3370,21 +3370,7 @@ pub(super) fn optimistic_queue_item_with_id(
 }
 
 pub(super) fn queue_item_from_proto(item: proto::QueueItem) -> QueuedUserMessage {
-    QueuedUserMessage {
-        id: item.id,
-        status: match item.status {
-            proto::QueueItemStatus::Queued => QueueItemStatus::Queued,
-            proto::QueueItemStatus::Folding => QueueItemStatus::Folding,
-        },
-        text: item.text,
-        display_text: item.display_text,
-        target: cockpit_proto::QueueTarget {
-            id: item.target.id,
-            agent: item.target.agent,
-            depth: item.target.depth,
-            task_call_id: item.target.task_call_id,
-        },
-    }
+    item
 }
 
 /// The checked option ids from a closed `/toggle-redaction` multiselect, or

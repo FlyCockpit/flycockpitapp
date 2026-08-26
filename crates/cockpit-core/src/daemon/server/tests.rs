@@ -17215,7 +17215,7 @@ fn authz_matrix_principal(level: AuthzLevel, project_root: &Path, kind: &str) ->
 
 #[cfg(unix)]
 fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
-    matches!(
+    let attached_session_kinds = matches!(
         kind,
         "send_user_message"
             | "send_user_message_bulk"
@@ -17254,14 +17254,25 @@ fn authz_kind_needs_attached_state(kind: &str, level: AuthzLevel) -> bool {
             | "pin"
             | "refresh_env"
             | "refresh_config"
-    )
-        // Both kinds gate on `require_attached` before doing any work, in every
-        // build profile — the prelude must attach wherever the level can attach
-        // at all, so the owner cell exercises the attached dispatch path
-        // instead of re-proving the attach gate (which has its own dedicated
-        // negative tests).
-        || (kind == "get_inventory_bundle" && level != AuthzLevel::NoAccess)
-        || (kind == "lsp_control" && matches!(level, AuthzLevel::Owner | AuthzLevel::Writer))
+    );
+    if attached_session_kinds {
+        return true;
+    }
+  // Both kinds gate on `require_attached` before doing any work, in every
+  // build profile — the prelude must attach wherever the level can attach
+  // at all, so the owner cell exercises the attached dispatch path
+  // instead of re-proving the attach gate (which has its own dedicated
+  // negative tests).
+    #[cfg(feature = "remote")]
+    {
+        (kind == "get_inventory_bundle" && level != AuthzLevel::NoAccess)
+            || (kind == "lsp_control"
+                && matches!(level, AuthzLevel::Owner | AuthzLevel::Writer))
+    }
+    #[cfg(not(feature = "remote"))]
+    {
+        kind == "get_inventory_bundle" || kind == "lsp_control"
+    }
 }
 
 #[cfg(unix)]

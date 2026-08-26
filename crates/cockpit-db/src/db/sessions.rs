@@ -857,7 +857,11 @@ fn btw_info_for_row_conn(conn: &Connection, row: &SessionRow) -> Result<BtwForkI
 /// is what lets resolution after deletion emit owner-visible recovery status
 /// without recreating session content. It is written in the caller's
 /// transaction, so a session can never be removed without one.
-pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
+/// Returns the exact number of rows changed by the final session cascade.
+/// Preparatory tombstones and cleanup intents are deliberately outside the
+/// measured interval; the count begins immediately before the root DELETE and
+/// covers the root, descendants, FK dependents, and delete projections.
+pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<u64> {
     #[cfg(windows)]
     for member in collect_subtree(conn, session_id)? {
         let sidecars: i64 = conn.query_row(
@@ -912,12 +916,13 @@ pub fn delete_session_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
         )
         .context("recording external journal session tombstone")?;
     }
+    let changes_before = conn.total_changes();
     conn.execute(
         "DELETE FROM sessions WHERE session_id = ?1",
         [session_id.to_string()],
     )
     .context("deleting session")?;
-    Ok(())
+    Ok(conn.total_changes().saturating_sub(changes_before))
 }
 
 impl Db {
@@ -1958,7 +1963,7 @@ impl Db {
     /// deletes the row + fork subtree. Intent reconciliation remains the
     /// caller's post-commit responsibility.
     pub fn delete_session_row_conn(conn: &Connection, session_id: Uuid) -> Result<()> {
-        delete_session_conn(conn, session_id)
+        delete_session_conn(conn, session_id).map(|_| ())
     }
 
     /// Transaction-composable deletion which refuses to treat a concurrently

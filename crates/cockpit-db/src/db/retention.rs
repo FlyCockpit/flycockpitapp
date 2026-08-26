@@ -76,6 +76,8 @@ fn default_retention_vacuum_interval_days() -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RetentionOutcome {
     pub sessions_expired: u64,
+    /// All rows changed by whole-session cascades, including dependent rows.
+    pub session_cascade_rows_deleted: u64,
     pub payload_rows_deleted: u64,
     pub transcript_rows_deleted: u64,
     pub raw_wire_rows_deleted_or_redacted: u64,
@@ -91,6 +93,12 @@ pub struct RetentionProtectionReport {
     pub total_session_rows: u64,
     pub directly_pinned_sessions: u64,
     pub pin_protected_root_sessions: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SessionExpiryOutcome {
+    sessions_expired: u64,
+    cascade_rows_deleted: u64,
 }
 
 impl Db {
@@ -226,8 +234,18 @@ impl Db {
     /// Delete old closed, non-ephemeral root sessions whose entire subtrees are
     /// closed and older than the cutoff.
     pub async fn expire_old_sessions(&self, session_cutoff_secs: i64) -> Result<u64> {
+        Ok(self
+            .expire_old_sessions_with_accounting(session_cutoff_secs)
+            .await?
+            .sessions_expired)
+    }
+
+    async fn expire_old_sessions_with_accounting(
+        &self,
+        session_cutoff_secs: i64,
+    ) -> Result<SessionExpiryOutcome> {
         if session_cutoff_secs <= 0 {
-            return Ok(0);
+            return Ok(SessionExpiryOutcome::default());
         }
         // `transaction`: each `delete_session_conn` writes an external
         // side-effect tombstone before deleting, and the pair must commit or
@@ -236,7 +254,7 @@ impl Db {
         let removed = self
             .transaction(move |conn| expire_old_sessions_conn(conn, session_cutoff_secs))
             .await?;
-        if removed > 0
+        if removed.sessions_expired > 0
             && let Err(error) = self.reconcile_delegation_sidecar_cleanup_intents().await
         {
             tracing::warn!(%error, "retention sidecar cleanup remains durably pending");
@@ -280,7 +298,9 @@ impl Db {
 
         if cfg.session_window_days > 0 {
             let cutoff = now_secs - (cfg.session_window_days as i64) * 86_400;
-            outcome.sessions_expired = self.expire_old_sessions(cutoff).await?;
+            let expired = self.expire_old_sessions_with_accounting(cutoff).await?;
+            outcome.sessions_expired = expired.sessions_expired;
+            outcome.session_cascade_rows_deleted = expired.cascade_rows_deleted;
         }
         let transcript_cutoff = retention_cutoff(now_secs, cfg.transcript_window_days);
         let raw_wire_cutoff = retention_cutoff(now_secs, cfg.raw_wire_window_days);
@@ -312,7 +332,7 @@ impl Db {
         }
 
         let deleted = outcome
-            .sessions_expired
+            .session_cascade_rows_deleted
             .saturating_add(outcome.payload_rows_deleted)
             .saturating_add(outcome.goal_tombstones_purged);
         let deleted = deleted.saturating_add(outcome.local_authority_rows_purged);
@@ -397,59 +417,104 @@ fn prune_session_payloads_conn(
     )";
     let mut transcripts = 0_u64;
     if transcript_cutoff_secs > 0 {
-        transcripts = tx.execute(
-            &format!(
-                "DELETE FROM session_events
-                  WHERE ts_ms < ?1 AND {closed}
-                    AND NOT EXISTS (
-                        SELECT 1 FROM sessions child
-                         WHERE child.parent_session_id=session_events.session_id
-                           AND child.fork_point_turn_id=session_events.seq
-                    )"
-            ),
+        let predicate = format!(
+            "ts_ms < ?1 AND {closed}
+             AND NOT EXISTS (
+                 SELECT 1 FROM sessions child
+                  WHERE child.parent_session_id=session_events.session_id
+                    AND child.fork_point_turn_id=session_events.seq
+             )"
+        );
+        transcripts = count_delete_candidates(
+            &tx,
+            "session_events",
+            &predicate,
+            transcript_cutoff_secs.saturating_mul(1000),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM session_events WHERE {predicate}"),
             params![transcript_cutoff_secs.saturating_mul(1000)],
-        )? as u64;
+        )?;
     }
     let mut raw_wire = 0_u64;
     if raw_wire_cutoff_secs > 0 {
-        raw_wire = raw_wire.saturating_add(tx.execute(
-            &format!("DELETE FROM inference_requests WHERE ts_ms < ?1 AND {closed}"),
+        let inference_request_predicate = format!("ts_ms < ?1 AND {closed}");
+        raw_wire = raw_wire.saturating_add(count_delete_candidates(
+            &tx,
+            "inference_requests",
+            &inference_request_predicate,
+            raw_wire_cutoff_secs.saturating_mul(1000),
+        )?);
+        tx.execute(
+            &format!("DELETE FROM inference_requests WHERE {inference_request_predicate}"),
             params![raw_wire_cutoff_secs.saturating_mul(1000)],
-        )? as u64);
+        )?;
         // A parent deletion cascades its call subtree. Delete it only when no
         // descendant is newer than the cutoff; otherwise retain the complete
         // structural chain until the youngest descendant becomes eligible.
-        raw_wire = raw_wire.saturating_add(tx.execute(
-            &format!(
-                "DELETE FROM tool_call_events
-                      WHERE timestamp < ?1 AND {closed}
-                        AND NOT EXISTS (
-                            WITH RECURSIVE descendants(call_id, timestamp) AS (
-                                SELECT child.call_id, child.timestamp
-                                  FROM tool_call_events child
-                                 WHERE child.session_id=tool_call_events.session_id
-                                   AND child.parent_call_id=tool_call_events.call_id
-                                UNION ALL
-                                SELECT child.call_id, child.timestamp
-                                  FROM tool_call_events child
-                                  JOIN descendants parent ON child.parent_call_id=parent.call_id
-                                 WHERE child.session_id=tool_call_events.session_id
-                            )
-                            SELECT 1 FROM descendants WHERE timestamp >= ?1
-                        )"
-            ),
+        // Count the complete target set before DELETE: SQLite's `changes()`
+        // excludes rows removed by FK cascades, so counting only the parent
+        // statements would under-report the retained tree and vacuum signal.
+        let tool_call_predicate = format!(
+            "timestamp < ?1 AND {closed}
+             AND NOT EXISTS (
+                 WITH RECURSIVE descendants(call_id, timestamp) AS (
+                     SELECT child.call_id, child.timestamp
+                       FROM tool_call_events child
+                      WHERE child.session_id=tool_call_events.session_id
+                        AND child.parent_call_id=tool_call_events.call_id
+                     UNION ALL
+                     SELECT child.call_id, child.timestamp
+                       FROM tool_call_events child
+                       JOIN descendants parent ON child.parent_call_id=parent.call_id
+                      WHERE child.session_id=tool_call_events.session_id
+                 )
+                 SELECT 1 FROM descendants WHERE timestamp >= ?1
+             )"
+        );
+        raw_wire = raw_wire.saturating_add(count_delete_candidates(
+            &tx,
+            "tool_call_events",
+            &tool_call_predicate,
+            raw_wire_cutoff_secs,
+        )?);
+        tx.execute(
+            &format!("DELETE FROM tool_call_events WHERE {tool_call_predicate}"),
             params![raw_wire_cutoff_secs],
-        )? as u64);
+        )?;
     }
     let mut terminal_evidence = 0_u64;
     if terminal_evidence_cutoff_secs > 0 {
-        terminal_evidence = tx.execute(
-            &format!("DELETE FROM inference_calls WHERE timestamp < ?1 AND {closed}"),
+        let predicate = format!("timestamp < ?1 AND {closed}");
+        terminal_evidence = count_delete_candidates(
+            &tx,
+            "inference_calls",
+            &predicate,
+            terminal_evidence_cutoff_secs,
+        )?;
+        tx.execute(
+            &format!("DELETE FROM inference_calls WHERE {predicate}"),
             params![terminal_evidence_cutoff_secs],
-        )? as u64;
+        )?;
     }
     tx.commit().context("commit prune_session_payloads tx")?;
     Ok((transcripts, raw_wire, terminal_evidence))
+}
+
+fn count_delete_candidates(
+    conn: &Connection,
+    table: &str,
+    predicate: &str,
+    cutoff: i64,
+) -> Result<u64> {
+    let count: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"),
+            params![cutoff],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("counting {table} retention delete candidates"))?;
+    u64::try_from(count).with_context(|| format!("negative {table} retention candidate count"))
 }
 
 fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
@@ -499,15 +564,37 @@ fn old_session_roots(conn: &Connection, cutoff_secs: i64) -> Result<Vec<Uuid>> {
     Ok(out)
 }
 
-fn expire_old_sessions_conn(conn: &Connection, cutoff_secs: i64) -> Result<u64> {
+fn expire_old_sessions_conn(conn: &Connection, cutoff_secs: i64) -> Result<SessionExpiryOutcome> {
     let roots = old_session_roots(conn, cutoff_secs)?;
-    let mut removed = 0;
+    let mut removed = 0_u64;
+    let mut cascade_rows_deleted = 0_u64;
     for root in roots {
-        crate::db::sessions::delete_session_conn(conn, root)
+        // Count the complete logical session cascade before deleting its root.
+        // `DELETE FROM sessions` reports only the root through `changes()`;
+        // descendant forks are removed by the self-FK cascade.
+        let subtree_rows: i64 = conn.query_row(
+            "WITH RECURSIVE subtree(session_id) AS (
+                 SELECT session_id FROM sessions WHERE session_id=?1
+                 UNION ALL
+                 SELECT child.session_id
+                   FROM sessions child
+                   JOIN subtree parent ON child.parent_session_id=parent.session_id
+             )
+             SELECT COUNT(*) FROM subtree",
+            [root.to_string()],
+            |row| row.get(0),
+        )?;
+        let subtree_rows =
+            u64::try_from(subtree_rows).context("negative session retention subtree row count")?;
+        let cascade_rows = crate::db::sessions::delete_session_conn(conn, root)
             .with_context(|| format!("expiring old session {root}"))?;
-        removed += 1;
+        removed = removed.saturating_add(subtree_rows);
+        cascade_rows_deleted = cascade_rows_deleted.saturating_add(cascade_rows);
     }
-    Ok(removed)
+    Ok(SessionExpiryOutcome {
+        sessions_expired: removed,
+        cascade_rows_deleted,
+    })
 }
 
 fn parse_uuid_sql(raw: String) -> rusqlite::Result<Uuid> {
@@ -694,6 +781,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_wire_accounting_counts_every_cascaded_tool_descendant() {
+        let db = Db::open_in_memory().unwrap();
+        let session = db.create_session("p", "/x", "Build").await.unwrap();
+        close_session(&db, session.session_id, 10).await;
+        for call_id in ["root", "child", "grandchild"] {
+            insert_payload_rows(&db, session.session_id, call_id, 10).await;
+        }
+        let session_id = session.session_id;
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE tool_call_events SET parent_call_id='root'
+                  WHERE session_id=?1 AND call_id='child'",
+                [session_id.to_string()],
+            )?;
+            conn.execute(
+                "UPDATE tool_call_events SET parent_call_id='child'
+                  WHERE session_id=?1 AND call_id='grandchild'",
+                [session_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.prune_session_payloads(0, 20, 0).await.unwrap(),
+            (0, 6, 0)
+        );
+        assert_eq!(
+            payload_count(&db, "tool_call_events", session.session_id).await,
+            0
+        );
+        assert_eq!(
+            payload_count(&db, "inference_requests", session.session_id).await,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn session_age_out_skips_open_subtree() {
         let db = Db::open_in_memory().unwrap();
         let root = db.create_session("p", "/x", "Build").await.unwrap();
@@ -715,6 +841,27 @@ mod tests {
         assert_eq!(db.expire_old_sessions(20).await.unwrap(), 0);
         assert!(db.get_session(root.session_id).await.unwrap().is_some());
         assert!(db.get_session(child.session_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn session_age_out_accounts_for_every_cascaded_session_row() {
+        let db = Db::open_in_memory().unwrap();
+        let root = db.create_session("p", "/x", "Build").await.unwrap();
+        let child = db.create_fork(root.session_id, None).await.unwrap();
+        let grandchild = db.create_fork(child.session_id, None).await.unwrap();
+        close_session(&db, root.session_id, 10).await;
+        close_session(&db, child.session_id, 10).await;
+        close_session(&db, grandchild.session_id, 10).await;
+
+        assert_eq!(db.expire_old_sessions(20).await.unwrap(), 3);
+        assert!(db.get_session(root.session_id).await.unwrap().is_none());
+        assert!(db.get_session(child.session_id).await.unwrap().is_none());
+        assert!(
+            db.get_session(grandchild.session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -804,6 +951,34 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = Db::open(&tmp.path().join("retention.db")).unwrap();
         assert!(db.vacuum_retention_database().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cascaded_session_rows_satisfy_the_vacuum_threshold() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Db::open(&tmp.path().join("retention-threshold.db")).unwrap();
+        let root = db.create_session("p", "/x", "Build").await.unwrap();
+        let child = db.create_fork(root.session_id, None).await.unwrap();
+        close_session(&db, root.session_id, 10).await;
+        close_session(&db, child.session_id, 10).await;
+        insert_payload_rows(&db, root.session_id, "root-evidence", 10).await;
+        let cfg = RetentionConfig {
+            transcript_window_days: 0,
+            raw_wire_window_days: 0,
+            terminal_evidence_window_days: 0,
+            session_window_days: 1,
+            // The two session rows alone are below threshold. Their dependent
+            // evidence cascade must participate in the vacuum decision.
+            vacuum_min_deletions: 3,
+            vacuum_interval_days: 0,
+            ..RetentionConfig::default()
+        };
+
+        let outcome = db.run_retention_pass(&cfg, 100_000).await.unwrap();
+
+        assert_eq!(outcome.sessions_expired, 2);
+        assert!(outcome.session_cascade_rows_deleted > outcome.sessions_expired);
+        assert!(outcome.vacuumed);
     }
 
     #[test]

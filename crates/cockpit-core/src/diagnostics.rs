@@ -499,14 +499,18 @@ async fn database_lines(
                     "openability: ok (SQLite opened, but Cockpit rejected its schema)".to_string(),
                 );
                 lines.push(format!("schema: FAILED ({})", one_line(&message)));
+                lines.push(
+                    "integrity: unavailable because Cockpit rejected the schema before integrity checks"
+                        .to_string(),
+                );
             } else {
                 lines.push(format!("openability: FAILED ({})", one_line(&message)));
                 lines.push(
                     "schema: unavailable because the database could not be opened".to_string(),
                 );
+                lines.push("integrity: unavailable because SQLite did not open".to_string());
             }
-            lines.push("integrity: unavailable because the database did not open".to_string());
-            lines.push(retention_line(&extended.retention));
+            append_database_failure_guidance(&mut lines, &extended.retention);
             return (lines, true);
         }
         // No DB at all (e.g. a TUI client): the resolved path stays visible but
@@ -515,7 +519,7 @@ async fn database_lines(
             lines.push("openability: unavailable (daemon not running)".to_string());
             lines.push("schema: unavailable".to_string());
             lines.push("integrity: unavailable (daemon not running)".to_string());
-            lines.push(retention_line(&extended.retention));
+            append_database_failure_guidance(&mut lines, &extended.retention);
             return (lines, true);
         }
     };
@@ -540,6 +544,7 @@ async fn database_lines(
                 .expect("one database read failed");
             lines.push(format!("schema: FAILED ({})", one_line(&error.to_string())));
             lines.push("integrity: unavailable because schema reads failed".to_string());
+            append_database_failure_guidance(&mut lines, &extended.retention);
             return (lines, true);
         }
     }
@@ -563,6 +568,7 @@ async fn database_lines(
                 "storage: FAILED ({})",
                 one_line(&error.to_string())
             ));
+            append_database_failure_guidance(&mut lines, &extended.retention);
             return (lines, true);
         }
     }
@@ -576,6 +582,7 @@ async fn database_lines(
                 "integrity: FAILED ({})",
                 one_line(&format!("{error:#}"))
             ));
+            append_database_failure_guidance(&mut lines, &extended.retention);
             return (lines, true);
         }
     }
@@ -591,6 +598,7 @@ async fn database_lines(
                 "retention protection: FAILED ({})",
                 one_line(&format!("{error:#}"))
             ));
+            append_database_failure_guidance(&mut lines, &extended.retention);
             return (lines, true);
         }
     }
@@ -609,9 +617,16 @@ async fn database_lines(
 #[allow(dead_code)]
 fn is_schema_rejection(message: &str) -> bool {
     [
+        crate::db::SCHEMA_PROFILE_MISMATCH_CODE,
+        crate::db::SCHEMA_REJECTION_AFTER_OPEN_CODE,
+        "incompatible prerelease database schema",
+        "incompatible legacy prerelease database schema",
+        "database migration ledger is corrupt",
         "database schema version mismatch",
+        "database schema version is inconsistent",
         "database migration ledger is newer than this binary",
         "migration checksum mismatch",
+        "database schema fingerprint mismatch",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -620,7 +635,7 @@ fn is_schema_rejection(message: &str) -> bool {
 #[allow(dead_code)]
 fn retention_line(retention: &crate::db::retention::RetentionConfig) -> String {
     let sessions = if retention.session_window_days == 0 {
-        "disabled".to_string()
+        "unlimited".to_string()
     } else {
         format!("{} days", retention.session_window_days)
     };
@@ -637,6 +652,21 @@ fn retention_line(retention: &crate::db::retention::RetentionConfig) -> String {
         window(retention.raw_wire_window_days),
         window(retention.terminal_evidence_window_days)
     )
+}
+
+fn append_database_failure_guidance(
+    lines: &mut Vec<String>,
+    retention: &crate::db::retention::RetentionConfig,
+) {
+    lines.push(
+        "export: unavailable while database health is failed; do not bypass daemon validation"
+            .to_string(),
+    );
+    lines.push(
+        "repair: read-only doctor never edits SQLite; restore a validated sibling *.backup-*.sqlite or move the database aside and restart"
+            .to_string(),
+    );
+    lines.push(retention_line(retention));
 }
 
 async fn daemon_lines() -> (Vec<String>, bool) {
@@ -2515,6 +2545,55 @@ mod tests {
                 .iter()
                 .any(|line| line == "spool: none (not yet created)"),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn database_schema_rejection_classifier_covers_every_boot_rejection_family() {
+        for message in [
+            "FCDB_SCHEMA_PROFILE_MISMATCH: wrong profile",
+            "FCDB_SCHEMA_REJECTED_AFTER_OPEN: backup ledger differs from compiled schema",
+            "incompatible prerelease database schema v2",
+            "incompatible legacy prerelease database schema v1",
+            "database migration ledger is corrupt: gap",
+            "database schema version is inconsistent: user_version drift",
+            "migration checksum mismatch for 0001_initial.sql",
+            "database schema fingerprint mismatch at migration 1",
+        ] {
+            assert!(is_schema_rejection(message), "not classified: {message}");
+        }
+        assert!(!is_schema_rejection(
+            "opening SQLite read-only: permission denied"
+        ));
+    }
+
+    #[test]
+    fn database_failure_guidance_is_actionable_and_zero_windows_are_unlimited() {
+        let retention = crate::db::retention::RetentionConfig {
+            transcript_window_days: 0,
+            raw_wire_window_days: 0,
+            terminal_evidence_window_days: 0,
+            session_window_days: 0,
+            ..crate::db::retention::RetentionConfig::default()
+        };
+        let mut lines = Vec::new();
+        append_database_failure_guidance(&mut lines, &retention);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("export: unavailable"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("repair: read-only doctor"))
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(
+                "retention: sessions unlimited; transcripts unlimited; raw/wire unlimited; terminal evidence unlimited"
+            )
         );
     }
 }

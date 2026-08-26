@@ -4034,6 +4034,7 @@ fn log_retention_outcome(outcome: crate::db::retention::RetentionOutcome) {
     {
         tracing::info!(
             sessions_expired = outcome.sessions_expired,
+            session_cascade_rows_deleted = outcome.session_cascade_rows_deleted,
             payload_rows_deleted = outcome.payload_rows_deleted,
             transcript_rows_deleted = outcome.transcript_rows_deleted,
             raw_wire_rows_deleted_or_redacted = outcome.raw_wire_rows_deleted_or_redacted,

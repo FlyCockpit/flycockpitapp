@@ -1144,6 +1144,10 @@ const SCHEMA_PROFILE: &str = "local-v0.1";
 /// in-place migration in v0.1: opt-in remote builds must use a separate data
 /// directory (or an explicit supported export/import flow).
 pub const SCHEMA_PROFILE_MISMATCH_CODE: &str = "FCDB_SCHEMA_PROFILE_MISMATCH";
+/// Stable diagnostic code for an existing SQLite database which opened, but
+/// whose pre-migration backup could not be promoted to a trusted restorable
+/// artifact because the schema/ledger was not an exact compiled state.
+pub const SCHEMA_REJECTION_AFTER_OPEN_CODE: &str = "FCDB_SCHEMA_REJECTED_AFTER_OPEN";
 
 fn schema_profile_mismatch(database_profile: &str) -> anyhow::Error {
     anyhow::anyhow!(
@@ -1187,7 +1191,7 @@ fn backup_before_pending_migration(
                 "rejecting an unproven or malformed prerelease schema ledger",
             )?;
             return Err(assessment_error).context(
-                "database schema could not be proven compatible; a validated backup was created before rejection",
+                "database schema could not be proven compatible; a durable backup artifact was preserved before rejection",
             );
         }
     };
@@ -1208,20 +1212,37 @@ fn create_migration_backup(
         .unwrap_or_default()
         .as_millis();
     let backup = path.with_extension(format!("v{schema_version}.backup-{stamp}.sqlite"));
-    conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+    // The initial artifact is intentionally outside doctor's trusted sibling
+    // glob. Only exact compiled-ledger validation promotes it to `*.sqlite`;
+    // a physically sound drift artifact remains durable but visibly untrusted.
+    let untrusted = PathBuf::from(format!("{}.untrusted", backup.display()));
+    conn.execute("VACUUM INTO ?1", [untrusted.to_string_lossy().as_ref()])
         .with_context(|| {
             format!(
                 "creating SQLite online backup of {} at {} before {reason}",
                 path.display(),
-                backup.display()
+                untrusted.display()
             )
         })?;
-    files::repair_private_file(&backup, "database backup")?;
+    files::repair_private_file(&untrusted, "database backup artifact")?;
     // Preserve the physical recovery artifact before performing logical
     // validation. A drifted source can legitimately fail the latter check;
     // its online backup must still reach the filesystem durability boundary.
+    fsync_file_and_parent(&untrusted)?;
+    validate_migration_backup(&untrusted, schema_version).with_context(|| {
+        format!(
+            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: migration backup artifact {} was durably preserved but remains untrusted before {reason}",
+            untrusted.display()
+        )
+    })?;
+    std::fs::rename(&untrusted, &backup).with_context(|| {
+        format!(
+            "promoting trusted migration backup {} to {}",
+            untrusted.display(),
+            backup.display()
+        )
+    })?;
     fsync_file_and_parent(&backup)?;
-    validate_migration_backup(&backup, schema_version)?;
     prune_migration_backups(path)?;
     Ok(())
 }
@@ -1311,38 +1332,64 @@ fn validate_migration_backup(path: &Path, expected_schema_version: i64) -> Resul
         )
     })?;
 
-    if table_exists(&backup, "schema_version")? {
-        let columns = table_columns(&backup, "schema_version")?;
-        if columns.iter().any(|column| column == "schema_fingerprint") {
-            verify_supported_ledger_shape(&backup)?;
-            let ledger_version = current_schema_version(&backup)?;
-            if expected_schema_version > 0 {
-                anyhow::ensure!(
-                    ledger_version == expected_schema_version,
-                    "migration backup {} ledger version {ledger_version} differs from recorded backup version {expected_schema_version}",
-                    path.display()
-                );
-            }
-            verify_user_version(&backup, ledger_version)?;
-            let (profile, fingerprint): (String, String) = backup
-                .query_row(
-                    "SELECT schema_profile, schema_fingerprint FROM schema_version WHERE version=?1",
-                    [ledger_version],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .context("reading migration backup schema metadata")?;
-            anyhow::ensure!(
-                !profile.trim().is_empty(),
-                "migration backup {} has an empty schema profile",
+    validate_compiled_migration_backup_ledger(&backup, expected_schema_version).with_context(
+        || {
+            format!(
+                "migration backup {} was durably preserved but is not a trusted restorable backup",
                 path.display()
-            );
-            anyhow::ensure!(
-                fingerprint == exact_ddl_fingerprint(&backup)?,
-                "migration backup {} schema fingerprint does not match its recorded {profile} profile",
-                path.display()
-            );
-        }
-    }
+            )
+        },
+    )?;
+    Ok(())
+}
+
+/// Prove that a physically sound backup is the exact schema compiled into this
+/// binary, not merely a self-consistent database with an attacker- or
+/// drift-authored fingerprint. Drift artifacts remain fsynced on disk, but a
+/// caller must never describe them as trusted/restorable.
+fn validate_compiled_migration_backup_ledger(
+    backup: &Connection,
+    expected_schema_version: i64,
+) -> Result<()> {
+    anyhow::ensure!(
+        table_exists(backup, "schema_version")?,
+        "compiled migration ledger is absent"
+    );
+    let columns = table_columns(backup, "schema_version")?;
+    let expected_columns = [
+        "version",
+        "name",
+        "sha256",
+        "schema_fingerprint",
+        "schema_profile",
+        "applied_at",
+    ];
+    anyhow::ensure!(
+        columns.iter().map(String::as_str).eq(expected_columns),
+        "compiled migration ledger columns differ from the exact supported shape"
+    );
+    let ledger_version = current_schema_version(backup)?;
+    anyhow::ensure!(
+        ledger_version == expected_schema_version,
+        "backup ledger version {ledger_version} differs from recorded backup version {expected_schema_version}"
+    );
+    let compiled_version = usize::try_from(ledger_version)
+        .context("backup ledger version cannot select a compiled migration prefix")?;
+    anyhow::ensure!(
+        compiled_version > 0 && compiled_version <= MIGRATIONS.len(),
+        "backup ledger version {ledger_version} has no exact compiled migration prefix"
+    );
+    let compiled_migrations = &MIGRATIONS[..compiled_version];
+    verify_user_version(backup, ledger_version)?;
+    // Verifies every row: contiguous version, exact name and SQL definition
+    // hash, lowercase hash shapes, and the one compiled profile on every row.
+    verify_ledger(backup, compiled_migrations)?;
+    let actual_fingerprint = exact_ddl_fingerprint(backup)?;
+    let compiled_fingerprint = compiled_expected_fingerprint(compiled_migrations)?;
+    anyhow::ensure!(
+        actual_fingerprint == compiled_fingerprint,
+        "backup DDL fingerprint differs from the exact compiled {SCHEMA_PROFILE} schema"
+    );
     Ok(())
 }
 
@@ -1792,12 +1839,17 @@ fn database_storage_report(
         .checked_mul(freelist_page_count)
         .context("SQLite reclaimable byte count overflow")?;
 
-    let file_size = |candidate: &Path| -> Result<u64> {
+    let required_file_size = |candidate: &Path| -> Result<u64> {
+        std::fs::metadata(candidate)
+            .map(|metadata| metadata.len())
+            .with_context(|| format!("reading database file size {}", candidate.display()))
+    };
+    let optional_sidecar_size = |candidate: &Path| -> Result<u64> {
         match std::fs::metadata(candidate) {
             Ok(metadata) => Ok(metadata.len()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
             Err(error) => Err(error)
-                .with_context(|| format!("reading database file size {}", candidate.display())),
+                .with_context(|| format!("reading database sidecar size {}", candidate.display())),
         }
     };
     let sidecar = |base: &Path, suffix: &str| {
@@ -1807,9 +1859,9 @@ fn database_storage_report(
     };
     let (main_file_bytes, wal_file_bytes, shared_memory_file_bytes) = match path {
         Some(path) => (
-            file_size(path)?,
-            file_size(&sidecar(path, "-wal"))?,
-            file_size(&sidecar(path, "-shm"))?,
+            required_file_size(path)?,
+            optional_sidecar_size(&sidecar(path, "-wal"))?,
+            optional_sidecar_size(&sidecar(path, "-shm"))?,
         ),
         None => (0, 0, 0),
     };
@@ -1940,6 +1992,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn storage_report_requires_main_file_but_allows_absent_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("snapshot.db");
+        std::fs::write(&main, b"main").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+
+        let report = database_storage_report(&conn, Some(&main)).unwrap();
+        assert_eq!(report.main_file_bytes, 4);
+        assert_eq!(report.wal_file_bytes, 0);
+        assert_eq!(report.shared_memory_file_bytes, 0);
+
+        std::fs::remove_file(&main).unwrap();
+        let error = database_storage_report(&conn, Some(&main)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reading database file size"),
+            "unexpected error: {error:#}"
+        );
+    }
+
     #[tokio::test]
     async fn rollback_failure_poison_closes_the_writer_queue() {
         let temp = tempfile::tempdir().unwrap();
@@ -2039,7 +2111,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_migration_writes_backup_first() {
+    fn uncompiled_pending_schema_preserves_but_does_not_trust_backup() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("cockpit.db");
         let conn = Connection::open(&path).unwrap();
@@ -2048,18 +2120,82 @@ mod tests {
             &["CREATE TABLE first_backup_probe (id INTEGER PRIMARY KEY);"],
         )
         .unwrap();
-        backup_before_pending_migration(&conn, &path, 2).unwrap();
+        let error = backup_before_pending_migration(&conn, &path, 2).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a trusted restorable backup"),
+            "unexpected error: {error:#}"
+        );
         let backup = std::fs::read_dir(temp.path())
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
-            .find(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "sqlite")
-            })
+            .find(|path| path.to_string_lossy().ends_with(".sqlite.untrusted"))
             .unwrap();
         let copied = Connection::open(backup).unwrap();
         assert_eq!(current_schema_version(&copied).unwrap(), 1);
+    }
+
+    fn compiled_backup_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_with(&conn, MIGRATIONS).unwrap();
+        conn
+    }
+
+    #[test]
+    fn compiled_backup_ledger_validator_accepts_only_the_exact_compiled_identity() {
+        let conn = compiled_backup_fixture();
+        validate_compiled_migration_backup_ledger(&conn, EXPECTED_SCHEMA_VERSION).unwrap();
+    }
+
+    #[test]
+    fn exact_compiled_backup_is_promoted_to_the_trusted_sibling_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let conn = Connection::open(&path).unwrap();
+        migrate_with(&conn, MIGRATIONS).unwrap();
+
+        create_migration_backup(&conn, &path, EXPECTED_SCHEMA_VERSION, "test promotion").unwrap();
+
+        let names = std::fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            names
+                .iter()
+                .any(|name| name.contains(".backup-") && name.ends_with(".sqlite"))
+        );
+        assert!(!names.iter().any(|name| name.ends_with(".untrusted")));
+    }
+
+    #[test]
+    fn compiled_backup_ledger_validator_rejects_every_forged_identity_axis() {
+        for mutation in [
+            "UPDATE schema_version SET name='forged.sql' WHERE version=1",
+            "UPDATE schema_version SET sha256=lower(hex(randomblob(32))) WHERE version=1",
+            "UPDATE schema_version SET schema_profile=CASE schema_profile WHEN 'local-v0.1' THEN 'remote-v0.1' ELSE 'local-v0.1' END WHERE version=1",
+        ] {
+            let conn = compiled_backup_fixture();
+            conn.execute_batch(mutation).unwrap();
+            assert!(
+                validate_compiled_migration_backup_ledger(&conn, EXPECTED_SCHEMA_VERSION).is_err(),
+                "forged backup identity passed: {mutation}"
+            );
+        }
+
+        // A drift author can recompute a self-consistent fingerprint. The
+        // backup still is not the exact DDL compiled into this binary.
+        let conn = compiled_backup_fixture();
+        conn.execute_batch("CREATE TABLE forged_backup_object(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let forged_fingerprint = exact_ddl_fingerprint(&conn).unwrap();
+        conn.execute(
+            "UPDATE schema_version SET schema_fingerprint=?1 WHERE version=?2",
+            params![forged_fingerprint, EXPECTED_SCHEMA_VERSION],
+        )
+        .unwrap();
+        assert!(validate_compiled_migration_backup_ledger(&conn, EXPECTED_SCHEMA_VERSION).is_err());
     }
 
     #[test]

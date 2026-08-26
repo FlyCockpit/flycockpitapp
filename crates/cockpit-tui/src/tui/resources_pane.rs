@@ -339,11 +339,15 @@ impl ResourcesPane {
             *self.list.offset_mut() = 0;
             return;
         }
-        let current = self.selected_index();
-        let next = if delta < 0 {
-            crate::tui::nav::wrap_prev(current, total)
+        let next = if self.selected_request_id.is_none() {
+            if delta < 0 { total - 1 } else { 0 }
         } else {
-            crate::tui::nav::wrap_next(current, total)
+            let current = self.selected_index();
+            if delta < 0 {
+                crate::tui::nav::wrap_prev(current, total)
+            } else {
+                crate::tui::nav::wrap_next(current, total)
+            }
         };
         self.select_index(next);
         self.follow_selection = true;
@@ -688,6 +692,7 @@ mod tests {
         registry.end_frame();
         let replacement = registry.targets()[0].rect;
         assert_eq!(pane.selected_request_id, None);
+        assert!(pane.handle_key(press(KeyCode::Enter)).is_none());
         assert!(pane.pointer_promote(stale_id).is_none());
         assert!(!matches!(
             registry.handle_mouse(mouse(
@@ -698,6 +703,57 @@ mod tests {
             Some(crate::tui::button::ButtonPointerOutcome::Activated(_))
         ));
         assert_ne!(stale_id, replacement_id);
+        pane.handle_key(press(KeyCode::Down));
+        assert_eq!(pane.selected_request_id, Some(replacement_id));
+        assert!(pane.follow_selection);
+    }
+
+    #[test]
+    fn missing_selection_arrows_choose_edges_without_skipping_rows() {
+        let mut value = snapshot();
+        for display_id in ["rs-0003", "rs-0004"] {
+            let mut entry = value.queued[0].clone();
+            entry.id = Uuid::new_v4();
+            entry.display_id = display_id.to_string();
+            value.queued.push(entry);
+        }
+        let first_id = value.queued.first().unwrap().id;
+        let last_id = value.queued.last().unwrap().id;
+
+        let mut down = ResourcesPane::open();
+        down.apply_snapshot_result(Ok(value.clone()));
+        down.selected_request_id = None;
+        down.handle_key(press(KeyCode::Down));
+        assert_eq!(down.selected_request_id, Some(first_id));
+        down.handle_key(press(KeyCode::Down));
+        assert_eq!(down.selected_request_id, Some(value.queued[1].id));
+
+        let mut up = ResourcesPane::open();
+        up.apply_snapshot_result(Ok(value));
+        up.selected_request_id = None;
+        up.handle_key(press(KeyCode::Up));
+        assert_eq!(up.selected_request_id, Some(last_id));
+    }
+
+    #[test]
+    fn removed_selected_request_requires_explicit_reselection() {
+        let mut value = snapshot();
+        let mut second = value.queued[0].clone();
+        second.id = Uuid::new_v4();
+        second.display_id = "rs-0003".to_string();
+        value.queued.push(second);
+        let mut pane = ResourcesPane::open();
+        pane.apply_snapshot_result(Ok(value.clone()));
+        pane.handle_key(press(KeyCode::Down));
+        let removed_id = pane.selected_request_id.unwrap();
+        value.queued.retain(|entry| entry.id != removed_id);
+        let first_remaining = value.queued[0].id;
+
+        pane.apply_snapshot_result(Ok(value));
+        assert_eq!(pane.selected_request_id, None);
+        assert!(pane.handle_key(press(KeyCode::Enter)).is_none());
+        pane.handle_key(press(KeyCode::Down));
+        assert_eq!(pane.selected_request_id, Some(first_remaining));
     }
 
     #[test]

@@ -84,8 +84,7 @@ pub struct NotesPane {
     highest_applied_generation: Option<u64>,
     initial_inventory_unresolved: bool,
     pending_save: Option<PendingSave>,
-    in_flight_generation: Option<u64>,
-    queued_actions: VecDeque<QueuedNotesAction>,
+    pending_generations: VecDeque<u64>,
     mode: Mode,
     /// The reused composer editing engine for the raw-markdown editor. Holds
     /// the note source while [`Mode::Editing`]; honors vim when enabled.
@@ -114,11 +113,6 @@ struct PendingSave {
     id: Uuid,
     generation: u64,
     draft: String,
-}
-
-struct QueuedNotesAction {
-    generation: u64,
-    kind: NotesRpcActionKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +175,10 @@ impl NotesRpcAction {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub fn serialization_key(&self) -> String {
+        format!("notes.projection:{}", self.project_root)
     }
 
     pub fn run_blocking_rpc(
@@ -384,8 +382,7 @@ impl NotesPane {
             highest_applied_generation: None,
             initial_inventory_unresolved: true,
             pending_save: None,
-            in_flight_generation: None,
-            queued_actions: VecDeque::new(),
+            pending_generations: VecDeque::new(),
             mode: Mode::Browsing,
             editor: Composer::new(vim_enabled),
             vim_enabled,
@@ -408,7 +405,7 @@ impl NotesPane {
             kind: NotesRpcActionKind::Load { keep: None },
             generation: self.operation_generation,
         };
-        self.in_flight_generation = Some(action.generation);
+        self.pending_generations.push_back(action.generation);
         Some(action)
     }
 
@@ -452,14 +449,15 @@ impl NotesPane {
                     return None;
                 }
                 if (result.generation == 0 && !self.initial_inventory_unresolved)
-                    || self.in_flight_generation != Some(result.generation)
+                    || !self.pending_generations.contains(&result.generation)
                     || self
                         .highest_applied_generation
                         .is_some_and(|applied| result.generation <= applied)
                 {
                     return None;
                 }
-                self.in_flight_generation = None;
+                self.pending_generations
+                    .retain(|generation| *generation != result.generation);
                 let has_newer_intent = result.generation != self.operation_generation;
                 if let Some(error) = result.error {
                     if let Some(save) = self
@@ -473,7 +471,7 @@ impl NotesPane {
                     } else if !has_newer_intent {
                         self.status = Some(error);
                     }
-                    return self.start_next_queued_action();
+                    return None;
                 }
                 let old_index = self.selected_index();
                 let old_selection = self.selection;
@@ -546,7 +544,7 @@ impl NotesPane {
                         self.enter_edit();
                     }
                 }
-                self.start_next_queued_action()
+                None
             }
             // Transport failures must carry the action envelope; callers route
             // those through `apply_transport_error` instead.
@@ -560,50 +558,30 @@ impl NotesPane {
         generation: u64,
         error: String,
     ) -> Option<NotesRpcAction> {
-        if instance_id != self.instance_id || self.in_flight_generation != Some(generation) {
+        if instance_id != self.instance_id || !self.pending_generations.contains(&generation) {
             return None;
         }
-        self.in_flight_generation = None;
+        self.pending_generations
+            .retain(|pending| *pending != generation);
         self.status = Some(error);
-        self.start_next_queued_action()
+        None
     }
 
-    fn schedule_action(
-        &mut self,
-        kind: NotesRpcActionKind,
-    ) -> Option<(u64, Option<NotesRpcAction>)> {
+    fn schedule_action(&mut self, kind: NotesRpcActionKind) -> Option<(u64, NotesRpcAction)> {
         let daemon_socket = self.daemon_socket.clone()?;
         self.operation_generation = self.operation_generation.wrapping_add(1);
         let generation = self.operation_generation;
-        if self.in_flight_generation.is_some() {
-            self.queued_actions
-                .push_back(QueuedNotesAction { generation, kind });
-            return Some((generation, None));
-        }
-        self.in_flight_generation = Some(generation);
+        self.pending_generations.push_back(generation);
         Some((
             generation,
-            Some(NotesRpcAction {
+            NotesRpcAction {
                 instance_id: self.instance_id,
                 daemon_socket,
                 project_root: self.project_root.clone(),
                 kind,
                 generation,
-            }),
+            },
         ))
-    }
-
-    fn start_next_queued_action(&mut self) -> Option<NotesRpcAction> {
-        let queued = self.queued_actions.pop_front()?;
-        let daemon_socket = self.daemon_socket.clone()?;
-        self.in_flight_generation = Some(queued.generation);
-        Some(NotesRpcAction {
-            instance_id: self.instance_id,
-            daemon_socket,
-            project_root: self.project_root.clone(),
-            kind: queued.kind,
-            generation: queued.generation,
-        })
     }
 
     fn invalidate_pending_operations(&mut self) {
@@ -646,7 +624,7 @@ impl NotesPane {
                     generation,
                     draft: self.editor.text().to_string(),
                 });
-                return action.map_or(NotesOutcome::Stay, NotesOutcome::Rpc);
+                return NotesOutcome::Rpc(action);
             }
             self.status = Some("Unavailable — reconnect to the daemon, then Retry".to_string());
         }
@@ -782,7 +760,7 @@ impl NotesPane {
                 };
                 if let Some((_, action)) = self.schedule_action(kind) {
                     self.mode = Mode::Browsing;
-                    return action.map_or(NotesOutcome::Stay, NotesOutcome::Rpc);
+                    return NotesOutcome::Rpc(action);
                 }
             }
             KeyCode::Backspace => {
@@ -809,7 +787,7 @@ impl NotesPane {
                     if let Some((_, action)) =
                         self.schedule_action(NotesRpcActionKind::Delete { id, fallback_index })
                     {
-                        return action.map_or(NotesOutcome::Stay, NotesOutcome::Rpc);
+                        return NotesOutcome::Rpc(action);
                     };
                     self.status = Some("notes db unavailable".to_string());
                 }
@@ -897,8 +875,7 @@ impl NotesPane {
             highest_applied_generation: None,
             initial_inventory_unresolved: false,
             pending_save: None,
-            in_flight_generation: None,
-            queued_actions: VecDeque::new(),
+            pending_generations: VecDeque::new(),
             mode: Mode::Editing { id: Uuid::nil() },
             editor: Composer::new(vim_enabled),
             vim_enabled,
@@ -1217,8 +1194,7 @@ mod tests {
             highest_applied_generation: None,
             initial_inventory_unresolved: false,
             pending_save: None,
-            in_flight_generation: None,
-            queued_actions: VecDeque::new(),
+            pending_generations: VecDeque::new(),
             mode: Mode::Browsing,
             editor: Composer::new(false),
             vim_enabled: false,
@@ -1249,7 +1225,7 @@ mod tests {
         pane.highest_applied_generation = None;
         pane.initial_inventory_unresolved = true;
         pane.selection = SidebarSelection::Uninitialized;
-        pane.in_flight_generation = Some(0);
+        pane.pending_generations = VecDeque::from([0]);
     }
 
     fn rendered_buffer(pane: &mut NotesPane, width: u16, height: u16) -> String {
@@ -1300,7 +1276,7 @@ mod tests {
             note(Uuid::new_v4(), "third", "three"),
         ];
         pane.select_sidebar(1);
-        pane.in_flight_generation = Some(1);
+        pane.pending_generations = VecDeque::from([1]);
 
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 0,
@@ -1354,7 +1330,7 @@ mod tests {
         ];
 
         pane.select_sidebar(pane.notes.len());
-        pane.in_flight_generation = Some(1);
+        pane.pending_generations = VecDeque::from([1]);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 0,
             generation: 1,
@@ -1376,7 +1352,7 @@ mod tests {
         ];
         pane.select_sidebar(1);
         pane.operation_generation = 2;
-        pane.in_flight_generation = Some(2);
+        pane.pending_generations = VecDeque::from([2]);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 0,
             generation: 2,
@@ -1395,7 +1371,7 @@ mod tests {
 
         let fallback = pane.notes[1].id;
         pane.operation_generation = 3;
-        pane.in_flight_generation = Some(3);
+        pane.pending_generations = VecDeque::from([3]);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 0,
             generation: 3,
@@ -1408,7 +1384,7 @@ mod tests {
         assert_eq!(pane.selection, SidebarSelection::Note(fallback));
 
         pane.operation_generation = 4;
-        pane.in_flight_generation = Some(4);
+        pane.pending_generations = VecDeque::from([4]);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 0,
             generation: 4,
@@ -1471,7 +1447,7 @@ mod tests {
         }));
         assert_eq!(initially_empty.selection, SidebarSelection::New);
         initially_empty.operation_generation = 1;
-        initially_empty.in_flight_generation = Some(1);
+        initially_empty.pending_generations = VecDeque::from([1]);
         let _ = initially_empty.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 0,
             generation: 1,
@@ -1498,7 +1474,7 @@ mod tests {
         }));
         assert_eq!(retry.selection, SidebarSelection::Uninitialized);
         assert_eq!(retry.status.as_deref(), Some("temporary daemon failure"));
-        retry.in_flight_generation = Some(0);
+        retry.pending_generations = VecDeque::from([0]);
         let _ = retry.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 0,
             generation: 0,
@@ -1512,7 +1488,7 @@ mod tests {
 
         retry.select_sidebar(retry.notes.len());
         retry.operation_generation = 1;
-        retry.in_flight_generation = Some(1);
+        retry.pending_generations = VecDeque::from([1]);
         let _ = retry.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 0,
             generation: 1,
@@ -1581,7 +1557,7 @@ mod tests {
             note(other, "other", "other"),
         ];
         pane.select_sidebar(0);
-        pane.in_flight_generation = Some(1);
+        pane.pending_generations = VecDeque::from([1]);
         pane.enter_edit();
         assert!(matches!(pane.mode, Mode::Editing { id } if id == edited));
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
@@ -1609,7 +1585,7 @@ mod tests {
             note(other, "other", "other"),
         ];
         pane.select_sidebar(0);
-        pane.in_flight_generation = Some(1);
+        pane.pending_generations = VecDeque::from([1]);
         pane.handle_key(press(KeyCode::Char('d')));
         assert!(matches!(pane.mode, Mode::ConfirmingDelete { id } if id == edited));
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
@@ -1687,22 +1663,23 @@ mod tests {
 
         pane.handle_key(press(KeyCode::Char('n')));
         pane.paste("created");
-        assert!(matches!(
-            pane.handle_key(press(KeyCode::Enter)),
-            NotesOutcome::Stay
-        ));
-        let create = pane
-            .apply_rpc_result(Ok(NotesRpcResult {
-                instance_id: 0,
-                generation: 0,
-                error: None,
-                project_root: "/proj".into(),
-                notes: vec![note(resurrected, "old snapshot", "stale")],
-                selection: SelectionAfterRpc::Preserve,
-                enter_edit: false,
-            }))
-            .expect("queued create starts only after initial load completes");
-        assert_eq!(create.generation, pane.in_flight_generation.unwrap());
+        let NotesOutcome::Rpc(create) = pane.handle_key(press(KeyCode::Enter)) else {
+            panic!("confirmed create is handed to the app lane immediately");
+        };
+        assert_eq!(
+            pane.pending_generations,
+            VecDeque::from([0, create.generation])
+        );
+        let next = pane.apply_rpc_result(Ok(NotesRpcResult {
+            instance_id: 0,
+            generation: 0,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(resurrected, "old snapshot", "stale")],
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert!(next.is_none());
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 0,
             generation: create.generation,
@@ -1778,7 +1755,7 @@ mod tests {
     #[test]
     fn serialized_saves_execute_a_then_b_and_latest_failure_keeps_b_draft() {
         let mut pane = pane(true);
-        pane.in_flight_generation = None;
+        pane.pending_generations.clear();
         pane.enter_edit();
         let id = match pane.mode {
             Mode::Editing { id } => id,
@@ -1790,33 +1767,24 @@ mod tests {
         };
         pane.paste(" + draft B");
         let b_draft = pane.editor.text().to_string();
-        assert!(matches!(pane.leave_edit(), NotesOutcome::Stay));
-        let b_generation = pane.pending_save.as_ref().unwrap().generation;
+        let NotesOutcome::Rpc(save_b) = pane.leave_edit() else {
+            panic!("B is handed to the serialized app lane immediately");
+        };
+        assert_eq!(
+            pane.pending_generations,
+            VecDeque::from([save_a.generation, save_b.generation])
+        );
 
-        let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
+        let next = pane.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 0,
-            generation: b_generation,
+            generation: save_a.generation,
             error: None,
             project_root: "/proj".into(),
-            notes: vec![note(id, "ideas", &b_draft)],
+            notes: vec![note(id, "ideas", "draft A")],
             selection: SelectionAfterRpc::Keep(id),
             enter_edit: false,
         }));
-        assert_eq!(pane.in_flight_generation, Some(save_a.generation));
-        assert_eq!(pane.editor.text(), b_draft);
-
-        let save_b = pane
-            .apply_rpc_result(Ok(NotesRpcResult {
-                instance_id: 0,
-                generation: save_a.generation,
-                error: None,
-                project_root: "/proj".into(),
-                notes: vec![note(id, "ideas", "draft A")],
-                selection: SelectionAfterRpc::Keep(id),
-                enter_edit: false,
-            }))
-            .expect("B begins only after A completion");
-        assert_eq!(save_b.generation, b_generation);
+        assert!(next.is_none());
         assert!(matches!(save_b.kind, NotesRpcActionKind::Save { id: saved, .. } if saved == id));
         assert_eq!(pane.notes[0].content, "draft A");
         assert!(matches!(pane.mode, Mode::Editing { id: editing } if editing == id));
@@ -1836,9 +1804,9 @@ mod tests {
     }
 
     #[test]
-    fn projection_lane_orders_duplicate_and_distinct_mutations() {
+    fn confirmed_mutations_are_all_handed_to_the_same_app_lane() {
         let mut pane = pane(true);
-        pane.in_flight_generation = None;
+        pane.pending_generations.clear();
         let id = pane.notes[0].id;
         let (_, first) = pane
             .schedule_action(NotesRpcActionKind::Rename {
@@ -1846,46 +1814,26 @@ mod tests {
                 name: "first".into(),
             })
             .unwrap();
-        let first = first.expect("first starts");
         let (duplicate_generation, duplicate) = pane
             .schedule_action(NotesRpcActionKind::Rename {
                 id,
                 name: "first".into(),
             })
             .unwrap();
-        assert!(duplicate.is_none());
         let (delete_generation, delete) = pane
             .schedule_action(NotesRpcActionKind::Delete {
                 id,
                 fallback_index: 0,
             })
             .unwrap();
-        assert!(delete.is_none());
-
-        let duplicate = pane
-            .apply_rpc_result(Ok(NotesRpcResult {
-                instance_id: 0,
-                generation: first.generation,
-                error: None,
-                project_root: "/proj".into(),
-                notes: vec![note(id, "first", "before")],
-                selection: SelectionAfterRpc::Keep(id),
-                enter_edit: false,
-            }))
-            .expect("duplicate rename is next, never concurrent");
         assert_eq!(duplicate.generation, duplicate_generation);
-        let delete = pane
-            .apply_rpc_result(Ok(NotesRpcResult {
-                instance_id: 0,
-                generation: duplicate.generation,
-                error: None,
-                project_root: "/proj".into(),
-                notes: vec![note(id, "first", "before")],
-                selection: SelectionAfterRpc::Keep(id),
-                enter_edit: false,
-            }))
-            .expect("distinct delete follows both renames");
         assert_eq!(delete.generation, delete_generation);
+        assert_eq!(first.serialization_key(), duplicate.serialization_key());
+        assert_eq!(duplicate.serialization_key(), delete.serialization_key());
+        assert_eq!(
+            pane.pending_generations,
+            VecDeque::from([first.generation, duplicate_generation, delete_generation])
+        );
         assert!(
             matches!(delete.kind, NotesRpcActionKind::Delete { id: deleted, .. } if deleted == id)
         );
@@ -1899,7 +1847,7 @@ mod tests {
 
         let mut reopened = pane(true);
         reopened.instance_id = second_instance;
-        reopened.in_flight_generation = Some(1);
+        reopened.pending_generations = VecDeque::from([1]);
         let original = reopened.notes.clone();
         let foreign_note = Uuid::new_v4();
 
@@ -1913,13 +1861,13 @@ mod tests {
             enter_edit: false,
         }));
         assert_eq!(reopened.notes, original);
-        assert_eq!(reopened.in_flight_generation, Some(1));
+        assert_eq!(reopened.pending_generations.front().copied(), Some(1));
         assert!(
             reopened
                 .apply_transport_error(first_instance, 1, "closed pane error".into())
                 .is_none()
         );
-        assert_eq!(reopened.in_flight_generation, Some(1));
+        assert_eq!(reopened.pending_generations.front().copied(), Some(1));
 
         let current_note = Uuid::new_v4();
         let _ = reopened.apply_rpc_result(Ok(NotesRpcResult {
@@ -1932,7 +1880,7 @@ mod tests {
             enter_edit: false,
         }));
         assert_eq!(reopened.notes[0].id, current_note);
-        assert_eq!(reopened.in_flight_generation, None);
+        assert_eq!(reopened.pending_generations.front().copied(), None);
 
         let _ = reopened.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: first_instance,
@@ -1953,10 +1901,10 @@ mod tests {
     }
 
     #[test]
-    fn transport_error_advances_one_queued_action_and_duplicate_is_inert() {
+    fn transport_error_settles_one_generation_and_duplicate_is_inert() {
         let mut pane = pane(true);
         pane.instance_id = 41;
-        pane.in_flight_generation = None;
+        pane.pending_generations.clear();
         pane.enter_edit();
         let id = pane.notes[0].id;
         pane.editor.set("first draft".into());
@@ -1965,15 +1913,19 @@ mod tests {
         };
         pane.paste(" plus queued draft");
         let queued_draft = pane.editor.text().to_string();
-        assert!(matches!(pane.leave_edit(), NotesOutcome::Stay));
-        let queued_generation = pane.pending_save.as_ref().unwrap().generation;
+        let NotesOutcome::Rpc(second) = pane.leave_edit() else {
+            panic!("second save is handed to the app lane immediately");
+        };
+        let queued_generation = second.generation;
 
-        let second = pane
-            .apply_transport_error(41, first.generation, "worker stopped".into())
-            .expect("exact current error advances one queued action");
+        let next = pane.apply_transport_error(41, first.generation, "worker stopped".into());
+        assert!(next.is_none(), "the app lane owns release and dispatch");
         assert_eq!(second.instance_id, 41);
         assert_eq!(second.generation, queued_generation);
-        assert_eq!(pane.in_flight_generation, Some(queued_generation));
+        assert_eq!(
+            pane.pending_generations.front().copied(),
+            Some(queued_generation)
+        );
         assert_eq!(pane.editor.text(), queued_draft);
         assert!(matches!(pane.mode, Mode::Editing { id: editing } if editing == id));
 
@@ -1985,8 +1937,10 @@ mod tests {
             pane.apply_transport_error(40, queued_generation, "wrong pane".into())
                 .is_none()
         );
-        assert_eq!(pane.in_flight_generation, Some(queued_generation));
-        assert!(pane.queued_actions.is_empty());
+        assert_eq!(
+            pane.pending_generations.front().copied(),
+            Some(queued_generation)
+        );
 
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 41,
@@ -1998,7 +1952,7 @@ mod tests {
             enter_edit: false,
         }));
         assert_eq!(pane.notes[0].content, queued_draft);
-        assert_eq!(pane.in_flight_generation, None);
+        assert_eq!(pane.pending_generations.front().copied(), None);
     }
 
     #[test]
@@ -2012,7 +1966,7 @@ mod tests {
             note(next, "next", "c"),
         ];
         pane.select_sidebar(1);
-        pane.in_flight_generation = Some(1);
+        pane.pending_generations = VecDeque::from([1]);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 0,
             generation: 1,
@@ -2025,7 +1979,7 @@ mod tests {
         assert_eq!(pane.selection, SidebarSelection::Note(next));
 
         pane.operation_generation = 2;
-        pane.in_flight_generation = Some(2);
+        pane.pending_generations = VecDeque::from([2]);
         let _ = pane.apply_rpc_result(Ok(NotesRpcResult {
             instance_id: 0,
             generation: 2,

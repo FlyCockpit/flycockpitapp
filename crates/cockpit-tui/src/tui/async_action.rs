@@ -1644,6 +1644,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serialized_notes_intents_outlive_view_and_error_releases_once() {
+        let mut runner = AsyncActionRunner::default();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_first, first_barrier) = oneshot::channel::<()>();
+        let key = AsyncActionKey::new("notes.projection:/proj");
+        let first_order = Arc::clone(&order);
+        runner.start_serialized(
+            AsyncActionKind::NotesProjection {
+                instance_id: 1,
+                generation: 1,
+            },
+            key.clone(),
+            async move {
+                first_barrier.await.unwrap();
+                first_order.lock().unwrap().push(1);
+                Err("first worker failed".into())
+            },
+        );
+        let second_order = Arc::clone(&order);
+        runner.start_serialized(
+            AsyncActionKind::NotesProjection {
+                instance_id: 1,
+                generation: 2,
+            },
+            key,
+            async move {
+                second_order.lock().unwrap().push(2);
+                Ok(AsyncActionPayload::Unit)
+            },
+        );
+
+        // No pane/view object is retained by either durable intent.
+        tokio::task::yield_now().await;
+        assert!(order.lock().unwrap().is_empty());
+        release_first.send(()).unwrap();
+        let results = wait_for_results(&mut runner).await;
+        assert_eq!(*order.lock().unwrap(), [1, 2]);
+        assert_eq!(results.len(), 2, "each intent settles exactly once");
+        assert!(results.iter().any(|result| result.payload.is_err()));
+        assert!(results.iter().any(|result| result.payload.is_ok()));
+    }
+
+    #[tokio::test]
     async fn owned_async_action_timeout_is_terminal_and_late_completion_is_rejected() {
         let mut runner = AsyncActionRunner::default();
         let (release, barrier) = oneshot::channel::<()>();

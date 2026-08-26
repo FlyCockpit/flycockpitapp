@@ -1744,9 +1744,7 @@ impl App {
                 } else {
                     None
                 };
-                if let Some(action) = next {
-                    self.start_notes_rpc_action(action);
-                }
+                debug_assert!(next.is_none(), "notes actions are app-lane owned");
             }
             AsyncActionKind::Internal("leaks.rpc") => {
                 if let Overlay::Leaks(pane) = &mut self.overlay {

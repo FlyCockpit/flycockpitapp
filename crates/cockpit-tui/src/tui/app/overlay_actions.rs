@@ -71,16 +71,15 @@ impl App {
             instance_id: action.instance_id(),
             generation: action.generation(),
         };
-        self.async_actions.start_blocking(
-            kind,
-            crate::tui::async_action::AsyncActionPolicy::AllowConcurrent,
-            move || {
-                action
-                    .run_blocking_rpc(endpoint)
-                    .map(crate::tui::async_action::AsyncActionPayload::NotesRpc)
-                    .map_err(|e| e.to_string())
-            },
-        );
+        let key = crate::tui::async_action::AsyncActionKey::new(action.serialization_key());
+        self.async_actions.start_serialized(kind, key, async move {
+            let result = tokio::task::spawn_blocking(move || action.run_blocking_rpc(endpoint))
+                .await
+                .map_err(|error| format!("notes rpc worker failed: {error}"))?;
+            result
+                .map(crate::tui::async_action::AsyncActionPayload::NotesRpc)
+                .map_err(|error| error.to_string())
+        });
     }
 
     /// Open the `/leaks` pane (replacing the interim transcript list) and kick

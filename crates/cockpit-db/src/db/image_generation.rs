@@ -631,6 +631,242 @@ fn execute_image_handoff_outcome_transitions_conn(
     Ok(())
 }
 
+fn execute_reconciliation_claim_attempt_transition_conn(
+    conn: &Connection,
+    input: &ClaimImageGenerationReconciliation,
+    expected_version: u64,
+    observed_journal_version: u64,
+) -> Result<u64> {
+    let from = ImageGenerationAttemptState::SubmissionUnknown;
+    let to = ImageGenerationAttemptState::Reconciling;
+    ensure!(
+        attempt_transition_allowed(from, to),
+        "reconciliation claim attempt transition is not canonical"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("reconciliation claim attempt version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3 WHERE job_id=?4 AND slot_id=?5 AND attempt_number=?6 AND state=?7 AND version=?8",params![to.as_str(),i64::try_from(next)?,i64::try_from(observed_journal_version)?,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),from.as_str(),i64::try_from(expected_version)?])?==1,"reconciliation claim lost attempt compare-and-set");
+    Ok(next)
+}
+
+struct ReconciliationStateTransition<'a> {
+    authority: &'a SealedImageGenerationRecoveryAuthority,
+    attempt_from: ImageGenerationAttemptState,
+    attempt_to: ImageGenerationAttemptState,
+    slot_from: ImageGenerationSlotState,
+    slot_to: Option<ImageGenerationSlotState>,
+    journal_version: u64,
+    outcome: &'a str,
+    evidence_digest: &'a str,
+    retry: bool,
+}
+
+fn execute_reconciliation_state_transitions_conn(
+    conn: &Connection,
+    transition: &ReconciliationStateTransition<'_>,
+) -> Result<()> {
+    ensure!(
+        attempt_transition_allowed(transition.attempt_from, transition.attempt_to),
+        "reconciliation attempt transition is not canonical"
+    );
+    let attempt_next = transition
+        .authority
+        .attempt_version
+        .checked_add(1)
+        .context("reconciliation attempt version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,nonacceptance_evidence_digest=CASE WHEN ?4='authoritative_nonacceptance' THEN ?5 ELSE NULL END WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state=?9 AND version=?10 AND external_operation_id=?11",params![transition.attempt_to.as_str(),i64::try_from(attempt_next)?,i64::try_from(transition.journal_version)?,transition.outcome,transition.evidence_digest,transition.authority.job_id.to_string(),transition.authority.slot_id.to_string(),i64::from(transition.authority.attempt_number),transition.attempt_from.as_str(),i64::try_from(transition.authority.attempt_version)?,transition.authority.external_operation_id.to_string()])?==1,"reconciliation lost attempt compare-and-set");
+    if let Some(slot_to) = transition.slot_to {
+        let allowed = if transition.retry {
+            IMAGE_SLOT_CONDITIONAL_EDGES
+                .contains(&(transition.slot_from.as_str(), slot_to.as_str()))
+        } else {
+            slot_transition_allowed(transition.slot_from, slot_to)
+        };
+        ensure!(allowed, "reconciliation slot transition is not canonical");
+        let slot_next = transition
+            .authority
+            .slot_version
+            .checked_add(1)
+            .context("reconciliation slot version overflow")?;
+        ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,failure_reason=CASE WHEN ?1='failed' THEN ?3 ELSE NULL END WHERE job_id=?4 AND slot_id=?5 AND state=?6 AND version=?7",params![slot_to.as_str(),i64::try_from(slot_next)?,transition.outcome,transition.authority.job_id.to_string(),transition.authority.slot_id.to_string(),transition.slot_from.as_str(),i64::try_from(transition.authority.slot_version)?])?==1,"reconciliation lost slot compare-and-set");
+    }
+    Ok(())
+}
+
+struct AcceptedResponseFailureTransition<'a, 'b> {
+    input: &'a CommitAcceptedImageResponseFailure<'b>,
+    attempt_from: ImageGenerationAttemptState,
+    slot_from: ImageGenerationSlotState,
+}
+
+fn execute_accepted_response_failure_transitions_conn(
+    conn: &Connection,
+    transition: &AcceptedResponseFailureTransition<'_, '_>,
+) -> Result<()> {
+    let input = transition.input;
+    ensure!(
+        attempt_transition_allowed(
+            transition.attempt_from,
+            ImageGenerationAttemptState::FailedAfterAcceptance
+        ),
+        "accepted response failure attempt transition is not canonical"
+    );
+    ensure!(
+        slot_transition_allowed(transition.slot_from, ImageGenerationSlotState::Failed),
+        "accepted response failure slot transition is not canonical"
+    );
+    let attempt_next = input
+        .expected_attempt_version
+        .checked_add(1)
+        .context("accepted response failure attempt version overflow")?;
+    let slot_next = input
+        .expected_slot_version
+        .checked_add(1)
+        .context("accepted response failure slot version overflow")?;
+    let journal_next = input
+        .expected_journal_version
+        .checked_add(1)
+        .context("accepted response failure journal version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state='failed_after_acceptance',version=?1,observed_journal_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state=?6 AND version=?7 AND external_operation_id=?8",params![i64::try_from(attempt_next)?,i64::try_from(journal_next)?,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),transition.attempt_from.as_str(),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()])?==1,"accepted response failure lost attempt compare-and-set");
+    ensure!(conn.execute("UPDATE image_generation_slots SET state='failed',version=?1,failure_reason=?2 WHERE job_id=?3 AND slot_id=?4 AND state=?5 AND version=?6",params![i64::try_from(slot_next)?,input.safe_reason,input.job_id.to_string(),input.slot_id.to_string(),transition.slot_from.as_str(),i64::try_from(input.expected_slot_version)?])?==1,"accepted response failure lost slot compare-and-set");
+    Ok(())
+}
+
+struct ResponseAdoptionTransition<'a, 'b> {
+    input: &'a AdoptImageGenerationResponse<'b>,
+    attempt_from: ImageGenerationAttemptState,
+    attempt_to: ImageGenerationAttemptState,
+    slot_from: ImageGenerationSlotState,
+    slot_to: ImageGenerationSlotState,
+    slot_expected_version: u64,
+    cancellation_version: Option<i64>,
+}
+
+fn execute_response_adoption_transitions_conn(
+    conn: &Connection,
+    transition: &ResponseAdoptionTransition<'_, '_>,
+) -> Result<()> {
+    let input = transition.input;
+    ensure!(
+        attempt_transition_allowed(transition.attempt_from, transition.attempt_to),
+        "response adoption attempt transition is not canonical"
+    );
+    ensure!(
+        slot_transition_allowed(transition.slot_from, transition.slot_to),
+        "response adoption slot transition is not canonical"
+    );
+    let attempt_next = input
+        .expected_attempt_version
+        .checked_add(1)
+        .context("response adoption attempt version overflow")?;
+    let slot_next = transition
+        .slot_expected_version
+        .checked_add(1)
+        .context("response adoption slot version overflow")?;
+    let journal_next = input
+        .expected_journal_version
+        .checked_add(1)
+        .context("response adoption journal version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,applied_cancellation_version=?4,response_digest=?5 WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state=?9 AND version=?10 AND external_operation_id=?11",params![transition.attempt_to.as_str(),i64::try_from(attempt_next)?,i64::try_from(journal_next)?,transition.cancellation_version,input.response_digest,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),transition.attempt_from.as_str(),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()])?==1,"attempt response adoption lost its compare-and-set");
+    ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,applied_cancellation_version=?3,result_after_cancel=?4 WHERE job_id=?5 AND slot_id=?6 AND state=?7 AND version=?8",params![transition.slot_to.as_str(),i64::try_from(slot_next)?,transition.cancellation_version,i64::from(transition.cancellation_version.is_some()),input.job_id.to_string(),input.slot_id.to_string(),transition.slot_from.as_str(),i64::try_from(transition.slot_expected_version)?])?==1,"slot response adoption lost its compare-and-set");
+    Ok(())
+}
+
+fn execute_deadline_attempt_journal_binding_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    operation_id: Uuid,
+    expected_version: u64,
+    next_version: u64,
+) -> Result<()> {
+    ensure!(
+        next_version
+            == expected_version
+                .checked_add(1)
+                .context("deadline journal version overflow")?,
+        "deadline journal binding did not advance exactly once"
+    );
+    ensure!(conn.execute("UPDATE image_generation_attempts SET observed_journal_version=?1 WHERE job_id=?2 AND external_operation_id=?3 AND observed_journal_version=?4",params![i64::try_from(next_version)?,job_id.to_string(),operation_id.to_string(),i64::try_from(expected_version)?])?==1,"deadline expiry lost attempt journal binding");
+    Ok(())
+}
+
+fn execute_cancellation_attempt_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    attempt_number: u32,
+    from: ImageGenerationAttemptState,
+    expected_version: u64,
+    to: ImageGenerationAttemptState,
+    cancellation_version: u64,
+) -> Result<u64> {
+    ensure!(
+        attempt_transition_allowed(from, to),
+        "attempt cannot accept cancellation"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("cancellation attempt version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,applied_cancellation_version=?3 WHERE job_id=?4 AND slot_id=?5 AND attempt_number=?6 AND state=?7 AND version=?8",params![to.as_str(),i64::try_from(next)?,i64::try_from(cancellation_version)?,job_id.to_string(),slot_id.to_string(),i64::from(attempt_number),from.as_str(),i64::try_from(expected_version)?])?==1,"cancellation lost attempt compare-and-set");
+    Ok(next)
+}
+
+fn execute_cancellation_slot_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    from: ImageGenerationSlotState,
+    expected_version: u64,
+    to: ImageGenerationSlotState,
+    cancellation_version: u64,
+    result_after_cancel: bool,
+) -> Result<u64> {
+    ensure!(
+        slot_transition_allowed(from, to),
+        "slot cannot accept cancellation"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("cancellation slot version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,applied_cancellation_version=?3,result_after_cancel=?4 WHERE job_id=?5 AND slot_id=?6 AND state=?7 AND version=?8",params![to.as_str(),i64::try_from(next)?,i64::try_from(cancellation_version)?,i64::from(result_after_cancel),job_id.to_string(),slot_id.to_string(),from.as_str(),i64::try_from(expected_version)?])?==1,"cancellation lost slot compare-and-set");
+    Ok(next)
+}
+
+fn execute_validating_slot_cancellation_marker_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    expected_version: u64,
+    cancellation_version: u64,
+) -> Result<u64> {
+    let next = expected_version
+        .checked_add(1)
+        .context("validating cancellation marker version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_slots SET version=?1,applied_cancellation_version=?2,result_after_cancel=1 WHERE job_id=?3 AND slot_id=?4 AND state='validating' AND version=?5 AND applied_cancellation_version IS NULL",params![i64::try_from(next)?,i64::try_from(cancellation_version)?,job_id.to_string(),slot_id.to_string(),i64::try_from(expected_version)?])?==1,"validating result lost cancellation compare-and-set");
+    Ok(next)
+}
+
+fn execute_late_publication_slot_transition_conn(
+    conn: &Connection,
+    job_id: Uuid,
+    slot_id: Uuid,
+    expected_version: u64,
+) -> Result<u64> {
+    ensure!(
+        slot_transition_allowed(
+            ImageGenerationSlotState::LateQuarantined,
+            ImageGenerationSlotState::Published
+        ),
+        "late publication slot transition is not canonical"
+    );
+    let next = expected_version
+        .checked_add(1)
+        .context("late publication slot version overflow")?;
+    ensure!(conn.execute("UPDATE image_generation_slots SET state='published',version=?1,published_disposition='late_authorized',published_disposition_generation=?1 WHERE job_id=?2 AND slot_id=?3 AND state='late_quarantined' AND version=?4 AND result_after_cancel=1 AND applied_cancellation_version IS NOT NULL",params![i64::try_from(next)?,job_id.to_string(),slot_id.to_string(),i64::try_from(expected_version)?])?==1,"late publication slot compare-and-set lost");
+    Ok(next)
+}
+
 pub const fn slot_is_job_settled(state: ImageGenerationSlotState) -> bool {
     use ImageGenerationSlotState as S;
     matches!(
@@ -2176,7 +2412,12 @@ impl Db {
                     ExternalTransitionOutcome::Committed(record) => record,
                     _ => anyhow::bail!("reconciliation claim lost journal compare-and-set"),
                 };
-                ensure!(conn.execute("UPDATE image_generation_attempts SET state='reconciling',version=version+1,observed_journal_version=?1 WHERE job_id=?2 AND slot_id=?3 AND attempt_number=?4 AND state='submission_unknown' AND version=?5",params![record.version,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),attempt_version])?==1,"reconciliation claim lost attempt compare-and-set");
+                execute_reconciliation_claim_attempt_transition_conn(
+                    conn,
+                    input,
+                    u64::try_from(attempt_version)?,
+                    u64::try_from(record.version)?,
+                )?;
             }
             let mut authority = Self::image_generation_recovery_authority_conn(
                 conn,
@@ -2395,31 +2636,34 @@ impl Db {
             evidence_inserted == 1,
             "reconciliation evidence identity is not bound"
         );
-        let attempt_changed=conn.execute("UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,nonacceptance_evidence_digest=CASE WHEN ?4='authoritative_nonacceptance' THEN ?5 ELSE NULL END WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state=?9 AND version=?10 AND external_operation_id=?11",params![attempt_next.as_str(),i64::try_from(input.attempt_version+1)?,i64::try_from(journal_version)?,outcome,evidence_digest,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),attempt_state.as_str(),i64::try_from(input.attempt_version)?,input.external_operation_id.to_string()])?;
-        ensure!(
-            attempt_changed == 1,
-            "reconciliation lost attempt compare-and-set"
-        );
         if retry.is_some() {
             ensure!(conn.execute("INSERT INTO image_generation_attempt_activation_facts(job_id,slot_id,attempt_number,activation_reason,prior_attempt_number,activated_at_unix_ms) VALUES(?1,?2,?3,'authoritative_retry',?4,?5)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(next_attempt_number),i64::from(input.attempt_number),proof.now_unix_ms])?==1,"reconciled retry activation was not recorded");
         }
-        if matches!(
+        let accepted_during_cancellation = matches!(
             proof.outcome,
             ImageGenerationReconciliationOutcome::AuthoritativeAccepted
-        ) && cancellation.is_some()
-        {
+        ) && cancellation.is_some();
+        if accepted_during_cancellation {
             ensure!(
                 slot_state == ImageGenerationSlotState::CancellationRequested
                     && slot_version == i64::try_from(input.slot_version)?,
                 "accepted cancellation reconciliation lost its no-op slot authority"
             );
-        } else {
-            let slot_changed=conn.execute("UPDATE image_generation_slots SET state=?1,version=?2,failure_reason=CASE WHEN ?1='failed' THEN ?3 ELSE NULL END WHERE job_id=?4 AND slot_id=?5 AND state=?6 AND version=?7",params![slot_next.as_str(),i64::try_from(input.slot_version+1)?,outcome,input.job_id.to_string(),input.slot_id.to_string(),slot_state.as_str(),i64::try_from(input.slot_version)?])?;
-            ensure!(
-                slot_changed == 1,
-                "reconciliation lost slot compare-and-set"
-            );
         }
+        execute_reconciliation_state_transitions_conn(
+            conn,
+            &ReconciliationStateTransition {
+                authority: input,
+                attempt_from: attempt_state,
+                attempt_to: attempt_next,
+                slot_from: slot_state,
+                slot_to: (!accepted_during_cancellation).then_some(slot_next),
+                journal_version,
+                outcome,
+                evidence_digest,
+                retry: retry.is_some(),
+            },
+        )?;
         if retry.is_some() {
             execute_image_job_transition_conn(
                 conn,
@@ -2819,6 +3063,15 @@ impl Db {
         atomic_conn(conn, "image_generation_accepted_response_failure", || {
             let bound: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM image_generation_response_fetch_outcomes WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND outcome='definitive_failure' AND safe_reason=?4) OR EXISTS(SELECT 1 FROM image_generation_response_reconciliations WHERE job_id=?1 AND slot_id=?2 AND attempt_number=?3 AND outcome='definitive_failure' AND safe_reason=?4)",params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),input.safe_reason],|row|row.get(0))?;
             ensure!(bound, "accepted response failure evidence is absent");
+            let (attempt_from, slot_from): (String, String) = conn.query_row(
+                "SELECT a.state,s.state FROM image_generation_attempts a JOIN image_generation_slots s USING(job_id,slot_id) WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.version=?4 AND s.version=?5",
+                params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,i64::try_from(input.expected_slot_version)?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).context("accepted response failure authority is unavailable")?;
+            let attempt_from = ImageGenerationAttemptState::parse(&attempt_from)
+                .context("accepted response failure attempt state is unknown")?;
+            let slot_from = ImageGenerationSlotState::parse(&slot_from)
+                .context("accepted response failure slot state is unknown")?;
             match transition_external_operation_conn(
                 conn,
                 input.external_operation_id,
@@ -2829,8 +3082,14 @@ impl Db {
                 ExternalTransitionOutcome::Committed(_) => {}
                 _ => anyhow::bail!("accepted response failure lost journal compare-and-set"),
             }
-            ensure!(conn.execute("UPDATE image_generation_attempts SET state='failed_after_acceptance',version=version+1,observed_journal_version=?1 WHERE job_id=?2 AND slot_id=?3 AND attempt_number=?4 AND state IN ('accepted','downloading','cancellation_requested') AND version=?5 AND external_operation_id=?6",params![i64::try_from(input.expected_journal_version+1)?,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()])?==1,"accepted response failure lost attempt compare-and-set");
-            ensure!(conn.execute("UPDATE image_generation_slots SET state='failed',version=version+1,failure_reason=?1 WHERE job_id=?2 AND slot_id=?3 AND state IN ('running','downloading','cancellation_requested') AND version=?4",params![input.safe_reason,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(input.expected_slot_version)?])?==1,"accepted response failure lost slot compare-and-set");
+            execute_accepted_response_failure_transitions_conn(
+                conn,
+                &AcceptedResponseFailureTransition {
+                    input,
+                    attempt_from,
+                    slot_from,
+                },
+            )?;
             commit_terminal_job_projection_conn(conn, input.job_id, input.at_unix_ms)?;
             Ok(())
         })
@@ -2924,6 +3183,15 @@ impl Db {
             "SELECT cancellation_version FROM image_generation_cancellation_facts WHERE job_id=?1",
             [input.job_id.to_string()], |row| row.get(0),
         ).optional()?;
+        let (attempt_from, slot_from): (String, String) = conn.query_row(
+            "SELECT a.state,s.state FROM image_generation_attempts a JOIN image_generation_slots s USING(job_id,slot_id) WHERE a.job_id=?1 AND a.slot_id=?2 AND a.attempt_number=?3 AND a.version=?4 AND s.version=?5",
+            params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,i64::try_from(input.expected_slot_version)?],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).context("response adoption authority is unavailable")?;
+        let attempt_from = ImageGenerationAttemptState::parse(&attempt_from)
+            .context("response adoption attempt state is unknown")?;
+        let mut slot_from = ImageGenerationSlotState::parse(&slot_from)
+            .context("response adoption slot state is unknown")?;
         let ordering = cancellation.map_or(ResponseAdoptionOrdering::Ordinary, |version| {
             ResponseAdoptionOrdering::ResponseAfterCancellation {
                 cancellation_version: version as u64,
@@ -2968,24 +3236,16 @@ impl Db {
                 "image generation response adoption attempt transition is not canonical"
             );
         }
-        let next_attempt_version = input
-            .expected_attempt_version
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("attempt version overflow"))?;
+        ensure!(
+            attempt_sources.contains(&attempt_from),
+            "response adoption attempt source state is unavailable"
+        );
         if let Some(cancellation_version) = cancellation {
             conn.execute(
                 "INSERT INTO image_generation_cancelled_result_facts(job_id,slot_id,attempt_number,cancellation_version,response_digest,journal_terminal_version,ordering) VALUES(?1,?2,?3,?4,?5,?6,'response_after_cancellation')",
                 params![input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),cancellation_version,input.response_digest,i64::try_from(input.expected_journal_version+1)?],
             )?;
         }
-        let changed = conn.execute(
-            "UPDATE image_generation_attempts SET state=?1,version=?2,observed_journal_version=?3,applied_cancellation_version=?4,response_digest=?5 WHERE job_id=?6 AND slot_id=?7 AND attempt_number=?8 AND state IN ('accepted','downloading','cancellation_requested') AND version=?9 AND external_operation_id=?10",
-            params![attempt_next.as_str(),i64::try_from(next_attempt_version)?,i64::try_from(input.expected_journal_version+1)?,applied_cancellation,input.response_digest,input.job_id.to_string(),input.slot_id.to_string(),i64::from(input.attempt_number),i64::try_from(input.expected_attempt_version)?,input.external_operation_id.to_string()],
-        )?;
-        ensure!(
-            changed == 1,
-            "attempt response adoption lost its compare-and-set"
-        );
         let slot_next = ImageGenerationSlotState::Validating;
         ensure!(
             slot_transition_allowed(ImageGenerationSlotState::Downloading, slot_next),
@@ -3001,23 +3261,29 @@ impl Db {
             );
         }
         let mut slot_expected_version = input.expected_slot_version;
-        if cancellation.is_some() {
-            let changed=conn.execute(
-                "UPDATE image_generation_slots SET state='downloading',version=?1 WHERE job_id=?2 AND slot_id=?3 AND state='cancellation_requested' AND version=?4",
-                params![i64::try_from(slot_expected_version+1)?,input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(slot_expected_version)?],
+        if cancellation.is_some() && slot_from == ImageGenerationSlotState::CancellationRequested {
+            slot_expected_version = execute_basic_image_slot_transition_conn(
+                conn,
+                input.job_id,
+                input.slot_id,
+                slot_from,
+                slot_expected_version,
+                ImageGenerationSlotState::Downloading,
             )?;
-            if changed == 1 {
-                slot_expected_version += 1;
-            }
+            slot_from = ImageGenerationSlotState::Downloading;
         }
-        let changed = conn.execute(
-            "UPDATE image_generation_slots SET state=?1,version=?2,applied_cancellation_version=?3,result_after_cancel=?4 WHERE job_id=?5 AND slot_id=?6 AND state='downloading' AND version=?7",
-            params![slot_next.as_str(),i64::try_from(slot_expected_version+1)?,applied_cancellation,i64::from(cancellation.is_some()),input.job_id.to_string(),input.slot_id.to_string(),i64::try_from(slot_expected_version)?],
+        execute_response_adoption_transitions_conn(
+            conn,
+            &ResponseAdoptionTransition {
+                input,
+                attempt_from,
+                attempt_to: attempt_next,
+                slot_from,
+                slot_to: slot_next,
+                slot_expected_version,
+                cancellation_version: applied_cancellation,
+            },
         )?;
-        ensure!(
-            changed == 1,
-            "slot response adoption lost its compare-and-set"
-        );
         Ok(ordering)
     }
 
@@ -3306,7 +3572,13 @@ impl Db {
                             anyhow::bail!("deadline expiry lost journal compare-and-set")
                         }
                     };
-                    ensure!(conn.execute("UPDATE image_generation_attempts SET observed_journal_version=?1 WHERE job_id=?2 AND external_operation_id=?3 AND observed_journal_version=?4",params![record.version,job_id.to_string(),operation_id.to_string(),version])?==1,"deadline expiry lost attempt journal binding");
+                    execute_deadline_attempt_journal_binding_conn(
+                        conn,
+                        job_id,
+                        operation_id,
+                        u64::try_from(version)?,
+                        u64::try_from(record.version)?,
+                    )?;
                 }
             }
             let cancellation_version = 1_u64;
@@ -3436,11 +3708,16 @@ impl Db {
                         inserted == 1,
                         "adopted response lost cancellation/publication compare-and-set"
                     );
-                    let changed=conn.execute("UPDATE image_generation_attempts SET state='completed_after_cancel',version=?1,applied_cancellation_version=?2 WHERE job_id=?3 AND slot_id=?4 AND attempt_number=?5 AND state='response_adopted' AND version=?6",params![version+1,cancellation_version,input.job_id.to_string(),&slot_id,attempt_number,version])?;
-                    ensure!(
-                        changed == 1,
-                        "adopted response cancellation lost attempt compare-and-set"
-                    );
+                    execute_cancellation_attempt_transition_conn(
+                        conn,
+                        input.job_id,
+                        Uuid::parse_str(&slot_id)?,
+                        u32::try_from(attempt_number)?,
+                        ImageGenerationAttemptState::ResponseAdopted,
+                        u64::try_from(version)?,
+                        ImageGenerationAttemptState::CompletedAfterCancel,
+                        input.cancellation_version,
+                    )?;
                     continue;
                 }
                 let attempt_handoff_possible = matches!(
@@ -3490,28 +3767,28 @@ impl Db {
                 } else {
                     ImageGenerationAttemptState::Cancelled
                 };
-                ensure!(
-                    attempt_transition_allowed(
-                        ImageGenerationAttemptState::parse(&state)
-                            .ok_or_else(|| anyhow::anyhow!("unknown attempt state"))?,
-                        next
-                    ),
-                    "attempt cannot accept cancellation"
-                );
-                let changed=conn.execute(
-                    "UPDATE image_generation_attempts SET state=?1,version=?2,applied_cancellation_version=?3 WHERE job_id=?4 AND slot_id=?5 AND attempt_number=?6 AND state=?7 AND version=?8",
-                    params![next.as_str(),version+1,cancellation_version,input.job_id.to_string(),&slot_id,attempt_number,&state,version],
+                execute_cancellation_attempt_transition_conn(
+                    conn,
+                    input.job_id,
+                    Uuid::parse_str(&slot_id)?,
+                    u32::try_from(attempt_number)?,
+                    ImageGenerationAttemptState::parse(&state)
+                        .ok_or_else(|| anyhow::anyhow!("unknown attempt state"))?,
+                    u64::try_from(version)?,
+                    next,
+                    input.cancellation_version,
                 )?;
-                ensure!(changed == 1, "cancellation lost attempt compare-and-set");
             }
             let current = ImageGenerationSlotState::parse(&slot_state)
                 .ok_or_else(|| anyhow::anyhow!("unknown slot state"))?;
             if response_adopted && slot_state == "validating" {
-                let changed=conn.execute("UPDATE image_generation_slots SET version=?1,applied_cancellation_version=?2,result_after_cancel=1 WHERE job_id=?3 AND slot_id=?4 AND state='validating' AND version=?5 AND applied_cancellation_version IS NULL",params![slot_version+1,cancellation_version,input.job_id.to_string(),&slot_id,slot_version])?;
-                ensure!(
-                    changed == 1,
-                    "validating result lost cancellation compare-and-set"
-                );
+                execute_validating_slot_cancellation_marker_conn(
+                    conn,
+                    input.job_id,
+                    Uuid::parse_str(&slot_id)?,
+                    u64::try_from(slot_version)?,
+                    input.cancellation_version,
+                )?;
                 continue;
             }
             let next = if response_adopted && slot_state == "ready_to_publish" {
@@ -3521,15 +3798,16 @@ impl Db {
             } else {
                 ImageGenerationSlotState::Cancelled
             };
-            ensure!(
-                slot_transition_allowed(current, next),
-                "slot cannot accept cancellation"
-            );
-            let changed=conn.execute(
-                "UPDATE image_generation_slots SET state=?1,version=?2,applied_cancellation_version=?3,result_after_cancel=?4 WHERE job_id=?5 AND slot_id=?6 AND state=?7 AND version=?8",
-                params![next.as_str(),slot_version+1,cancellation_version,i64::from(response_adopted),input.job_id.to_string(),&slot_id,&slot_state,slot_version],
+            execute_cancellation_slot_transition_conn(
+                conn,
+                input.job_id,
+                Uuid::parse_str(&slot_id)?,
+                current,
+                u64::try_from(slot_version)?,
+                next,
+                input.cancellation_version,
+                response_adopted,
             )?;
-            ensure!(changed == 1, "cancellation lost slot compare-and-set");
         }
         let (job_state, job_version): (String, i64) = conn.query_row(
             "SELECT state,version FROM image_generation_jobs WHERE job_id=?1",
@@ -4756,7 +5034,12 @@ fn finalize_image_generation_late_publication_at_conn(
         u64::try_from(projection.artifact_generation)?,
         now_unix_ms,
     )?;
-    ensure!(tx.execute("UPDATE image_generation_slots SET state='published',version=version+1,published_disposition='late_authorized',published_disposition_generation=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='late_quarantined' AND version=?3 AND result_after_cancel=1 AND applied_cancellation_version IS NOT NULL",params![projection.job_id,projection.slot_id,projection.slot_version])?==1,"late publication slot compare-and-set lost");
+    execute_late_publication_slot_transition_conn(
+        &tx,
+        Uuid::parse_str(&projection.job_id)?,
+        Uuid::parse_str(&projection.slot_id)?,
+        u64::try_from(projection.slot_version)?,
+    )?;
     tx.commit()?;
     Ok(())
 }

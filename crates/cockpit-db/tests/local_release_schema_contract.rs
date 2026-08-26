@@ -30,10 +30,44 @@ fn is_runtime_managed_table(name: &str) -> bool {
             | "session_fts"
             | "session_fts_data"
             | "session_fts_idx"
-            | "session_fts_content"
             | "session_fts_docsize"
             | "session_fts_config"
     )
+}
+
+fn assert_session_fts_runtime_contract(conn: &Connection, local_sql: &str) {
+    let declaration = local_sql
+        .split("CREATE VIRTUAL TABLE session_fts")
+        .nth(1)
+        .and_then(|tail| tail.split_once(");").map(|(body, _)| body))
+        .expect("session_fts virtual-table declaration must exist");
+    assert_eq!(
+        declaration, " USING fts5(\n    body,\n    content=''\n",
+        "session_fts columns, tokenizer, or content options changed; review its runtime shadows"
+    );
+
+    let mut statement = conn
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type='table' AND name LIKE 'session_fts_%' AND name!='session_fts_docs'
+             ORDER BY name",
+        )
+        .unwrap();
+    let shadows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<BTreeSet<_>>>()
+        .unwrap();
+    assert_eq!(
+        shadows,
+        BTreeSet::from([
+            "session_fts_config".to_owned(),
+            "session_fts_data".to_owned(),
+            "session_fts_docsize".to_owned(),
+            "session_fts_idx".to_owned(),
+        ]),
+        "contentless session_fts must generate exactly the reviewed FTS5 shadows"
+    );
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -487,6 +521,7 @@ fn local_base_and_remote_extension_have_exact_physical_ownership() {
     local
         .execute_batch(local_sql)
         .expect("0001_initial.sql must execute as SQLite");
+    assert_session_fts_runtime_contract(&local, local_sql);
     let local_inventory = schema_inventory(&local);
     let local_tables = local_inventory.get("table").cloned().unwrap_or_default();
     let full = Connection::open_in_memory().unwrap();

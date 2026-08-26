@@ -328,7 +328,7 @@ pub struct AgentRunner {
     pub skill_inventory_names: Arc<Mutex<Option<std::collections::HashSet<String>>>>,
     /// Queue-edit foreground target from the attach snapshot. Live updates
     /// arrive as `TurnEvent::ForegroundInputTarget`.
-    pub foreground_target: Option<cockpit_core::engine::message::QueueTarget>,
+    pub foreground_target: Option<proto::QueueTarget>,
     /// Authoritative active-model snapshot from `Attach`, used to seed chrome
     /// before any later live active-model event arrives.
     pub active_model_state: Option<proto::ActiveModelState>,
@@ -543,7 +543,7 @@ impl AgentRunner {
             active_agent: Arc::new(Mutex::new("Build".to_string())),
             active_agent_path: Arc::new(Mutex::new(vec!["Build".to_string()])),
             skill_inventory_names: Arc::new(Mutex::new(None)),
-            foreground_target: Some(cockpit_core::engine::message::QueueTarget::root("Build")),
+            foreground_target: Some(proto::QueueTarget::root("Build")),
             active_model_state: None,
             session_id_state: Arc::new(Mutex::new(session_id)),
             attachment_epoch: Arc::new(AtomicU64::new(0)),
@@ -1482,7 +1482,7 @@ pub struct SessionSwitchOutcome {
     pub active_agent: String,
     pub active_agent_path: Vec<String>,
     pub last_applied_seq: Option<i64>,
-    pub foreground_target: Option<cockpit_core::engine::message::QueueTarget>,
+    pub foreground_target: Option<proto::QueueTarget>,
     pub active_model_state: Option<proto::ActiveModelState>,
     pub project_id: String,
     pub history: Vec<proto::HistoryEntry>,
@@ -4504,12 +4504,8 @@ fn queue_item_from_proto(
     cockpit_core::engine::message::QueuedUserMessage {
         id: item.id,
         status: match item.status {
-            proto::QueueItemStatus::Queued => {
-                cockpit_core::engine::message::QueueItemStatus::Queued
-            }
-            proto::QueueItemStatus::Folding => {
-                cockpit_core::engine::message::QueueItemStatus::Folding
-            }
+            proto::QueueItemStatus::Queued => proto::QueueItemStatus::Queued,
+            proto::QueueItemStatus::Folding => proto::QueueItemStatus::Folding,
         },
         text: item.text,
         display_text: item.display_text,
@@ -4517,10 +4513,8 @@ fn queue_item_from_proto(
     }
 }
 
-fn queue_target_from_proto(
-    target: proto::QueueTarget,
-) -> cockpit_core::engine::message::QueueTarget {
-    cockpit_core::engine::message::QueueTarget {
+fn queue_target_from_proto(target: proto::QueueTarget) -> proto::QueueTarget {
+    proto::QueueTarget {
         id: target.id,
         agent: target.agent,
         depth: target.depth,

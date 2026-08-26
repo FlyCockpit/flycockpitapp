@@ -17,6 +17,8 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::{Mutex, Notify, watch};
 use uuid::Uuid;
 
+pub use crate::daemon::proto::{QueueItemStatus, QueueTarget};
+
 /// Sentinel emitted in wire text by
 /// the TUI paste registry at each real-image
 /// position. We split on it here to interleave text and image content
@@ -211,13 +213,6 @@ impl SubmissionOrigin {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QueueItemStatus {
-    Queued,
-    Folding,
-}
-
 #[derive(Debug, Clone)]
 pub struct QueuedUserMessage {
     pub id: Uuid,
@@ -225,21 +220,6 @@ pub struct QueuedUserMessage {
     pub text: String,
     pub display_text: Option<String>,
     pub target: QueueTarget,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct QueueTarget {
-    pub id: String,
-    pub agent: String,
-    pub depth: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_call_id: Option<String>,
-}
-
-impl Default for QueueTarget {
-    fn default() -> Self {
-        Self::root("")
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1127,32 +1107,6 @@ fn queued_message_from_submission(item: &QueuedSubmission) -> QueuedUserMessage 
         text: item.submission.text.clone(),
         display_text: item.submission.display_text.clone(),
         target: item.target.clone(),
-    }
-}
-
-impl QueueTarget {
-    pub fn root(agent: impl Into<String>) -> Self {
-        Self {
-            id: "root".to_string(),
-            agent: agent.into(),
-            depth: 0,
-            task_call_id: None,
-        }
-    }
-
-    pub fn child(
-        agent: impl Into<String>,
-        depth: usize,
-        task_call_id: impl Into<String>,
-        label: impl AsRef<str>,
-    ) -> Self {
-        let task_call_id = task_call_id.into();
-        Self {
-            id: format!("task:{task_call_id}:{}", label.as_ref()),
-            agent: agent.into(),
-            depth,
-            task_call_id: Some(task_call_id),
-        }
     }
 }
 

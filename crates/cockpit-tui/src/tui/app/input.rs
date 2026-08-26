@@ -18,7 +18,8 @@ use super::{
 use crate::tui::agent_runner;
 use crate::tui::async_action::{AsyncActionKey, AsyncActionPayload, AsyncActionPolicy};
 use crate::tui::settings::Dialog;
-use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
+use cockpit_core::engine::message::QueuedUserMessage;
+use cockpit_proto::QueueItemStatus;
 use cockpit_proto::{self, Request, Response};
 
 async fn admit_image_ingress_via_daemon(
@@ -3371,7 +3372,7 @@ pub(super) fn optimistic_queue_item_with_id(
         status: QueueItemStatus::Queued,
         text,
         display_text,
-        target: cockpit_core::engine::message::QueueTarget::root(""),
+        target: cockpit_proto::QueueTarget::root(""),
     }
 }
 
@@ -3384,7 +3385,7 @@ pub(super) fn queue_item_from_proto(item: proto::QueueItem) -> QueuedUserMessage
         },
         text: item.text,
         display_text: item.display_text,
-        target: cockpit_core::engine::message::QueueTarget {
+        target: cockpit_proto::QueueTarget {
             id: item.target.id,
             agent: item.target.agent,
             depth: item.target.depth,

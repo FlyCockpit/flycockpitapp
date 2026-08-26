@@ -3228,13 +3228,45 @@ pub struct TagExpansionMeta {
     pub ok: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueueTarget {
     pub id: String,
     pub agent: String,
     pub depth: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_call_id: Option<String>,
+}
+
+impl Default for QueueTarget {
+    fn default() -> Self {
+        Self::root("")
+    }
+}
+
+impl QueueTarget {
+    pub fn root(agent: impl Into<String>) -> Self {
+        Self {
+            id: "root".to_string(),
+            agent: agent.into(),
+            depth: 0,
+            task_call_id: None,
+        }
+    }
+
+    pub fn child(
+        agent: impl Into<String>,
+        depth: usize,
+        task_call_id: impl Into<String>,
+        label: impl AsRef<str>,
+    ) -> Self {
+        let task_call_id = task_call_id.into();
+        Self {
+            id: format!("task:{task_call_id}:{}", label.as_ref()),
+            agent: agent.into(),
+            depth,
+            task_call_id: Some(task_call_id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

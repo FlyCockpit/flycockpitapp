@@ -9,10 +9,9 @@ use crate::tui::async_action::{
 use crate::tui::composer::Composer;
 use crate::tui::history::{HistoryEntry, PendingMsg};
 use cockpit_core::engine::TurnEvent;
-use cockpit_core::engine::message::{
-    QueueItemStatus, QueueTarget, QueuedUserMessage, UserSubmission,
-};
+use cockpit_core::engine::message::{QueuedUserMessage, UserSubmission};
 use cockpit_proto::{self, Request, Response};
+use cockpit_proto::{QueueItemStatus, QueueTarget};
 
 use super::{
     App, FreshQueueAck, RunnerAttachContinuation,

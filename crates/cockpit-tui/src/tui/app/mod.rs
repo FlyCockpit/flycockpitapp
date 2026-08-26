@@ -127,12 +127,13 @@ use crate::tui::history::{
 use crate::tui::input_source::{MAX_DRAIN_PER_PASS, ObservedTerminalEvent, TerminalInput};
 use crate::tui::settings::{self, Dialog, OAuthBeginResult, OAuthFlowOp, OAuthProvider};
 use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
-use cockpit_core::engine::message::{QueueTarget, QueuedUserMessage};
+use cockpit_core::engine::message::QueuedUserMessage;
 use cockpit_core::engine::{
     ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, TurnEvent,
 };
 use cockpit_core::git::{self, RepoStatus};
 use cockpit_core::welcome::{self, LaunchBundle, LaunchInfo};
+use cockpit_proto::QueueTarget;
 pub(super) use history_log::{DirtyScan, HistoryEntryId, HistoryLog};
 pub(super) use history_window::HistoryWindow;
 #[cfg(test)]

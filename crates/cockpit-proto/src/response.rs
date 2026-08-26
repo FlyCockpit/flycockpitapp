@@ -842,6 +842,14 @@ pub enum Response {
         sources: Vec<crate::GitReviewSourceResult>,
     },
 
+    GitRepoStatus {
+        status: Option<crate::RepoStatus>,
+    },
+
+    WorktreeRoot {
+        root: Option<String>,
+    },
+
     TerminalOpened {
         terminal_id: Uuid,
         viewer_count: usize,
@@ -1434,6 +1442,8 @@ macro_rules! response_variants {
             (Response::GitDiffFile { .. }, "git_diff_file");
             (Response::GitDiff { .. }, "git_diff");
             (Response::GitReviewSources { .. }, "git_review_sources");
+            (Response::GitRepoStatus { .. }, "git_repo_status");
+            (Response::WorktreeRoot { .. }, "worktree_root");
             (Response::TerminalOpened { .. }, "terminal_opened");
             (Response::LspControlResult { .. }, "lsp_control_result");
             (Response::DaemonStatus { .. }, "daemon_status");

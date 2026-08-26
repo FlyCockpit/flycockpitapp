@@ -466,6 +466,18 @@
     },
     "request": "git_review_sources"
   },
+  "git_repo_status": {
+    "params": {
+      "project_root": "project_root-fixture"
+    },
+    "request": "git_repo_status"
+  },
+  "find_worktree_root": {
+    "params": {
+      "path": "path-fixture"
+    },
+    "request": "find_worktree_root"
+  },
   "git_status": {
     "params": {
       "project_root": "project_root-fixture"

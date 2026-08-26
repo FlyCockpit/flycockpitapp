@@ -540,6 +540,16 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
                 }
             }
         }
+        proto::Response::GitRepoStatus { status } => {
+            if let Some(status) = status {
+                scrub_string(&mut status.branch, redact);
+            }
+        }
+        proto::Response::WorktreeRoot { root } => {
+            if let Some(root) = root {
+                scrub_string(root, redact);
+            }
+        }
         proto::Response::LspControlResult { message } => scrub_string(message, redact),
         proto::Response::DaemonStatus {
             pid: _,

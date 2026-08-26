@@ -1890,6 +1890,34 @@ fn valid_pr_reference(pr: &str) -> bool {
         && pr.chars().all(|ch| !ch.is_control() && ch != '`')
 }
 
+pub async fn git_repo_status(project_root: String) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "git_repo_status",
+        tokio::task::spawn_blocking(move || git_repo_status_blocking(&project_root)),
+    )
+    .await
+}
+
+pub(crate) fn git_repo_status_blocking(project_root: &str) -> Result<Response, ErrorPayload> {
+    let root = canonical_project_root(project_root)?;
+    let status = crate::git::repo_status(&root).map_err(internal)?;
+    Ok(Response::GitRepoStatus { status })
+}
+
+pub async fn find_worktree_root(path: String) -> Result<Response, ErrorPayload> {
+    join_fs_handler(
+        "find_worktree_root",
+        tokio::task::spawn_blocking(move || find_worktree_root_blocking(&path)),
+    )
+    .await
+}
+
+pub(crate) fn find_worktree_root_blocking(path: &str) -> Result<Response, ErrorPayload> {
+    let root = crate::git::find_worktree_root(std::path::Path::new(path))
+        .map(|root| root.display().to_string());
+    Ok(Response::WorktreeRoot { root })
+}
+
 async fn join_fs_handler(
     request_kind: &'static str,
     handle: tokio::task::JoinHandle<Result<Response, ErrorPayload>>,

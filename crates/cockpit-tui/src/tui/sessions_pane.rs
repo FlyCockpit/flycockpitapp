@@ -521,12 +521,13 @@ impl SessionsPane {
     /// `daemon_connected` selects the data path: connected uses the typed RPC
     /// list; disconnected renders Unavailable and keeps Retry available.
     pub fn open(
+        worktree_root: Option<&std::path::Path>,
         cwd: &std::path::Path,
         daemon_connected: bool,
         daemon_socket: Option<std::path::PathBuf>,
         use_emojis: bool,
     ) -> Self {
-        let project_id = resolve_project_id(cwd);
+        let project_id = resolve_project_id(worktree_root, cwd);
         let scope = if project_id.is_some() {
             Scope::Project
         } else {
@@ -3472,6 +3473,7 @@ mod tests {
     fn daemon_connected_open_starts_loading_without_blocking() {
         let tmp = tempfile::tempdir().unwrap();
         let pane = SessionsPane::open(
+            None,
             tmp.path(),
             true,
             Some(tmp.path().join("missing-daemon.sock")),

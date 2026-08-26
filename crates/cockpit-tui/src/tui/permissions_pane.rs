@@ -97,14 +97,16 @@ pub struct PermissionsPane {
 }
 
 impl PermissionsPane {
-    /// Open the pane, loading project + global grants for `cwd`. Both
-    /// scopes always appear (even when empty / unresolvable) so the user
-    /// sees an explicit state per scope. Pure file reads — no daemon
-    /// round-trip.
-    pub fn open(cwd: &Path) -> Self {
-        let project_dir = cockpit_core::git::find_worktree_root(cwd)
+    /// Open the pane, loading project + global grants for the already-resolved
+    /// git `worktree_root` (`None` when the cwd is not in a repo or the daemon
+    /// has not resolved it yet). Both scopes always appear (even when empty /
+    /// unresolvable) so the user sees an explicit state per scope. The worktree
+    /// root is daemon-resolved (git authority stays out of the TUI); reading
+    /// the approval files here is a local, non-daemon file read.
+    pub fn open(worktree_root: Option<&Path>) -> Self {
+        let project_dir = worktree_root
             .filter(|root| cockpit_config::trust::project_config_allowed(&root.join(".cockpit")))
-            .and_then(|root| project_approvals_dir(&root));
+            .and_then(project_approvals_dir);
         let global_dir = global_approvals_dir();
         let scopes = vec![
             load_scope(Scope::Project, project_dir),

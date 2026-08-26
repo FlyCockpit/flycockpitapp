@@ -268,7 +268,7 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
         ),
         (
             OverlaySurface::Stats,
-            Overlay::Stats(crate::tui::stats_pane::StatsPane::open(tmp.path())),
+            Overlay::Stats(crate::tui::stats_pane::StatsPane::open(None, tmp.path())),
         ),
         (
             OverlaySurface::Usage,
@@ -277,6 +277,7 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
         (
             OverlaySurface::Sessions,
             Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
+                None,
                 tmp.path(),
                 false,
                 None,
@@ -290,7 +291,7 @@ pub(crate) fn run_tui_button_pointer_dispatch_matrix() {
         (
             OverlaySurface::Permissions,
             Overlay::Permissions(crate::tui::permissions_pane::PermissionsPane::open(
-                tmp.path(),
+                Some(tmp.path()),
             )),
         ),
         (

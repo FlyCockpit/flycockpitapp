@@ -120,11 +120,13 @@ enum StatsPaneState {
 
 impl StatsPane {
     /// Open the pane for `cwd` and request the first roll-up (current
-    /// project / 7d by default, per §15a).
-    pub fn open(cwd: &std::path::Path) -> Self {
+    /// project / 7d by default, per §15a). `worktree_root` is the
+    /// daemon-resolved git root used to scope the project (falling back to
+    /// `cwd`); the TUI no longer shells out to git here.
+    pub fn open(worktree_root: Option<&std::path::Path>, cwd: &std::path::Path) -> Self {
         static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
         let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        let project_id = resolve_project_id(cwd);
+        let project_id = resolve_project_id(worktree_root, cwd);
         let scope = if project_id.is_some() {
             ScopeToggle::Project
         } else {
@@ -1055,7 +1057,7 @@ mod tests {
     #[test]
     fn db_async_render_stats_pane_renders_empty_state_without_db() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut pane = StatsPane::open(tmp.path());
+        let mut pane = StatsPane::open(None, tmp.path());
         assert!(pane.take_pending_fetch_key().is_some());
         let text = render_text(&pane, 80);
         assert!(text.contains("loading stats"));
@@ -1064,7 +1066,7 @@ mod tests {
     #[test]
     fn db_async_render_stats_pane_renders_fetched_state() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut pane = StatsPane::open(tmp.path());
+        let mut pane = StatsPane::open(None, tmp.path());
         let key = pane.take_pending_fetch_key().unwrap();
         pane.apply_fetch_result(StatsPaneFetchResult {
             key,
@@ -1412,7 +1414,7 @@ mod tests {
     #[test]
     fn test_backend_matrix_covers_loading_error_empty_unicode_and_scroll() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut loading = StatsPane::open(tmp.path());
+        let mut loading = StatsPane::open(None, tmp.path());
         assert!(rendered_buffer(&mut loading, 24, 7).contains("loading"));
         loading.rollup = StatsPaneState::Error("offline e\u{301}".to_string());
         assert!(rendered_buffer(&mut loading, 80, 8).contains("offline"));
@@ -1524,9 +1526,9 @@ mod tests {
     #[test]
     fn fetch_results_are_fenced_to_exact_stats_pane_open() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut old = StatsPane::open(tmp.path());
+        let mut old = StatsPane::open(None, tmp.path());
         let old_key = old.take_pending_fetch_key().unwrap();
-        let mut reopened = StatsPane::open(tmp.path());
+        let mut reopened = StatsPane::open(None, tmp.path());
         assert_ne!(old.generation, reopened.generation);
 
         reopened.apply_fetch_result(StatsPaneFetchResult {

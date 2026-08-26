@@ -131,7 +131,6 @@ use cockpit_client::presentation::{
 };
 use cockpit_client::submission::ClientUserSubmission;
 use cockpit_config::extended::{DiffStyle, ThinkingDisplay, VimModeSetting};
-use cockpit_core::git;
 use cockpit_core::welcome;
 use cockpit_proto::QueueItem as QueuedUserMessage;
 use cockpit_proto::{LaunchBundle, LaunchInfo, QueueTarget, RepoStatus};
@@ -2066,6 +2065,11 @@ pub struct App {
     /// `run`. The event loop syncs this into `launch.repo_status` once
     /// per tick.
     pub(super) repo_status: Arc<Mutex<Option<RepoStatus>>>,
+    /// Daemon-resolved git worktree root for `launch.cwd`, resolved once by
+    /// the background task spawned in `run` (the cwd is stable for the
+    /// session). `None` until resolved or when the cwd is not in a repo. Panes
+    /// read this instead of shelling out to git themselves.
+    pub(super) worktree_root: Arc<Mutex<Option<std::path::PathBuf>>>,
     pub(super) dialog: Dialog,
     /// User-opened modal/pane overlays. Required prompts (`daemon_prompt` and
     /// `question_dialog`) stay separate so they can shadow and resume this
@@ -3538,6 +3542,7 @@ impl App {
         composer.set_vim_mode(VimMode::Insert);
 
         let repo_status = Arc::new(Mutex::new(launch.repo_status.clone()));
+        let worktree_root = Arc::new(Mutex::new(None));
 
         // Probe the daemon synchronously up front so startup can either
         // autostart it per config or show the ask-mode/failure prompt on the
@@ -3643,6 +3648,7 @@ impl App {
             reconnect: None,
             daemon_link: None,
             repo_status,
+            worktree_root,
             dialog: Dialog::None,
             overlay: Overlay::None,
             daemon_prompt: daemon_state.prompt,
@@ -4015,11 +4021,21 @@ impl App {
             }
         }
 
-        let refresh_handle = spawn_git_refresh(self.launch.cwd.clone(), self.repo_status.clone());
+        let refresh_handle = spawn_git_refresh(
+            self.launch.cwd.clone(),
+            self.lifecycle.clone(),
+            self.repo_status.clone(),
+        );
+        let worktree_handle = spawn_worktree_root_resolve(
+            self.launch.cwd.clone(),
+            self.lifecycle.clone(),
+            self.worktree_root.clone(),
+        );
 
         let result = self.event_loop(&mut terminal).await;
 
         refresh_handle.abort();
+        worktree_handle.abort();
 
         // Process-exit cleanup for an open `/side` (no orphaned ephemeral
         // sessions): discard the throwaway fork *before* the daemon guard
@@ -4633,32 +4649,103 @@ fn editor_argv_for_target(editor: &std::ffi::OsStr, target: &str) -> Vec<String>
     argv
 }
 
-/// Background task that polls `git status` every `GIT_REFRESH_INTERVAL`
-/// without blocking the event-loop thread. The result lands in `shared`;
-/// the event loop reads it on the next tick.
+/// Background task that polls the repository status pill every
+/// `GIT_REFRESH_INTERVAL` without blocking the event-loop thread. Git
+/// authority is daemon-owned: each tick issues a `GitRepoStatus` RPC rather
+/// than shelling out to `git` in the TUI process. The result lands in
+/// `shared`; the event loop reads it on the next tick.
 fn spawn_git_refresh(
     cwd: std::path::PathBuf,
+    lifecycle: cockpit_client::LifecycleClient,
     shared: Arc<Mutex<Option<RepoStatus>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let project_root = cwd.display().to_string();
         let mut interval = tokio::time::interval(GIT_REFRESH_INTERVAL);
         // Do NOT skip the first tick: `App::new` no longer fetches git
         // status synchronously (it would block the first frame in a giant
         // repo), so this background poller owns the initial fetch too. The
-        // first `interval.tick()` completes immediately, populating the
+        // first `interval.tick()` completes immediately, requesting the
         // branch pill a tick after launch; subsequent ticks refresh on
         // `GIT_REFRESH_INTERVAL`.
         loop {
             interval.tick().await;
-            let cwd = cwd.clone();
-            let status = tokio::task::spawn_blocking(move || git::repo_status(&cwd).ok().flatten())
-                .await
-                .unwrap_or(None);
-            if let Ok(mut guard) = shared.lock() {
+            // Only overwrite on a successful RPC. A transiently unavailable
+            // daemon (or the daemonless fallback) leaves the last-known pill
+            // in place instead of clearing it; a successful `None` (not in a
+            // repo / detached HEAD) still clears it, matching the old local
+            // behaviour.
+            if let Some(status) = daemon_repo_status(&lifecycle, &project_root).await
+                && let Ok(mut guard) = shared.lock()
+            {
                 *guard = status;
             }
         }
     })
+}
+
+/// One-shot background task that resolves the git worktree root for `cwd`
+/// through the daemon (`FindWorktreeRoot`) and stores it in `shared`. The cwd
+/// is fixed for the session, so a single resolution suffices; panes read the
+/// stored root instead of shelling out to git. Runs off the event loop so it
+/// never blocks the first frame.
+fn spawn_worktree_root_resolve(
+    cwd: std::path::PathBuf,
+    lifecycle: cockpit_client::LifecycleClient,
+    shared: Arc<Mutex<Option<std::path::PathBuf>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let path = cwd.display().to_string();
+        if let Some(root) = daemon_find_worktree_root(&lifecycle, &path).await
+            && let Ok(mut guard) = shared.lock()
+        {
+            *guard = root;
+        }
+    })
+}
+
+/// Issue a `GitRepoStatus` RPC. Returns `Some(status)` on success (where the
+/// inner `Option` distinguishes "in a repo" from "not"), or `None` when the
+/// daemon is unavailable or replies with an unexpected shape.
+async fn daemon_repo_status(
+    lifecycle: &cockpit_client::LifecycleClient,
+    project_root: &str,
+) -> Option<Option<RepoStatus>> {
+    let client = crate::tui::settings::settings_daemon_client(lifecycle)
+        .await
+        .ok()?;
+    match client
+        .request(cockpit_proto::Request::GitRepoStatus {
+            project_root: project_root.to_string(),
+        })
+        .await
+    {
+        Ok(Ok(cockpit_proto::Response::GitRepoStatus { status })) => Some(status),
+        _ => None,
+    }
+}
+
+/// Issue a `FindWorktreeRoot` RPC. Returns `Some(root)` on success (where the
+/// inner `Option` is `None` when `path` is not inside a git worktree), or
+/// `None` when the daemon is unavailable or replies with an unexpected shape.
+async fn daemon_find_worktree_root(
+    lifecycle: &cockpit_client::LifecycleClient,
+    path: &str,
+) -> Option<Option<std::path::PathBuf>> {
+    let client = crate::tui::settings::settings_daemon_client(lifecycle)
+        .await
+        .ok()?;
+    match client
+        .request(cockpit_proto::Request::FindWorktreeRoot {
+            path: path.to_string(),
+        })
+        .await
+    {
+        Ok(Ok(cockpit_proto::Response::WorktreeRoot { root })) => {
+            Some(root.map(std::path::PathBuf::from))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

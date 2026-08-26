@@ -7576,6 +7576,14 @@ async fn handle_serialized_request_impl(
             sources,
         } => crate::daemon::fs_api::git_review_sources(project_root, sources).await,
 
+        Request::GitRepoStatus { project_root } => {
+            crate::daemon::fs_api::git_repo_status(project_root).await
+        }
+
+        Request::FindWorktreeRoot { path } => {
+            crate::daemon::fs_api::find_worktree_root(path).await
+        }
+
         Request::OpenTerminal { cwd, cols, rows } => {
             let session_id = state
                 .attached
@@ -13608,6 +13616,12 @@ async fn handle_concurrent_request_impl(
             project_root,
             sources,
         } => crate::daemon::fs_api::git_review_sources(project_root, sources).await,
+        Request::GitRepoStatus { project_root } => {
+            crate::daemon::fs_api::git_repo_status(project_root).await
+        }
+        Request::FindWorktreeRoot { path } => {
+            crate::daemon::fs_api::find_worktree_root(path).await
+        }
         Request::ListSessions {
             project_id,
             parent_session_id,

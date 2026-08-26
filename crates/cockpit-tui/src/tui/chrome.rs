@@ -18,8 +18,7 @@ use crate::tui::theme::{
     button_hover_style, button_idle_style,
 };
 use cockpit_config::{extended::LlmMode, sandbox_mode::SandboxMode};
-use cockpit_core::git::repo_counts;
-use cockpit_proto::LaunchInfo;
+use cockpit_proto::{LaunchInfo, RepoStatus};
 #[cfg(feature = "remote")]
 use cockpit_proto::{ConnectorDisclosure, OrgSyncDisclosure};
 
@@ -46,6 +45,25 @@ pub fn status_line_spans(info: &LaunchInfo) -> Vec<Span<'static>> {
     }
 
     spans
+}
+
+/// Presentation-only exception: this is a pure formatter over
+/// `cockpit_proto::RepoStatus` (no I/O), so it lives in the TUI rather than
+/// crossing a daemon RPC. It mirrors the core `repo_counts` formatter (in the
+/// `cockpit_core` git module), which stays in core for the startup welcome
+/// text; keep the two in sync.
+fn repo_counts(repo: &RepoStatus) -> String {
+    let mut parts = Vec::new();
+    if repo.staged > 0 {
+        parts.push(format!("+{}", repo.staged));
+    }
+    if repo.unstaged > 0 {
+        parts.push(format!("~{}", repo.unstaged));
+    }
+    if repo.unpushed > 0 {
+        parts.push(format!("^{}", repo.unpushed));
+    }
+    parts.join(" ")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

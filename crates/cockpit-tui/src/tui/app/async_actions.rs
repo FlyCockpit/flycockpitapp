@@ -2979,6 +2979,17 @@ impl App {
             .or(self.startup_background.daemon_socket.as_deref())
     }
 
+    /// The daemon-resolved git worktree root for the launch cwd, if the
+    /// background resolver (`spawn_worktree_root_resolve`) has populated it.
+    /// `None` when the cwd is not in a repo or has not been resolved yet.
+    /// Panes read this instead of shelling out to git themselves.
+    pub(super) fn resolved_worktree_root(&self) -> Option<std::path::PathBuf> {
+        self.worktree_root
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
     pub(super) fn sessions_daemon_endpoint(&self) -> Option<cockpit_client::ClientEndpoint> {
         self.attached_daemon_endpoint()
     }

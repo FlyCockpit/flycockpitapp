@@ -595,6 +595,23 @@
     },
     "response": "git_review_sources"
   },
+  "git_repo_status": {
+    "data": {
+      "status": {
+        "branch": "main",
+        "staged": 1,
+        "unstaged": 2,
+        "unpushed": 3
+      }
+    },
+    "response": "git_repo_status"
+  },
+  "worktree_root": {
+    "data": {
+      "root": "root-fixture"
+    },
+    "response": "worktree_root"
+  },
   "git_status": {
     "data": {
       "entries": [

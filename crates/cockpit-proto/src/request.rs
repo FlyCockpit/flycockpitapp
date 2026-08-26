@@ -1010,6 +1010,21 @@ pub enum Request {
         sources: Vec<crate::GitReadSource>,
     },
 
+    /// Read the branch/ahead-behind status pill through daemon-owned Git
+    /// authority. Backs the TUI chrome poller so the terminal process never
+    /// shells out to `git` itself.
+    GitRepoStatus {
+        project_root: String,
+    },
+
+    /// Resolve `path` to its git worktree root through daemon-owned Git
+    /// authority (`git rev-parse --show-toplevel`). `None` when `path` is not
+    /// inside a repository. Lets TUI panes discover the worktree root without
+    /// shelling out to `git` themselves.
+    FindWorktreeRoot {
+        path: String,
+    },
+
     OpenTerminal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
@@ -3657,6 +3672,8 @@ macro_rules! request_variants {
             (Request::GitDiffFile { .. }, "git_diff_file");
             (Request::GitDiff { .. }, "git_diff");
             (Request::GitReviewSources { .. }, "git_review_sources");
+            (Request::GitRepoStatus { .. }, "git_repo_status");
+            (Request::FindWorktreeRoot { .. }, "find_worktree_root");
             (Request::OpenTerminal { .. }, "open_terminal");
             (Request::AttachTerminal { .. }, "attach_terminal");
             (Request::TerminalInput { .. }, "terminal_input");
@@ -3954,6 +3971,8 @@ macro_rules! command {
             (Request::GitDiffFile { project_root, path }, "git_diff_file", project_files(project_root), none, false, read_only, none, concurrent, path(path), "project_root:String|path:String", [project_root: String => project_root, path: String => file_existing(project_root)]);
             (Request::GitDiff { project_root, source }, "git_diff", owner_only, none, false, local_only, none, concurrent, none, "project_root:String|source:crate::GitReadSource", [project_root: String => project_root, source: $crate::GitReadSource => param]);
             (Request::GitReviewSources { project_root, sources }, "git_review_sources", owner_only, none, false, local_only, none, concurrent, none, "project_root:String|sources:Vec<crate::GitReadSource>", [project_root: String => project_root, sources: Vec<$crate::GitReadSource> => param]);
+            (Request::GitRepoStatus { project_root }, "git_repo_status", owner_only, none, false, local_only, none, concurrent, none, "project_root:String", [project_root: String => project_root]);
+            (Request::FindWorktreeRoot { path }, "find_worktree_root", owner_only, none, false, local_only, none, concurrent, none, "path:String", [path: String => param]);
             (Request::OpenTerminal { cwd, cols, rows }, "open_terminal", terminal, none, true, idempotent_adapter_mutation, durable_dispatch_key(dispatch_key_and_generation), serialized, none, "cwd:Option<String>|cols:u16|rows:u16", [cwd: Option<String> => param, cols: u16 => param, rows: u16 => param]);
             (Request::AttachTerminal { terminal_id, cols, rows }, "attach_terminal", terminal, none, false, read_only, none, serialized, none, "terminal_id:Uuid|cols:u16|rows:u16", [terminal_id: Uuid => terminal, cols: u16 => param, rows: u16 => param]);
             (Request::TerminalInput { terminal_id, bytes }, "terminal_input", terminal, none, false, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "terminal_id:Uuid|bytes:Vec<u8>", [terminal_id: Uuid => terminal, bytes: Vec<u8> => param]);

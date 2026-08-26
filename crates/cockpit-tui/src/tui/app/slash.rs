@@ -1087,7 +1087,9 @@ fn run_quick(app: &mut App, _: &str) -> bool {
 }
 
 fn run_stats(app: &mut App, _: &str) -> bool {
-    let mut pane = crate::tui::stats_pane::StatsPane::open(&app.launch.cwd);
+    let worktree_root = app.resolved_worktree_root();
+    let mut pane =
+        crate::tui::stats_pane::StatsPane::open(worktree_root.as_deref(), &app.launch.cwd);
     let fetch = pane.take_pending_fetch_key();
     app.overlay = Overlay::Stats(pane);
     if let Some(key) = fetch {
@@ -1127,7 +1129,9 @@ fn run_sessions(app: &mut App, _: &str) -> bool {
     let daemon_socket = app
         .sessions_daemon_socket()
         .map(std::path::Path::to_path_buf);
+    let worktree_root = app.resolved_worktree_root();
     app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
+        worktree_root.as_deref(),
         &app.launch.cwd,
         app.daemon_connected,
         daemon_socket,
@@ -1296,8 +1300,9 @@ fn run_build(app: &mut App, _: &str) -> bool {
 }
 
 fn run_permissions(app: &mut App, _: &str) -> bool {
+    let worktree_root = app.resolved_worktree_root();
     app.overlay = Overlay::Permissions(crate::tui::permissions_pane::PermissionsPane::open(
-        &app.launch.cwd,
+        worktree_root.as_deref(),
     ));
     false
 }

@@ -167,6 +167,7 @@ fn app_with_sessions_preview_pane_body(tmp: &tempfile::TempDir, app: &mut App) {
     app.startup_background.daemon_socket = Some(dead_socket.clone());
     let session_id = Uuid::new_v4();
     let mut pane = crate::tui::sessions_pane::SessionsPane::open(
+        None,
         &app.launch.cwd,
         true,
         Some(dead_socket),
@@ -196,6 +197,7 @@ fn question_dialog_shadows_and_resumes_an_open_overlay() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = configured_app(&tmp);
     app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
+        None,
         &app.launch.cwd,
         false,
         None,
@@ -295,6 +297,7 @@ fn leader_with_sessions_pane_open_shows_sessions_context() {
     let mut app = configured_app(&tmp);
 
     app.overlay = Overlay::Sessions(crate::tui::sessions_pane::SessionsPane::open(
+        None,
         &app.launch.cwd,
         false,
         None,

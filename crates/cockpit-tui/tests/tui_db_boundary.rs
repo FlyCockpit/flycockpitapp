@@ -1439,6 +1439,41 @@ fn git_diff_and_review_source_authority_is_daemon_owned() {
 }
 
 #[test]
+fn repo_status_and_worktree_root_authority_is_daemon_owned() {
+    // The chrome poller, the branch pill, and the permissions/session panes no
+    // longer reach into `cockpit_core::git`: repository status and worktree
+    // root discovery are daemon RPCs, and `repo_counts` is a presentation-only
+    // formatter that moved into the TUI.
+    for path in [
+        "crates/cockpit-tui/src/tui/chrome.rs",
+        "crates/cockpit-tui/src/tui/app/mod.rs",
+        "crates/cockpit-tui/src/tui/permissions_pane.rs",
+        "crates/cockpit-tui/src/tui/pane_shared.rs",
+    ] {
+        let source = production_source(&read(path));
+        assert!(
+            !source.contains("cockpit_core::git"),
+            "{path} retains a direct cockpit_core::git dependency"
+        );
+    }
+    // The worktree-root discovery these panes used to shell out for is gone
+    // from their own source; the daemon resolves it instead.
+    for path in [
+        "crates/cockpit-tui/src/tui/permissions_pane.rs",
+        "crates/cockpit-tui/src/tui/pane_shared.rs",
+    ] {
+        let source = production_source(&read(path));
+        assert!(
+            !source.contains("find_worktree_root"),
+            "{path} retains direct worktree-root git authority"
+        );
+    }
+    let tui = tui_sources();
+    assert!(tui.contains("Request::GitRepoStatus"));
+    assert!(tui.contains("Request::FindWorktreeRoot"));
+}
+
+#[test]
 fn tui_agent_authority_is_daemon_owned() {
     let agents = production_source(&read("crates/cockpit-tui/src/tui/settings/agents_page.rs"));
     let goals = production_source(&read("crates/cockpit-tui/src/tui/goal_settings_pane.rs"));

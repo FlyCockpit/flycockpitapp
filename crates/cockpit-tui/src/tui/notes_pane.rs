@@ -71,6 +71,8 @@ pub struct NotesPane {
     sidebar: ListState,
     selection: SidebarSelection,
     operation_generation: u64,
+    highest_applied_generation: Option<u64>,
+    initial_inventory_unresolved: bool,
     pending_save: Option<PendingSave>,
     mode: Mode,
     /// The reused composer editing engine for the raw-markdown editor. Holds
@@ -348,6 +350,8 @@ impl NotesPane {
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::Uninitialized,
             operation_generation: 0,
+            highest_applied_generation: None,
+            initial_inventory_unresolved: true,
             pending_save: None,
             mode: Mode::Browsing,
             editor: Composer::new(vim_enabled),
@@ -407,57 +411,48 @@ impl NotesPane {
                     return;
                 }
                 let is_current = result.generation == self.operation_generation;
-                if let Some(error) = result.error {
-                    if is_current {
-                        if let Some(save) = self
-                            .pending_save
-                            .as_ref()
-                            .filter(|save| save.generation == result.generation)
-                        {
-                            debug_assert!(
-                                matches!(self.mode, Mode::Editing { id } if id == save.id)
-                            );
-                            debug_assert_eq!(self.editor.text(), save.draft);
-                        }
-                        self.status = Some(error);
-                    }
+                if (result.generation == 0 && !self.initial_inventory_unresolved)
+                    || !is_current
+                    || self
+                        .highest_applied_generation
+                        .is_some_and(|applied| result.generation <= applied)
+                {
                     return;
                 }
-                if !is_current
-                    && matches!(
-                        self.mode,
-                        Mode::Naming { .. } | Mode::Editing { .. } | Mode::ConfirmingDelete { .. }
-                    )
-                {
+                if let Some(error) = result.error {
+                    if let Some(save) = self
+                        .pending_save
+                        .as_ref()
+                        .filter(|save| save.generation == result.generation)
+                    {
+                        debug_assert!(matches!(self.mode, Mode::Editing { id } if id == save.id));
+                        debug_assert_eq!(self.editor.text(), save.draft);
+                    }
+                    self.status = Some(error);
                     return;
                 }
                 let old_index = self.selected_index();
                 let old_selection = self.selection;
-                let old_mode = self.mode.clone();
                 self.notes = result.notes;
-                let requested = if !is_current {
-                    old_selection
-                } else {
-                    match result.selection {
-                        SelectionAfterRpc::Preserve => match old_selection {
-                            SidebarSelection::Uninitialized => {
-                                self.notes.first().map_or(SidebarSelection::New, |note| {
+                let requested = match result.selection {
+                    SelectionAfterRpc::Preserve => match old_selection {
+                        SidebarSelection::Uninitialized => {
+                            self.notes.first().map_or(SidebarSelection::New, |note| {
+                                SidebarSelection::Note(note.id)
+                            })
+                        }
+                        established => established,
+                    },
+                    SelectionAfterRpc::Keep(id) => SidebarSelection::Note(id),
+                    SelectionAfterRpc::Deleted { fallback_index } => {
+                        self.notes.get(fallback_index).map_or_else(
+                            || {
+                                self.notes.last().map_or(SidebarSelection::New, |note| {
                                     SidebarSelection::Note(note.id)
                                 })
-                            }
-                            established => established,
-                        },
-                        SelectionAfterRpc::Keep(id) => SidebarSelection::Note(id),
-                        SelectionAfterRpc::Deleted { fallback_index } => {
-                            self.notes.get(fallback_index).map_or_else(
-                                || {
-                                    self.notes.last().map_or(SidebarSelection::New, |note| {
-                                        SidebarSelection::Note(note.id)
-                                    })
-                                },
-                                |note| SidebarSelection::Note(note.id),
-                            )
-                        }
+                            },
+                            |note| SidebarSelection::Note(note.id),
+                        )
                     }
                 };
                 let resolved = match requested {
@@ -479,21 +474,19 @@ impl NotesPane {
                 };
                 self.selection = resolved;
                 self.sidebar.select(Some(self.selected_index()));
-                if is_current {
-                    self.mode = Mode::Browsing;
-                    if self
-                        .pending_save
-                        .as_ref()
-                        .is_some_and(|save| save.generation == result.generation)
-                    {
-                        self.pending_save = None;
-                    }
-                    self.status = None;
-                    if result.enter_edit {
-                        self.enter_edit();
-                    }
-                } else {
-                    self.mode = old_mode;
+                self.highest_applied_generation = Some(result.generation);
+                self.initial_inventory_unresolved = false;
+                self.mode = Mode::Browsing;
+                if self
+                    .pending_save
+                    .as_ref()
+                    .is_some_and(|save| save.generation == result.generation)
+                {
+                    self.pending_save = None;
+                }
+                self.status = None;
+                if result.enter_edit {
+                    self.enter_edit();
                 }
             }
             Err(e) => self.status = Some(e),
@@ -794,6 +787,8 @@ impl NotesPane {
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::New,
             operation_generation: 0,
+            highest_applied_generation: None,
+            initial_inventory_unresolved: false,
             pending_save: None,
             mode: Mode::Editing { id: Uuid::nil() },
             editor: Composer::new(vim_enabled),
@@ -1109,6 +1104,8 @@ mod tests {
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::Note(id),
             operation_generation: 0,
+            highest_applied_generation: None,
+            initial_inventory_unresolved: false,
             pending_save: None,
             mode: Mode::Browsing,
             editor: Composer::new(false),
@@ -1496,6 +1493,87 @@ mod tests {
         }));
         assert!(matches!(pane.mode, Mode::Editing { id: editing } if editing == id));
         assert!(pane.editor.text().contains('!'));
+    }
+
+    #[test]
+    fn stalled_initial_snapshot_cannot_overwrite_newer_mutation_results() {
+        let resurrected = Uuid::new_v4();
+        let created = Uuid::new_v4();
+        let mut pane = pane(true);
+        pane.notes.clear();
+        pane.selection = SidebarSelection::Uninitialized;
+        pane.initial_inventory_unresolved = true;
+
+        pane.handle_key(press(KeyCode::Char('n')));
+        pane.paste("created");
+        let NotesOutcome::Rpc(create) = pane.handle_key(press(KeyCode::Enter)) else {
+            panic!("create action");
+        };
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: create.generation,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(created, "created", "")],
+            selection: SelectionAfterRpc::Keep(created),
+            enter_edit: true,
+        }));
+
+        pane.editor.set("saved body".to_string());
+        let NotesOutcome::Rpc(save) = pane.leave_edit() else {
+            panic!("save action");
+        };
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: save.generation,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(created, "created", "saved body")],
+            selection: SelectionAfterRpc::Keep(created),
+            enter_edit: false,
+        }));
+
+        pane.handle_key(press(KeyCode::Char('r')));
+        pane.paste(" renamed");
+        let NotesOutcome::Rpc(rename) = pane.handle_key(press(KeyCode::Enter)) else {
+            panic!("rename action");
+        };
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: rename.generation,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(created, "created renamed", "saved body")],
+            selection: SelectionAfterRpc::Keep(created),
+            enter_edit: false,
+        }));
+
+        pane.handle_key(press(KeyCode::Char('d')));
+        let NotesOutcome::Rpc(delete) = pane.handle_key(press(KeyCode::Char('y'))) else {
+            panic!("delete action");
+        };
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: delete.generation,
+            error: None,
+            project_root: "/proj".into(),
+            notes: Vec::new(),
+            selection: SelectionAfterRpc::Deleted { fallback_index: 0 },
+            enter_edit: false,
+        }));
+        assert!(pane.notes.is_empty());
+        let applied = pane.highest_applied_generation;
+
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 0,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(resurrected, "old snapshot", "stale")],
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert!(
+            pane.notes.is_empty(),
+            "stalled load must not resurrect deleted data"
+        );
+        assert_eq!(pane.selection, SidebarSelection::New);
+        assert_eq!(pane.highest_applied_generation, applied);
     }
 
     #[test]

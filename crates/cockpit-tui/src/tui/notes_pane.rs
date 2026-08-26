@@ -44,7 +44,25 @@ use cockpit_proto::{ProjectNote, Request, Response};
 static NEXT_NOTES_PANE_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 fn next_notes_pane_instance() -> u64 {
-    NEXT_NOTES_PANE_INSTANCE.fetch_add(1, Ordering::Relaxed)
+    claim_next_notes_pane_instance(&NEXT_NOTES_PANE_INSTANCE)
+}
+
+fn claim_next_notes_pane_instance(counter: &AtomicU64) -> u64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            if current == 0 {
+                None
+            } else {
+                current.checked_add(1)
+            }
+        })
+        .expect("notes pane instance identity exhausted")
+}
+
+fn next_notes_operation_generation(current: u64) -> u64 {
+    current
+        .checked_add(1)
+        .expect("notes operation generation exhausted")
 }
 
 /// Which part of the dialog has focus / what the user is doing.
@@ -557,7 +575,7 @@ impl NotesPane {
     }
 
     fn schedule_action(&mut self, kind: NotesRpcActionKind) -> Option<(u64, NotesRpcAction)> {
-        self.operation_generation = self.operation_generation.wrapping_add(1);
+        self.operation_generation = next_notes_operation_generation(self.operation_generation);
         let generation = self.operation_generation;
         self.pending_generations.push_back(generation);
         Some((
@@ -572,7 +590,7 @@ impl NotesPane {
     }
 
     fn invalidate_pending_operations(&mut self) {
-        self.operation_generation = self.operation_generation.wrapping_add(1);
+        self.operation_generation = next_notes_operation_generation(self.operation_generation);
     }
 
     fn invalidate_pending_save(&mut self) {
@@ -1252,6 +1270,55 @@ mod tests {
         };
         pane.sidebar.select(Some(0));
         pane
+    }
+
+    #[test]
+    fn notes_correlation_identities_fail_closed_before_reuse() {
+        let reserved = AtomicU64::new(0);
+        assert!(
+            std::panic::catch_unwind(|| claim_next_notes_pane_instance(&reserved)).is_err(),
+            "production pane instances must never claim reserved identity zero"
+        );
+
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(claim_next_notes_pane_instance(&counter), u64::MAX - 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert!(
+            std::panic::catch_unwind(|| claim_next_notes_pane_instance(&counter)).is_err(),
+            "a pane identity must never wrap or reuse the reserved zero value"
+        );
+
+        assert_eq!(next_notes_operation_generation(0), 1);
+        assert_eq!(next_notes_operation_generation(u64::MAX - 1), u64::MAX);
+        assert!(
+            std::panic::catch_unwind(|| next_notes_operation_generation(u64::MAX)).is_err(),
+            "an operation identity must never wrap into initial-load generation zero"
+        );
+    }
+
+    #[test]
+    fn maximum_notes_generation_still_rejects_an_older_completion() {
+        let mut pane = pane(true);
+        let current = pane.notes[0].clone();
+        pane.operation_generation = u64::MAX;
+        pane.pending_generations = VecDeque::from([u64::MAX]);
+        let instance_id = pane.instance_id;
+        let project_root = pane.project_root.clone();
+
+        assert!(
+            pane.apply_rpc_result(Ok(NotesRpcResult {
+                instance_id,
+                generation: u64::MAX - 1,
+                project_root,
+                notes: vec![note(Uuid::new_v4(), "stale", "stale")],
+                selection: SelectionAfterRpc::Preserve,
+                enter_edit: false,
+                error: None,
+            }))
+            .is_none()
+        );
+        assert_eq!(pane.notes[0].id, current.id);
+        assert_eq!(pane.pending_generations, VecDeque::from([u64::MAX]));
     }
 
     #[test]

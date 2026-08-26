@@ -400,7 +400,12 @@ fn request_owned_graceful_stop(
             .enable_all()
             .build()
             .context("building owner graceful-stop runtime")?;
-        runtime.block_on(request_owned_graceful_stop_async(cleanup, expected, || {}))
+        runtime.block_on(request_owned_graceful_stop_async(
+            cleanup,
+            expected,
+            || {},
+            || {},
+        ))
     }
     #[cfg(not(unix))]
     {
@@ -414,6 +419,7 @@ async fn request_owned_graceful_stop_async(
     cleanup: &ProcessCleanup,
     expected: &DaemonPidReceipt,
     after_connect: impl FnOnce(),
+    after_ack: impl FnOnce(),
 ) -> anyhow::Result<()> {
     let client = cockpit_client::DaemonClient::connect(&cleanup.paths.socket)
         .await
@@ -433,12 +439,23 @@ async fn request_owned_graceful_stop_async(
     if !matches!(response, crate::daemon::proto::Response::Ack) {
         anyhow::bail!("unexpected owner shutdown response: {response:?}");
     }
-    if read_daemon_pid_record(&cleanup.paths.pid_file)
-        != Some(DaemonPidRecord::Receipt(expected.clone()))
-    {
-        anyhow::bail!(
-            "daemon receipt changed after owner graceful-stop acknowledgement; replacement metadata was preserved"
-        );
+    after_ack();
+    match read_daemon_pid_record(&cleanup.paths.pid_file) {
+        Some(DaemonPidRecord::Receipt(receipt)) if receipt == *expected => {}
+        None if matches!(
+            std::fs::symlink_metadata(&cleanup.paths.pid_file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) =>
+        {
+            // The exact daemon may retire its own metadata after Ack and
+            // before its process has fully exited. The retained Child handle
+            // remains the authoritative object to await/reap.
+        }
+        Some(_) | None => {
+            anyhow::bail!(
+                "daemon receipt changed or became malformed after owner graceful-stop acknowledgement; replacement metadata was preserved"
+            );
+        }
     }
     Ok(())
 }
@@ -1276,10 +1293,61 @@ mod tests {
 
     #[tokio::test]
     async fn owner_protocol_hello_stop_ack_and_child_exit_is_valid() {
-        initialize_process_reaper().expect("process reaper");
         let root = tempfile::tempdir().unwrap();
         let (guard, paths, pid) = child_guard(root.path(), "protocol-valid");
         let expected = publish_owned_receipt(&guard, &paths, pid);
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let retired_paths = paths.clone();
+        let (retired, retirement) = std::sync::mpsc::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = ProtoStream::new(socket);
+            send_hello(&mut stream, crate::daemon::proto::PROTOCOL_VERSION).await;
+            let id = receive_stop(&mut stream).await;
+            stream
+                .send(&Envelope::response(id, Response::Ack))
+                .await
+                .unwrap();
+            std::fs::remove_file(&retired_paths.pid_file).unwrap();
+            std::fs::remove_file(&retired_paths.socket).unwrap();
+            retired.send(()).unwrap();
+            // Model the real daemon exiting after its acknowledged drain.
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
+        });
+
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        request_owned_graceful_stop_async(
+            &cleanup,
+            &expected,
+            || {},
+            move || retirement.recv().unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::task::spawn_blocking(move || {
+            let mut child = cleanup.child.lock().unwrap();
+            child_wait(child.as_mut().unwrap()).unwrap();
+            *child = None;
+        })
+        .await
+        .unwrap();
+        server.await.unwrap();
+        guard.disarm();
+        assert_eq!(
+            read_daemon_pid_record(&paths.pid_file),
+            None,
+            "daemon self-retirement before process exit is accepted"
+        );
+        assert!(!paths.socket.exists());
+        assert_ne!(expected.publication_nonce, [0; 32]);
+    }
+
+    #[tokio::test]
+    async fn malformed_post_ack_receipt_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let (guard, paths, pid) = child_guard(root.path(), "protocol-malformed-post-ack");
+        let expected = publish_owned_receipt(&guard, &paths, pid);
+        let cleanup = guard.process.as_ref().unwrap().clone();
         let listener = UnixListener::bind(&paths.socket).unwrap();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
@@ -1290,23 +1358,24 @@ mod tests {
                 .send(&Envelope::response(id, Response::Ack))
                 .await
                 .unwrap();
-            // Model the real daemon exiting after its acknowledged drain.
-            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) }, 0);
         });
-
-        let cleanup = guard.process.as_ref().unwrap().clone();
-        tokio::task::spawn_blocking(move || cleanup_exact_process(&cleanup))
-            .await
-            .unwrap()
-            .unwrap();
+        let malformed_path = paths.pid_file.clone();
+        let error = request_owned_graceful_stop_async(
+            &cleanup,
+            &expected,
+            || {},
+            move || std::fs::write(&malformed_path, "not-a-receipt\n").unwrap(),
+        )
+        .await
+        .unwrap_err();
         server.await.unwrap();
-        guard.disarm();
+        assert!(error.to_string().contains("became malformed"));
         assert_eq!(
-            read_daemon_pid_record(&paths.pid_file),
-            None,
-            "exact metadata is retired after the child exits"
+            std::fs::read_to_string(&paths.pid_file).unwrap(),
+            "not-a-receipt\n"
         );
-        assert_ne!(expected.publication_nonce, [0; 32]);
+        guard.disarm();
+        reap_fixture_child(&guard);
     }
 
     #[tokio::test]
@@ -1335,7 +1404,7 @@ mod tests {
             });
 
             assert!(
-                request_owned_graceful_stop_async(&cleanup, &expected, || {})
+                request_owned_graceful_stop_async(&cleanup, &expected, || {}, || {})
                     .await
                     .is_err()
             );
@@ -1364,7 +1433,7 @@ mod tests {
         });
 
         assert!(
-            request_owned_graceful_stop_async(&cleanup, &expected, || {})
+            request_owned_graceful_stop_async(&cleanup, &expected, || {}, || {})
                 .await
                 .unwrap_err()
                 .to_string()
@@ -1403,11 +1472,16 @@ mod tests {
         });
         let replacement_path = paths.pid_file.clone();
         let executable = std::fs::canonicalize("/bin/sleep").unwrap();
-        let result = request_owned_graceful_stop_async(&cleanup, &expected, move || {
-            std::fs::remove_file(&replacement_path).unwrap();
-            cockpit_host::daemon_lifecycle::write_pid_file(&replacement_path, pid, &executable)
-                .unwrap();
-        })
+        let result = request_owned_graceful_stop_async(
+            &cleanup,
+            &expected,
+            move || {
+                std::fs::remove_file(&replacement_path).unwrap();
+                cockpit_host::daemon_lifecycle::write_pid_file(&replacement_path, pid, &executable)
+                    .unwrap();
+            },
+            || {},
+        )
         .await;
 
         assert!(result.unwrap_err().to_string().contains("receipt changed"));
@@ -1442,7 +1516,7 @@ mod tests {
             replacement
         });
 
-        let error = request_owned_graceful_stop_async(&cleanup, &expected, || {})
+        let error = request_owned_graceful_stop_async(&cleanup, &expected, || {}, || {})
             .await
             .unwrap_err();
         let replacement = server.await.unwrap();

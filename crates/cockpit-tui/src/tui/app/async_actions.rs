@@ -2895,7 +2895,7 @@ impl App {
         self.async_actions.start_serialized(
             AsyncActionKind::DaemonRpc("resources.snapshot"),
             AsyncActionKey::new("resources.projection"),
-            async {
+            async move {
                 let result = tokio::task::spawn_blocking(move || {
                     match crate::tui::agent_runner::resource_snapshot_blocking(lifecycle)? {
                         cockpit_proto::Response::ResourceSnapshot { snapshot } => Ok(snapshot),

@@ -546,6 +546,167 @@ fn call_name(call: &syn::ExprCall) -> Option<String> {
     }
 }
 
+fn lifecycle_authority_findings(source: &str) -> Vec<String> {
+    use std::collections::HashMap;
+
+    fn collect_use(
+        tree: &syn::UseTree,
+        prefix: &mut Vec<String>,
+        aliases: &mut HashMap<String, String>,
+    ) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                collect_use(&path.tree, prefix, aliases);
+                prefix.pop();
+            }
+            syn::UseTree::Name(name) => {
+                let mut full = prefix.clone();
+                full.push(name.ident.to_string());
+                aliases.insert(name.ident.to_string(), full.join("::"));
+            }
+            syn::UseTree::Rename(rename) => {
+                let mut full = prefix.clone();
+                full.push(rename.ident.to_string());
+                aliases.insert(rename.rename.to_string(), full.join("::"));
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    collect_use(item, prefix, aliases);
+                }
+            }
+            syn::UseTree::Glob(_) => {}
+        }
+    }
+
+    struct AliasCollector(HashMap<String, String>);
+    impl<'ast> Visit<'ast> for AliasCollector {
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            collect_use(&item.tree, &mut Vec::new(), &mut self.0);
+        }
+
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if let syn::Type::Path(path) = item.ty.as_ref() {
+                self.0.insert(
+                    item.ident.to_string(),
+                    path.path.to_token_stream().to_string().replace(' ', ""),
+                );
+            }
+        }
+    }
+
+    fn resolve(parts: &[String], aliases: &HashMap<String, String>) -> String {
+        let Some(first) = parts.first() else {
+            return String::new();
+        };
+        let mut resolved = first.clone();
+        for _ in 0..=aliases.len() {
+            let Some(next) = aliases.get(&resolved) else {
+                break;
+            };
+            if next == &resolved {
+                break;
+            }
+            resolved = next.clone();
+        }
+        for part in &parts[1..] {
+            resolved.push_str("::");
+            resolved.push_str(part);
+        }
+        resolved
+    }
+
+    struct AuthorityCalls<'a> {
+        aliases: &'a HashMap<String, String>,
+        findings: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for AuthorityCalls<'_> {
+        fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
+            let mut parts = expression
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>();
+            if let Some(qself) = &expression.qself {
+                let ty = qself.ty.to_token_stream().to_string().replace(' ', "");
+                let ty = self.aliases.get(&ty).cloned().unwrap_or(ty);
+                parts.insert(0, ty);
+            }
+            let resolved = resolve(&parts, self.aliases);
+            let last = parts.last().map(String::as_str).unwrap_or_default();
+            let forbidden_named = matches!(
+                last,
+                "probe_or_spawn"
+                    | "spawn_detached"
+                    | "ensure_persistent_daemon"
+                    | "serve_lifecycle_requests"
+                    | "request_on_socket"
+            );
+            let forbidden_core_probe = matches!(
+                resolved.as_str(),
+                "cockpit_core::daemon::discover" | "cockpit_core::daemon::probe"
+            );
+            let forbidden_connect = resolved.ends_with("DaemonClient::connect")
+                || resolved.ends_with("UnixStream::connect");
+            let forbidden_channel = resolved.ends_with("LifecycleClient::channel");
+            if forbidden_named || forbidden_core_probe || forbidden_connect || forbidden_channel {
+                self.findings.push(format!(
+                    "line {}: forbidden lifecycle authority `{resolved}`",
+                    expression.span().start().line
+                ));
+            }
+            syn::visit::visit_expr_path(self, expression);
+        }
+
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if call_name(call).as_deref() == Some("daemon_reveal_leak_blocking")
+                && call.args.first().is_some_and(|argument| {
+                    matches!(argument, syn::Expr::Reference(reference)
+                        if matches!(reference.expr.as_ref(), syn::Expr::Path(path)
+                            if path.path.is_ident("socket")))
+                })
+            {
+                self.findings.push(format!(
+                    "line {}: leak reveal is bound to a raw socket",
+                    call.span().start().line
+                ));
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            let resolved = resolve(
+                &path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>(),
+                self.aliases,
+            );
+            if resolved.ends_with("EphemeralDaemonGuard") || resolved.ends_with("OwnedDaemonGuard")
+            {
+                self.findings.push(format!(
+                    "line {}: forbidden lifecycle guard `{resolved}`",
+                    path.span().start().line
+                ));
+            }
+            syn::visit::visit_type_path(self, path);
+        }
+    }
+
+    let file = syn::parse_file(source).expect("production lifecycle source remains parseable");
+    let mut aliases = AliasCollector(HashMap::new());
+    aliases.visit_file(&file);
+    let mut calls = AuthorityCalls {
+        aliases: &aliases.0,
+        findings: Vec::new(),
+    };
+    calls.visit_file(&file);
+    calls.findings
+}
+
 fn path_is_spawn_blocking(path: &syn::Path) -> bool {
     let parts = path
         .segments
@@ -1845,23 +2006,6 @@ fn pasted_images_use_opaque_daemon_retained_ingress() {
 
 #[test]
 fn daemon_lifecycle_and_reconnect_authority_is_injected() {
-    const FORBIDDEN: &[&str] = &[
-        "DaemonClient::connect(",
-        "LifecycleClient::channel(",
-        "serve_lifecycle_requests",
-        "probe_or_spawn",
-        "spawn_detached",
-        "ensure_persistent_daemon",
-        "EphemeralDaemonGuard",
-        "OwnedDaemonGuard",
-        "cockpit_core::daemon::discover",
-        "cockpit_core::daemon::probe",
-        "request_on_socket",
-        "daemon_reveal_leak_blocking(&socket",
-        "tokio::net::UnixStream::connect",
-        "UnixStream::connect",
-    ];
-
     fn visit(path: &Path, findings: &mut Vec<String>) {
         for entry in fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
@@ -1876,26 +2020,16 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
                 continue;
             }
             let source = production_source(&fs::read_to_string(&path).unwrap());
-            let tokens: String = syn::parse_file(&source)
-                .expect("production TUI source remains parseable")
-                .to_token_stream()
-                .to_string()
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect();
-            for forbidden in FORBIDDEN {
-                if *forbidden == "UnixStream::connect"
-                    && path.ends_with("crates/cockpit-tui/src/clipboard/display.rs")
+            for finding in lifecycle_authority_findings(&source) {
+                if path.ends_with("crates/cockpit-tui/src/clipboard/display.rs")
+                    && finding.contains("UnixStream::connect")
                 {
                     continue;
                 }
-                let compact: String = forbidden.chars().filter(|ch| !ch.is_whitespace()).collect();
-                if tokens.contains(&compact) {
-                    findings.push(format!(
-                        "{} retains daemon lifecycle/reconnect authority `{forbidden}`",
-                        path.strip_prefix(repo_root()).unwrap().display()
-                    ));
-                }
+                findings.push(format!(
+                    "{}: {finding}",
+                    path.strip_prefix(repo_root()).unwrap().display()
+                ));
             }
         }
     }
@@ -1908,19 +2042,71 @@ fn daemon_lifecycle_and_reconnect_authority_is_injected() {
         findings.join("\n")
     );
 
-    let app = read("apps/cli/src/commands/tui.rs");
-    let app = production_source(&app);
-    let (run, run_with_session) = app
-        .split_once("pub async fn run_with_session")
-        .expect("CLI TUI composition must expose both run entrypoints");
-    assert!(run.contains("lifecycle_composition()"));
-    let run_with_session = run_with_session
-        .split_once("fn prepare_tui_workspace_trust")
-        .expect("CLI TUI run_with_session boundary remains explicit")
-        .0;
-    assert!(run_with_session.contains("lifecycle_composition()"));
-    assert!(app.contains("LifecycleClient::channel"));
-    assert!(app.contains("serve_lifecycle_requests"));
+    struct CompositionCalls {
+        lifecycle: bool,
+        constructor: bool,
+        channel: bool,
+        responder: bool,
+    }
+    impl<'ast> Visit<'ast> for CompositionCalls {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            let name = call_name(call);
+            self.lifecycle |= name.as_deref() == Some("lifecycle_composition");
+            self.channel |= name.as_deref() == Some("channel");
+            self.responder |= name.as_deref() == Some("serve_lifecycle_requests");
+            if matches!(
+                name.as_deref(),
+                Some("new_composed" | "new_composed_with_session")
+            ) {
+                self.constructor |= call.args.last().is_some_and(
+                    |argument| matches!(argument, syn::Expr::Path(path) if path.path.is_ident("lifecycle")),
+                );
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let app = syn::parse_file(&production_source(&read("apps/cli/src/commands/tui.rs")))
+        .expect("CLI TUI composition remains parseable");
+    for entrypoint in ["run", "run_with_session"] {
+        let function = app
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == entrypoint => Some(function),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing CLI TUI entrypoint {entrypoint}"));
+        let mut calls = CompositionCalls {
+            lifecycle: false,
+            constructor: false,
+            channel: false,
+            responder: false,
+        };
+        calls.visit_block(&function.block);
+        assert!(calls.lifecycle, "{entrypoint} does not compose lifecycle");
+        assert!(
+            calls.constructor,
+            "{entrypoint} does not inject lifecycle into App"
+        );
+    }
+    let composition = app
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "lifecycle_composition" => {
+                Some(function)
+            }
+            _ => None,
+        })
+        .expect("missing CLI lifecycle composition function");
+    let mut calls = CompositionCalls {
+        lifecycle: false,
+        constructor: false,
+        channel: false,
+        responder: false,
+    };
+    calls.visit_block(&composition.block);
+    assert!(calls.channel && calls.responder);
     let settings = read("crates/cockpit-tui/src/tui/settings/mod.rs");
     assert!(!settings.contains("serve_lifecycle_requests"));
     assert!(!settings.contains("LifecycleClient::channel"));
@@ -1957,4 +2143,17 @@ fn lifecycle_gate_masks_only_logically_test_only_cfgs() {
         !findings.is_empty(),
         "renaming a daemon transport must not evade the authority inventory"
     );
+
+    for source in [
+        "fn f() { let _ = <cockpit_client::DaemonClient>::connect; }",
+        "use cockpit_client::DaemonClient as C; fn f() { let _ = C::connect; }",
+        "use std::os::unix::net::UnixStream as S; fn f() { let _ = S::connect; }",
+        "type S = std::os::unix::net::UnixStream; fn f() { let _connect = S::connect; }",
+        "type S = std::os::unix::net::UnixStream; type T = S; fn f() { let _ = T::connect; }",
+    ] {
+        assert!(
+            !lifecycle_authority_findings(source).is_empty(),
+            "AST lifecycle gate missed alternate authority spelling: {source}"
+        );
+    }
 }

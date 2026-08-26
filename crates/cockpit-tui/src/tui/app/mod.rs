@@ -828,16 +828,20 @@ async fn set_workspace_trust_async(
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+pub(crate) enum BlockingDaemonRequestError {
+    Conflict(String),
+    Other(String),
+}
+
+#[cfg(test)]
 fn set_workspace_trust_with_retry(
     project_root: &str,
     mode: cockpit_proto::WorkspaceTrustMode,
     mut expected_generation: u64,
     mut request: impl FnMut(
         cockpit_proto::Request,
-    ) -> Result<
-        cockpit_proto::Response,
-        crate::tui::agent_runner::BlockingDaemonRequestError,
-    >,
+    ) -> Result<cockpit_proto::Response, BlockingDaemonRequestError>,
 ) -> Result<u64, String> {
     for attempt in 0..=1 {
         let response = request(cockpit_proto::Request::SetWorkspaceTrust {
@@ -850,9 +854,7 @@ fn set_workspace_trust_with_retry(
                 return Ok(config_generation);
             }
             Ok(other) => return Err(format!("unexpected workspace trust response: {other:?}")),
-            Err(crate::tui::agent_runner::BlockingDaemonRequestError::Conflict(_))
-                if attempt == 0 =>
-            {
+            Err(BlockingDaemonRequestError::Conflict(_)) if attempt == 0 => {
                 expected_generation = match request(cockpit_proto::Request::GetStartupDisclosures {
                     project_root: project_root.to_string(),
                 }) {
@@ -874,12 +876,12 @@ fn set_workspace_trust_with_retry(
 }
 
 #[cfg(test)]
-fn blocking_request_error(error: crate::tui::agent_runner::BlockingDaemonRequestError) -> String {
+fn blocking_request_error(error: BlockingDaemonRequestError) -> String {
     match error {
-        crate::tui::agent_runner::BlockingDaemonRequestError::Conflict(message) => {
+        BlockingDaemonRequestError::Conflict(message) => {
             format!("config conflict after refresh: {message}")
         }
-        crate::tui::agent_runner::BlockingDaemonRequestError::Other(message) => message,
+        BlockingDaemonRequestError::Other(message) => message,
     }
 }
 

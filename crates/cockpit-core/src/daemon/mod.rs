@@ -1198,41 +1198,37 @@ fn submit_supervisor_to_reaper(
     supervisor: std::thread::JoinHandle<()>,
     completed: Option<tokio::sync::oneshot::Sender<Result<()>>>,
 ) {
-    let reap = SupervisorReap {
-        supervisor,
-        completed,
-    };
-    if let Some(reaper) = supervisor_reaper() {
-        match reaper.send(reap) {
+    submit_supervisor_reap(
+        supervisor_reaper(),
+        SupervisorReap {
+            supervisor,
+            completed,
+        },
+    );
+}
+
+fn submit_supervisor_reap(
+    reaper: Option<&std::sync::mpsc::Sender<SupervisorReap>>,
+    reap: SupervisorReap,
+) {
+    let reap = match reaper {
+        Some(reaper) => match reaper.send(reap) {
             Ok(()) => return,
-            Err(error) => {
-                let reap = error.0;
-                let _ = std::thread::Builder::new()
-                    .name("cockpit-daemon-supervisor-reaper-fallback".to_string())
-                    .spawn(move || {
-                        let result = reap
-                            .supervisor
-                            .join()
-                            .map_err(|_| anyhow::anyhow!("in-process daemon supervisor panicked"));
-                        if let Some(completed) = reap.completed {
-                            let _ = completed.send(result);
-                        }
-                    });
-                return;
-            }
-        }
+            Err(error) => error.0,
+        },
+        None => reap,
+    };
+    // Emergency fallback retains the original JoinHandle. There is no second
+    // fallible thread spawn whose closure could consume and detach it.
+    let result = reap
+        .supervisor
+        .join()
+        .map_err(|_| anyhow::anyhow!("in-process daemon supervisor panicked"));
+    if let Some(completed) = reap.completed {
+        let _ = completed.send(result);
+    } else if let Err(error) = result {
+        tracing::error!(%error, "emergency supervisor join failed");
     }
-    let _ = std::thread::Builder::new()
-        .name("cockpit-daemon-supervisor-reaper-fallback".to_string())
-        .spawn(move || {
-            let result = reap
-                .supervisor
-                .join()
-                .map_err(|_| anyhow::anyhow!("in-process daemon supervisor panicked"));
-            if let Some(completed) = reap.completed {
-                let _ = completed.send(result);
-            }
-        });
 }
 
 pub(crate) fn reap_daemon_owner_thread(supervisor: std::thread::JoinHandle<()>) {
@@ -3260,6 +3256,42 @@ mod tests {
             .block_on(guard.shutdown())
             .expect("runtime-independent shutdown");
         assert!(server::in_process_context(&paths.socket).is_none());
+    }
+
+    #[test]
+    fn supervisor_reaper_unavailable_joins_retained_handle() {
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_on_thread = completed.clone();
+        let supervisor = std::thread::spawn(move || {
+            completed_on_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        submit_supervisor_reap(
+            None,
+            SupervisorReap {
+                supervisor,
+                completed: None,
+            },
+        );
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn disconnected_supervisor_reaper_recovers_and_joins_handle() {
+        let (send, receive) = std::sync::mpsc::channel();
+        drop(receive);
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_on_thread = completed.clone();
+        let supervisor = std::thread::spawn(move || {
+            completed_on_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        submit_supervisor_reap(
+            Some(&send),
+            SupervisorReap {
+                supervisor,
+                completed: None,
+            },
+        );
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) {

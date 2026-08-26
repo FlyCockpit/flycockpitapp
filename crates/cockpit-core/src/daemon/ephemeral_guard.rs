@@ -45,6 +45,11 @@ struct ProcessReap {
 static PROCESS_REAPER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<ProcessReap>>> =
     std::sync::OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    static INJECT_PROCESS_CLEANUP_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) fn initialize_process_reaper() -> anyhow::Result<()> {
     PROCESS_REAPER
         .get_or_init(|| {
@@ -53,10 +58,7 @@ pub(crate) fn initialize_process_reaper() -> anyhow::Result<()> {
                 .name("cockpit-ephemeral-process-reaper".to_string())
                 .spawn(move || {
                     while let Ok(reap) = receive.recv() {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            cleanup_exact_process(&reap.cleanup)
-                        }))
-                        .unwrap_or_else(|_| Err(anyhow::anyhow!("process cleanup panicked")));
+                        let result = run_process_cleanup_recovering(&reap.cleanup);
                         if let Some(completed) = reap.completed {
                             let _ = completed.send(result);
                         } else if let Err(error) = result {
@@ -72,6 +74,55 @@ pub(crate) fn initialize_process_reaper() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("starting ephemeral process reaper"))
 }
 
+fn run_process_cleanup_recovering(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cleanup_exact_process(cleanup)
+    }));
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            emergency_kill_wait_and_retire(cleanup);
+            Err(error)
+        }
+        Err(_) => {
+            emergency_kill_wait_and_retire(cleanup);
+            Err(anyhow::anyhow!(
+                "process cleanup panicked; exact child emergency-reaped"
+            ))
+        }
+    }
+}
+
+fn emergency_kill_wait_and_retire(cleanup: &ProcessCleanup) {
+    let mut child_slot = match cleanup.child.lock() {
+        Ok(child) => child,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let expected_pid = child_slot
+        .as_ref()
+        .map(std::process::Child::id)
+        .or_else(|| {
+            let receipt = match cleanup.receipt.lock() {
+                Ok(receipt) => receipt,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            receipt.as_ref().map(|receipt| receipt.pid)
+        });
+    if let Some(child) = child_slot.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    *child_slot = None;
+    drop(child_slot);
+    if let Some(expected_pid) = expected_pid {
+        let bound = match cleanup.receipt.lock() {
+            Ok(receipt) => receipt.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let _ = retire_late_exact_metadata(cleanup, expected_pid, bound.as_ref());
+    }
+}
+
 fn process_reaper() -> anyhow::Result<&'static std::sync::mpsc::Sender<ProcessReap>> {
     initialize_process_reaper()?;
     PROCESS_REAPER
@@ -81,6 +132,10 @@ fn process_reaper() -> anyhow::Result<&'static std::sync::mpsc::Sender<ProcessRe
 }
 
 fn cleanup_exact_process(cleanup: &ProcessCleanup) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if INJECT_PROCESS_CLEANUP_PANIC.with(|inject| inject.replace(false)) {
+        panic!("injected process cleanup panic");
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut child_slot = cleanup
         .child
@@ -262,7 +317,7 @@ impl EphemeralDaemonGuard {
                     // If the process-lifetime reaper unexpectedly retired,
                     // retain exact ownership and perform the same bounded
                     // cleanup synchronously while surfacing its result.
-                    return cleanup_exact_process(&error.0.cleanup);
+                    return run_process_cleanup_recovering(&error.0.cleanup);
                 }
                 completion
                     .recv()
@@ -321,14 +376,15 @@ impl Drop for EphemeralDaemonGuard {
             match process_reaper() {
                 Ok(reaper) => {
                     if let Err(error) = reaper.send(reap) {
-                        if let Err(cleanup_error) = cleanup_exact_process(&error.0.cleanup) {
+                        if let Err(cleanup_error) = run_process_cleanup_recovering(&error.0.cleanup)
+                        {
                             tracing::error!(%cleanup_error, "emergency ephemeral cleanup failed");
                         }
                     }
                 }
                 Err(error) => {
                     tracing::error!(%error, "ephemeral process reaper unavailable during drop");
-                    if let Err(cleanup_error) = cleanup_exact_process(&reap.cleanup) {
+                    if let Err(cleanup_error) = run_process_cleanup_recovering(&reap.cleanup) {
                         tracing::error!(%cleanup_error, "emergency ephemeral cleanup failed");
                     }
                 }
@@ -425,7 +481,7 @@ pub fn spawn_signal_shutdown(
                         Err(error) => {
                             let cleanup = error.0.cleanup;
                             let _ = tokio::task::spawn_blocking(move || {
-                                cleanup_exact_process(&cleanup)
+                                run_process_cleanup_recovering(&cleanup)
                             })
                             .await;
                         }
@@ -433,9 +489,10 @@ pub fn spawn_signal_shutdown(
                     Err(error) => {
                         tracing::error!(%error, "signal-triggered daemon reaper unavailable");
                         let cleanup = reap.cleanup;
-                        let _ =
-                            tokio::task::spawn_blocking(move || cleanup_exact_process(&cleanup))
-                                .await;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            run_process_cleanup_recovering(&cleanup)
+                        })
+                        .await;
                     }
                 }
             } else {
@@ -653,5 +710,38 @@ mod tests {
         }
         assert!(!paths.pid_file.exists());
         assert!(!paths.socket.exists());
+    }
+
+    #[test]
+    fn cleanup_panic_retains_and_reaps_exact_child() {
+        let root = tempfile::tempdir().unwrap();
+        let (guard, _paths, _pid) = child_guard(root.path(), "cleanup-panic");
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        guard.armed.store(false, Ordering::SeqCst);
+        INJECT_PROCESS_CLEANUP_PANIC.with(|inject| inject.set(true));
+        assert!(run_process_cleanup_recovering(&cleanup).is_err());
+        assert!(cleanup.child.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn poisoned_child_mutex_still_emergency_reaps() {
+        let root = tempfile::tempdir().unwrap();
+        let (guard, _paths, _pid) = child_guard(root.path(), "poisoned-child");
+        let cleanup = guard.process.as_ref().unwrap().clone();
+        guard.armed.store(false, Ordering::SeqCst);
+        let child = cleanup.child.clone();
+        let _ = std::thread::spawn(move || {
+            let _locked = child.lock().unwrap();
+            panic!("poison child handle");
+        })
+        .join();
+        assert!(run_process_cleanup_recovering(&cleanup).is_err());
+        assert!(
+            cleanup
+                .child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+        );
     }
 }

@@ -434,6 +434,13 @@ pub enum Operator {
     Yank,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditOutcome {
+    pub removed_range: std::ops::Range<usize>,
+    pub inserted_range: std::ops::Range<usize>,
+    pub cursor: usize,
+}
+
 pub struct Composer {
     buffer: String,
     cursor: usize,
@@ -804,13 +811,15 @@ impl Composer {
         self.normalize_cursor_after_edit(EditIntent::InsertionEnd(desired));
     }
 
-    pub fn delete_left(&mut self) {
+    pub fn delete_left(&mut self) -> Option<std::ops::Range<usize>> {
         if self.cursor == 0 {
-            return;
+            return None;
         }
+        let old_cursor = self.cursor;
         let previous = semantic_boundary_before(&self.buffer, self.cursor);
         self.buffer.drain(previous..self.cursor);
         self.normalize_cursor_after_edit(EditIntent::DeletionStart(previous));
+        Some(previous..old_cursor)
     }
 
     /// Drain the semantic-grapheme-normalized range and return the actual
@@ -826,14 +835,15 @@ impl Composer {
         Some(start..end)
     }
 
-    pub fn delete_right(&mut self) {
+    pub fn delete_right(&mut self) -> Option<std::ops::Range<usize>> {
         if self.cursor >= self.buffer.len() {
-            return;
+            return None;
         }
         let start = self.cursor;
         let next = semantic_boundary_after(&self.buffer, start);
         self.buffer.drain(start..next);
         self.normalize_cursor_after_edit(EditIntent::DeletionStart(start));
+        Some(start..next)
     }
 
     pub fn move_left(&mut self) {
@@ -1649,15 +1659,15 @@ impl Composer {
 
     /// Replace the `@partial` immediately left of the cursor with
     /// `@{replacement}`. No-op if no `@` token is active.
-    pub fn replace_at_token(&mut self, replacement: &str) {
+    pub fn replace_at_token(&mut self, replacement: &str) -> Option<EditOutcome> {
         let Some(at_idx) = self.buffer[..self.cursor].rfind('@') else {
-            return;
+            return None;
         };
         // Confirm boundary — mirror at_query semantics.
         if at_idx > 0 {
             let prev = self.buffer[..at_idx].chars().next_back();
             if !matches!(prev, Some(c) if c.is_whitespace()) {
-                return;
+                return None;
             }
         }
         let body_end = self.cursor;
@@ -1669,6 +1679,11 @@ impl Composer {
         new.push_str(&self.buffer[body_end..]);
         self.buffer = new;
         self.normalize_cursor_after_edit(EditIntent::InsertionEnd(new_cursor));
+        Some(EditOutcome {
+            removed_range: at_idx..body_end,
+            inserted_range: at_idx..new_cursor,
+            cursor: self.cursor,
+        })
     }
 
     /// Cursor's (line, column) measured in terminal display columns.

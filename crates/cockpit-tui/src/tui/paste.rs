@@ -166,6 +166,43 @@ pub struct PasteTextCountReplacement {
 }
 
 impl PasteRegistry {
+    fn expected_placeholder(block: &PasteBlock) -> String {
+        match &block.kind {
+            PasteKind::Text { tokens, .. } => tokens.map_or_else(
+                || Self::pending_text_placeholder(block.number),
+                |tokens| Self::text_placeholder(block.number, tokens),
+            ),
+            PasteKind::Image { .. } | PasteKind::ImageHandle { .. } => {
+                Self::image_placeholder(block.number)
+            }
+        }
+    }
+
+    /// Reconcile presentation blocks after a full-buffer edit. Any block
+    /// whose exact placeholder identity or semantic-grapheme boundaries were
+    /// disturbed is retired rather than retaining corrupt payload authority.
+    pub fn reconcile_buffer(&mut self, buffer: &str) {
+        let mut offset = 0usize;
+        let mut boundaries = std::collections::BTreeSet::from([0usize]);
+        for grapheme in crate::tui::markdown::semantic_graphemes(buffer) {
+            offset += grapheme.len();
+            boundaries.insert(offset);
+        }
+        self.blocks.retain(|block| {
+            block.start <= block.end
+                && block.end <= buffer.len()
+                && boundaries.contains(&block.start)
+                && boundaries.contains(&block.end)
+                && buffer
+                    .get(block.start..block.end)
+                    .is_some_and(|text| text == Self::expected_placeholder(block))
+        });
+        debug_assert!(
+            self.blocks
+                .windows(2)
+                .all(|pair| pair[0].end <= pair[1].start)
+        );
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -1495,5 +1532,66 @@ gamma",
         let (vision, imgs) = r.build_wire(&buffer, true);
         assert_eq!(imgs, vec![png]);
         assert!(vision.contains(IMAGE_PART_SENTINEL));
+    }
+
+    #[test]
+    fn reconcile_retires_blocks_whose_edges_join_semantic_graphemes() {
+        let mut composer = Composer::new(false);
+        let mut registry = PasteRegistry::new();
+        let placeholder = registry.register_text(0, "payload".into(), 1);
+        composer.insert_str(&placeholder);
+        composer.set_cursor(composer.len());
+        let at = composer.cursor();
+        composer.insert_char('\u{301}');
+        registry.shift_for_edit(at, '\u{301}'.len_utf8() as isize);
+        registry.reconcile_buffer(composer.text());
+        assert!(
+            registry.is_empty(),
+            "combining seam invalidates exact block"
+        );
+
+        let mut composer = Composer::new(false);
+        let mut registry = PasteRegistry::new();
+        let placeholder = registry.register_image(0, vec![1, 2, 3]);
+        composer.insert_str(&placeholder);
+        composer.set_cursor(0);
+        composer.insert_str("\u{200d}");
+        registry.shift_for_edit(0, '\u{200d}'.len_utf8() as isize);
+        registry.reconcile_buffer(composer.text());
+        assert!(registry.is_empty(), "ZWJ seam invalidates exact block");
+
+        for seam in ["\u{1161}", "\u{094d}"] {
+            let mut composer = Composer::new(false);
+            let mut registry = PasteRegistry::new();
+            let placeholder = registry.register_text(0, "payload".into(), 1);
+            composer.insert_str(&placeholder);
+            composer.set_cursor(0);
+            composer.insert_str(seam);
+            registry.shift_for_edit(0, seam.len() as isize);
+            registry.reconcile_buffer(composer.text());
+            assert!(
+                registry.is_empty(),
+                "Hangul/virama seam invalidates block authority"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_block_delete_resegments_neighbors_without_stale_authority() {
+        let mut composer = Composer::new(false);
+        composer.set("🇺");
+        let mut registry = PasteRegistry::new();
+        let start = composer.len();
+        let placeholder = registry.register_text(start, "payload".into(), 1);
+        composer.insert_str(&placeholder);
+        composer.insert_str("🇸");
+        let end = start + placeholder.len();
+        let removed = composer.delete_range(start, end).expect("block deletion");
+        registry.shift_for_edit(removed.start, -(removed.len() as isize));
+        registry.reconcile_buffer(composer.text());
+        assert!(registry.is_empty());
+        assert_eq!(composer.cursor(), 0, "regional pair seam snaps backward");
+        composer.delete_right();
+        assert!(composer.text().is_empty());
     }
 }

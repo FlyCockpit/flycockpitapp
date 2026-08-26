@@ -1548,7 +1548,7 @@ impl App {
                 if !self.at_popup_active()
                     && let Some((s, e)) = self.completed_tag_left()
                 {
-                    self.composer.delete_range(s, e);
+                    let _ = self.composer_delete_range_block_aware(s, e);
                     self.refresh_at_dismiss();
                     self.reset_at_window();
                     return false;
@@ -1579,7 +1579,7 @@ impl App {
                 if !self.at_popup_active()
                     && let Some((s, e)) = self.completed_tag_right()
                 {
-                    self.composer.delete_range(s, e);
+                    let _ = self.composer_delete_range_block_aware(s, e);
                     self.refresh_at_dismiss();
                     self.reset_at_window();
                     return false;
@@ -1968,7 +1968,20 @@ impl App {
         }
         let idx = self.at_selected.min(suggestions.len() - 1);
         let sug = suggestions[idx].clone();
-        self.composer.replace_at_token(&sug.replacement);
+        let Some(edit) = self.composer.replace_at_token(&sug.replacement) else {
+            return false;
+        };
+        if !self.paste_registry.is_empty() {
+            self.paste_registry.shift_for_edit(
+                edit.removed_range.start,
+                -(edit.removed_range.len() as isize),
+            );
+            self.paste_registry.shift_for_edit(
+                edit.inserted_range.start,
+                edit.inserted_range.len() as isize,
+            );
+            self.reconcile_paste_blocks();
+        }
         self.at_selected = 0;
         self.at_scroll = 0;
 
@@ -1988,7 +2001,7 @@ impl App {
                 project_id,
             );
             // Trailing space terminates the tag and closes the popup.
-            self.composer.insert_char(' ');
+            self.composer_insert_char(' ');
             self.at_dismissed = true;
         }
         // Dir-descend (Tab on a directory): `replacement` ends with `/`,
@@ -2069,7 +2082,7 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::SHIFT)
                     || key.modifiers.contains(KeyModifiers::ALT)
                 {
-                    self.composer.insert_char('\n');
+                    self.composer_insert_char('\n');
                     return false;
                 }
                 self.complete_or_submit()
@@ -2183,11 +2196,11 @@ impl App {
                         self.composer.set_vim_mode(VimMode::Insert);
                     }
                     'o' => {
-                        self.composer.open_below();
+                        self.composer_open_below();
                         self.composer.set_vim_mode(VimMode::Insert);
                     }
                     'O' => {
-                        self.composer.open_above();
+                        self.composer_open_above();
                         self.composer.set_vim_mode(VimMode::Insert);
                     }
                     'p' => self.vim_paste(true),
@@ -2468,6 +2481,7 @@ impl App {
                     self.paste_registry
                         .shift_for_edit(removed.start, -(removed.len() as isize));
                 }
+                self.reconcile_paste_blocks();
             }
         }
         self.mirror_register_to_clipboard();
@@ -3756,9 +3770,12 @@ impl App {
         if let Some((start, end, full)) = self.paste_registry.expandable_text_at(cursor, &data) {
             // Replace the placeholder span with the raw text and drop the
             // block from the registry.
-            self.composer.delete_range(start, end);
-            self.paste_registry.remove_range(start, end);
-            self.composer.set_cursor(start);
+            if let Some(removed) = self.composer.delete_range(start, end) {
+                self.paste_registry
+                    .shift_for_edit(removed.start, -(removed.len() as isize));
+                self.composer.set_cursor(removed.start);
+            }
+            self.reconcile_paste_blocks();
             self.insert_text_raw(&full);
             self.refresh_at_dismiss();
             self.reset_at_window();
@@ -3821,6 +3838,11 @@ impl App {
         self.composer.set_cursor(at);
         self.composer.insert_str(text);
         self.paste_registry.shift_for_edit(at, text.len() as isize);
+        self.reconcile_paste_blocks();
+    }
+
+    fn reconcile_paste_blocks(&mut self) {
+        self.paste_registry.reconcile_buffer(self.composer.text());
     }
 
     /// Condense a long text paste into a pending `[Pasted text #N, counting
@@ -3838,6 +3860,7 @@ impl App {
         // `register_text_pending` already recorded the block at `[at, at+len)`;
         // shift only the blocks that were *after* the insertion point.
         self.shift_other_blocks_after_insert(at, placeholder.len());
+        self.reconcile_paste_blocks();
         self.start_paste_token_count(block_id, full);
     }
 
@@ -3863,15 +3886,22 @@ impl App {
             return false;
         };
         let cursor = self.composer.cursor();
-        let old_len = replacement.end - replacement.start;
         let new_len = replacement.replacement.len();
-        self.composer
-            .delete_range(replacement.start, replacement.end);
+        let Some(removed) = self
+            .composer
+            .delete_range(replacement.start, replacement.end)
+        else {
+            self.reconcile_paste_blocks();
+            return false;
+        };
+        let insertion_start = removed.start;
+        let old_len = removed.len();
+        self.composer.set_cursor(insertion_start);
         self.composer.insert_str(&replacement.replacement);
-        let new_end = replacement.start + new_len;
-        let new_cursor = if cursor <= replacement.start {
+        let new_end = insertion_start + new_len;
+        let new_cursor = if cursor <= removed.start {
             cursor
-        } else if cursor >= replacement.end {
+        } else if cursor >= removed.end {
             if new_len >= old_len {
                 cursor + (new_len - old_len)
             } else {
@@ -3881,7 +3911,28 @@ impl App {
             new_end
         };
         self.composer.set_cursor(new_cursor);
+        self.reconcile_paste_blocks();
         true
+    }
+
+    fn composer_open_below(&mut self) {
+        if self.paste_registry.is_empty() {
+            self.composer.open_below();
+            return;
+        }
+        self.composer.move_line_end();
+        self.composer_insert_char('\n');
+    }
+
+    fn composer_open_above(&mut self) {
+        if self.paste_registry.is_empty() {
+            self.composer.open_above();
+            return;
+        }
+        self.composer.move_line_start();
+        self.composer_insert_char('\n');
+        self.composer
+            .set_cursor(self.composer.cursor().saturating_sub(1));
     }
 
     /// Insert a pasted image as a `[Pasted image #N]` block. On a
@@ -3906,6 +3957,7 @@ impl App {
         let placeholder = self.paste_registry.register_image(at, png);
         self.composer.insert_str(&placeholder);
         self.shift_other_blocks_after_insert(at, placeholder.len());
+        self.reconcile_paste_blocks();
         self.refresh_at_dismiss();
         self.reset_at_window();
         self.reset_slash_window();
@@ -3970,6 +4022,7 @@ impl App {
         );
         self.composer.insert_str(&placeholder);
         self.shift_other_blocks_after_insert(at, placeholder.len());
+        self.reconcile_paste_blocks();
         self.refresh_at_dismiss();
         self.reset_at_window();
         self.reset_slash_window();
@@ -4049,8 +4102,27 @@ impl App {
     /// Delete the block at `[start, end)` from both the buffer and the
     /// registry, leaving the cursor at `start`.
     fn delete_paste_block(&mut self, start: usize, end: usize) {
-        self.composer.delete_range(start, end);
-        self.paste_registry.remove_range(start, end);
+        if let Some(removed) = self.composer.delete_range(start, end) {
+            self.paste_registry
+                .shift_for_edit(removed.start, -(removed.len() as isize));
+        }
+        self.reconcile_paste_blocks();
+    }
+
+    fn composer_delete_range_block_aware(
+        &mut self,
+        mut start: usize,
+        mut end: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        if let Some((block_start, block_end)) = self.paste_registry.block_crossed_by(start, end) {
+            start = start.min(block_start);
+            end = end.max(block_end);
+        }
+        let removed = self.composer.delete_range(start, end)?;
+        self.paste_registry
+            .shift_for_edit(removed.start, -(removed.len() as isize));
+        self.reconcile_paste_blocks();
+        Some(removed)
     }
 
     /// Apply a Tab press to the pending ghost prediction
@@ -4096,6 +4168,7 @@ impl App {
         self.composer.insert_char(ch);
         self.paste_registry
             .shift_for_edit(at, ch.len_utf8() as isize);
+        self.reconcile_paste_blocks();
     }
 
     /// Backspace, block-aware. (The whole-block case is handled by the
@@ -4112,15 +4185,11 @@ impl App {
         // Never delete from inside a block interior — snap to its start.
         let cursor = self.paste_registry.skip_cursor(cursor, false);
         self.composer.set_cursor(cursor);
-        let before = self.composer.len();
-        self.composer.delete_left();
-        let removed = before - self.composer.len();
-        if removed > 0 {
-            // delete_left removes the char ending at the old cursor; the
-            // edit anchor is the new cursor position.
+        if let Some(removed) = self.composer.delete_left() {
             self.paste_registry
-                .shift_for_edit(self.composer.cursor(), -(removed as isize));
+                .shift_for_edit(removed.start, -(removed.len() as isize));
         }
+        self.reconcile_paste_blocks();
     }
 
     /// Forward-delete (`Delete` / vim `x`), block-aware ordinary-char
@@ -4133,13 +4202,11 @@ impl App {
         let cursor = self.composer.cursor();
         let cursor = self.paste_registry.skip_cursor(cursor, true);
         self.composer.set_cursor(cursor);
-        let at = self.composer.cursor();
-        let before = self.composer.len();
-        self.composer.delete_right();
-        let removed = before - self.composer.len();
-        if removed > 0 {
-            self.paste_registry.shift_for_edit(at, -(removed as isize));
+        if let Some(removed) = self.composer.delete_right() {
+            self.paste_registry
+                .shift_for_edit(removed.start, -(removed.len() as isize));
         }
+        self.reconcile_paste_blocks();
     }
 
     /// Run a vim normal-mode motion (`w`/`W`/`b`/`B`) then snap the cursor
@@ -4233,6 +4300,7 @@ impl App {
             self.paste_registry
                 .shift_for_edit(removed.start, -(removed.len() as isize));
         }
+        self.reconcile_paste_blocks();
     }
 
     /// Run a `f`/`F`/`t`/`T` find as a standalone Normal-mode motion,
@@ -4273,6 +4341,7 @@ impl App {
             self.paste_registry
                 .shift_for_edit(removed.start, -(removed.len() as isize));
         }
+        self.reconcile_paste_blocks();
         self.mirror_register_to_clipboard();
     }
 
@@ -4327,6 +4396,7 @@ impl App {
         if inserted > 0 && !self.paste_registry.is_empty() {
             self.paste_registry.shift_for_edit(anchor, inserted);
         }
+        self.reconcile_paste_blocks();
     }
 
     /// Mirror the unnamed register to the system clipboard (best-effort).
@@ -4510,6 +4580,7 @@ impl App {
                     self.paste_registry
                         .shift_for_edit(removed.start, -(removed.len() as isize));
                 }
+                self.reconcile_paste_blocks();
                 self.composer
                     .set_vim_mode(if matches!(op, Operator::Change) {
                         VimMode::Insert

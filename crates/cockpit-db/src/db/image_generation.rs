@@ -2769,7 +2769,7 @@ impl Db {
     /// Inserts the sealed plan and its initial projection in the caller's
     /// transaction. Composition with grants, resources, spend and journal
     /// rows therefore needs no second connection or async boundary.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     fn create_image_generation_job_conn(
         conn: &Connection,
         input: &CreateImageGenerationJob<'_>,
@@ -2934,7 +2934,7 @@ impl Db {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     fn cas_image_generation_job_state_conn(
         conn: &Connection,
         job_id: Uuid,
@@ -2965,7 +2965,7 @@ impl Db {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     fn cas_image_generation_slot_state_conn(
         conn: &Connection,
         job_id: Uuid,
@@ -5739,7 +5739,7 @@ pub fn image_generation_component_set_binding(
     Ok((json, digest))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 mod tests {
     use super::*;
     use crate::db::image_generation_plan::*;

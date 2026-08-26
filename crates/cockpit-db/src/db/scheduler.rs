@@ -299,7 +299,7 @@ fn scheduled_job_from_row(row: &Row<'_>) -> rusqlite::Result<ScheduledJobRow> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 mod tests {
     use super::*;
 

@@ -3550,9 +3550,10 @@ mod tests {
 
     #[test]
     fn migration_files_on_disk_match_expected_set() {
-        // Pre-release: the directory contains the local base plus the opt-in
-        // remote profile extension. The independent literal catches stray or
-        // deleted schema inputs without deriving expectations from MIGRATIONS.
+        // Pre-release: the directory contains the local base plus independent
+        // opt-in extended and remote profile extensions. The literal catches
+        // stray or deleted schema inputs without deriving expectations from
+        // MIGRATIONS.
         let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("db")
@@ -3567,6 +3568,7 @@ mod tests {
         assert_eq!(
             migrations,
             vec![
+                "0001_extended_profile.sql".to_string(),
                 "0001_initial.sql".to_string(),
                 "0001_remote_profile.sql".to_string(),
             ]

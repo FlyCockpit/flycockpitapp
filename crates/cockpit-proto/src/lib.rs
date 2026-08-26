@@ -6950,6 +6950,7 @@ mod tests {
                 begin_client_operation_id: "begin-mcp".into(),
                 flow_id: Some("flow".into()),
             },
+            #[cfg(feature = "extended")]
             Request::SaveImageSpendPolicy {
                 client_operation_id: "save-image-spend".into(),
                 project_key: "project".into(),
@@ -7083,6 +7084,7 @@ mod tests {
                 config_generation: 7,
                 credential_count: 0,
             },
+            #[cfg(feature = "extended")]
             Response::ImageSpendPolicySaved {
                 client_operation_id: "save-image-spend".into(),
                 project_key: "project".into(),

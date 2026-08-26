@@ -11058,7 +11058,7 @@ async fn remote_setup_copilot_auth_refuses_ambient_github_token_read() {
 /// the DB write once, commits the durable replay record, and a same-operation
 /// replay returns the cached response without a second write.
 #[tokio::test]
-#[cfg(feature = "remote")]
+#[cfg(all(feature = "remote", feature = "extended"))]
 async fn remote_owner_save_image_spend_policy_commits_and_replays() {
     let ctx = persistent_test_ctx();
     let operation = remote_owner_operation().await;
@@ -16703,7 +16703,9 @@ fn authz_dispatch_cases() -> Vec<AuthzDispatchCase> {
         authz_owner_only("get_extended_config_snapshot"),
         authz_owner_only("export_policy"),
         authz_owner_only("import_policy"),
+        #[cfg(feature = "extended")]
         authz_owner_only("get_image_spend_policy"),
+        #[cfg(feature = "extended")]
         authz_owner_only("save_image_spend_policy"),
         authz_owner_only("image_endpoint_list"),
         authz_owner_only("image_endpoint_get"),
@@ -18332,6 +18334,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
             bundle_json: "{}".into(),
             replace: false,
         },
+        #[cfg(feature = "extended")]
         "get_image_spend_policy" => Request::GetImageSpendPolicy {
             project_key: root.clone(),
         },
@@ -18475,6 +18478,7 @@ fn authz_matrix_request(kind: &str, session_id: Uuid, project_root: &Path) -> Re
                 "cc".repeat(32),
             ),
         },
+        #[cfg(feature = "extended")]
         "save_image_spend_policy" => Request::SaveImageSpendPolicy {
             client_operation_id: "authz-image-save".into(),
             project_key: root.clone(),
@@ -23548,6 +23552,7 @@ async fn request_ordering_concurrent_set_is_exactly_the_enumerated_reads() {
         "fs_read",
         "fs_stat",
         "get_host_capabilities",
+        #[cfg(feature = "extended")]
         "get_image_spend_policy",
         "image_endpoint_list",
         "image_endpoint_get",
@@ -25478,7 +25483,9 @@ async fn command_table_metadata_is_exhaustive_and_stable() {
         CommandMetadataCase { request: Request::SaveExtendedConfig { project_root: "/tmp/project".into(), path: "AGENTS.md".into(), content: String::new(), base_hash: None }, kind: "save_extended_config", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
         CommandMetadataCase { request: Request::ExportPolicy { project_root: "/tmp/project".into() }, kind: "export_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImportPolicy { project_root: "/tmp/project".into(), bundle_json: "{}".into(), replace: false }, kind: "import_policy", session_id: None, audit_path: Some("/tmp/project"), mutating: true },
+        #[cfg(feature = "extended")]
         CommandMetadataCase { request: Request::GetImageSpendPolicy { project_key: "proj".into() }, kind: "get_image_spend_policy", session_id: None, audit_path: None, mutating: false },
+        #[cfg(feature = "extended")]
         CommandMetadataCase { request: Request::SaveImageSpendPolicy { client_operation_id: "image-save".into(), project_key: "proj".into(), settings_json: "{}".into(), expected_policy_version: None }, kind: "save_image_spend_policy", session_id: None, audit_path: None, mutating: true },
         CommandMetadataCase { request: Request::ImageEndpointList { project_root: "/tmp/project".into(), limit: None, cursor: None }, kind: "image_endpoint_list", session_id: None, audit_path: Some("/tmp/project"), mutating: false },
         CommandMetadataCase { request: Request::ImageEndpointGet { project_root: "/tmp/project".into(), endpoint_id: "ep1".into() }, kind: "image_endpoint_get", session_id: None, audit_path: Some("/tmp/project"), mutating: false },

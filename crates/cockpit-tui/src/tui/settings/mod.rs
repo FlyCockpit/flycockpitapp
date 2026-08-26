@@ -48,6 +48,7 @@ pub(crate) mod disk_daemon_fake;
 mod grab;
 mod harnesses_page;
 mod image_generation;
+#[cfg(feature = "extended")]
 mod image_spend;
 mod lsp_page;
 mod mcp_page;
@@ -1226,6 +1227,7 @@ enum PendingSettingsOperation {
         target: SettingsEffectTarget,
         prompt: category::ShadowedGlobalPrompt,
     },
+    #[cfg(feature = "extended")]
     ImageSpendLoad {
         target: SettingsEffectTarget,
         project_key: String,
@@ -1304,7 +1306,6 @@ impl PendingSettingsOperation {
             },
             Self::ExtendedRefresh { target, .. }
             | Self::ProjectShadowSnapshot { target, .. }
-            | Self::ImageSpendLoad { target, .. }
             | Self::ProviderMutation { target, .. }
             | Self::Followup { target, .. }
             | Self::SimpleMutation { target, .. }
@@ -1313,6 +1314,8 @@ impl PendingSettingsOperation {
             | Self::TypedDocumentEdit { target, .. }
             | Self::CategoryExternalPrepare { target, .. }
             | Self::CategoryExternalRead { target, .. } => target.clone(),
+            #[cfg(feature = "extended")]
+            Self::ImageSpendLoad { target, .. } => target.clone(),
             Self::ProviderCatalog {
                 project_root,
                 provider_id,
@@ -1407,6 +1410,7 @@ enum SettingsMutationAction {
         project_root: String,
         expected_request_hash: String,
     },
+    #[cfg(feature = "extended")]
     ImageSpendSave {
         client_operation_id: String,
         project_key: String,
@@ -1429,6 +1433,7 @@ impl SettingsMutationAction {
                 "put_provider_credential"
             }
             Self::CopilotSetup { .. } => "setup_copilot_auth",
+            #[cfg(feature = "extended")]
             Self::ImageSpendSave { .. } => "save_image_spend_policy",
         }
     }
@@ -1466,8 +1471,9 @@ impl SettingsMutationAction {
             | Self::CopilotSetup {
                 client_operation_id,
                 ..
-            }
-            | Self::ImageSpendSave {
+            } => client_operation_id,
+            #[cfg(feature = "extended")]
+            Self::ImageSpendSave {
                 client_operation_id,
                 ..
             } => client_operation_id,
@@ -1476,6 +1482,7 @@ impl SettingsMutationAction {
 
     fn matches_durable_receipt(&self, response: &Response) -> bool {
         match (self, response) {
+            #[cfg(feature = "extended")]
             (
                 Self::ImageSpendSave {
                     client_operation_id,
@@ -1719,12 +1726,13 @@ fn settlement_hash_matches(operation: &PendingSettingsOperation, observed: &str)
             | SettingsMutationAction::McpOAuthCancel {
                 expected_request_hash,
                 ..
-            }
-            | SettingsMutationAction::ImageSpendSave {
+            } => Some(expected_request_hash.as_str()),
+            #[cfg(feature = "extended")]
+            SettingsMutationAction::ImageSpendSave {
                 expected_request_hash,
                 ..
-            }
-            | SettingsMutationAction::ProviderCredentialDelete {
+            } => Some(expected_request_hash.as_str()),
+            SettingsMutationAction::ProviderCredentialDelete {
                 expected_request_hash,
                 ..
             }
@@ -2670,13 +2678,16 @@ fn boxed_page(page: Page) -> PageBox {
 #[allow(private_interfaces)]
 #[cfg(test)]
 pub(crate) enum TestPageRef<'a> {
-    Root { cursor: usize },
+    Root {
+        cursor: usize,
+    },
     DefaultModel(&'a DefaultModelPage),
     Agents(&'a AgentsPage),
     Tools(&'a ToolsPage),
     Harnesses(&'a HarnessesPage),
     Providers(&'a ProvidersPage),
     Category(&'a CategoryPage),
+    #[cfg(feature = "extended")]
     ImageSpend(&'a image_spend::ImageSpendPage),
     Instructions(&'a InstructionsPage),
     RedactPatterns(&'a RedactPatternsPage),
@@ -2697,12 +2708,15 @@ pub(crate) enum TestPageRef<'a> {
 
 #[cfg(test)]
 enum TestPageMut<'a> {
-    Root { cursor: &'a mut usize },
+    Root {
+        cursor: &'a mut usize,
+    },
     Agents(&'a mut AgentsPage),
     Tools(&'a mut ToolsPage),
     Harnesses(&'a mut HarnessesPage),
     Providers(&'a mut ProvidersPage),
     Category(&'a mut CategoryPage),
+    #[cfg(feature = "extended")]
     ImageSpend(&'a mut image_spend::ImageSpendPage),
     Instructions(&'a mut InstructionsPage),
     RedactPatterns(&'a mut RedactPatternsPage),
@@ -2732,6 +2746,7 @@ impl std::fmt::Debug for TestPageRef<'_> {
             Self::Harnesses(_) => f.write_str("Harnesses"),
             Self::Providers(_) => f.write_str("Providers"),
             Self::Category(_) => f.write_str("Category"),
+            #[cfg(feature = "extended")]
             Self::ImageSpend(_) => f.write_str("ImageSpend"),
             Self::Instructions(_) => f.write_str("Instructions"),
             Self::RedactPatterns(_) => f.write_str("RedactPatterns"),
@@ -2762,6 +2777,7 @@ impl std::fmt::Debug for TestPageMut<'_> {
             Self::Harnesses(_) => f.write_str("Harnesses"),
             Self::Providers(_) => f.write_str("Providers"),
             Self::Category(_) => f.write_str("Category"),
+            #[cfg(feature = "extended")]
             Self::ImageSpend(_) => f.write_str("ImageSpend"),
             Self::Instructions(_) => f.write_str("Instructions"),
             Self::RedactPatterns(_) => f.write_str("RedactPatterns"),
@@ -2958,6 +2974,7 @@ impl SettingsCx {
         operation_id
     }
 
+    #[cfg(feature = "extended")]
     pub(super) fn queue_image_spend_load(
         &mut self,
         project_key: String,
@@ -2984,6 +3001,19 @@ impl SettingsCx {
         );
     }
 
+    #[cfg(not(feature = "extended"))]
+    pub(super) fn queue_image_spend_load(
+        &mut self,
+        _project_key: String,
+        page_instance_id: uuid::Uuid,
+    ) {
+        self.completed_image_spend = Some(ImageSpendCompletion::Failed {
+            page_instance_id,
+            message: "image-generation budgets require the extended build profile".into(),
+        });
+    }
+
+    #[cfg(feature = "extended")]
     fn queue_image_spend_save(
         &mut self,
         project_key: String,
@@ -3026,6 +3056,17 @@ impl SettingsCx {
             },
         );
         Ok(())
+    }
+
+    #[cfg(not(feature = "extended"))]
+    fn queue_image_spend_save(
+        &mut self,
+        _project_key: String,
+        _settings: cockpit_config::config::image_spend::ImageSpendSettings,
+        _expected_policy_version: Option<u64>,
+        _page_instance_id: uuid::Uuid,
+    ) -> Result<(), String> {
+        Err("image-generation budgets require the extended build profile".into())
     }
 
     fn enqueue_settlement_effect(
@@ -3140,6 +3181,7 @@ impl SettingsCx {
                     });
                 }
                 SettingsMutationAction::ProviderCredentialPut { .. } => {}
+                #[cfg(feature = "extended")]
                 SettingsMutationAction::ImageSpendSave {
                     page_instance_id, ..
                 } => {
@@ -3629,6 +3671,7 @@ impl SettingsCx {
                     self.pending_shadow_prompt = Some(prompt);
                 }
             }
+            #[cfg(feature = "extended")]
             PendingSettingsOperation::ImageSpendLoad {
                 target,
                 project_key: _,
@@ -3940,6 +3983,7 @@ impl SettingsCx {
                     return Ok(());
                 }
                 let result = match (action, completion.response) {
+                    #[cfg(feature = "extended")]
                     (
                         SettingsMutationAction::ImageSpendSave {
                             client_operation_id,
@@ -6022,11 +6066,15 @@ impl SettingsDialog {
                     ));
                 }
                 if let Some(completion) = self.cx.completed_image_spend.take() {
+                    let mut completion = Some(completion);
+                    #[cfg(feature = "extended")]
                     if let Some(page) = self.page.downcast_mut::<image_spend::ImageSpendPage>() {
-                        page.apply_daemon_completion(completion);
-                    } else if let Some(page) = self
-                        .page
-                        .downcast_mut::<image_generation::BudgetEditorPage>()
+                        page.apply_daemon_completion(completion.take().unwrap());
+                    }
+                    if let Some(completion) = completion
+                        && let Some(page) = self
+                            .page
+                            .downcast_mut::<image_generation::BudgetEditorPage>()
                     {
                         page.apply_daemon_completion(completion);
                     }
@@ -6239,6 +6287,7 @@ impl SettingsDialog {
         if let Some(p) = self.page.downcast_ref::<CategoryPage>() {
             return TestPageRef::Category(p);
         }
+        #[cfg(feature = "extended")]
         if let Some(p) = self.page.downcast_ref::<image_spend::ImageSpendPage>() {
             return TestPageRef::ImageSpend(p);
         }
@@ -6331,6 +6380,7 @@ impl SettingsDialog {
         if self.page.as_any().is::<CategoryPage>() {
             return TestPageMut::Category(self.page.downcast_mut::<CategoryPage>().unwrap());
         }
+        #[cfg(feature = "extended")]
         if self.page.as_any().is::<image_spend::ImageSpendPage>() {
             return TestPageMut::ImageSpend(
                 self.page
@@ -6640,6 +6690,7 @@ impl SettingsDialog {
     }
 
     fn tick(&mut self) {
+        #[cfg(feature = "extended")]
         if let Some(page) = self.page.downcast_mut::<image_spend::ImageSpendPage>() {
             page.poll();
         }
@@ -7464,6 +7515,7 @@ impl SettingsPage for RootPage {
                         cx.reload_extended();
                         Some(category_page(CategoryPage::new(Category::Behavior)))
                     }
+                    #[cfg(feature = "extended")]
                     "Image spend budgets" => {
                         let project_key = cx
                             .active_project_root
@@ -7622,6 +7674,7 @@ pub(super) const DEFAULT_MODEL_TITLE: &str = "Default model for new sessions";
 /// from the menu.
 fn root_nodes() -> [NavNode; 16] {
     [
+        #[cfg(feature = "extended")]
         NavNode {
             id: pointer_actions::RootNodeId::DefaultModel,
             title: pointer_actions::RootNodeId::DefaultModel.title(),

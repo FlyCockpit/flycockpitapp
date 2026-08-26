@@ -380,7 +380,7 @@ pub(crate) fn spawn_image_generation_worker(
     tokio::spawn(worker.run(shutdown))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 mod tests {
     use super::*;
     use std::sync::Mutex;

@@ -26,7 +26,13 @@ workspace = true
 # internal/remote builds; they are absent from the default help and dispatch
 # surface.
 default = []
-extended = ["cockpit-core/extended", "cockpit-db/extended"]
+extended = [
+    "cockpit-client/extended",
+    "cockpit-core/extended",
+    "cockpit-db/extended",
+    "cockpit-proto/extended",
+    "cockpit-tui/extended",
+]
 remote = [
     "cockpit-client/remote",
     "cockpit-core/remote",

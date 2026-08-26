@@ -7206,6 +7206,7 @@ async fn handle_serialized_request_impl(
             finish_provider_mutation_future!(remote_operation, ctx, "import_policy", mutation)
         }
 
+        #[cfg(feature = "extended")]
         Request::GetImageSpendPolicy { project_key } => {
             let current = ctx
                 .db
@@ -7321,6 +7322,7 @@ async fn handle_serialized_request_impl(
             .await
         }
 
+        #[cfg(feature = "extended")]
         Request::SaveImageSpendPolicy {
             client_operation_id,
             project_key,
@@ -13899,6 +13901,7 @@ async fn handle_concurrent_request_impl(
             )
             .await
         }
+        #[cfg(feature = "extended")]
         Request::GetImageSpendPolicy { project_key } => {
             let current = ctx
                 .db

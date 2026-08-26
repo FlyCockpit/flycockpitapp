@@ -738,8 +738,9 @@ fn scrub_response_free_text(response: &mut proto::Response, redact: &RedactionTa
         }
         // Metadata-only: a config file path + counts / typed spend settings /
         // version numbers. No user free-text that could embed a secret.
-        proto::Response::PolicyImported { .. }
-        | proto::Response::ImageSpendPolicy { .. }
+        proto::Response::PolicyImported { .. } => {}
+        #[cfg(feature = "extended")]
+        proto::Response::ImageSpendPolicy { .. }
         | proto::Response::ImageSpendPolicySaved { .. } => {}
         // Redacted image-control read reply. Every secret-BEARING field
         // (credential_ref/headers/graph_json/target source_urls) is dropped at

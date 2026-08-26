@@ -797,11 +797,13 @@ pub enum Response {
         provider_count: u32,
     },
 
+    #[cfg(feature = "extended")]
     ImageSpendPolicy {
         settings: Option<cockpit_config::config::image_spend::ImageSpendSettings>,
         policy_version: Option<u64>,
     },
 
+    #[cfg(feature = "extended")]
     ImageSpendPolicySaved {
         client_operation_id: String,
         project_key: String,
@@ -1412,7 +1414,9 @@ macro_rules! response_variants {
             (Response::SetupWizardApplied { .. }, "setup_wizard_applied");
             (Response::PolicyExported { .. }, "policy_exported");
             (Response::PolicyImported { .. }, "policy_imported");
+            #[cfg(feature = "extended")]
             (Response::ImageSpendPolicy { .. }, "image_spend_policy");
+            #[cfg(feature = "extended")]
             (Response::ImageSpendPolicySaved { .. }, "image_spend_policy_saved");
             (Response::ImageControlRead(..), "image_control_read");
             (Response::ImageControlMutated(..), "image_control_mutated");

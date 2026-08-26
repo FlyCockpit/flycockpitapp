@@ -1954,12 +1954,14 @@ pub enum Request {
     },
 
     /// Return the current daemon-owned image spend policy.
+    #[cfg(feature = "extended")]
     GetImageSpendPolicy {
         #[serde(deserialize_with = "deserialize_owner_provider_id")]
         project_key: String,
     },
 
     /// Validate and persist an image spend policy through the daemon owner.
+    #[cfg(feature = "extended")]
     SaveImageSpendPolicy {
         /// Stable owner-chosen id used for durable replay and settlement.
         client_operation_id: String,
@@ -3289,9 +3291,11 @@ impl Request {
                     return Err("policy bundle exceeds maximum length".to_string());
                 }
             }
+            #[cfg(feature = "extended")]
             Self::GetImageSpendPolicy { project_key } => {
                 validate_owner_identifier("project key", project_key, MAX_OWNER_PROVIDER_ID_BYTES)?;
             }
+            #[cfg(feature = "extended")]
             Self::SaveImageSpendPolicy {
                 client_operation_id,
                 project_key,
@@ -3742,7 +3746,9 @@ macro_rules! request_variants {
             (Request::SaveExtendedConfig { .. }, "save_extended_config");
             (Request::ExportPolicy { .. }, "export_policy");
             (Request::ImportPolicy { .. }, "import_policy");
+            #[cfg(feature = "extended")]
             (Request::GetImageSpendPolicy { .. }, "get_image_spend_policy");
+            #[cfg(feature = "extended")]
             (Request::SaveImageSpendPolicy { .. }, "save_image_spend_policy");
             (Request::ImageEndpointList { .. }, "image_endpoint_list");
             (Request::ImageEndpointGet { .. }, "image_endpoint_get");
@@ -4041,6 +4047,7 @@ macro_rules! command {
             (Request::SaveExtendedConfig { project_root, path, content, base_hash }, "save_extended_config", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|path:String|content:String|base_hash:Option<String>", [project_root: String => project_root, path: String => param, content: String => param, base_hash: Option<String> => param]);
             (Request::ExportPolicy { project_root }, "export_policy", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String", [project_root: String => project_root]);
             (Request::ImportPolicy { project_root, bundle_json, replace }, "import_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, path(project_root), "project_root:String|bundle_json:String|replace:bool", [project_root: String => project_root, bundle_json: String => param, replace: bool => param]);
+            #[cfg(feature = "extended")]
             (Request::GetImageSpendPolicy { project_key }, "get_image_spend_policy", owner_only, none, false, local_only, none, concurrent, none, "project_key:String", [project_key: String => param]);
             (Request::ImageEndpointList { project_root, limit, cursor }, "image_endpoint_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
             (Request::ImageEndpointGet { project_root, endpoint_id }, "image_endpoint_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|endpoint_id:String", [project_root: String => project_root, endpoint_id: String => param]);
@@ -4048,6 +4055,7 @@ macro_rules! command {
             (Request::ImageTargetGet { project_root, target_id }, "image_target_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|target_id:String", [project_root: String => project_root, target_id: String => param]);
             (Request::ImageWorkflowList { project_root, limit, cursor }, "image_workflow_list", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|limit:Option<u16>|cursor:Option<String>", [project_root: String => project_root, limit: Option<u16> => param, cursor: Option<String> => param]);
             (Request::ImageWorkflowGet { project_root, workflow_id }, "image_workflow_get", owner_only, none, false, local_only, none, concurrent, path(project_root), "project_root:String|workflow_id:String", [project_root: String => project_root, workflow_id: String => param]);
+            #[cfg(feature = "extended")]
             (Request::SaveImageSpendPolicy { client_operation_id, project_key, settings_json, expected_policy_version }, "save_image_spend_policy", owner_only, none, true, nonrepeatable_mutation, nonrepeatable_dispatch, serialized, none, "client_operation_id:String|project_key:String|settings_json:String|expected_policy_version:Option<u64>", [client_operation_id: String => param, project_key: String => param, settings_json: String => param, expected_policy_version: Option<u64> => param]);
             (Request::ImageEndpointCreate { client_operation_id, mutation_intent_hash, project_root, endpoint_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_create", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);
             (Request::ImageEndpointUpdate { client_operation_id, mutation_intent_hash, project_root, endpoint_id, endpoint_json, expected_config_generation, expected_config_revision, mutation_capability }, "image_endpoint_update", owner_only, none, true, local_only, none, serialized, path(project_root), "client_operation_id:String|mutation_intent_hash:String|project_root:String|endpoint_id:String|endpoint_json:SensitiveWirePayload|expected_config_generation:u64|expected_config_revision:String|mutation_capability:crate::image_control::ImageConfigMutationCapabilityV1", [client_operation_id: String => param, mutation_intent_hash: String => param, project_root: String => project_root, endpoint_id: String => param, endpoint_json: SensitiveWirePayload => param, expected_config_generation: u64 => param, expected_config_revision: String => param, mutation_capability: crate::image_control::ImageConfigMutationCapabilityV1 => param]);

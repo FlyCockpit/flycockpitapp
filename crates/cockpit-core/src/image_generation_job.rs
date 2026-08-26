@@ -66,7 +66,7 @@ use cockpit_host::private_fs::held_directory::{
 const MAX_AUTHORITY_STRING_BYTES: usize = 1_024;
 const MAX_PROVIDER_HANDOFF_EVIDENCE_BYTES: usize = 64 * 1024;
 const MAX_IMAGE_MEDIA_PLAN_SNAPSHOT_BYTES: usize = 64 * 1024;
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 static FORCE_ACCEPTED_RESPONSE_POST_RENAME_CUT: std::sync::LazyLock<
     std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
 > = std::sync::LazyLock::new(Default::default);
@@ -249,7 +249,7 @@ pub enum AcceptedImageResponseProgress {
     OutcomeUnknown,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 pub(crate) struct DeterministicImageGenerationAdapter {
     outcomes: std::sync::Mutex<std::collections::VecDeque<ImageGenerationHandoffResult>>,
     requests: std::sync::Mutex<Vec<ImageGenerationHandoffRequest>>,
@@ -261,7 +261,7 @@ pub(crate) struct DeterministicImageGenerationAdapter {
     cancellation_requests: std::sync::Mutex<Vec<ImageGenerationCancelRequest>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 impl DeterministicImageGenerationAdapter {
     pub(crate) fn new(outcomes: Vec<ImageGenerationHandoffResult>) -> Self {
         Self {
@@ -307,7 +307,7 @@ impl DeterministicImageGenerationAdapter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 struct ScriptedAcceptedResponseFetcher {
     fetches: std::sync::Mutex<std::collections::VecDeque<AcceptedImageResponseFetchOutcome>>,
     reconciliations:
@@ -316,10 +316,10 @@ struct ScriptedAcceptedResponseFetcher {
     reconcile_count: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 impl accepted_response_fetch_sealed::Sealed for ScriptedAcceptedResponseFetcher {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 #[async_trait::async_trait]
 impl AcceptedImageResponseFetcher for ScriptedAcceptedResponseFetcher {
     async fn fetch(
@@ -349,7 +349,7 @@ impl AcceptedImageResponseFetcher for ScriptedAcceptedResponseFetcher {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 impl ScriptedAcceptedResponseFetcher {
     fn new(
         fetches: Vec<AcceptedImageResponseFetchOutcome>,
@@ -364,10 +364,10 @@ impl ScriptedAcceptedResponseFetcher {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 impl image_generation_adapter_sealed::Sealed for DeterministicImageGenerationAdapter {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 #[async_trait::async_trait]
 impl ImageGenerationAdapter for DeterministicImageGenerationAdapter {
     async fn handoff(
@@ -1815,7 +1815,7 @@ impl OutputPathAuthorityId {
 
     /// Test-only raw constructor. `#[cfg(test)]`-gated so production cannot
     /// bypass [`Self::from_verified_output_directory`].
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     pub(crate) fn from_raw_for_test(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -3924,11 +3924,11 @@ pub struct HeldImageGenerationArtifactRoot {
 }
 
 impl HeldImageGenerationArtifactRoot {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     fn force_next_directory_sync_failure(&self) {
         self.guard.force_next_directory_sync_failure();
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     fn force_accepted_response_post_rename_cut(&self, component_id: Uuid) {
         FORCE_ACCEPTED_RESPONSE_POST_RENAME_CUT
             .lock()
@@ -4904,7 +4904,7 @@ pub fn retain_generated_image_artifact(
     };
     let evidence = effect.artifact().clone();
     let evidence_json = held_artifact_evidence_json(&evidence)?;
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     if FORCE_ACCEPTED_RESPONSE_POST_RENAME_CUT
         .lock()
         .unwrap()
@@ -5021,7 +5021,7 @@ impl HeldImageGenerationOutputDirectory {
     ) -> Result<HeldDirectoryEffectOutcome> {
         self.guard.delete_recovered_destination(recovery)
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "extended"))]
     fn force_next_directory_sync_failure(&self) {
         self.guard.force_next_directory_sync_failure();
     }
@@ -5452,7 +5452,7 @@ fn valid_path_component(value: &str) -> bool {
     valid_string(value) && value != "." && value != ".." && !value.contains(['/', '\\'])
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "extended"))]
 mod tests {
     use super::*;
     use std::sync::Arc;

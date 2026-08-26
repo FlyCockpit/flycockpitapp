@@ -1296,22 +1296,28 @@ fn create_migration_backup_with_limit(
     let untrusted = path.with_extension(format!(
         "v{schema_version}.backup-untrusted-{content_digest}.sqlite.quarantine"
     ));
-    if untrusted.exists() {
-        remove_backup_candidate(&candidate)?;
-        candidate_guard.disarm();
-        files::repair_private_file(&untrusted, "quarantined database backup artifact")?;
-        fsync_file_and_parent(&untrusted)?;
-        anyhow::bail!(
-            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: an exact content-identical backup is already durably quarantined at {}; it is not a trusted restorable backup before {reason}",
-            untrusted.display()
-        );
-    }
     let validation = validate_migration_backup(&candidate, schema_version).with_context(|| {
         format!(
             "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: migration backup artifact {} was durably preserved but remains untrusted before {reason}",
             untrusted.display()
         )
     });
+    if validation.is_err() && existing_quarantine_matches(&untrusted, &content_digest)? {
+        remove_backup_candidate(&candidate)?;
+        candidate_guard.disarm();
+        fsync_file_and_parent(&untrusted)?;
+        return Err(validation.unwrap_err()).context(format!(
+            "an exact content-identical backup is already durably quarantined at {}",
+            untrusted.display()
+        ));
+    }
+    // A mismatched, truncated, insecure, or symlink occupant must never make
+    // us discard the fresh candidate merely because it owns the digest-shaped
+    // pathname. Move it into the lock-owned candidate namespace; it remains
+    // recoverable until the replacement reaches its fsync boundary.
+    let displaced = quarantine_path_present(&untrusted)?
+        .then(|| displace_invalid_quarantine(path, &untrusted))
+        .transpose()?;
     if let Err(error) = validation {
         std::fs::rename(&candidate, &untrusted).with_context(|| {
             format!(
@@ -1322,6 +1328,9 @@ fn create_migration_backup_with_limit(
         })?;
         candidate_guard.disarm();
         fsync_file_and_parent(&untrusted)?;
+        if let Some(displaced) = displaced {
+            remove_backup_candidate(&displaced)?;
+        }
         prune_untrusted_migration_backups(path)?;
         return Err(error);
     }
@@ -1334,8 +1343,76 @@ fn create_migration_backup_with_limit(
     })?;
     candidate_guard.disarm();
     fsync_file_and_parent(&backup)?;
+    if let Some(displaced) = displaced {
+        remove_backup_candidate(&displaced)?;
+    }
     prune_migration_backups(path)?;
     Ok(())
+}
+
+fn existing_quarantine_matches(path: &Path, expected_digest: &str) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspecting quarantine artifact {}", path.display()));
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    files::repair_private_file(path, "quarantined database backup artifact")?;
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("rechecking quarantine artifact {}", path.display()))?;
+    if !quarantine_metadata_is_private_and_owned(&metadata) {
+        return Ok(false);
+    }
+    Ok(file_sha256(path)? == expected_digest)
+}
+
+fn quarantine_path_present(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspecting quarantine path {}", path.display()))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn quarantine_metadata_is_private_and_owned(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    // SAFETY: `geteuid` has no preconditions and reads process identity only.
+    let effective_uid = unsafe { libc::geteuid() };
+    metadata.permissions().mode() & 0o777 == 0o600 && metadata.uid() == effective_uid
+}
+
+#[cfg(not(unix))]
+fn quarantine_metadata_is_private_and_owned(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
+fn displace_invalid_quarantine(database: &Path, quarantine: &Path) -> Result<PathBuf> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let displaced = database.with_extension(format!(
+        "backup-candidate-replaced-{stamp}-{:016x}.sqlite.tmp",
+        rand::random::<u64>()
+    ));
+    std::fs::rename(quarantine, &displaced).with_context(|| {
+        format!(
+            "moving invalid quarantine artifact {} aside at {}",
+            quarantine.display(),
+            displaced.display()
+        )
+    })?;
+    fsync_file_and_parent(&displaced)?;
+    Ok(displaced)
 }
 
 /// Cross-process serialization for recovery-artifact admission. The sibling
@@ -2727,6 +2804,49 @@ mod tests {
         );
         assert_ne!(file_sha256(&one).unwrap(), file_sha256(&two).unwrap());
         assert_eq!(file_sha256(&one).unwrap(), file_sha256(&one).unwrap());
+    }
+
+    #[test]
+    fn quarantine_dedupe_requires_exact_regular_private_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cockpit.db");
+        let exact_bytes = b"exact quarantined database bytes";
+        let source = temp.path().join("source.sqlite");
+        std::fs::write(&source, exact_bytes).unwrap();
+        let digest = file_sha256(&source).unwrap();
+        let quarantine =
+            database.with_extension(format!("v1.backup-untrusted-{digest}.sqlite.quarantine"));
+
+        std::fs::write(&quarantine, exact_bytes).unwrap();
+        assert!(existing_quarantine_matches(&quarantine, &digest).unwrap());
+
+        std::fs::write(&quarantine, b"same-name but wrong bytes").unwrap();
+        assert!(!existing_quarantine_matches(&quarantine, &digest).unwrap());
+
+        std::fs::write(&quarantine, &exact_bytes[..4]).unwrap();
+        assert!(!existing_quarantine_matches(&quarantine, &digest).unwrap());
+
+        let displaced = displace_invalid_quarantine(&database, &quarantine).unwrap();
+        assert!(!quarantine_path_present(&quarantine).unwrap());
+        assert_eq!(std::fs::read(displaced).unwrap(), &exact_bytes[..4]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_dedupe_rejects_symlink_even_when_target_digest_matches() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.sqlite");
+        std::fs::write(&target, b"matching target bytes").unwrap();
+        let digest = file_sha256(&target).unwrap();
+        let quarantine = temp.path().join(format!(
+            "cockpit.v1.backup-untrusted-{digest}.sqlite.quarantine"
+        ));
+        symlink(&target, &quarantine).unwrap();
+
+        assert!(!existing_quarantine_matches(&quarantine, &digest).unwrap());
+        assert!(quarantine_path_present(&quarantine).unwrap());
     }
 
     #[test]

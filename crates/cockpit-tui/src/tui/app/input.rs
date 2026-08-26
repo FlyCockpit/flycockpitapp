@@ -2773,7 +2773,7 @@ impl App {
             .into_iter()
             .map(cockpit_proto::TagExpansionMeta::from)
             .collect::<Vec<_>>();
-        let submission = ClientUserSubmission {
+        let submission = cockpit_client::submission::ClientUserSubmission {
             expected_model_state_generation: self
                 .active_model_state_confirmed
                 .then_some(self.active_model_state_generation),

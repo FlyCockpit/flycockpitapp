@@ -433,8 +433,9 @@ const DISABLE_MARKER: &str = "COCKPIT_DISABLE_REDACT";
 
 /// Number of encoded variants registered for forced secrets. Keep this
 /// fixed and small so a large denylist or SSH key set cannot multiply the
-/// matcher without bound.
-const MAX_FORCED_SECRET_VARIANTS: usize = 3;
+/// matcher without bound. The four variants are base64, lowercase hex,
+/// uppercase hex, and percent/URL encoding (see [`encoded_secret_variants`]).
+const MAX_FORCED_SECRET_VARIANTS: usize = 4;
 
 /// Hard lower bound for every redaction pattern. Values below this length can
 /// corrupt unrelated output (for example, a timeout rendered as `120s`) and are
@@ -691,18 +692,45 @@ fn origin_is_disk_derived(origin: &str) -> bool {
 }
 
 fn case_secret_variants(value: &str) -> Vec<String> {
-    let mut variants = Vec::with_capacity(2);
+    let mut variants = Vec::with_capacity(3);
     let lower = value.to_ascii_lowercase();
     if lower != value {
-        variants.push(lower);
+        variants.push(lower.clone());
     }
     let upper = value.to_ascii_uppercase();
     if upper != value {
         variants.push(upper);
     }
+    // Capitalized ("Title"-case first letter) echo: the audit (SEC-F3) calls out
+    // "all-uppercase or capitalized" echoes, and the fully-upper variant above
+    // does not cover a first-letter-only capitalization of an otherwise-lowercase
+    // value (e.g. `abc123def` echoed as `Abc123def`). Build it from the lowercase
+    // form so it is well-defined regardless of the source value's own casing.
+    if let Some(capitalized) = capitalize_first_ascii(&lower)
+        && capitalized != value
+    {
+        variants.push(capitalized);
+    }
     variants.sort();
     variants.dedup();
     variants
+}
+
+/// Uppercase the first ASCII-alphabetic character of `s` (already lowercased by
+/// the caller), leaving the rest untouched. Returns `None` when `s` has no ASCII
+/// letter to capitalize, so a purely numeric/symbolic value adds no variant.
+fn capitalize_first_ascii(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut capitalized = false;
+    for ch in s.chars() {
+        if !capitalized && ch.is_ascii_alphabetic() {
+            out.push(ch.to_ascii_uppercase());
+            capitalized = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    capitalized.then_some(out)
 }
 
 fn encoded_secret_variants(value: &str) -> Vec<String> {
@@ -713,7 +741,12 @@ fn encoded_secret_variants(value: &str) -> Vec<String> {
     let mut variants = Vec::with_capacity(MAX_FORCED_SECRET_VARIANTS);
     let bytes = value.as_bytes();
     variants.push(base64::engine::general_purpose::STANDARD.encode(bytes));
+    // Register BOTH hex cases. `hex_encode` alone left an uppercase-hex echo of
+    // a secret unscrubbed (SEC-F3, gap 2), because the substitution matcher is
+    // case-sensitive (`ascii_case_insensitive(false)`). For an all-numeric-nibble
+    // value the two encodings coincide and the later value-dedup collapses them.
     variants.push(hex_encode(bytes));
+    variants.push(hex_encode_upper(bytes));
     variants.push(url_encode(bytes));
     variants.retain(|variant| !variant.is_empty() && variant != value);
     variants.truncate(MAX_FORCED_SECRET_VARIANTS);
@@ -721,11 +754,18 @@ fn encoded_secret_variants(value: &str) -> Vec<String> {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
+    hex_encode_with(bytes, b"0123456789abcdef")
+}
+
+fn hex_encode_upper(bytes: &[u8]) -> String {
+    hex_encode_with(bytes, b"0123456789ABCDEF")
+}
+
+fn hex_encode_with(bytes: &[u8], alphabet: &[u8; 16]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
+        out.push(alphabet[(byte >> 4) as usize] as char);
+        out.push(alphabet[(byte & 0x0f) as usize] as char);
     }
     out
 }
@@ -1055,6 +1095,23 @@ impl RedactionTable {
                 // not credential-bearing; override the Candidate default here at
                 // the collector site (decision 11).
                 candidate.source = OrdinarySource::Environment;
+                // SEC-F3 gap 1: register case-transformed variants for the whole
+                // secret-shaped key family (`*_KEY`/`*_TOKEN`/`*_PAT`/`*_APIKEY`/
+                // `*_ACCESS_KEY`/… via `is_secret_shaped_key`), not just the four
+                // length-exempt shapes `credential_shaped_key` covers. The matcher
+                // is case-sensitive, so without this an all-uppercase or
+                // capitalized echo of a `*_KEY`/`*_TOKEN` secret went unscrubbed.
+                //
+                // This is DECOUPLED from `length_exempt` on purpose: the length
+                // exemption stays narrow (`credential_shaped_key`), so broadened
+                // families remain subject to the `min_secret_length` prune below.
+                // That prune (plus the hard `MIN_REDACTION_ENTRY_LENGTH` floor) is
+                // the anti-false-positive floor that keeps a short/low-entropy
+                // value — e.g. a 4-char PIN echoing a dictionary word — out of the
+                // table, so broadening case variants cannot over-redact common
+                // words. `is_secret_shaped_key` is a superset of
+                // `credential_shaped_key`, so this only ever ADDS coverage.
+                candidate.register_case_variants = is_secret_shaped_key(name);
                 candidates.push(candidate);
             }
         }
@@ -2748,6 +2805,115 @@ mod scrub_inventory_tests {
 
     fn set(paths: &[&str]) -> BTreeSet<String> {
         paths.iter().map(|path| (*path).to_string()).collect()
+    }
+}
+
+#[cfg(test)]
+mod sec_f3_case_and_hex_tests {
+    //! Regression tests for audit finding SEC-F3: case-transformed and
+    //! uppercase-hex echoes of secrets must be scrubbed for the common secret
+    //! key families, while the anti-false-positive length floor is preserved.
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Hermetic config: env-scan only (no dotenv walk, no SSH-dir read), with a
+    /// distinctive placeholder for exact-match assertions.
+    fn env_cfg(min_secret_length: usize) -> RedactConfig {
+        RedactConfig {
+            scan_environment: true,
+            scan_dotenv: false,
+            scan_ssh_keys: false,
+            min_secret_length,
+            placeholder: "***REDACT***".into(),
+            ..Default::default()
+        }
+    }
+
+    fn build(cfg: &RedactConfig, env: &HashMap<String, String>) -> RedactionTable {
+        let dir = TempDir::new().unwrap();
+        RedactionTable::build_with_env(cfg, dir.path(), env).unwrap()
+    }
+
+    /// Gap 1: a `*_API_KEY` / `*_TOKEN` env secret (NOT one of the four
+    /// `credential_shaped_key` shapes) must have its all-uppercase and its
+    /// capitalized echoes scrubbed. Fails pre-fix: those families received no
+    /// case variants, and `case_secret_variants` produced no capitalized form.
+    #[test]
+    fn secret_family_key_case_echoes_are_scrubbed() {
+        let cfg = env_cfg(8);
+        // All-lowercase high-entropy value so upper/capitalized are distinct
+        // from the raw and from each other.
+        let secret = "hunter2secrettokenvalue0099";
+        let env = HashMap::from([
+            ("SERVICE_API_KEY".to_string(), secret.to_string()),
+            ("GITHUB_TOKEN".to_string(), secret.to_string()),
+        ]);
+        let table = build(&cfg, &env);
+
+        let upper = secret.to_ascii_uppercase();
+        let capitalized = capitalize_first_ascii(secret).unwrap();
+        assert_ne!(upper, secret);
+        assert_ne!(capitalized, secret);
+
+        assert_eq!(table.scrub(&upper), cfg.placeholder, "uppercased echo");
+        assert_eq!(
+            table.scrub(&capitalized),
+            cfg.placeholder,
+            "capitalized echo"
+        );
+        // The lowercased raw itself is of course still scrubbed.
+        assert_eq!(table.scrub(secret), cfg.placeholder);
+    }
+
+    /// Gap 2: the uppercase-hex encoding of a secret must be scrubbed, alongside
+    /// the lowercase-hex encoding. Fails pre-fix: only lowercase hex was
+    /// registered.
+    #[test]
+    fn uppercase_hex_encoding_is_scrubbed() {
+        let cfg = env_cfg(8);
+        let secret = "hunter2secrettokenvalue0099";
+        let env = HashMap::from([("SERVICE_API_KEY".to_string(), secret.to_string())]);
+        let table = build(&cfg, &env);
+
+        let hex_lower = hex_encode(secret.as_bytes());
+        let hex_upper = hex_encode_upper(secret.as_bytes());
+        // Precondition: the value contains a nibble in a..f so the two hex cases
+        // actually differ (otherwise the test would be vacuous).
+        assert_ne!(hex_lower, hex_upper);
+
+        assert_eq!(
+            table.scrub(&format!("token={hex_upper}")),
+            "token=***REDACT***",
+            "uppercase hex echo"
+        );
+        assert_eq!(
+            table.scrub(&format!("token={hex_lower}")),
+            "token=***REDACT***",
+            "lowercase hex echo still scrubbed"
+        );
+    }
+
+    /// Anti-false-positive floor: a `*_KEY` family env var with a short value
+    /// below `min_secret_length` (and not one of the length-exempt
+    /// `credential_shaped_key` shapes) must NOT enter the table, so none of its
+    /// case echoes are over-redacted. This locks in the floor that broadening
+    /// case-variant coverage must preserve.
+    #[test]
+    fn short_secret_family_value_is_not_over_redacted() {
+        let cfg = env_cfg(8);
+        let env = HashMap::from([
+            ("FOO_API_KEY".to_string(), "cat".to_string()),
+            ("BAR_TOKEN".to_string(), "test".to_string()),
+        ]);
+        let table = build(&cfg, &env);
+
+        for probe in ["cat", "CAT", "Cat", "test", "TEST", "Test"] {
+            assert_eq!(
+                table.scrub(probe),
+                probe,
+                "short low-entropy value `{probe}` must not be redacted"
+            );
+        }
     }
 }
 

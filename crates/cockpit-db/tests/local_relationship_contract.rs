@@ -142,6 +142,76 @@ struct ForeignKey {
     columns: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelationshipClass {
+    Foreign,
+    External,
+    Polymorphic,
+    Denormalized,
+}
+
+fn id_like_columns(sql: &str) -> Vec<(String, String)> {
+    let mut columns = Vec::new();
+    for (table, body) in table_bodies(sql) {
+        for clause in split_top_level(body) {
+            let upper = clause.to_ascii_uppercase();
+            if [
+                "FOREIGN KEY",
+                "PRIMARY KEY",
+                "UNIQUE",
+                "CHECK",
+                "CONSTRAINT",
+            ]
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+            {
+                continue;
+            }
+            let column = identifier(clause);
+            if column == "id"
+                || column.ends_with("_id")
+                || column.ends_with("_ids")
+                || column.ends_with("_ids_json")
+                || column.ends_with("_key")
+            {
+                columns.push((table.clone(), column));
+            }
+        }
+    }
+    columns
+}
+
+fn relationship_class(
+    table: &str,
+    column: &str,
+    foreign_keys: &std::collections::BTreeSet<(String, String)>,
+) -> RelationshipClass {
+    if foreign_keys.contains(&(table.to_owned(), column.to_owned())) {
+        return RelationshipClass::Foreign;
+    }
+    if column == "scope_id"
+        || column == "consumer_id"
+        || column == "owner_id"
+        || column.ends_with("_scope_id")
+        || column.ends_with("_consumer_id")
+    {
+        return RelationshipClass::Polymorphic;
+    }
+    if matches!(
+        (table, column),
+        ("tool_call_events", "project_id")
+            | ("inference_calls", "project_id")
+            | ("usage_events", "project_id")
+            | ("session_events", "provider_id" | "model_id")
+    ) {
+        return RelationshipClass::Denormalized;
+    }
+    // The remaining values are deliberately opaque domain/upstream IDs, or
+    // the stable identity of the row itself. They have no local target and
+    // must not acquire a guessed FK merely because their spelling ends `_id`.
+    RelationshipClass::External
+}
+
 fn table_bodies(sql: &str) -> Vec<(String, &str)> {
     let upper = sql.to_ascii_uppercase();
     let mut tables = Vec::new();
@@ -273,6 +343,58 @@ fn every_foreign_key_group_has_a_usable_child_leading_index() {
         missing.is_empty(),
         "foreign-key child groups without a usable leading index: {missing:?}"
     );
+}
+
+#[test]
+fn every_id_like_column_has_exactly_one_relationship_classification() {
+    let (foreign_keys, _) = foreign_keys_and_local_keys(SCHEMA);
+    let foreign_columns = foreign_keys
+        .iter()
+        .flat_map(|foreign_key| {
+            foreign_key
+                .columns
+                .iter()
+                .map(|column| (foreign_key.table.clone(), column.clone()))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let inventory = id_like_columns(SCHEMA)
+        .into_iter()
+        .map(|(table, column)| {
+            let class = relationship_class(&table, &column, &foreign_columns);
+            ((table, column), class)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert!(
+        inventory.len() >= 200,
+        "id-like inventory unexpectedly shrank"
+    );
+    for required in [
+        (
+            ("sessions", "parent_session_id"),
+            RelationshipClass::Foreign,
+        ),
+        (
+            ("tool_call_events", "parent_call_id"),
+            RelationshipClass::Foreign,
+        ),
+        (
+            ("tool_call_events", "project_id"),
+            RelationshipClass::Denormalized,
+        ),
+        (
+            ("media_reservation_deltas", "scope_id"),
+            RelationshipClass::Polymorphic,
+        ),
+        (("sessions", "session_id"), RelationshipClass::External),
+    ] {
+        assert_eq!(
+            inventory.get(&(required.0.0.to_owned(), required.0.1.to_owned())),
+            Some(&required.1),
+            "relationship classification drifted for {}.{}",
+            required.0.0,
+            required.0.1
+        );
+    }
 }
 
 #[test]

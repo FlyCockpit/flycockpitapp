@@ -24,36 +24,157 @@ fn schema_inventory(conn: &Connection) -> BTreeMap<String, BTreeSet<String>> {
 }
 
 fn is_runtime_managed_table(name: &str) -> bool {
-    name == "schema_version"
-        || name == "session_fts"
-        || (name.starts_with("session_fts_") && name != "session_fts_docs")
+    matches!(
+        name,
+        "schema_version"
+            | "session_fts"
+            | "session_fts_data"
+            | "session_fts_idx"
+            | "session_fts_content"
+            | "session_fts_docsize"
+            | "session_fts_config"
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SqlToken {
+    Word(String),
+    Identifier(String),
+    Symbol(char),
+}
+
+impl SqlToken {
+    fn is_keyword(&self, expected: &str) -> bool {
+        matches!(self, Self::Word(value) if value.eq_ignore_ascii_case(expected))
+    }
+
+    fn identifier(&self) -> Option<&str> {
+        match self {
+            Self::Word(value) | Self::Identifier(value) => Some(value),
+            Self::Symbol(_) => None,
+        }
+    }
+}
+
+fn sql_tokens(sql: &str) -> Vec<SqlToken> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+        } else if bytes[index..].starts_with(b"--") {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+        } else if bytes[index..].starts_with(b"/*") {
+            index += 2;
+            while index + 1 < bytes.len() && !bytes[index..].starts_with(b"*/") {
+                index += 1;
+            }
+            index = (index + 2).min(bytes.len());
+        } else if matches!(bytes[index], b'\'' | b'"' | b'`' | b'[') {
+            let opening = bytes[index];
+            let closing = if opening == b'[' { b']' } else { opening };
+            let quoted_identifier = opening != b'\'';
+            index += 1;
+            let mut value = Vec::new();
+            while index < bytes.len() {
+                if bytes[index] == closing {
+                    if closing != b']' && index + 1 < bytes.len() && bytes[index + 1] == closing {
+                        value.push(closing);
+                        index += 2;
+                        continue;
+                    }
+                    index += 1;
+                    break;
+                }
+                value.push(bytes[index]);
+                index += 1;
+            }
+            if quoted_identifier {
+                tokens.push(SqlToken::Identifier(
+                    String::from_utf8_lossy(&value).into_owned(),
+                ));
+            }
+        } else if matches!(bytes[index], b'.' | b'(' | b')' | b';') {
+            tokens.push(SqlToken::Symbol(char::from(bytes[index])));
+            index += 1;
+        } else {
+            let start = index;
+            while index < bytes.len()
+                && !bytes[index].is_ascii_whitespace()
+                && !matches!(
+                    bytes[index],
+                    b'.' | b'(' | b')' | b';' | b'\'' | b'"' | b'`' | b'['
+                )
+                && !bytes[index..].starts_with(b"--")
+                && !bytes[index..].starts_with(b"/*")
+            {
+                index += 1;
+            }
+            tokens.push(SqlToken::Word(
+                String::from_utf8_lossy(&bytes[start..index]).into_owned(),
+            ));
+        }
+    }
+    tokens
 }
 
 fn sql_table_objects(sql: &str) -> Vec<String> {
-    sql.lines()
-        .filter_map(|line| {
-            let tokens = line.split_whitespace().collect::<Vec<_>>();
-            let name = match tokens.as_slice() {
-                [create, table, name, ..]
-                    if create.eq_ignore_ascii_case("CREATE")
-                        && table.eq_ignore_ascii_case("TABLE") =>
-                {
-                    *name
-                }
-                [create, virtual_token, table, name, ..]
-                    if create.eq_ignore_ascii_case("CREATE")
-                        && virtual_token.eq_ignore_ascii_case("VIRTUAL")
-                        && table.eq_ignore_ascii_case("TABLE") =>
-                {
-                    *name
-                }
-                _ => return None,
+    let tokens = sql_tokens(sql);
+    let mut tables = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if !tokens[index].is_keyword("CREATE") {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 1;
+        if tokens
+            .get(cursor)
+            .is_some_and(|token| token.is_keyword("VIRTUAL"))
+        {
+            cursor += 1;
+        }
+        if !tokens
+            .get(cursor)
+            .is_some_and(|token| token.is_keyword("TABLE"))
+        {
+            index += 1;
+            continue;
+        }
+        cursor += 1;
+        if tokens
+            .get(cursor)
+            .is_some_and(|token| token.is_keyword("IF"))
+            && tokens
+                .get(cursor + 1)
+                .is_some_and(|token| token.is_keyword("NOT"))
+            && tokens
+                .get(cursor + 2)
+                .is_some_and(|token| token.is_keyword("EXISTS"))
+        {
+            cursor += 3;
+        }
+        let Some(mut name) = tokens.get(cursor).and_then(SqlToken::identifier) else {
+            index += 1;
+            continue;
+        };
+        if tokens.get(cursor + 1) == Some(&SqlToken::Symbol('.')) {
+            let Some(qualified_name) = tokens.get(cursor + 2).and_then(SqlToken::identifier) else {
+                index += 1;
+                continue;
             };
-            let name =
-                name.trim_matches(|character| matches!(character, '(' | '`' | '"' | '[' | ']'));
-            (!is_runtime_managed_table(name)).then(|| name.to_owned())
-        })
-        .collect()
+            name = qualified_name;
+        }
+        if !is_runtime_managed_table(name) {
+            tables.push(name.to_owned());
+        }
+        index = cursor + 1;
+    }
+    tables
 }
 
 fn assert_static_table_ownership(
@@ -102,6 +223,24 @@ fn assert_static_table_ownership(
             .get(table)
             .is_some_and(|owner| owner.status != "remove-from-v0.1")
     }));
+}
+
+#[test]
+fn static_sql_table_lexer_preserves_real_duplicates_and_ignores_decoys() {
+    let sql = r#"
+        -- CREATE TABLE line_comment_decoy(value TEXT);
+        /* CREATE TABLE block_comment_decoy(value TEXT); */
+        SELECT 'CREATE TABLE string_decoy(value TEXT)';
+        CREATE
+          TABLE IF NOT EXISTS "main"."quoted table" (value TEXT);
+        CREATE VIRTUAL TABLE [session_fts] USING fts5(body);
+        CREATE TABLE duplicate(value TEXT);
+        CREATE TABLE duplicate(other TEXT);
+    "#;
+    assert_eq!(
+        sql_table_objects(sql),
+        vec!["quoted table", "duplicate", "duplicate"]
+    );
 }
 
 #[test]

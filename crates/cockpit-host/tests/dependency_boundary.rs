@@ -98,13 +98,28 @@ fn daemon_pid_and_metadata_guard_live_only_in_host() {
     for required in [
         "struct DaemonPidReceipt",
         "fn read_daemon_pid_record",
+        "cockpit-daemon-pid-v1",
+        "as_encoded_bytes",
+        "from_encoded_bytes_unchecked",
         "SYS_pidfd_open",
         "SYS_pidfd_send_signal",
+        "pub fn is_alive(&self) -> std::io::Result<bool>",
         "remove_metadata_if_receipt_matches",
     ] {
         assert!(
             host.contains(required),
             "stable receipt-bound lifecycle primitive is missing: {required}"
+        );
+    }
+    for required in [
+        "fn read_bound_endpoint_record_from",
+        "record.socket != canonical.socket",
+        "DaemonPidRecord::Receipt(receipt)",
+        "preserving metadata and refusing numeric signaling",
+    ] {
+        assert!(
+            daemon.contains(required),
+            "daemon endpoint/stop fail-closed contract is missing: {required}"
         );
     }
 }

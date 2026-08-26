@@ -46,8 +46,12 @@ impl VerifiedDaemonProcess {
         pidfd_send_signal(&self.pidfd, libc::SIGTERM)
     }
 
-    pub fn is_alive(&self) -> bool {
-        pidfd_send_signal(&self.pidfd, 0).is_ok()
+    pub fn is_alive(&self) -> std::io::Result<bool> {
+        match pidfd_send_signal(&self.pidfd, 0) {
+            Ok(()) => Ok(true),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -77,8 +81,12 @@ pub fn acquire_verified_daemon_process(receipt: &DaemonPidReceipt) -> VerifiedPr
     if identity != PidIdentity::VerifiedDaemon {
         return VerifiedProcessOutcome::Identity(identity);
     }
-    if pidfd_send_signal(&pidfd, 0).is_err() {
-        return VerifiedProcessOutcome::Identity(PidIdentity::Missing);
+    match pidfd_send_signal(&pidfd, 0) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+            return VerifiedProcessOutcome::Identity(PidIdentity::Missing);
+        }
+        Err(_) => return VerifiedProcessOutcome::Identity(PidIdentity::Unverified),
     }
     VerifiedProcessOutcome::Verified(VerifiedDaemonProcess {
         receipt: receipt.clone(),
@@ -140,12 +148,17 @@ pub fn read_pid_file(pid_file: &Path) -> Option<u32> {
 pub fn read_daemon_pid_record(pid_file: &Path) -> Option<DaemonPidRecord> {
     let value = std::fs::read_to_string(pid_file).ok()?;
     let mut lines = value.lines();
-    let pid = lines.next()?.trim().parse::<u32>().ok()?;
-    let Some(executable) = lines.next() else {
+    let first = lines.next()?.trim();
+    if first != "cockpit-daemon-pid-v1" {
+        let pid = first.parse::<u32>().ok()?;
+        if lines.next().is_some() {
+            return None;
+        }
         return Some(DaemonPidRecord::LegacyNumeric(pid));
-    };
-    let executable = PathBuf::from(executable.trim());
-    if executable.as_os_str().is_empty() || lines.any(|line| !line.trim().is_empty()) {
+    }
+    let pid = lines.next()?.parse::<u32>().ok()?;
+    let executable = decode_executable_identity(lines.next()?)?;
+    if lines.next().is_some() {
         return None;
     }
     Some(DaemonPidRecord::Receipt(DaemonPidReceipt {
@@ -162,9 +175,53 @@ pub fn write_pid_file(
     executable: &Path,
 ) -> anyhow::Result<DaemonPidReceipt> {
     let executable = std::fs::canonicalize(executable)?;
-    let body = format!("{pid}\n{}\n", executable.display());
+    let body = format!(
+        "cockpit-daemon-pid-v1\n{pid}\n{}\n",
+        encode_executable_identity(&executable)
+    );
     crate::private_fs::write_private_file(pid_file, body.as_bytes())?;
     Ok(DaemonPidReceipt { pid, executable })
+}
+
+fn encode_executable_identity(executable: &Path) -> String {
+    format!(
+        "native:{}",
+        hex_encode(executable.as_os_str().as_encoded_bytes())
+    )
+}
+
+fn decode_executable_identity(value: &str) -> Option<PathBuf> {
+    let bytes = hex_decode(value.strip_prefix("native:")?)?;
+    // SAFETY: bytes were obtained from OsStr::as_encoded_bytes on this host
+    // and hex round-tripped without modification. Lifecycle receipts are
+    // machine-local and are never portable between platforms or Rust builds.
+    let executable = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(bytes) };
+    Some(PathBuf::from(executable))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)? as u8;
+            let low = (pair[1] as char).to_digit(16)? as u8;
+            Some((high << 4) | low)
+        })
+        .collect()
 }
 
 /// Remove PID and socket metadata only while the PID file still binds the
@@ -540,6 +597,34 @@ mod tests {
             read_daemon_pid_record(&pid_file),
             Some(DaemonPidRecord::Receipt(receipt))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_receipt_round_trips_non_utf8_and_newline_path_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let name = std::ffi::OsString::from_vec(b"cockpit-\xff-\n-daemon".to_vec());
+        let executable = temp.path().join(name);
+        let pid_file = temp.path().join("daemon.pid");
+        std::fs::write(&executable, b"executable fixture").expect("executable fixture");
+
+        let receipt = write_pid_file(&pid_file, 42, &executable).expect("publish pid identity");
+
+        assert_eq!(
+            read_daemon_pid_record(&pid_file),
+            Some(DaemonPidRecord::Receipt(receipt))
+        );
+    }
+
+    #[test]
+    fn obsolete_two_line_pid_receipt_fails_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("daemon.pid");
+        std::fs::write(&pid_file, "42\n/old/ambiguous/encoding\n").expect("old receipt");
+
+        assert_eq!(read_daemon_pid_record(&pid_file), None);
     }
 
     #[cfg(unix)]

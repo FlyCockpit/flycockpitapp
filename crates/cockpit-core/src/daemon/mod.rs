@@ -228,14 +228,38 @@ fn endpoint_file_for_state(state: &Path) -> PathBuf {
     state.join("daemon-endpoint.json")
 }
 
-fn read_endpoint_record() -> Option<DaemonEndpointRecord> {
-    let path = endpoint_file().ok()?;
-    read_endpoint_record_from(&path)
+fn read_endpoint_record(canonical: &DaemonPaths) -> Option<DaemonEndpointRecord> {
+    let expected_path = endpoint_file_for_state(canonical.pid_file.parent()?);
+    let configured_path = endpoint_file().ok()?;
+    if configured_path != expected_path {
+        return None;
+    }
+    read_bound_endpoint_record_from(&configured_path, canonical)
 }
 
 fn read_endpoint_record_from(path: &Path) -> Option<DaemonEndpointRecord> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+fn read_bound_endpoint_record_from(
+    path: &Path,
+    canonical: &DaemonPaths,
+) -> Option<DaemonEndpointRecord> {
+    if path != endpoint_file_for_state(canonical.pid_file.parent()?) {
+        return None;
+    }
+    let record = read_endpoint_record_from(path)?;
+    if record.version != 1
+        || record.kind != DaemonEndpointKind::Persistent
+        || record.socket != canonical.socket
+    {
+        return None;
+    }
+    let DaemonPidRecord::Receipt(receipt) = read_daemon_pid_record(&canonical.pid_file)? else {
+        return None;
+    };
+    (record.pid == receipt.pid && record.executable == receipt.executable).then_some(record)
 }
 
 #[cfg(any(unix, test))]
@@ -711,7 +735,7 @@ pub async fn discover() -> DaemonProbe {
         return DaemonProbe::new(DaemonStatus::Running, canonical);
     }
 
-    if let Some(record) = read_endpoint_record()
+    if let Some(record) = read_endpoint_record(&canonical)
         && record.kind == DaemonEndpointKind::Persistent
     {
         let recorded = endpoint_paths(&canonical, &record);
@@ -770,7 +794,7 @@ pub fn discover_blocking() -> DaemonProbe {
         return DaemonProbe::new(DaemonStatus::Running, canonical);
     }
 
-    if let Some(record) = read_endpoint_record()
+    if let Some(record) = read_endpoint_record(&canonical)
         && record.kind == DaemonEndpointKind::Persistent
     {
         let recorded = endpoint_paths(&canonical, &record);
@@ -794,7 +818,7 @@ fn discover_blocking_with_canonical(canonical: DaemonPaths) -> DaemonProbe {
     note_blocking_probe_call();
     if let Some(state) = canonical.pid_file.parent() {
         let endpoint = endpoint_file_for_state(state);
-        if let Some(record) = read_endpoint_record_from(&endpoint)
+        if let Some(record) = read_bound_endpoint_record_from(&endpoint, &canonical)
             && record.kind == DaemonEndpointKind::Persistent
         {
             let recorded = endpoint_paths(&canonical, &record);
@@ -1681,10 +1705,10 @@ pub fn stop(paths: &DaemonPaths) -> Result<bool> {
     return stop_unix_without_stable_handle(paths, record);
     #[cfg(not(unix))]
     {
-        let _ = record;
-        let _ = std::fs::remove_file(&paths.pid_file);
-        let _ = std::fs::remove_file(&paths.socket);
-        Ok(true)
+        let _ = (paths, record);
+        anyhow::bail!(
+            "daemon lifecycle metadata exists but this platform has no stable process handle; preserving metadata and refusing numeric signaling"
+        )
     }
 }
 
@@ -1726,11 +1750,16 @@ fn stop_linux(paths: &DaemonPaths, record: DaemonPidRecord) -> Result<bool> {
                 .min(deadline.saturating_duration_since(std::time::Instant::now())),
         );
     }
-    if process.is_alive() {
-        anyhow::bail!(
+    match process.is_alive() {
+        Ok(false) => {}
+        Ok(true) => anyhow::bail!(
             "timed out waiting for daemon PID {} to stop; preserving its receipt and socket metadata",
             receipt.pid
-        );
+        ),
+        Err(error) => anyhow::bail!(
+            "could not prove daemon PID {} exited ({error}); preserving its receipt and socket metadata",
+            receipt.pid
+        ),
     }
     cleanup_receipt_metadata(paths, &receipt);
     Ok(true)
@@ -1934,7 +1963,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn endpoint_record_recovers_running_daemon_from_different_runtime_dir() {
+    fn endpoint_record_cannot_redirect_discovery_to_a_different_runtime_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_home = dir.path().join("state");
         let runtime_a = dir.path().join("rt-a");
@@ -1942,16 +1971,14 @@ mod tests {
         std::fs::create_dir_all(runtime_a.join("cockpit")).expect("runtime a");
 
         let socket_a = runtime_a.join("cockpit/cockpit.sock");
-        let listener = spawn_hello_socket(socket_a.clone());
-
-        // Wait until the listener thread has bound before probing; in the full
-        // test suite other threads can otherwise let this test race the bind.
-        wait_for_socket(&socket_a);
-
         let paths = canonical_in(&state_home, &runtime_a);
         assert_eq!(paths.socket, socket_a);
-        std::fs::write(&paths.pid_file, std::process::id().to_string()).expect("pid file");
-        let receipt = test_pid_receipt(std::process::id());
+        let receipt = write_pid_file(
+            &paths.pid_file,
+            std::process::id(),
+            &std::env::current_exe().unwrap(),
+        )
+        .expect("pid receipt");
         write_endpoint_record_with_receipt_and_canonical(&paths, &paths, &receipt)
             .expect("endpoint record");
 
@@ -1959,9 +1986,8 @@ mod tests {
         assert_ne!(canonical_b.socket, socket_a);
 
         let probe = discover_blocking_with_canonical(canonical_b);
-        assert_eq!(probe.status, DaemonStatus::Running);
-        assert_eq!(probe.paths.socket, socket_a);
-        listener.join().expect("listener thread");
+        assert_eq!(probe.status, DaemonStatus::Stale);
+        assert_eq!(probe.paths.socket, runtime_b.join("cockpit/cockpit.sock"));
     }
 
     #[cfg(unix)]
@@ -2041,6 +2067,31 @@ mod tests {
             endpoint.exists(),
             "unbound endpoint cleanup must fail closed"
         );
+    }
+
+    #[test]
+    fn endpoint_reader_rejects_executable_receipt_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_home = dir.path().join("state");
+        let runtime_dir = dir.path().join("runtime");
+        let paths = canonical_in(&state_home, &runtime_dir);
+        let receipt = write_pid_file(
+            &paths.pid_file,
+            std::process::id(),
+            &std::env::current_exe().unwrap(),
+        )
+        .expect("pid receipt");
+        let endpoint = endpoint_file_for_state(paths.pid_file.parent().unwrap());
+        let record = DaemonEndpointRecord {
+            version: 1,
+            pid: receipt.pid,
+            socket: paths.socket.clone(),
+            executable: paths.pid_file.clone(),
+            kind: DaemonEndpointKind::Persistent,
+        };
+        std::fs::write(&endpoint, serde_json::to_vec(&record).unwrap()).expect("endpoint");
+
+        assert!(read_bound_endpoint_record_from(&endpoint, &paths).is_none());
     }
 
     #[test]

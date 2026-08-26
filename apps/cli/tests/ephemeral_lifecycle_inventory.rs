@@ -43,13 +43,105 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
 }
 
 fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+    fn possible_when_test_is_false(meta: &syn::Meta) -> (bool, bool) {
+        match meta {
+            syn::Meta::Path(path) if path.is_ident("test") => (true, false),
+            syn::Meta::Path(_) | syn::Meta::NameValue(_) => (true, true),
+            syn::Meta::List(list) => {
+                let nested = list
+                    .parse_args_with(
+                        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                    )
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(possible_when_test_is_false)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|_| vec![(true, true)]);
+                if list.path.is_ident("all") {
+                    let can_be_true = nested.iter().all(|(_, can_true)| *can_true);
+                    let can_be_false = nested.iter().any(|(can_false, _)| *can_false);
+                    (can_be_false, can_be_true)
+                } else if list.path.is_ident("any") {
+                    let can_be_true = nested.iter().any(|(_, can_true)| *can_true);
+                    let can_be_false = nested.iter().all(|(can_false, _)| *can_false);
+                    (can_be_false, can_be_true)
+                } else if list.path.is_ident("not") && nested.len() == 1 {
+                    let (can_be_false, can_be_true) = nested[0];
+                    (can_be_true, can_be_false)
+                } else {
+                    (true, true)
+                }
+            }
+        }
+    }
+
     attrs.iter().any(|attr| {
         attr.path().is_ident("test")
             || (attr.path().is_ident("cfg")
-                && attr
-                    .parse_args::<syn::Path>()
-                    .is_ok_and(|path| path.is_ident("test")))
+                && attr.parse_args::<syn::Meta>().is_ok_and(|meta| {
+                    let (_, can_be_true_without_test) = possible_when_test_is_false(&meta);
+                    !can_be_true_without_test
+                }))
     })
+}
+
+fn owned_session_occurrences_in_source(source: &str, relative: &str) -> Vec<String> {
+    fn contains_owner(tokens: impl ToTokens) -> bool {
+        tokens
+            .to_token_stream()
+            .to_string()
+            .split(|character: char| !character.is_alphanumeric() && character != '_')
+            .any(|token| token == "OwnedDaemonSession")
+    }
+
+    fn inspect_items(items: &[syn::Item], relative: &str, violations: &mut Vec<String>) {
+        for item in items {
+            let attrs = match item {
+                syn::Item::Const(item) => &item.attrs,
+                syn::Item::Enum(item) => &item.attrs,
+                syn::Item::ExternCrate(item) => &item.attrs,
+                syn::Item::Fn(item) => &item.attrs,
+                syn::Item::ForeignMod(item) => &item.attrs,
+                syn::Item::Impl(item) => &item.attrs,
+                syn::Item::Macro(item) => &item.attrs,
+                syn::Item::Mod(item) => &item.attrs,
+                syn::Item::Static(item) => &item.attrs,
+                syn::Item::Struct(item) => &item.attrs,
+                syn::Item::Trait(item) => &item.attrs,
+                syn::Item::TraitAlias(item) => &item.attrs,
+                syn::Item::Type(item) => &item.attrs,
+                syn::Item::Union(item) => &item.attrs,
+                syn::Item::Use(item) => &item.attrs,
+                _ => &[],
+            };
+            if is_test_only(attrs) {
+                continue;
+            }
+            if let syn::Item::Mod(module) = item
+                && let Some((_, nested)) = &module.content
+            {
+                if module.ident == "OwnedDaemonSession" {
+                    violations.push(format!(
+                        "{relative}: production module named OwnedDaemonSession"
+                    ));
+                }
+                inspect_items(nested, relative, violations);
+                continue;
+            }
+            if contains_owner(item) {
+                violations.push(format!(
+                    "{relative}: production OwnedDaemonSession identifier outside canonical owner"
+                ));
+            }
+        }
+    }
+
+    let file = syn::parse_file(source).expect("core source parses");
+    let mut violations = Vec::new();
+    inspect_items(&file.items, relative, &mut violations);
+    violations
 }
 
 #[derive(Default)]
@@ -1002,11 +1094,25 @@ fn production_cli_has_one_structural_lifecycle_runner_inventory() {
 
 #[test]
 fn core_runner_is_the_only_raw_owner() {
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/cockpit-core/src/daemon/client.rs"),
-    )
-    .unwrap();
+    let core_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/cockpit-core/src");
+    let owner_path = Path::new("daemon/client.rs");
+    let source = std::fs::read_to_string(core_root.join(owner_path)).unwrap();
+    let mut outside_owner_violations = Vec::new();
+    for path in rust_files(&core_root) {
+        let relative = path.strip_prefix(&core_root).unwrap();
+        if relative == owner_path {
+            continue;
+        }
+        outside_owner_violations.extend(owned_session_occurrences_in_source(
+            &std::fs::read_to_string(&path).unwrap(),
+            &relative.display().to_string(),
+        ));
+    }
+    assert!(
+        outside_owner_violations.is_empty(),
+        "{}",
+        outside_owner_violations.join("\n")
+    );
     let file = syn::parse_file(&source).unwrap();
     assert!(
         core_contract_violations(&source).is_empty(),
@@ -1191,6 +1297,27 @@ fn scoped_capability_contract_rejects_clone_raw_escape_and_weakened_lifetimes() 
             "accepted raw owner occurrence: {addition}"
         );
     }
+}
+
+#[test]
+fn core_wide_owner_inventory_rejects_a_second_file_and_respects_cfg_polarity() {
+    let adversarial = r#"
+        #[cfg(test)]
+        struct TestOnly(OwnedDaemonSession);
+        #[cfg(all(unix, test))]
+        const ALSO_TEST_ONLY: Option<OwnedDaemonSession> = None;
+        #[cfg(any(test, unix))]
+        struct ProductionOnUnix { owner: OwnedDaemonSession }
+    "#;
+    let violations = owned_session_occurrences_in_source(adversarial, "other.rs");
+    assert_eq!(violations.len(), 1);
+    assert!(violations[0].starts_with("other.rs:"));
+
+    let second_file = "pub(crate) type HiddenOwner = OwnedDaemonSession;";
+    assert_eq!(
+        owned_session_occurrences_in_source(second_file, "nested/second.rs"),
+        ["nested/second.rs: production OwnedDaemonSession identifier outside canonical owner"]
+    );
 }
 
 #[test]

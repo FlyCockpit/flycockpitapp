@@ -2,38 +2,9 @@ use super::*;
 
 pub use crate::daemon::proto::IdleReason;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ControlRequestId(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlRequestNotDelivered {
-    NoRunner,
-    ChannelFull,
-    ChannelClosed,
-    RunnerTeardown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ControlRequestOutcome {
-    NotDelivered(ControlRequestNotDelivered),
-    Rejected(String),
-    Applied,
-    ConfigRefreshed {
-        applied_generation: u64,
-        changed: bool,
-    },
-    HostCapabilities {
-        snapshot: Box<crate::daemon::proto::HostCapabilitySnapshot>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ToolProgress {
-    pub call_id: String,
-    pub done: u64,
-    pub total: u64,
-    pub unit: String,
-}
+pub use cockpit_client::presentation::{
+    ControlRequestId, ControlRequestNotDelivered, ControlRequestOutcome, ToolProgress,
+};
 
 /// Events the agent emits during a turn. The driver forwards these to
 /// the TUI for display; the persistence layer can subscribe to the

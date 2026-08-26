@@ -815,7 +815,7 @@ impl App {
             _ => {
                 self.report_control_not_delivered(
                     label,
-                    cockpit_core::engine::ControlRequestNotDelivered::NoRunner,
+                    cockpit_client::presentation::ControlRequestNotDelivered::NoRunner,
                 );
                 None
             }

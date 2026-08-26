@@ -4022,7 +4022,7 @@ fn proto_event_to_turn_event(event: proto::Event) -> Option<TurnEvent> {
             total,
             unit,
             ..
-        } => TurnEvent::ToolProgress(cockpit_core::engine::ToolProgress {
+        } => TurnEvent::ToolProgress(cockpit_client::presentation::ToolProgress {
             call_id,
             done,
             total,

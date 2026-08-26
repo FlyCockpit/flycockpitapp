@@ -29,9 +29,9 @@ use crate::tui::theme::{
     ERROR_TEXT, INFO_TEXT, METADATA_TEXT, MUTED_COLOR_INDEX, PLAN_YELLOW, SUBAGENT_ORANGE,
     SUCCESS_TEXT, TOOL_OUTPUT, TOOL_SIDEBAR, WARNING_TEXT,
 };
-use cockpit_client::presentation::ResponsePerformance;
+use cockpit_client::presentation::{ResponsePerformance, ToolProgress};
 use cockpit_config::extended::ThinkingDisplay;
-use cockpit_core::engine::{ToolProgress, tool::ToolPresentation};
+use cockpit_core::engine::tool::ToolPresentation;
 
 mod pending;
 mod scroll;

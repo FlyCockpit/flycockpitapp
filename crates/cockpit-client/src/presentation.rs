@@ -26,6 +26,39 @@ pub enum DisplayErrorKind {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ControlRequestId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlRequestNotDelivered {
+    NoRunner,
+    ChannelFull,
+    ChannelClosed,
+    RunnerTeardown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlRequestOutcome {
+    NotDelivered(ControlRequestNotDelivered),
+    Rejected(String),
+    Applied,
+    ConfigRefreshed {
+        applied_generation: u64,
+        changed: bool,
+    },
+    HostCapabilities {
+        snapshot: Box<cockpit_proto::HostCapabilitySnapshot>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ToolProgress {
+    pub call_id: String,
+    pub done: u64,
+    pub total: u64,
+    pub unit: String,
+}
+
 /// Provider-reported token usage attached to a presented inference result.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {

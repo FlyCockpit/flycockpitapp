@@ -2610,7 +2610,10 @@ impl App {
         false
     }
 
-    pub(super) fn update_tool_progress(&mut self, progress: cockpit_core::engine::ToolProgress) {
+    pub(super) fn update_tool_progress(
+        &mut self,
+        progress: cockpit_client::presentation::ToolProgress,
+    ) {
         for entry in self.history.iter_mut().rev() {
             let HistoryEntry::ToolBox { calls, .. } = entry else {
                 continue;
@@ -2635,7 +2638,7 @@ impl App {
                     )
                 })
                 .unwrap_or((progress.done, progress.total));
-            call.progress = Some(cockpit_core::engine::ToolProgress {
+            call.progress = Some(cockpit_client::presentation::ToolProgress {
                 done,
                 total,
                 ..progress

@@ -9,7 +9,7 @@ const SCHEMA: &str = include_str!("../src/db/migrations/0001_initial.sql");
 const EXTENDED_SCHEMA: &str = include_str!("../src/db/migrations/0001_extended_profile.sql");
 const RELATIONSHIP_INVENTORY: &str = include_str!("support/relationship_inventory.tsv");
 const LOCAL_SCHEMA_REVIEW_DIGEST: &str =
-    "5c15f7acb82576b40c178036da773a5963de471b79f3c899599048f902df4f64";
+    "bd15e048b38b847648b31c193b5edca95d6f8ec09b8839520dce24c9696f400d";
 const EXTENDED_SCHEMA_REVIEW_DIGEST: &str =
     "e32fef009c919d44dd8de06788cc473394959a8835de3d4f40dc4bd4a62ed1e2";
 const RELATIONSHIP_INVENTORY_REVIEW_DIGEST: &str =
@@ -299,6 +299,16 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
         };
         (path.path.segments.len() == 1).then(|| path.path.segments[0].ident.to_string())
     }
+    fn macro_tokens_touch_any(
+        tokens: proc_macro2::TokenStream,
+        names: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        tokens.into_iter().any(|token| match token {
+            proc_macro2::TokenTree::Ident(identifier) => names.contains(&identifier.to_string()),
+            proc_macro2::TokenTree::Group(group) => macro_tokens_touch_any(group.stream(), names),
+            proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => false,
+        })
+    }
     fn canonical_connection_imports(syntax: &syn::File) -> std::collections::BTreeSet<String> {
         fn inspect(
             tree: &syn::UseTree,
@@ -515,6 +525,11 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
                         .is_some_and(|identifier| self.names.contains(&identifier));
                     syn::visit::visit_expr_assign(self, assignment);
                 }
+
+                fn visit_macro(&mut self, invocation: &'ast syn::Macro) {
+                    self.found |= macro_tokens_touch_any(invocation.tokens.clone(), self.names);
+                    syn::visit::visit_macro(self, invocation);
+                }
             }
             let mut connection_mutation = ConnectionMutation {
                 names: &connections,
@@ -577,6 +592,13 @@ fn annotated_sql_literal(source: &str, marker: &str) -> String {
                     fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
                         self.count += usize::from(pattern.ident == self.name);
                         syn::visit::visit_pat_ident(self, pattern);
+                    }
+
+                    fn visit_macro(&mut self, invocation: &'ast syn::Macro) {
+                        let names = std::collections::BTreeSet::from([self.name.to_owned()]);
+                        self.count +=
+                            usize::from(macro_tokens_touch_any(invocation.tokens.clone(), &names));
+                        syn::visit::visit_macro(self, invocation);
                     }
                 }
                 let mut patterns = Patterns {
@@ -728,6 +750,27 @@ fn hot_query_binding_rejects_duplicate_and_ignores_unrelated_literals() {
                 // schema-hot-query: reviewed.shape
                 let sql = "SELECT exact FROM owned WHERE id=?1";
                 let sql = "SELECT drifted FROM owned";
+                conn.prepare(sql);
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            macro_rules! shadow { ($name:ident) => { let $name = FakeConnection; }; }
+            fn owner(conn: &Connection) {
+                shadow!(conn);
+                conn.prepare(
+                    // schema-hot-query: reviewed.shape
+                    "SELECT exact FROM owned WHERE id=?1"
+                );
+            }
+        "#,
+        r#"
+            use rusqlite::Connection;
+            macro_rules! shadow { ($name:ident) => { let $name = "SELECT drifted FROM owned"; }; }
+            fn owner(conn: &Connection) {
+                // schema-hot-query: reviewed.shape
+                let sql = "SELECT exact FROM owned WHERE id=?1";
+                shadow!(sql);
                 conn.prepare(sql);
             }
         "#,

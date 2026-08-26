@@ -321,9 +321,20 @@ fn reject_unsupported_schema_forms(tokens: &[Token]) {
         }
         if matches!(token, Token::Mark('.')) {
             let schema_context = index >= 2
-                && ["table", "index", "view", "trigger", "references", "on"]
-                    .iter()
-                    .any(|keyword| is(tokens.get(index - 2), keyword));
+                && [
+                    "table",
+                    "index",
+                    "view",
+                    "trigger",
+                    "references",
+                    "on",
+                    "from",
+                    "into",
+                    "update",
+                    "join",
+                ]
+                .iter()
+                .any(|keyword| is(tokens.get(index - 2), keyword));
             assert!(
                 !schema_context,
                 "schema-qualified object names are unsupported"
@@ -1041,7 +1052,10 @@ mod tests {
             CREATE VIEW child_view AS SELECT * FROM child;
             CREATE VIRTUAL TABLE child_search USING fts5(note);
             CREATE TRIGGER child_guard BEFORE UPDATE ON child
-              BEGIN SELECT RAISE(ABORT, 'immutable'); END;
+              BEGIN
+                -- DELETE FROM main.child is inert comment text.
+                SELECT RAISE(ABORT, 'FROM main.child is inert literal text');
+              END;
             /* REFERENCES also_ignored(id) */
         "#]);
         assert_eq!(schema.tables.len(), 2);
@@ -1098,6 +1112,11 @@ mod tests {
             "CREATE TABLE child(id TEXT); CREATE VIEW main.child_view AS SELECT * FROM child;",
             "CREATE VIRTUAL TABLE main.child_search USING fts5(body);",
             "CREATE TABLE child(id TEXT); CREATE TRIGGER main.child_guard BEFORE UPDATE ON child BEGIN SELECT 1; END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER DELETE ON child BEGIN DELETE FROM main.child; END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER INSERT ON child BEGIN INSERT INTO main.child(id) VALUES (1); END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN UPDATE main.child SET id=1; END;",
+            "CREATE TABLE child(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT id FROM main.child; END;",
+            "CREATE TABLE child(id TEXT); CREATE TABLE other(id TEXT); CREATE TRIGGER child_guard AFTER UPDATE ON child BEGIN SELECT child.id FROM child JOIN main.other ON other.id=child.id; END;",
         ] {
             assert!(
                 std::panic::catch_unwind(|| parse(&[sql])).is_err(),

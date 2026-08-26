@@ -3312,7 +3312,7 @@ impl App {
         if self.composer.paste_is_empty() {
             return plain();
         }
-        let blocks = self.composer.paste_blocks();
+        let blocks = self.composer.paste_spans().collect::<Vec<_>>();
         let chunk_end = chunk_byte_start + text.len();
         // Quick reject: no block overlaps this chunk.
         if !blocks

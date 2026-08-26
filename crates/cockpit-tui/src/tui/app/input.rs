@@ -4947,7 +4947,7 @@ mod queued_message_edit_tests {
 mod paste_routing_tests {
     use crate::tui::agent_runner::{AgentRunner, TestRunnerOverrides};
     use crate::tui::app::{App, Overlay, PendingModelSelection};
-    use crate::tui::composer::{PasteKind, PasteRegistry};
+    use crate::tui::composer::{RegisteredComposer, TestPasteKind};
     use crate::tui::keys_overlay::{KeyContext, KeysOverlay};
     use crate::tui::pins_overlay::{CopyPick, ForkPick, PinPick, PinsReview};
     use crate::tui::settings::Dialog;
@@ -5083,19 +5083,20 @@ mod paste_routing_tests {
 
         assert_eq!(
             app.composer.text(),
-            PasteRegistry::pending_text_placeholder(1)
+            RegisteredComposer::test_pending_text_placeholder(1)
         );
-        let block = &app.composer.paste_blocks()[0];
+        let block = &app.composer.test_paste_blocks()[0];
         assert!(matches!(
             &block.kind,
-            PasteKind::Text { full, tokens: None, .. } if full == &pasted
+            TestPasteKind::Text { full, tokens: None } if full == &pasted
         ));
 
         drain_async_actions_until_idle(&mut app).await;
 
-        let expected = PasteRegistry::text_placeholder(1, cockpit_core::tokens::count(&pasted));
+        let expected =
+            RegisteredComposer::test_text_placeholder(1, cockpit_core::tokens::count(&pasted));
         assert_eq!(app.composer.text(), expected);
-        let block = &app.composer.paste_blocks()[0];
+        let block = &app.composer.test_paste_blocks()[0];
         assert_eq!((block.start, block.end), (0, expected.len()));
     }
 
@@ -5186,7 +5187,7 @@ mod paste_routing_tests {
         let pasted = long_paste("delete");
 
         app.handle_paste(pasted);
-        let block_id = app.composer.paste_blocks()[0].id;
+        let block_id = app.composer.test_paste_blocks()[0].id;
         let (start, end) = app
             .composer
             .paste_block_left()
@@ -5205,18 +5206,18 @@ mod paste_routing_tests {
         let pasted = long_paste("shift");
 
         app.handle_paste(pasted);
-        let block_id = app.composer.paste_blocks()[0].id;
+        let block_id = app.composer.test_paste_blocks()[0].id;
         app.composer.set_cursor(0);
         app.composer.insert_char('>');
 
-        assert_eq!(app.composer.paste_blocks()[0].start, 1);
+        assert_eq!(app.composer.test_paste_blocks()[0].start, 1);
         assert!(app.apply_paste_token_count(block_id, 123));
-        let expected = format!(">{}", PasteRegistry::text_placeholder(1, 123));
+        let expected = format!(">{}", RegisteredComposer::test_text_placeholder(1, 123));
         assert_eq!(app.composer.text(), expected);
-        let block = &app.composer.paste_blocks()[0];
+        let block = &app.composer.test_paste_blocks()[0];
         assert_eq!(
             &app.composer.text()[block.start..block.end],
-            PasteRegistry::text_placeholder(1, 123)
+            RegisteredComposer::test_text_placeholder(1, 123)
         );
     }
 
@@ -5230,24 +5231,24 @@ mod paste_routing_tests {
         app.handle_paste(first);
         app.composer.insert_char(' ');
         app.handle_paste(second);
-        let first_id = app.composer.paste_blocks()[0].id;
-        let second_id = app.composer.paste_blocks()[1].id;
+        let first_id = app.composer.test_paste_blocks()[0].id;
+        let second_id = app.composer.test_paste_blocks()[1].id;
 
         assert!(app.apply_paste_token_count(second_id, 22));
         assert!(app.apply_paste_token_count(first_id, 11));
 
         let expected = format!(
             "{} {}",
-            PasteRegistry::text_placeholder(1, 11),
-            PasteRegistry::text_placeholder(2, 22)
+            RegisteredComposer::test_text_placeholder(1, 11),
+            RegisteredComposer::test_text_placeholder(2, 22)
         );
         assert_eq!(app.composer.text(), expected);
-        for block in app.composer.paste_blocks() {
+        for block in app.composer.test_paste_blocks() {
             assert_eq!(
                 &app.composer.text()[block.start..block.end],
                 match block.number {
-                    1 => PasteRegistry::text_placeholder(1, 11),
-                    2 => PasteRegistry::text_placeholder(2, 22),
+                    1 => RegisteredComposer::test_text_placeholder(1, 11),
+                    2 => RegisteredComposer::test_text_placeholder(2, 22),
                     other => panic!("unexpected block number {other}"),
                 }
             );

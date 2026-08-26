@@ -151,6 +151,28 @@ fn raw_paste_authority_is_nested_and_restricted_to_the_composer_owner() {
         let item = named_struct(&paste, name);
         assert!(matches!(item.vis, Visibility::Restricted(_)));
     }
+    for name in ["PasteKind", "RetainedImage"] {
+        let item = paste
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Enum(item) if item.ident == name => Some(item),
+                _ => None,
+            })
+            .expect("raw paste enum exists");
+        assert!(matches!(item.vis, Visibility::Restricted(_)));
+    }
+    let block = named_struct(&paste, "PasteBlock");
+    assert!(matches!(block.vis, Visibility::Restricted(_)));
+    let Fields::Named(block_fields) = &block.fields else {
+        panic!("PasteBlock has named fields");
+    };
+    assert!(
+        block_fields
+            .named
+            .iter()
+            .all(|field| matches!(field.vis, Visibility::Restricted(_)))
+    );
     let rebuild = named_struct(&paste, "EditorPasteRebuild");
     let Fields::Named(fields) = &rebuild.fields else {
         panic!("EditorPasteRebuild has named fields");
@@ -176,6 +198,34 @@ fn raw_paste_authority_is_nested_and_restricted_to_the_composer_owner() {
             method.sig.ident
         );
     }
+}
+
+#[test]
+fn render_surface_exposes_geometry_only() {
+    let owner = syn::parse_file(OWNER_SOURCE).expect("owner source parses");
+    let span = named_struct(&owner, "PasteSpan");
+    assert!(matches!(span.vis, Visibility::Restricted(_)));
+    let Fields::Named(fields) = &span.fields else {
+        panic!("PasteSpan has named fields");
+    };
+    let actual = fields
+        .named
+        .iter()
+        .map(|field| {
+            (
+                field.ident.as_ref().unwrap().to_string(),
+                compact(&field.ty),
+                matches!(field.vis, Visibility::Restricted(_)),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            ("start".into(), "usize".into(), true),
+            ("end".into(), "usize".into(), true),
+        ]
+    );
 }
 
 #[test]
@@ -275,7 +325,7 @@ fn owner_api_is_closed_and_never_lends_mutable_components() {
         "paste_before",
         "paste_block_left",
         "paste_block_right",
-        "paste_blocks",
+        "paste_spans",
         "paste_is_empty",
         "plain_payload",
         "probe_motion",
@@ -299,6 +349,9 @@ fn owner_api_is_closed_and_never_lends_mutable_components() {
         "wire_image_ingress_drafts",
         "wire_parts",
         "yank_current_line",
+        "test_paste_blocks",
+        "test_pending_text_placeholder",
+        "test_text_placeholder",
     ];
     expected.sort_unstable();
     assert_eq!(public_methods, expected);
@@ -308,6 +361,9 @@ fn owner_api_is_closed_and_never_lends_mutable_components() {
         "clear",
         "insert_registered_image",
         "insert_registered_text",
+        "test_paste_blocks",
+        "test_pending_text_placeholder",
+        "test_text_placeholder",
     ] {
         let method = implementation
             .items
@@ -343,6 +399,13 @@ fn authority_name(path: &syn::Path) -> Option<&'static str> {
     ["RegisteredComposer", "Composer", "PasteRegistry"]
         .into_iter()
         .find(|candidate| name == *candidate)
+}
+
+fn contains_raw_paste_payload(tokens: impl ToTokens) -> bool {
+    let tokens = compact(tokens);
+    ["PasteBlock", "PasteKind", "RetainedImage", "PasteRegistry"]
+        .iter()
+        .any(|name| tokens.contains(name))
 }
 
 #[derive(Default)]
@@ -393,13 +456,19 @@ impl ProductionInventory<'_> {
     }
 
     fn authority_storage(&mut self, owner: &str, tokens: impl ToTokens) {
-        if self.test_depth != 0 {
+        if self.test_depth != 0 || self.is_raw_registry_implementation() {
             return;
         }
         let ty = compact(tokens);
-        if ["RegisteredComposer", "PasteRegistry"]
-            .iter()
-            .any(|name| ty.contains(name))
+        if [
+            "RegisteredComposer",
+            "PasteRegistry",
+            "PasteBlock",
+            "PasteKind",
+            "RetainedImage",
+        ]
+        .iter()
+        .any(|name| ty.contains(name))
         {
             self.violation(format!("{owner} owns or aliases composer authority"));
         }
@@ -589,6 +658,15 @@ impl<'ast> Visit<'ast> for ProductionInventory<'_> {
                     ));
                 }
             }
+            if !self.is_authority_owner()
+                && !self.is_raw_registry_implementation()
+                && contains_raw_paste_payload(signature)
+            {
+                self.violation(format!(
+                    "{} exposes raw paste payload authority",
+                    signature.ident
+                ));
+            }
         }
         visit::visit_signature(self, signature);
     }
@@ -751,6 +829,9 @@ fn ratchet_detectors_reject_adversarial_aliases_and_extra_authorities() {
         "pub(super) use crate::tui::composer::RegisteredComposer;",
         "fn f() { let constructor = RegisteredComposer::new; let _ = constructor(false); }",
         "macro_rules! owner { () => { RegisteredComposer::new(false) } }",
+        "fn leak() -> Vec<PasteBlock> { todo!() }",
+        "fn accept(kind: PasteKind) { let _ = kind; }",
+        "struct Payload { retained: RetainedImage }",
     ] {
         let inventory = inspect_production(source, "tui/adversarial.rs");
         assert!(!inventory.violations.is_empty(), "accepted: {source}");

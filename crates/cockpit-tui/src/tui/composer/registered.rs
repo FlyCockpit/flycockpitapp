@@ -59,6 +59,31 @@ pub(crate) struct RegisteredComposer {
     paste_registry: PasteRegistry,
 }
 
+/// Presentation-only geometry for one atomic paste placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PasteSpan {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TestPasteKind {
+    Text { full: String, tokens: Option<usize> },
+    Image,
+    ImageHandle,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TestPasteBlock {
+    pub(crate) id: u64,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) number: u32,
+    pub(crate) kind: TestPasteKind,
+}
+
 impl Deref for RegisteredComposer {
     type Target = Composer;
 
@@ -120,8 +145,43 @@ impl RegisteredComposer {
         self.paste_registry.is_empty()
     }
 
-    pub(crate) fn paste_blocks(&self) -> &[PasteBlock] {
-        self.paste_registry.blocks()
+    pub(crate) fn paste_spans(&self) -> impl Iterator<Item = PasteSpan> + '_ {
+        self.paste_registry.blocks().iter().map(|block| PasteSpan {
+            start: block.start,
+            end: block.end,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_paste_blocks(&self) -> Vec<TestPasteBlock> {
+        self.paste_registry
+            .blocks()
+            .iter()
+            .map(|block| TestPasteBlock {
+                id: block.id,
+                start: block.start,
+                end: block.end,
+                number: block.number,
+                kind: match &block.kind {
+                    PasteKind::Text { full, tokens, .. } => TestPasteKind::Text {
+                        full: full.clone(),
+                        tokens: *tokens,
+                    },
+                    PasteKind::Image { .. } => TestPasteKind::Image,
+                    PasteKind::ImageHandle { .. } => TestPasteKind::ImageHandle,
+                },
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending_text_placeholder(number: u32) -> String {
+        PasteRegistry::pending_text_placeholder(number)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_text_placeholder(number: u32, tokens: usize) -> String {
+        PasteRegistry::text_placeholder(number, tokens)
     }
 
     pub(crate) fn display_text(&self) -> String {
@@ -970,12 +1030,12 @@ mod tests {
     fn adversarial_cursor_and_insert_cannot_split_registered_placeholder() {
         let mut owner = RegisteredComposer::new(false);
         owner.insert_registered_text("full payload".to_string(), 2);
-        let original = owner.paste_blocks()[0].clone();
+        let original = owner.paste_registry.blocks()[0].clone();
 
         owner.set_cursor(original.start + 3);
         owner.insert_char('>');
 
-        let block = &owner.paste_blocks()[0];
+        let block = &owner.paste_registry.blocks()[0];
         assert_eq!(
             &owner.text()[block.start..block.end],
             PasteRegistry::text_placeholder(1, 2)
@@ -1081,7 +1141,8 @@ mod tests {
 
         assert_eq!(
             owner
-                .paste_blocks()
+                .paste_registry
+                .blocks()
                 .iter()
                 .map(|block| block.number)
                 .collect::<Vec<_>>(),
@@ -1221,7 +1282,7 @@ mod tests {
         let snapshot = owner.editor_snapshot();
         owner.rebuild_from_editor(&editor, &snapshot);
 
-        assert_eq!(owner.paste_blocks().len(), 1);
+        assert_eq!(owner.paste_registry.blocks().len(), 1);
         assert_eq!(
             owner.plain_payload().as_deref(),
             Some("expanded editor payload")

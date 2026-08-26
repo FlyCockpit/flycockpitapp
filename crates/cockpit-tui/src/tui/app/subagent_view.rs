@@ -35,7 +35,7 @@ mod tests {
         composer.insert_registered_image(vec![1, 2, 3]);
         let error = subagent_steer_message(&composer).expect_err("images unsupported");
         assert!(error.contains("does not accept image attachments"));
-        assert_eq!(composer.paste_blocks().len(), 1);
+        assert_eq!(composer.test_paste_blocks().len(), 1);
     }
 }
 

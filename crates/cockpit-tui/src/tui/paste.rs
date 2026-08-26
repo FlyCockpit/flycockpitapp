@@ -53,7 +53,7 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 /// text (sent inline to the model); image blocks carry PNG bytes + a
 /// content hash + whether this occurrence is a duplicate reference.
 #[derive(Debug, Clone)]
-pub enum PasteKind {
+pub(super) enum PasteKind {
     /// Condensed text. `full` is the verbatim pasted text the model
     /// receives inline at this block's position (display-only
     /// condensation — the placeholder is never sent for text).
@@ -96,7 +96,7 @@ pub struct ImageIngressDraftAuthority {
 }
 
 #[derive(Debug, Clone)]
-pub enum RetainedImage {
+pub(super) enum RetainedImage {
     Bytes(Vec<u8>),
     Handle {
         draft: ImageIngressDraftAuthority,
@@ -122,17 +122,17 @@ impl RetainedImage {
 /// the composer buffer and is the placeholder's exact extent; the registered
 /// composer owner keeps it in sync via [`PasteRegistry::shift_for_edit`].
 #[derive(Debug, Clone)]
-pub struct PasteBlock {
-    pub id: u64,
-    pub start: usize,
-    pub end: usize,
+pub(super) struct PasteBlock {
+    pub(super) id: u64,
+    pub(super) start: usize,
+    pub(super) end: usize,
     /// 1-based display number (`#N`): per-composer running index over
     /// condensed text pastes for [`PasteKind::Text`], over *distinct*
     /// images for [`PasteKind::Image`]. The visible placeholder text
     /// lives in the composer buffer at `[start, end)` — the registry
     /// tracks only the range, number, and payload.
-    pub number: u32,
-    pub kind: PasteKind,
+    pub(super) number: u32,
+    pub(super) kind: PasteKind,
 }
 
 /// The per-composer block registry. Blocks are kept sorted by `start`.

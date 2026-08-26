@@ -31,7 +31,7 @@ mod registered;
 
 pub(crate) use paste::ImageIngressDraftAuthority;
 #[cfg(test)]
-pub(crate) use paste::{PasteKind, PasteRegistry};
+pub(crate) use registered::TestPasteKind;
 pub(crate) use registered::{ComposerMotion, RegisteredComposer};
 
 /// Display width of [`INPUT_PREFIX`] in terminal columns. Computed via

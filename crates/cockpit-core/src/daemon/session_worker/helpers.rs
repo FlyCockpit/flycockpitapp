@@ -230,24 +230,22 @@ pub(crate) fn resolve_new_session_llm_mode(
     providers.resolve_mode(&active.provider, &active.model, global)
 }
 
-/// Persist a live `/llm-mode` switch to the layered config so a resume
-/// keeps it (implementation note). Writes to the
-/// highest-precedence existing `config.json` on the discovered
-/// path (the layer `load_for_cwd` would read), or — when none exists yet —
-/// scaffolds one in the project `.cockpit/` so `/settings` + the config
-/// file + `/llm-mode` all resolve to the same value. Round-trips through
+/// Persist a live `/llm-mode` switch to the layered config so a resume keeps it
+/// (implementation note). Writes to the layer `load_for_cwd` actually reads —
+/// the nearest project `.cockpit/config.json` (honoring `COCKPIT_CONFIG`), not
+/// the home-first first-existing layer, so a per-project toggle takes effect and
+/// is not masked by a nearer project layer. When no config layer exists yet, it
+/// scaffolds one in the project `.cockpit/` so `/settings` + the config file +
+/// `/llm-mode` all resolve to the same value. Round-trips through
 /// [`ExtendedConfigDoc`] so unknown keys (including sibling layer/provider
 /// metadata) survive.
 pub(super) fn persist_llm_mode(
     project_root: &std::path::Path,
     mode: crate::config::extended::LlmMode,
 ) -> anyhow::Result<()> {
-    use crate::config::dirs::{CONFIG_FILE, discover_config_dirs};
+    use crate::config::dirs::{CONFIG_FILE, most_specific_config_write_target};
     use crate::config::extended::ExtendedConfigDoc;
-    let target = discover_config_dirs(project_root)
-        .into_iter()
-        .map(|d| d.path.join(CONFIG_FILE))
-        .find(|p| p.exists())
+    let target = most_specific_config_write_target(project_root)
         .unwrap_or_else(|| project_root.join(".cockpit").join(CONFIG_FILE));
     let mut doc = ExtendedConfigDoc::load(&target)?;
     let mut cfg = doc.config();
@@ -280,23 +278,27 @@ pub(crate) fn daemon_no_sandbox() -> anyhow::Result<bool> {
 }
 
 /// Persist sandbox intent (`sandbox.defaultMode`). Capability-missing
-/// `SetSandbox` must not call this.
+/// `SetSandbox` must not call this. Writes to the layer `load_for_cwd` reads
+/// (nearest project `.cockpit/config.json`, honoring `COCKPIT_CONFIG`) so a
+/// per-project `/sandbox` toggle takes effect and is not masked by a nearer
+/// project layer; scaffolds a project `.cockpit/` when no layer exists yet.
 pub(super) fn persist_sandbox_intent(
     project_root: &std::path::Path,
     mode: crate::tools::sandbox_mode::SandboxMode,
 ) -> anyhow::Result<()> {
-    use crate::config::dirs::{CONFIG_FILE, discover_config_dirs};
+    use crate::config::dirs::{CONFIG_FILE, most_specific_config_write_target};
     use crate::config::extended::ExtendedConfigDoc;
-    let target = discover_config_dirs(project_root)
-        .into_iter()
-        .map(|d| d.path.join(CONFIG_FILE))
-        .find(|p| p.exists())
+    let target = most_specific_config_write_target(project_root)
         .unwrap_or_else(|| project_root.join(".cockpit").join(CONFIG_FILE));
     let mut doc = ExtendedConfigDoc::load(&target)?;
     let mut cfg = doc.config();
-    if cfg.sandbox.default_mode == mode {
-        return Ok(());
-    }
+    // Persist unconditionally. A previous "skip if unchanged" short-circuit
+    // compared against the ISOLATED target layer, which — now that the target
+    // is the nearest project layer (often a fresh/default doc) rather than the
+    // first existing file — could equal the requested mode while an outer layer
+    // still overrode it, silently dropping a toggle-to-default. Writing the
+    // intent to the nearest layer every time is idempotent and matches
+    // `persist_llm_mode`.
     cfg.sandbox.default_mode = mode;
     doc.write(&cfg)?;
     Ok(())

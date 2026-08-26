@@ -575,7 +575,7 @@ pub struct TrustStatusArgs {
     pub path: Option<PathBuf>,
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 #[command(
     after_help = "Exit codes:\n  0  no failing checks\n  1  one or more doctor checks failed\n\nNetwork provider checks run by default; use --offline to skip DNS and HTTP."
 )]
@@ -2026,7 +2026,14 @@ mod tests {
             cursor += found + needle.len();
         }
 
-        assert!(quickstart.contains("cockpit account"), "{quickstart}");
+        assert!(
+            quickstart.to_ascii_lowercase().contains("local-only"),
+            "quickstart must document the public local-only contract:\n{quickstart}"
+        );
+        assert!(
+            !quickstart.contains("cockpit account"),
+            "public v0.1 quickstart must not document a FlyCockpit account command:\n{quickstart}"
+        );
         assert!(quickstart.contains("cockpit provider"), "{quickstart}");
 
         let commands = quickstart_shell_commands();

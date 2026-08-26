@@ -444,7 +444,7 @@ mod tests {
                      binding_revision_map_payload, binding_revision_map_digest,
                      created_at_unix_ms
                  ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, 1)",
-                params![
+                rusqlite::params![
                     snapshot_id.to_string(),
                     session_id.to_string(),
                     installation_id.to_string(),
@@ -518,7 +518,7 @@ mod tests {
                      binding_revision_map_payload, binding_revision_map_digest,
                      created_at_unix_ms
                  ) VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, 2)",
-                params![
+                rusqlite::params![
                     snapshot_id.to_string(),
                     session_id.to_string(),
                     installation_id.to_string(),
@@ -3571,6 +3571,69 @@ mod tests {
         .await
         .unwrap();
 
+        let question = crate::db::wire::InterruptQuestion::Single {
+            prompt: "Approve?".into(),
+            options: vec![crate::db::wire::InterruptOption {
+                id: "approve".into(),
+                label: "Approve".into(),
+                description: None,
+                secondary: false,
+            }],
+            allow_freetext: false,
+            command_detail: None,
+            permission: true,
+            approval_class: None,
+            sandbox_escalation: None,
+        };
+        let interrupt_id = db
+            .raise_interrupt_with_agent_instance(
+                session.session_id,
+                "host-approval-test",
+                Some(agent.agent_instance_id),
+                "approval",
+                Some(&question),
+            )
+            .await
+            .unwrap();
+        let decision_request_id = Uuid::new_v4();
+        let bind_decision = decision_request_id.to_string();
+        let bind_session = session.session_id.to_string();
+        let bind_agent = agent.agent_instance_id.to_string();
+        let bind_operation = approved_operation_id.to_string();
+        let bind_interrupt = interrupt_id.to_string();
+        db.write(move |conn| {
+            conn.execute(
+                "INSERT INTO decision_requests (
+                     decision_request_id, agent_instance_id, session_id,
+                     task_call_id_ref, workspace_ref,
+                     options_contract_json, free_text_contract_json, recommendation_json,
+                     rationale_redaction_class, decision_class, host_approval_operation_id,
+                     deadline_unix_ms, policy_receipt_json,
+                     resolver_route, state, revision, created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, ?3, NULL, NULL, '{}', NULL, NULL, 'none', 'host_approval', ?4, NULL, NULL, 'user', 'pending', 0, 20, 20)",
+                rusqlite::params![bind_decision, bind_agent, bind_session, bind_operation],
+            )?;
+            conn.execute(
+                "UPDATE agent_host_approval_operations
+                 SET decision_request_id = ?1
+                 WHERE operation_id = ?2 AND session_id = ?3",
+                rusqlite::params![
+                    decision_request_id.to_string(),
+                    approved_operation_id.to_string(),
+                    session.session_id.to_string()
+                ],
+            )?;
+            conn.execute(
+                "UPDATE needs_attention
+                 SET decision_request_id = ?1
+                 WHERE interrupt_id = ?2",
+                rusqlite::params![decision_request_id.to_string(), bind_interrupt],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
         assert!(matches!(
             db.transition_agent_instance(
                 session.session_id,
@@ -4046,7 +4109,11 @@ impl HostApprovalOperation {
             operation_kind,
             canonical_input_json: String::from_utf8(canonical)
                 .context("canonical host approval input was not UTF-8")?,
-            input_digest: format!("{:x}", digest.finalize()),
+            input_digest: digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
         })
     }
 
@@ -4369,10 +4436,13 @@ impl RedactedInterruptQuestion {
             | Self::Multi {
                 option_ids,
                 allow_freetext,
-            } => ensure!(
-                !option_ids.is_empty() || *allow_freetext,
-                "QuestionTool choice contract must offer an option or allow free-text"
-            ),
+            } => {
+                ensure!(
+                    !option_ids.is_empty() || *allow_freetext,
+                    "QuestionTool choice contract must offer an option or allow free-text"
+                );
+                Ok(())
+            }
             Self::Freetext => Ok(()),
         }
     }
@@ -4386,10 +4456,13 @@ impl RedactedInterruptQuestion {
                     allow_freetext,
                 },
                 ResolveResponse::Single { selected_id },
-            ) => ensure!(
-                option_ids.iter().any(|id| id == selected_id),
-                "QuestionTool answer selected an option not offered by this question"
-            ),
+            ) => {
+                ensure!(
+                    option_ids.iter().any(|id| id == selected_id),
+                    "QuestionTool answer selected an option not offered by this question"
+                );
+                Ok(())
+            }
             (
                 Self::Single {
                     allow_freetext: true,
@@ -5267,7 +5340,7 @@ pub enum AutoResolutionBegin {
 /// An answer received from the public AgentTree daemon boundary. Option IDs
 /// are daemon-minted opaque capabilities from the redacted Attention
 /// contract, never the original QuestionTool continuation IDs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PublicDecisionAnswer {
     Option { id: String },
     FreeText { text: String },
@@ -5291,7 +5364,7 @@ impl PublicDecisionAnswer {
 /// boundary has selected the exact linked decision and translated it through
 /// its private mapping.  In particular, this type has no daemon-wire decoder
 /// and the public `ResolveAgentDecision` route cannot construct it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PrivateDecisionContinuationAnswer {
     Option { id: String },
     FreeText { text: String },
@@ -6681,8 +6754,12 @@ pub(crate) fn workspace_ref_for_host_path(
     // root or decision packet.
     unsafe {
         crate::db::agent_tree_decisions::HostWorkspaceRef::from_daemon_derived(format!(
-            "workspace:v1:{:x}",
-            digest.finalize()
+            "workspace:v1:{}",
+            digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         ))
     }
 }

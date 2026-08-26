@@ -336,12 +336,33 @@ impl Model {
                     .await
                 }
                 Model::ChatGpt { model, .. } => {
+                    // The ChatGPT/Codex Responses model runs strict tool schemas
+                    // (`with_strict_tools`). Normalize the utility tool to the
+                    // wire form here (adds `additionalProperties:false`, marks
+                    // optional properties nullable, …) so this path matches the
+                    // main inference path and the OpenAI utility path instead of
+                    // being the lone tool-dispatch site that leaves the schema
+                    // for rig's own strict-tool sanitizer to close. Today rig
+                    // closes it, so this is defense-in-depth for the
+                    // safety-critical `risk_tool`/`safety_tool` verdicts: if that
+                    // third-party sanitizer ever changed, strict validation would
+                    // reject them, the safety gate would fail closed into a
+                    // spurious approval prompt, and the injection check would fail
+                    // open — so we do not depend on it.
+                    let wire_tool = wire_schema::definitions_for_wire(
+                        crate::config::providers::WireApi::Responses,
+                        std::slice::from_ref(tool),
+                    )
+                    .as_ref()
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| tool.clone());
                     let response = configured_completion_request(
                         build_chatgpt_completion_model(model.clone()),
                         system,
                         &[],
                         Message::user(prompt),
-                        std::slice::from_ref(tool),
+                        std::slice::from_ref(&wire_tool),
                         &params,
                         chatgpt_additional_params(&params),
                     )

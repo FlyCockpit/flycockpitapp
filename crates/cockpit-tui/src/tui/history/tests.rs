@@ -1094,7 +1094,7 @@ fn render_toolbox_smoke() {
 #[test]
 fn tool_progress_row_renders_bar_and_counts() {
     let mut call = mk_call("bash", "index src", ToolCallState::Processing);
-    call.progress = Some(cockpit_core::engine::ToolProgress {
+    call.progress = Some(cockpit_client::presentation::ToolProgress {
         call_id: "id".to_string(),
         done: 3,
         total: 10,
@@ -1122,7 +1122,7 @@ fn tool_progress_row_renders_bar_and_counts() {
 #[test]
 fn tool_progress_render_clamps_monotonic() {
     let mut call = mk_call("bash", "index src", ToolCallState::Processing);
-    call.progress = Some(cockpit_core::engine::ToolProgress {
+    call.progress = Some(cockpit_client::presentation::ToolProgress {
         call_id: "id".to_string(),
         done: 12,
         total: 10,
@@ -1137,7 +1137,7 @@ fn tool_progress_render_clamps_monotonic() {
 #[test]
 fn tool_progress_narrow_width_degrades() {
     let mut call = mk_call("bash", "index src", ToolCallState::Processing);
-    call.progress = Some(cockpit_core::engine::ToolProgress {
+    call.progress = Some(cockpit_client::presentation::ToolProgress {
         call_id: "id".to_string(),
         done: 3,
         total: 10,

@@ -4919,7 +4919,7 @@ mod queued_message_edit_tests {
             .push(optimistic_queue_item("local stale".to_string()));
         let daemon_item = proto_item("daemon item", QueueItemStatus::Queued);
 
-        app.apply_event(cockpit_core::engine::TurnEvent::QueueUpdated {
+        app.apply_event(cockpit_client::presentation::TurnEvent::QueueUpdated {
             queue: vec![queue_item_from_proto(daemon_item)],
         });
 

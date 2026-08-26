@@ -1020,6 +1020,13 @@ impl Db {
     }
 }
 
+// Canonical `BEGIN IMMEDIATE` transaction wrapper: rolls back on body error,
+// COMMIT failure, and panic, chaining a rollback failure via
+// `TransactionRollbackFailed` so the writer loop can poison a wedged
+// connection. `task_delegations::immediate_transaction` deliberately mirrors
+// this control flow (it only differs by carrying per-operation context
+// strings) — keep the two in sync; a drift there is what reintroduced the
+// COMMIT-failure leak once already.
 fn run_transaction<F, T>(conn: &Connection, f: F) -> Result<T>
 where
     F: FnOnce(&Connection) -> Result<T>,

@@ -9,6 +9,17 @@ use super::wire::{normalize_openai_usage_aliases_bytes, take_normalized_sse_line
 
 const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum bytes the SSE line-normalizer may buffer waiting for a `\n`.
+///
+/// The provider stream is drained line-by-line: `take_normalized_sse_lines`
+/// emits every complete `\n`-terminated line and `pending` holds only the
+/// trailing partial line between chunks. A provider (or a MITM on a
+/// misconfigured `base_url`) that never emits a newline would otherwise grow
+/// `pending` without bound and OOM the daemon. Real SSE events are small token
+/// deltas, so this cap is far above any legitimate single line while still
+/// bounding worst-case memory; crossing it aborts the stream as hostile.
+const MAX_SSE_PENDING_BYTES: usize = 16 * 1024 * 1024;
+
 // `openai::Client` is rig's *Responses API* client (POSTs `/responses`).
 // Every OpenAI-compatible provider in `src/providers/mod.rs` (z.ai,
 // MiniMax, OpenCode Zen, generic openai-compatible, Ollama) speaks the
@@ -156,20 +167,39 @@ impl rig::http_client::HttpClientExt for UsageAliasHttpClient {
                         >,
                 >,
             > = Box::pin(futures::stream::unfold(
-                (body, Vec::<u8>::new()),
-                |(mut body, mut pending)| async move {
+                (body, Vec::<u8>::new(), false),
+                |(mut body, mut pending, aborted)| async move {
+                    // A prior iteration hit the no-newline cap and yielded a
+                    // terminal error; end the stream rather than spin.
+                    if aborted {
+                        return None;
+                    }
                     loop {
                         let normalized = take_normalized_sse_lines(&mut pending, false);
                         if !normalized.is_empty() {
-                            return Some((Ok(normalized), (body, pending)));
+                            return Some((Ok(normalized), (body, pending, false)));
                         }
                         match body.next().await {
-                            Some(Ok(bytes)) => pending.extend_from_slice(&bytes),
-                            Some(Err(e)) => return Some((Err(e), (body, pending))),
+                            Some(Ok(bytes)) => {
+                                pending.extend_from_slice(&bytes);
+                                if pending.len() > MAX_SSE_PENDING_BYTES {
+                                    let error = rig::http_client::Error::Instance(Box::new(
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!(
+                                                "provider SSE stream buffered {} bytes with no newline (cap {MAX_SSE_PENDING_BYTES}); treating the connection as hostile",
+                                                pending.len(),
+                                            ),
+                                        ),
+                                    ));
+                                    return Some((Err(error), (body, pending, true)));
+                                }
+                            }
+                            Some(Err(e)) => return Some((Err(e), (body, pending, false))),
                             None => {
                                 let normalized = take_normalized_sse_lines(&mut pending, true);
                                 return (!normalized.is_empty())
-                                    .then_some((Ok(normalized), (body, pending)));
+                                    .then_some((Ok(normalized), (body, pending, false)));
                             }
                         }
                     }

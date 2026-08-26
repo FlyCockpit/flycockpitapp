@@ -1,6 +1,6 @@
 use super::{App, wire_history_to_entries};
 use crate::tui::history::{HistoryEntry, ToolCallState};
-use cockpit_core::engine::TurnEvent;
+use cockpit_client::presentation::TurnEvent;
 use cockpit_proto::HistoryEntry as Wire;
 use serde_json::json;
 

@@ -129,7 +129,17 @@ impl ClientEndpoint {
                         stream.flush().await?;
                         stream.shutdown().await?;
                         const MAX_SENSITIVE_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
-                        let mut response = Zeroizing::new(Vec::new());
+                        // Pre-size the zeroizing buffer to the response ceiling
+                        // so `read_to_end` never reallocates: a realloc would
+                        // copy the partial plaintext into a fresh allocation and
+                        // free the old one WITHOUT zeroizing it, stranding
+                        // revealed-secret fragments in freed heap (Zeroizing's
+                        // drop only scrubs the final allocation). Any response
+                        // within the ceiling now lands in this one buffer, and
+                        // its full capacity is zeroed on drop.
+                        let mut response = Zeroizing::new(Vec::with_capacity(
+                            MAX_SENSITIVE_RESPONSE_BYTES as usize,
+                        ));
                         stream
                             .take(MAX_SENSITIVE_RESPONSE_BYTES + 1)
                             .read_to_end(&mut response)
@@ -277,6 +287,17 @@ pub fn is_protocol_version_mismatch(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<proto::ErrorPayload>()
         .is_some_and(|payload| payload.code == proto::ErrorCode::ProtocolVersion)
+}
+
+/// Typed request surface shared by [`DaemonClient`] and lifetime-bound
+/// wrappers that must not convert back into a client handle.
+pub trait DaemonRequestClient: Send + Sync {
+    fn request(
+        &self,
+        request: Request,
+    ) -> impl std::future::Future<
+        Output = Result<std::result::Result<Response, ErrorPayload>>,
+    > + Send;
 }
 
 /// Public handle. Cheap to clone: every clone shares the same
@@ -474,6 +495,15 @@ impl DaemonClient {
         {
             false
         }
+    }
+}
+
+impl DaemonRequestClient for DaemonClient {
+    async fn request(
+        &self,
+        request: Request,
+    ) -> Result<std::result::Result<Response, ErrorPayload>> {
+        DaemonClient::request(self, request).await
     }
 }
 
@@ -837,6 +867,7 @@ mod tests {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
+            session_entry_mode: Some(proto::SessionEntryMode::Code),
             model_override: None,
             client_protocol_version,
             env_snapshot: None,
@@ -847,6 +878,7 @@ mod tests {
     fn attached_response(session_id: Uuid) -> Response {
         Response::Attached {
             session_id,
+            session_entry_mode: proto::SessionEntryMode::Code,
             short_id: "abc123".to_string(),
             project_root: "/tmp".to_string(),
             project_id: "project".to_string(),
@@ -1260,6 +1292,7 @@ mod tests {
             initial_model: None,
             no_sandbox: false,
             interactive: true,
+            session_entry_mode: Some(proto::SessionEntryMode::Code),
             model_override: None,
             client_protocol_version: proto::PROTOCOL_VERSION,
             env_snapshot: None,

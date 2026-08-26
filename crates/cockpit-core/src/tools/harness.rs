@@ -211,16 +211,22 @@ async fn refresh_models(
 /// most-specific writable layer). Best-effort: a write failure is logged,
 /// never surfaced as a tool error (the probe still succeeded).
 fn persist_models(name: &str, models: Vec<String>, cwd: &std::path::Path) {
-    use crate::config::dirs::discover_config_dirs;
-    let dirs = discover_config_dirs(cwd);
-    // Prefer the most-specific layer (last in walk order) that defines the
-    // harness; else the most-specific layer overall.
+    use crate::config::dirs::config_dirs_most_specific_first;
+    // Prefer the nearest layer that already defines the harness (the one load
+    // precedence reads); else the most-specific writable layer. `config_dirs_
+    // most_specific_first` yields nearest-first, so `target`/`defining` are set
+    // once on the first (most-specific) match — the previous loop overwrote
+    // them on every iteration and ended on the OUTERMOST layer, where a nearer
+    // project layer masks the write.
     let mut target: Option<std::path::PathBuf> = None;
     let mut defining: Option<std::path::PathBuf> = None;
-    for dir in &dirs {
+    for dir in config_dirs_most_specific_first(cwd) {
         let path = dir.path.join(crate::config::dirs::CONFIG_FILE);
-        target = Some(path.clone());
-        if let Ok(doc) = ExtendedConfigDoc::load(&path)
+        if target.is_none() {
+            target = Some(path.clone());
+        }
+        if defining.is_none()
+            && let Ok(doc) = ExtendedConfigDoc::load(&path)
             && doc.config().harnesses.contains_key(name)
         {
             defining = Some(path);

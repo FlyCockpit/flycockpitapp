@@ -5,7 +5,7 @@ use cockpit_proto::{self as proto, ErrorCode, Request, Response};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::DaemonClient;
+use crate::DaemonRequestClient;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -38,8 +38,8 @@ pub enum ImageUploadError {
     Transport(String),
 }
 
-pub async fn upload_submission_images(
-    client: &DaemonClient,
+pub async fn upload_submission_images<C: DaemonRequestClient>(
+    client: &C,
     images: &[SubmissionImage],
 ) -> Result<Vec<proto::ImageAttachmentRef>, ImageUploadError> {
     if images.len() > proto::MAX_IMAGES_PER_USER_MESSAGE {
@@ -73,8 +73,8 @@ pub async fn upload_submission_images(
     Ok(refs)
 }
 
-async fn upload_one(
-    client: &DaemonClient,
+async fn upload_one<C: DaemonRequestClient>(
+    client: &C,
     png: &[u8],
 ) -> Result<proto::ImageAttachmentRef, ImageUploadError> {
     if png.is_empty() {
@@ -121,8 +121,8 @@ async fn upload_one(
     }
 }
 
-async fn upload_chunks(
-    client: &DaemonClient,
+async fn upload_chunks<C: DaemonRequestClient>(
+    client: &C,
     upload_id: Uuid,
     png: &[u8],
 ) -> Result<proto::ImageAttachmentRef, ImageUploadError> {
@@ -169,7 +169,10 @@ async fn upload_chunks(
     }
 }
 
-async fn request(client: &DaemonClient, value: Request) -> Result<Response, ImageUploadError> {
+async fn request<C: DaemonRequestClient>(
+    client: &C,
+    value: Request,
+) -> Result<Response, ImageUploadError> {
     match client.request(value).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(error)) if error.code == ErrorCode::BadRequest => {

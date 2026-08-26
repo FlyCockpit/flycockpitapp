@@ -211,7 +211,7 @@ impl HostApprovalEffectHandoff {
 
     async fn reject_if_unclaimed(mut self) {
         if self.claimed {
-            self.mark_submission_unknown().await;
+            Box::pin(self.mark_submission_unknown()).await;
             return;
         }
         let Ok(authority) = self.db_authority() else {
@@ -305,7 +305,7 @@ impl HostApprovalEffectHandoff {
 
     async fn mark_submission_unknown(mut self) {
         if !self.claimed {
-            self.reject_if_unclaimed().await;
+            Box::pin(self.reject_if_unclaimed()).await;
             return;
         }
         let Ok(authority) = self.db_authority() else {
@@ -2210,7 +2210,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
                     // we restore the durable operation UUID; handing the
                     // newly allocated prompt UUID to the effect scope would
                     // strand the actual dispatching record on restart.
-                    let operation = match operation.with_persisted_operation_id(operation_id) {
+                    let operation = match operation.clone().with_persisted_operation_id(operation_id) {
                         Ok(operation) => operation,
                         Err(_) => return InterruptOutcome::Resolved(ResolveResponse::Cancel),
                     };
@@ -2496,7 +2496,7 @@ pub(crate) async fn raise_and_wait_with_agent_tree(
         &set,
         owner.workspace_ref.clone(),
     ) {
-        Ok(contract) => match (host_operation, host_approval_authority) {
+        Ok(contract) => match (host_operation.clone(), host_approval_authority) {
             (Some(operation), Some(authority)) => {
                 contract.with_host_approval_subject(operation, authority)
             }

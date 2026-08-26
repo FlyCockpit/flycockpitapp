@@ -422,11 +422,11 @@ fn async_dispatch_failure_reconciles_exact_row_before_next_record_succeeds() {
         second.optimistic_submission_id
     );
 
-    app.apply_event(cockpit_core::engine::TurnEvent::UserMessageDispatchFailed {
+    app.apply_event(cockpit_client::presentation::TurnEvent::UserMessageDispatchFailed {
         error: "image upload rejected".to_string(),
         optimistic_submission_id: first.optimistic_submission_id,
     });
-    app.apply_event(cockpit_core::engine::TurnEvent::UserMessageRecorded {
+    app.apply_event(cockpit_client::presentation::TurnEvent::UserMessageRecorded {
         seq: 91,
         client_submission_ids: vec![second.optimistic_submission_id],
         preflight_cleaned: None,
@@ -484,11 +484,11 @@ fn fresh_a_failure_then_busy_b_fold_reconciles_history_queue_and_duplicate_recor
     assert_eq!(first.submission.text, "same visible text");
     assert_eq!(second.submission.text, "same visible text");
 
-    app.apply_event(cockpit_core::engine::TurnEvent::UserMessageDispatchFailed {
+    app.apply_event(cockpit_client::presentation::TurnEvent::UserMessageDispatchFailed {
         error: "upload failed".to_string(),
         optimistic_submission_id: first.optimistic_submission_id,
     });
-    app.apply_event(cockpit_core::engine::TurnEvent::QueuedUserMessagesFolded {
+    app.apply_event(cockpit_client::presentation::TurnEvent::QueuedUserMessagesFolded {
         text: second.submission.text.clone(),
         display_text: second.submission.display_text.clone(),
         tag_expansions: second.submission.tag_expansions.clone(),
@@ -497,7 +497,7 @@ fn fresh_a_failure_then_busy_b_fold_reconciles_history_queue_and_duplicate_recor
         seq: Some(92),
         preflight_cleaned: None,
     });
-    app.apply_event(cockpit_core::engine::TurnEvent::UserMessageRecorded {
+    app.apply_event(cockpit_client::presentation::TurnEvent::UserMessageRecorded {
         seq: 92,
         client_submission_ids: vec![queued_b_id],
         preflight_cleaned: None,
@@ -549,7 +549,7 @@ fn async_busy_b_failure_removes_only_b_and_keeps_fresh_a_working() {
     assert!(app.busy);
     assert_eq!(app.queue[0].id, second.optimistic_submission_id);
 
-    app.apply_event(cockpit_core::engine::TurnEvent::UserMessageDispatchFailed {
+    app.apply_event(cockpit_client::presentation::TurnEvent::UserMessageDispatchFailed {
         error: "busy upload failed".to_string(),
         optimistic_submission_id: second.optimistic_submission_id,
     });
@@ -1845,9 +1845,9 @@ fn multireview_kickoff_queue_full_reconciles_user_row_and_ends_span() {
         control_rx.try_recv().map(|request| request.request),
         Ok(cockpit_proto::Request::SetAgent { name }) if name == "Multireview"
     ));
-    app.apply_event(cockpit_core::engine::TurnEvent::ControlRequestFinished {
-        request_id: cockpit_core::engine::ControlRequestId(1),
-        outcome: cockpit_core::engine::ControlRequestOutcome::Applied,
+    app.apply_event(cockpit_client::presentation::TurnEvent::ControlRequestFinished {
+        request_id: cockpit_client::presentation::ControlRequestId(1),
+        outcome: cockpit_client::presentation::ControlRequestOutcome::Applied,
     });
     assert!(
         app.history.iter().any(|entry| {
@@ -1889,9 +1889,9 @@ fn multireview_kickoff_closed_reconciles_user_row_and_ends_span() {
         control_rx.try_recv().map(|request| request.request),
         Ok(cockpit_proto::Request::SetAgent { name }) if name == "Multireview"
     ));
-    app.apply_event(cockpit_core::engine::TurnEvent::ControlRequestFinished {
-        request_id: cockpit_core::engine::ControlRequestId(1),
-        outcome: cockpit_core::engine::ControlRequestOutcome::Applied,
+    app.apply_event(cockpit_client::presentation::TurnEvent::ControlRequestFinished {
+        request_id: cockpit_client::presentation::ControlRequestId(1),
+        outcome: cockpit_client::presentation::ControlRequestOutcome::Applied,
     });
     assert!(newest_user_failed(&app));
     assert!(error_lines(&app).iter().any(
@@ -1920,9 +1920,9 @@ fn multireview_kickoff_success_warns_pushes_user_and_dispatches() {
         control_rx.try_recv().map(|request| request.request),
         Ok(cockpit_proto::Request::SetAgent { name }) if name == "Multireview"
     ));
-    app.apply_event(cockpit_core::engine::TurnEvent::ControlRequestFinished {
-        request_id: cockpit_core::engine::ControlRequestId(1),
-        outcome: cockpit_core::engine::ControlRequestOutcome::Applied,
+    app.apply_event(cockpit_client::presentation::TurnEvent::ControlRequestFinished {
+        request_id: cockpit_client::presentation::ControlRequestId(1),
+        outcome: cockpit_client::presentation::ControlRequestOutcome::Applied,
     });
     let submission = input_rx.try_recv().expect("kickoff submitted");
     assert_eq!(submission.text, "kickoff");

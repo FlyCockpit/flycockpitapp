@@ -750,49 +750,55 @@ impl RecoveredNoninteractiveEndpointCollector {
     ) -> Result<Vec<crate::engine::driver::RecoveredNoninteractiveResolverEndpoint>> {
         loop {
             let notified = self.changed.notified();
-            let endpoints = self
-                .endpoints
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let terminal = self
-                .terminal
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let unrecoverable = self
-                .unrecoverable
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some((agent_instance_id, error)) = expected
-                .iter()
-                .find_map(|agent_instance_id| {
-                    unrecoverable
-                        .get(agent_instance_id)
-                        .map(|error| (agent_instance_id, error))
-                })
-            {
-                anyhow::bail!(
-                    "recovered recursive executor {agent_instance_id} cannot install a resolver mailbox: {error}"
-                );
-            }
-            if expected.iter().all(|agent_instance_id| {
-                endpoints.contains_key(agent_instance_id) || terminal.contains(agent_instance_id)
-            }) {
-                return Ok(expected
+            let ready = {
+                let endpoints = self
+                    .endpoints
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let terminal = self
+                    .terminal
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let unrecoverable = self
+                    .unrecoverable
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some((agent_instance_id, error)) = expected
                     .iter()
-                    .filter_map(|agent_instance_id| {
-                        endpoints.get(agent_instance_id).cloned().map(|(endpoint_generation, endpoint)| {
-                            crate::engine::driver::RecoveredNoninteractiveResolverEndpoint {
-                                agent_instance_id: *agent_instance_id,
-                                endpoint_generation,
-                                endpoint,
-                            }
-                        })
+                    .find_map(|agent_instance_id| {
+                        unrecoverable
+                            .get(agent_instance_id)
+                            .map(|error| (agent_instance_id, error))
                     })
-                    .collect());
+                {
+                    anyhow::bail!(
+                        "recovered recursive executor {agent_instance_id} cannot install a resolver mailbox: {error}"
+                    );
+                }
+                if expected.iter().all(|agent_instance_id| {
+                    endpoints.contains_key(agent_instance_id) || terminal.contains(agent_instance_id)
+                }) {
+                    Some(
+                        expected
+                            .iter()
+                            .filter_map(|agent_instance_id| {
+                                endpoints.get(agent_instance_id).cloned().map(|(endpoint_generation, endpoint)| {
+                                    crate::engine::driver::RecoveredNoninteractiveResolverEndpoint {
+                                        agent_instance_id: *agent_instance_id,
+                                        endpoint_generation,
+                                        endpoint,
+                                    }
+                                })
+                            })
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            };
+            if let Some(ready) = ready {
+                return Ok(ready);
             }
-            drop(unrecoverable);
-            drop(terminal);
-            drop(endpoints);
             notified.await;
         }
     }
@@ -2340,7 +2346,8 @@ impl Driver {
                 write_scope.as_deref(),
                 &child_cwd.resolved,
                 &self.cwd,
-            )?;
+            )
+            .map_err(anyhow::Error::msg)?;
             let child = crate::engine::builtin::load(
                 &child_agent,
                 &self.spawn_args_delegated_in_cwd_scoped(
@@ -3521,7 +3528,7 @@ impl Driver {
                             .await;
                     }
                     if was_backgrounded {
-                        self.record_background_noninteractive_error(&task_call_id, &body)
+                        self.settle_live_noninteractive_children_failed(&task_call_id, &body)
                             .await;
                         Ok(self
                             .async_delegation_result(&task_call_id)
@@ -3529,6 +3536,23 @@ impl Driver {
                             .map(NoninteractiveCompletionDelivery::AsyncUser)
                             .unwrap_or(NoninteractiveCompletionDelivery::None))
                     } else {
+                        // Inline runtime failure: settle the child to Failed
+                        // (DB + registry) so `task.control` does not report a
+                        // dead child as running, then mark it delivered (the
+                        // error is returned inline as the tool result). The
+                        // backgrounded arm above already does this via
+                        // `async_delegation_result`; the inline arm previously
+                        // did neither, leaving the child stuck `Running`.
+                        self.settle_live_noninteractive_children_failed(&task_call_id, &body)
+                            .await;
+                        if let Err(e) = self
+                            .session
+                            .db
+                            .mark_task_delegation_child_delivered(&task_call_id, "default")
+                            .await
+                        {
+                            tracing::warn!(error = %e, task_call_id, "mark failed inline single delegation delivered failed");
+                        }
                         Ok(NoninteractiveCompletionDelivery::Inline(
                             crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
@@ -3621,7 +3645,7 @@ impl Driver {
                             .await;
                     }
                     if was_backgrounded {
-                        self.record_background_noninteractive_error(&task_call_id, &body)
+                        self.settle_live_noninteractive_children_failed(&task_call_id, &body)
                             .await;
                         Ok(self
                             .async_delegation_result(&task_call_id)
@@ -3629,6 +3653,38 @@ impl Driver {
                             .map(NoninteractiveCompletionDelivery::AsyncUser)
                             .unwrap_or(NoninteractiveCompletionDelivery::None))
                     } else {
+                        // Inline runtime failure: settle every batch child to
+                        // Failed (DB + registry) so `task.control` does not
+                        // report dead children as running, then mark them
+                        // delivered (the error is returned inline as the tool
+                        // result). Previously the inline arm did neither.
+                        self.settle_live_noninteractive_children_failed(&task_call_id, &body)
+                            .await;
+                        match self
+                            .session
+                            .db
+                            .undelivered_task_delegation_children(&task_call_id)
+                            .await
+                        {
+                            Ok(rows) => {
+                                for row in rows {
+                                    if let Err(e) = self
+                                        .session
+                                        .db
+                                        .mark_task_delegation_child_delivered(
+                                            &task_call_id,
+                                            &row.label,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(error = %e, task_call_id, label = %row.label, "mark failed inline batch delegation delivered failed");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, task_call_id, "load failed inline batch delegation rows failed");
+                            }
+                        }
                         Ok(NoninteractiveCompletionDelivery::Inline(
                             crate::engine::message::synthetic_tool_result_message_with_provider_identity(
                                 task_call_id,
@@ -3678,7 +3734,13 @@ impl Driver {
         }
     }
 
-    pub(in crate::engine::driver) async fn record_background_noninteractive_error(
+    /// Settle every still-live child of `task_call_id` to `Failed` in the DB
+    /// and the in-memory registry, with `body` as the failure report. Called
+    /// when a delegation's spawned task itself returned `Err` (so no child was
+    /// `complete()`d), for BOTH backgrounded and inline delegations — otherwise
+    /// an inline runtime failure would leave the child stuck `Running`, and
+    /// `task.control` would report a dead child as running.
+    pub(in crate::engine::driver) async fn settle_live_noninteractive_children_failed(
         &mut self,
         task_call_id: &str,
         body: &str,
@@ -6615,7 +6677,7 @@ async fn complete_noninteractive_late_steer_continuation(
 /// accepted steer.  Accepted rows are intentionally no-redelivery durable
 /// checkpoints, so this helper only reports the runtime outcome to the
 /// session worker; it never releases or terminalizes those rows.
-fn retain_noninteractive_late_steer_checkpoint(
+pub(in crate::engine::driver) fn retain_noninteractive_late_steer_checkpoint(
     claimed: &[crate::db::agent_tree_decisions::LateUserDecisionSteer],
     externally_claimed: Vec<NoninteractiveLateSteerAck>,
     outcome: crate::engine::driver::LateUserSteerContinuationOutcome,
@@ -6746,7 +6808,7 @@ pub(crate) struct NoninteractiveOutcome {
 /// records the one tool result that has not yet been injected because the
 /// parent is waiting on its exact recursive executor set.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct NoninteractiveRecoverySnapshot {
+pub(in crate::engine::driver) struct NoninteractiveRecoverySnapshot {
     version: u8,
     history: Vec<Message>,
     #[serde(default)]
@@ -6756,7 +6818,7 @@ struct NoninteractiveRecoverySnapshot {
     /// state, never wire/UI content; a recovered executor uses it to restore
     /// the same permit without injecting the user payload again.
     #[serde(default)]
-    late_user_steer_continuation_id: Option<uuid::Uuid>,
+    pub(in crate::engine::driver) late_user_steer_continuation_id: Option<uuid::Uuid>,
     #[serde(default)]
     pending_recursive: Option<PendingRecursiveContinuation>,
 }
@@ -6898,7 +6960,7 @@ fn ready_noninteractive_recovery_snapshot(
     ready_noninteractive_recovery_snapshot_with_late_steer(history, next_prompt, None)
 }
 
-fn ready_noninteractive_recovery_snapshot_with_late_steer(
+pub(in crate::engine::driver) fn ready_noninteractive_recovery_snapshot_with_late_steer(
     history: Vec<Message>,
     next_prompt: Message,
     late_user_steer_continuation_id: Option<uuid::Uuid>,
@@ -6942,7 +7004,7 @@ fn waiting_recursive_recovery_snapshot(
     .context("serializing waiting recursive recovery snapshot")
 }
 
-fn parse_noninteractive_recovery_snapshot(
+pub(in crate::engine::driver) fn parse_noninteractive_recovery_snapshot(
     raw: &str,
 ) -> Result<NoninteractiveRecoverySnapshot> {
     let snapshot: serde_json::Value =
@@ -7501,7 +7563,7 @@ async fn recover_pending_recursive_continuation(
                 tandem,
                 event_tx,
                 endpoint_collector,
-                activation_gate,
+                activation_gate.clone(),
                 Some(start_gate),
             ))
             .await
@@ -7731,6 +7793,7 @@ async fn replay_parked_interrupt_in_noninteractive_executor(
         cancel: tokio_util::sync::CancellationToken::new(),
         shutdown_gate: agent.model.shutdown_gate(),
         approver: approver.clone(),
+        image_generation_dispatch: None,
         deferred_log,
         root_agent_frame: false,
         skill_write_origin: payload.resume.call_origin,
@@ -7833,9 +7896,9 @@ pub(crate) async fn run_noninteractive_resumable(
     tandem: Option<crate::engine::schedule::TandemSet>,
     event_tx: Option<mpsc::Sender<TurnEvent>>,
     steer_target: Option<NoninteractiveSteerTarget>,
-    /// Used only while reattaching a durable executor. The mailbox is handed
-    /// directly to the owning worker after its normal lifecycle registration
-    /// has been accepted, avoiding a polling race with the event forwarder.
+    // Used only while reattaching a durable executor. The mailbox is handed
+    // directly to the owning worker after its normal lifecycle registration
+    // has been accepted, avoiding a polling race with the event forwarder.
     endpoint_ready: Option<
         tokio::sync::oneshot::Sender<
             std::result::Result<
@@ -8848,7 +8911,7 @@ pub(crate) async fn run_noninteractive_resumable(
             backup_model.as_ref(),
             &fallback_models,
             &mut history,
-            next_prompt,
+            next_prompt.clone(),
             session.clone(),
             locks.clone(),
             redact.clone(),
@@ -9207,16 +9270,23 @@ pub(crate) async fn run_noninteractive_resumable(
                                 Vec::new(),
                                 Message::user(&prompt),
                             );
-                            let descriptors = launch_json
-                                .zip(snapshot_json)
-                                .map(|(launch_json, snapshot_json)| {
-                                    Ok::<_, anyhow::Error>((
-                                        validated_recursive_noninteractive_snapshot(&waiting_snapshot)?,
-                                        validated_recursive_noninteractive_launch(&launch_json)?,
-                                        validated_recursive_noninteractive_snapshot(&snapshot_json)?,
-                                    ))
-                                })
-                                .transpose();
+                            let descriptors = match (launch_json, snapshot_json) {
+                                (Ok(launch_json), Ok(snapshot_json)) => Some(
+                                    validated_recursive_noninteractive_snapshot(&waiting_snapshot)
+                                        .and_then(|parent_snapshot| {
+                                            validated_recursive_noninteractive_launch(&launch_json)
+                                                .and_then(|launch| {
+                                                    validated_recursive_noninteractive_snapshot(
+                                                        &snapshot_json,
+                                                    )
+                                                    .map(|snapshot| {
+                                                        (parent_snapshot, launch, snapshot)
+                                                    })
+                                                })
+                                        }),
+                                ),
+                                _ => None,
+                            };
                             match descriptors {
                                 Some(Ok((parent_snapshot, launch, snapshot))) => match session
                                     .db

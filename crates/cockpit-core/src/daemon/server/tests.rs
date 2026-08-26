@@ -14580,6 +14580,7 @@ async fn attached_state_with_worker_receiver(
         .to_string_lossy()
         .into_owned();
     let project_root = project_root.to_str().unwrap().to_string();
+    let session_project_root = project_root.clone();
     let session_row = ctx
         .db
         .write(move |conn| {
@@ -14590,7 +14591,7 @@ async fn attached_state_with_worker_receiver(
                 chrono::Utc::now().timestamp(),
             )?;
             let mut row =
-                crate::db::Db::build_new_session_row_conn(conn, "p", &project_root, "Build")?;
+                crate::db::Db::build_new_session_row_conn(conn, "p", &session_project_root, "Build")?;
             let selection = stub_active_model_ref();
             row.provider = Some(selection.provider.clone());
             row.model = Some(selection.model.clone());
@@ -20528,6 +20529,7 @@ async fn live_worker_with_receiver(
         .to_string_lossy()
         .into_owned();
     let project_root = project_root.to_str().unwrap().to_string();
+    let session_project_root = project_root.clone();
     let row = ctx
         .db
         .write(move |conn| {
@@ -20538,7 +20540,7 @@ async fn live_worker_with_receiver(
                 chrono::Utc::now().timestamp(),
             )?;
             let mut row =
-                crate::db::Db::build_new_session_row_conn(conn, "p", &project_root, "Build")?;
+                crate::db::Db::build_new_session_row_conn(conn, "p", &session_project_root, "Build")?;
             let selection = stub_active_model_ref();
             row.provider = Some(selection.provider.clone());
             row.model = Some(selection.model.clone());
@@ -28647,7 +28649,7 @@ async fn set_model_favorite_writes_global_retained_source_and_is_idempotent() {
     .expect("global retained favorite update succeeds");
     assert!(matches!(response, Response::Ack));
     refresh.await.unwrap();
-    assert!(crate::config::providers::ConfigDoc::providers_from_paths(&[global_config])
+    assert!(crate::config::providers::ConfigDoc::providers_from_paths(&[global_config.clone()])
         .providers["global"]
         .models[0]
         .favorite);
@@ -29259,7 +29261,7 @@ async fn modes_session_setup_set_default_model_keeps_retained_explicit_target_af
     assert_eq!(active_a.provider, "p");
     assert_eq!(active_a.model, "a");
     assert!(
-        crate::config::providers::ConfigDoc::providers_from_paths(&[config_b])
+        crate::config::providers::ConfigDoc::providers_from_paths(&[config_b.clone()])
             .active_model
             .is_none(),
         "post-attach B must receive neither a config write nor an effective default"
@@ -29504,7 +29506,12 @@ async fn modes_session_setup_set_default_model_receipt_binds_authority_before_po
     let conflict = handle_request(
         Request::SetDefaultModel {
             default_update_id: Uuid::new_v4(),
-            ..request.clone()
+            provider: Some("p".to_owned()),
+            model: Some("a".to_owned()),
+            reasoning_effort: None,
+            thinking_mode: None,
+            prompt_cache_retention: None,
+            clear: false,
         },
         &mut state,
         &ctx,
@@ -33642,7 +33649,8 @@ async fn modes_session_setup_dispatch_never_rereads_workspace_config_after_swap_
         "failed capability refresh must retain the last-good generation"
     );
     assert_eq!(
-        after_failed_refresh.providers, before_failed_refresh.providers,
+        serde_json::to_value(&after_failed_refresh.providers).unwrap(),
+        serde_json::to_value(&before_failed_refresh.providers).unwrap(),
         "replacement provider config must not poison the worker snapshot"
     );
     std::fs::rename(&workspace, &replacement).unwrap();
@@ -33780,8 +33788,8 @@ async fn modes_session_setup_endpoint_keeps_last_good_config_then_refreshes_dura
         "failed refresh must retain the last-good generation"
     );
     assert_eq!(
-        handle.config_snapshot().providers,
-        before_failed_refresh.providers,
+        serde_json::to_value(&handle.config_snapshot().providers).unwrap(),
+        serde_json::to_value(&before_failed_refresh.providers).unwrap(),
         "failed refresh must retain the last-good provider authority"
     );
 

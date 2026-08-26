@@ -810,6 +810,7 @@ impl AgentRunner {
                     target,
                     cancel_outgoing_turn_after_attach,
                     current_client,
+                    session_id_state,
                     last_applied_seq,
                     endpoint,
                     input_tx,
@@ -839,6 +840,7 @@ impl AgentRunner {
             let mut outcome = switch_session_inner(
                 current_client,
                 attach_context,
+                session_id_state,
                 endpoint,
                 target,
                 cancel_outgoing_turn_after_attach,
@@ -1878,6 +1880,7 @@ fn should_refresh_skill_inventory(event: &proto::Event) -> bool {
 async fn switch_session_inner(
     current_client: Arc<RwLock<DaemonClient>>,
     attach_context: Arc<RwLock<AttachRequestContext>>,
+    session_id_state: Arc<Mutex<Uuid>>,
     endpoint: ClientEndpoint,
     target: SessionTarget,
     cancel_outgoing_turn_after_attach: bool,
@@ -2153,7 +2156,16 @@ pub async fn try_spawn(
     lifecycle: LifecycleClient,
     intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, None, None, no_sandbox, lifecycle, intent).await
+    try_spawn_inner(
+        cwd,
+        None,
+        None,
+        Some(proto::SessionEntryMode::Code),
+        no_sandbox,
+        lifecycle,
+        intent,
+    )
+    .await
 }
 
 /// Attach a fresh or model-less existing session seeded with the complete
@@ -2167,10 +2179,34 @@ pub async fn try_spawn_with_model(
     lifecycle: LifecycleClient,
     intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
+    try_spawn_with_model_and_entry_mode(
+        cwd,
+        session_id,
+        initial_model,
+        no_sandbox,
+        lifecycle,
+        intent,
+        session_id.is_none().then_some(proto::SessionEntryMode::Code),
+    )
+    .await
+}
+
+/// Same as [`try_spawn_with_model`], but the caller supplies the new-session
+/// entry mode. Resume/existing attaches must pass `None`.
+pub async fn try_spawn_with_model_and_entry_mode(
+    cwd: &Path,
+    session_id: Option<uuid::Uuid>,
+    initial_model: cockpit_config::providers::ActiveModelRef,
+    no_sandbox: bool,
+    lifecycle: LifecycleClient,
+    intent: LifecycleIntent,
+    requested_session_entry_mode: Option<proto::SessionEntryMode>,
+) -> Result<AgentRunner, String> {
     try_spawn_inner(
         cwd,
         session_id,
         Some(initial_model),
+        requested_session_entry_mode,
         no_sandbox,
         lifecycle,
         intent,
@@ -2191,13 +2227,23 @@ pub async fn attach_to_session(
     lifecycle: LifecycleClient,
     intent: LifecycleIntent,
 ) -> Result<AgentRunner, String> {
-    try_spawn_inner(cwd, Some(session_id), None, no_sandbox, lifecycle, intent).await
+    try_spawn_inner(
+        cwd,
+        Some(session_id),
+        None,
+        None,
+        no_sandbox,
+        lifecycle,
+        intent,
+    )
+    .await
 }
 
 async fn try_spawn_inner(
     cwd: &Path,
     session_id: Option<uuid::Uuid>,
     initial_model: Option<cockpit_config::providers::ActiveModelRef>,
+    requested_session_entry_mode: Option<proto::SessionEntryMode>,
     no_sandbox: bool,
     lifecycle: LifecycleClient,
     intent: LifecycleIntent,
@@ -4622,6 +4668,7 @@ mod tests {
                 0x89, b'P', b'N', b'G', 0, 1, 2, 3,
             ])],
             forced_skill: Some("review".to_string()),
+            ..Default::default()
         }
     }
 

@@ -269,6 +269,10 @@ impl AuthorizedWorkspaceRoot {
         &self.canonical_path
     }
 
+    pub(crate) fn read_regular_file_relative(&self, components: &[&str]) -> Result<Vec<u8>> {
+        self.held_directory.read_regular_file_relative(components)
+    }
+
     pub fn verify(&self, path: &Path) -> Result<PathBuf> {
         let observed = Self::capture(path)?;
         ensure!(
@@ -1365,7 +1369,12 @@ impl WorkerWorkspaceConfigAuthority {
                         authority
                     }
                 };
-                hook.bind_retained_execution_authority(Arc::clone(&authority))
+                hook.bind_retained_execution_authority(
+                    Arc::clone(&authority)
+                        as Arc<
+                            dyn cockpit_config::config::extended::hooks::RetainedHookExecutionAuthority,
+                        >,
+                )
                     .map_err(anyhow::Error::msg)?;
                 // Snapshot the source program while its whole retained source
                 // chain is still verified. Windows deliberately stops here:
@@ -6807,8 +6816,8 @@ pub(crate) mod session_setup_test_support {
                     project_id: "session-setup-fixture-project".into(),
                     project_root: workspace.to_string_lossy().into_owned(),
                     active_agent: "reviewer".into(),
-                    started_at_unix_s: 4,
-                    last_active_at_unix_s: 4,
+                    started_at_unix_ms: 4,
+                    last_active_at_unix_ms: 4,
                 },
                 existing_session_claim_token: None,
                 idempotency_key: "session-setup-fixture-prepare".into(),
@@ -8607,7 +8616,10 @@ mod tests {
             &ignored_chain.layers,
         )
         .expect("global-only provider view");
-        assert_eq!(ignored_providers.providers["p"].models[0].name, "global");
+        assert_eq!(
+            ignored_providers.providers["p"].models[0].name.as_deref(),
+            Some("global")
+        );
         let (_, ignored_extended) = source
             .load_effective_for_daemon_with_retained_workspace_layer(
                 workspace.path(),
@@ -8654,7 +8666,10 @@ mod tests {
             &trusted_again.layers,
         )
         .expect("restored provider view");
-        assert_eq!(providers_again.providers["p"].models[0].name, "project");
+        assert_eq!(
+            providers_again.providers["p"].models[0].name.as_deref(),
+            Some("project")
+        );
         assert!(authority
             .resolve_hooks_for_policy(&trusted)
             .expect("restored project hooks")
@@ -10588,20 +10603,22 @@ mod tests {
     fn modes_session_setup_scope_collisions_remain_distinct_and_revision_is_deterministic() {
         let id_a = Uuid::new_v4();
         let id_b = Uuid::new_v4();
-        let candidate = |installation_id, scope| SessionSetupAgentCandidateV1 {
-            installation: AgentInstallationRecordV1 {
-                installation_id: installation_id.to_string(),
-                scope,
-                source_agent_id: "authored/reviewer".into(),
-                source_identity: "publisher/repository:agents/reviewer.md".into(),
-                source_revision: Some("a".repeat(40)),
-                source_digest: "b".repeat(64),
-                installation_revision: 3,
-                bindings: Vec::new(),
-            },
-            selected: installation_id == id_b,
-            slots: Vec::new(),
-            locked_reason: None,
+        let candidate = |installation_id: Uuid, scope: AgentInstallationScopeWire| {
+            SessionSetupAgentCandidateV1 {
+                installation: AgentInstallationRecordV1 {
+                    installation_id: installation_id.to_string(),
+                    scope,
+                    source_agent_id: "authored/reviewer".into(),
+                    source_identity: "publisher/repository:agents/reviewer.md".into(),
+                    source_revision: Some("a".repeat(40)),
+                    source_digest: "b".repeat(64),
+                    installation_revision: 3,
+                    bindings: Vec::new(),
+                },
+                selected: installation_id == id_b,
+                slots: Vec::new(),
+                locked_reason: None,
+            }
         };
         let candidates = vec![
             candidate(id_a, AgentInstallationScopeWire::Global),

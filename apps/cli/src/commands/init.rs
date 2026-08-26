@@ -59,13 +59,16 @@ pub async fn run(args: InitArgs, no_sandbox: bool) -> Result<()> {
     };
     eprintln!("Exploring the project and writing `{shown}`…");
     let exit_code = crate::daemon::client::run_owned_daemon(mode_lc, |client| {
-        Box::pin(crate::commands::run::attach_send_pump(
-            &client,
-            prompt,
-            no_sandbox,
-            crate::cli::OutputFormat::Default,
-            crate::commands::run::RunPumpOptions::default(),
-        ))
+        Box::pin(async move {
+            crate::commands::run::attach_send_pump(
+                &client,
+                prompt,
+                no_sandbox,
+                crate::cli::OutputFormat::Default,
+                crate::commands::run::RunPumpOptions::default(),
+            )
+            .await
+        })
     })
     .await?;
     if exit_code != 0 {

@@ -248,7 +248,7 @@ fn tui_config_count_stable_across_interactions() {
     reset_config_counters();
 
     // attach: apply a pushed snapshot.
-    app.apply_event(cockpit_core::engine::TurnEvent::ConfigSnapshot {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ConfigSnapshot {
         snapshot: Box::new(pushed),
     });
     // /model change: apply an active-model state.
@@ -265,7 +265,7 @@ fn tui_config_count_stable_across_interactions() {
         1,
     );
     // turn-event application: a foreground-target event re-runs skill discovery.
-    app.apply_event(cockpit_core::engine::TurnEvent::ForegroundInputTarget {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ForegroundInputTarget {
         target: cockpit_proto::QueueTarget::root("Build"),
     });
     // /settings close and /new both funnel through `resync`; attached, it must
@@ -299,7 +299,7 @@ fn attach_seeds_tui_config_snapshot() {
     );
 
     let snapshot = snapshot_from_tree(tmp.path(), 7);
-    app.apply_event(cockpit_core::engine::TurnEvent::ConfigSnapshot {
+    app.apply_event(cockpit_client::presentation::TurnEvent::ConfigSnapshot {
         snapshot: Box::new(snapshot),
     });
 
@@ -411,7 +411,7 @@ fn assert_config_epoch_reset_accepts_authoritative_zero(path: ConfigEpochPath) {
         }
         ConfigEpochPath::SameSessionReconnect => {
             app.agent_runner = Some(Ok(stub_runner()));
-            app.apply_event(cockpit_core::engine::TurnEvent::DaemonLinkReconnected {
+            app.apply_event(cockpit_client::presentation::TurnEvent::DaemonLinkReconnected {
                 active_model_state: None,
             });
         }

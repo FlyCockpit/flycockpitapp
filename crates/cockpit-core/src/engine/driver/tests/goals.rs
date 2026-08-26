@@ -1168,6 +1168,64 @@ async fn maybe_start_goal_supervision_round_leases_control_job() {
     assert_eq!(round.jobs.len(), 1);
 }
 
+/// Regression: when the swarm authority REFUSES the planner spawn (here: a full
+/// swarm queue), goal supervision must not wedge. A refused spawn registers no
+/// swarm and emits no `Completed`, so counting it into the round would leave
+/// the round waiting forever. The round must retire (become `None`) instead.
+#[tokio::test]
+async fn refused_goal_supervision_spawn_does_not_wedge_round() {
+    let (mut driver, _tmp) = test_driver_without_network(1);
+    driver.schedule.set_swarm_max_concurrency(1);
+    // Occupy the single slot, then fill the swarm queue so any further spawn is
+    // refused with "queue is full".
+    for i in 0..(crate::engine::schedule::authority::MAX_SWARM_QUEUE_LEN + 1) {
+        driver
+            .schedule
+            .spawn_swarm(crate::engine::schedule::authority::SpawnSpec {
+                job_id: Some(format!("filler-{i}")),
+                goal_provenance: None,
+                worker: crate::engine::schedule::authority::SpawnWorkerKind::Bee,
+                prompt: "fill the swarm queue".into(),
+                write_scope: "/tmp/unused-goal-slot".into(),
+                model: None,
+                model_origin: crate::engine::schedule::authority::SpawnModelOrigin::HostConfig,
+                depth: 0,
+                max_depth: 0,
+            });
+    }
+    let goal = driver
+        .session
+        .db
+        .create_session_goal(
+            driver.session.id,
+            &driver.session.project_id,
+            "planner spawn will be refused",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(goal_control_job_state(&driver, goal.id).await, "pending");
+
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+    driver
+        .maybe_start_goal_supervision_round(&goal, &tx)
+        .await
+        .unwrap();
+
+    // The planner spawn was refused, so it is not tracked and the round retires
+    // rather than waiting forever on a job that will never complete.
+    assert!(
+        driver.goal_supervision_round.is_none(),
+        "refused spawn must not leave a wedged round"
+    );
+    // An all-refused round emits no supervision progress.
+    assert!(
+        rx.try_recv().is_err(),
+        "all-refused round should emit no supervision progress"
+    );
+}
+
 /// Finishing the leased planner through `handle_goal_supervision_completion`
 /// must write the resulting disposition/phase and mark the job row terminal.
 /// Calling `Db::finish_goal_control_job` directly would leave this green

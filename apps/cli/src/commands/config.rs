@@ -1,6 +1,4 @@
-#[cfg(feature = "extended")]
-use anyhow::bail;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 #[cfg(feature = "extended")]
 use crate::cli::ImageSpendArgs;

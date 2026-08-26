@@ -62,8 +62,8 @@ pub use backup::{
     suggested_action_for_failure_class, turn_with_backup,
 };
 pub use events::{
-    AgentTreeExecutorRequest, ControlRequestId, ControlRequestNotDelivered,
-    ControlRequestOutcome, IdleReason, ToolProgress, TurnEvent,
+    AgentTreeExecutorRequest, AgentTreeResolverRequest, ControlRequestId,
+    ControlRequestNotDelivered, ControlRequestOutcome, IdleReason, ToolProgress, TurnEvent,
 };
 pub(crate) use events::{
     AgentTreeEndpointGeneration, next_agent_tree_endpoint_generation,

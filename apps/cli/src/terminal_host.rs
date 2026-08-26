@@ -1786,11 +1786,11 @@ fn reserve_input_locked(state: &TerminalState, bytes: Vec<u8>) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("terminal input queue rejected frame: {error}"))
 }
 
-fn bracketed_paste_bytes(text: &str) -> Vec<u8> {
+fn bracketed_paste_bytes(text: &[u8]) -> Vec<u8> {
     let mut out =
         Vec::with_capacity(BRACKETED_PASTE_START.len() + text.len() + BRACKETED_PASTE_END.len());
     out.extend_from_slice(BRACKETED_PASTE_START);
-    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(text);
     out.extend_from_slice(BRACKETED_PASTE_END);
     out
 }
@@ -2894,7 +2894,7 @@ mod tests {
     #[test]
     fn bracketed_paste_wraps_path() {
         assert_eq!(
-            bracketed_paste_bytes("/tmp/img.png"),
+            bracketed_paste_bytes(b"/tmp/img.png"),
             b"\x1b[200~/tmp/img.png\x1b[201~".to_vec()
         );
     }
@@ -3039,8 +3039,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn terminal_ingress_general_agent_integration() {
+        // Pin the child to POSIX sh. `$SHELL` on developer/CI hosts is often
+        // interactive zsh/bash; under suite load those shells flush type-ahead
+        // and can echo a quote-joined `printf 'RDY_''SENTINEL'` as the
+        // contiguous sentinel before `stty` applies, so ESC arrives as `^[`.
+        let env = crate::test_env::lock();
+        env.set_var("SHELL", "/bin/sh");
         for echo in [false, true] {
-            let (tx, mut rx) = broadcast::channel(4096);
+            let (tx, mut rx) = broadcast::channel(64 * 1024);
             let tmp = tempfile::tempdir().unwrap();
             let host = TerminalHost::new_for_test(tx, tmp.path().join("terms"));
             let Response::TerminalOpened {
@@ -3059,21 +3065,21 @@ mod tests {
             // ingress_finish is surfaced on the host's outbound event stream.
             //
             // Two subtleties, both handled below:
-            //  * The readiness sentinel is quote-split in the setup command
-            //    (`RDY_''SENTINEL_7f3`) so the shell echoing the typed command
-            //    line — which happens before `stty` disables echo — cannot
-            //    contain the sentinel contiguously; only the executed `printf`
-            //    output does. We therefore wait for the EXECUTED sentinel, not
-            //    the shell's command echo.
+            //  * The readiness sentinel is assembled by `printf '%s%s'` from
+            //    two arguments so the shell echoing the typed command line —
+            //    which happens before `stty` disables echo — cannot contain
+            //    the sentinel contiguously; only the executed `printf` output
+            //    does. We therefore wait for the EXECUTED sentinel, not the
+            //    shell's command echo.
             //  * An interactive shell flushes type-ahead while it initialises,
             //    which can silently discard a command sent too early. So we
             //    re-send (prefixed with a kill-line and terminated with CR, the
             //    real Enter key) until the executed sentinel actually appears.
             let sentinel: &[u8] = b"RDY_SENTINEL_7f3";
             let setup: &[u8] = if echo {
-                b"\x15stty -icanon echo -echoctl min 1 time 0; printf 'RDY_''SENTINEL_7f3'; exec sleep 30\r"
+                b"\x15stty -icanon echo -echoctl min 1 time 0; printf '%s%s' RDY_ SENTINEL_7f3; exec sleep 30\r"
             } else {
-                b"\x15stty raw -echo; printf 'RDY_''SENTINEL_7f3'; exec cat\r"
+                b"\x15stty raw -echo -echoctl; printf '%s%s' RDY_ SENTINEL_7f3; exec cat\r"
             };
             let ready_deadline = Instant::now() + Duration::from_secs(20);
             let mut ready = false;
@@ -3230,7 +3236,11 @@ mod tests {
             );
         }
         let exact =
-            bracketed_paste_bytes(&shell_path_literal(path, IngressShellDialect::Posix).unwrap());
+            bracketed_paste_bytes(
+                shell_path_literal(path, IngressShellDialect::Posix)
+                    .unwrap()
+                    .as_bytes(),
+            );
         assert!(exact.starts_with(BRACKETED_PASTE_START));
         assert!(exact.ends_with(BRACKETED_PASTE_END));
         assert!(!exact.ends_with(b"\n"));

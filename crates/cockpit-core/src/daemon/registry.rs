@@ -31,7 +31,7 @@ use crate::config::trust::{
     resolve_workspace_trust_policy_with_revision_from_db,
 };
 use crate::daemon::EventSender;
-use crate::daemon::server::dispatch::CONFIG_PUBLICATION_RPC_LOCK;
+use crate::daemon::server::CONFIG_PUBLICATION_RPC_LOCK;
 use crate::daemon::session_worker::{self, SessionWorkerHandle};
 use crate::daemon::shutdown::ShutdownSignal;
 use crate::db::Db;
@@ -1214,6 +1214,7 @@ impl SessionRegistry {
             );
         }
         let active = initial_model
+            .clone()
             .or_else(|| model_override.cloned())
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new session")?;
@@ -1347,6 +1348,7 @@ impl SessionRegistry {
         let mut hooks = workspace_root_authority.resolve_hooks_for_policy(&trust_policy)?;
         let config_watch_paths = workspace_root_authority.config_watch_paths();
         let active = initial_model
+            .clone()
             .or_else(|| providers_cfg.active_model.clone())
             .context("no model selected for the new assistant session")?;
         let mut session = Session::create_assistant_deferred(
@@ -2999,7 +3001,6 @@ mod tests {
                     crate::env_snapshot::EnvSnapshotSource::DaemonStart,
                     Default::default(),
                 ),
-                proto::SessionEntryMode::Code,
             )
             .await
             .err()
@@ -3013,7 +3014,7 @@ mod tests {
         let session = test_session(&reg);
         let id = session.id;
         let handle = test_handle(&reg, session);
-        reg.insert_test_worker_without_join(handle);
+        let generation = reg.insert_test_worker_without_join(handle);
         let config_watcher = tokio::spawn(std::future::pending::<()>());
         let abort_handle = config_watcher.abort_handle();
         let join = tokio::spawn(async {});

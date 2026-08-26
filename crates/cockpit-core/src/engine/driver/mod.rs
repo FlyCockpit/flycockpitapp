@@ -15,6 +15,11 @@ mod context_reduction;
 mod delegation_helpers;
 mod inbound;
 mod noninteractive;
+#[cfg(test)]
+pub(in crate::engine::driver) use noninteractive::{
+    parse_noninteractive_recovery_snapshot, ready_noninteractive_recovery_snapshot_with_late_steer,
+    retain_noninteractive_late_steer_checkpoint,
+};
 mod queue;
 mod reports;
 mod schedule_dispatch;
@@ -3263,7 +3268,7 @@ impl Driver {
                 .is_none(),
             "root already has a recovered accepted late-steer checkpoint"
         );
-        {
+        let endpoint_generation = {
             let root = self
                 .stack
                 .first_mut()
@@ -3273,7 +3278,15 @@ impl Driver {
                 "recovered root late-steer snapshot does not match the live root identity"
             );
             root.history = history;
-        }
+            match root.endpoint_generation {
+                Some(generation) => generation,
+                None => {
+                    let generation = crate::engine::agent::next_agent_tree_endpoint_generation();
+                    root.endpoint_generation = Some(generation);
+                    generation
+                }
+            }
+        };
         self.recovered_interactive_late_steer_continuations.insert(
             agent_instance_id,
             RecoveredInteractiveLateSteerContinuation {
@@ -3289,7 +3302,7 @@ impl Driver {
                 pending_response: None,
             },
         );
-        Ok(())
+        Ok(endpoint_generation)
     }
 
     async fn reattach_interactive_task_child(
@@ -3297,7 +3310,7 @@ impl Driver {
         recovery: RecoveredInteractiveTaskChild,
         input_queue: &crate::engine::message::UserSubmissionQueue,
         tx: &mpsc::Sender<TurnEvent>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::engine::agent::AgentTreeEndpointGeneration> {
         anyhow::ensure!(
             self.stack
                 .last()
@@ -3457,7 +3470,7 @@ impl Driver {
                     )
             });
         let child_recursion = self
-            .resolve_task_recursion(&recovery.child_agent, remaining_depth, &model)
+            .resolve_task_recursion(&recovery.child_agent, Some(remaining_depth), &model)
             .map_err(anyhow::Error::msg)?;
         let mut admission = self
             .admit_current_vnext_children(1)
@@ -5425,18 +5438,44 @@ impl Driver {
                 .role(scratch_role)?
                 .display()
                 .to_string();
-            self.schedule
-                .spawn_swarm(crate::engine::schedule::authority::SpawnSpec {
-                    job_id: Some(job_id.clone()),
-                    goal_provenance: Some((job.goal_id, job.attempt_generation)),
-                    worker,
-                    prompt: job.request_json.clone(),
-                    write_scope,
-                    model,
-                    model_origin: crate::engine::schedule::authority::SpawnModelOrigin::HostConfig,
-                    depth: 0,
-                    max_depth: 0,
-                });
+            let spawn_result =
+                self.schedule
+                    .spawn_swarm(crate::engine::schedule::authority::SpawnSpec {
+                        job_id: Some(job_id.clone()),
+                        goal_provenance: Some((job.goal_id, job.attempt_generation)),
+                        worker,
+                        prompt: job.request_json.clone(),
+                        write_scope,
+                        model,
+                        model_origin:
+                            crate::engine::schedule::authority::SpawnModelOrigin::HostConfig,
+                        depth: 0,
+                        max_depth: 0,
+                    });
+            // A refused spawn (oversized prompt or a full swarm queue) registers
+            // no job and will emit no `Completed`. Counting it into the round
+            // would wedge goal supervision permanently, since the round only
+            // retires once its job set empties. Skip it and surface the refusal.
+            // The control job stays `leased` — so a Verifying panel's
+            // terminal-verdict gate (which counts pending+leased panelists) still
+            // correctly blocks on it rather than resolving a verdict short a
+            // panelist — and is re-leased after its 300s TTL on a later
+            // supervision round. This downgrades the former permanent wedge to a
+            // soft stall that self-heals the next time the goal loop wakes (a
+            // full queue drains and each completion wakes it; an oversized prompt
+            // is a logged user error). `queued`/`scheduled` spawns DO run and
+            // emit `Completed`, so they are still tracked. Deliberately NOT
+            // finished-as-failed here: `finish_goal_control_job(Err)` coerces a
+            // panelist to a fabricated `Refute`/pauses the goal on a transient
+            // full queue.
+            if let Some(refusal) = spawn_result.strip_prefix("refused:") {
+                tracing::warn!(
+                    job_id = %job_id,
+                    reason = refusal.trim(),
+                    "goal-supervision swarm spawn refused; not tracking it in this round"
+                );
+                continue;
+            }
             let round = self
                 .goal_supervision_round
                 .as_mut()

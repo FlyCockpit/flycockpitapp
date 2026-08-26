@@ -1,5 +1,5 @@
 use super::{App, Overlay, ToastKind};
-use cockpit_core::engine::TurnEvent;
+use cockpit_client::presentation::TurnEvent;
 use cockpit_proto::{
     InterruptOption, InterruptQuestion, InterruptQuestionSet, InterruptRaiseReason,
 };

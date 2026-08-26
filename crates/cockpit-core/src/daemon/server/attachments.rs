@@ -33,7 +33,7 @@ pub(super) async fn admit_image_ingress(
         return Err(bad_request("image ingress session mismatch"));
     }
     let root = attached.handle.project_root.clone();
-    let trust = attached.handle.trust_policy.clone();
+    let trust = attached.handle.current_trust_policy();
     let project_id = attached.handle.project_id();
     let project_text = root
         .to_str()

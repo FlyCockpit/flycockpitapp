@@ -1,5 +1,6 @@
 use super::{App, WorkingSpanState};
-use cockpit_core::engine::{IdleReason, TurnEvent};
+use cockpit_client::presentation::TurnEvent;
+use cockpit_proto::IdleReason;
 
 fn app() -> App {
     let tmp = tempfile::tempdir().unwrap();

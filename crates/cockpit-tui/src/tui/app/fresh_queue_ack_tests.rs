@@ -1,6 +1,6 @@
 use super::{App, FreshQueueAck};
 use crate::tui::history::HistoryEntry;
-use cockpit_core::engine::TurnEvent;
+use cockpit_client::presentation::TurnEvent;
 use cockpit_core::engine::message::{QueueItemStatus, QueuedUserMessage};
 
 fn item(id: u128, text: &str) -> QueuedUserMessage {

@@ -773,6 +773,7 @@ async fn async_main(launch_start: Instant) -> anyhow::Result<()> {
         Some(Command::Daemon(sub)) => commands::daemon::run(sub).await,
         Some(Command::Doctor(args)) => commands::doctor::run(args, cli.no_sandbox).await,
         Some(Command::Session(sub)) => commands::session::run(sub).await,
+        #[cfg(feature = "extended")]
         Some(Command::Schedule(sub)) => commands::schedule::run(sub).await,
         Some(Command::Skill(sub)) => commands::skill::run(sub).await,
         Some(Command::Trust(sub)) => commands::trust::run(sub).await,

@@ -14,6 +14,9 @@ workspace = true
 # ledgers are excluded from the public local v0.1 dependency surface.
 default = []
 remote = []
+# Future local-only product domains that are deliberately outside the public
+# v0.1 schema: durable cron and image generation/spend ledgers.
+extended = []
 
 [dependencies]
 anyhow = { workspace = true }

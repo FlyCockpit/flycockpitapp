@@ -2733,6 +2733,38 @@ async fn handle_send_user_message_bulk(
     .await
 }
 
+fn require_compiled_product_domain(request: &Request) -> std::result::Result<(), ErrorPayload> {
+    #[cfg(feature = "extended")]
+    {
+        let _ = request;
+        Ok(())
+    }
+    #[cfg(not(feature = "extended"))]
+    {
+        let kind = principal::request_kind(request);
+        let deferred = kind.starts_with("image_")
+            || matches!(
+                kind,
+                "get_image_spend_policy"
+                    | "save_image_spend_policy"
+                    | "create_scheduled_job"
+                    | "list_scheduled_jobs"
+                    | "delete_scheduled_job"
+                    | "set_scheduled_job_enabled"
+                    | "run_scheduled_job"
+            );
+        if deferred {
+            return Err(ErrorPayload {
+                code: ErrorCode::BadRequest,
+                message: format!(
+                    "request `{kind}` requires the opt-in extended local capability profile"
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 pub(super) async fn handle_serialized_request(
     request: Request,
     state: &mut MutableClientState,
@@ -3795,6 +3827,7 @@ async fn handle_serialized_request_impl(
     effects: &mut ClientRequestEffects,
     #[cfg(feature = "remote")] remote_operation: Option<&super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    require_compiled_product_domain(&request)?;
     if ctx.redaction_publication_is_poisoned() {
         return Err(ErrorPayload {
             code: ErrorCode::Internal,
@@ -13262,6 +13295,7 @@ async fn handle_concurrent_request_impl(
     ctx: Arc<DaemonContext>,
     #[cfg(feature = "remote")] remote_operation: Option<super::RemoteOperationContext>,
 ) -> std::result::Result<Response, ErrorPayload> {
+    require_compiled_product_domain(&request)?;
     #[cfg(feature = "remote")]
     if let Some(operation) = &remote_operation {
         tracing::debug!(

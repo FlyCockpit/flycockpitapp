@@ -990,12 +990,17 @@ fn apply_connection_pragmas(conn: &Connection, on_disk: bool) -> Result<()> {
 struct Migration {
     name: &'static str,
     sql: &'static str,
+    deferred_sql: &'static str,
     extension_sql: &'static str,
 }
 
-#[cfg(feature = "remote")]
+#[cfg(all(feature = "remote", feature = "extended"))]
+const SCHEMA_PROFILE: &str = "remote-extended-v0.1";
+#[cfg(all(feature = "remote", not(feature = "extended")))]
 const SCHEMA_PROFILE: &str = "remote-v0.1";
-#[cfg(not(feature = "remote"))]
+#[cfg(all(not(feature = "remote"), feature = "extended"))]
+const SCHEMA_PROFILE: &str = "extended-local-v0.1";
+#[cfg(all(not(feature = "remote"), not(feature = "extended")))]
 const SCHEMA_PROFILE: &str = "local-v0.1";
 
 /// Stable diagnostic identifier for attempting to open one prerelease build
@@ -1015,6 +1020,10 @@ fn schema_profile_mismatch(database_profile: &str) -> anyhow::Error {
 const MIGRATIONS: &[Migration] = &[Migration {
     name: "0001_initial.sql",
     sql: include_str!("migrations/0001_initial.sql"),
+    #[cfg(not(feature = "extended"))]
+    deferred_sql: "",
+    #[cfg(feature = "extended")]
+    deferred_sql: include_str!("migrations/0001_extended_profile.sql"),
     #[cfg(not(feature = "remote"))]
     extension_sql: "",
     #[cfg(feature = "remote")]
@@ -1222,8 +1231,11 @@ fn migration_definition_hash(migration: &Migration) -> String {
     // Omitting the extension made two materially different schemas share a
     // migration checksum and allowed an edited profile extension to pass the
     // ledger check.
-    let mut definition = String::with_capacity(migration.sql.len() + migration.extension_sql.len());
+    let mut definition = String::with_capacity(
+        migration.sql.len() + migration.deferred_sql.len() + migration.extension_sql.len(),
+    );
     definition.push_str(migration.sql);
+    definition.push_str(migration.deferred_sql);
     definition.push_str(migration.extension_sql);
     migration_hash(&definition)
 }
@@ -1232,6 +1244,7 @@ fn compiled_expected_fingerprint(migrations: &[Migration]) -> Result<String> {
     let expected = Connection::open_in_memory().context("opening expected-schema database")?;
     for migration in migrations {
         expected.execute_batch(migration.sql)?;
+        expected.execute_batch(migration.deferred_sql)?;
         expected.execute_batch(migration.extension_sql)?;
     }
     expected.execute_batch(
@@ -1240,7 +1253,7 @@ fn compiled_expected_fingerprint(migrations: &[Migration]) -> Result<String> {
             name TEXT NOT NULL CHECK (length(name) > 0), \
             sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'), \
             schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64 AND schema_fingerprint = lower(schema_fingerprint) AND schema_fingerprint NOT GLOB '*[^0-9a-f]*'), \
-            schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'remote-v0.1')), \
+            schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'extended-local-v0.1', 'remote-v0.1', 'remote-extended-v0.1')), \
             applied_at TEXT NOT NULL\
         );",
     )?;
@@ -1407,7 +1420,7 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
                 name TEXT NOT NULL CHECK (length(name) > 0), \
                 sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 = lower(sha256) AND sha256 NOT GLOB '*[^0-9a-f]*'), \
                 schema_fingerprint TEXT NOT NULL CHECK (length(schema_fingerprint) = 64 AND schema_fingerprint = lower(schema_fingerprint) AND schema_fingerprint NOT GLOB '*[^0-9a-f]*'), \
-                schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'remote-v0.1')), \
+                schema_profile TEXT NOT NULL CHECK (schema_profile IN ('local-v0.1', 'extended-local-v0.1', 'remote-v0.1', 'remote-extended-v0.1')), \
                 applied_at TEXT NOT NULL\
             );",
         )
@@ -1426,6 +1439,10 @@ fn migrate_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
             }
             conn.execute_batch(migration.sql)
                 .with_context(|| format!("applying migration {version}"))?;
+            if !migration.deferred_sql.is_empty() {
+                conn.execute_batch(migration.deferred_sql)
+                    .with_context(|| format!("applying migration {version} deferred profile"))?;
+            }
             if !migration.extension_sql.is_empty() {
                 conn.execute_batch(migration.extension_sql)
                     .with_context(|| format!("applying migration {version} build profile"))?;
@@ -1626,6 +1643,7 @@ mod tests {
             .map(|(index, sql)| Migration {
                 name: NAMES[index],
                 sql,
+                deferred_sql: "",
                 extension_sql: "",
             })
             .collect::<Vec<_>>();

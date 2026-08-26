@@ -200,6 +200,7 @@ pub enum Command {
     Session(SessionCommand),
 
     /// Manage durable daemon scheduler jobs.
+    #[cfg(feature = "extended")]
     #[command(subcommand)]
     Schedule(ScheduleCommand),
 
@@ -496,6 +497,7 @@ pub struct SkillCuratorRollbackArgs {
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
     /// Show or save explicit image-generation spend policy.
+    #[cfg(feature = "extended")]
     #[command(name = "image-spend")]
     ImageSpend(ImageSpendArgs),
     /// Export portable provider/model policy JSON without credentials.
@@ -506,6 +508,7 @@ pub enum ConfigCommand {
     ImportPolicy(ConfigImportPolicyArgs),
 }
 
+#[cfg(feature = "extended")]
 #[derive(Debug, clap::Args)]
 pub struct ImageSpendArgs {
     /// Save the reviewed JSON policy from this file.

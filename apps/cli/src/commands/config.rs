@@ -1,15 +1,21 @@
-use anyhow::{Context, Result, bail};
+#[cfg(feature = "extended")]
+use anyhow::bail;
+use anyhow::{Context, Result};
 
-use crate::cli::{ConfigCommand, ConfigExportPolicyArgs, ConfigImportPolicyArgs, ImageSpendArgs};
+#[cfg(feature = "remote")]
+use crate::cli::ImageSpendArgs;
+use crate::cli::{ConfigCommand, ConfigExportPolicyArgs, ConfigImportPolicyArgs};
 
 pub async fn run(cmd: ConfigCommand) -> Result<()> {
     match cmd {
+        #[cfg(feature = "extended")]
         ConfigCommand::ImageSpend(args) => image_spend(args).await,
         ConfigCommand::ExportPolicy(args) => export_policy(args).await,
         ConfigCommand::ImportPolicy(args) => import_policy(args).await,
     }
 }
 
+#[cfg(feature = "extended")]
 async fn image_spend(args: ImageSpendArgs) -> Result<()> {
     let project_key = args
         .project_key

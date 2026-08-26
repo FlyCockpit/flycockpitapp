@@ -214,12 +214,14 @@ fn sql_table_objects(sql: &str) -> Vec<String> {
 fn assert_static_table_ownership(
     ownership: &BTreeMap<String, Ownership>,
     local_sql: &str,
+    extended_sql: &str,
     remote_sql: &str,
 ) {
     let local = sql_table_objects(local_sql);
+    let extended = sql_table_objects(extended_sql);
     let remote = sql_table_objects(remote_sql);
     let mut counts = BTreeMap::<String, usize>::new();
-    for table in local.iter().chain(&remote) {
+    for table in local.iter().chain(&extended).chain(&remote) {
         *counts.entry(table.clone()).or_default() += 1;
     }
     let duplicates = counts
@@ -239,19 +241,25 @@ fn assert_static_table_ownership(
     );
 
     let local = local.into_iter().collect::<BTreeSet<_>>();
+    let extended = extended.into_iter().collect::<BTreeSet<_>>();
     let remote = remote.into_iter().collect::<BTreeSet<_>>();
     assert!(
-        local.is_disjoint(&remote),
-        "local and remote SQL profiles must not declare the same table"
+        local.is_disjoint(&extended) && local.is_disjoint(&remote) && extended.is_disjoint(&remote),
+        "local, extended-local, and remote SQL profiles must have disjoint table ownership"
+    );
+    let classified_extended = ownership
+        .iter()
+        .filter_map(|(name, owner)| (owner.launch_profile == "deferred").then_some(name.clone()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        classified_extended, extended,
+        "extended-local SQL tables must be exactly the deferred classifications"
     );
     let classified_remote = ownership
         .iter()
-        .filter_map(|(name, owner)| (owner.status == "remove-from-v0.1").then_some(name.clone()))
+        .filter_map(|(name, owner)| (owner.launch_profile == "remote").then_some(name.clone()))
         .collect::<BTreeSet<_>>();
-    assert_eq!(
-        classified_remote, remote,
-        "remote-profile SQL tables must be exactly the remove-from-v0.1 classifications"
-    );
+    assert_eq!(classified_remote, remote);
     assert!(local.iter().all(|table| {
         ownership
             .get(table)
@@ -447,6 +455,7 @@ fn agent_mutation_recovery_is_hash_only_and_blocks_blind_restart_rejection() {
 #[derive(Debug)]
 struct Ownership {
     status: String,
+    launch_profile: String,
 }
 
 fn required_text<'a>(name: &str, entry: &'a toml::value::Table, field: &str) -> &'a str {
@@ -481,11 +490,33 @@ fn ownership() -> BTreeMap<String, Ownership> {
                 "recovery_entrypoint",
                 "retention_policy",
                 "state_machine",
+                "semantic_class",
+                "identity_policy",
+                "snapshot_policy",
+                "launch_profile",
                 "invariant_owner",
             ] {
                 required_text(name, entry, field);
             }
             let status = required_text(name, entry, "status");
+            let semantic_class = required_text(name, entry, "semantic_class");
+            assert!(
+                matches!(
+                    semantic_class,
+                    "entity"
+                        | "junction"
+                        | "immutable-fact"
+                        | "projection"
+                        | "singleton"
+                        | "queue-lease"
+                ),
+                "table {name} has unsupported semantic class {semantic_class}"
+            );
+            let launch_profile = required_text(name, entry, "launch_profile");
+            assert!(
+                matches!(launch_profile, "local" | "deferred" | "remote"),
+                "table {name} has unsupported launch profile {launch_profile}"
+            );
             assert!(
                 matches!(
                     status,
@@ -497,6 +528,7 @@ fn ownership() -> BTreeMap<String, Ownership> {
                 name.clone(),
                 Ownership {
                     status: status.to_owned(),
+                    launch_profile: launch_profile.to_owned(),
                 },
             )
         })
@@ -506,15 +538,34 @@ fn ownership() -> BTreeMap<String, Ownership> {
 #[test]
 fn local_base_and_remote_extension_have_exact_physical_ownership() {
     let local_sql = include_str!("../src/db/migrations/0001_initial.sql");
+    let extended_sql = include_str!("../src/db/migrations/0001_extended_profile.sql");
     let remote_sql = include_str!("../src/db/migrations/0001_remote_profile.sql");
     let ownership = ownership();
     // Keep this source-level gate before either migration is handed to SQLite:
     // malformed or unavailable extensions must not hide ownership drift.
-    assert_static_table_ownership(&ownership, local_sql, remote_sql);
+    assert_static_table_ownership(&ownership, local_sql, extended_sql, remote_sql);
     for remote_vocabulary in ["remote_device", "public_remote"] {
         assert!(
             !local_sql.contains(remote_vocabulary),
             "local launch schema contains remote-only vocabulary {remote_vocabulary}"
+        );
+    }
+    for deferred_table in [
+        "scheduled_jobs",
+        "image_spend_policy_versions",
+        "image_generation_jobs",
+    ] {
+        assert!(
+            !sql_table_objects(local_sql)
+                .iter()
+                .any(|table| table == deferred_table),
+            "local launch schema contains deferred table {deferred_table}"
+        );
+        assert!(
+            sql_table_objects(extended_sql)
+                .iter()
+                .any(|table| table == deferred_table),
+            "extended-local schema is missing deferred table {deferred_table}"
         );
     }
     let local = Connection::open_in_memory().unwrap();
@@ -527,8 +578,10 @@ fn local_base_and_remote_extension_have_exact_physical_ownership() {
     let full = Connection::open_in_memory().unwrap();
     full.execute_batch(include_str!("../src/db/migrations/0001_initial.sql"))
         .expect("local base must execute before the remote extension");
+    full.execute_batch(extended_sql)
+        .expect("extended-local profile must execute after the local base");
     full.execute_batch(remote_sql)
-        .expect("remote profile extension must execute after the local base");
+        .expect("remote profile extension must execute after the local and extended profiles");
     let full_inventory = schema_inventory(&full);
     let full_tables = full_inventory.get("table").cloned().unwrap_or_default();
     assert_eq!(

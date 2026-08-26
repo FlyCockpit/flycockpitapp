@@ -11,6 +11,7 @@ publish = false
 
 [features]
 test-support = ["dep:cockpit-test-support"]
+extended = ["cockpit-db/extended"]
 # Starts FlyCockpit-owned account/sync/relay background work. The public v0.1
 # CLI leaves this off; provider network access remains available independently.
 remote = [

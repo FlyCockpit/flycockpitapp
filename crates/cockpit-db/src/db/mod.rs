@@ -126,6 +126,8 @@ use sha2::{Digest, Sha256};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MIGRATION_BACKUP_LIMIT: usize = 3;
+const UNTRUSTED_MIGRATION_BACKUP_LIMIT: usize = 2;
+const UNTRUSTED_MIGRATION_BACKUP_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 thread_local! {
     static OPEN_DEFAULT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1212,10 +1214,24 @@ fn create_migration_backup(
         .unwrap_or_default()
         .as_millis();
     let backup = path.with_extension(format!("v{schema_version}.backup-{stamp}.sqlite"));
+    let source_fingerprint = migration_backup_source_fingerprint(conn, path, schema_version);
     // The initial artifact is intentionally outside doctor's trusted sibling
-    // glob. Only exact compiled-ledger validation promotes it to `*.sqlite`;
-    // a physically sound drift artifact remains durable but visibly untrusted.
-    let untrusted = PathBuf::from(format!("{}.untrusted", backup.display()));
+    // glob. Its source/version/schema identity makes repeated failed boots
+    // reuse one quarantine artifact instead of copying the same database until
+    // the disk fills. Only exact compiled-ledger validation promotes a fresh
+    // artifact to `*.sqlite`; quarantine artifacts are never promoted later.
+    let untrusted = path.with_extension(format!(
+        "v{schema_version}.backup-untrusted-{source_fingerprint}.sqlite.quarantine"
+    ));
+    if untrusted.exists() {
+        files::repair_private_file(&untrusted, "quarantined database backup artifact")?;
+        fsync_file_and_parent(&untrusted)?;
+        prune_untrusted_migration_backups(path)?;
+        anyhow::bail!(
+            "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: an identical source/version/schema backup is already durably quarantined at {}; it is not a trusted restorable backup before {reason}",
+            untrusted.display()
+        );
+    }
     conn.execute("VACUUM INTO ?1", [untrusted.to_string_lossy().as_ref()])
         .with_context(|| {
             format!(
@@ -1229,12 +1245,16 @@ fn create_migration_backup(
     // validation. A drifted source can legitimately fail the latter check;
     // its online backup must still reach the filesystem durability boundary.
     fsync_file_and_parent(&untrusted)?;
-    validate_migration_backup(&untrusted, schema_version).with_context(|| {
+    let validation = validate_migration_backup(&untrusted, schema_version).with_context(|| {
         format!(
             "{SCHEMA_REJECTION_AFTER_OPEN_CODE}: migration backup artifact {} was durably preserved but remains untrusted before {reason}",
             untrusted.display()
         )
-    })?;
+    });
+    if let Err(error) = validation {
+        prune_untrusted_migration_backups(path)?;
+        return Err(error);
+    }
     std::fs::rename(&untrusted, &backup).with_context(|| {
         format!(
             "promoting trusted migration backup {} to {}",
@@ -1245,6 +1265,39 @@ fn create_migration_backup(
     fsync_file_and_parent(&backup)?;
     prune_migration_backups(path)?;
     Ok(())
+}
+
+fn migration_backup_source_fingerprint(
+    conn: &Connection,
+    path: &Path,
+    schema_version: i64,
+) -> String {
+    let ddl =
+        exact_ddl_fingerprint(conn).unwrap_or_else(|error| format!("unreadable-ddl:{error:#}"));
+    let sidecar = |suffix: &str| {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    let identity = [path.to_path_buf(), sidecar("-wal")]
+        .into_iter()
+        .map(|candidate| match std::fs::metadata(&candidate) {
+            Ok(metadata) => {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |duration| duration.as_nanos());
+                format!("{}:{}:{modified}", candidate.display(), metadata.len())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                format!("{}:absent", candidate.display())
+            }
+            Err(error) => format!("{}:metadata-error:{error}", candidate.display()),
+        })
+        .collect::<Vec<_>>()
+        .join("\0");
+    migration_hash(&format!("{schema_version}\0{ddl}\0{identity}"))
 }
 
 /// Decide whether opening an existing prerelease database must first preserve
@@ -1436,6 +1489,74 @@ fn prune_migration_backups(path: &Path) -> Result<()> {
     backups.sort_by_key(|(modified, _)| *modified);
     for (_, stale) in backups.into_iter().rev().skip(MIGRATION_BACKUP_LIMIT) {
         std::fs::remove_file(stale)?;
+    }
+    Ok(())
+}
+
+/// Bound quarantined recovery artifacts independently from trusted backups.
+/// At least the newest artifact is preserved even when it alone exceeds the
+/// byte budget; older artifacts are removed until both bounds are satisfied.
+fn prune_untrusted_migration_backups(path: &Path) -> Result<()> {
+    prune_untrusted_migration_backups_with_limits(
+        path,
+        UNTRUSTED_MIGRATION_BACKUP_LIMIT,
+        UNTRUSTED_MIGRATION_BACKUP_TOTAL_BYTES,
+    )
+}
+
+fn prune_untrusted_migration_backups_with_limits(
+    path: &Path,
+    count_limit: usize,
+    total_byte_limit: u64,
+) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let prefix = format!(
+        "{}.",
+        path.file_stem().unwrap_or_default().to_string_lossy()
+    );
+    let mut backups = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let candidate = entry.path();
+        let owned = candidate.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with(&prefix)
+                && name.contains(".backup-untrusted-")
+                && name.ends_with(".sqlite.quarantine")
+        });
+        if !owned {
+            continue;
+        }
+        let metadata = entry.metadata().with_context(|| {
+            format!(
+                "reading quarantined backup metadata {}",
+                candidate.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "quarantined backup is not a regular file: {}",
+            candidate.display()
+        );
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        backups.push((modified, metadata.len(), candidate));
+    }
+    backups.sort_by_key(|(modified, _, _)| *modified);
+    let mut total_bytes = backups
+        .iter()
+        .fold(0_u64, |total, (_, bytes, _)| total.saturating_add(*bytes));
+    while backups.len() > 1 && (backups.len() > count_limit || total_bytes > total_byte_limit) {
+        let (_, bytes, stale) = backups.remove(0);
+        std::fs::remove_file(stale)?;
+        total_bytes = total_bytes.saturating_sub(bytes);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .with_context(|| format!("opening backup directory {} for fsync", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("fsyncing backup directory {}", parent.display()))?;
     }
     Ok(())
 }
@@ -2129,7 +2250,7 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
-            .find(|path| path.to_string_lossy().ends_with(".sqlite.untrusted"))
+            .find(|path| path.to_string_lossy().ends_with(".sqlite.quarantine"))
             .unwrap();
         let copied = Connection::open(backup).unwrap();
         assert_eq!(current_schema_version(&copied).unwrap(), 1);
@@ -2166,7 +2287,7 @@ mod tests {
                 .iter()
                 .any(|name| name.contains(".backup-") && name.ends_with(".sqlite"))
         );
-        assert!(!names.iter().any(|name| name.ends_with(".untrusted")));
+        assert!(!names.iter().any(|name| name.ends_with(".quarantine")));
     }
 
     #[test]
@@ -2253,6 +2374,98 @@ mod tests {
                 .filter(|entry| entry.file_name().to_string_lossy().contains(".backup-"))
                 .count(),
             MIGRATION_BACKUP_LIMIT
+        );
+    }
+
+    #[test]
+    fn quarantined_backups_are_bounded_independently_from_trusted_backups() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        for index in 0..5 {
+            std::fs::write(
+                temp.path().join(format!(
+                    "cockpit.v1.backup-untrusted-{index:064x}.sqlite.quarantine"
+                )),
+                vec![0_u8; 8],
+            )
+            .unwrap();
+        }
+        std::fs::write(temp.path().join("cockpit.backup-0.sqlite"), b"trusted").unwrap();
+
+        prune_untrusted_migration_backups(&path).unwrap();
+
+        let names = std::fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.ends_with(".sqlite.quarantine"))
+                .count(),
+            UNTRUSTED_MIGRATION_BACKUP_LIMIT
+        );
+        assert!(names.iter().any(|name| name == "cockpit.backup-0.sqlite"));
+    }
+
+    #[test]
+    fn quarantined_backup_byte_budget_preserves_only_the_newest_oversized_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        for index in 0..3 {
+            std::fs::write(
+                temp.path().join(format!(
+                    "cockpit.v1.backup-untrusted-{index:064x}.sqlite.quarantine"
+                )),
+                vec![0_u8; 8],
+            )
+            .unwrap();
+        }
+
+        prune_untrusted_migration_backups_with_limits(&path, 3, 4).unwrap();
+
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".sqlite.quarantine"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn identical_rejected_schema_reuses_one_quarantine_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cockpit.db");
+        let conn = Connection::open(&path).unwrap();
+        migrate_test_with(
+            &conn,
+            &["CREATE TABLE repeated_rejection_probe (id INTEGER PRIMARY KEY);"],
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let error = backup_before_pending_migration(&conn, &path, 2).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(SCHEMA_REJECTION_AFTER_OPEN_CODE),
+                "unexpected error: {error:#}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".sqlite.quarantine"))
+                .count(),
+            1
         );
     }
 

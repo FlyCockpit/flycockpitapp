@@ -349,11 +349,11 @@ pub(super) async fn persist_staged_terminal_removal(
             disposition = disposition.as_str(),
             "terminal client-submission receipt write failed; exact queued payload remains held"
         );
-        return Err(proto::ErrorPayload {
-            code: proto::ErrorCode::Internal,
-            message: "could not durably remove queued message; its exact payload remains held and will not execute; retry the same removal"
-                .to_string(),
-        });
+        return Err(user_message_database_error(
+            &error,
+            proto::ErrorCode::Internal,
+            "could not durably remove queued message; its exact payload remains held and will not execute; retry the same removal",
+        ));
     }
     let snapshot = commit_staged_removal_after_receipts(session, queue, staged, &receipts).await;
     Ok((removed, snapshot, receipts))
@@ -668,7 +668,7 @@ mod user_message_database_error_tests {
     use super::*;
 
     #[test]
-    fn every_sqlite_storage_failure_keeps_its_protocol_reconciliation_code() {
+    fn every_queue_receipt_storage_failure_keeps_its_ambiguous_reconciliation_code() {
         for (sqlite_code, protocol_code) in [
             (rusqlite::ErrorCode::DiskFull, proto::ErrorCode::StorageFull),
             (
@@ -695,14 +695,19 @@ mod user_message_database_error_tests {
                 },
                 None,
             );
-            let error = anyhow::Error::new(sqlite).context("real user-message database phase");
+            let error = anyhow::Error::new(sqlite)
+                .context("terminal queue receipt commit outcome is ambiguous");
             let payload = user_message_database_error(
                 &error,
                 proto::ErrorCode::UserMessageNotAccepted,
                 "fallback must not win",
             );
             assert_eq!(payload.code, protocol_code);
-            assert!(payload.message.contains("real user-message database phase"));
+            assert!(
+                payload
+                    .message
+                    .contains("terminal queue receipt commit outcome is ambiguous")
+            );
         }
     }
 
@@ -1072,9 +1077,13 @@ async fn commit_remote_queue_mutation(
             if let Some(staged) = staged.as_ref() { queue.mark_staged_removal_failed(staged).await; }
             Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation capacity reached".into() })
         }
-        Err(_) => {
+        Err(error) => {
             if let Some(staged) = staged.as_ref() { queue.mark_staged_removal_failed(staged).await; }
-            Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: "remote queue operation could not be committed".into() })
+            Err(user_message_database_error(
+                &error,
+                proto::ErrorCode::Internal,
+                "remote queue operation could not be committed",
+            ))
         }
     }
 }
@@ -3088,9 +3097,13 @@ pub(super) async fn run_worker(
                                 if let Some(staged) = staged.as_ref() { driver_input_queue.mark_staged_removal_failed(staged).await; }
                                 let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Conflict, message: "remote operation capacity reached".into() })); continue;
                             }
-                            Err(_) => {
+                            Err(error) => {
                                 if let Some(staged) = staged.as_ref() { driver_input_queue.mark_staged_removal_failed(staged).await; }
-                                let _ = respond_to.send(Err(proto::ErrorPayload { code: proto::ErrorCode::Internal, message: "remote queue operation could not be committed".into() })); continue;
+                                let _ = respond_to.send(Err(user_message_database_error(
+                                    &error,
+                                    proto::ErrorCode::Internal,
+                                    "remote queue operation could not be committed",
+                                ))); continue;
                             }
                         };
                         let _ = respond_to.send(Ok(remote_queue_mutation_response(receipt)));

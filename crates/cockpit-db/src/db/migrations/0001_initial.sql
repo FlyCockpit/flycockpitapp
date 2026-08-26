@@ -50,6 +50,8 @@ CREATE TABLE sessions (
     started_at_unix_ms      INTEGER NOT NULL,
     last_active_at_unix_ms  INTEGER NOT NULL CHECK (last_active_at_unix_ms >= started_at_unix_ms),
     ended_at_unix_ms        INTEGER CHECK (ended_at_unix_ms IS NULL OR ended_at_unix_ms >= started_at_unix_ms),
+    -- [relationship:denormalized] Immutable-attribution display snapshots;
+    -- provider/model registry changes never rewrite session history.
     provider        TEXT,
     model           TEXT,
     model_selection_json TEXT CHECK (
@@ -77,12 +79,17 @@ CREATE TABLE sessions (
         )
     ),
     active_agent    TEXT    NOT NULL DEFAULT 'orchestrator-build',
+    -- [relationship:denormalized] Historical assistant label. Assistant
+    -- deletion is RESTRICT-free by design because sessions preserve history.
     assistant_name  TEXT,
 
     -- fork tree + auto-titling (GOALS §17). SQLite owns parent integrity
     -- and cascades deletion through the complete fork subtree.
+    -- [relationship:foreign] parent_session_id owns the fork subtree.
     parent_session_id  TEXT,                     -- NULL = root
-    fork_point_turn_id TEXT,                     -- turn in parent where fork branched; NULL = root
+    -- [relationship:foreign] Optional historical event sequence in that exact
+    -- parent session. NULL means the parent's durable tail at fork time.
+    fork_point_turn_id TEXT,
     title              TEXT,                     -- utility-model-generated label (§17d)
     user_renamed       INTEGER NOT NULL DEFAULT 0 CHECK (user_renamed IN (0, 1)), -- 1 = user set title; locks out auto-titling
     short_id           TEXT CHECK (
@@ -173,12 +180,21 @@ CREATE TABLE sessions (
     lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active', 'deleting')),
 
     CHECK (parent_session_id IS NULL OR parent_session_id <> session_id),
+    CHECK (fork_point_turn_id IS NULL OR (
+        parent_session_id IS NOT NULL
+        AND length(fork_point_turn_id) > 0
+        AND fork_point_turn_id NOT GLOB '*[^0-9]*'
+        AND fork_point_turn_id = CAST(CAST(fork_point_turn_id AS INTEGER) AS TEXT)
+    )),
     CHECK (btw_parent_session_id IS NULL OR btw_parent_session_id <> session_id),
     CHECK ((guidance_baseline_path IS NULL) = (guidance_baseline_hash IS NULL)),
     CHECK (last_viewed_at_unix_ms IS NULL OR last_viewed_at_unix_ms >= started_at_unix_ms),
     CHECK (archived_at_unix_ms IS NULL OR archived_at_unix_ms >= started_at_unix_ms),
-    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
-    FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (parent_session_id, fork_point_turn_id)
+        REFERENCES session_events(session_id, seq)
+        ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY (btw_parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- Parent links form an acyclic ownership graph. The recursive UNION is also
@@ -239,7 +255,7 @@ CREATE TABLE media_attachments (
         AND length(replace(attachment_id, '-', '')) = 32
         AND replace(attachment_id, '-', '') NOT GLOB '*[^0-9a-f]*'
     ),
-    session_id                     TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id                     TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     canonical_project_digest       TEXT NOT NULL,
     media_kind                     TEXT NOT NULL CHECK (media_kind IN ('image', 'audio', 'video')),
     source_kind                    TEXT NOT NULL CHECK (source_kind IN ('local_path', 'retained_https', 'authenticated_session_upload')),
@@ -304,7 +320,7 @@ CREATE INDEX idx_media_attachments_cleanup
     ON media_attachments(availability, draft_expires_at_unix_ms);
 
 CREATE TABLE media_attachment_failure_reasons (
-    attachment_id TEXT PRIMARY KEY REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    attachment_id TEXT PRIMARY KEY REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     reason TEXT NOT NULL CHECK (reason IN (
         'ambiguous_or_unsupported_container', 'unsupported_codec',
         'unsupported_color_profile', 'invalid_media', 'resource_limit',
@@ -357,20 +373,20 @@ CREATE TABLE media_attachment_components (
     CHECK (byte_length NOT GLOB '*[^0-9]*' AND byte_length GLOB '[1-9]*'),
     CHECK (updated_at_unix_ms >= created_at_unix_ms),
     FOREIGN KEY (attachment_id, attachment_version)
-        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_media_attachment_components_attachment
     ON media_attachment_components(attachment_id, component_id);
 
 CREATE TABLE media_image_component_dimensions (
-    component_id TEXT PRIMARY KEY REFERENCES media_attachment_components(component_id) ON DELETE CASCADE,
+    component_id TEXT PRIMARY KEY REFERENCES media_attachment_components(component_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     width INTEGER NOT NULL CHECK(width > 0 AND width <= 8192),
     height INTEGER NOT NULL CHECK(height > 0 AND height <= 8192)
 );
 
 CREATE TABLE media_attachment_transition_evidence (
-    attachment_id TEXT NOT NULL REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    attachment_id TEXT NOT NULL REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     availability_generation TEXT NOT NULL,
     from_state TEXT NOT NULL,
     to_state TEXT NOT NULL,
@@ -380,7 +396,7 @@ CREATE TABLE media_attachment_transition_evidence (
 );
 
 CREATE TABLE media_av_normalization_evidence (
-    attachment_id TEXT PRIMARY KEY REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    attachment_id TEXT PRIMARY KEY REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     runtime_fingerprint TEXT NOT NULL,
     probe_digest TEXT NOT NULL,
     decode_digest TEXT NOT NULL,
@@ -396,7 +412,7 @@ CREATE TABLE media_av_normalization_evidence (
 );
 
 CREATE TABLE media_storage_publication_intents (
-    upload_id TEXT PRIMARY KEY REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
+    upload_id TEXT PRIMARY KEY REFERENCES media_uploads(upload_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     temporary_storage_id TEXT NOT NULL,
     quarantine_storage_id TEXT NOT NULL,
     derivative_storage_ids_json TEXT NOT NULL CHECK (
@@ -442,8 +458,8 @@ END;
 -- commit atomically and this intent is removed.
 CREATE TABLE media_ingress_publication_intents (
     admission_id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-    reservation_id TEXT NOT NULL UNIQUE REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    reservation_id TEXT NOT NULL UNIQUE REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     storage_id TEXT NOT NULL UNIQUE,
     source_sha256 TEXT NOT NULL,
     request_source_digest TEXT NOT NULL,
@@ -455,11 +471,11 @@ CREATE TABLE media_ingress_publication_intents (
 
 CREATE TABLE media_ingress_admission_receipts (
     admission_id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-    attachment_id TEXT NOT NULL UNIQUE REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    attachment_id TEXT NOT NULL UNIQUE REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_version TEXT NOT NULL,
     availability_generation TEXT NOT NULL,
-    reservation_id TEXT NOT NULL UNIQUE REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT,
+    reservation_id TEXT NOT NULL UNIQUE REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     normalized_sha256 TEXT NOT NULL,
     request_source_digest TEXT NOT NULL,
     normalized_byte_length TEXT NOT NULL,
@@ -525,7 +541,7 @@ CREATE TABLE media_attachment_references (
     released_at_unix_ms   INTEGER,
     UNIQUE (attachment_id, attachment_version, consumer_kind, consumer_id),
     FOREIGN KEY (attachment_id, attachment_version)
-        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_media_attachment_references_live
@@ -538,7 +554,7 @@ CREATE TABLE media_attachment_component_leases (
     lease_id                       TEXT PRIMARY KEY,
     attachment_id                  TEXT NOT NULL,
     attachment_version             TEXT NOT NULL,
-    component_id                   TEXT NOT NULL REFERENCES media_attachment_components(component_id) ON DELETE CASCADE,
+    component_id                   TEXT NOT NULL REFERENCES media_attachment_components(component_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     lease_kind                     TEXT NOT NULL CHECK (lease_kind IN ('preview', 'model')),
     expected_availability_generation TEXT NOT NULL,
     captured_capability_generation TEXT NOT NULL,
@@ -549,7 +565,7 @@ CREATE TABLE media_attachment_component_leases (
     acquired_at_unix_ms            INTEGER NOT NULL,
     released_at_unix_ms            INTEGER,
     FOREIGN KEY (attachment_id, attachment_version)
-        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE UNIQUE INDEX idx_media_attachment_component_leases_live_id
@@ -559,19 +575,19 @@ CREATE INDEX idx_media_attachment_component_leases_live_attachment
     ON media_attachment_component_leases(attachment_id, attachment_version, released_at_unix_ms);
 
 CREATE TABLE media_component_lease_reconciliation_evidence (
-    lease_id TEXT PRIMARY KEY REFERENCES media_attachment_component_leases(lease_id) ON DELETE CASCADE,
+    lease_id TEXT PRIMARY KEY REFERENCES media_attachment_component_leases(lease_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     reason TEXT NOT NULL CHECK(reason = 'daemon_restart'),
     released_at_unix_ms INTEGER NOT NULL
 );
 
 CREATE TABLE media_component_security_evidence (
-    lease_id TEXT PRIMARY KEY REFERENCES media_attachment_component_leases(lease_id) ON DELETE CASCADE,
+    lease_id TEXT PRIMARY KEY REFERENCES media_attachment_component_leases(lease_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id TEXT NOT NULL,
     component_id TEXT NOT NULL,
     reason TEXT NOT NULL CHECK(reason = 'storage_security_violation'),
     recorded_at_unix_ms INTEGER NOT NULL,
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
-    FOREIGN KEY (component_id) REFERENCES media_attachment_components(component_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (component_id) REFERENCES media_attachment_components(component_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE media_attachment_cleanup_intents (
@@ -586,11 +602,11 @@ CREATE TABLE media_attachment_cleanup_intents (
     completed_at_unix_ms             INTEGER,
     CHECK (length(component_set_digest) = 64 AND component_set_digest NOT GLOB '*[^0-9a-f]*'),
     FOREIGN KEY (attachment_id, attachment_version)
-        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE media_component_deletion_intents (
-    component_id TEXT PRIMARY KEY REFERENCES media_attachment_components(component_id) ON DELETE CASCADE,
+    component_id TEXT PRIMARY KEY REFERENCES media_attachment_components(component_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id TEXT NOT NULL,
     storage_id TEXT NOT NULL,
     stable_identity_digest TEXT NOT NULL,
@@ -634,13 +650,13 @@ CREATE TABLE media_security_recovery_operations (
     CHECK (length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(affected_set_digest) = 64 AND affected_set_digest NOT GLOB '*[^0-9a-f]*'),
     FOREIGN KEY (attachment_id, attachment_version)
-        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE
+        REFERENCES media_attachments(attachment_id, attachment_version) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE media_local_path_registration_operations (
     local_operation_id       TEXT PRIMARY KEY,
     authoritative_operation_id TEXT NOT NULL,
-    session_id               TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id               TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     canonical_project_digest TEXT NOT NULL,
     client_draft_id          TEXT NOT NULL,
     request_binding_digest   TEXT NOT NULL,
@@ -662,7 +678,7 @@ CREATE TABLE media_local_path_registration_evidence (
     source_mtime_unix_ns      TEXT NOT NULL,
     reservation_id           TEXT NOT NULL,
     reservation_digest       TEXT NOT NULL,
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE media_local_path_registration_audit (
@@ -674,7 +690,7 @@ CREATE TABLE media_local_path_registration_audit (
 CREATE TABLE media_retained_https_operations (
     local_operation_id         TEXT PRIMARY KEY,
     authoritative_operation_id TEXT NOT NULL,
-    session_id                 TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id                 TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     canonical_project_digest   TEXT NOT NULL,
     client_draft_id            TEXT NOT NULL,
     request_binding_digest     TEXT NOT NULL,
@@ -703,7 +719,7 @@ CREATE TABLE media_retained_https_evidence (
     reservation_digest       TEXT NOT NULL,
     CHECK (length(source_evidence_digest) = 64 AND source_evidence_digest NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(reservation_digest) = 64 AND reservation_digest NOT GLOB '*[^0-9a-f]*'),
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE media_retained_https_audit (
@@ -738,46 +754,46 @@ CREATE TABLE media_attachment_processing_jobs (
     claim_attempt                    INTEGER NOT NULL DEFAULT 0,
     created_at_unix_ms               INTEGER NOT NULL,
     completed_at_unix_ms             INTEGER,
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 CREATE TABLE media_attachment_processing_security_evidence (
-    job_id             TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    job_id             TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id      TEXT NOT NULL,
     component_id       TEXT NOT NULL,
     reason             TEXT NOT NULL CHECK(reason = 'storage_security_violation'),
     recorded_at_unix_ms INTEGER NOT NULL,
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE,
-    FOREIGN KEY (component_id) REFERENCES media_attachment_components(component_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (component_id) REFERENCES media_attachment_components(component_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 CREATE TABLE media_attachment_processing_publication_intents (
-    job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     output_ids_json TEXT NOT NULL,
     created_at_unix_ms INTEGER NOT NULL
 );
 CREATE TABLE media_attachment_processing_cleanup_evidence (
-    job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    job_id          TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     evidence_digest TEXT NOT NULL,
     completed_at_unix_ms INTEGER NOT NULL,
     CHECK (length(evidence_digest)=64 AND evidence_digest NOT GLOB '*[^0-9a-f]*')
 );
 CREATE TABLE media_attachment_processing_failure_evidence (
-    job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id TEXT NOT NULL,
     reason TEXT NOT NULL CHECK(reason IN ('processing_failed','model_runtime_unavailable')),
     recorded_at_unix_ms INTEGER NOT NULL,
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 CREATE TABLE media_attachment_processing_output_security_evidence (
-    job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE,
+    job_id TEXT PRIMARY KEY REFERENCES media_attachment_processing_jobs(job_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attachment_id TEXT NOT NULL,
     output_ids_json TEXT NOT NULL,
     reason TEXT NOT NULL CHECK(reason='storage_security_violation'),
     recorded_at_unix_ms INTEGER NOT NULL,
-    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+    FOREIGN KEY (attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE media_uploads (
-    upload_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE, canonical_project_digest TEXT NOT NULL,
+    upload_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT, canonical_project_digest TEXT NOT NULL,
     client_draft_id TEXT NOT NULL, media_kind TEXT NOT NULL CHECK(media_kind IN ('image','audio','video')),
     state TEXT NOT NULL CHECK(state IN ('open','finalizing','materialized','cancelled','expired','failed')),
     upload_generation TEXT NOT NULL, declared_total_bytes TEXT NOT NULL, acknowledged_chunks INTEGER NOT NULL,
@@ -792,7 +808,7 @@ CREATE TABLE media_uploads (
 CREATE TABLE media_upload_chunks (
     upload_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, byte_length INTEGER NOT NULL,
     sha256 TEXT NOT NULL, storage_offset TEXT NOT NULL, acknowledged_at_unix_ms INTEGER NOT NULL,
-    PRIMARY KEY(upload_id,chunk_index), FOREIGN KEY(upload_id) REFERENCES media_uploads(upload_id) ON DELETE CASCADE,
+    PRIMARY KEY(upload_id,chunk_index), FOREIGN KEY(upload_id) REFERENCES media_uploads(upload_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK(byte_length>0 AND byte_length<=262144), CHECK(length(sha256)=64 AND sha256 NOT GLOB '*[^0-9a-f]*')
 );
 CREATE TRIGGER media_upload_publication_intent_complete
@@ -803,7 +819,7 @@ BEGIN
 END;
 CREATE TABLE media_attachment_upload_origins(
     attachment_id TEXT PRIMARY KEY,client_draft_id TEXT NOT NULL,upload_id TEXT NOT NULL UNIQUE,upload_generation TEXT NOT NULL,
-    FOREIGN KEY(attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE
+    FOREIGN KEY(attachment_id) REFERENCES media_attachments(attachment_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 CREATE TABLE local_media_operations (
     local_operation_id TEXT PRIMARY KEY, authoritative_operation_id TEXT NOT NULL, action TEXT NOT NULL,
@@ -830,7 +846,7 @@ CREATE TABLE media_reservations (
     queue_sequence INTEGER NOT NULL UNIQUE CHECK(queue_sequence >= 1),
     deadline_monotonic_ms INTEGER NOT NULL CHECK(deadline_monotonic_ms >= 0),
     created_wall_ms INTEGER NOT NULL,
-    external_operation_id TEXT UNIQUE REFERENCES external_journal_operations(operation_id),
+    external_operation_id TEXT UNIQUE REFERENCES external_journal_operations(operation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     quarantined INTEGER NOT NULL DEFAULT 0 CHECK(quarantined IN (0,1)),
     published INTEGER NOT NULL DEFAULT 0 CHECK(published IN (0,1)),
     cancellation_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancellation_requested IN (0,1))
@@ -877,7 +893,7 @@ WHEN (OLD.state || '>' || NEW.state) NOT IN (
 )
 BEGIN SELECT RAISE(ABORT, 'illegal media reservation state transition'); END;
 CREATE TABLE media_reservation_plan_facts (
-    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     dimension TEXT NOT NULL,
     plan_json TEXT NOT NULL,
     PRIMARY KEY(reservation_id, dimension)
@@ -885,7 +901,7 @@ CREATE TABLE media_reservation_plan_facts (
 CREATE TRIGGER media_plan_fact_immutable_update BEFORE UPDATE ON media_reservation_plan_facts BEGIN SELECT RAISE(ABORT,'media plan facts are immutable'); END;
 CREATE TRIGGER media_plan_fact_immutable_delete BEFORE DELETE ON media_reservation_plan_facts BEGIN SELECT RAISE(ABORT,'media plan facts are immutable'); END;
 CREATE TABLE media_reservation_versions (
-    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     version INTEGER NOT NULL CHECK(version >= 1),
     state TEXT NOT NULL,
     recorded_wall_ms INTEGER NOT NULL,
@@ -905,12 +921,12 @@ INSERT INTO media_scheduler_cursor(singleton,last_session_id) VALUES(1,NULL);
 -- input. Keeping readiness durable lets the atomic fair claimant distinguish
 -- a slow upload from work that is actually waiting for an execution permit.
 CREATE TABLE media_execution_ready (
-    reservation_id TEXT PRIMARY KEY REFERENCES media_reservations(reservation_id),
+    reservation_id TEXT PRIMARY KEY REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     ready_wall_ms INTEGER NOT NULL
 );
 CREATE TABLE media_reservation_deltas (
     delta_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     reservation_version INTEGER NOT NULL CHECK(reservation_version >= 1),
     dimension TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
     estimated INTEGER NOT NULL CHECK(estimated >= 0), delta INTEGER NOT NULL,
@@ -933,7 +949,7 @@ CREATE TABLE media_accounting_blocks (
     PRIMARY KEY(scope_kind, scope_id)
 );
 CREATE TABLE media_artifact_facts (
-    artifact_id TEXT PRIMARY KEY, reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id),
+    artifact_id TEXT PRIMARY KEY, reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     dimension TEXT NOT NULL, byte_count INTEGER NOT NULL CHECK(byte_count >= 0), checksum TEXT NOT NULL,
     quarantined INTEGER NOT NULL CHECK(quarantined IN (0,1)), deletion_tombstone_checksum TEXT
 );
@@ -942,14 +958,14 @@ CREATE TRIGGER media_artifact_immutable_update BEFORE UPDATE ON media_artifact_f
 WHEN NEW.artifact_id!=OLD.artifact_id OR NEW.reservation_id!=OLD.reservation_id OR NEW.dimension!=OLD.dimension OR NEW.byte_count!=OLD.byte_count OR NEW.checksum!=OLD.checksum OR NEW.quarantined!=OLD.quarantined OR OLD.deletion_tombstone_checksum IS NOT NULL OR NEW.deletion_tombstone_checksum IS NULL
 BEGIN SELECT RAISE(ABORT,'media artifact facts are immutable'); END;
 CREATE TABLE media_cleanup_attestations (
-    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id), dimension TEXT NOT NULL,
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT, dimension TEXT NOT NULL,
     attestation_kind TEXT NOT NULL CHECK(attestation_kind='zero_materialized_or_verified_cleaned'),
     checksum TEXT NOT NULL, created_wall_ms INTEGER NOT NULL, PRIMARY KEY(reservation_id,dimension)
 );
 CREATE TRIGGER media_cleanup_attestation_immutable_update BEFORE UPDATE ON media_cleanup_attestations BEGIN SELECT RAISE(ABORT,'media cleanup attestations are immutable'); END;
 CREATE TRIGGER media_cleanup_attestation_immutable_delete BEFORE DELETE ON media_cleanup_attestations BEGIN SELECT RAISE(ABORT,'media cleanup attestations are immutable'); END;
 CREATE TABLE media_accounting_corruption_facts (
-    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id), reservation_version INTEGER NOT NULL CHECK(reservation_version >= 1),
+    reservation_id TEXT NOT NULL REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT, reservation_version INTEGER NOT NULL CHECK(reservation_version >= 1),
     dimension TEXT NOT NULL, unrepresentable_actual TEXT NOT NULL, reason TEXT NOT NULL, created_wall_ms INTEGER NOT NULL,
     PRIMARY KEY(reservation_id, reservation_version, dimension)
 );
@@ -969,11 +985,11 @@ CREATE TRIGGER media_repair_state_graph BEFORE UPDATE OF state ON media_repair_a
     (OLD.state='verifying' AND NEW.state IN ('committed','failed')) OR OLD.state=NEW.state
 ) BEGIN SELECT RAISE(ABORT, 'invalid media repair state transition'); END;
 CREATE TABLE media_counter_shadow (
-    attempt_id TEXT NOT NULL REFERENCES media_repair_attempts(attempt_id) ON DELETE CASCADE,
+    attempt_id TEXT NOT NULL REFERENCES media_repair_attempts(attempt_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     dimension TEXT NOT NULL, charged INTEGER NOT NULL CHECK(charged >= 0), PRIMARY KEY(attempt_id, dimension)
 );
 CREATE TABLE media_downstream_ownership (
-    reservation_id TEXT PRIMARY KEY REFERENCES media_reservations(reservation_id),
+    reservation_id TEXT PRIMARY KEY REFERENCES media_reservations(reservation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     invocation_id TEXT NOT NULL,
     bound_wall_ms INTEGER NOT NULL,
     released_wall_ms INTEGER
@@ -983,6 +999,8 @@ CREATE INDEX idx_media_downstream_invocation ON media_downstream_ownership(invoc
 CREATE INDEX idx_sessions_project_started ON sessions (project_id, started_at_unix_ms DESC);
 CREATE INDEX idx_sessions_last_active     ON sessions (last_active_at_unix_ms DESC);
 CREATE INDEX idx_sessions_open            ON sessions (ended_at_unix_ms) WHERE ended_at_unix_ms IS NULL;
+CREATE INDEX idx_sessions_parent_fork_point ON sessions(parent_session_id, fork_point_turn_id);
+CREATE INDEX idx_sessions_parent_started ON sessions (parent_session_id, started_at_unix_ms DESC);
 CREATE INDEX idx_sessions_parent          ON sessions (parent_session_id);
 -- Partial so rows whose short_id is still NULL (lazily backfilled on next
 -- touch by src/db/sessions.rs) don't trip the uniqueness constraint.
@@ -1012,7 +1030,7 @@ CREATE TABLE sealed_values (
     origin     TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (session_id, value_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_sealed_values_session_created
@@ -1033,6 +1051,8 @@ CREATE TABLE tool_call_events (
     event_id            TEXT    PRIMARY KEY,
     session_id          TEXT    NOT NULL,
     call_id             TEXT    NOT NULL,
+    -- [relationship:foreign] Same-session parent tool call. Historical
+    -- attribution is retained with the child and cannot cross sessions.
     parent_call_id      TEXT    DEFAULT NULL,
     parent_child_index  INTEGER DEFAULT NULL,
     timestamp           INTEGER NOT NULL,
@@ -1088,13 +1108,18 @@ CREATE TABLE tool_call_events (
     -- provider wire identity for the call: the provider-native item/call
     -- ids, where the call id came from, the wire API flavor, and the
     -- provider family.
+    -- [relationship:external] Provider-owned opaque wire identifiers, not
+    -- local registry keys and therefore intentionally not foreign keys.
     provider_item_id        TEXT DEFAULT NULL,
     provider_call_id        TEXT DEFAULT NULL,
     provider_call_id_source TEXT DEFAULT NULL,
     wire_api                TEXT DEFAULT NULL,
     provider_family         TEXT DEFAULT NULL,
 
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (session_id, parent_call_id)
+        REFERENCES tool_call_events(session_id, call_id)
+        ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_tce_session_ts ON tool_call_events (session_id, timestamp);
@@ -1102,7 +1127,8 @@ CREATE INDEX idx_tce_project_ts ON tool_call_events (project_id, timestamp);
 CREATE INDEX idx_tce_model_ts   ON tool_call_events (model, timestamp);
 CREATE INDEX idx_tce_tool_ts    ON tool_call_events (tool, timestamp);
 CREATE INDEX idx_tce_lang_ts    ON tool_call_events (language, timestamp);
-CREATE INDEX idx_tce_parent     ON tool_call_events (parent_call_id);
+CREATE UNIQUE INDEX uq_tce_session_call ON tool_call_events(session_id, call_id);
+CREATE INDEX idx_tce_parent     ON tool_call_events (session_id, parent_call_id);
 
 -- ---- inference_calls -------------------------------------------------------
 
@@ -1130,7 +1156,7 @@ CREATE TABLE inference_calls (
     -- expectation (GOALS §10) against measured reality.
     cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
 
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_ic_session_ts ON inference_calls (session_id, timestamp);
@@ -1144,7 +1170,7 @@ CREATE TABLE lock_state (
     agent_id    TEXT    NOT NULL,
     session_id  TEXT    NOT NULL,
     acquired_at INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_lock_state_session ON lock_state (session_id);
@@ -1156,7 +1182,7 @@ CREATE TABLE lock_reads (
     read_at     INTEGER NOT NULL,
     read_hash   INTEGER,
     PRIMARY KEY (session_id, agent_id, path),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- ---- needs_attention (GOALS §3b) --------------------------------------------
@@ -1184,13 +1210,13 @@ CREATE TABLE agent_instances (
     created_at_unix_ms INTEGER NOT NULL,
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (agent_instance_id, session_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (parent_agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
-    FOREIGN KEY (task_delegation_job_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE RESTRICT,
-    FOREIGN KEY (task_delegation_child_uuid) REFERENCES task_delegation_children(child_uuid) ON DELETE RESTRICT,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (task_delegation_job_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (task_delegation_child_uuid) REFERENCES task_delegation_children(child_uuid) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (resolved_profile_snapshot_id, session_id)
-        REFERENCES agent_profile_snapshots(snapshot_id, session_id) ON DELETE RESTRICT
+        REFERENCES agent_profile_snapshots(snapshot_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_agent_instances_session_state
@@ -1216,7 +1242,7 @@ CREATE TABLE decision_requests (
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (decision_request_id, session_id),
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_decision_requests_agent_state
@@ -1231,9 +1257,9 @@ CREATE TABLE decision_receipts (
     session_event_seq INTEGER,
     created_at_unix_ms INTEGER NOT NULL,
     FOREIGN KEY (decision_request_id, session_id)
-        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE,
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (session_id, session_event_seq)
-        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT
+        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE TABLE agent_transition_receipts (
@@ -1246,9 +1272,9 @@ CREATE TABLE agent_transition_receipts (
     created_at_unix_ms INTEGER NOT NULL,
     PRIMARY KEY (agent_instance_id, terminal_state),
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (session_id, session_event_seq)
-        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT
+        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE TRIGGER decision_receipts_immutable
@@ -1305,8 +1331,8 @@ CREATE TABLE needs_attention (
          AND parked_call_id IS NULL AND parked_resume_json IS NULL
          AND parked_gate_json IS NULL)
     ),
-    FOREIGN KEY (decision_request_id) REFERENCES decision_requests(decision_request_id) ON DELETE CASCADE,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (decision_request_id) REFERENCES decision_requests(decision_request_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_na_session_open ON needs_attention (session_id, state);
@@ -1320,7 +1346,7 @@ CREATE TABLE decision_attention_mutation_guards (
     decision_request_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
     FOREIGN KEY (decision_request_id, session_id)
-        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE
+        REFERENCES decision_requests(decision_request_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TRIGGER needs_attention_decision_session_insert
@@ -1477,7 +1503,7 @@ CREATE TABLE tokenizer_calibration (
 -- The index is on-demand (no file watcher): the central `index_target`
 -- helper re-stats tracked files on each tool call and re-indexes
 -- stale/removed ones before answering. `intel_files` is the parent; the
--- per-file tables FK to it ON DELETE CASCADE so dropping a deleted or
+-- per-file tables FK to it ON DELETE CASCADE ON UPDATE RESTRICT so dropping a deleted or
 -- stale file's row purges its symbols/imports/identifiers/deps/callsites
 -- in one statement.
 
@@ -1510,7 +1536,7 @@ CREATE TABLE intel_symbols (
     parent     TEXT,
     visibility TEXT,
     signature  TEXT,
-    FOREIGN KEY (root, path) REFERENCES intel_files(root, path) ON DELETE CASCADE
+    FOREIGN KEY (root, path) REFERENCES intel_files(root, path) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE intel_imports (
@@ -1518,7 +1544,7 @@ CREATE TABLE intel_imports (
     path   TEXT NOT NULL,
     target TEXT NOT NULL,
     line   INTEGER NOT NULL,
-    FOREIGN KEY (root, path) REFERENCES intel_files(root, path) ON DELETE CASCADE
+    FOREIGN KEY (root, path) REFERENCES intel_files(root, path) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE intel_identifiers (
@@ -1526,7 +1552,7 @@ CREATE TABLE intel_identifiers (
     path  TEXT NOT NULL,
     token TEXT NOT NULL,
     line  INTEGER NOT NULL,
-    FOREIGN KEY (root, path) REFERENCES intel_files(root, path) ON DELETE CASCADE
+    FOREIGN KEY (root, path) REFERENCES intel_files(root, path) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE intel_deps (
@@ -1535,7 +1561,7 @@ CREATE TABLE intel_deps (
     importee   TEXT,
     raw_target TEXT NOT NULL,
     line       INTEGER NOT NULL,
-    FOREIGN KEY (root, importer) REFERENCES intel_files(root, path) ON DELETE CASCADE
+    FOREIGN KEY (root, importer) REFERENCES intel_files(root, path) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE intel_callsites (
@@ -1545,7 +1571,7 @@ CREATE TABLE intel_callsites (
     caller_symbol TEXT,
     callee_name   TEXT NOT NULL,
     callee_kind   TEXT,
-    FOREIGN KEY (root, caller_file) REFERENCES intel_files(root, path) ON DELETE CASCADE
+    FOREIGN KEY (root, caller_file) REFERENCES intel_files(root, path) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX intel_symbols_name      ON intel_symbols(name);
@@ -1639,7 +1665,7 @@ CREATE TABLE inference_requests (
     goal_id TEXT,                               -- immutable host-goal attribution at dispatch
     goal_attempt_generation INTEGER,            -- attempt generation captured with goal_id
     PRIMARY KEY (call_id, ordinal),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_ireq_session ON inference_requests (session_id);
@@ -1680,7 +1706,7 @@ CREATE TABLE session_events (
     model_id TEXT,                                 -- authoring model id, NULL for model-less events
     llm_mode TEXT CHECK (llm_mode IN ('defensive', 'normal', 'frontier')), -- authoring LLM mode, NULL for model-less events
     model_trust TEXT,                              -- write-time resolved model trust, NULL for model-less events
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE UNIQUE INDEX uq_session_events_session_seq ON session_events (session_id, seq);
@@ -1723,9 +1749,9 @@ CREATE TABLE verification_operations (
     created_at_unix_ms INTEGER NOT NULL,
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (operation_id, session_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     CHECK ((estimate_state = 'available' AND budget_action IS NULL) OR
            (estimate_state = 'estimate_unavailable' AND budget_action IS NOT NULL)),
     CHECK ((state = 'skipped_budget_refused') = (budget_action = 'refuse')),
@@ -1757,7 +1783,7 @@ CREATE TABLE verification_candidates (
     UNIQUE (candidate_id, operation_id),
     UNIQUE (candidate_id, session_id),
     FOREIGN KEY (operation_id, session_id)
-        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_verification_candidates_operation_state
@@ -1779,9 +1805,9 @@ CREATE TABLE verification_candidate_artifacts (
     mode_digest TEXT CHECK (length(mode_digest) = 64 AND mode_digest NOT GLOB '*[^0-9a-f]*'),
     PRIMARY KEY (candidate_id, ordinal),
     FOREIGN KEY (candidate_id, operation_id)
-        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE CASCADE,
+        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (candidate_id, session_id)
-        REFERENCES verification_candidates(candidate_id, session_id) ON DELETE CASCADE,
+        REFERENCES verification_candidates(candidate_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK ((operation_kind = 'rename') = (prior_path_digest IS NOT NULL)),
     CHECK ((operation_kind = 'mode') = (mode_digest IS NOT NULL))
 );
@@ -1796,11 +1822,11 @@ CREATE TABLE verification_late_results (
     received_at_unix_ms INTEGER NOT NULL,
     UNIQUE (candidate_id, result_digest),
     FOREIGN KEY (candidate_id, operation_id)
-        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE CASCADE,
+        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (candidate_id, session_id)
-        REFERENCES verification_candidates(candidate_id, session_id) ON DELETE CASCADE,
+        REFERENCES verification_candidates(candidate_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (operation_id, session_id)
-        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE verification_syntheses (
@@ -1818,9 +1844,9 @@ CREATE TABLE verification_syntheses (
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (operation_id, session_id),
     FOREIGN KEY (operation_id, session_id)
-        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE,
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (selected_candidate_id, operation_id)
-        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE RESTRICT,
+        REFERENCES verification_candidates(candidate_id, operation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     CHECK ((state = 'selected' AND selected_candidate_id IS NOT NULL AND artifact_kind = 'proposed_call' AND canonical_call_digest IS NOT NULL)
         OR (state = 'synthesized_write' AND selected_candidate_id IS NULL AND artifact_kind = 'write_change_set' AND write_union_receipt_digest IS NOT NULL)
         OR (state IN ('pending', 'refused', 'no_valid_candidate', 'failed') AND selected_candidate_id IS NULL))
@@ -1836,9 +1862,9 @@ CREATE TABLE verification_synthesis_artifacts (
     source_artifact_ordinal INTEGER NOT NULL CHECK (source_artifact_ordinal >= 0),
     PRIMARY KEY (synthesis_id, ordinal),
     UNIQUE (synthesis_id, source_candidate_id, source_artifact_ordinal),
-    FOREIGN KEY (synthesis_id) REFERENCES verification_syntheses(synthesis_id) ON DELETE CASCADE,
+    FOREIGN KEY (synthesis_id) REFERENCES verification_syntheses(synthesis_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (source_candidate_id, source_artifact_ordinal)
-        REFERENCES verification_candidate_artifacts(candidate_id, ordinal) ON DELETE RESTRICT
+        REFERENCES verification_candidate_artifacts(candidate_id, ordinal) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE TABLE verification_projection_envelopes (
@@ -1856,7 +1882,7 @@ CREATE TABLE verification_projection_envelopes (
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (operation_id, session_id),
     FOREIGN KEY (operation_id, session_id)
-        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE verification_dispatch_attempts (
@@ -1873,7 +1899,7 @@ CREATE TABLE verification_dispatch_attempts (
     updated_at_unix_ms INTEGER NOT NULL,
     UNIQUE (operation_id, session_id),
     FOREIGN KEY (operation_id, session_id)
-        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE verification_projections (
@@ -1887,7 +1913,7 @@ CREATE TABLE verification_projections (
     UNIQUE (projection_id, session_id),
     UNIQUE (operation_id, session_id),
     FOREIGN KEY (operation_id, session_id)
-        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE
+        REFERENCES verification_operations(operation_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE verification_projection_events (
@@ -1898,9 +1924,9 @@ CREATE TABLE verification_projection_events (
     PRIMARY KEY (projection_id, ordinal),
     UNIQUE (projection_id, session_event_seq),
     FOREIGN KEY (projection_id, session_id)
-        REFERENCES verification_projections(projection_id, session_id) ON DELETE CASCADE,
+        REFERENCES verification_projections(projection_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (session_id, session_event_seq)
-        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT
+        REFERENCES session_events(session_id, seq) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_verification_projection_events_session
@@ -1921,7 +1947,7 @@ CREATE TABLE client_submission_terminal_receipts (
     )),
     created_at_ms       INTEGER NOT NULL,
     PRIMARY KEY (session_id, client_submission_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- Authoritative exactly-once ledger for typed user-message submissions. UUID
@@ -1958,7 +1984,7 @@ CREATE TABLE message_operation_receipts (
     ),
     CHECK (state = 'terminal_rejected' OR artifact_terminal_reason IS NULL),
     CHECK ((artifact_model_fence_generation IS NULL) = (artifact_model_fence_json IS NULL)),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE message_submission_receipts (
@@ -1981,10 +2007,10 @@ CREATE TABLE message_submission_receipts (
     CHECK ((state = 'materialized') = (message_seq IS NOT NULL AND fold_ordinal IS NOT NULL)),
     CHECK (state = 'terminal_rejected' OR artifact_terminal_reason IS NULL),
     FOREIGN KEY (session_id, operation_id)
-      REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE,
+      REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (session_id, operation_id, client_submission_id, message_request_digest)
       REFERENCES message_operation_receipts(session_id, operation_id, client_submission_id, message_request_digest)
-      ON DELETE CASCADE
+      ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE message_queue_items (
@@ -2004,7 +2030,7 @@ CREATE TABLE message_queue_items (
     UNIQUE (session_id, client_submission_id),
     CHECK (state = 'terminal_rejected' OR artifact_terminal_reason IS NULL),
     FOREIGN KEY (session_id, client_submission_id)
-      REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE
+      REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE message_attachment_references (
@@ -2023,7 +2049,7 @@ CREATE TABLE message_attachment_references (
     UNIQUE (session_id, client_submission_id, attachment_id),
     CHECK (released_at IS NULL OR released_at >= acquired_at),
     FOREIGN KEY (session_id, client_submission_id)
-      REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE
+      REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- Large compaction records spill out of the inline event JSON as one canonical
@@ -2034,7 +2060,7 @@ CREATE TABLE compaction_handoffs (
     session_id  TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     created_at   INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_compaction_handoffs_session ON compaction_handoffs(session_id);
@@ -2047,7 +2073,7 @@ CREATE TABLE compaction_shadows (
     payload_json TEXT NOT NULL,
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- ---- approval_grants (sandboxing part 1, §2) -------------------------------------
@@ -2087,7 +2113,7 @@ CREATE TABLE approval_grants (
             OR ((grant_kind <> 'command' OR verdict <> 'allow') AND risk_tier IS NULL)
         ),
     PRIMARY KEY (session_id, grant_kind, grant_key),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_approval_grants_session ON approval_grants (session_id);
@@ -2107,7 +2133,7 @@ CREATE TABLE loop_guard_rules (
     rule_verdict  TEXT    NOT NULL CHECK (rule_verdict IN ('accept', 'reject')),
     recorded_at   INTEGER NOT NULL,
     PRIMARY KEY (session_id, signature),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_loop_guard_rules_session ON loop_guard_rules (session_id);
@@ -2139,10 +2165,10 @@ CREATE VIRTUAL TABLE session_fts USING fts5(
 CREATE TABLE session_fts_docs (
     rowid      INTEGER PRIMARY KEY,
     row_kind   TEXT NOT NULL CHECK (row_kind IN ('title', 'message', 'compaction')),
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     seq        INTEGER,
     FOREIGN KEY (session_id, seq)
-        REFERENCES session_events(session_id, seq) ON DELETE CASCADE,
+        REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT,
     UNIQUE(row_kind, session_id, seq)
 );
 
@@ -2381,7 +2407,7 @@ CREATE TABLE guidance_contents (
 CREATE TABLE subagent_handles (
     handle          TEXT PRIMARY KEY,
     session_id      TEXT NOT NULL
-        REFERENCES sessions (session_id) ON DELETE CASCADE,
+        REFERENCES sessions (session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     agent           TEXT NOT NULL,
     transcript_json TEXT NOT NULL,
     created_at      INTEGER NOT NULL,
@@ -2429,7 +2455,7 @@ CREATE TABLE pins (
     pinned_ms   INTEGER NOT NULL,             -- epoch milliseconds (pin order)
     PRIMARY KEY (session_id, seq),
     FOREIGN KEY (session_id, seq)
-        REFERENCES session_events(session_id, seq) ON DELETE CASCADE
+        REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_pins_session ON pins (session_id, pinned_ms);
@@ -2446,7 +2472,7 @@ CREATE INDEX idx_pins_session ON pins (session_id, pinned_ms);
 
 CREATE TABLE prune_ledger (
     session_id  TEXT PRIMARY KEY
-        REFERENCES sessions (session_id) ON DELETE CASCADE,
+        REFERENCES sessions (session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     ledger_json TEXT NOT NULL,
     updated_at  INTEGER NOT NULL
 );
@@ -2475,7 +2501,7 @@ CREATE TABLE tandem_inference (
     response_json TEXT,                             -- full raw completion (text + tool calls)
     usage_json    TEXT,                             -- provider-reported token usage
     status        TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'errored', 'timed_out', 'cancelled')),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_tandem_session ON tandem_inference (session_id);
@@ -2488,7 +2514,7 @@ CREATE INDEX idx_tandem_parent  ON tandem_inference (parent_call_id);
 
 CREATE TABLE task_todos (
     id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     content TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'completed', 'cancelled')),
     priority INTEGER NOT NULL DEFAULT 0,
@@ -2507,8 +2533,8 @@ CREATE INDEX idx_task_todos_session_status_priority
 
 CREATE TABLE task_todo_notes (
     id TEXT PRIMARY KEY,
-    todo_id TEXT NOT NULL REFERENCES task_todos(id) ON DELETE CASCADE,
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    todo_id TEXT NOT NULL REFERENCES task_todos(id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     kind TEXT NOT NULL CHECK (kind IN ('summary', 'finding', 'decision', 'artifact', 'blocker', 'handoff')),
     body TEXT NOT NULL,
     author_agent TEXT NOT NULL,
@@ -2524,8 +2550,8 @@ CREATE INDEX idx_task_todo_notes_session
 
 CREATE TABLE task_todo_assignments (
     id TEXT PRIMARY KEY,
-    todo_id TEXT NOT NULL REFERENCES task_todos(id) ON DELETE CASCADE,
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    todo_id TEXT NOT NULL REFERENCES task_todos(id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     task_call_id TEXT NOT NULL,
     label TEXT NOT NULL DEFAULT 'default',
     child_agent TEXT NOT NULL,
@@ -2545,7 +2571,7 @@ CREATE INDEX idx_task_todo_assignments_session
 
 CREATE TABLE session_goals (
     id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     project_id TEXT NOT NULL,
     objective TEXT NOT NULL,
     context TEXT,
@@ -2590,7 +2616,7 @@ CREATE INDEX idx_session_goals_session_status
 
 CREATE TABLE goal_control_jobs (
     job_id TEXT PRIMARY KEY,
-    goal_id TEXT NOT NULL REFERENCES session_goals(id) ON DELETE CASCADE,
+    goal_id TEXT NOT NULL REFERENCES session_goals(id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attempt_generation INTEGER NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('planner', 'evaluator', 'gatekeeper', 'cold_skeptic')),
     slot INTEGER NOT NULL CHECK (slot >= 0),
@@ -2607,7 +2633,7 @@ CREATE INDEX idx_goal_control_jobs_registered
     ON goal_control_jobs(goal_id, state, attempt_generation);
 
 CREATE TABLE goal_root_turns (
-    goal_id TEXT NOT NULL REFERENCES session_goals(id) ON DELETE CASCADE,
+    goal_id TEXT NOT NULL REFERENCES session_goals(id) ON DELETE CASCADE ON UPDATE RESTRICT,
     attempt_generation INTEGER NOT NULL,
     turn_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'finished', 'cancelled')),
@@ -2668,15 +2694,15 @@ CREATE TABLE session_text_artifacts (
     CHECK((kind = 'tool_result' AND capture_reason IN ('display_truncation', 'prune_boundary')) OR (kind IN ('user_input_source', 'user_input_projection') AND capture_reason = 'oversized_user_input')),
     CHECK((owner_relation = 'source_user_input' AND owner_slot = -1) OR (owner_relation <> 'source_user_input' AND owner_slot >= 0)),
     CHECK((content_representation = 'raw' AND archive_import_id IS NULL) OR (content_representation = 'export_redacted' AND archive_import_id IS NOT NULL)),
-    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
-    FOREIGN KEY(archive_import_id) REFERENCES session_text_artifact_archive_imports(import_id) ON DELETE RESTRICT,
+    FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY(archive_import_id) REFERENCES session_text_artifact_archive_imports(import_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     -- This deferred circular ownership FK is intentionally the database-level
     -- backstop for direct SQL: an artifact cannot commit without exactly its
     -- one matching ref, while the normal composition can insert the immutable
     -- body before its ref in the same transaction.
     FOREIGN KEY(session_id,artifact_id,owner_event_seq,owner_relation,owner_slot)
       REFERENCES session_text_artifact_event_refs(session_id,artifact_id,event_seq,relation,owner_slot)
-      ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+      ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED
 );
 
 CREATE INDEX idx_session_text_artifacts_session_created
@@ -2690,7 +2716,7 @@ CREATE TABLE session_user_message_model_envelopes (
     event_seq INTEGER NOT NULL CHECK(typeof(event_seq) = 'integer' AND event_seq > 0),
     envelope_json TEXT NOT NULL CHECK(typeof(envelope_json) = 'text' AND length(CAST(envelope_json AS BLOB)) <= 131072 AND json_valid(envelope_json) AND json_type(envelope_json) = 'object'),
     PRIMARY KEY(session_id, event_seq),
-    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE
+    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- An accepted submission is immutable.  In particular, a restart must never
@@ -2710,8 +2736,8 @@ CREATE TABLE session_text_artifact_event_refs (
     owner_slot INTEGER NOT NULL CHECK(typeof(owner_slot) = 'integer' AND owner_slot >= -1),
     artifact_id TEXT NOT NULL CHECK(typeof(artifact_id) = 'text' AND length(artifact_id) = 36),
     PRIMARY KEY(session_id, artifact_id),
-    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE,
-    FOREIGN KEY(session_id, artifact_id) REFERENCES session_text_artifacts(session_id, artifact_id) ON DELETE CASCADE,
+    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY(session_id, artifact_id) REFERENCES session_text_artifacts(session_id, artifact_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK((relation = 'source_user_input' AND projection_slot IS NULL AND owner_slot = -1) OR (relation <> 'source_user_input' AND projection_slot IS NOT NULL AND owner_slot = projection_slot)),
     UNIQUE(session_id,artifact_id,event_seq,relation,owner_slot)
 );
@@ -2741,8 +2767,9 @@ CREATE TABLE session_text_artifact_projection_pending_slots (
     projection_slot INTEGER NOT NULL CHECK(typeof(projection_slot) = 'integer' AND projection_slot >= 0),
     unresolved INTEGER NOT NULL DEFAULT 1 CHECK(unresolved = 1),
     PRIMARY KEY(session_id, event_seq, projection_slot),
-    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE,
+    FOREIGN KEY(session_id, event_seq) REFERENCES session_events(session_id, seq) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY(unresolved) REFERENCES session_text_artifact_projection_pending_sentinel(unresolved)
+        ON DELETE RESTRICT ON UPDATE RESTRICT
         DEFERRABLE INITIALLY DEFERRED
 );
 
@@ -3202,9 +3229,9 @@ CREATE TABLE session_text_artifact_quota_reservations (
     updated_at INTEGER NOT NULL CHECK(typeof(updated_at) = 'integer' AND updated_at BETWEEN -9223372036854775808 AND 9223372036854775807),
     PRIMARY KEY(session_id, client_submission_id),
     CHECK((model_fence_generation IS NULL) = (model_fence_json IS NULL)),
-    FOREIGN KEY(session_id, client_submission_id) REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE,
-    FOREIGN KEY(session_id, operation_id) REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE,
-    FOREIGN KEY(session_id, queue_item_id) REFERENCES message_queue_items(session_id, queue_item_id) ON DELETE CASCADE
+    FOREIGN KEY(session_id, client_submission_id) REFERENCES message_submission_receipts(session_id, client_submission_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY(session_id, operation_id) REFERENCES message_operation_receipts(session_id, operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY(session_id, queue_item_id) REFERENCES message_queue_items(session_id, queue_item_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 -- The Rust admission planner is an optimization only. These transaction-safe
 -- SQL guards make committed bodies plus live worst-case reservations a hard
@@ -3323,7 +3350,7 @@ CREATE TABLE task_delegation_jobs (
     final_delivered INTEGER NOT NULL DEFAULT 0 CHECK (final_delivered IN (0, 1)),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE TABLE task_delegation_children (
@@ -3353,7 +3380,7 @@ CREATE TABLE task_delegation_children (
     requested_cwd TEXT,
     resolved_cwd TEXT,
     PRIMARY KEY (task_call_id, label),
-    FOREIGN KEY (task_call_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE CASCADE
+    FOREIGN KEY (task_call_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_task_delegation_jobs_session_status
@@ -3371,7 +3398,7 @@ CREATE TABLE task_delegation_steers (
     delivered INTEGER NOT NULL DEFAULT 0 CHECK (delivered IN (0, 1)),
     created_at INTEGER NOT NULL,
     delivered_at INTEGER,
-    FOREIGN KEY (task_call_id, label) REFERENCES task_delegation_children(task_call_id, label) ON DELETE CASCADE
+    FOREIGN KEY (task_call_id, label) REFERENCES task_delegation_children(task_call_id, label) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_task_delegation_steers_pending
@@ -3391,8 +3418,8 @@ CREATE TABLE task_delegation_payloads (
     created_at INTEGER NOT NULL,
     delivered_at INTEGER,
     PRIMARY KEY (task_call_id, label),
-    FOREIGN KEY (task_call_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE CASCADE,
-    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (task_call_id) REFERENCES task_delegation_jobs(task_call_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK ((body_inline IS NOT NULL) OR (sidecar_path IS NOT NULL))
 );
 
@@ -3463,7 +3490,7 @@ CREATE TABLE paused_session_work (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     resolved_at INTEGER,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_paused_session_work_status_updated
@@ -3481,7 +3508,7 @@ CREATE TABLE skill_pairs (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (session_id, call_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_skill_pairs_session_owner
@@ -3534,7 +3561,7 @@ CREATE TABLE retention_meta (
 -- The session's living plan document (plan mode), one row per session.
 
 CREATE TABLE session_plan_docs (
-    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     content TEXT NOT NULL,
     revision INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
@@ -3573,7 +3600,7 @@ CREATE TABLE secure_key_versions (
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL,
     PRIMARY KEY (namespace, version),
-    FOREIGN KEY (namespace) REFERENCES secure_key_namespaces(namespace)
+    FOREIGN KEY (namespace) REFERENCES secure_key_namespaces(namespace) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_secure_key_versions_state
@@ -3591,7 +3618,7 @@ CREATE TABLE secure_key_sagas (
     key_digest  TEXT,
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL,
-    FOREIGN KEY (namespace) REFERENCES secure_key_namespaces(namespace)
+    FOREIGN KEY (namespace) REFERENCES secure_key_namespaces(namespace) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_secure_key_sagas_ns ON secure_key_sagas (namespace, kind);
@@ -3612,7 +3639,7 @@ CREATE TABLE secure_key_consumer_refs (
     updated_at      INTEGER NOT NULL,
     UNIQUE (namespace, version, consumer_kind, consumer_id),
     FOREIGN KEY (namespace, version)
-        REFERENCES secure_key_versions(namespace, version)
+        REFERENCES secure_key_versions(namespace, version) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_secure_key_refs_version_state
@@ -3701,8 +3728,8 @@ CREATE TABLE session_text_artifact_run_invocation_bindings (
     run_invocation_id TEXT NOT NULL,
     origin_principal_digest TEXT NOT NULL,
     PRIMARY KEY(session_id, client_submission_id),
-    FOREIGN KEY(session_id, client_submission_id) REFERENCES session_text_artifact_quota_reservations(session_id, client_submission_id) ON DELETE CASCADE,
-    FOREIGN KEY(run_invocation_id) REFERENCES run_invocations(client_submission_id) ON DELETE RESTRICT
+    FOREIGN KEY(session_id, client_submission_id) REFERENCES session_text_artifact_quota_reservations(session_id, client_submission_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY(run_invocation_id) REFERENCES run_invocations(client_submission_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 CREATE TRIGGER text_artifact_run_binding_validate_insert
 BEFORE INSERT ON session_text_artifact_run_invocation_bindings
@@ -3773,7 +3800,7 @@ CREATE TABLE execution_containments (
     created_at_wall_ms      INTEGER NOT NULL,
     updated_at_wall_ms      INTEGER NOT NULL,
     emptied_at_wall_ms      INTEGER,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_execution_containments_session
@@ -3825,10 +3852,10 @@ CREATE TABLE write_scope_leases (
     created_at_wall_ms      INTEGER NOT NULL,
     updated_at_wall_ms      INTEGER NOT NULL,
     released_at_wall_ms     INTEGER,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
-    FOREIGN KEY (parent_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (parent_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_write_scope_leases_session
@@ -3949,9 +3976,9 @@ CREATE TABLE write_scope_transfers (
     version                     INTEGER NOT NULL,
     created_at_wall_ms          INTEGER NOT NULL,
     updated_at_wall_ms          INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
-    FOREIGN KEY (parent_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT,
-    FOREIGN KEY (child_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (parent_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (child_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_write_scope_transfers_parent
@@ -4076,8 +4103,8 @@ CREATE TABLE write_scope_permits (
     containment_id          TEXT,
     acquired_at_wall_ms     INTEGER NOT NULL,
     released_at_wall_ms     INTEGER,
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
-    FOREIGN KEY (lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_write_scope_permits_lease
@@ -4114,12 +4141,12 @@ CREATE TABLE workspace_leases (
     created_at_unix_ms        INTEGER NOT NULL,
     updated_at_unix_ms        INTEGER NOT NULL,
     UNIQUE (workspace_lease_id, session_id),
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
-    FOREIGN KEY (write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
+    FOREIGN KEY (write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (pinned_by_agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT,
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     CHECK ((pinned_at_unix_ms IS NULL) = (pinned_by_agent_instance_id IS NULL)),
     CHECK ((state = 'cleaned') = (terminal_reason IS NOT NULL)),
     CHECK (
@@ -4236,11 +4263,11 @@ CREATE TABLE task_artifacts (
     -- Artifact provenance is session-owned even though its source lease and
     -- agent references use restrictive composite FKs for normal lifecycle
     -- operations. Session teardown must collect the whole recovery graph.
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (source_workspace_lease_id, session_id)
-        REFERENCES workspace_leases(workspace_lease_id, session_id) ON DELETE RESTRICT,
+        REFERENCES workspace_leases(workspace_lease_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     FOREIGN KEY (agent_instance_id, session_id)
-        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT
+        REFERENCES agent_instances(agent_instance_id, session_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_task_artifacts_source_state
@@ -4279,10 +4306,10 @@ CREATE TABLE task_artifact_integration_receipts (
     -- Keep the immutable receipt in the session-owned cascade graph as well
     -- as under its artifact. This avoids a restrictive target-scope FK
     -- disconnecting receipt cleanup from session lifecycle ownership.
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     FOREIGN KEY (artifact_id, session_id)
-        REFERENCES task_artifacts(artifact_id, session_id) ON DELETE CASCADE,
-    FOREIGN KEY (target_write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT
+        REFERENCES task_artifacts(artifact_id, session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    FOREIGN KEY (target_write_scope_lease_id) REFERENCES write_scope_leases(lease_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_task_artifact_receipts_target
@@ -4435,7 +4462,7 @@ END;
 -- paths/URLs, credentials, headers, provider payloads, or signed query
 -- values, and never spool HMAC key material.
 --
--- Deliberately NOT `ON DELETE CASCADE` from sessions: session deletion writes
+-- Deliberately NOT `ON DELETE CASCADE ON UPDATE RESTRICT` from sessions: session deletion writes
 -- an external_journal_session_tombstones row and unresolved operations
 -- survive it, so late provider evidence still resolves exactly once without
 -- recreating session content.
@@ -4516,7 +4543,7 @@ CREATE TABLE external_journal_events (
     cancellation_requested_at_wall_ms INTEGER,
     emitted_at_wall_ms                INTEGER NOT NULL,
     FOREIGN KEY (operation_id)
-        REFERENCES external_journal_operations (operation_id) ON DELETE CASCADE
+        REFERENCES external_journal_operations (operation_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE UNIQUE INDEX uq_external_journal_events_version
@@ -4543,7 +4570,7 @@ CREATE TABLE external_journal_spool_capsules (
     quarantined        INTEGER NOT NULL DEFAULT 0 CHECK (quarantined IN (0, 1)),
     created_at_wall_ms INTEGER NOT NULL,
     FOREIGN KEY (operation_id)
-        REFERENCES external_journal_operations (operation_id) ON DELETE CASCADE
+        REFERENCES external_journal_operations (operation_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_external_journal_capsules_partition
@@ -4844,7 +4871,7 @@ CREATE TABLE sealed_global_project_grants (
     project_key   TEXT    NOT NULL,
     granted_at_ms INTEGER NOT NULL,
     PRIMARY KEY (record_id, project_key),
-    FOREIGN KEY (record_id) REFERENCES sealed_value_records(record_id) ON DELETE CASCADE
+    FOREIGN KEY (record_id) REFERENCES sealed_value_records(record_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 -- The exact grant tuple for one immutable action instance. Every targeting
@@ -4867,11 +4894,11 @@ CREATE TABLE sealed_action_grants (
     issued_at_ms       INTEGER NOT NULL,
     expires_at_ms      INTEGER,
     revoked_at_ms      INTEGER,
-    FOREIGN KEY (record_id) REFERENCES sealed_value_records(record_id) ON DELETE CASCADE,
+    FOREIGN KEY (record_id) REFERENCES sealed_value_records(record_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     -- A grant names an exact session. When that session is deleted the grant
     -- must go with it: an outstanding grant naming a dead session would be a
     -- capability nobody can see and nobody can revoke.
-    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_sealed_action_grants_lookup
@@ -5010,7 +5037,7 @@ CREATE INDEX idx_sealed_recovery_audit_record
 -- blocks or aliases a fresh append.
 CREATE TABLE protected_redaction_history (
     history_id       TEXT    PRIMARY KEY,
-    session_id       TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id       TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     sealed_record_id TEXT,
     sealed_version   INTEGER,
     source           TEXT    NOT NULL CHECK (source IN ('Sealed', 'Environment', 'Credential', 'ContainedLeak')),
@@ -5057,7 +5084,7 @@ CREATE TABLE protected_redaction_artifact_refs (
     history_id    TEXT    NOT NULL,
     created_at_ms INTEGER NOT NULL,
     PRIMARY KEY (artifact_kind, artifact_id, history_id),
-    FOREIGN KEY (history_id) REFERENCES protected_redaction_history(history_id) ON DELETE CASCADE
+    FOREIGN KEY (history_id) REFERENCES protected_redaction_history(history_id) ON DELETE CASCADE ON UPDATE RESTRICT
 );
 
 CREATE INDEX idx_protected_redaction_artifact_refs_history
@@ -5079,7 +5106,7 @@ CREATE INDEX idx_protected_redaction_artifact_refs_artifact
 -- safe `seen` metadata and clears rotation state.
 CREATE TABLE protected_leak_records (
     report_id        TEXT    PRIMARY KEY,
-    session_id       TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id       TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     history_id       TEXT    NOT NULL,
     -- Keyed fingerprint: SHA-256(session_id || source || literal_fingerprint).
     -- Safe to expose; does not reveal the literal.
@@ -5110,7 +5137,7 @@ CREATE TABLE protected_leak_records (
     last_reported_ms  INTEGER NOT NULL,
     contained_at_ms   INTEGER,
     retired_at_ms     INTEGER,
-    FOREIGN KEY (history_id) REFERENCES protected_redaction_history(history_id) ON DELETE CASCADE,
+    FOREIGN KEY (history_id) REFERENCES protected_redaction_history(history_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     UNIQUE (session_id, leak_fingerprint)
 );
 CREATE INDEX idx_protected_leak_records_session
@@ -5164,7 +5191,7 @@ CREATE TABLE secret_vault_items (
         'redaction_table'
     )),
     item_id       TEXT    NOT NULL,
-    key_version   INTEGER NOT NULL REFERENCES secret_vault_keys(key_version),
+    key_version   INTEGER NOT NULL REFERENCES secret_vault_keys(key_version) ON DELETE RESTRICT ON UPDATE RESTRICT,
     nonce         BLOB    NOT NULL CHECK (length(nonce) = 12),
     ciphertext    BLOB    NOT NULL CHECK (length(ciphertext) >= 16),
     created_at    INTEGER NOT NULL,
@@ -5408,7 +5435,7 @@ CREATE TABLE assistant_mutation_journals (
     PRIMARY KEY (owner_digest, client_operation_id),
     FOREIGN KEY (owner_digest, client_operation_id)
         REFERENCES local_operation_receipts(owner_digest, client_operation_id)
-        ON UPDATE RESTRICT ON DELETE CASCADE,
+        ON UPDATE RESTRICT ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK (length(trim(owner_digest)) > 0),
     CHECK (length(trim(client_operation_id)) > 0),
     CHECK (length(trim(requested_project_root)) > 0),
@@ -5684,7 +5711,7 @@ CREATE TABLE image_config_mutation_journals (
     PRIMARY KEY (owner_digest, client_operation_id),
     FOREIGN KEY (owner_digest, client_operation_id)
         REFERENCES local_operation_receipts(owner_digest, client_operation_id)
-        ON DELETE CASCADE,
+        ON DELETE CASCADE ON UPDATE RESTRICT,
     CHECK (length(trim(project_root)) > 0),
     CHECK (length(trim(target_path)) > 0)
 );
@@ -5759,7 +5786,7 @@ CREATE TABLE agent_installations (
 );
 
 CREATE TABLE installation_observations (
-    installation_id              TEXT PRIMARY KEY REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    installation_id              TEXT PRIMARY KEY REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     observed_digest              TEXT NOT NULL,
     observation_revision         INTEGER NOT NULL CHECK (observation_revision >= 1),
     review_state                  TEXT NOT NULL CHECK (review_state IN ('reviewed', 'rebind_required')),
@@ -5768,7 +5795,7 @@ CREATE TABLE installation_observations (
 
 CREATE TABLE agent_model_bindings (
     binding_id                    TEXT PRIMARY KEY,
-    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     definition_digest             TEXT NOT NULL,
     slot_id                       TEXT NOT NULL,
     provider_profile_handle       TEXT NOT NULL,
@@ -5811,7 +5838,7 @@ CREATE TABLE installation_operations (
 
 CREATE TABLE installation_continuations (
     continuation_token           TEXT PRIMARY KEY,
-    operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE,
+    operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     choice_set_json              TEXT NOT NULL,
     expires_at_unix_ms           INTEGER NOT NULL,
     submitted_choice_id          TEXT,
@@ -5824,7 +5851,7 @@ ON installation_continuations(state, expires_at_unix_ms);
 
 CREATE TABLE installation_journals (
     journal_id                   TEXT PRIMARY KEY,
-    operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE,
+    operation_id                 TEXT NOT NULL UNIQUE REFERENCES installation_operations(operation_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     checkpoint                   TEXT NOT NULL CHECK (checkpoint IN ('staged', 'db_committed', 'file_renamed', 'complete')),
     staged_file_metadata_json    TEXT,
     prior_file_metadata_json     TEXT,
@@ -5836,20 +5863,20 @@ CREATE TABLE installation_journals (
 -- Bind requests get their own receipt because a retry must be distinguished
 -- from a different mutation that happens to choose identical model metadata.
 CREATE TABLE agent_binding_receipts (
-    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     definition_digest             TEXT NOT NULL,
     slot_id                       TEXT NOT NULL,
     idempotency_key               TEXT NOT NULL,
     request_fingerprint           TEXT NOT NULL,
-    binding_id                    TEXT NOT NULL REFERENCES agent_model_bindings(binding_id) ON DELETE RESTRICT,
+    binding_id                    TEXT NOT NULL REFERENCES agent_model_bindings(binding_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     created_at_unix_ms            INTEGER NOT NULL,
     PRIMARY KEY (installation_id, definition_digest, slot_id, idempotency_key)
 );
 
 CREATE TABLE agent_profile_snapshots (
     snapshot_id                   TEXT PRIMARY KEY,
-    session_id                    TEXT NOT NULL UNIQUE REFERENCES sessions(session_id) ON DELETE CASCADE,
-    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT,
+    session_id                    TEXT NOT NULL UNIQUE REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
+    installation_id               TEXT NOT NULL REFERENCES agent_installations(installation_id) ON DELETE RESTRICT ON UPDATE RESTRICT,
     schema_version                INTEGER NOT NULL CHECK (schema_version >= 1),
     canonical_payload             BLOB NOT NULL,
     canonical_payload_digest      TEXT NOT NULL,
@@ -5861,10 +5888,10 @@ CREATE TABLE agent_profile_snapshots (
 );
 
 CREATE TABLE agent_session_preparations (
-    session_id                    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id                    TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     idempotency_key               TEXT NOT NULL,
     request_fingerprint           TEXT NOT NULL,
-    snapshot_id                   TEXT NOT NULL UNIQUE REFERENCES agent_profile_snapshots(snapshot_id) ON DELETE CASCADE,
+    snapshot_id                   TEXT NOT NULL UNIQUE REFERENCES agent_profile_snapshots(snapshot_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     -- This receipt is the module-owned Prepared marker.  A pre-existing
     -- ordinary active session can never acquire a profile snapshot later.
     -- `0` means the caller atomically claimed a pre-registered, idle
@@ -5884,13 +5911,15 @@ CREATE TABLE agent_session_preparations (
 -- the same transaction as its immutable snapshot; an ordinary active session
 -- has no marker and is therefore never silently adopted.
 CREATE TABLE agent_session_preparation_claims (
-    session_id                    TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+    session_id                    TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE ON UPDATE RESTRICT,
     claim_token                   TEXT NOT NULL UNIQUE,
     claim_state                   TEXT NOT NULL CHECK (claim_state IN ('eligible', 'claimed', 'running', 'terminal')),
     created_at_unix_ms            INTEGER NOT NULL,
     claimed_at_unix_ms            INTEGER,
     terminal_at_unix_ms           INTEGER
 );
+CREATE INDEX idx_agent_session_preparation_claims_recovery
+    ON agent_session_preparation_claims(claim_state, session_id);
 
 -- Once an owner has offered an existing idle session to agent preparation,
 -- ordinary dispatch must not race in work before the preparation claim either

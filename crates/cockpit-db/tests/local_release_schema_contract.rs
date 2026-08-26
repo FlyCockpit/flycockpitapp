@@ -537,6 +537,48 @@ fn sql_trigger<'a>(sql: &'a str, name: &str, table: &str) -> &'a str {
     trigger
 }
 
+fn semantic_transition_guard_tables(sql: &str) -> BTreeSet<String> {
+    sql.split("CREATE TRIGGER ")
+        .skip(1)
+        .filter_map(|trigger| {
+            let body = trigger.split("END;").next()?;
+            let header = body.split("BEGIN").next()?;
+            if !header.contains(" UPDATE ") && !header.contains("UPDATE ON ") {
+                return None;
+            }
+            let field = ["state", "phase"].into_iter().find(|field| {
+                let old = format!("OLD.{field}");
+                let new = format!("NEW.{field}");
+                if !body.contains(&old) || !body.contains(&new) {
+                    return false;
+                }
+                body.contains(&format!("CASE {old}"))
+                    || body.contains(&format!("CASE {new}"))
+                    || body.contains(&format!("{old} || '>' || {new}"))
+                    || body.contains(&format!("{old}<>{new}"))
+                    || body.contains(&format!("{old} <> {new}"))
+                    || body.lines().any(|line| {
+                        line.contains(&old)
+                            && line.contains(&new)
+                            && ["=", "<>", "!=", " IN ", " NOT IN "]
+                                .iter()
+                                .any(|operator| line.contains(operator))
+                    })
+                    || (body.contains(&format!("{old} = '"))
+                        && (body.contains(&format!("{new} <> '"))
+                            || body.contains(&format!("{new} != '"))
+                            || body.contains(&format!("{new} NOT IN ("))))
+            });
+            field?;
+            let tokens = header.split_whitespace().collect::<Vec<_>>();
+            tokens
+                .windows(2)
+                .rev()
+                .find_map(|pair| (pair[0] == "ON").then(|| pair[1].trim().to_owned()))
+        })
+        .collect()
+}
+
 fn sql_registry_edges(sql: &str, registry: &str) -> BTreeSet<String> {
     let values = sql
         .split(&format!("INSERT INTO {registry} VALUES"))
@@ -584,7 +626,18 @@ fn sql_state_check(declaration: &str) -> &str {
     .into_iter()
     .find_map(|marker| declaration.split(marker).nth(1))
     .and_then(|tail| tail.split("))").next())
-    .unwrap_or_else(|| panic!("table has no closed SQL state CHECK"))
+    .or_else(|| {
+        [
+            "CHECK (phase IN (",
+            "CHECK(phase IN (",
+            "CHECK (phase IN(",
+            "CHECK(phase IN(",
+        ]
+        .into_iter()
+        .find_map(|marker| declaration.split(marker).nth(1))
+        .and_then(|tail| tail.split("))").next())
+    })
+    .unwrap_or_else(|| panic!("table has no closed SQL state/phase CHECK"))
 }
 
 fn sql_only_edges(name: &str, trigger: &str) -> BTreeSet<String> {
@@ -621,6 +674,96 @@ fn sql_only_edges(name: &str, trigger: &str) -> BTreeSet<String> {
         "image_security_recovery_audit" => {
             assert!(trigger.contains("OLD.state!='recorded'"));
             cartesian_edges("recorded", quoted_set_after(trigger, "NEW.state NOT IN ("))
+        }
+        "write_scope_transfer" => {
+            let states = [
+                "prepared",
+                "parent_excluded",
+                "child_activated",
+                "child_terminal",
+                "parent_restored",
+                "committed",
+            ];
+            for (index, state) in states.iter().enumerate() {
+                assert!(
+                    trigger.contains(&format!("WHEN '{state}' THEN {index}")),
+                    "write-scope transfer SQL phase ordering drifted"
+                );
+            }
+            let mut edges = states
+                .iter()
+                .map(|state| format!("{state}>{state}"))
+                .collect::<BTreeSet<_>>();
+            edges.extend(
+                states
+                    .windows(2)
+                    .map(|pair| format!(">{}", pair[1]))
+                    .zip(states)
+                    .map(|(to, from)| format!("{from}{to}")),
+            );
+            assert!(trigger.contains("NEW.phase = 'committed' AND OLD.child_lease_id IS NULL"));
+            edges.insert("prepared>committed".to_owned());
+            edges
+        }
+        "write_scope_permit" => {
+            assert!(trigger.contains("OLD.state = 'released' AND NEW.state <> 'released'"));
+            BTreeSet::from([
+                "held>held".to_owned(),
+                "held>released".to_owned(),
+                "released>released".to_owned(),
+            ])
+        }
+        "remote_rename" => {
+            let cases = [
+                (
+                    "prepared",
+                    &["prepared", "artifact_synced", "effect_unknown"][..],
+                ),
+                (
+                    "artifact_synced",
+                    &[
+                        "artifact_synced",
+                        "renamed",
+                        "applied_mismatch",
+                        "effect_unknown",
+                    ][..],
+                ),
+                (
+                    "renamed",
+                    &["renamed", "source_parent_synced", "effect_unknown"][..],
+                ),
+                (
+                    "source_parent_synced",
+                    &[
+                        "source_parent_synced",
+                        "target_parent_synced",
+                        "effect_unknown",
+                    ][..],
+                ),
+                (
+                    "target_parent_synced",
+                    &["target_parent_synced", "applied", "effect_unknown"][..],
+                ),
+                ("applied", &["applied", "ledger_committed"][..]),
+            ];
+            let mut edges = BTreeSet::new();
+            for (from, destinations) in cases {
+                let marker = format!("WHEN '{from}' THEN NEW.state NOT IN (");
+                let parsed = quoted_set_after(trigger, &marker);
+                assert_eq!(
+                    parsed,
+                    destinations
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect(),
+                    "remote rename SQL CASE drifted for {from}"
+                );
+                edges.extend(destinations.iter().map(|to| format!("{from}>{to}")));
+            }
+            for terminal in ["applied_mismatch", "effect_unknown", "ledger_committed"] {
+                edges.insert(format!("{terminal}>{terminal}"));
+            }
+            edges
         }
         _ => panic!("SQL-only family {name} needs a registry or exact extractor"),
     }
@@ -925,7 +1068,11 @@ fn ownership() -> BTreeMap<String, Ownership> {
         }
         let sources = edges
             .iter()
-            .filter_map(|edge| edge.split_once('>').map(|(from, _)| from.to_owned()))
+            .filter_map(|edge| {
+                edge.split_once('>')
+                    .filter(|(from, to)| from != to)
+                    .map(|(from, _)| from.to_owned())
+            })
             .collect::<BTreeSet<_>>();
         assert_eq!(
             declared_terminals,
@@ -943,32 +1090,38 @@ fn ownership() -> BTreeMap<String, Ownership> {
         include_str!("../src/db/migrations/0001_remote_profile.sql"),
     ]
     .join("\n");
-    let guarded_tables = sql
-        .split("CREATE TRIGGER ")
-        .skip(1)
-        .filter_map(|trigger| {
-            let name = trigger.split_whitespace().next()?;
-            let is_graph = name.contains("state_graph")
-                || name.contains("legal_transition")
-                || name.contains("legal_edge")
-                || name.contains("transition_guard")
-                || name.ends_with("_transition")
-                || name.contains("terminal_final")
-                || name.contains("terminal_is_final");
-            if !is_graph || name.contains("registry") {
-                return None;
-            }
-            let header = trigger
-                .split("WHEN")
-                .next()
-                .or_else(|| trigger.split("BEGIN").next())?;
-            let tokens = header.split_whitespace().collect::<Vec<_>>();
-            tokens
-                .windows(2)
-                .rev()
-                .find_map(|pair| (pair[0] == "ON").then(|| pair[1].trim().to_owned()))
-        })
-        .collect::<BTreeSet<_>>();
+    let guarded_tables = semantic_transition_guard_tables(&sql);
+    let explicit_guarded_tables = [
+        "agent_editor_leases",
+        "external_journal_operations",
+        "image_generation_artifact_cleanup_intents",
+        "image_generation_artifact_components",
+        "image_generation_artifact_security_recovery_attempts",
+        "image_generation_artifact_security_recovery_audits",
+        "image_generation_artifacts",
+        "image_generation_attempts",
+        "image_generation_jobs",
+        "image_generation_late_publication_leases",
+        "image_generation_response_publication_intents",
+        "image_generation_slots",
+        "local_operation_receipts",
+        "media_repair_attempts",
+        "media_reservations",
+        "remote_attachment_operations",
+        "remote_rename_journal",
+        "task_artifacts",
+        "workspace_leases",
+        "write_scope_leases",
+        "write_scope_permits",
+        "write_scope_transfers",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        guarded_tables, explicit_guarded_tables,
+        "semantic SQL transition-guard registry drifted"
+    );
     for guarded_table in &guarded_tables {
         let classification = table
             .get(guarded_table)
@@ -982,6 +1135,11 @@ fn ownership() -> BTreeMap<String, Ownership> {
     }
     let exact_guarded_tables = families
         .values()
+        .filter(|family| {
+            family
+                .as_table()
+                .is_some_and(|family| family.get("state_columns").is_none())
+        })
         .chain(sql_families.values())
         .filter_map(|family| family.as_table()?.get("table")?.as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();

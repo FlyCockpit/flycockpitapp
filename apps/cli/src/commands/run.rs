@@ -1901,6 +1901,25 @@ mod tests {
     }
 
     #[test]
+    fn injected_signal_cleanup_during_preflight_is_joined_before_exit_selection() {
+        let cleanup_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal_complete = cleanup_complete.clone();
+        let signal_cleanup = std::thread::spawn(move || {
+            signal_complete.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let result: anyhow::Result<()> = finish_owned_run(
+            Err(RunPreflightFailure::new(2, "invalid_arguments", "injected").into()),
+            || {
+                signal_cleanup.join().unwrap();
+                assert!(cleanup_complete.load(std::sync::atomic::Ordering::SeqCst));
+                Ok(())
+            },
+        );
+        assert!(cleanup_complete.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(result.unwrap_err().is::<RunPreflightFailure>());
+    }
+
+    #[test]
     fn owner_and_signal_cleanup_are_armed_before_run_preflight() {
         let source = include_str!("run.rs");
         let start = source.find("pub async fn run(").unwrap();
@@ -1918,6 +1937,31 @@ mod tests {
         assert!(guard < signal && signal < preflight);
         assert!(preflight < drop_guard && drop_guard < exit);
         assert_eq!(run.matches("std::process::exit(").count(), 1);
+    }
+
+    #[test]
+    fn every_ephemeral_cli_command_publishes_owner_to_its_signal_watcher() {
+        for (name, source) in [
+            ("run", include_str!("run.rs")),
+            ("learn", include_str!("learn.rs")),
+            ("init", include_str!("init.rs")),
+            ("doctor", include_str!("doctor.rs")),
+            ("session", include_str!("session.rs")),
+            ("invocation", include_str!("invocation.rs")),
+        ] {
+            assert!(
+                source.contains("take_owned_daemon_guard()"),
+                "{name} must take provisional process ownership"
+            );
+            assert!(
+                source.contains("spawn_signal_shutdown(guard.as_ref(), true)"),
+                "{name} must arm signal teardown immediately after ownership transfer"
+            );
+            assert!(
+                source.contains("drop(guard)"),
+                "{name} must release the guard before selecting an exit path"
+            );
+        }
     }
 
     #[test]

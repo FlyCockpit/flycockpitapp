@@ -27,6 +27,7 @@ pub struct DoctorCouldNotRun(#[source] pub anyhow::Error);
 
 use crate::cli::DoctorArgs;
 use crate::daemon::client::{LifecycleMode, probe_or_spawn};
+use crate::daemon::ephemeral_guard::spawn_signal_shutdown;
 use crate::daemon::proto::{Request, Response};
 
 const DIAGNOSTIC_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -84,6 +85,7 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
     // daemon. The guard owns only a daemon this command spawned, and reaps it
     // on every return path after the socket RPC has been attempted.
     let guard = daemon.take_owned_daemon_guard();
+    let signal_task = spawn_signal_shutdown(guard.as_ref(), true);
     let response = daemon
         .client
         .request(build_doctor_request(&args, no_sandbox))
@@ -94,7 +96,11 @@ pub async fn run(args: DoctorArgs, no_sandbox: bool) -> Result<()> {
                 DoctorCouldNotRun(anyhow::anyhow!("daemon rejected doctor snapshot: {error}"))
             })
         });
+    if let Some(task) = signal_task {
+        task.abort();
+    }
     let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
+    drop(guard);
     let response = match (response, shutdown) {
         (Ok(response), Ok(())) => Ok(response),
         (Err(error), Ok(())) => Err(error),

@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::cli::{InvocationCancelArgs, InvocationCommand, InvocationStatusArgs, OutputFormat};
 use crate::daemon::client::{LifecycleMode, probe_or_spawn};
+use crate::daemon::ephemeral_guard::{aggregate_shutdown_result, spawn_signal_shutdown};
 use crate::daemon::proto::{self, Request, Response};
 
 pub async fn run(cmd: InvocationCommand) -> Result<()> {
@@ -18,53 +19,70 @@ async fn status(args: InvocationStatusArgs) -> Result<()> {
     let id = parse_canonical_uuid(&args.client_submission_id).map_err(|e| {
         exit_usage(2, &e);
     })?;
-    let client = connect()
+    let mut daemon = connect()
         .await
         .map_err(|e| exit_transport(4, &format!("{e:#}")))?;
-    match client
+    let client = daemon.client.clone();
+    let guard = daemon.take_owned_daemon_guard();
+    let signal_task = spawn_signal_shutdown(guard.as_ref(), true);
+    let result = match client
         .request(Request::GetRunInvocationStatus {
             client_submission_id: id,
         })
         .await
     {
-        Ok(Ok(Response::RunInvocationStatus { status })) => {
-            print_status(args.format, &status)?;
-            Ok(())
+        Ok(Ok(Response::RunInvocationStatus { status })) => print_status(args.format, &status),
+        Ok(Ok(other)) => {
+            Err(InvocationCommandError::transport(format!("unexpected response: {other:?}")).into())
         }
-        Ok(Ok(other)) => exit_transport(4, &format!("unexpected response: {other:?}")),
-        Ok(Err(error)) => map_error_exit(&error),
-        Err(error) => exit_transport(4, &error.to_string()),
+        Ok(Err(error)) => Err(map_daemon_error(&error).into()),
+        Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
+    };
+    if let Some(task) = signal_task {
+        task.abort();
     }
+    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
+    drop(guard);
+    finish_invocation_result(aggregate_shutdown_result(result, shutdown))
 }
 
 async fn cancel(args: InvocationCancelArgs) -> Result<()> {
     let id = parse_canonical_uuid(&args.client_submission_id).map_err(|e| {
         exit_usage(2, &e);
     })?;
-    let client = connect()
+    let mut daemon = connect()
         .await
         .map_err(|e| exit_transport(4, &format!("{e:#}")))?;
-    match client
+    let client = daemon.client.clone();
+    let guard = daemon.take_owned_daemon_guard();
+    let signal_task = spawn_signal_shutdown(guard.as_ref(), true);
+    let result = match client
         .request(Request::CancelRunInvocation {
             client_submission_id: id,
         })
         .await
     {
         Ok(Ok(Response::RunInvocationCancelResult { result })) => {
-            print_cancel(args.format, &result)?;
-            Ok(())
+            print_cancel(args.format, &result)
         }
-        Ok(Ok(other)) => exit_transport(4, &format!("unexpected response: {other:?}")),
-        Ok(Err(error)) => map_error_exit(&error),
-        Err(error) => exit_transport(4, &error.to_string()),
+        Ok(Ok(other)) => {
+            Err(InvocationCommandError::transport(format!("unexpected response: {other:?}")).into())
+        }
+        Ok(Err(error)) => Err(map_daemon_error(&error).into()),
+        Err(error) => Err(InvocationCommandError::transport(error.to_string()).into()),
+    };
+    if let Some(task) = signal_task {
+        task.abort();
     }
+    let shutdown = guard.as_ref().map_or(Ok(()), |guard| guard.shutdown());
+    drop(guard);
+    finish_invocation_result(aggregate_shutdown_result(result, shutdown))
 }
 
-async fn connect() -> Result<cockpit_client::DaemonClient> {
-    let daemon = probe_or_spawn(LifecycleMode::AttachOrEphemeral)
+async fn connect() -> Result<crate::daemon::client::ConnectedDaemon> {
+    probe_or_spawn(LifecycleMode::AttachOrEphemeral)
         .await
-        .context("connecting to daemon")?;
-    Ok(daemon.client)
+        .context("connecting to daemon")
 }
 
 /// Accept only the canonical lowercase hyphenated UUID spelling.
@@ -161,25 +179,53 @@ fn print_cancel(format: OutputFormat, result: &proto::RunInvocationCancelResultV
     Ok(())
 }
 
-fn map_error_exit(error: &proto::ErrorPayload) -> ! {
-    match error.code {
-        proto::ErrorCode::InvocationNotFound => {
-            eprintln!("invocation not found");
-            std::process::exit(5);
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct InvocationCommandError {
+    exit_code: i32,
+    message: String,
+}
+
+impl InvocationCommandError {
+    fn transport(message: String) -> Self {
+        Self {
+            exit_code: 4,
+            message,
         }
+    }
+}
+
+fn map_daemon_error(error: &proto::ErrorPayload) -> InvocationCommandError {
+    let exit_code = match error.code {
+        proto::ErrorCode::InvocationNotFound => 5,
         proto::ErrorCode::InvocationLookupBusy
         | proto::ErrorCode::InvocationCapacityExceeded
         | proto::ErrorCode::ClientSubmissionIdUnavailable
         | proto::ErrorCode::Authorization
         | proto::ErrorCode::ProtocolVersion
-        | proto::ErrorCode::Unavailable => {
-            eprintln!("{}", error.message);
-            std::process::exit(4);
+        | proto::ErrorCode::Unavailable => 4,
+        _ => 4,
+    };
+    InvocationCommandError {
+        exit_code,
+        message: if exit_code == 5 {
+            "invocation not found".to_string()
+        } else {
+            error.message.clone()
+        },
+    }
+}
+
+fn finish_invocation_result(result: Result<()>) -> Result<()> {
+    match result {
+        Err(error) if error.downcast_ref::<InvocationCommandError>().is_some() => {
+            let command = error
+                .downcast_ref::<InvocationCommandError>()
+                .expect("invocation command error checked above");
+            eprintln!("{}", command.message);
+            std::process::exit(command.exit_code);
         }
-        _ => {
-            eprintln!("{}", error.message);
-            std::process::exit(4);
-        }
+        result => result,
     }
 }
 

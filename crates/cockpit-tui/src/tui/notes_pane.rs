@@ -786,7 +786,7 @@ impl NotesPane {
             notes: Vec::new(),
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::New,
-            operation_generation: 0,
+            operation_generation: 1,
             highest_applied_generation: None,
             initial_inventory_unresolved: false,
             pending_save: None,
@@ -1103,7 +1103,7 @@ mod tests {
             }],
             sidebar: initial_sidebar_state(),
             selection: SidebarSelection::Note(id),
-            operation_generation: 0,
+            operation_generation: 1,
             highest_applied_generation: None,
             initial_inventory_unresolved: false,
             pending_save: None,
@@ -1130,6 +1130,13 @@ mod tests {
             name: name.into(),
             content: content.into(),
         }
+    }
+
+    fn mark_initial_inventory_unresolved(pane: &mut NotesPane) {
+        pane.operation_generation = 0;
+        pane.highest_applied_generation = None;
+        pane.initial_inventory_unresolved = true;
+        pane.selection = SidebarSelection::Uninitialized;
     }
 
     fn rendered_buffer(pane: &mut NotesPane, width: u16, height: u16) -> String {
@@ -1182,7 +1189,7 @@ mod tests {
         pane.select_sidebar(1);
 
         pane.apply_rpc_result(Ok(NotesRpcResult {
-            generation: 0,
+            generation: 1,
             error: None,
             project_root: "/proj".into(),
             notes: vec![
@@ -1194,6 +1201,21 @@ mod tests {
             enter_edit: false,
         }));
         assert_eq!(pane.selected_index(), 2);
+        assert_eq!(pane.current().map(|note| note.id), Some(keep));
+        let applied_ids = pane.notes.iter().map(|note| note.id).collect::<Vec<_>>();
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 1,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(Uuid::new_v4(), "duplicate", "must be ignored")],
+            selection: SelectionAfterRpc::Keep(Uuid::new_v4()),
+            enter_edit: false,
+        }));
+        assert_eq!(
+            pane.notes.iter().map(|note| note.id).collect::<Vec<_>>(),
+            applied_ids,
+            "duplicate generation is ignored"
+        );
         assert_eq!(pane.current().map(|note| note.id), Some(keep));
 
         for _ in 0..20 {
@@ -1217,7 +1239,7 @@ mod tests {
 
         pane.select_sidebar(pane.notes.len());
         pane.apply_rpc_result(Ok(NotesRpcResult {
-            generation: 0,
+            generation: 1,
             error: None,
             project_root: "/proj".into(),
             notes: (0..8)
@@ -1235,8 +1257,9 @@ mod tests {
             note(Uuid::new_v4(), "after", "c"),
         ];
         pane.select_sidebar(1);
+        pane.operation_generation = 2;
         pane.apply_rpc_result(Ok(NotesRpcResult {
-            generation: 0,
+            generation: 2,
             error: None,
             project_root: "/proj".into(),
             notes: vec![
@@ -1251,8 +1274,9 @@ mod tests {
         assert_eq!(pane.selected_index(), 1);
 
         let fallback = pane.notes[1].id;
+        pane.operation_generation = 3;
         pane.apply_rpc_result(Ok(NotesRpcResult {
-            generation: 0,
+            generation: 3,
             error: None,
             project_root: "/proj".into(),
             notes: pane.notes.clone(),
@@ -1261,8 +1285,9 @@ mod tests {
         }));
         assert_eq!(pane.selection, SidebarSelection::Note(fallback));
 
+        pane.operation_generation = 4;
         pane.apply_rpc_result(Ok(NotesRpcResult {
-            generation: 0,
+            generation: 4,
             error: None,
             project_root: "/proj".into(),
             notes: Vec::new(),
@@ -1271,6 +1296,19 @@ mod tests {
         }));
         assert_eq!(pane.selection, SidebarSelection::New);
         assert_eq!(pane.selected_index(), 0);
+        pane.apply_rpc_result(Ok(NotesRpcResult {
+            generation: 2,
+            error: None,
+            project_root: "/proj".into(),
+            notes: vec![note(Uuid::new_v4(), "stale", "must be ignored")],
+            selection: SelectionAfterRpc::Preserve,
+            enter_edit: false,
+        }));
+        assert!(
+            pane.notes.is_empty(),
+            "older positive generation is ignored"
+        );
+        assert_eq!(pane.selection, SidebarSelection::New);
     }
 
     #[test]
@@ -1278,7 +1316,7 @@ mod tests {
         let first = Uuid::new_v4();
         let mut initial = pane(true);
         initial.notes.clear();
-        initial.selection = SidebarSelection::Uninitialized;
+        mark_initial_inventory_unresolved(&mut initial);
         initial.apply_rpc_result(Ok(NotesRpcResult {
             generation: 0,
             error: None,
@@ -1295,7 +1333,7 @@ mod tests {
 
         let mut initially_empty = pane(true);
         initially_empty.notes.clear();
-        initially_empty.selection = SidebarSelection::Uninitialized;
+        mark_initial_inventory_unresolved(&mut initially_empty);
         initially_empty.apply_rpc_result(Ok(NotesRpcResult {
             generation: 0,
             error: None,
@@ -1305,8 +1343,9 @@ mod tests {
             enter_edit: false,
         }));
         assert_eq!(initially_empty.selection, SidebarSelection::New);
+        initially_empty.operation_generation = 1;
         initially_empty.apply_rpc_result(Ok(NotesRpcResult {
-            generation: 0,
+            generation: 1,
             error: None,
             project_root: "/proj".into(),
             notes: vec![note(first, "arrived later", "a")],
@@ -1318,7 +1357,7 @@ mod tests {
 
         let mut retry = pane(true);
         retry.notes.clear();
-        retry.selection = SidebarSelection::Uninitialized;
+        mark_initial_inventory_unresolved(&mut retry);
         retry.apply_rpc_result(Ok(NotesRpcResult {
             generation: 0,
             error: Some("temporary daemon failure".into()),
@@ -1340,8 +1379,9 @@ mod tests {
         assert_eq!(retry.selection, SidebarSelection::Note(first));
 
         retry.select_sidebar(retry.notes.len());
+        retry.operation_generation = 1;
         retry.apply_rpc_result(Ok(NotesRpcResult {
-            generation: 0,
+            generation: 1,
             error: None,
             project_root: "/proj".into(),
             notes: vec![
@@ -1360,7 +1400,7 @@ mod tests {
         for activation in [KeyCode::Char('n'), KeyCode::Enter] {
             let mut pane = pane(true);
             pane.notes.clear();
-            pane.selection = SidebarSelection::Uninitialized;
+            mark_initial_inventory_unresolved(&mut pane);
             pane.sidebar.select(Some(0));
             pane.handle_key(press(activation));
             assert_eq!(pane.selection, SidebarSelection::New);
@@ -1408,7 +1448,7 @@ mod tests {
         pane.enter_edit();
         assert!(matches!(pane.mode, Mode::Editing { id } if id == edited));
         pane.apply_rpc_result(Ok(NotesRpcResult {
-            generation: 0,
+            generation: 1,
             error: None,
             project_root: "/proj".into(),
             notes: vec![note(other, "other", "changed")],
@@ -1434,7 +1474,7 @@ mod tests {
         pane.handle_key(press(KeyCode::Char('d')));
         assert!(matches!(pane.mode, Mode::ConfirmingDelete { id } if id == edited));
         pane.apply_rpc_result(Ok(NotesRpcResult {
-            generation: 0,
+            generation: 1,
             error: None,
             project_root: "/proj".into(),
             notes: vec![note(other, "other", "changed")],
@@ -1501,8 +1541,7 @@ mod tests {
         let created = Uuid::new_v4();
         let mut pane = pane(true);
         pane.notes.clear();
-        pane.selection = SidebarSelection::Uninitialized;
-        pane.initial_inventory_unresolved = true;
+        mark_initial_inventory_unresolved(&mut pane);
 
         pane.handle_key(press(KeyCode::Char('n')));
         pane.paste("created");
@@ -1588,7 +1627,7 @@ mod tests {
         ];
         pane.select_sidebar(1);
         pane.apply_rpc_result(Ok(NotesRpcResult {
-            generation: 0,
+            generation: 1,
             error: None,
             project_root: "/proj".into(),
             notes: vec![note(first, "first", "a"), note(next, "next", "c")],
@@ -1597,8 +1636,9 @@ mod tests {
         }));
         assert_eq!(pane.selection, SidebarSelection::Note(next));
 
+        pane.operation_generation = 2;
         pane.apply_rpc_result(Ok(NotesRpcResult {
-            generation: 0,
+            generation: 2,
             error: None,
             project_root: "/proj".into(),
             notes: vec![note(first, "first", "a")],

@@ -699,8 +699,12 @@ impl App {
                 }
             }
             crate::tui::button::ButtonDispatch::ResourcePromote { index } => {
-                if let Overlay::Resources(pane) = &mut self.overlay {
-                    pane.pointer_promote(index);
+                let outcome = match &mut self.overlay {
+                    Overlay::Resources(pane) => pane.pointer_promote(index),
+                    _ => None,
+                };
+                if let Some(outcome) = outcome {
+                    self.start_resources_outcome(outcome);
                 }
             }
             crate::tui::button::ButtonDispatch::NoteNew => {
@@ -2739,6 +2743,56 @@ mod affordance_hover_tests {
         assert_eq!(resolve_inner_scroll_target(&bottom, 4, true), Some(target));
         assert_eq!(resolve_inner_scroll_target(&bottom, 4, false), None);
         assert_eq!(resolve_inner_scroll_target(&bottom, 8, true), None);
+    }
+}
+
+#[cfg(test)]
+mod resource_button_dispatch_tests {
+    use super::{App, Overlay};
+    use crate::tui::async_action::AsyncActionKind;
+    use crate::tui::button::ButtonDispatch;
+    use crate::tui::resources_pane::ResourcesPane;
+    use cockpit_core::engine::resource_scheduler::{
+        ResourceQueuedSnapshot, ResourceRequestMetadata, ResourceRequirements,
+        ResourceSchedulerSnapshot,
+    };
+    use cockpit_proto::ResourceQueuedState;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn promote_button_enqueues_daemon_mutation_for_clicked_request() {
+        let mut pane = ResourcesPane::open();
+        let queued = ["rs-first", "rs-clicked"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, display_id)| ResourceQueuedSnapshot {
+                id: uuid::Uuid::new_v4(),
+                display_id: display_id.to_string(),
+                resources: ResourceRequirements::new([("cpu", 1)]),
+                metadata: ResourceRequestMetadata::default(),
+                queued_at_ms: index as i64,
+                wait_ms: index as u64,
+                state: ResourceQueuedState::Queued,
+                promoted_by: None,
+                promoted_at_ms: None,
+            })
+            .collect();
+        pane.apply_snapshot_result(Ok(ResourceSchedulerSnapshot {
+            enabled: true,
+            pools: Vec::new(),
+            running: Vec::new(),
+            queued,
+            max_queued: 16,
+        }));
+        let mut app = App::new(None, false);
+        app.overlay = Overlay::Resources(pane);
+
+        app.dispatch_button(ButtonDispatch::ResourcePromote { index: 1 });
+
+        assert_eq!(
+            app.async_actions.pending_kinds(),
+            vec![AsyncActionKind::DaemonRpc("resources.promote")]
+        );
+        assert!(matches!(app.overlay, Overlay::Resources(_)));
     }
 }
 

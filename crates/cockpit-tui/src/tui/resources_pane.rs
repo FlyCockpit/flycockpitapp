@@ -97,8 +97,12 @@ impl ResourcesPane {
         }
     }
 
-    pub(crate) fn pointer_promote(&mut self, index: usize) {
+    pub(crate) fn pointer_promote(&mut self, index: usize) -> Option<ResourcesOutcome> {
         self.select_index(index);
+        self.snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.queued.get(index))
+            .map(|entry| ResourcesOutcome::Promote(entry.display_id.clone()))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<ResourcesOutcome> {

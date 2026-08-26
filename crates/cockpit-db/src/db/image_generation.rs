@@ -4075,6 +4075,75 @@ impl Db {
         Ok(())
     }
 
+    fn execute_late_publication_artifact_transition_conn(
+        conn: &Connection,
+        artifact_id: &str,
+        expected_generation: u64,
+        now_unix_ms: i64,
+    ) -> Result<()> {
+        ensure!(
+            artifact_transition_allowed(
+                ImageGenerationArtifactState::LateQuarantined,
+                ImageGenerationArtifactState::Retained
+            ),
+            "late publication artifact transition is not canonical"
+        );
+        ensure!(conn.execute("UPDATE image_generation_artifacts SET state='retained',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state='late_quarantined' AND generation=?3",params![now_unix_ms,artifact_id,i64::try_from(expected_generation)?])?==1,"late publication artifact compare-and-set lost");
+        Ok(())
+    }
+
+    fn execute_artifact_cleanup_transition_conn(
+        conn: &Connection,
+        input: &BeginImageGenerationArtifactCleanup,
+    ) -> Result<()> {
+        ensure!(
+            artifact_transition_allowed(
+                input.expected_state,
+                ImageGenerationArtifactState::CleanupPending
+            ),
+            "artifact cleanup transition is not canonical"
+        );
+        let changed=conn.execute("UPDATE image_generation_artifacts SET state='cleanup_pending',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state=?3 AND generation=?4 AND active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references r WHERE r.artifact_id=image_generation_artifacts.artifact_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=image_generation_artifacts.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed','security_blocked','delete_authorized')) AND (immediate_cleanup=1 OR (eligibility_at_unix_ms IS NOT NULL AND eligibility_at_unix_ms<=?1) OR ?5 IN ('invalid_output','restart_recovery','owner_recovery'))",params![input.now_unix_ms,input.artifact_id.to_string(),input.expected_state.as_str(),i64::try_from(input.expected_generation)?,input.reason.as_str()])?;
+        ensure!(
+            changed == 1,
+            "artifact cleanup compare-and-set lost or is ineligible"
+        );
+        Ok(())
+    }
+
+    fn execute_component_tombstone_transition_conn(
+        conn: &Connection,
+        input: &CommitImageGenerationComponentDeletion,
+    ) -> Result<()> {
+        ensure!(
+            artifact_component_transition_allowed(
+                ImageGenerationArtifactComponentState::Deleting,
+                ImageGenerationArtifactComponentState::Tombstoned
+            ),
+            "component tombstone transition is not canonical"
+        );
+        ensure!(conn.execute("UPDATE image_generation_artifact_components SET state='tombstoned',generation=generation+1 WHERE artifact_id=?1 AND component_id=?2 AND state='deleting' AND generation=?3",params![input.artifact_id.to_string(),input.component_id.to_string(),i64::try_from(input.expected_generation)?])?==1,"component tombstone compare-and-set lost");
+        Ok(())
+    }
+
+    fn execute_artifact_tombstone_transition_conn(
+        conn: &Connection,
+        artifact_id: Uuid,
+        expected_generation: u64,
+        now_unix_ms: i64,
+        terminal_reason: &str,
+    ) -> Result<()> {
+        ensure!(
+            artifact_transition_allowed(
+                ImageGenerationArtifactState::Deleting,
+                ImageGenerationArtifactState::Tombstoned
+            ),
+            "artifact tombstone transition is not canonical"
+        );
+        ensure!(conn.execute("UPDATE image_generation_artifacts SET state='tombstoned',generation=generation+1,terminal_reason=?1,updated_at_unix_ms=?2 WHERE artifact_id=?3 AND state='deleting' AND generation=?4",params![terminal_reason,now_unix_ms,artifact_id.to_string(),i64::try_from(expected_generation)?])?==1,"artifact tombstone compare-and-set lost");
+        Ok(())
+    }
+
     pub fn acquire_image_generation_artifact_lease_conn(
         conn: &Connection,
         input: &AcquireImageGenerationArtifactLease<'_>,
@@ -4495,7 +4564,12 @@ fn finalize_image_generation_late_publication_at_conn(
     let projection=tx.query_row("SELECT p.artifact_id,p.artifact_generation,p.job_id,p.slot_id,p.expected_slot_version,p.output_authority_digest,p.output_authority_generation,p.destination_name,p.output_evidence_json FROM image_generation_late_publication_leases p JOIN image_generation_artifacts a ON a.artifact_id=p.artifact_id JOIN image_generation_slots s ON s.job_id=p.job_id AND s.slot_id=p.slot_id JOIN image_generation_late_publication_authorization_facts f ON f.authorization_digest=p.authorization_digest WHERE p.publication_operation_id=?1 AND p.state='copy_committed' AND p.version=?2 AND a.state='late_quarantined' AND a.generation=p.artifact_generation AND s.state='late_quarantined' AND s.version=p.expected_slot_version AND s.result_after_cancel=1 AND f.revoked_at_unix_ms IS NULL AND f.output_authority_digest=p.output_authority_digest AND f.output_authority_generation=p.output_authority_generation AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_cleanup_intents i WHERE i.artifact_id=a.artifact_id)",params![publication_operation_id.to_string(),i64::try_from(expected_lease_version)?],|row|Ok(LatePublicationFinalizeProjection{artifact_id:row.get(0)?,artifact_generation:row.get(1)?,job_id:row.get(2)?,slot_id:row.get(3)?,slot_version:row.get(4)?,output_authority_digest:row.get(5)?,output_authority_generation:row.get(6)?,destination_name:row.get(7)?,output_evidence_json:row.get(8)?})).optional()?.context("late publication finalization lost its lease")?;
     tx.execute("INSERT INTO image_generation_user_published_outputs(publication_operation_id,artifact_id,artifact_generation,output_authority_digest,output_authority_generation,destination_name,output_evidence_json,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![publication_operation_id.to_string(),projection.artifact_id,projection.artifact_generation,projection.output_authority_digest,projection.output_authority_generation,projection.destination_name,projection.output_evidence_json,now_unix_ms])?;
     tx.execute("UPDATE image_generation_late_publication_leases SET state='published',version=version+1,decided_at_unix_ms=?3 WHERE publication_operation_id=?1 AND state='copy_committed' AND version=?2",params![publication_operation_id.to_string(),i64::try_from(expected_lease_version)?,now_unix_ms])?;
-    ensure!(tx.execute("UPDATE image_generation_artifacts SET state='retained',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state='late_quarantined' AND generation=?3",params![now_unix_ms,projection.artifact_id,projection.artifact_generation])?==1,"late publication artifact compare-and-set lost");
+    Db::execute_late_publication_artifact_transition_conn(
+        &tx,
+        &projection.artifact_id,
+        u64::try_from(projection.artifact_generation)?,
+        now_unix_ms,
+    )?;
     ensure!(tx.execute("UPDATE image_generation_slots SET state='published',version=version+1,published_disposition='late_authorized',published_disposition_generation=version+1 WHERE job_id=?1 AND slot_id=?2 AND state='late_quarantined' AND version=?3 AND result_after_cancel=1 AND applied_cancellation_version IS NOT NULL",params![projection.job_id,projection.slot_id,projection.slot_version])?==1,"late publication slot compare-and-set lost");
     tx.commit()?;
     Ok(())
@@ -4643,14 +4717,7 @@ impl Db {
             "INSERT INTO image_generation_artifact_cleanup_intents(cleanup_operation_id,artifact_id,expected_artifact_generation,reason,state,version,created_at_unix_ms) VALUES(?1,?2,?3,?4,'pending',1,?5)",
             params![input.cleanup_operation_id.to_string(),input.artifact_id.to_string(),i64::try_from(cleanup_generation)?,input.reason.as_str(),input.now_unix_ms],
         )?;
-        let changed = tx.execute(
-            "UPDATE image_generation_artifacts SET state='cleanup_pending',generation=generation+1,updated_at_unix_ms=?1 WHERE artifact_id=?2 AND state=?3 AND generation=?4 AND active_lease_count=0 AND NOT EXISTS(SELECT 1 FROM image_generation_artifact_references r WHERE r.artifact_id=image_generation_artifacts.artifact_id AND r.released_at_unix_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM image_generation_late_publication_leases p WHERE p.artifact_id=image_generation_artifacts.artifact_id AND p.state IN ('reserved','copy_authorized','copy_committed','security_blocked','delete_authorized')) AND (immediate_cleanup=1 OR (eligibility_at_unix_ms IS NOT NULL AND eligibility_at_unix_ms<=?1) OR ?5 IN ('invalid_output','restart_recovery','owner_recovery'))",
-            params![input.now_unix_ms,input.artifact_id.to_string(),input.expected_state.as_str(),i64::try_from(input.expected_generation)?,input.reason.as_str()],
-        )?;
-        ensure!(
-            changed == 1,
-            "artifact cleanup compare-and-set lost or is ineligible"
-        );
+        Self::execute_artifact_cleanup_transition_conn(&tx, input)?;
         tx.commit()?;
         Ok(())
     }
@@ -4682,11 +4749,7 @@ impl Db {
             "INSERT INTO image_generation_component_release_facts(artifact_id,component_id,release_operation_id,deletion_evidence_digest,committed_at_unix_ms) VALUES(?1,?2,?3,?4,?5)",
             params![input.artifact_id.to_string(),input.component_id.to_string(),input.release_operation_id.to_string(),input.deletion_evidence_digest,input.committed_at_unix_ms],
         )?;
-        let tombstoned = tx.execute(
-            "UPDATE image_generation_artifact_components SET state='tombstoned',generation=generation+1 WHERE artifact_id=?1 AND component_id=?2 AND state='deleting' AND generation=?3",
-            params![input.artifact_id.to_string(),input.component_id.to_string(),i64::try_from(input.expected_generation)?],
-        )?;
-        ensure!(tombstoned == 1, "component tombstone compare-and-set lost");
+        Self::execute_component_tombstone_transition_conn(&tx, input)?;
         tx.commit()?;
         Ok(())
     }
@@ -4711,8 +4774,13 @@ impl Db {
             "artifact terminal reason is empty"
         );
         let tx = conn.unchecked_transaction()?;
-        let artifact=tx.execute("UPDATE image_generation_artifacts SET state='tombstoned',generation=generation+1,terminal_reason=?1,updated_at_unix_ms=?2 WHERE artifact_id=?3 AND state='deleting' AND generation=?4",params![terminal_reason,now_unix_ms,artifact_id.to_string(),i64::try_from(expected_generation)?])?;
-        ensure!(artifact == 1, "artifact tombstone compare-and-set lost");
+        Self::execute_artifact_tombstone_transition_conn(
+            &tx,
+            artifact_id,
+            expected_generation,
+            now_unix_ms,
+            terminal_reason,
+        )?;
         let cleanup=tx.execute("UPDATE image_generation_artifact_cleanup_intents SET state='completed',version=version+1,completed_at_unix_ms=?1 WHERE cleanup_operation_id=?2 AND artifact_id=?3 AND state='deleting'",params![now_unix_ms,cleanup_operation_id.to_string(),artifact_id.to_string()])?;
         ensure!(cleanup == 1, "cleanup completion compare-and-set lost");
         tx.commit()?;

@@ -1115,11 +1115,11 @@ async fn probe_user_message(
         .map_err(|error| {
             tracing::warn!(%error, %session_id, %client_submission_id,
                 "client submission probe failed; refusing ambiguous retry");
-            proto::ErrorPayload {
-                code: proto::ErrorCode::Internal,
-                message: "could not verify whether this message was already accepted; retry"
-                    .to_string(),
-            }
+            user_message_database_error(
+                &error,
+                proto::ErrorCode::Internal,
+                "could not verify whether this message was already accepted; retry",
+            )
         })?;
 
     let terminal = if durable.is_none() {
@@ -1130,11 +1130,11 @@ async fn probe_user_message(
             .map_err(|error| {
                 tracing::warn!(%error, %session_id, %client_submission_id,
                     "terminal client submission probe failed; refusing ambiguous retry");
-                proto::ErrorPayload {
-                    code: proto::ErrorCode::Internal,
-                    message: "could not verify whether this message was already terminated; retry"
-                        .to_string(),
-                }
+                user_message_database_error(
+                    &error,
+                    proto::ErrorCode::Internal,
+                    "could not verify whether this message was already terminated; retry",
+                )
             })?
     } else {
         None
@@ -2505,11 +2505,24 @@ pub(super) async fn run_worker(
                     // check below so the full duplicate path (remote operation
                     // resolution, queue snapshot) is unchanged.
                     if artifact_admission.is_none() {
-                        if let Ok(Some(durable)) = session
+                        let durable = match session
                             .db
                             .client_submission_receipt(session_id, receipt.id)
                             .await
                         {
+                            Ok(durable) => durable,
+                            Err(error) => {
+                                tracing::warn!(%error, %session_id, client_submission_id = %receipt.id,
+                                    "early client submission conflict lookup failed; refusing ambiguous enqueue");
+                                let _ = respond_to.send(Err(user_message_database_error(
+                                    &error,
+                                    proto::ErrorCode::Internal,
+                                    "could not verify whether this message identity was already used; retry",
+                                )));
+                                continue;
+                            }
+                        };
+                        if let Some(durable) = durable {
                             if durable.origin_principal != receipt.origin_principal
                                 || durable.fingerprint != receipt.fingerprint
                             {

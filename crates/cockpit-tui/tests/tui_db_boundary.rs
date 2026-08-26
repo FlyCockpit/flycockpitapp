@@ -472,6 +472,12 @@ fn production_uses_cockpit_proto_directly() {
                     path.display()
                 ));
             }
+            if compact.contains("cockpit_core::engine::IdleReason") {
+                findings.push(format!(
+                    "{}: IdleReason is a cockpit-proto wire type",
+                    path.display()
+                ));
+            }
             if compact.contains("externcratecockpit_core") {
                 findings.push(format!(
                     "{}: whole-crate cockpit_core extern aliases obscure protocol ownership",
@@ -488,6 +494,7 @@ fn production_uses_cockpit_proto_directly() {
                     || imported == "cockpit_core::daemon::self"
                     || imported == "cockpit_core::daemon::proto"
                     || imported.starts_with("cockpit_core::daemon::proto::")
+                    || imported == "cockpit_core::engine::IdleReason"
                 {
                     findings.push(format!(
                         "{}: protocol import must use cockpit_proto directly: {imported}",

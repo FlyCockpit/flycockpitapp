@@ -3008,31 +3008,31 @@ pub(super) struct IdleReasonStatus {
     kind: ToastKind,
 }
 
-fn idle_reason_status(reason: cockpit_core::engine::IdleReason) -> Option<IdleReasonStatus> {
+fn idle_reason_status(reason: cockpit_proto::IdleReason) -> Option<IdleReasonStatus> {
     match reason {
-        cockpit_core::engine::IdleReason::Completed => None,
-        cockpit_core::engine::IdleReason::GoalComplete => Some(IdleReasonStatus {
+        cockpit_proto::IdleReason::Completed => None,
+        cockpit_proto::IdleReason::GoalComplete => Some(IdleReasonStatus {
             text: "goal session completed".to_string(),
             kind: ToastKind::Success,
         }),
-        cockpit_core::engine::IdleReason::NeedsIntervention { code } => Some(IdleReasonStatus {
+        cockpit_proto::IdleReason::NeedsIntervention { code } => Some(IdleReasonStatus {
             text: format!("goal stalled ({code}) — run `/goal resume` or send guidance"),
             kind: ToastKind::Warning,
         }),
-        cockpit_core::engine::IdleReason::BudgetLimited => Some(IdleReasonStatus {
+        cockpit_proto::IdleReason::BudgetLimited => Some(IdleReasonStatus {
             text: "goal paused: token budget reached — run `/goal resume` or adjust budget"
                 .to_string(),
             kind: ToastKind::Warning,
         }),
-        cockpit_core::engine::IdleReason::UsageLimited => Some(IdleReasonStatus {
+        cockpit_proto::IdleReason::UsageLimited => Some(IdleReasonStatus {
             text: "usage limit — auto-resuming shortly".to_string(),
             kind: ToastKind::Warning,
         }),
-        cockpit_core::engine::IdleReason::Error { class } => Some(IdleReasonStatus {
+        cockpit_proto::IdleReason::Error { class } => Some(IdleReasonStatus {
             text: format!("turn stopped on {class} — inspect the error and retry"),
             kind: ToastKind::Error,
         }),
-        cockpit_core::engine::IdleReason::Interrupted => Some(IdleReasonStatus {
+        cockpit_proto::IdleReason::Interrupted => Some(IdleReasonStatus {
             text: "turn interrupted".to_string(),
             kind: ToastKind::Info,
         }),
